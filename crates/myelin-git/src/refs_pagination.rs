@@ -91,7 +91,7 @@ impl RefKind {
 pub struct RefPageItem {
     pub kind: RefKind,
     /// Fully-qualified ref name. Consumers must use this exact name for subsequent resolution.
-    pub full_name: String,
+    pub qualified_name: String,
     /// Display name with the `refs/heads/` or `refs/tags/` prefix removed.
     pub name: String,
     pub tip: Oid,
@@ -544,7 +544,7 @@ fn scan_refs(
         }
         let item = RefPageItem {
             kind,
-            full_name: full_name.to_string(),
+            qualified_name: full_name.to_string(),
             name: short_name.to_string(),
             tip: Oid::new(target.to_string()),
         };
@@ -594,7 +594,11 @@ fn scan_refs(
         pins.push(pin);
     }
     if let Some(pin) = default {
-        if pins.iter().all(|item| item.full_name != pin.full_name) && pins.len() < MAX_PINS {
+        if pins
+            .iter()
+            .all(|item| item.qualified_name != pin.qualified_name)
+            && pins.len() < MAX_PINS
+        {
             pins.push(pin);
         }
     }
@@ -845,7 +849,7 @@ mod tests {
             filtered
                 .pins
                 .iter()
-                .map(|pin| pin.full_name.as_str())
+                .map(|pin| pin.qualified_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["refs/heads/z-current", "refs/heads/main"]
         );
@@ -864,7 +868,7 @@ mod tests {
             })
             .expect("missing current is not guessed");
         assert_eq!(missing.pins.len(), 1);
-        assert_eq!(missing.pins[0].full_name, "refs/heads/main");
+        assert_eq!(missing.pins[0].qualified_name, "refs/heads/main");
         let deduplicated = fixture
             .repo
             .refs_page(RefsPageRequest {
@@ -873,7 +877,7 @@ mod tests {
             })
             .expect("current/default deduplication");
         assert_eq!(deduplicated.pins.len(), 1);
-        assert_eq!(deduplicated.pins[0].full_name, "refs/heads/main");
+        assert_eq!(deduplicated.pins[0].qualified_name, "refs/heads/main");
     }
 
     fn first_cursor(fixture: &Fixture, query: Option<&str>) -> String {
