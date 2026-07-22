@@ -2439,7 +2439,7 @@ impl DurableGitBackend {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?;
         let mut refs: Vec<(String, String)> = repo
-            .list_refs()?
+            .list_refs_bounded(WIRE_MAX_REFS)?
             .into_iter()
             .map(|(n, o)| (n, o.0))
             .collect();
@@ -2545,7 +2545,7 @@ impl DurableGitBackend {
         // full-history connectivity walk below. The walk hides these so a thin push only pays for the
         // newly-introduced commits; an unreadable ref list fails safe to `[]` (a wider walk = stricter).
         let existing_tips: Vec<CoreOid> = repo
-            .list_refs()
+            .list_refs_bounded(WIRE_MAX_REFS)
             .unwrap_or_default()
             .into_iter()
             .map(|(_, oid)| oid)
@@ -3024,6 +3024,10 @@ const REPO_SCAN_MAX_CANDIDATES: usize = 10_000;
 const PR_LIST_MAX_RECORDS: usize = 10_000;
 const PR_LIST_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// Smart-HTTP must advertise/walk all direct refs, so it cannot page them. Keep that unavoidable
+/// materialization finite while leaving ample headroom for large repositories.
+const WIRE_MAX_REFS: usize = 100_000;
+
 /// The inline-text cap for a blob view (R3.4). The ODB header is checked first: a larger object gets
 /// a metadata-only download fallback and is never inflated merely to build the interactive page.
 const BLOB_INLINE_CAP: usize = 512 * 1024;
@@ -3240,6 +3244,9 @@ fn map_durable_err(e: DurableError) -> EdgeError {
         }
         DurableError::Git(m) if m.starts_with("branch protection limit exceeded:") => {
             EdgeError::PayloadTooLarge("branch protection policy exceeds the storage limit".into())
+        }
+        DurableError::Git(m) if m.starts_with("wire ref limit exceeded:") => {
+            EdgeError::PayloadTooLarge("repository exceeds the smart-HTTP ref limit".into())
         }
         // A traversal-rejected slug / malformed body (e.g. R3.1 open-PR with no `title`) surfaces as a
         // clean 400 (never a silent wrong path, never a 500 for a client input error).
@@ -5555,6 +5562,10 @@ mod pr_list_tests {
             (
                 "branch protection limit exceeded: private repository detail",
                 "branch protection policy exceeds the storage limit",
+            ),
+            (
+                "wire ref limit exceeded: private repository detail",
+                "repository exceeds the smart-HTTP ref limit",
             ),
         ] {
             let mapped = map_durable_err(DurableError::Git(private.into()));
