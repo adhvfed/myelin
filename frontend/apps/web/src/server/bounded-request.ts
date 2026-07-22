@@ -1,12 +1,15 @@
 const BODY_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 export const MAX_MUTATION_BODY_BYTES = 1024 * 1024;
+export const MAX_MUTATION_BODY_READ_MS = 15_000;
+
+const READ_DEADLINE = Symbol("request-body-read-deadline");
 
 export type BoundedRequestResult =
   | { ok: true; request: Request }
   | { ok: false; response: Response };
 
-function rejection(status: number, message: string): BoundedRequestResult {
+function rejection(status: number, message: string, closeConnection = false): BoundedRequestResult {
   return {
     ok: false,
     response: new Response(message, {
@@ -14,6 +17,7 @@ function rejection(status: number, message: string): BoundedRequestResult {
       headers: {
         "Cache-Control": "no-store",
         "Content-Type": "text/plain; charset=utf-8",
+        ...(closeConnection ? { Connection: "close" } : {}),
       },
     }),
   };
@@ -34,6 +38,7 @@ function declaredLength(request: Request): number | null | "invalid" {
 export async function boundMutationRequest(
   request: Request,
   limit = MAX_MUTATION_BODY_BYTES,
+  timeoutMs = MAX_MUTATION_BODY_READ_MS,
 ): Promise<BoundedRequestResult> {
   if (!BODY_METHODS.has(request.method.toUpperCase()) || request.body == null) {
     return { ok: true, request };
@@ -41,35 +46,50 @@ export async function boundMutationRequest(
   if (!Number.isSafeInteger(limit) || limit < 0) {
     throw new RangeError("request body limit must be a non-negative safe integer");
   }
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError("request body timeout must be a positive safe integer");
+  }
 
   const length = declaredLength(request);
-  if (length === "invalid") return rejection(400, "invalid Content-Length");
-  if (length != null && length > limit) return rejection(413, "request body too large");
+  if (length === "invalid") return rejection(400, "invalid Content-Length", true);
+  if (length != null && length > limit) return rejection(413, "request body too large", true);
 
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let observed = 0;
-  let overflow = false;
+  let handedOff = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<typeof READ_DEADLINE>((resolve) => {
+    timer = setTimeout(() => resolve(READ_DEADLINE), timeoutMs);
+  });
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const result = await Promise.race([reader.read(), deadline]);
+      if (result === READ_DEADLINE) {
+        chunks.length = 0;
+        handedOff = true;
+        void drainDetached(reader);
+        return rejection(408, "request body timed out", true);
+      }
+      const { done, value } = result;
       if (done) break;
-      if (overflow) continue;
       observed += value.byteLength;
       if (observed > limit) {
         // H3 1.x does not tolerate cancellation of its IncomingMessage-backed Web stream: its
         // eventual `end` handler closes the already-cancelled controller and crashes Node. Drain
-        // the remainder without retaining it so chunked overflow stays constant-memory.
-        overflow = true;
+        // the remainder without retaining it in a detached task. Closing this HTTP connection lets
+        // the middleware return 413 immediately and prevents a slow remainder from occupying it.
         chunks.length = 0;
-        continue;
+        handedOff = true;
+        void drainDetached(reader);
+        return rejection(413, "request body too large", true);
       }
       chunks.push(value);
     }
   } finally {
-    reader.releaseLock();
+    if (timer !== undefined) clearTimeout(timer);
+    if (!handedOff) reader.releaseLock();
   }
-  if (overflow) return rejection(413, "request body too large");
 
   const body = new Uint8Array(observed);
   let offset = 0;
@@ -83,4 +103,18 @@ export async function boundMutationRequest(
     duplex: "half",
   };
   return { ok: true, request: new Request(request, init) };
+}
+
+/** Keep consuming an H3-backed request after the response is decided. No chunk is retained, and all
+ * stream failures are contained because the client may disappear as the close response is sent. */
+async function drainDetached(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+  try {
+    while (!(await reader.read()).done) {
+      // Deliberately empty: consuming applies backpressure without retaining attacker bytes.
+    }
+  } catch {
+    // A closed connection is the normal terminal state for an early rejection.
+  } finally {
+    reader.releaseLock();
+  }
 }
