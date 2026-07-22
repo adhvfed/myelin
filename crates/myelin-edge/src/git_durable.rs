@@ -43,7 +43,7 @@ use myelin_git::check_status::GitOid;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};
 use myelin_git::durable::{
     BlobPathLookup, CommitDetail, CommitMeta, FileLinesLookup, PrDiff, TreePathLookup,
-    FILE_LINES_MAX_RANGE,
+    FILE_LINES_MAX_RANGE, WIRE_MAX_REFS,
 };
 use myelin_git::durable::{DurableError, DurableGitRepo, DurableGitStore};
 use myelin_git::events::pseudonymized_event_principal;
@@ -3023,10 +3023,6 @@ const REPO_SCAN_MAX_CANDIDATES: usize = 10_000;
 /// query itself so exact list semantics cannot turn into an unbounded filesystem/SQL materialization.
 const PR_LIST_MAX_RECORDS: usize = 10_000;
 const PR_LIST_MAX_BYTES: usize = 64 * 1024 * 1024;
-
-/// Smart-HTTP must advertise/walk all direct refs, so it cannot page them. Keep that unavoidable
-/// materialization finite while leaving ample headroom for large repositories.
-const WIRE_MAX_REFS: usize = 100_000;
 
 /// The inline-text cap for a blob view (R3.4). The ODB header is checked first: a larger object gets
 /// a metadata-only download fallback and is never inflated merely to build the interactive page.
