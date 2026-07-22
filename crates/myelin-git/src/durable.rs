@@ -100,6 +100,47 @@ fn git_err(ctx: &str, e: git2::Error) -> DurableError {
     DurableError::Git(format!("{ctx}: {e}"))
 }
 
+static ATOMIC_WRITE_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Durably replace `file` with `bytes`: sync a process-unique temporary file, rename it into place,
+/// then sync the parent directory so the rename itself survives a crash.
+pub(crate) fn write_file_atomic(
+    dir: &Path,
+    file: &Path,
+    bytes: &[u8],
+) -> Result<(), DurableError> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| DurableError::Io(format!("create dir {}: {e}", dir.display())))?;
+    let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = file.file_name().and_then(|value| value.to_str()).unwrap_or("record");
+    let tmp = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
+    let result = (|| {
+        let mut handle = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+            .map_err(|e| DurableError::Io(format!("create {}: {e}", tmp.display())))?;
+        handle
+            .write_all(bytes)
+            .map_err(|e| DurableError::Io(format!("write {}: {e}", tmp.display())))?;
+        handle
+            .sync_all()
+            .map_err(|e| DurableError::Io(format!("sync {}: {e}", tmp.display())))?;
+        std::fs::rename(&tmp, file).map_err(|e| {
+            DurableError::Io(format!("rename {} to {}: {e}", tmp.display(), file.display()))
+        })?;
+        std::fs::File::open(dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| DurableError::Io(format!("sync dir {}: {e}", dir.display())))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 // ───────────────────────────── durable per-ref generation counter (R0.4 / git #1 HIGH) ───────────
 
 /// The git-config key holding the durable, monotonic generation of one ref (R0.4 / git #1 HIGH).
