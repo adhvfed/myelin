@@ -563,6 +563,81 @@ pub struct PrListSlice {
     pub has_more: bool,
 }
 
+/// Cross-repository inbox bucket selected by `/v1/git/prs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrListBucket {
+    Yours,
+    NeedsReview,
+}
+
+impl PrListBucket {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "yours" => Some(Self::Yours),
+            "needs-review" => Some(Self::NeedsReview),
+            _ => None,
+        }
+    }
+}
+
+/// Validated cross-repository bucket page request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrCrossListQuery {
+    pub bucket: PrListBucket,
+    pub sort: PrListSort,
+    pub offset: usize,
+    pub limit: usize,
+    pub viewer_pseudonym: String,
+}
+
+impl PrCrossListQuery {
+    pub fn new(
+        bucket: PrListBucket,
+        sort: PrListSort,
+        offset: usize,
+        limit: usize,
+        viewer_pseudonym: impl Into<String>,
+    ) -> Result<Self, DurableError> {
+        let query = Self {
+            bucket,
+            sort,
+            offset,
+            limit,
+            viewer_pseudonym: viewer_pseudonym.into(),
+        };
+        query.validate()?;
+        Ok(query)
+    }
+
+    pub fn validate(&self) -> Result<(), DurableError> {
+        if self.offset > PR_LIST_OFFSET_MAX {
+            return Err(DurableError::Git(format!(
+                "pull request page offset must be at most {PR_LIST_OFFSET_MAX}"
+            )));
+        }
+        if !(1..=PR_LIST_PAGE_MAX).contains(&self.limit) {
+            return Err(DurableError::Git(
+                "pull request page limit must be between 1 and 100".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrCrossListRecord {
+    pub repo_slug: String,
+    pub record: PrRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrCrossListSlice {
+    pub records: Vec<PrCrossListRecord>,
+    pub total: usize,
+    pub offset: usize,
+    pub has_more: bool,
+}
+
 // ───────────────────────────── the merge-gate evaluation (reused logic) ───────────────────────────
 
 /// The combined merge-gate decision over the repo-owned ruleset and durable PR facts. It combines

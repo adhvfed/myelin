@@ -60,8 +60,8 @@ use myelin_git::lifecycle::{
 use myelin_git::pg_pr_store::{PgPrStore, PrMutation, PrOperationId};
 use myelin_git::pr_store::{
     effective_ruleset, evaluate_merge, merge_pr, BranchProtectionConfig, ChecksSummary,
-    DurablePrStore, MergeAttempt, PrListCounts, PrListQuery, PrListSlice, PrListSort, PrListState,
-    PrRecord, ReviewRecord, PR_LIST_OFFSET_MAX,
+    DurablePrStore, MergeAttempt, PrCrossListQuery, PrCrossListRecord, PrListBucket, PrListCounts,
+    PrListQuery, PrListSlice, PrListSort, PrListState, PrRecord, ReviewRecord, PR_LIST_OFFSET_MAX,
 };
 use myelin_git::pr_threads::{
     AnchorSide, AnchorState, BatchVerdict, CommentRecord, CommentState, DurablePrThreadStore,
@@ -287,6 +287,14 @@ struct EnrichedPr {
 struct EnrichedPrSlice {
     rows: Vec<EnrichedPr>,
     counts: PrListCounts,
+    total: usize,
+    offset: usize,
+    limit: usize,
+    has_more: bool,
+}
+
+struct EnrichedCrossPrSlice {
+    rows: Vec<EnrichedPr>,
     total: usize,
     offset: usize,
     limit: usize,
@@ -1866,20 +1874,19 @@ impl DurableGitBackend {
     /// requested reviewer) is applied by the handler over this leak-free set. Per-repository reads
     /// and the request-wide record/serialized-byte aggregate are independently capped; below those
     /// ceilings the returned bucket remains exact.
-    fn list_prs_cross(
+    fn visible_pr_repo_slugs(
         &self,
         tenant: &str,
         region: &str,
         principal: &Principal,
-    ) -> Result<Vec<EnrichedPr>, DurableError> {
-        self.list_prs_cross_bounded(
-            tenant,
-            region,
-            principal,
-            CrossPrListLimits::production(),
-        )
+    ) -> Result<Vec<String>, DurableError> {
+        let candidates = self.scan_repo_slugs(tenant, region)?;
+        Ok(self
+            .repo_authz
+            .visible_repos(principal, tenant, region, &candidates))
     }
 
+    #[cfg(test)]
     fn list_prs_cross_bounded(
         &self,
         tenant: &str,
@@ -1887,16 +1894,24 @@ impl DurableGitBackend {
         principal: &Principal,
         limits: CrossPrListLimits,
     ) -> Result<Vec<EnrichedPr>, DurableError> {
-        let candidates = self.scan_repo_slugs(tenant, region)?;
-        let visible = self
-            .repo_authz
-            .visible_repos(principal, tenant, region, &candidates);
+        let visible = self.visible_pr_repo_slugs(tenant, region, principal)?;
+        self.list_visible_prs_cross_bounded(tenant, region, principal, &visible, limits)
+    }
+
+    fn list_visible_prs_cross_bounded(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal: &Principal,
+        visible: &[String],
+        limits: CrossPrListLimits,
+    ) -> Result<Vec<EnrichedPr>, DurableError> {
         let viewer = Self::pseudonym(tenant, principal);
         let mut out = Vec::new();
         let mut aggregate_records = 0usize;
         let mut aggregate_bytes = 0usize;
         for slug in visible {
-            let loc = Self::loc(tenant, region, &slug);
+            let loc = Self::loc(tenant, region, slug);
             self.store.open_repo(&loc)?;
             let records = self.pr_list(&loc, principal)?;
             aggregate_records = checked_cross_pr_list_total(
@@ -1912,9 +1927,121 @@ impl DurableGitBackend {
                 limits.maximum_bytes,
                 "cross-repository serialized bytes",
             )?;
-            out.extend(self.enrich_pr_records(&loc, &viewer, Some(&slug), records));
+            out.extend(self.enrich_pr_records(&loc, &viewer, Some(slug), records));
         }
         Ok(out)
+    }
+
+    fn enrich_cross_pr_records(
+        &self,
+        tenant: &str,
+        region: &str,
+        viewer: &str,
+        records: Vec<PrCrossListRecord>,
+    ) -> Vec<EnrichedPr> {
+        let mut configs = std::collections::BTreeMap::new();
+        for item in &records {
+            configs.entry(item.repo_slug.clone()).or_insert_with(|| {
+                self.prs
+                    .get_protection(&Self::loc(tenant, region, &item.repo_slug))
+                    .ok()
+            });
+        }
+        records
+            .into_iter()
+            .map(|item| {
+                let summary = match configs.get(&item.repo_slug) {
+                    Some(Some(config)) => {
+                        let ruleset = effective_ruleset(config.as_ref(), &item.record.base_ref);
+                        item.record.checks_summary(&ruleset)
+                    }
+                    _ => ChecksSummary::unavailable(),
+                };
+                let you_requested = item.record.is_review_requested_of(viewer);
+                EnrichedPr {
+                    rec: item.record,
+                    summary,
+                    you_requested,
+                    repo_slug: Some(item.repo_slug),
+                }
+            })
+            .collect()
+    }
+
+    fn list_prs_cross_page(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal: &Principal,
+        query: &PrCrossListQuery,
+    ) -> Result<EnrichedCrossPrSlice, DurableError> {
+        let visible = self.visible_pr_repo_slugs(tenant, region, principal)?;
+        if let Some(store) = &self.pg_prs {
+            let page = store.list_cross_page(
+                &Self::verified_pr_scope(principal, &Self::loc(tenant, region, "_visible"))?,
+                &visible,
+                query,
+            )?;
+            return Ok(EnrichedCrossPrSlice {
+                rows: self.enrich_cross_pr_records(
+                    tenant,
+                    region,
+                    &query.viewer_pseudonym,
+                    page.records,
+                ),
+                total: page.total,
+                offset: page.offset,
+                limit: query.limit,
+                has_more: page.has_more,
+            });
+        }
+
+        let mut rows = self.list_visible_prs_cross_bounded(
+            tenant,
+            region,
+            principal,
+            &visible,
+            CrossPrListLimits::production(),
+        )?;
+        rows.retain(|item| match query.bucket {
+            PrListBucket::Yours => item.rec.author_pseudonym == query.viewer_pseudonym,
+            PrListBucket::NeedsReview => {
+                item.you_requested
+                    && item.rec.author_pseudonym != query.viewer_pseudonym
+                    && matches!(item.rec.state, PrState::Open | PrState::Draft)
+            }
+        });
+        match query.sort {
+            PrListSort::Created => rows.sort_by(|a, b| {
+                b.rec.number.cmp(&a.rec.number).then(
+                    a.repo_slug
+                        .as_deref()
+                        .cmp(&b.repo_slug.as_deref()),
+                )
+            }),
+            PrListSort::Updated => rows.sort_by(|a, b| {
+                b.rec
+                    .updated_at
+                    .cmp(&a.rec.updated_at)
+                    .then(b.rec.number.cmp(&a.rec.number))
+                    .then(a.repo_slug.as_deref().cmp(&b.repo_slug.as_deref()))
+            }),
+        }
+        let total = rows.len();
+        let mut rows: Vec<_> = rows
+            .into_iter()
+            .skip(query.offset)
+            .take(query.limit.saturating_add(1))
+            .collect();
+        let has_more = rows.len() > query.limit;
+        rows.truncate(query.limit);
+        Ok(EnrichedCrossPrSlice {
+            rows,
+            total,
+            offset: query.offset,
+            limit: query.limit,
+            has_more,
+        })
     }
 
     /// The stable state token for a PR (matches [`Self::pr_json`]).
@@ -3347,6 +3474,90 @@ fn repo_pr_list_query(
     }
     PrListQuery::new(
         state.unwrap_or(PrListState::Open),
+        sort.unwrap_or(PrListSort::Updated),
+        cursor.unwrap_or(0),
+        limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+        viewer_pseudonym,
+    )
+    .map_err(|_| EdgeError::BadRequest("invalid pull request page".into()))
+}
+
+fn cross_pr_list_query(
+    ctx: &HandlerCtx<'_>,
+    viewer_pseudonym: String,
+) -> Result<PrCrossListQuery, EdgeError> {
+    if ctx.request.query.len() > PR_LIST_QUERY_MAX_BYTES {
+        return Err(EdgeError::BadRequest(
+            "pull request list query is too large".into(),
+        ));
+    }
+    let mut bucket = None;
+    let mut sort = None;
+    let mut cursor = None;
+    let mut limit = None;
+    if !ctx.request.query.is_empty() {
+        for pair in ctx.request.query.split('&') {
+            let (raw_name, raw_value) = pair.split_once('=').ok_or_else(|| {
+                EdgeError::BadRequest("pull request list query is malformed".into())
+            })?;
+            let name = decode_pr_list_query_component(raw_name)?;
+            let value = decode_pr_list_query_component(raw_value)?;
+            let duplicate = |field: &str| {
+                EdgeError::BadRequest(format!(
+                    "duplicate pull request list query parameter `{field}`"
+                ))
+            };
+            match name.as_str() {
+                "bucket" => {
+                    if bucket.is_some() {
+                        return Err(duplicate("bucket"));
+                    }
+                    bucket = Some(PrListBucket::parse(&value).ok_or_else(|| {
+                        EdgeError::BadRequest("invalid pull request bucket".into())
+                    })?);
+                }
+                "sort" => {
+                    if sort.is_some() {
+                        return Err(duplicate("sort"));
+                    }
+                    sort = Some(PrListSort::parse(&value).ok_or_else(|| {
+                        EdgeError::BadRequest("invalid pull request sort".into())
+                    })?);
+                }
+                "cursor" => {
+                    if cursor.is_some() {
+                        return Err(duplicate("cursor"));
+                    }
+                    let parsed = value.parse::<usize>().ok().filter(|parsed| {
+                        value == parsed.to_string() && *parsed <= PR_LIST_OFFSET_MAX
+                    });
+                    cursor = Some(parsed.ok_or_else(|| {
+                        EdgeError::BadRequest("invalid pull request cursor".into())
+                    })?);
+                }
+                "limit" => {
+                    if limit.is_some() {
+                        return Err(duplicate("limit"));
+                    }
+                    let parsed = value.parse::<usize>().ok().filter(|parsed| {
+                        value == parsed.to_string() && (1..=MAX_PAGE_LIMIT).contains(parsed)
+                    });
+                    limit = Some(parsed.ok_or_else(|| {
+                        EdgeError::BadRequest(format!(
+                            "pull request list limit must be canonical and within 1..={MAX_PAGE_LIMIT}"
+                        ))
+                    })?);
+                }
+                _ => {
+                    return Err(EdgeError::BadRequest(format!(
+                        "unknown pull request list query parameter `{name}`"
+                    )))
+                }
+            }
+        }
+    }
+    PrCrossListQuery::new(
+        bucket.unwrap_or(PrListBucket::NeedsReview),
         sort.unwrap_or(PrListSort::Updated),
         cursor.unwrap_or(0),
         limit.unwrap_or(DEFAULT_PAGE_LIMIT),
@@ -6291,61 +6502,24 @@ impl Handler for DPrChecks {
     }
 }
 
-/// Build the R3.1 PR-list envelope: sort newest-first, paginate over an offset cursor (with BOTH
-/// `next_cursor` and `prev_cursor` — the bidirectional pager, fixes ux-git #12), and attach `counts`
-/// (computed over the ALREADY-leak-free `enriched` set — a forbidden PR never reached it, the anti-
-/// oracle rule). `enriched` is the prefiltered+bucketed set; `counts` is the caller-supplied tally.
-fn pr_list_envelope(mut enriched: Vec<EnrichedPr>, ctx: &HandlerCtx<'_>, counts: Value) -> Value {
-    let sort = ctx.request.query_param("sort");
-    // Newest-first. `sort=created` orders by the monotonic PR number (a create-order proxy — the
-    // record has no created_at); the default `sort=updated` orders by the durable updated stamp,
-    // tie-broken by number so the order is total + stable (cursor stability).
-    match sort.as_deref() {
-        Some("created") => enriched.sort_by_key(|item| std::cmp::Reverse(item.rec.number)),
-        _ => enriched.sort_by(|a, b| {
-            b.rec
-                .updated_at
-                .cmp(&a.rec.updated_at)
-                .then(b.rec.number.cmp(&a.rec.number))
-        }),
-    }
-    let total = enriched.len();
-    let offset = ctx
-        .page
-        .cursor
-        .as_deref()
-        .and_then(|c| c.parse::<usize>().ok())
-        .unwrap_or(0);
-    let limit = ctx.page.limit;
-    let items: Vec<Value> = enriched
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .map(DurableGitBackend::pr_list_row_json)
-        .collect();
-    // saturating: `cursor` is attacker-supplied; usize::MAX must yield an empty page, never
-    // an add-overflow panic (verifier finding, R3.1).
-    let next_cursor = if offset.saturating_add(limit) < total {
-        Some(offset.saturating_add(limit).to_string())
-    } else {
-        None
-    };
-    // `prev_cursor` is `None` at the head (the "Newer" control is aria-disabled, not removed).
-    let prev_cursor = if offset > 0 {
-        Some(offset.saturating_sub(limit).to_string())
-    } else {
-        None
-    };
+fn cross_pr_list_envelope(page: EnrichedCrossPrSlice) -> Value {
+    let next_cursor = page
+        .offset
+        .checked_add(page.limit)
+        .filter(|offset| page.has_more && *offset <= PR_LIST_OFFSET_MAX)
+        .map(|offset| offset.to_string());
+    let prev_cursor =
+        (page.offset > 0).then(|| page.offset.saturating_sub(page.limit).to_string());
     json!({
-        "items": items,
+        "items": page.rows.iter().map(DurableGitBackend::pr_list_row_json).collect::<Vec<_>>(),
         "page": {
             "next_cursor": next_cursor,
             "prev_cursor": prev_cursor,
-            "limit": limit,
-            "offset": offset,
-            "total": total,
+            "limit": page.limit,
+            "offset": page.offset,
+            "total": page.total,
         },
-        "counts": counts,
+        "counts": { "bucket": page.total },
     })
 }
 
@@ -6414,28 +6588,13 @@ struct DMyPrs {
 }
 impl Handler for DMyPrs {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let all = self
-            .be
-            .list_prs_cross(tenant_of(ctx), region_of(ctx), ctx.principal)
-            .map_err(map_durable_err)?;
         let viewer = DurableGitBackend::pseudonym(tenant_of(ctx), ctx.principal);
-        let bucket = ctx.request.query_param("bucket");
-        let in_bucket = |e: &EnrichedPr| match bucket.as_deref().unwrap_or("needs-review") {
-            "yours" => e.rec.author_pseudonym == viewer,
-            // "needs-review" (default): the viewer is a requested reviewer AND not the author (you
-            // do not review your own PR). Closed/merged PRs never need review.
-            _ => {
-                e.you_requested
-                    && e.rec.author_pseudonym != viewer
-                    && matches!(e.rec.state, PrState::Open | PrState::Draft)
-            }
-        };
-        let bucketed: Vec<EnrichedPr> = all.into_iter().filter(|e| in_bucket(e)).collect();
-        let counts = json!({ "bucket": bucketed.len() });
-        Ok(EdgeResponse::json(
-            200,
-            &pr_list_envelope(bucketed, ctx, counts),
-        ))
+        let query = cross_pr_list_query(ctx, viewer)?;
+        let page = self
+            .be
+            .list_prs_cross_page(tenant_of(ctx), region_of(ctx), ctx.principal, &query)
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(200, &cross_pr_list_envelope(page)))
     }
 }
 
@@ -8033,6 +8192,86 @@ mod pr_list_tests {
         // The count is over the leak-free set — beta's PR never contributes.
         assert_eq!(body["counts"]["bucket"], 1);
         assert_eq!(body["page"]["total"], 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cross_repo_query_is_strict_and_fs_order_has_repo_tie_breaker() {
+        let root = temp_root("cross-strict-query");
+        let viewer = human("u:viewer");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root);
+        open_pr(&be, "beta", "Beta", &viewer);
+        open_pr(&be, "alpha", "Alpha", &viewer);
+        let authz = GrantBackedRepos::new()
+            .grant_read("u:viewer", TENANT, "alpha")
+            .grant_read("u:viewer", TENANT, "beta");
+        let handler = DMyPrs {
+            be: Arc::new(be.with_repo_authorizer(Arc::new(authz))),
+        };
+        for query in [
+            "bucket=unknown",
+            "bucket=yours&bucket=needs-review",
+            "sort=oldest",
+            "sort=updated&sort=created",
+            "cursor=01",
+            "cursor=10001",
+            "cursor=1&cursor=2",
+            "limit=0",
+            "limit=01",
+            "limit=101",
+            "limit=1&limit=2",
+            "unknown=value",
+            "limit",
+            "limit=%ZZ",
+        ] {
+            assert!(matches!(
+                serve_result(&handler, &viewer, None, query),
+                Err(EdgeError::BadRequest(_))
+            ));
+        }
+
+        let first = serve(
+            &handler,
+            &viewer,
+            None,
+            "bucket=yours&sort=created&limit=1",
+        );
+        assert_eq!(first["counts"]["bucket"], 2);
+        assert_eq!(first["items"][0]["repo"], "alpha");
+        assert_eq!(first["page"]["next_cursor"], "1");
+        let second = serve(
+            &handler,
+            &viewer,
+            None,
+            "bucket=yours&sort=created&limit=1&cursor=1",
+        );
+        assert_eq!(second["items"][0]["repo"], "beta");
+        assert!(second["page"]["next_cursor"].is_null());
+
+        let capped = cross_pr_list_envelope(EnrichedCrossPrSlice {
+            rows: Vec::new(),
+            total: PR_LIST_OFFSET_MAX + 1,
+            offset: PR_LIST_OFFSET_MAX,
+            limit: 100,
+            has_more: true,
+        });
+        assert!(capped["page"]["next_cursor"].is_null());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn empty_visible_cross_repo_set_is_exact_empty() {
+        let root = temp_root("cross-empty-visible");
+        let viewer = human("u:viewer");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root);
+        open_pr(&be, "hidden", "Hidden", &viewer);
+        let handler = DMyPrs {
+            be: Arc::new(be.with_repo_authorizer(Arc::new(GrantBackedRepos::new()))),
+        };
+        let body = serve(&handler, &viewer, None, "bucket=yours");
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert_eq!(body["counts"]["bucket"], 0);
+        assert_eq!(body["page"]["total"], 0);
         std::fs::remove_dir_all(&root).ok();
     }
 
