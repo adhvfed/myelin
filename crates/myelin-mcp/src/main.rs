@@ -470,6 +470,7 @@ async fn serve(core: Core) -> Result<(), String> {
     let backend = Arc::new(
         DurableGitBackend::rooted(
             git_root,
+            String::new(),
             core.provider.clone(),
             core.kms.clone(),
             core.handle.clone(),

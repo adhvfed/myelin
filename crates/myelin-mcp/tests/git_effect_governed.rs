@@ -467,6 +467,7 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
     let backend = Arc::new(
         DurableGitBackend::rooted(
             &root,
+            String::new(),
             provider,
             Arc::new(KmsEngine::new()),
             handle,

@@ -268,6 +268,12 @@ fn validated_public_base_url(value: Result<String, VarError>) -> Result<String, 
     if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
         return Err("MYELIN_PUBLIC_BASE_URL must be an absolute HTTP(S) URL".into());
     }
+    if uri
+        .authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+    {
+        return Err("MYELIN_PUBLIC_BASE_URL must not contain credentials".into());
+    }
     if uri.query().is_some() {
         return Err("MYELIN_PUBLIC_BASE_URL must not contain a query string".into());
     }
@@ -741,6 +747,7 @@ async fn serve(
     let git_backend = Arc::new(
         DurableGitBackend::rooted(
             git_root,
+            public_base_url.clone(),
             provider.clone(),
             kms.clone(),
             handle.clone(),
@@ -1128,6 +1135,11 @@ mod runtime_config_tests {
             validated_public_base_url(Ok("https://myelin.example/?tenant=acme".into()))
                 .unwrap_err(),
             "MYELIN_PUBLIC_BASE_URL must not contain a query string"
+        );
+        assert_eq!(
+            validated_public_base_url(Ok("https://operator:secret@myelin.example".into()))
+                .unwrap_err(),
+            "MYELIN_PUBLIC_BASE_URL must not contain credentials"
         );
     }
 

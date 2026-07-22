@@ -426,6 +426,9 @@ impl GatewayBuilder {
         assert!(
             matches!(uri.scheme_str(), Some("http" | "https"))
                 && uri.authority().is_some()
+                && !uri
+                    .authority()
+                    .is_some_and(|authority| authority.as_str().contains('@'))
                 && uri.query().is_none(),
             "public base URL must be an absolute, query-free HTTP(S) URL"
         );
