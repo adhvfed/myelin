@@ -596,7 +596,9 @@ impl DurableGitRepo {
         for r in refs {
             let r = r.map_err(|e| git_err("reference iter", e))?;
             if let Some(oid) = r.target() {
-                let name = r.name().unwrap_or_default();
+                let name = r.name().map_err(|_| {
+                    DurableError::Git("reference name is not valid UTF-8".into())
+                })?;
                 out.push((name.to_string(), Oid::new(oid.to_string())));
             }
         }
@@ -755,20 +757,19 @@ impl DurableGitRepo {
             } else {
                 Some(Oid::new(old.to_string()))
             };
+            let signature = entry.committer();
+            let committer = signature.name().map_err(|_| {
+                DurableError::Git(format!("reflog {name} committer is not valid UTF-8"))
+            })?;
+            let message = entry
+                .message()
+                .map_err(|e| git_err(&format!("read reflog message for {name}"), e))?
+                .unwrap_or_default();
             out.push(DurableReflogEntry {
                 old_oid,
                 new_oid: Oid::new(entry.id_new().to_string()),
-                committer: entry
-                    .committer()
-                    .name()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default(),
-                message: entry
-                    .message()
-                    .ok()
-                    .flatten()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default(),
+                committer: committer.to_string(),
+                message: message.to_string(),
             });
         }
         Ok(out)
@@ -861,7 +862,10 @@ impl DurableGitRepo {
         let mut out = Vec::new();
         for entry in tree.iter() {
             let is_dir = matches!(entry.kind(), Some(git2::ObjectType::Tree));
-            out.push((entry.name().unwrap_or_default().to_string(), is_dir));
+            let name = entry.name().map_err(|_| {
+                DurableError::Git("tree entry name is not valid UTF-8".into())
+            })?;
+            out.push((name.to_string(), is_dir));
         }
         out.sort();
         Ok(out)
@@ -917,13 +921,16 @@ impl DurableGitRepo {
             let size = if is_dir {
                 None
             } else {
-                entry
+                let object = entry
                     .to_object(&repo)
-                    .ok()
-                    .and_then(|o| o.as_blob().map(|b| b.size() as u64))
+                    .map_err(|e| git_err("tree entry object", e))?;
+                object.as_blob().map(|blob| blob.size() as u64)
             };
+            let name = entry.name().map_err(|_| {
+                DurableError::Git("tree entry name is not valid UTF-8".into())
+            })?;
             out.push(TreeEntryInfo {
-                name: entry.name().unwrap_or_default().to_string(),
+                name: name.to_string(),
                 is_dir,
                 size,
             });
@@ -2561,6 +2568,38 @@ mod tests {
         assert_eq!(
             repo.ref_generation(ref_name),
             Err(DurableError::Git(format!("negative ref generation stored for {ref_name}")))
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reflog_entries_reject_non_utf8_audit_identity() {
+        let root = temp_root("reflog-identity-corrupt");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let commit = seed_commit(&repo, b"audit\n");
+        let pseudonym = b"psn@acme.noreply";
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&commit),
+            "create",
+            std::str::from_utf8(pseudonym).unwrap(),
+        )
+        .expect("create ref");
+
+        let path = repo.path().join("logs/refs/heads/main");
+        let mut bytes = std::fs::read(&path).expect("read reflog fixture");
+        let offset = bytes
+            .windows(pseudonym.len())
+            .position(|window| window == pseudonym)
+            .expect("pseudonym recorded in reflog");
+        bytes[offset] = 0xff;
+        std::fs::write(&path, bytes).expect("corrupt reflog identity fixture");
+
+        assert!(
+            matches!(repo.reflog_entries("refs/heads/main"), Err(DurableError::Git(_))),
+            "invalid audit identity bytes must not become an empty committer"
         );
         std::fs::remove_dir_all(&root).ok();
     }
