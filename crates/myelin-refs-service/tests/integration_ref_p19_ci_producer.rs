@@ -98,9 +98,9 @@ impl StepAnchorResolver for CiLogStepSeam {
                 byte_len: bytes.len() as u64,
             },
             // An unknown step / a pruned run → GONE (the root run still resolves).
-            Err(CiLogError::UnknownStep { .. }) | Err(CiLogError::MalformedAnchor(_)) => {
-                StepResolution::Gone
-            }
+            Err(CiLogError::UnknownStep { .. })
+            | Err(CiLogError::MalformedAnchor(_))
+            | Err(CiLogError::LimitExceeded(_)) => StepResolution::Gone,
             // A crypto-shredded segment (the DEK destroyed) or a corrupt index → ERASED/Gone. A shred
             // surfaces as an archive error; the catch_unwind in the shred test below proves the LOUD
             // refusal. Here a clean archive error maps to GONE (never a wrong serve).
