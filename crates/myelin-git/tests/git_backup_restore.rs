@@ -206,11 +206,14 @@ fn a_failed_restore_does_not_poison_the_target() {
     let want = seed_history(&src_repo, "acme");
     let good = GitRepoBackup::create(&src_repo).unwrap();
 
-    // A CORRUPT artifact: the frame is valid (deserialize succeeds) but the pack's trailing SHA byte
-    // is flipped, so libgit2's pack indexer rejects it at ingest (a real hard-verify, not a guess).
+    // A CORRUPT artifact: flip the pack's trailing SHA byte, then recompute the outer v2 artifact
+    // checksum. The frame remains valid (deserialize succeeds), while libgit2's pack indexer rejects
+    // the corrupted pack at ingest (a real hard-verify, not a guess).
     let mut bytes = good.serialize();
-    let last = bytes.len() - 1;
-    bytes[last] ^= 0xFF;
+    let frame_len = bytes.len() - blake3::OUT_LEN;
+    bytes[frame_len - 1] ^= 0xFF;
+    let checksum = blake3::hash(&bytes[..frame_len]);
+    bytes[frame_len..].copy_from_slice(checksum.as_bytes());
     let corrupt = GitRepoBackup::deserialize(&bytes).expect("frame valid; pack corrupt");
 
     let dst_root = temp_root("retry-dst");
