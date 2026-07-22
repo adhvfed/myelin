@@ -5,6 +5,7 @@ import { createMiddleware } from "@solidjs/start/middleware";
 import { requestMethodPolicy, sameOriginVerdict } from "~/lib/csrf";
 import { securityHeaders } from "~/lib/security-headers";
 import { transportVerdict } from "~/lib/transport-security";
+import { boundMutationRequest } from "~/server/bounded-request";
 import { canonicalPublicOrigin } from "~/server/public-origin";
 
 const production = process.env.NODE_ENV === "production";
@@ -19,7 +20,7 @@ function applySecurityHeaders(headers: Headers, nonce: string): void {
 }
 
 export default createMiddleware({
-  onRequest: (event) => {
+  onRequest: async (event) => {
     const nonce = randomBytes(16).toString("base64");
     event.locals.cspNonce = nonce;
     applySecurityHeaders(event.response.headers, nonce);
@@ -75,6 +76,10 @@ export default createMiddleware({
         });
       }
     }
+
+    const bounded = await boundMutationRequest(event.request);
+    if (!bounded.ok) return bounded.response;
+    event.request = bounded.request;
   },
   onBeforeResponse: (event) => {
     const nonce = event.locals.cspNonce;
