@@ -1302,9 +1302,9 @@ impl DurableGitBackend {
     }
 
     fn next_pr_number(&self, loc: &RepoLoc) -> Result<u64, DurableError> {
-        // Peer-review finding #3: allocate from the FILENAME-authoritative max (not `list()`, which is a
-        // tolerant view that skips a corrupt record — deriving the next number from it would REUSE a
-        // corrupt highest PR's number and overwrite its file). A corrupt record still counts here.
+        // Peer-review finding #3: allocate from the FILENAME-authoritative max, independently of
+        // parsing the list. A corrupt highest PR record makes list fail loud but its occupied filename
+        // still counts here, so allocation can never reuse and overwrite it.
         // The directory read is authoritative too: an I/O fault must abort allocation, never reset it
         // to #1. Exhausting the u64 namespace is likewise a loud refusal, not a wrap to zero.
         Self::next_pr_number_after(self.prs.max_pr_number(loc)?)
