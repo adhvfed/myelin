@@ -7,7 +7,7 @@ import { edgeOrigin } from "./edge-origin";
  * would otherwise strand a partial 200. */
 export default function validateRuntimeConfig(): void {
   const production = process.env.NODE_ENV === "production";
-  sessionBackend(production, process.env.REDIS_URL);
+  sessionBackend(production, process.env.REDIS_URL, process.env.MYELIN_WEB_SESSION_KEY);
   edgeOrigin();
   if (production || process.env.MYELIN_PUBLIC_ORIGIN?.trim()) {
     canonicalPublicOrigin({

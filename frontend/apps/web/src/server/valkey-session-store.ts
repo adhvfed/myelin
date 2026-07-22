@@ -8,6 +8,7 @@ import {
   type SessionRecord,
   type SessionStore,
 } from "./session-store";
+import { SessionCipher } from "./session-cipher";
 
 export const SESSION_KEY_PREFIX = "myelin:web-session:v1:";
 
@@ -15,12 +16,7 @@ const VALID_SESSION_LUA = `
 local function valid_record(record)
   return type(record) == "table"
     and type(record.token) == "string"
-    and type(record.refreshToken) == "string"
-    and type(record.scheme) == "string"
-    and type(record.principalId) == "string"
-    and type(record.displayName) == "string"
-    and type(record.region) == "string"
-    and type(record.tenant) == "string"
+    and type(record.sealed) == "string"
 end
 local function valid_session(session)
   return type(session) == "table"
@@ -113,25 +109,29 @@ if not decoded or type(value) ~= "table" or value.checkedAt ~= clock[1] then ret
 return 1
 `;
 
+type StoredRecord = { token: string; sealed: string };
+
+function validStoredRecord(value: unknown): value is StoredRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.token === "string" && typeof record.sealed === "string";
+}
+
 function validRecord(value: unknown): value is SessionRecord {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
-  return [
-    "token",
-    "refreshToken",
-    "scheme",
-    "principalId",
-    "displayName",
-    "region",
-    "tenant",
-  ].every((field) => typeof record[field] === "string");
+  return ["token", "refreshToken", "scheme", "principalId", "displayName", "region", "tenant"].every(
+    (field) => typeof record[field] === "string",
+  );
 }
 
 export class ValkeySessionStore implements SessionStore {
   readonly #redis: Redis;
+  readonly #cipher: SessionCipher;
   #outageReported = false;
 
-  constructor(url: string) {
+  constructor(url: string, encryptionKey: string | undefined) {
+    this.#cipher = new SessionCipher(encryptionKey);
     this.#redis = new Redis(url, {
       connectTimeout: 5_000,
       maxRetriesPerRequest: 1,
@@ -154,7 +154,7 @@ export class ValkeySessionStore implements SessionStore {
       ISSUE_SCRIPT,
       1,
       this.#key(id),
-      JSON.stringify(record),
+      JSON.stringify(this.#seal(id, record)),
       SESSION_ABSOLUTE_TTL_MS,
       Math.min(SESSION_IDLE_TTL_MS, SESSION_ABSOLUTE_TTL_MS),
     );
@@ -166,7 +166,7 @@ export class ValkeySessionStore implements SessionStore {
       2,
       this.#key(id),
       this.#key(priorId),
-      JSON.stringify(record),
+      JSON.stringify(this.#seal(id, record)),
       SESSION_ABSOLUTE_TTL_MS,
       Math.min(SESSION_IDLE_TTL_MS, SESSION_ABSOLUTE_TTL_MS),
     );
@@ -182,7 +182,7 @@ export class ValkeySessionStore implements SessionStore {
     if (typeof raw !== "string") return null;
     try {
       const record: unknown = JSON.parse(raw);
-      if (validRecord(record)) return record;
+      if (validStoredRecord(record)) return this.#open(id, record);
     } catch {
       // Corrupt session data is authentication failure, never a partially trusted record.
     }
@@ -195,7 +195,7 @@ export class ValkeySessionStore implements SessionStore {
       UPDATE_TOKEN_SCRIPT,
       1,
       this.#key(id),
-      token,
+      this.#cipher.encrypt(id, "token", token),
       SESSION_IDLE_TTL_MS,
     );
     return updated === 1;
@@ -217,5 +217,33 @@ export class ValkeySessionStore implements SessionStore {
 
   #key(id: string): string {
     return `${SESSION_KEY_PREFIX}${id}`;
+  }
+
+  #seal(id: string, record: SessionRecord): StoredRecord {
+    const { token, ...rest } = record;
+    return {
+      token: this.#cipher.encrypt(id, "token", token),
+      sealed: this.#cipher.encrypt(id, "record", JSON.stringify(rest)),
+    };
+  }
+
+  #open(id: string, record: StoredRecord): SessionRecord {
+    const rest: unknown = JSON.parse(this.#cipher.decrypt(id, "record", record.sealed));
+    const opened = {
+      ...(rest as Omit<SessionRecord, "token">),
+      token: this.#cipher.decrypt(id, "token", record.token),
+    };
+    if (!validRecord(opened)) throw new Error("stored session record has an invalid shape");
+    // Project only the declared fields even after authenticated decryption; future schema fields or
+    // a mistakenly sealed extra property must not flow into request-local identity objects.
+    return {
+      token: opened.token,
+      refreshToken: opened.refreshToken,
+      scheme: opened.scheme,
+      principalId: opened.principalId,
+      displayName: opened.displayName,
+      region: opened.region,
+      tenant: opened.tenant,
+    };
   }
 }

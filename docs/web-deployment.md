@@ -15,15 +15,19 @@ Create a root-readable deployment environment file outside the repository:
 
 ```dotenv
 REDIS_URL=rediss://user:password@valkey.internal:6380/0
+MYELIN_WEB_SESSION_KEY=<32-random-bytes-as-base64url>
 MYELIN_PUBLIC_ORIGIN=https://myelin.example
 MYELIN_EDGE_URL=http://edge.internal:8080
 MYELIN_HSTS=1
 ```
 
-`REDIS_URL`, `MYELIN_PUBLIC_ORIGIN`, and `MYELIN_EDGE_URL` are mandatory. The public origin must be
-HTTPS; the Valkey connection must use TLS; and the edge value must be a credential-free HTTP(S)
-origin on the private service network. Enable HSTS only after the public hostname is permanently
-HTTPS.
+`REDIS_URL`, `MYELIN_WEB_SESSION_KEY`, `MYELIN_PUBLIC_ORIGIN`, and `MYELIN_EDGE_URL` are mandatory.
+Generate the session key once with `node -p "require('crypto').randomBytes(32).toString('base64url')"`
+and inject the same secret into every web replica. It encrypts and authenticates the complete trusted
+session record at rest with AES-256-GCM; changing it intentionally invalidates all existing browser
+sessions. The public origin must be HTTPS; the Valkey connection must use TLS; and the edge value must
+be a credential-free HTTP(S) origin on the private service network. Enable HSTS only after the public
+hostname is permanently HTTPS.
 
 Run the listener on a private host binding behind the TLS ingress:
 
