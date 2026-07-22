@@ -64,6 +64,7 @@ describe("parsePrMutation", () => {
     { op: "comment", repo: "core", n: 1, threadId: "r-1", body_md: "x" },
     { op: "review-discard", repo: "core", n: 1, reviewId: "t-1" },
     { op: "review-submit", repo: "core", n: 1, reviewId: "r-1", verdict: "dismissed" },
+    { op: "thread", repo: "core", n: 1, body_md: "x", anchor: { path: "src/x", line: 1 } },
     { op: "thread", repo: "core", n: 1, body_md: " ", anchor: { path: "src/x", line: 1 } },
     { op: "thread", repo: "core", n: 1, body_md: "x", anchor: { path: "../secret", line: 1 } },
     { op: "thread", repo: "core", n: 1, body_md: "x", anchor: { path: "src/x", line: -1 } },
