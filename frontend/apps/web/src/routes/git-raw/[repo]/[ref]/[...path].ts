@@ -24,6 +24,11 @@ export async function GET(event: APIEvent) {
 
   try {
     const res = await edgeGetRaw(edgePath);
+    if (res.status < 200 || res.status >= 300) {
+      await res.body.cancel().catch(() => undefined);
+      const status = res.status >= 400 && res.status <= 599 ? res.status : 502;
+      return new Response(status === 404 ? "not found" : "could not load file", { status });
+    }
     const headers = rawResponseHeaders({ attachment, contentType: res.contentType, path });
     return new Response(res.body, { status: res.status, headers });
   } catch (e) {
