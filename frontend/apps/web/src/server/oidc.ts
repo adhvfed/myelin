@@ -5,7 +5,11 @@ import { deleteCookie, getCookie, setCookie } from "vinxi/http";
 import { edgeLoginWithOidc, edgeWhoamiWithToken } from "./gateway";
 import { oidcClientConfig, type OidcClientConfig } from "./oidc-config";
 import { oidcAuthorizationUrl, oidcClientAuthorization } from "./oidc-core";
-import { runOidcCallback } from "./oidc-callback-core";
+import {
+  matchesOidcStateCookie,
+  oidcStateCookieName,
+  runOidcCallback,
+} from "./oidc-callback-core";
 import {
   MemoryOidcTransactionStore,
   type OidcTransactionStore,
@@ -17,7 +21,9 @@ import { sessionBackend } from "./session-backend";
 const MAX_TOKEN_RESPONSE_BYTES = 64 * 1024;
 const OIDC_TIMEOUT_MS = 15_000;
 const production = process.env.NODE_ENV === "production";
-const stateCookie = production ? "__Host-myelin_oidc_state" : "myelin_oidc_state";
+// One host-only cookie per transaction keeps concurrent tabs independent. The callback state selects
+// exactly one cookie, so an unsolicited or malformed callback cannot erase another login attempt.
+const stateCookiePrefix = production ? "__Host-myelin_oidc_state_" : "myelin_oidc_state_";
 
 const globalStore = globalThis as unknown as {
   __myelinOidcTransactionStore?: OidcTransactionStore;
@@ -70,18 +76,24 @@ export async function beginOidcLogin(): Promise<string> {
   }
   if (!issued) throw new Error("could not allocate an OIDC transaction");
 
-  setCookie(stateCookie, state, {
+  const cookieName = oidcStateCookieName(stateCookiePrefix, state);
+  if (!cookieName) throw new Error("generated OIDC state has an invalid shape");
+  setStateCookie(cookieName, state);
+  return oidcAuthorizationUrl(oidc, state, nonce, codeVerifier);
+}
+
+function setStateCookie(name: string, value: string): void {
+  setCookie(name, value, {
     httpOnly: true,
     sameSite: "lax",
     secure: production,
     path: "/",
     maxAge: 10 * 60,
   });
-  return oidcAuthorizationUrl(oidc, state, nonce, codeVerifier);
 }
 
-function clearStateCookie(): void {
-  deleteCookie(stateCookie, {
+function clearStateCookie(name: string): void {
+  deleteCookie(name, {
     httpOnly: true,
     sameSite: "lax",
     secure: production,
@@ -162,12 +174,17 @@ async function exchangeCode(
 export async function completeOidcLogin(requestUrl: string): Promise<boolean> {
   const oidc = config();
   const callback = new URL(requestUrl);
-  const cookieState = getCookie(stateCookie) ?? "";
-  clearStateCookie();
   if (!oidc) return false;
+  const states = callback.searchParams.getAll("state");
+  const state = states.length === 1 ? states[0]! : "";
+  const cookieName = oidcStateCookieName(stateCookiePrefix, state);
+  if (!cookieName) return false;
+  const cookieState = getCookie(cookieName) ?? "";
+  if (!matchesOidcStateCookie(state, cookieState)) return false;
+  clearStateCookie(cookieName);
   return runOidcCallback(
     {
-      states: callback.searchParams.getAll("state"),
+      states,
       codes: callback.searchParams.getAll("code"),
       cookieState,
       providerError: callback.searchParams.has("error"),

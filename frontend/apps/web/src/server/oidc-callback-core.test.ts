@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { runOidcCallback } from "./oidc-callback-core";
+import {
+  matchesOidcStateCookie,
+  oidcStateCookieName,
+  runOidcCallback,
+} from "./oidc-callback-core";
 
 const state = "A".repeat(43);
 const redirectUri = "https://myelin.example/auth/oidc/callback";
@@ -37,13 +41,26 @@ describe("runOidcCallback", () => {
 
   it.each([
     { states: [state, state], codes: ["code"], cookieState: state, providerError: false },
-    { states: [state], codes: ["code", "code"], cookieState: state, providerError: false },
     { states: [state], codes: ["code"], cookieState: "B".repeat(43), providerError: false },
-    { states: [state], codes: ["code"], cookieState: state, providerError: true },
-  ])("rejects ambiguous, mismatched, or provider-error callbacks before consumption", async (input) => {
+  ])("rejects ambiguous or mismatched callbacks before consumption", async (input) => {
     const deps = dependencies();
     expect(await runOidcCallback({ ...input, redirectUri }, deps)).toBe(false);
     expect(deps.consume).not.toHaveBeenCalled();
+    expect(deps.exchange).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { codes: ["code", "code"], providerError: false },
+    { codes: ["code"], providerError: true },
+  ])("consumes a matched transaction before rejecting a provider or code error", async (over) => {
+    const deps = dependencies();
+    expect(await runOidcCallback({
+      states: [state],
+      cookieState: state,
+      redirectUri,
+      ...over,
+    }, deps)).toBe(false);
+    expect(deps.consume).toHaveBeenCalledWith(state);
     expect(deps.exchange).not.toHaveBeenCalled();
   });
 
@@ -58,5 +75,21 @@ describe("runOidcCallback", () => {
       redirectUri,
     }, deps)).toBe(false);
     expect(deps.exchange).not.toHaveBeenCalled();
+  });
+
+  it("uses an independent host cookie for every concurrent transaction", () => {
+    const otherState = "B".repeat(43);
+    expect(oidcStateCookieName("__Host-myelin_oidc_state_", state)).toBe(
+      `__Host-myelin_oidc_state_${state}`,
+    );
+    expect(oidcStateCookieName("__Host-myelin_oidc_state_", otherState)).not.toBe(
+      oidcStateCookieName("__Host-myelin_oidc_state_", state),
+    );
+  });
+
+  it("rejects malformed cookie names and mismatched state values", () => {
+    expect(oidcStateCookieName("prefix_", "short")).toBeNull();
+    expect(matchesOidcStateCookie(state, state)).toBe(true);
+    expect(matchesOidcStateCookie(state, "B".repeat(43))).toBe(false);
   });
 });
