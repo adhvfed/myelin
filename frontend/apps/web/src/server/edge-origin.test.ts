@@ -14,12 +14,21 @@ describe("canonicalEdgeOrigin", () => {
     );
   });
 
-  it.each(["http://edge:8080", "https://edge.internal/"])(
-    "accepts and normalizes an HTTP(S) origin: %s",
+  it.each(["https://edge.internal", "https://edge.internal/"])(
+    "accepts and normalizes a production HTTPS origin: %s",
     (configured) => {
       expect(canonicalEdgeOrigin({ production: true, configured })).toBe(configured.replace(/\/$/, ""));
     },
   );
+
+  it("allows explicit HTTP only for the local non-production harness", () => {
+    expect(canonicalEdgeOrigin({ production: false, configured: "http://edge:8080" })).toBe(
+      "http://edge:8080",
+    );
+    expect(() => canonicalEdgeOrigin({ production: true, configured: "http://edge:8080" })).toThrow(
+      "MYELIN_EDGE_URL must use https:// in production",
+    );
+  });
 
   it.each([
     "edge.internal",
