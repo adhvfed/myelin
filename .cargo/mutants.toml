@@ -49,6 +49,17 @@ exclude_re = [
     "::fmt ->",
     "TimeSource for SystemTime",
     "_for_test",
+    # These adapters can only be distinguished from their empty/in-memory replacements with live
+    # Postgres. Their behaviour is covered by the durable integration suite; the DB-free mutation
+    # job cannot observe it. Keep the testable store/transaction logic in scope below them.
+    "Consumer<H>::durable_dead_letters",
+    "DedupLedger::durable",
+    "DurableOutboxBacking::",
+    # The ULID entropy mixer is validated as an adapter property (valid, monotonic, unique output),
+    # not by coupling tests to individual SplitMix64 bit operations. Mutating those operations
+    # generally yields another valid PRNG and is therefore observationally equivalent.
+    "UlidMinter::",
+    "IdMinter for UlidMinter",
     # An EQUIVALENT mutant (documented in lib.rs): `retry_through_tripped` is structurally ALWAYS
     # 0 in correct code (the open-breaker guard makes a non-zero value unreachable), so a constant-
     # `0` body is observably indistinguishable from the live atomic read. We keep the live read so a

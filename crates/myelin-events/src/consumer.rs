@@ -1025,6 +1025,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn consumer_routing_and_handled_status_accessors_reflect_live_state() {
+        let consumer = Consumer::new(
+            done_handler(),
+            sub("indexer", &["myelin://acme/issues/"]),
+            DedupLedger::new(),
+        );
+        let message = msg("01J-STATUS", "myelin://acme/issues/issue/PROJ-1");
+
+        assert!(consumer.accepts(&message.subject));
+        assert!(!consumer.accepts("myelin://acme/chat/message/1"));
+        assert!(!consumer.is_handled(&message.envelope.event_id));
+        assert_eq!(consumer.deliver(&message), Delivered::Acked);
+        assert!(consumer.is_handled(&message.envelope.event_id));
+    }
+
     // --- Rule 1: idempotent on event_id via the dedup ledger ---
 
     /// A redelivered `event_id` is a no-op: the ledger absorbs it, the handler runs exactly ONCE,

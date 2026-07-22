@@ -570,6 +570,19 @@ pub struct DrainReport {
     pub drain_errors: usize,
 }
 
+impl DrainReport {
+    fn durable_failure() -> Self {
+        Self {
+            drain_errors: 1,
+            ..Self::default()
+        }
+    }
+
+    fn add_drain_errors(&mut self, errors: usize) {
+        self.drain_errors += errors;
+    }
+}
+
 /// The outbox relay (contract 2.3 relay half) — stateless, horizontally-replicable. Holds the
 /// [`OutboxStore`] it drains and the [`BusTransport`] it publishes to (both cloneable handles),
 /// plus a `clock` for the `published_at` stamp.
@@ -668,10 +681,7 @@ impl<T: BusTransport> Relay<T> {
                          (0 lost), depth/age signals remain the alarm: {}",
                         e.0
                     );
-                    DrainReport {
-                        drain_errors: 1,
-                        ..DrainReport::default()
-                    }
+                    DrainReport::durable_failure()
                 }
             };
         }
@@ -754,7 +764,7 @@ impl<T: BusTransport> Relay<T> {
             total.failed += r.failed;
             // Surface a durable-arm drain error across the loop too (a failed drain makes no
             // progress → the loop breaks below, but the error is not silently dropped).
-            total.drain_errors += r.drain_errors;
+            total.add_drain_errors(r.drain_errors);
             // No progress (broker down: every row failed, none dead-lettered yet) → stop so we
             // do not spin forever. The caller heals the broker and drains again.
             if !made_progress {
@@ -924,6 +934,48 @@ mod tests {
             contains_personal_data: false,
             pii_key_ref: None,
         }
+    }
+
+    #[test]
+    fn transport_classification_codes_are_stable() {
+        assert_eq!(IntakeDependency::Blob.name(), "blob");
+        assert_eq!(
+            DeliveryPoisonKind::MalformedEnvelope.code(),
+            "malformed_envelope"
+        );
+        assert_eq!(
+            DeliveryPoisonKind::SubjectMismatch.code(),
+            "subject_mismatch"
+        );
+        assert_eq!(
+            DeliveryQuarantineReason::MalformedEnvelope.code(),
+            "malformed_envelope"
+        );
+        assert_eq!(
+            DeliveryQuarantineReason::SubjectMismatch.code(),
+            "subject_mismatch"
+        );
+        assert_eq!(
+            DeliveryQuarantineReason::NoRegisteredConsumer.code(),
+            "no_registered_consumer"
+        );
+    }
+
+    #[test]
+    fn durable_drain_errors_are_reported_and_accumulated() {
+        let failure = DrainReport::durable_failure();
+        assert_eq!(failure.drain_errors, 1);
+        assert_eq!(failure.published, 0);
+        assert_eq!(failure.deduplicated, 0);
+        assert_eq!(failure.failed, 0);
+        assert_eq!(failure.dead_lettered, 0);
+
+        let mut total = DrainReport {
+            drain_errors: 3,
+            ..DrainReport::default()
+        };
+        total.add_drain_errors(4);
+        assert_eq!(total.drain_errors, 7);
     }
 
     fn commit_n(
