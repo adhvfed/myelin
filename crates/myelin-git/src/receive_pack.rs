@@ -891,30 +891,125 @@ impl RefStore {
     }
 
     /// The reflog (append-only; the per-ref history — used by the holder + the audit walk). On the
-    /// durable path this reads the real on-disk git reflog of every ref (loaded from disk).
+    /// durable path this reads the real on-disk reflog of every current direct ref. Deleted-ref
+    /// history is not present in physical Git reflogs and must come from durable ref-update events.
     pub fn reflog(&self) -> Result<Vec<ReflogEntry>, crate::durable::DurableError> {
+        self.reflog_bounded(
+            crate::durable::REFLOG_MAX_TOTAL_ENTRIES,
+            crate::durable::REFLOG_MAX_TOTAL_BYTES,
+        )
+    }
+
+    fn reflog_bounded(
+        &self,
+        maximum_total_entries: usize,
+        maximum_total_bytes: usize,
+    ) -> Result<Vec<ReflogEntry>, crate::durable::DurableError> {
         match &self.backing {
-            RefBacking::Memory { reflog, .. } => Ok(
-                reflog.lock().unwrap_or_else(|e| e.into_inner()).clone()
-            ),
+            RefBacking::Memory { reflog, .. } => {
+                let reflog = reflog.lock().unwrap_or_else(|e| e.into_inner());
+                if reflog.len() > maximum_total_entries {
+                    return Err(crate::durable::DurableError::Git(
+                        "audit reflog limit exceeded: total entry count".into(),
+                    ));
+                }
+                let materialized_bytes = reflog.iter().try_fold(0usize, |total, entry| {
+                    total.checked_add(Self::reflog_entry_string_bytes(entry))
+                });
+                if materialized_bytes.is_none_or(|bytes| bytes > maximum_total_bytes) {
+                    return Err(crate::durable::DurableError::Git(
+                        "audit reflog limit exceeded: total bytes".into(),
+                    ));
+                }
+                Ok(reflog.clone())
+            }
             RefBacking::Disk { repo } => {
                 // Assemble the per-ref durable reflogs into the RefStore view, oldest-first per ref,
-                // with the monotonic `update_seq` = the entry's 1-based position in that ref's reflog.
+                // deriving each surviving entry's sequence from the durable generation so a
+                // delete+recreate never resets it to one.
                 let mut out = Vec::new();
+                let mut input_bytes = 0usize;
+                let mut output_bytes = 0usize;
                 for (name, _tip) in repo.list_refs_bounded(crate::durable::WIRE_MAX_REFS)? {
-                    for (i, e) in repo.reflog_entries(&name)?.into_iter().enumerate() {
-                        out.push(ReflogEntry {
+                    let remaining_entries = maximum_total_entries.checked_sub(out.len()).ok_or_else(
+                        || {
+                            crate::durable::DurableError::Git(
+                                "audit reflog limit exceeded: total entry count".into(),
+                            )
+                        },
+                    )?;
+                    let remaining_input_bytes = maximum_total_bytes
+                        .checked_sub(input_bytes)
+                        .ok_or_else(|| {
+                            crate::durable::DurableError::Git(
+                                "audit reflog limit exceeded: total bytes".into(),
+                            )
+                        })?;
+                    let (entries, on_disk_bytes, generation) = repo.reflog_entries_bounded(
+                        &name,
+                        crate::durable::REFLOG_MAX_ENTRIES_PER_REF.min(remaining_entries),
+                        crate::durable::REFLOG_MAX_BYTES_PER_REF.min(remaining_input_bytes),
+                    )?;
+                    input_bytes = input_bytes.checked_add(on_disk_bytes).ok_or_else(|| {
+                        crate::durable::DurableError::Git(
+                            "audit reflog limit exceeded: total bytes".into(),
+                        )
+                    })?;
+                    let entry_count = u64::try_from(entries.len()).map_err(|_| {
+                        crate::durable::DurableError::Git(
+                            "audit reflog entry count does not fit durable generation".into(),
+                        )
+                    })?;
+                    let sequence_base = generation.checked_sub(entry_count).ok_or_else(|| {
+                        crate::durable::DurableError::Git(format!(
+                            "reflog for {name} is ahead of its durable generation"
+                        ))
+                    })?;
+                    for (i, e) in entries.into_iter().enumerate() {
+                        let offset = u64::try_from(i)
+                            .ok()
+                            .and_then(|index| index.checked_add(1))
+                            .ok_or_else(|| {
+                                crate::durable::DurableError::Git(
+                                    "audit reflog sequence overflow".into(),
+                                )
+                            })?;
+                        let entry = ReflogEntry {
                             ref_name: RefName::new(name.clone()),
                             old_oid: e.old_oid.map(|o| Oid::new(o.0)),
                             new_oid: Oid::new(e.new_oid.0),
-                            update_seq: (i as u64) + 1,
+                            update_seq: sequence_base.checked_add(offset).ok_or_else(|| {
+                                crate::durable::DurableError::Git(
+                                    "audit reflog sequence overflow".into(),
+                                )
+                            })?,
                             pusher_pseudonym: e.committer,
-                        });
+                        };
+                        output_bytes = output_bytes
+                            .checked_add(Self::reflog_entry_string_bytes(&entry))
+                            .ok_or_else(|| {
+                                crate::durable::DurableError::Git(
+                                    "audit reflog limit exceeded: total bytes".into(),
+                                )
+                            })?;
+                        if output_bytes > maximum_total_bytes {
+                            return Err(crate::durable::DurableError::Git(
+                                "audit reflog limit exceeded: total bytes".into(),
+                            ));
+                        }
+                        out.push(entry);
                     }
                 }
                 Ok(out)
             }
         }
+    }
+
+    fn reflog_entry_string_bytes(entry: &ReflogEntry) -> usize {
+        entry.ref_name.0.len()
+            + entry.old_oid.as_ref().map_or(0, |oid| oid.0.len())
+            + entry.new_oid.0.len()
+            + entry.pusher_pseudonym.len()
     }
 
     /// Read a ref's current tip from the backing (NO lock taken here — callers hold the per-ref lock).
@@ -2311,6 +2406,16 @@ mod tests {
             Some(Oid::new("v3"))
         );
         let log = store.reflog().expect("reflog");
+        assert!(matches!(
+            store.reflog_bounded(2, crate::durable::REFLOG_MAX_TOTAL_BYTES),
+            Err(crate::durable::DurableError::Git(message))
+                if message == "audit reflog limit exceeded: total entry count"
+        ));
+        assert!(matches!(
+            store.reflog_bounded(3, 1),
+            Err(crate::durable::DurableError::Git(message))
+                if message == "audit reflog limit exceeded: total bytes"
+        ));
         let seqs: Vec<u64> = log
             .iter()
             .filter(|e| e.ref_name == RefName::new("refs/heads/feature"))
@@ -2631,6 +2736,95 @@ mod tests {
         );
         assert!(result.is_err(), "a missing durable repo is not an absent ref");
         assert_eq!(outbox.committed_count(), 0, "no event commits on an invented empty tip");
+    }
+
+    #[test]
+    fn durable_reflog_sequence_survives_delete_and_recreate() {
+        let root = std::env::temp_dir().join(format!(
+            "myelin-reflog-sequence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let loc = crate::core::RepoLoc::new("acme", "fr-par", "core");
+        let durable = Arc::new(
+            crate::durable::DurableGitStore::rooted(&root)
+                .create_repo(&loc)
+                .expect("create durable repo"),
+        );
+        let blob = durable.write_blob(b"audit\n").expect("write blob");
+        let tree = durable.write_tree(&[("README.md", &blob)]).expect("write tree");
+        let first = durable
+            .write_commit(
+                &tree,
+                &[],
+                "first",
+                "anon-1@acme.noreply",
+                "anon-1@acme.noreply",
+            )
+            .expect("write first commit");
+        let second = durable
+            .write_commit(
+                &tree,
+                &[&first],
+                "second",
+                "anon-1@acme.noreply",
+                "anon-1@acme.noreply",
+            )
+            .expect("write second commit");
+        durable
+            .update_ref_cas(
+                "refs/heads/main",
+                None,
+                Some(&first),
+                "create",
+                "anon-1@acme.noreply",
+            )
+            .expect("create ref");
+        durable
+            .update_ref_cas(
+                "refs/heads/main",
+                Some(&first),
+                Some(&second),
+                "update",
+                "anon-1@acme.noreply",
+            )
+            .expect("update ref");
+        durable
+            .update_ref_cas(
+                "refs/heads/main",
+                Some(&second),
+                None,
+                "delete",
+                "anon-1@acme.noreply",
+            )
+            .expect("delete ref");
+        durable
+            .update_ref_cas(
+                "refs/heads/main",
+                None,
+                Some(&second),
+                "recreate",
+                "anon-1@acme.noreply",
+            )
+            .expect("recreate ref");
+
+        let store = RefStore::open_durable(
+            Arc::clone(&durable),
+            "core",
+            ctx_base(),
+            OutboxStore::new(),
+            Arc::new(MonotonicMinter::new()),
+        );
+        let log = store.reflog().expect("read durable reflog");
+        assert_eq!(log.len(), 1, "only the recreated ref's physical history survives");
+        assert_eq!(log[0].update_seq, 4, "durable generation must not reset to one");
+
+        drop(store);
+        drop(durable);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -461,7 +461,7 @@ mod tests {
         // seq 1 already applied on disk.
         repo.update_ref_cas("refs/heads/main", None, Some(&c1), "create", "psn@acme.noreply")
             .unwrap();
-        assert_eq!(repo.reflog_len("refs/heads/main"), 1);
+        assert_eq!(repo.reflog_len("refs/heads/main"), Ok(1));
 
         let recs = vec![
             GitRefUpdatedRecord {
@@ -485,7 +485,7 @@ mod tests {
         assert_eq!(report.reapplied, vec![("refs/heads/main".to_string(), 2)], "only seq 2 re-applied");
         assert_eq!(report.already_current, 1, "seq 1 already current");
         assert_eq!(repo.read_ref("refs/heads/main").unwrap(), Some(c2));
-        assert_eq!(repo.reflog_len("refs/heads/main"), 2);
+        assert_eq!(repo.reflog_len("refs/heads/main"), Ok(2));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -521,7 +521,11 @@ mod tests {
         repo.update_ref_cas("refs/heads/main", None, Some(&c3), "recreate", "psn@acme.noreply").unwrap();
 
         // The reflog RESTARTED (the old, wrong generation source) but the durable generation is 4.
-        assert_eq!(repo.reflog_len("refs/heads/main"), 1, "recreated ref's reflog restarted");
+        assert_eq!(
+            repo.reflog_len("refs/heads/main"),
+            Ok(1),
+            "recreated ref's reflog restarted"
+        );
         assert_eq!(
             repo.ref_generation("refs/heads/main"),
             Ok(4),
