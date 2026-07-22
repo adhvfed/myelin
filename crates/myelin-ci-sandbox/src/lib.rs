@@ -693,7 +693,9 @@ pub const SANDBOX_CAPTURE_BOUND: usize = 256 * 1024;
 /// timeout-kill — defeating prompt termination and risking a cross-stream deadlock. Draining-and-
 /// discarding applies no backpressure, so the guest runs to its real exit / the timeout fires cleanly.
 ///
-/// Returns the captured head bytes and whether any bytes beyond the bound were seen (`truncated`).
+/// Returns the captured head bytes and whether any bytes beyond the bound were seen or the stream
+/// could not be read through EOF (`truncated`). A read fault must not make a partial protocol payload
+/// look complete to callers such as the Git wire adapter.
 pub(crate) fn drain_capped<R: std::io::Read>(mut r: R, limit: usize) -> (Vec<u8>, bool) {
     let mut head = Vec::new();
     let mut truncated = false;
@@ -715,7 +717,12 @@ pub(crate) fn drain_capped<R: std::io::Read>(mut r: R, limit: usize) -> (Vec<u8>
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break, // pipe error ⇒ treat as end-of-stream; the wait/kill loop owns lifecycle.
+            Err(_) => {
+                // The prefix is still useful for diagnostics, but it is not a complete stream. Mark
+                // it truncated so protocol callers fail closed instead of serving partial bytes.
+                truncated = true;
+                break;
+            }
         }
     }
     (head, truncated)
@@ -1029,6 +1036,34 @@ pub fn agent_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PrefixThenReadFault {
+        prefix: Option<Vec<u8>>,
+    }
+
+    impl std::io::Read for PrefixThenReadFault {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(prefix) = self.prefix.take() {
+                buf[..prefix.len()].copy_from_slice(&prefix);
+                Ok(prefix.len())
+            } else {
+                Err(std::io::Error::other("injected stream read fault"))
+            }
+        }
+    }
+
+    #[test]
+    fn capped_drain_marks_a_read_fault_as_incomplete() {
+        let (head, truncated) = drain_capped(
+            PrefixThenReadFault {
+                prefix: Some(b"partial".to_vec()),
+            },
+            SANDBOX_CAPTURE_BOUND,
+        );
+
+        assert_eq!(head, b"partial");
+        assert!(truncated);
+    }
 
     fn digest() -> ImageRef {
         ImageRef::pinned("registry.example/img@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890").unwrap()

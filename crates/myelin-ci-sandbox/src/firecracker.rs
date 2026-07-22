@@ -827,8 +827,13 @@ fn spawn_and_capture(
     let start = Instant::now();
 
     // Drain both pipes on threads so a chatty guest console cannot fill a pipe buffer and deadlock.
-    let mut out = child.stdout.take().expect("piped stdout");
-    let mut err = child.stderr.take().expect("piped stderr");
+    let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
+        // `piped()` should always install both handles, but do not panic or orphan a VMM if the
+        // process implementation violates that contract.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("firecracker console pipe unavailable".to_string());
+    };
     // CT-002c: cap each drained stream at CONSOLE_CAPTURE_BOUND (head capture) and DISCARD the rest to
     // EOF — bounds host memory under a runaway guest while still draining the pipe so the guest never
     // blocks on a full pipe (no deadlock that would defeat the timeout).
@@ -861,8 +866,10 @@ fn spawn_and_capture(
     let wall = start.elapsed();
 
     // The child has exited/been-killed ⇒ the pipes hit EOF ⇒ the drain threads finish.
-    let out_buf = th_out.join().unwrap_or_default();
-    let err_buf = th_err.join().unwrap_or_default();
+    let out_result = th_out.join();
+    let err_result = th_err.join();
+    let out_buf = out_result.map_err(|_| "firecracker stdout drain thread panicked".to_string())?;
+    let err_buf = err_result.map_err(|_| "firecracker stderr drain thread panicked".to_string())?;
     let mut console = String::from_utf8_lossy(&out_buf).into_owned();
     console.push_str(&String::from_utf8_lossy(&err_buf));
 

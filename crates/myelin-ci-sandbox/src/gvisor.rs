@@ -814,11 +814,21 @@ fn run_and_capture(
     // CT-006a: feed the bounded request body to the container's stdin on a DEDICATED thread (so a
     // large body + a slow in-guest reader cannot deadlock against our stdout/stderr drains), then drop
     // the handle to deliver EOF (the stateless-rpc request terminator). None ⇒ stdin was `null`.
-    let stdin_th = stdin.map(|bytes| {
-        let mut si = child.stdin.take().expect("piped stdin");
+    let stdin_pipe = if stdin.is_some() {
+        child.stdin.take()
+    } else {
+        None
+    };
+    if stdin.is_some() && stdin_pipe.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("runsc stdin pipe unavailable".to_string());
+    }
+    let stdin_th = stdin.zip(stdin_pipe).map(|(bytes, mut si)| {
         std::thread::spawn(move || {
-            let _ = si.write_all(&bytes);
+            let result = si.write_all(&bytes);
             // `si` drops here ⇒ the write end closes ⇒ the guest `git` sees EOF on its request body.
+            result
         })
     });
 
@@ -826,8 +836,14 @@ fn run_and_capture(
     let start = Instant::now();
 
     // Drain both pipes on threads so a chatty container cannot fill a pipe buffer and deadlock.
-    let mut out = child.stdout.take().expect("piped stdout");
-    let mut err = child.stderr.take().expect("piped stderr");
+    let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(t) = stdin_th {
+            let _ = t.join();
+        }
+        return Err("runsc output pipe unavailable".to_string());
+    };
     // stdout draining depends on the stream's mode (CT-006c):
     //   - `CappedHead` (CI/agent logs): cap at SANDBOX_CAPTURE_BOUND (256 KiB head capture) + DISCARD the
     //     rest to EOF — bounds host memory under a runaway container, byte-unchanged from CT-002c.
@@ -872,12 +888,24 @@ fn run_and_capture(
     let wall = start.elapsed();
 
     // The child has exited/been-killed ⇒ the pipes hit EOF ⇒ the drain threads finish.
-    let (stdout, stdout_truncated) = th_out.join().unwrap_or_default();
-    let stderr = th_err.join().unwrap_or_default();
+    let stdout_result = th_out.join();
+    let stderr_result = th_err.join();
     // The writer thread has finished (the child read its request body, or it exited and the write
     // EPIPE'd — either way `write_all` returned). Join so no thread outlives the run.
-    if let Some(t) = stdin_th {
-        let _ = t.join();
+    let stdin_result = stdin_th.map(std::thread::JoinHandle::join);
+
+    let (stdout, stdout_truncated) =
+        stdout_result.map_err(|_| "runsc stdout drain thread panicked".to_string())?;
+    let stderr = stderr_result.map_err(|_| "runsc stderr drain thread panicked".to_string())?;
+    if let Some(write_result) = stdin_result {
+        let write_result =
+            write_result.map_err(|_| "runsc stdin writer thread panicked".to_string())?;
+        // A child that failed or was killed may legitimately close stdin early; its primary outcome
+        // remains authoritative. A successful child, however, must have received the full bounded
+        // request body or the Git wire exchange is incomplete.
+        if exit == Some(0) {
+            write_result.map_err(|e| format!("write runsc stdin: {e}"))?;
+        }
     }
 
     // The container + its sentry/gofer tree are gone; reap the cgroup (kill any straggler, rmdir).
@@ -918,7 +946,8 @@ struct RunCaptureOptions<'a> {
 /// the bytes are written to disk as they arrive, NOT buffered in a growing Vec. Keeps reading past the
 /// cap (draining + discarding) so the container never blocks on a full pipe (no deadlock that would
 /// defeat the timeout). Returns the materialized head (≤ `cap` bytes, read back from the temp file) and
-/// whether the cap was exceeded (`truncated`). The temp file is removed before returning (no leak).
+/// whether the cap was exceeded or the stream could not be read through EOF (`truncated`). The temp
+/// file is removed before returning (no leak).
 ///
 /// NOTE (future, documented): materializing back into a `Vec` still costs `min(pack, cap)` host RAM at
 /// the end — true end-to-end streaming would need a `WireOutput`/`SandboxResult` streaming-body API
@@ -964,7 +993,11 @@ fn drain_to_temp_file<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break, // pipe error ⇒ end-of-stream; the wait/kill loop owns lifecycle.
+            Err(_) => {
+                // Preserve the diagnostic prefix, but force the wire seam to reject it as incomplete.
+                truncated = true;
+                break;
+            }
         }
     }
     let _ = file.flush();
@@ -2016,6 +2049,27 @@ mod tests {
             over,
             "over the cap ⇒ truncated flag set (the wire seam then refuses loudly)"
         );
+    }
+
+    #[test]
+    fn drain_to_temp_file_marks_a_read_fault_as_incomplete() {
+        struct FaultAfterPrefix(Option<&'static [u8]>);
+
+        impl Read for FaultAfterPrefix {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(prefix) = self.0.take() {
+                    buf[..prefix.len()].copy_from_slice(prefix);
+                    Ok(prefix.len())
+                } else {
+                    Err(std::io::Error::other("injected wire read fault"))
+                }
+            }
+        }
+
+        let (head, incomplete) = drain_to_temp_file(FaultAfterPrefix(Some(b"partial-pack")), 1024);
+
+        assert_eq!(head, b"partial-pack");
+        assert!(incomplete);
     }
 
     #[test]
