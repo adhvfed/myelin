@@ -105,9 +105,13 @@ describe.runIf(Boolean(redisUrl))("ValkeySessionStore integration", () => {
 
     try {
       await sessionStore.issue(id, record);
+      // Sample the wall clock before PTTL. Sampling after the network round trip can make the
+      // comparison bound 1–2 ms smaller than the already-returned integer TTL and flake while the
+      // stored expiry is still correct.
+      const observedAtMs = Date.now();
       const ttl = await admin.pttl(`${SESSION_KEY_PREFIX}${id}`);
       expect(ttl).toBeGreaterThan(0);
-      expect(ttl).toBeLessThanOrEqual(credentialExpiresAtMs - Date.now());
+      expect(ttl).toBeLessThanOrEqual(credentialExpiresAtMs - observedAtMs);
     } finally {
       await sessionStore.delete(id);
       admin.disconnect(false);
