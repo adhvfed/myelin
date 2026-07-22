@@ -2816,7 +2816,7 @@ impl DurableGitBackend {
                 // F9 (R4.1 dogfood): the first push that lands a branch heals a dangling `init_bare`
                 // HEAD (→ the default branch) so a fresh `git clone` checks out with NO "nonexistent
                 // ref, unable to checkout" warning. Best-effort: the push already committed durably and
-                // the read-side resolver (`refs_view`) remains the fallback, so a heal hiccup must never
+                // the read-side paginated ref summary remains the fallback, so a heal hiccup must never
                 // turn an ACCEPTED push into a failure.
                 let _ = repo.heal_head_symref();
                 Ok(report_status("ok", &per_ref_status))

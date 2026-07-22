@@ -760,6 +760,19 @@ mod tests {
     }
 
     #[test]
+    fn summary_rejects_a_corrupt_head_instead_of_guessing_main() {
+        let fixture = Fixture::new("corrupt-head");
+        fixture.add_ref("refs/heads/main", &fixture.first_tip);
+        std::fs::write(fixture.repo.path().join("HEAD"), b"ref: refs/heads/\xff\n")
+            .expect("corrupt HEAD fixture");
+
+        assert!(
+            matches!(fixture.repo.refs_summary(), Err(DurableError::Git(_))),
+            "an unreadable HEAD must not be represented as a valid main default"
+        );
+    }
+
+    #[test]
     fn more_than_one_thousand_refs_page_without_duplicates_or_skips() {
         let fixture = Fixture::new("large-namespace");
         let mut expected = Vec::new();
