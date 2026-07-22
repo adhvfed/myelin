@@ -23,9 +23,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
-/// The per-`(stream, scope)` broadcast capacity (bounded — a slow consumer that lags past this is
-/// dropped by the broadcast channel, the bounded-and-sheds posture, contract §7.7). The slow-consumer
-/// → `resync_required` snapshot fallback is the firehose seam's deferred half (named above).
+/// The per-`(stream, scope)` broadcast capacity (bounded — a slow consumer that lags past this has
+/// its HTTP stream terminated, forcing the client to resynchronize rather than silently miss frames;
+/// the bounded-and-sheds posture, contract §7.7). The durable resume cursor is the deferred half.
 const CHANNEL_CAPACITY: usize = 256;
 
 /// One Server-Sent Event frame (the `EventSource` wire shape). `event` is the optional event type the

@@ -641,14 +641,21 @@ fn full_body(bytes: Vec<u8>) -> EdgeBody {
 }
 
 /// A streaming SSE body fed by the subscription's broadcast receiver: each frame is written as one
-/// SSE event; a lagged-receiver error is skipped (the bounded-and-sheds posture).
+/// SSE event. A lagged receiver terminates immediately so the client observes a disconnect and
+/// resynchronizes; it must never cross an invisible event gap on an apparently healthy stream.
 fn sse_body(rx: tokio::sync::broadcast::Receiver<crate::sse::SseEvent>) -> EdgeBody {
-    let stream = BroadcastStream::new(rx).filter_map(|res| match res {
-        Ok(ev) => Some(Ok::<Frame<Bytes>, std::io::Error>(Frame::data(Bytes::from(ev.frame())))),
-        // A lagged/closed receiver yields an error frame we skip (the connection is dropped to
-        // resync on the real firehose seam; here we simply stop emitting on close).
-        Err(_) => None,
-    });
+    let stream = BroadcastStream::new(rx)
+        .map_while(|res| match res {
+            Ok(ev) => Some(Ok::<Frame<Bytes>, std::io::Error>(Frame::data(
+                Bytes::from(ev.frame()),
+            ))),
+            // BroadcastStream yields `Err(Lagged(_))`; return end-of-stream on the gap. Channel
+            // closure already ends the source stream without producing an item.
+            Err(_) => None,
+        })
+        // Tokio's `map_while` is intentionally not fused; without this, a later poll could resume
+        // with a newer event after the gap. Once ended, this HTTP body must stay ended.
+        .fuse();
     StreamBody::new(stream).boxed()
 }
 
@@ -660,6 +667,26 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn lagged_sse_body_terminates_instead_of_skipping_to_newer_events() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(2);
+        for sequence in 1..=3 {
+            sender
+                .send(crate::sse::SseEvent::data(sequence.to_string()))
+                .unwrap();
+        }
+
+        let mut body = sse_body(receiver);
+        assert!(
+            body.frame().await.is_none(),
+            "a lagged stream closes before exposing a newer frame after the invisible gap"
+        );
+        assert!(
+            body.frame().await.is_none(),
+            "termination is permanent, not a one-item filter"
+        );
+    }
 
     /// (a) A body under the cap collects fully and byte-for-byte.
     #[tokio::test]
