@@ -135,6 +135,12 @@ impl EffectCost {
         self.wholesale.saturating_add(self.markup)
     }
 
+    /// The exact total when it is representable. Admission must use this form: an overflowing
+    /// price cannot be faithfully reserved or settled and therefore must never reach mutation.
+    pub fn checked_total(&self) -> Option<u64> {
+        self.wholesale.checked_add(self.markup)
+    }
+
     /// As the Storage [`MeteredUnit`] the settle records (one cost event per metered unit, 11.7).
     fn as_metered_unit(&self) -> MeteredUnit {
         MeteredUnit {
@@ -578,7 +584,12 @@ where
 
         // (5) BUDGET — the reserve has remaining balance for this effect's metered cost (11.7). No
         //     balance → Denied (no privileged fallback — the run cannot spend past its reserve).
-        let cost = plan.cost.total();
+        let Some(cost) = plan.cost.checked_total() else {
+            return PlanVerdict::WouldDeny(
+                PipelineStep::Budget,
+                "metered cost exceeds the supported minor-unit range".into(),
+            );
+        };
         if !self.budget.has_remaining(cost) {
             return PlanVerdict::WouldDeny(
                 PipelineStep::Budget,
@@ -1481,6 +1492,60 @@ mod tests {
             0,
             "AG-D2: 0 privileged fallback"
         );
+    }
+
+    #[test]
+    fn step5_unrepresentable_cost_denies_before_mutation_or_metering() {
+        let cat = Catalogue {
+            defs: vec![tool_def(
+                "issue.create",
+                &["issue.write"],
+                false,
+                EffectKind::Mutate,
+            )],
+        };
+        let check = allow_caps(&["issue.write"]);
+        let del = Delegator {
+            policy: vec!["issue.write".into()],
+        };
+        let tenant = Tenant {
+            forbid: BTreeSet::new(),
+        };
+        let endpoint = Endpoint {
+            fail: false,
+            applied: RefCell::new(vec![]),
+        };
+        let mut budget = Budget {
+            remaining: u64::MAX,
+            billed: 0,
+            settles: 0,
+        };
+        let mut signals = PipelineSignals::new();
+        let mut effect = plan("issue.create", r#"{"title":"x"}"#);
+        effect.cost = EffectCost {
+            unit: "issue.create",
+            wholesale: u64::MAX,
+            markup: 1,
+        };
+        let mut pipeline = pipeline(
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            BTreeSet::new(),
+            &mut signals,
+        );
+
+        let outcome = pipeline.apply_planned(&effect);
+        assert!(
+            matches!(outcome, EffectResult::Denied(ref reason) if reason.contains("minor-unit range")),
+            "{outcome:?}"
+        );
+        assert!(endpoint.applied.borrow().is_empty(), "overflowing cost must not mutate");
+        assert_eq!(budget.settles, 0, "overflowing cost must not reach settlement");
+        assert_eq!(budget.billed, 0);
     }
 
     /// **Step 6 (HITL GATE) — a `requires_approval` tool not yet approved → Gated; the tool does NOT
