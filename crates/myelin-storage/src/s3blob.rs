@@ -272,7 +272,10 @@ impl BlobStore for S3BlobStore {
                     BlobError::Backend(kind)
                 }
             })?;
-        let stored_len = out.content_length().unwrap_or(0).max(0) as usize;
+        let stored_len = stored_len_from_content_length(out.content_length()).ok_or_else(|| {
+            self.mark_runtime_failure(S3ReadinessError::Transient);
+            BlobError::Backend(S3ReadinessError::Transient)
+        })?;
         Ok(BlobMeta {
             hash: hash.clone(),
             stored_len,
@@ -296,6 +299,12 @@ impl BlobStore for S3BlobStore {
         }
         Ok(())
     }
+}
+
+/// S3 `Content-Length` is mandatory metadata for a successful HEAD. Missing, negative, or
+/// platform-unrepresentable lengths are a backend protocol fault, never a fabricated empty blob.
+fn stored_len_from_content_length(content_length: Option<i64>) -> Option<usize> {
+    usize::try_from(content_length?).ok()
 }
 
 fn s3_config_is_valid(cfg: &S3Config) -> bool {
@@ -411,6 +420,14 @@ mod tests {
         ] {
             assert!(!s3_config_is_valid(&invalid));
         }
+    }
+
+    #[test]
+    fn content_length_validation_preserves_real_zero_and_rejects_invalid_metadata() {
+        assert_eq!(stored_len_from_content_length(Some(0)), Some(0));
+        assert_eq!(stored_len_from_content_length(Some(42)), Some(42));
+        assert_eq!(stored_len_from_content_length(None), None);
+        assert_eq!(stored_len_from_content_length(Some(-1)), None);
     }
 
     #[test]
