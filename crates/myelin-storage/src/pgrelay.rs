@@ -1168,6 +1168,61 @@ impl PgRelay {
         rows.iter().map(row_from_pg).collect()
     }
 
+    /// Storage-bounded retained snapshot for startup recovery. The ordered cumulative size is
+    /// computed in PostgreSQL; envelopes beyond the byte ceiling are selected as `NULL`, so an
+    /// oversized retained set is rejected without transferring its excess JSON into process RAM.
+    pub async fn retained_rows_bounded(
+        &self,
+        maximum_rows: usize,
+        maximum_envelope_bytes: usize,
+    ) -> Result<Vec<OutboxRow>, PgError> {
+        let fetch_limit = i64::try_from(maximum_rows.saturating_add(1)).unwrap_or(i64::MAX);
+        let byte_limit = i64::try_from(maximum_envelope_bytes).unwrap_or(i64::MAX);
+        let rows = sqlx::query(
+            "WITH retained AS (
+               SELECT event_id,aggregate,seq,subject,envelope,attempts,published_at,
+                      pg_column_size(envelope)::bigint AS envelope_bytes
+                 FROM outbox ORDER BY aggregate ASC,seq ASC LIMIT $1
+             ), measured AS (
+               SELECT event_id,aggregate,seq,subject,envelope,attempts,published_at,
+                      sum(envelope_bytes) OVER (
+                        ORDER BY aggregate ASC,seq ASC
+                      )::bigint AS aggregate_bytes
+                 FROM retained
+             )
+             SELECT event_id,aggregate,seq,subject,
+                    CASE WHEN aggregate_bytes <= $2 THEN envelope ELSE NULL END AS envelope,
+                    attempts,
+                    to_char(published_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS published_at_str,
+                    aggregate_bytes
+               FROM measured ORDER BY aggregate ASC,seq ASC",
+        )
+        .bind(fetch_limit)
+        .bind(byte_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        if rows.len() > maximum_rows {
+            return Err(PgError::Query(
+                "retained outbox snapshot exceeds its row limit".into(),
+            ));
+        }
+        let mut decoded = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let aggregate_bytes: i64 = row
+                .try_get("aggregate_bytes")
+                .map_err(|e| PgError::Query(e.to_string()))?;
+            if aggregate_bytes > byte_limit {
+                return Err(PgError::Query(
+                    "retained outbox snapshot exceeds its envelope byte limit".into(),
+                ));
+            }
+            decoded.push(row_from_pg(row)?);
+        }
+        Ok(decoded)
+    }
+
     /// Snapshot the dead-lettered rows (retained, not deleted — parity with the in-memory
     /// `dead_letters()` snapshot).
     pub async fn dead_rows(&self) -> Result<Vec<OutboxRow>, PgError> {

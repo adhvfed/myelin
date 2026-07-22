@@ -98,6 +98,33 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+fn bounded_retained_rows(
+    rows: Vec<OutboxRow>,
+    maximum_rows: usize,
+    maximum_envelope_bytes: usize,
+) -> Result<Vec<OutboxRow>> {
+    if rows.len() > maximum_rows {
+        return Err(OutboxError(
+            "retained outbox snapshot exceeds its row limit".into(),
+        ));
+    }
+    let mut total_bytes = 0usize;
+    for row in &rows {
+        let envelope_bytes = serde_json::to_vec(&row.envelope)
+            .map_err(|_| OutboxError("retained outbox envelope could not be measured".into()))?
+            .len();
+        total_bytes = total_bytes.checked_add(envelope_bytes).ok_or_else(|| {
+            OutboxError("retained outbox envelope byte count overflowed".into())
+        })?;
+        if total_bytes > maximum_envelope_bytes {
+            return Err(OutboxError(
+                "retained outbox snapshot exceeds its envelope byte limit".into(),
+            ));
+        }
+    }
+    Ok(rows)
+}
+
 /// The frozen forward-only DDL for the `outbox` table (contract 2.3). This is the shape the
 /// migration runner (P-S15) applies when the OLTP tier client (P-007) is wired; the in-memory
 /// [`OutboxStore`] in this module models exactly these semantics until then. The columns +
@@ -354,6 +381,19 @@ pub trait DurableOutboxBacking: Send + Sync {
         });
         Ok(rows)
     }
+    /// Bounded retained-witness snapshot for startup recovery. Durable implementations must
+    /// override this so limits are applied by storage before rows are materialized in process.
+    fn try_retained_rows_bounded(
+        &self,
+        maximum_rows: usize,
+        maximum_envelope_bytes: usize,
+    ) -> Result<Vec<OutboxRow>> {
+        bounded_retained_rows(
+            self.try_retained_rows()?,
+            maximum_rows,
+            maximum_envelope_bytes,
+        )
+    }
     /// Snapshot the dead-lettered rows (the operator alert / a test).
     fn dead_letters(&self) -> Vec<OutboxRow>;
 
@@ -591,6 +631,25 @@ impl OutboxStore {
                 });
                 Ok(rows)
             }
+        }
+    }
+
+    /// Fallible retained-witness snapshot with explicit materialization ceilings.
+    pub fn try_retained_rows_bounded(
+        &self,
+        maximum_rows: usize,
+        maximum_envelope_bytes: usize,
+    ) -> Result<Vec<OutboxRow>> {
+        match &self.backend {
+            OutboxBackend::Durable(b) => {
+                b.try_retained_rows_bounded(maximum_rows, maximum_envelope_bytes)
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => bounded_retained_rows(
+                self.try_retained_rows()?,
+                maximum_rows,
+                maximum_envelope_bytes,
+            ),
         }
     }
 
