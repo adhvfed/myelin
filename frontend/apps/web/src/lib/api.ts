@@ -24,7 +24,8 @@ import {
   parsePrThreads,
 } from "./mutation-response";
 import { parseFileLinesInput, parseFileLinesResponse } from "./file-lines";
-import { parseBlob, parseRefs, parseRepoHome, parseReposPage, parseTree } from "./repo-read-response";
+import { parseBlob, parseRefs, parseRepoHome, parseTree } from "./repo-read-response";
+import { parseRepoListPage } from "./repo-list-response";
 import { parseCommitDiff, parseCommitsPage } from "./commit-read-response";
 import { parsePr, parsePrDiff, parsePrListPage } from "./pr-read-response";
 import { parseIssueId, parseIssueListInput } from "./issue-read-input";
@@ -36,12 +37,15 @@ import {
   parseGitPrCursorInput,
   parseGitPrDiffInput,
   parseGitPrInput,
+  parseGitRepoListInput,
   parseGitRepoInput,
   parseGitRepoPrsInput,
   parseGitRefsInput,
   parseGitTreeInput,
   gitRefsSearchParams,
+  gitRepoListSearchParams,
   gitTreeSearchParams,
+  type GitRepoListInput,
   type GitRefsInput,
   type GitTreeInput,
 } from "./git-read-input";
@@ -125,7 +129,19 @@ export interface TreePageVM {
   limit: number;
 }
 
-/** The MR-014 uniform list envelope `{ items, page }`. */
+/** One summary-only repository catalogue row. Heavy RepoHome data belongs to `GET /repos/{repo}`. */
+export type RepoListRowVM =
+  | { state: "populated"; slug: string; clone_url: string }
+  | { state: "empty"; slug: string }
+  | { state: "restricted" };
+
+/** The bounded repository catalogue envelope. */
+export interface RepoListPage {
+  items: RepoListRowVM[];
+  page: { next_cursor: string | null; limit: number };
+}
+
+/** Legacy list-of-RepoHome envelope retained for the strict v1 home decoder compatibility tests. */
 export interface ReposPage {
   items: RepoHomeVM[];
   page: { next_cursor: string | null; limit: number };
@@ -519,11 +535,14 @@ function seg(s: string): string {
   return encodeURIComponent(s);
 }
 
-/** The repos screen's data: GET /v1/git/repos through the gateway → the edge ViewModel JSON. */
-export const getRepos = query(async (): Promise<ReposPage> => {
+/** The repos screen's summary data. Repo-home tree/README/history fields never enter this request. */
+export const getRepos = query(async (request: GitRepoListInput = {}): Promise<RepoListPage> => {
   "use server";
+  const input = parseGitRepoListInput(request);
+  if (!input) throw new RepoRouteError("error");
   return authed(async () => {
-    const page = parseReposPage(await edgeGet("/v1/git/repos"));
+    const search = gitRepoListSearchParams(input).toString();
+    const page = parseRepoListPage(await edgeGet(`/v1/git/repos?${search}`));
     if (!page) throw new RepoRouteError("error");
     return page;
   });

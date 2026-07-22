@@ -28,16 +28,25 @@ export default function TreeScreen() {
   const params = useParams();
   const [search] = useSearchParams();
   const navigate = useNavigate();
+  // Solid Router leaves an encoded slash inside a dynamic segment encoded. Decode exactly the route
+  // segment before handing it back to URL builders, otherwise `refs/heads/main` compounds to `%252F`.
+  const ref = () => {
+    try {
+      return decodeURIComponent(params.ref ?? "");
+    } catch {
+      return "";
+    }
+  };
   const path = () => params.path ?? "";
   const query = () => treeSearchValue(search.q);
   const cursor = () => treeCursorValue(search.cursor);
   const limit = () => treeLimitValue(search.limit);
   const [searchDraft, setSearchDraft] = createSignal(query());
   const initialTreeReader = new InitialTreeReader(getTree);
-  const ready = () => Boolean(params.repo && params.ref);
+  const ready = () => Boolean(params.repo && ref());
   const location = (overrides: { q?: string; cursor?: string } = {}) => treeHref({
     repo: params.repo!,
-    ref: params.ref!,
+    ref: ref(),
     path: path(),
     limit: limit(),
     q: Object.hasOwn(overrides, "q") ? overrides.q : query(),
@@ -54,7 +63,7 @@ export default function TreeScreen() {
   });
   const initialTree = createAsync(
     async () => ready()
-      ? initialTreeReader.read({ repo: params.repo!, ref: params.ref!, path: path() })
+      ? initialTreeReader.read({ repo: params.repo!, ref: ref(), path: path() })
       : undefined,
     { deferStream: true },
   );
@@ -63,7 +72,7 @@ export default function TreeScreen() {
       ready()
         ? getTree({
             repo: params.repo!,
-            ref: params.ref!,
+            ref: ref(),
             path: path(),
             limit: limit(),
             ...(cursor() ? { cursor: cursor() } : {}),
@@ -77,31 +86,31 @@ export default function TreeScreen() {
     const segs = path().split("/").filter(Boolean);
     if (segs.length === 0) return undefined; // the root has no parent row
     const parent = segs.slice(0, -1).map(encodeURIComponent).join("/");
-    return treeHref({ repo: params.repo!, ref: params.ref!, path: parent });
+    return treeHref({ repo: params.repo!, ref: ref(), path: parent });
   };
 
   const blobHrefForFile = () =>
-    `/git/repos/${params.repo}/blob/${encodeURIComponent(params.ref!)}/${path()
+    `/git/repos/${params.repo}/blob/${encodeURIComponent(ref())}/${path()
       .split("/")
       .map(encodeURIComponent)
       .join("/")}`;
 
   return (
     <section aria-labelledby="tree-title" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-4)" }}>
-      <Title>{path() || params.ref} · {params.repo} · Myelin</Title>
+      <Title>{path() || ref()} · {params.repo} · Myelin</Title>
       <div style={{ display: "flex", "align-items": "center", gap: "var(--space-3)", "flex-wrap": "wrap" }}>
-        <RepoBreadcrumb repo={params.repo!} refName={params.ref!} path={path()} kind="tree" />
-        <Show when={params.repo && params.ref}>
+        <RepoBreadcrumb repo={params.repo!} refName={ref()} path={path()} kind="tree" />
+        <Show when={params.repo && ref()}>
           <RefSwitcher
             repo={params.repo!}
-            currentRef={params.ref!}
-            currentFullRef={isFullGitRef(params.ref) ? params.ref : undefined}
+            currentRef={ref()}
+            currentFullRef={isFullGitRef(ref()) ? ref() : undefined}
             hrefFor={(ref) => treeHref({ repo: params.repo!, ref, path: path() })}
           />
         </Show>
       </div>
       <h1 id="tree-title" class="sr-only" style={{ position: "absolute", width: "1px", height: "1px", overflow: "hidden", clip: "rect(0 0 0 0)" }}>
-        {params.repo} tree {path() ? `/ ${path()}` : ""} at {params.ref}
+        {params.repo} tree {path() ? `/ ${path()}` : ""} at {ref()}
       </h1>
 
       <div class="ref-filter" style={{ "max-width": "24rem" }}>
@@ -127,7 +136,7 @@ export default function TreeScreen() {
               ? () => {
                   navigate(treeReloadHref({
                     repo: params.repo!,
-                    ref: params.ref!,
+                    ref: ref(),
                     path: path(),
                     limit: limit(),
                     q: query(),
@@ -153,10 +162,10 @@ export default function TreeScreen() {
                   >
                     <TreeList
                       repo={params.repo!}
-                      refName={vm.ref ?? params.ref!}
+                      refName={vm.ref ?? ref()}
                       path={path()}
                       entries={vm.entries ?? []}
-                      heading={path() || `Files on ${params.ref}`}
+                      heading={path() || `Files on ${ref()}`}
                       parentHref={parentHref()}
                     />
                   </Show>

@@ -1,12 +1,50 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  parseRepoSummaryQuery,
   parseTreeQuery,
   refsJson,
   repoHomeJson,
+  repoSummaryEnvelope,
   treeJson,
   validPrOperationId,
 } from "../../dev-edge/dev-contract.mjs";
+
+describe("the dev Edge repository summary contract", () => {
+  it("strictly parses summary coordinates and keyset-pages shape-separated fixtures", () => {
+    expect(parseRepoSummaryQuery("view=summary&limit=1"))
+      .toEqual({ limit: 1 });
+    const first = repoSummaryEnvelope({ limit: 1 });
+    if (!first) throw new Error("expected the first repository summary page");
+    expect(first).toEqual({
+      items: [{
+        state: "populated",
+        slug: "acme/myelin",
+        clone_url: "/acme/eu-west/myelin.git",
+      }],
+      page: { next_cursor: "rl1_YWNtZS9teWVsaW4", limit: 1 },
+    });
+    expect(first.items[0]).not.toHaveProperty("default_branch");
+    expect(first.items[0]).not.toHaveProperty("entries");
+
+    const second = repoSummaryEnvelope({ limit: 1, cursor: first.page.next_cursor });
+    expect(second).toEqual({
+      items: [{ state: "empty", slug: "acme/sandbox" }],
+      page: { next_cursor: null, limit: 1 },
+    });
+    expect(repoHomeJson("myelin")).toMatchObject({ default_branch: "main", entries: expect.any(Array) });
+  });
+
+  it("rejects unknown, duplicate, noncanonical, and out-of-bounds summary queries", () => {
+    for (const query of [
+      "", "view=home", "view=summary&view=summary", "view=summary&other=1",
+      "view=summary&limit=01", "view=summary&limit=0", "view=summary&limit=101",
+      "view=summary&cursor=", "view=summary&cursor=opaque",
+      "view=summary&cursor=rl1_YR", `view=summary&cursor=rl1_${"a".repeat(512)}`,
+      "x".repeat(16 * 1024 + 1),
+    ]) expect(parseRepoSummaryQuery(query), query).toBeNull();
+  });
+});
 
 describe("the dev Edge production-write contract", () => {
   it.each([
