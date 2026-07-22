@@ -513,20 +513,10 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
 
     fn save(&self, repo: &RepoLoc, doc: &SubjectThreads) -> Result<(), DurableError> {
         let dir = self.threads_dir(repo)?;
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| DurableError::Io(format!("create dir {}: {e}", dir.display())))?;
         let file = self.subject_path(repo, &doc.object_key)?;
         let bytes = serde_json::to_vec_pretty(doc)
             .map_err(|e| DurableError::Io(format!("serialize threads {}: {e}", doc.object_key)))?;
-        let tmp = dir.join(format!(
-            ".{}.tmp",
-            file.file_name().and_then(|s| s.to_str()).unwrap_or("x")
-        ));
-        std::fs::write(&tmp, &bytes)
-            .map_err(|e| DurableError::Io(format!("write {}: {e}", tmp.display())))?;
-        std::fs::rename(&tmp, &file)
-            .map_err(|e| DurableError::Io(format!("rename {}: {e}", file.display())))?;
-        Ok(())
+        crate::durable::write_file_atomic(&dir, &file, &bytes)
     }
 
     // ── thread + comment ops (single, un-batched — the Overview discussion + the diff line threads) ──
