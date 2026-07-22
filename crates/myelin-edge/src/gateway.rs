@@ -1938,6 +1938,11 @@ mod git_wire_basic_auth_tests {
         });
         let gw = Gateway::builder(authn, human, Arc::new(AllowAll))
             .default_token_scheme("agent")
+            .sse_route(
+                "/v1/t/{tenant}/events",
+                "edge.events.subscribe",
+                "edge",
+            )
             .route(
                 Method::Get,
                 "/v1/whoami",
@@ -1952,6 +1957,28 @@ mod git_wire_basic_auth_tests {
             )
             .build();
         (gw, token)
+    }
+
+    #[test]
+    fn sse_response_carries_the_verified_capability_expiry() {
+        let (gw, token) = seeded_gateway();
+        let response = gw.handle(EdgeRequest::new(
+            "GET",
+            "/v1/t/acme/events",
+            "",
+            vec![("authorization".into(), format!("Bearer {token}"))],
+            vec![],
+        ));
+
+        match response {
+            EdgeResponse::Sse {
+                expires_at_unix,
+                ..
+            } => assert_eq!(expires_at_unix, 9_999_999_999),
+            EdgeResponse::Bytes { status, .. } => {
+                panic!("expected an authenticated SSE response, got HTTP {status}")
+            }
+        }
     }
 
     fn basic_header(user: &str, pass: &str) -> (String, String) {
