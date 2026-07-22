@@ -728,6 +728,16 @@ pub struct CiPipelineReporter {
 }
 
 impl CiPipelineReporter {
+    /// Exact tenant scope this reporter verifies before any durable completion work.
+    pub fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    /// Exact residency region used for every reporter transaction.
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
     /// Build the production reporter with all terminal-accounting authorities present. There is no
     /// default pricer and no production constructor that bypasses the atomic accounting co-commit.
     pub fn new_accounted(
