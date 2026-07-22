@@ -35,7 +35,7 @@ fn edge_transport_keeps_slowloris_connection_and_body_memory_bounds() {
         "BoundedCollectError::TimedOut",
         "Err(BoundedCollectError::Read) => return request_body_read_error()",
         "fn request_body_read_error()",
-        "let gateway_permit = match gateway_dispatch_slots.try_acquire_owned()",
+        "let gateway_permit = match admission.gateway_dispatch.try_acquire_owned()",
         "tokio::task::spawn_blocking(move || {",
         "let _gateway_permit = gateway_permit;",
         "let _git_wire_permit = git_wire_permit;",
