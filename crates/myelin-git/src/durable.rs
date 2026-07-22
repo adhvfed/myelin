@@ -1605,7 +1605,14 @@ impl DurableGitRepo {
         head_oid: &str,
         per_file_line_cap: usize,
     ) -> Result<Option<PrDiff>, DurableError> {
-        self.pr_diff_bounded(base_ref, head_oid, per_file_line_cap, PR_DIFF_MAX_FILES)
+        self.pr_diff_bounded(
+            base_ref,
+            head_oid,
+            per_file_line_cap,
+            PR_DIFF_MAX_FILES,
+            DIFF_MAX_LINE_BYTES,
+            DIFF_MAX_RENDERED_BYTES,
+        )
     }
 
     fn pr_diff_bounded(
@@ -1614,6 +1621,8 @@ impl DurableGitRepo {
         head_oid: &str,
         per_file_line_cap: usize,
         maximum_files: usize,
+        maximum_line_bytes: usize,
+        maximum_rendered_bytes: usize,
     ) -> Result<Option<PrDiff>, DurableError> {
         let repo = self.open_git()?;
         let head = match git2::Oid::from_str(head_oid) {
@@ -1668,6 +1677,8 @@ impl DurableGitRepo {
         // materializes wholesale in the response Vec (R3.2 verifier HOLD — the cap is a load bound, not
         // just a post-hoc trim). Reset when a new file delta begins.
         let rendered = std::cell::RefCell::new(0usize);
+        let rendered_bytes = std::cell::Cell::new(0usize);
+        let limit_exceeded = std::cell::Cell::new(false);
         let mut file_cb = |delta: git2::DiffDelta<'_>, _p: f32| {
             *rendered.borrow_mut() = 0;
             let path = delta
@@ -1744,18 +1755,8 @@ impl DurableGitRepo {
             if !matches!(origin, '+' | '-' | ' ') {
                 return true; // skip file/hunk header context lines libgit2 emits with other origins.
             }
-            let content = String::from_utf8_lossy(line.content())
-                .trim_end_matches('\n')
-                .to_string();
-            // LFS sniff: a pointer file's first added line is `version https://git-lfs…`.
             let mut fs = files.borrow_mut();
             if let Some(f) = fs.last_mut() {
-                if f.kind == FileKind::Text
-                    && origin == '+'
-                    && content.starts_with("version https://git-lfs")
-                {
-                    f.kind = FileKind::Lfs;
-                }
                 // The diffstat (additions/deletions) always reflects the TRUE totals, even past the cap.
                 match origin {
                     '+' => f.additions += 1,
@@ -1767,25 +1768,50 @@ impl DurableGitRepo {
                 let mut r = rendered.borrow_mut();
                 if per_file_line_cap > 0 && *r >= per_file_line_cap {
                     f.truncated = true;
-                } else if let Some(h) = f.hunks.last_mut() {
-                    h.lines.push(DiffLineDelta {
-                        origin,
-                        content,
-                        old_no: line.old_lineno(),
-                        new_no: line.new_lineno(),
-                    });
-                    *r += 1;
+                } else {
+                    let content = String::from_utf8_lossy(line.content())
+                        .trim_end_matches('\n')
+                        .to_string();
+                    let next_bytes = rendered_bytes.get().checked_add(content.len());
+                    if content.len() > maximum_line_bytes
+                        || next_bytes.is_none_or(|bytes| bytes > maximum_rendered_bytes)
+                    {
+                        limit_exceeded.set(true);
+                        return false;
+                    }
+                    rendered_bytes.set(next_bytes.unwrap_or(maximum_rendered_bytes));
+                    // LFS sniff: a pointer file's first added line is `version https://git-lfs…`.
+                    if f.kind == FileKind::Text
+                        && origin == '+'
+                        && content.starts_with("version https://git-lfs")
+                    {
+                        f.kind = FileKind::Lfs;
+                    }
+                    if let Some(h) = f.hunks.last_mut() {
+                        h.lines.push(DiffLineDelta {
+                            origin,
+                            content,
+                            old_no: line.old_lineno(),
+                            new_no: line.new_lineno(),
+                        });
+                        *r += 1;
+                    }
                 }
             }
             true
         };
-        diff.foreach(
+        let traversal = diff.foreach(
             &mut file_cb,
             Some(&mut binary_cb),
             Some(&mut hunk_cb),
             Some(&mut line_cb),
-        )
-        .map_err(|e| git_err("pr diff foreach", e))?;
+        );
+        if limit_exceeded.get() {
+            return Err(DurableError::Git(
+                "pr diff computation limit exceeded: rendered diff content is too large".into(),
+            ));
+        }
+        traversal.map_err(|e| git_err("pr diff foreach", e))?;
 
         let mut files = files.into_inner();
         // Binary/LFS/submodule files carry NO text hunks (never a garbled dump).
@@ -2657,9 +2683,32 @@ mod tests {
         assert_eq!(ctx_a.new_no, Some(1));
 
         assert!(matches!(
-            repo.pr_diff_bounded("refs/heads/main", &head.0, 4000, 0),
+            repo.pr_diff_bounded(
+                "refs/heads/main",
+                &head.0,
+                4000,
+                0,
+                DIFF_MAX_LINE_BYTES,
+                DIFF_MAX_RENDERED_BYTES,
+            ),
             Err(DurableError::Git(message)) if message.starts_with("pr diff computation limit exceeded:")
         ));
+        for (line_bytes, rendered_bytes) in [
+            (0, DIFF_MAX_RENDERED_BYTES),
+            (DIFF_MAX_LINE_BYTES, 1),
+        ] {
+            assert!(matches!(
+                repo.pr_diff_bounded(
+                    "refs/heads/main",
+                    &head.0,
+                    4000,
+                    PR_DIFF_MAX_FILES,
+                    line_bytes,
+                    rendered_bytes,
+                ),
+                Err(DurableError::Git(message)) if message.starts_with("pr diff computation limit exceeded:")
+            ));
+        }
 
         // A malformed/absent head → None (the edge renders the empty state, not a 500).
         assert!(repo.pr_diff("refs/heads/main", "not-an-oid", 4000).unwrap().is_none());
