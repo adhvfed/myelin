@@ -119,6 +119,9 @@ pub const JQ_SERIALIZE_INDEX: &str = "jq_serialize";
 pub const JQ_IDEM_INDEX: &str = "jq_idem";
 /// Exact-cell run-ledger lookup used by [`crate::PgCiPipelineStarter`].
 pub const CI_JOB_RUN_LEDGER_INDEX: &str = "ci_job_run_ledger";
+/// Region starter discovery index over queued CI runs, with tenant ownership covered for an
+/// index-only lookup.
+pub const CI_RUN_QUEUED_REGION_INDEX: &str = "ci_run_queued_region";
 /// Forward-only migration id for [`CI_JOB_RUN_LEDGER_INDEX`]. Kept separate from the already-applied
 /// `ci_0002_ci_job` table/RLS migration so its checksum is never rewritten.
 pub const CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID: &str = "ci_0002a_ci_job_run_ledger";
@@ -150,6 +153,10 @@ pub const CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID: &str =
 /// Additive scheduler grant for the fresh per-claim nonce, without changing applied `ci_0016a`.
 pub const CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID: &str =
     "ci_0016b_scheduler_claim_nonce_grant";
+/// Additive queued-run discovery index, kept separate from the byte-frozen `ci_run` table create.
+pub const CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID: &str = "ci_0018_ci_run_queued_region";
+/// Additive, column-minimal queued-run discovery grant for the constrained region scheduler.
+pub const CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID: &str = "ci_0018a_scheduler_ci_run_discovery";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -763,6 +770,33 @@ GRANT SELECT ON job_queue TO myelin_ci_region_scheduler;
 GRANT UPDATE (state, lease_owner, lease_expires) ON job_queue TO myelin_ci_region_scheduler;
 GRANT SELECT ON fair_deficit TO myelin_ci_region_scheduler";
 
+/// Admit only the five `ci_run` columns needed to choose the tenant owning the oldest queued run.
+/// The paired permissive/restrictive SELECT policies preserve the same empty-tenant, server-mapped
+/// region boundary as queue claim/reap. No run payload, definition, repository, or mutation
+/// privilege is exposed to the scheduler credential.
+pub const GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL: &str = "\
+CREATE POLICY myelin_ci_scheduler_ci_run_discovery_access ON ci_run
+  AS PERMISSIVE FOR SELECT TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+CREATE POLICY myelin_ci_scheduler_ci_run_discovery_guard ON ci_run
+  AS RESTRICTIVE FOR SELECT TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+GRANT SELECT (tenant_id, region, state, created_at, run_id) ON ci_run
+  TO myelin_ci_region_scheduler";
+
+/// Non-blocking partial index for oldest-queued-run discovery in one residency cell.
+pub const CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+ci_run_queued_region ON ci_run (region, created_at, run_id) INCLUDE (tenant_id) \
+WHERE state = 'queued'";
+
 /// The stable migration ids of the WRITER-CRITICAL CI durable tables both CI service mains must have
 /// present regardless of boot order (CT-004m): `ci_run` (ci-dispatch's reserve/start co-commit + the
 /// control-plane run state), `check_attempt` (the control-plane monotonic counter), and
@@ -803,11 +837,11 @@ pub fn make_tenant_scoped_ddl(table: &str) -> String {
 }
 
 /// **The complete CI Control-Plane forward-only migration set** (contract 1.5 / 11.1; arch 01 §3).
-/// One table/RLS [`Migration`] per table, in FK-dependency order, plus four separately versioned
+/// One table/RLS [`Migration`] per table, in FK-dependency order, plus five separately versioned
 /// `CREATE INDEX CONCURRENTLY` migrations and one post-index validation migration: the run-ledger
-/// index and validator immediately after `ci_job`, and the three scheduler indexes immediately after
-/// `job_queue`. Keeping each concurrent index as one top-level command makes the same set executable
-/// by live PostgreSQL.
+/// index and validator immediately after `ci_job`, the three job scheduler indexes immediately after
+/// `job_queue`, and the queued-run discovery index as an additive follow-on. Keeping each concurrent
+/// index as one top-level command makes the same set executable by live PostgreSQL.
 ///
 /// Compatibility: the prior `ci_0004_job_queue` bundled these concurrent indexes into one
 /// multi-statement command. PostgreSQL rejected that command atomically before [`PgMigrator`]
@@ -893,6 +927,16 @@ pub fn ci_controlplane_migrations() -> Migrations {
         CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
         GRANT_SCHEDULER_CLAIM_NONCE_DDL,
         JOB_QUEUE_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID,
+        CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL,
+        CI_RUN_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID,
+        GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL,
+        CI_RUN_TABLE,
     ));
     Migrations::of(migrations)
 }
@@ -1079,8 +1123,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            30,
-            "17 table/RLS + 1 ci_run causal ALTER + 4 concurrent-index + 1 index-validation + 2 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 2 scheduler claim grants"
+            32,
+            "17 table/RLS + 1 ci_run causal ALTER + 5 concurrent-index + 1 index-validation + 2 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 2 scheduler claim grants + 1 scheduler ci_run discovery grant"
         );
         for m in &migrations.0 {
             assert!(
@@ -1116,6 +1160,8 @@ mod tests {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_LEASE_EPOCH_DDL);
             } else if m.id == CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CLAIM_NONCE_DDL);
+            } else if m.id == CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID {
+                assert_eq!(m.ddl, GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL);
             } else if m.id == CI_REGION_SCHEDULER_RLS_MIGRATION_ID {
                 assert_eq!(m.ddl, CREATE_CI_REGION_SCHEDULER_RLS_DDL);
             } else {
@@ -1148,8 +1194,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            30,
-            "the runner applied all 17 table/RLS, 1 ci_run causal ALTER, 4 concurrent-index, 1 index-validation, 2 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, and 2 scheduler claim grants"
+            32,
+            "the runner applied all 17 table/RLS, 1 ci_run causal ALTER, 5 concurrent-index, 1 index-validation, 2 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 2 scheduler claim grants, and 1 scheduler ci_run discovery grant"
         );
         assert_eq!(
             runner.applied()[0],
@@ -1161,21 +1207,45 @@ mod tests {
     #[test]
     fn region_scheduler_boundary_is_additive_restrictive_and_least_privilege() {
         let migrations = ci_controlplane_migrations();
-        // The nonce grant is the final additive migration; the already-shipped epoch grant remains
-        // byte-identical immediately before it.
-        let grant = migrations
+        // The ci_run discovery grant is the final additive migration. The already-shipped claim
+        // grants remain byte-identical.
+        let discovery = migrations
             .0
             .last()
-            .expect("the scheduler nonce grant is the final additive migration");
-        assert_eq!(grant.id, CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID);
-        assert_eq!(grant.table, Some(JOB_QUEUE_TABLE));
-        assert_eq!(grant.ddl, GRANT_SCHEDULER_CLAIM_NONCE_DDL);
+            .expect("the scheduler ci_run discovery grant is the final additive migration");
+        assert_eq!(discovery.id, CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID);
+        assert_eq!(discovery.table, Some(CI_RUN_TABLE));
+        assert_eq!(discovery.ddl, GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL);
+        let discovery_index = migrations
+            .0
+            .iter()
+            .find(|m| m.id == CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID)
+            .expect("queued-run discovery index remains present");
+        assert_eq!(discovery_index.table, Some(CI_RUN_TABLE));
+        assert_eq!(discovery_index.ddl, CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL);
+        for required in [
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ci_run_queued_region",
+            "ON ci_run (region, created_at, run_id)",
+            "INCLUDE (tenant_id)",
+            "WHERE state = 'queued'",
+        ] {
+            assert!(
+                discovery_index.ddl.contains(required),
+                "queued-run discovery index pins `{required}`"
+            );
+        }
         let epoch_grant = migrations
             .0
             .iter()
             .find(|m| m.id == CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID)
             .expect("immutable epoch grant remains present");
         assert_eq!(epoch_grant.ddl, GRANT_SCHEDULER_LEASE_EPOCH_DDL);
+        let nonce_grant = migrations
+            .0
+            .iter()
+            .find(|m| m.id == CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID)
+            .expect("immutable nonce grant remains present");
+        assert_eq!(nonce_grant.ddl, GRANT_SCHEDULER_CLAIM_NONCE_DDL);
         let scheduler = migrations
             .0
             .iter()
@@ -1218,6 +1288,32 @@ mod tests {
 
         let old_ids: Vec<&str> = create_statements().iter().map(|(id, _, _)| *id).collect();
         assert!(!old_ids.contains(&CI_REGION_SCHEDULER_RLS_MIGRATION_ID));
+
+        let discovery_ddl = discovery.ddl;
+        assert_eq!(discovery_ddl.matches("AS PERMISSIVE").count(), 1);
+        assert_eq!(discovery_ddl.matches("AS RESTRICTIVE").count(), 1);
+        for required in [
+            "current_setting('myelin.tenant_id', true) = ''",
+            "region = public.myelin_ci_scheduler_region()",
+            "region = current_setting('myelin.region', true)",
+            "GRANT SELECT (tenant_id, region, state, created_at, run_id) ON ci_run",
+        ] {
+            assert!(
+                discovery_ddl.contains(required),
+                "ci_run discovery boundary pins `{required}`"
+            );
+        }
+        for forbidden in [
+            "GRANT INSERT",
+            "GRANT UPDATE",
+            "GRANT DELETE",
+            "GRANT SELECT ON ci_run",
+        ] {
+            assert!(
+                !discovery_ddl.contains(forbidden),
+                "ci_run discovery boundary forbids `{forbidden}`"
+            );
+        }
     }
 
     #[test]

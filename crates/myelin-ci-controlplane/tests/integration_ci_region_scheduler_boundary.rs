@@ -66,6 +66,40 @@ async fn cleanup(admin: &PgPool, tenants: &[&str]) {
         .execute(admin)
         .await
         .expect("clean scheduler-boundary fairness fixtures");
+    sqlx::query("DELETE FROM ci_run WHERE tenant_id = ANY($1)")
+        .bind(tenants)
+        .execute(admin)
+        .await
+        .expect("clean scheduler-boundary run fixtures");
+}
+
+async fn insert_queued_run(
+    admin: &PgPool,
+    tenant: &str,
+    region: &str,
+    ordinal: u16,
+    created_at: &str,
+) {
+    let run_id = format!("20000000-0000-0000-0000-{ordinal:012}");
+    let wf_run_id = format!("30000000-0000-0000-0000-{ordinal:012}");
+    sqlx::query(
+        "INSERT INTO ci_run (
+           tenant_id, region, run_id, project_id, pipeline_id, wf_run_id,
+           definition_snapshot, trigger_kind, trust_tier, state, correlation_id, created_at
+         ) VALUES (
+           $1, $2, $3::uuid, '22222222-2222-2222-2222-222222222222'::uuid,
+           '33333333-3333-3333-3333-333333333333'::uuid, $4::uuid,
+           'myelin://ci/scheduler-boundary', 'push', 'trusted', 'queued', $3, $5::timestamptz
+         )",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(&run_id)
+    .bind(&wf_run_id)
+    .bind(created_at)
+    .execute(admin)
+    .await
+    .expect("insert queued run discovery fixture");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -119,6 +153,16 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
             EnqueueOutcome::Inserted
         );
     }
+    insert_queued_run(&admin, &tenant_a, FR_PAR, 201, "2001-01-01T00:00:00Z").await;
+    insert_queued_run(&admin, &tenant_b, FR_PAR, 202, "2000-01-01T00:00:00Z").await;
+    insert_queued_run(
+        &admin,
+        &tenant_other_region,
+        DE_FRA,
+        203,
+        "1999-01-01T00:00:00Z",
+    )
+    .await;
 
     let scheduler_config = CiSchedulerDbConfig::from_parts(
         scheduler_url.clone(),
@@ -131,7 +175,25 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         .await
         .expect("validate the dedicated scheduler role");
     let region_store = scheduler.region_queue_store();
+    let run_discovery = scheduler.region_run_discovery();
     let labels = vec![proof_label.clone()];
+
+    assert_eq!(
+        run_discovery
+            .next_queued_tenant(FR_PAR)
+            .await
+            .expect("discover oldest same-region queued run"),
+        Some(myelin_tenancy::TenantId(tenant_b.clone())),
+        "discovery returns only the authoritative tenant owning the oldest visible queued run"
+    );
+    assert!(
+        run_discovery
+            .next_queued_tenant(DE_FRA)
+            .await
+            .expect("wrong-region discovery is safely empty")
+            .is_none(),
+        "changing the client region GUC cannot expose a run outside the server-owned mapping"
+    );
 
     let baseline_null_stage = region_store
         .count_non_terminal_null_stage_jobs(FR_PAR)
@@ -298,8 +360,13 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         .execute(&mut *tenant_escape)
         .await
         .expect("restrictive policy update");
+    let escaped_runs: Vec<String> = sqlx::query_scalar("SELECT tenant_id FROM ci_run")
+        .fetch_all(&mut *tenant_escape)
+        .await
+        .expect("restrictive ci_run policy read");
     assert_eq!(escaped_rows, 0);
     assert_eq!(escaped_updates.rows_affected(), 0);
+    assert!(escaped_runs.is_empty());
     tenant_escape
         .rollback()
         .await
@@ -320,7 +387,12 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         .fetch_one(&mut *wrong_region)
         .await
         .expect("mapped-region policy read");
+    let other_region_runs: Vec<String> = sqlx::query_scalar("SELECT tenant_id FROM ci_run")
+        .fetch_all(&mut *wrong_region)
+        .await
+        .expect("mapped-region ci_run policy read");
     assert_eq!(other_region_rows, 0);
+    assert!(other_region_runs.is_empty());
     wrong_region
         .rollback()
         .await
@@ -342,7 +414,19 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         sqlx::query("SELECT * FROM ci_run LIMIT 1")
             .execute(&raw_scheduler)
             .await,
-        "scheduler unrelated-table read must be denied",
+        "scheduler broad ci_run read must be denied",
+    );
+    assert_permission_denied(
+        sqlx::query("SELECT definition_snapshot FROM ci_run LIMIT 1")
+            .execute(&raw_scheduler)
+            .await,
+        "scheduler sensitive ci_run column read must be denied",
+    );
+    assert_permission_denied(
+        sqlx::query("UPDATE ci_run SET state = 'running' WHERE true")
+            .execute(&raw_scheduler)
+            .await,
+        "scheduler ci_run mutation must be denied",
     );
     assert_permission_denied(
         sqlx::query("SELECT * FROM myelin_ci_scheduler_region_map")

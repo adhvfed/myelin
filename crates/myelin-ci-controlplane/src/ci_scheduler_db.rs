@@ -3,7 +3,8 @@
 //! The ordinary runtime pool authenticates as the tenant application role and must never claim or
 //! reap across tenants. This module opens the separately configured scheduler credential only after
 //! migrations, validates its server-owned region mapping and exact least-privilege posture, and
-//! exposes the pool solely as [`crate::CiRegionQueueStore`].
+//! exposes the pool solely as [`crate::CiRegionQueueStore`] and
+//! [`crate::CiRegionRunDiscovery`].
 //!
 //! **Named lint exclusion.** This file's SQL reads only PostgreSQL identity, catalog, privilege, and
 //! server-owned scheduler-region metadata. Those are database/cell authorization facts spanning
@@ -15,7 +16,7 @@ use myelin_config::MyelinConfig;
 use myelin_storage::connect_pool_with_reset;
 use sqlx::{PgPool, Row};
 
-use crate::CiRegionQueueStore;
+use crate::{CiRegionQueueStore, CiRegionRunDiscovery};
 
 /// Required production credential for the constrained region scheduler login.
 pub const CI_SCHEDULER_DATABASE_URL_ENV: &str = "MYELIN_CI_SCHEDULER_DATABASE_URL";
@@ -169,10 +170,10 @@ impl core::fmt::Display for CiSchedulerDbError {
                 "CI scheduler server-owned region does not match the configured region"
             }
             Self::InsufficientPrivileges => {
-                "CI scheduler database role lacks required queue privileges"
+                "CI scheduler database role lacks required queue or run-discovery privileges"
             }
             Self::ExcessPrivileges => {
-                "CI scheduler database role has privileges outside claim/reap"
+                "CI scheduler database role has privileges outside claim/reap/run discovery"
             }
         };
         f.write_str(message)
@@ -181,7 +182,7 @@ impl core::fmt::Display for CiSchedulerDbError {
 
 impl std::error::Error for CiSchedulerDbError {}
 
-/// Validated provider that can yield only the region queue capability, never a raw pool.
+/// Validated provider that can yield only scheduler capabilities, never a raw pool.
 pub struct CiSchedulerDbProvider {
     pool: PgPool,
 }
@@ -206,9 +207,14 @@ impl CiSchedulerDbProvider {
         Ok(Self { pool })
     }
 
-    /// Produce the only capability the scheduler credential is allowed to drive.
+    /// Produce the region-wide job claim/reap capability.
     pub fn region_queue_store(&self) -> CiRegionQueueStore {
         CiRegionQueueStore::with_pg(self.pool.clone())
+    }
+
+    /// Produce the column-minimal queued-run discovery capability.
+    pub fn region_run_discovery(&self) -> CiRegionRunDiscovery {
+        CiRegionRunDiscovery::with_pg(self.pool.clone())
     }
 }
 
@@ -242,6 +248,11 @@ struct SchedulerProbe {
     job_update_epoch: bool,
     job_update_nonce: bool,
     fair_select: bool,
+    run_select_tenant: bool,
+    run_select_region: bool,
+    run_select_state: bool,
+    run_select_created_at: bool,
+    run_select_run_id: bool,
     mapping_function_execute: bool,
     excess_privilege: bool,
 }
@@ -330,6 +341,11 @@ fn validate_probe_before_mapping(
         && scheduler.job_update_epoch
         && scheduler.job_update_nonce
         && scheduler.fair_select
+        && scheduler.run_select_tenant
+        && scheduler.run_select_region
+        && scheduler.run_select_state
+        && scheduler.run_select_created_at
+        && scheduler.run_select_run_id
         && scheduler.mapping_function_execute)
     {
         return Err(CiSchedulerDbError::InsufficientPrivileges);
@@ -427,6 +443,11 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'lease_epoch', 'UPDATE') AS job_update_epoch,
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'claim_nonce', 'UPDATE') AS job_update_nonce,
                 pg_catalog.has_table_privilege(session_user, 'public.fair_deficit', 'SELECT') AS fair_select,
+                pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'tenant_id', 'SELECT') AS run_select_tenant,
+                pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'region', 'SELECT') AS run_select_region,
+                pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'state', 'SELECT') AS run_select_state,
+                pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'created_at', 'SELECT') AS run_select_created_at,
+                pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'run_id', 'SELECT') AS run_select_run_id,
                 pg_catalog.has_function_privilege(
                   session_user, 'public.myelin_ci_scheduler_region()'::regprocedure, 'EXECUTE'
                 ) AS mapping_function_execute,
@@ -454,6 +475,25 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                   OR pg_catalog.has_table_privilege(session_user, 'public.fair_deficit', 'TRUNCATE')
                   OR pg_catalog.has_table_privilege(session_user, 'public.fair_deficit', 'REFERENCES')
                   OR pg_catalog.has_table_privilege(session_user, 'public.fair_deficit', 'TRIGGER')
+                  OR pg_catalog.has_table_privilege(session_user, 'public.ci_run', 'INSERT')
+                  OR pg_catalog.has_table_privilege(session_user, 'public.ci_run', 'UPDATE')
+                  OR pg_catalog.has_table_privilege(session_user, 'public.ci_run', 'DELETE')
+                  OR pg_catalog.has_table_privilege(session_user, 'public.ci_run', 'TRUNCATE')
+                  OR pg_catalog.has_table_privilege(session_user, 'public.ci_run', 'REFERENCES')
+                  OR pg_catalog.has_table_privilege(session_user, 'public.ci_run', 'TRIGGER')
+                  OR EXISTS (
+                    SELECT 1
+                      FROM pg_catalog.pg_attribute AS run_column
+                     WHERE run_column.attrelid = 'public.ci_run'::regclass
+                       AND run_column.attnum > 0
+                       AND NOT run_column.attisdropped
+                       AND run_column.attname NOT IN (
+                         'tenant_id', 'region', 'state', 'created_at', 'run_id'
+                       )
+                       AND pg_catalog.has_column_privilege(
+                         session_user, run_column.attrelid, run_column.attnum, 'SELECT'
+                       )
+                  )
                   OR EXISTS (
                     SELECT 1
                       FROM pg_catalog.pg_class AS unrelated
@@ -465,6 +505,7 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                        AND unrelated.oid NOT IN (
                          'public.job_queue'::regclass,
                          'public.fair_deficit'::regclass,
+                         'public.ci_run'::regclass,
                          'public.myelin_ci_scheduler_region_map'::regclass
                        )
                        AND (
@@ -562,6 +603,11 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
         job_update_epoch: row.get("job_update_epoch"),
         job_update_nonce: row.get("job_update_nonce"),
         fair_select: row.get("fair_select"),
+        run_select_tenant: row.get("run_select_tenant"),
+        run_select_region: row.get("run_select_region"),
+        run_select_state: row.get("run_select_state"),
+        run_select_created_at: row.get("run_select_created_at"),
+        run_select_run_id: row.get("run_select_run_id"),
         mapping_function_execute: row.get("mapping_function_execute"),
         excess_privilege: row.get("excess_privilege"),
     })
