@@ -29,7 +29,7 @@ use http_body_util::{BodyExt, Empty, Limited};
 use hyper::{Request, Uri};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use myelin_config::Mode;
+use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
     bootstrap_principal_and_mint, recover_placed_git_at_boot, register_git_durable,
     register_git_wire, register_issues, serve_edge_until_shutdown_with_probe,
@@ -76,7 +76,6 @@ const EDGE_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 const EDGE_READINESS_DEADLINE: Duration = Duration::from_secs(2);
 const EDGE_READINESS_CACHE_TTL: Duration = Duration::from_secs(1);
 const OIDC_JWKS_DEADLINE: Duration = Duration::from_secs(5);
-const OIDC_JWKS_MAX_BYTES: usize = 1024 * 1024;
 static READINESS_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct EdgeReadiness {
@@ -130,6 +129,31 @@ fn validated_oidc_jwks_uri(raw: &str) -> Result<Uri, String> {
         return Err("MYELIN_OIDC_JWKS_URI must not contain credentials".into());
     }
     Ok(uri)
+}
+
+fn validated_oidc_issuer(raw: &str) -> Result<String, String> {
+    if raw.contains('#') {
+        return Err("MYELIN_OIDC_ISSUER must not contain a fragment".into());
+    }
+    let uri: Uri = raw
+        .parse()
+        .map_err(|_| "MYELIN_OIDC_ISSUER is not a valid absolute URI".to_string())?;
+    if uri.scheme_str() != Some("https") {
+        return Err("MYELIN_OIDC_ISSUER must use https".into());
+    }
+    let authority = uri
+        .authority()
+        .ok_or_else(|| "MYELIN_OIDC_ISSUER must include a host".to_string())?;
+    if authority.as_str().contains('@') {
+        return Err("MYELIN_OIDC_ISSUER must not contain credentials".into());
+    }
+    if uri
+        .path_and_query()
+        .is_some_and(|value| value.query().is_some())
+    {
+        return Err("MYELIN_OIDC_ISSUER must not contain a query string".into());
+    }
+    Ok(raw.to_string())
 }
 
 fn parse_oidc_jwks_response(
@@ -773,6 +797,10 @@ async fn serve(
     );
     let human_login = Arc::new(match oidc_settings {
         Some(oidc) => {
+            let issuer = validated_oidc_issuer(&oidc.issuer).unwrap_or_else(|error| {
+                eprintln!("edge: invalid OIDC issuer configuration: {error}");
+                std::process::exit(1);
+            });
             let jwks_uri = oidc
                 .jwks_uri
                 .as_deref()
@@ -816,7 +844,7 @@ async fn serve(
                     "disabled"
                 }
             );
-            let config = OidcConfig::new(oidc.issuer, oidc.audience);
+            let config = OidcConfig::new(issuer, oidc.audience);
             let replay =
                 ReplayGuard::with_pg(DurableReplayBacking::new(provider.clone()), handle.clone());
             match jwks_uri {
@@ -1337,6 +1365,24 @@ mod runtime_config_tests {
                 "unexpected error for {raw}: {error}"
             );
             assert!(!error.contains("secret"), "URI credentials leaked: {error}");
+        }
+    }
+
+    #[test]
+    fn oidc_issuer_requires_a_query_free_https_identifier() {
+        assert_eq!(
+            validated_oidc_issuer("https://idp.example.com/tenant").unwrap(),
+            "https://idp.example.com/tenant"
+        );
+        for (raw, expected) in [
+            ("http://idp.example.com", "must use https"),
+            ("https://user:secret@idp.example.com", "credentials"),
+            ("https://idp.example.com?tenant=acme", "query string"),
+            ("https://idp.example.com#issuer", "fragment"),
+        ] {
+            let error = validated_oidc_issuer(raw).unwrap_err();
+            assert!(error.contains(expected));
+            assert!(!error.contains("secret"));
         }
     }
 
