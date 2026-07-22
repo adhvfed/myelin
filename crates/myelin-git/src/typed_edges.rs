@@ -177,8 +177,16 @@ pub fn edge_aggregate_key(source: &ArtifactRef, target: &ArtifactRef) -> Aggrega
 ///
 /// A `Closes` with no following key is NOT a trailer (no silent empty edge). Duplicate keys across
 /// lines are de-duplicated (a PR that says `Closes ENG-1` twice closes ENG-1 ONCE — 0 duplicate edges).
-pub fn parse_closes_trailers(message: &str) -> Vec<String> {
+pub fn parse_closes_trailers(message: &str) -> Result<Vec<String>, TrailerParseError> {
+    const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+    const MAX_KEYS: usize = 100;
+    const MAX_KEY_BYTES: usize = 256;
+    const MAX_TOTAL_KEY_BYTES: usize = 8 * 1024;
+    if message.len() > MAX_MESSAGE_BYTES {
+        return Err(TrailerParseError::LimitExceeded("message bytes"));
+    }
     let mut keys: Vec<String> = Vec::new();
+    let mut total_key_bytes = 0usize;
     for raw in message.lines() {
         let line = raw.trim();
         // Match a line-leading `Closes` (case-insensitive) followed by `:` or whitespace.
@@ -193,12 +201,41 @@ pub fn parse_closes_trailers(message: &str) -> Vec<String> {
                 continue;
             }
             if !keys.iter().any(|k| k == key) {
+                if key.len() > MAX_KEY_BYTES {
+                    return Err(TrailerParseError::LimitExceeded("issue key bytes"));
+                }
+                if keys.len() >= MAX_KEYS {
+                    return Err(TrailerParseError::LimitExceeded("issue key count"));
+                }
+                total_key_bytes = total_key_bytes
+                    .checked_add(key.len())
+                    .ok_or(TrailerParseError::LimitExceeded("total issue key bytes"))?;
+                if total_key_bytes > MAX_TOTAL_KEY_BYTES {
+                    return Err(TrailerParseError::LimitExceeded("total issue key bytes"));
+                }
                 keys.push(key.to_string());
             }
         }
     }
-    keys
+    Ok(keys)
 }
+
+/// A structured lifecycle trailer was refused before edge-key allocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrailerParseError {
+    /// A bounded message, key-count, single-key, or aggregate-key ceiling was exceeded.
+    LimitExceeded(&'static str),
+}
+
+impl std::fmt::Display for TrailerParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LimitExceeded(kind) => write!(f, "Closes trailer {kind} limit exceeded"),
+        }
+    }
+}
+
+impl std::error::Error for TrailerParseError {}
 
 /// Strip a line-leading `Closes` trailer keyword (case-insensitive), with an optional `:` and the
 /// mandatory following whitespace, returning the remainder (the issue-key portion). Returns `None` if
@@ -357,7 +394,7 @@ mod tests {
     #[test]
     fn closes_trailer_is_line_leading_not_mid_sentence() {
         let msg = "Fix the charge bug\n\nThis closes a long-standing race.\nCloses ENG-1\n";
-        let keys = parse_closes_trailers(msg);
+        let keys = parse_closes_trailers(msg).unwrap();
         assert_eq!(
             keys,
             vec!["ENG-1".to_string()],
@@ -369,7 +406,7 @@ mod tests {
     #[test]
     fn closes_trailer_colon_caseless_multikey_dedup() {
         let msg = "title\n\ncloses: ENG-1, ENG-2\nCLOSES ENG-2\nCloses ENG-3\n";
-        let keys = parse_closes_trailers(msg);
+        let keys = parse_closes_trailers(msg).unwrap();
         assert_eq!(
             keys,
             vec![
@@ -386,17 +423,43 @@ mod tests {
     #[test]
     fn closes_without_key_or_undelimited_is_not_a_trailer() {
         assert!(
-            parse_closes_trailers("Closes\n").is_empty(),
+            parse_closes_trailers("Closes\n").unwrap().is_empty(),
             "a bare `Closes` yields no key"
         );
         assert!(
-            parse_closes_trailers("Closes   \n").is_empty(),
+            parse_closes_trailers("Closes   \n").unwrap().is_empty(),
             "`Closes` + whitespace only, no key"
         );
         assert!(
-            parse_closes_trailers("Closesthebug now\n").is_empty(),
+            parse_closes_trailers("Closesthebug now\n")
+                .unwrap()
+                .is_empty(),
             "an undelimited `Closesthebug` is NOT the trailer keyword"
         );
+    }
+
+    #[test]
+    fn closes_trailer_parser_bounds_message_keys_and_key_bytes() {
+        let exact_keys = (0..100)
+            .map(|index| format!("Closes ENG-{index}\n"))
+            .collect::<String>();
+        assert_eq!(parse_closes_trailers(&exact_keys).unwrap().len(), 100);
+        assert!(parse_closes_trailers(&(exact_keys + "Closes ENG-100\n")).is_err());
+
+        let exact_key = "x".repeat(256);
+        assert_eq!(
+            parse_closes_trailers(&format!("Closes {exact_key}"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(parse_closes_trailers(&format!("Closes {}", "x".repeat(257))).is_err());
+        assert!(parse_closes_trailers(&"x".repeat(64 * 1024 + 1)).is_err());
+
+        let aggregate_over = (0..33)
+            .map(|index| format!("Closes {index:03}{}\n", "x".repeat(253)))
+            .collect::<String>();
+        assert!(parse_closes_trailers(&aggregate_over).is_err());
     }
 
     // ── 2. extraction: one edge per linkage, correct rel/target ────────────────────────────────────

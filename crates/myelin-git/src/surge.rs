@@ -254,7 +254,7 @@ pub fn run_e2e_1_pr_pane() -> E2eArtifact {
     let message = "Fix the auth bug.\n\nCloses ENG-1421\n";
 
     // git is the reference PRODUCER: the `Closes` trailer yields exactly one closes edge target.
-    let keys = parse_closes_trailers(message);
+    let keys = parse_closes_trailers(message).expect("bounded E2E fixture");
     let closes_targets: Vec<ArtifactRef> = keys
         .iter()
         .map(|k| ArtifactRef(format!("myelin://{}/issue/issue/{k}", tenant.0)))
@@ -330,7 +330,7 @@ pub fn run_e2e_2_fix_pr() -> E2eArtifact {
 
     // (4) git.pr.merged closes the issue via the Closes trailer (exactly one closes edge).
     let message = "Apply the fix.\n\nCloses ENG-1421\n";
-    let keys = parse_closes_trailers(message);
+    let keys = parse_closes_trailers(message).expect("bounded E2E fixture");
     let closes_targets: Vec<ArtifactRef> = keys
         .iter()
         .map(|k| ArtifactRef(format!("myelin://{}/issue/issue/{k}", tenant.0)))
@@ -361,7 +361,7 @@ pub fn run_e2e_3_spec_to_ship() -> E2eArtifact {
 
     // the LIVE lineage: the merged PR's closes linkage (commit→PR→merge→issue).
     let message = "Apply the fix.\n\nCloses ENG-1421\nCloses ENG-1500\n";
-    let keys = parse_closes_trailers(message);
+    let keys = parse_closes_trailers(message).expect("bounded E2E fixture");
     let closes_targets: Vec<ArtifactRef> = keys
         .iter()
         .map(|k| ArtifactRef(format!("myelin://{}/issue/issue/{k}", tenant.0)))
