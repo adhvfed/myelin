@@ -157,6 +157,28 @@ describe("gateway response limits", () => {
     await expect(edgeGetRaw("/v1/git/raw")).rejects.toThrow(/byte limit/);
   });
 
+  it("returns raw bytes as a stream without waiting for the upstream body to finish", async () => {
+    let upstream: ReadableStreamDefaultController<Uint8Array> | undefined;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          upstream = controller;
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/octet-stream" } },
+    )));
+
+    const raw = await edgeGetRaw("/v1/git/raw");
+    const reader = raw.body.getReader();
+    upstream!.enqueue(new Uint8Array([1, 2, 3]));
+
+    await expect(reader.read()).resolves.toEqual({
+      done: false,
+      value: new Uint8Array([1, 2, 3]),
+    });
+    await reader.cancel();
+  });
+
   it("uses a small dedicated cap for the unauthenticated auth config", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("{}", {
       status: 200,

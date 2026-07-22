@@ -16,7 +16,7 @@ import {
   updateSessionToken,
 } from "./session";
 import { edgeOrigin } from "./edge-origin";
-import { readLimitedBytes, readLimitedText } from "./bounded-response";
+import { readLimitedText, streamLimitedBytes } from "./bounded-response";
 import { validSessionToken } from "./session-store";
 
 export { GatewayError, Unauthorized } from "./gateway-core";
@@ -238,12 +238,12 @@ async function edgeRequest<T>(
 
 /** The RAW byte-fetch (R3.4 raw/download proxy). Streams an edge blob through the SAME server-side
  *  auth (Bearer from the session cookie; never a public signed URL — the sovereignty rail), with ONE
- *  refresh retry on 401. Returns the status, the edge's content-type, and raw bytes. The browser
+ *  refresh retry on 401. Returns the status, the edge's content-type, and a bounded stream. The browser
  *  proxy owns a safe Content-Disposition rather than trusting blob metadata. Binary-safe. */
 export interface RawEdgeResponse {
   status: number;
   contentType: string;
-  body: ArrayBuffer;
+  body: ReadableStream<Uint8Array>;
 }
 
 export async function edgeGetRaw(
@@ -266,6 +266,7 @@ export async function edgeGetRaw(
   let res = await doFetch(token);
   if (res.status === 401) {
     // ONE refresh round-trip + retry (mirrors runGateway), then give up.
+    await res.body?.cancel().catch(() => undefined);
     const rec = await getSessionRecord();
     let fresh: string | null = null;
     if (rec?.refreshToken) {
@@ -278,6 +279,8 @@ export async function edgeGetRaw(
       if (rr.status === 200) {
         const candidate = refreshAccessToken(await readLimitedText(rr, 64 * 1024), rec.token);
         if (candidate && (await updateSessionToken(candidate))) fresh = candidate;
+      } else {
+        await rr.body?.cancel().catch(() => undefined);
       }
     }
     if (!fresh) {
@@ -286,15 +289,15 @@ export async function edgeGetRaw(
     }
     res = await doFetch(fresh);
     if (res.status === 401) {
+      await res.body?.cancel().catch(() => undefined);
       await clearCurrentSession();
       throw new Unauthorized("still unauthorized after one refresh");
     }
   }
-  const body = await readLimitedBytes(res, MAX_EDGE_RAW_RESPONSE_BYTES);
   return {
     status: res.status,
     contentType: res.headers.get("content-type") ?? "application/octet-stream",
-    body: body.buffer,
+    body: streamLimitedBytes(res, MAX_EDGE_RAW_RESPONSE_BYTES),
   };
 }
 
