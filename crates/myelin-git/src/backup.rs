@@ -48,6 +48,7 @@
 //!   external oracle (see `tests/git_backup_restore.rs`). The DB-PITR floor (live `pg_basebackup`
 //!   / WAL replay) remains deferred — that is not this module.
 
+use std::io::Read as _;
 use std::path::Path;
 
 use crate::core::{Oid, RepoLoc};
@@ -64,7 +65,14 @@ const MAGIC_V1: &[u8] = b"MYELIN-GIT-BACKUP-v1\0";
 const MAGIC_V2: &[u8] = b"MYELIN-GIT-BACKUP-v2\0";
 const MAGIC: &[u8] = MAGIC_V2;
 const CHECKSUM_LEN: usize = 32;
-const MAX_BACKUP_REFS: usize = 1_000_000;
+const MAX_BACKUP_REFS: usize = crate::durable::WIRE_MAX_REFS;
+/// The present backup object owns one complete pack in memory. Refuse beyond this operational
+/// ceiling during construction, before a second repo-sized allocation can occur.
+const MAX_BACKUP_PACK_BYTES: usize = 512 * 1024 * 1024;
+/// Aggregate framing/ref-name/oid/checksum bytes outside the pack.
+const MAX_BACKUP_REF_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// Pack plus bounded ref-frame/checksum overhead accepted from off-host storage.
+const MAX_BACKUP_ARTIFACT_BYTES: usize = MAX_BACKUP_PACK_BYTES + MAX_BACKUP_REF_FRAME_BYTES;
 
 // ───────────────────────────── errors ────────────────────────────────────────────────────────────
 
@@ -143,9 +151,26 @@ impl GitRepoBackup {
     /// complete object closure reachable from those tips via libgit2 (we do NOT reimplement
     /// packing). The returned artifact is reconstructable on its own.
     pub fn create(repo: &DurableGitRepo) -> Result<GitRepoBackup, GitBackupError> {
+        Self::create_bounded(repo, MAX_BACKUP_PACK_BYTES)
+    }
+
+    fn create_bounded(
+        repo: &DurableGitRepo,
+        maximum_pack_bytes: usize,
+    ) -> Result<GitRepoBackup, GitBackupError> {
         // (1) Ref-snapshot point FIRST. Objects are immutable/append-only, so the closure reachable
         // from these exact tips is frozen — the backed-up refs will only point at backed-up objects.
         let refs = repo.list_refs_bounded(MAX_BACKUP_REFS)?;
+        let ref_frame_bytes = refs.iter().try_fold(MAGIC.len() + 4 + 8 + CHECKSUM_LEN, |total, (name, oid)| {
+            total
+                .checked_add(4 + name.len())
+                .and_then(|total| total.checked_add(4 + oid.as_str().len()))
+        });
+        if ref_frame_bytes.is_none_or(|bytes| bytes > MAX_BACKUP_REF_FRAME_BYTES) {
+            return Err(GitBackupError::BadArtifact(format!(
+                "backup ref frame exceeds the {MAX_BACKUP_REF_FRAME_BYTES}-byte artifact limit"
+            )));
+        }
 
         // (2) Pack the full closure with libgit2. Open the same on-disk bare repo GT-001 manages.
         let git = git2::Repository::open(repo.path())
@@ -168,9 +193,22 @@ impl GitRepoBackup {
         // insert_walk packs every commit in the walk + its tree + blobs (full history closure).
         pb.insert_walk(&mut walk).map_err(|e| git_err("insert_walk", e))?;
 
-        let mut buf = git2::Buf::new();
-        pb.write_buf(&mut buf).map_err(|e| git_err("write pack buf", e))?;
-        let pack = buf.to_vec();
+        let mut pack = Vec::new();
+        let mut exceeded = false;
+        let result = pb.foreach(|chunk| {
+            if chunk.len() > maximum_pack_bytes.saturating_sub(pack.len()) {
+                exceeded = true;
+                return false;
+            }
+            pack.extend_from_slice(chunk);
+            true
+        });
+        if exceeded {
+            return Err(GitBackupError::BadArtifact(format!(
+                "backup pack exceeds the {maximum_pack_bytes}-byte construction limit"
+            )));
+        }
+        result.map_err(|e| git_err("stream pack bytes", e))?;
 
         Ok(GitRepoBackup { refs, pack })
     }
@@ -217,6 +255,23 @@ impl GitRepoBackup {
     /// (bad magic, a truncated length, non-utf8 ref) is a LOUD [`GitBackupError::BadArtifact`],
     /// never a silent partial parse.
     pub fn deserialize(bytes: &[u8]) -> Result<GitRepoBackup, GitBackupError> {
+        Self::deserialize_bounded(
+            bytes,
+            MAX_BACKUP_ARTIFACT_BYTES,
+            MAX_BACKUP_PACK_BYTES,
+        )
+    }
+
+    fn deserialize_bounded(
+        bytes: &[u8],
+        maximum_artifact_bytes: usize,
+        maximum_pack_bytes: usize,
+    ) -> Result<GitRepoBackup, GitBackupError> {
+        if bytes.len() > maximum_artifact_bytes {
+            return Err(GitBackupError::BadArtifact(format!(
+                "backup artifact exceeds the {maximum_artifact_bytes}-byte read limit"
+            )));
+        }
         if bytes.len() < MAGIC.len() {
             return Err(GitBackupError::BadArtifact("artifact is shorter than its magic".into()));
         }
@@ -287,6 +342,11 @@ impl GitRepoBackup {
         let pack_len = usize::try_from(cur.take_u64()?).map_err(|_| {
             GitBackupError::BadArtifact("pack length exceeds this host's address space".into())
         })?;
+        if pack_len > maximum_pack_bytes {
+            return Err(GitBackupError::BadArtifact(format!(
+                "backup pack exceeds the {maximum_pack_bytes}-byte parse limit"
+            )));
+        }
         let pack = cur.take(pack_len)?.to_vec();
         if cur.remaining() != 0 {
             return Err(GitBackupError::BadArtifact(format!(
@@ -309,9 +369,38 @@ impl GitRepoBackup {
 
     /// Read + reconstruct the artifact from an off-host file.
     pub fn read_from_file(path: &Path) -> Result<GitRepoBackup, GitBackupError> {
-        let bytes = std::fs::read(path)
+        Self::read_from_file_bounded(path, MAX_BACKUP_ARTIFACT_BYTES)
+    }
+
+    fn read_from_file_bounded(
+        path: &Path,
+        maximum_artifact_bytes: usize,
+    ) -> Result<GitRepoBackup, GitBackupError> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| GitBackupError::Io(format!("open artifact {}: {e}", path.display())))?;
+        let file_bytes = file
+            .metadata()
+            .map_err(|e| GitBackupError::Io(format!("stat artifact {}: {e}", path.display())))?
+            .len();
+        if file_bytes > maximum_artifact_bytes as u64 {
+            return Err(GitBackupError::BadArtifact(format!(
+                "backup artifact exceeds the {maximum_artifact_bytes}-byte read limit"
+            )));
+        }
+        let mut bytes = Vec::new();
+        file.take((maximum_artifact_bytes as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
             .map_err(|e| GitBackupError::Io(format!("read artifact {}: {e}", path.display())))?;
-        GitRepoBackup::deserialize(&bytes)
+        if bytes.len() > maximum_artifact_bytes {
+            return Err(GitBackupError::BadArtifact(format!(
+                "backup artifact exceeds the {maximum_artifact_bytes}-byte read limit"
+            )));
+        }
+        GitRepoBackup::deserialize_bounded(
+            &bytes,
+            maximum_artifact_bytes,
+            MAX_BACKUP_PACK_BYTES.min(maximum_artifact_bytes),
+        )
     }
 }
 
@@ -605,6 +694,42 @@ mod tests {
             empty,
             "existing v1 artifacts remain readable"
         );
+    }
+
+    #[test]
+    fn backup_pack_and_artifact_limits_fail_before_unbounded_allocation() {
+        let root = temp_root("bounded-pack");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).unwrap();
+        seed(&repo);
+        let normal = GitRepoBackup::create(&repo).unwrap();
+        assert_eq!(
+            GitRepoBackup::create_bounded(&repo, normal.pack_len()).unwrap().pack_len(),
+            normal.pack_len(),
+            "the exact pack limit succeeds"
+        );
+        assert!(matches!(
+            GitRepoBackup::create_bounded(&repo, normal.pack_len() - 1),
+            Err(GitBackupError::BadArtifact(message)) if message.contains("construction limit")
+        ));
+
+        let mut declared_pack = MAGIC_V1.to_vec();
+        declared_pack.extend_from_slice(&0u32.to_be_bytes());
+        declared_pack.extend_from_slice(&2u64.to_be_bytes());
+        assert!(matches!(
+            GitRepoBackup::deserialize_bounded(&declared_pack, 64, 1),
+            Err(GitBackupError::BadArtifact(message)) if message.contains("parse limit")
+        ));
+
+        let artifact = temp_root("oversized-artifact");
+        std::fs::write(&artifact, [0u8; 17]).unwrap();
+        assert!(matches!(
+            GitRepoBackup::read_from_file_bounded(&artifact, 16),
+            Err(GitBackupError::BadArtifact(message)) if message.contains("read limit")
+        ));
+
+        std::fs::remove_file(&artifact).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// **DESTRUCTIVE round-trip into a CLEAN target (the unit slice).** Back up → restore into a
