@@ -90,7 +90,7 @@ fn open_pr_with_closes_trailer_then_merge_emits_exactly_one_closes_edge() {
     let merge_message = "Land the charge fix\n\nReviewed and tested.\nCloses ENG-1\n";
 
     // 2. parse the trailer (structured — a prose `closes` would not match).
-    let issue_keys = parse_closes_trailers(merge_message);
+    let issue_keys = parse_closes_trailers(merge_message).expect("bounded fixture");
     assert_eq!(
         issue_keys,
         vec!["ENG-1".to_string()],
@@ -202,7 +202,7 @@ fn plain_merge_without_trailer_or_link_emits_zero_edges() {
 
     // a body that MENTIONS closing in prose, but carries no trailer line.
     let message = "This closes a long-standing gap in the charge path, finally.";
-    let keys = parse_closes_trailers(message);
+    let keys = parse_closes_trailers(message).expect("bounded fixture");
     assert!(keys.is_empty(), "a prose `closes` is not a trailer");
 
     let ev = merged_event(&source);
