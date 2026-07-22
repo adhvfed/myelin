@@ -103,6 +103,9 @@ use crate::blob::ContentHash;
 use crate::encryption::SubjectId;
 use crate::firehose_archive::{ArchiveError, FirehoseArchiver, SealedSegment};
 use crate::kms::KmsEngine;
+
+const CI_LOG_MAX_SPANS_PER_STEP: usize = 10_000;
+const CI_LOG_MAX_RESOLVED_STEP_BYTES: usize = 64 * 1024 * 1024;
 use crate::residency::StoreResidencyReport;
 
 /// The firehose stream CI logs ride (the `(stream, scope)` half the archiver seals under). CI logs
@@ -282,7 +285,7 @@ impl CiLogIndex {
     pub fn step_log_len(&self, job_id: &str, step_no: u32) -> u64 {
         self.by_step
             .get(&(job_id.to_string(), step_no))
-            .map(|v| v.iter().map(|s| s.len).sum())
+            .map(|v| v.iter().fold(0u64, |total, span| total.saturating_add(span.len)))
             .unwrap_or(0)
     }
 
@@ -310,6 +313,8 @@ pub enum CiLogError {
         offset: u64,
         len: u64,
     },
+    /// A step resolution was refused before cloning spans or allocating its output buffer.
+    LimitExceeded(&'static str),
 }
 
 impl core::fmt::Display for CiLogError {
@@ -330,9 +335,12 @@ impl core::fmt::Display for CiLogError {
             } => write!(
                 f,
                 "ci log index: span [{offset}, {}) out of bounds in segment {} — corrupt index, serve refused",
-                offset + len,
+                offset.saturating_add(*len),
                 segment.to_multihash_string()
             ),
+            CiLogError::LimitExceeded(kind) => {
+                write!(f, "ci log index: {kind} limit exceeded")
+            }
         }
     }
 }
@@ -544,13 +552,43 @@ impl CiLogTier {
     /// the index never saw is a LOUD [`CiLogError::UnknownStep`] (never an empty/wrong serve). This is
     /// the byte-exact resolution behind the X-1 jump-to-failure.
     pub fn resolve_step(&self, job_id: &str, step_no: u32) -> Result<Vec<u8>, CiLogError> {
-        let spans: Vec<StepSpan> = {
+        self.resolve_step_bounded(
+            job_id,
+            step_no,
+            CI_LOG_MAX_SPANS_PER_STEP,
+            CI_LOG_MAX_RESOLVED_STEP_BYTES,
+        )
+    }
+
+    fn resolve_step_bounded(
+        &self,
+        job_id: &str,
+        step_no: u32,
+        maximum_spans: usize,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, CiLogError> {
+        let (spans, resolved_bytes): (Vec<StepSpan>, usize) = {
             let index = self.index.lock().expect("ci log index mutex");
             // `spans` is `Some` iff the index ever saw `(job, step)`, and `append` always pushes at
             // least one span — so a present key is never empty (no redundant `is_empty` guard). A step
             // the index never saw is a LOUD miss, never an empty serve.
             match index.spans(job_id, step_no) {
-                Some(spans) => spans.to_vec(),
+                Some(spans) => {
+                    if spans.len() > maximum_spans {
+                        return Err(CiLogError::LimitExceeded("step span count"));
+                    }
+                    let resolved_bytes = spans.iter().try_fold(0usize, |total, span| {
+                        usize::try_from(span.len)
+                            .ok()
+                            .and_then(|len| total.checked_add(len))
+                    });
+                    match resolved_bytes {
+                        Some(resolved_bytes) if resolved_bytes <= maximum_bytes => {
+                            (spans.to_vec(), resolved_bytes)
+                        }
+                        _ => return Err(CiLogError::LimitExceeded("resolved step bytes")),
+                    }
+                }
                 None => {
                     return Err(CiLogError::UnknownStep {
                         job_id: job_id.to_string(),
@@ -560,7 +598,7 @@ impl CiLogTier {
             }
         };
 
-        let mut out = Vec::with_capacity(spans.iter().map(|s| s.len as usize).sum());
+        let mut out = Vec::with_capacity(resolved_bytes);
         for span in &spans {
             // Read the segment the index names through the archiver that SEALED it (the per-tenant
             // fallback, or the subject's per-subject archiver for a C1 isolable-PII segment) + decode
@@ -873,6 +911,20 @@ mod tests {
         assert_ne!(
             spans[0].segment, spans[1].segment,
             "two distinct sealed segments"
+        );
+        drop(index);
+        assert_eq!(
+            t.resolve_step_bounded("run-9", 2, 2, 13)
+                .expect("exact limits accepted"),
+            b"part-A part-B"
+        );
+        assert_eq!(
+            t.resolve_step_bounded("run-9", 2, 1, 13),
+            Err(CiLogError::LimitExceeded("step span count"))
+        );
+        assert_eq!(
+            t.resolve_step_bounded("run-9", 2, 2, 12),
+            Err(CiLogError::LimitExceeded("resolved step bytes"))
         );
     }
 
