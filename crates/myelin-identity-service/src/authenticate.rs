@@ -444,7 +444,13 @@ impl HumanSsoAuthenticator {
         //     A resolves only into A's partition.
         let row = self
             .store
-            .resolve_credential(&scope, &assertion.scheme, &assertion.subject_key)
+            .try_resolve_credential(&scope, &assertion.scheme, &assertion.subject_key)
+            .map_err(|e| {
+                AuthzError::FailClosed(format!(
+                    "identity directory lookup failed for verified `{}` credential — fail-closed: {e}",
+                    assertion.scheme
+                ))
+            })?
             .ok_or_else(|| {
                 AuthzError::FailClosed(format!(
                     "no `{}` principal mapped for the verified subject in tenant `{}` (unknown \

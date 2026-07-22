@@ -671,31 +671,43 @@ impl PrincipalStore {
         Ok((key_ref, EncryptedProfile { nonce, ciphertext }))
     }
 
-    /// **Read a principal row (the opaque attribution + the erasable profile_ref) — RLS-scoped.**
-    /// Built through a [`TenantQuery`] so the access carries its `(tenant, region)` predicate; a
-    /// read for one tenant structurally cannot reach another's partition. `None` if no such
-    /// principal in the verified scope.
-    pub fn get_principal(
+    /// **Fallibly read a principal row (the opaque attribution + the erasable profile_ref) —
+    /// RLS-scoped.** A durable read fault stays distinct from an absent principal.
+    pub fn try_get_principal(
         &self,
         scope: &TenantScope,
         principal_id: &PrincipalId,
-    ) -> Option<PrincipalRow> {
+    ) -> Result<Option<PrincipalRow>, PrincipalError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             PrincipalBackend::Memory(inner_arc) => {
                 let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
-                inner
+                Ok(inner
                     .partitions
                     .get(&Self::part_key(scope))
-                    .and_then(|p| p.get(&principal_id.0).cloned())
+                    .and_then(|p| p.get(&principal_id.0).cloned()))
             }
             PrincipalBackend::Pg(pg) => pg
                 .block(pg.backing.get_principal(&scope.tenant().0, &principal_id.0))
-                .ok()
-                .flatten()
-                .map(|drow| Self::durable_to_row(scope, drow)),
+                .map(|row| row.map(|drow| Self::durable_to_row(scope, drow)))
+                .map_err(|e| PrincipalError::Storage(e.to_string())),
         }
+    }
+
+    /// **Read a principal row (the opaque attribution + the erasable profile_ref) — RLS-scoped.**
+    /// Built through a [`TenantQuery`] so the access carries its `(tenant, region)` predicate; a
+    /// read for one tenant structurally cannot reach another's partition. `None` if no such
+    /// principal exists in the verified scope. A durable fault fails static rather than becoming
+    /// indistinguishable from absence; production decisions that can return errors should prefer
+    /// [`Self::try_get_principal`].
+    pub fn get_principal(
+        &self,
+        scope: &TenantScope,
+        principal_id: &PrincipalId,
+    ) -> Option<PrincipalRow> {
+        self.try_get_principal(scope, principal_id)
+            .unwrap_or_else(|e| panic!("principal store: principal read failed loud: {e}"))
     }
 
     /// **Read + decrypt a principal's profile PII under its per-SUBJECT DEK (11.3 read path).**
@@ -791,32 +803,55 @@ impl PrincipalStore {
         scope: &TenantScope,
         principal_id: &PrincipalId,
     ) -> Option<PiiKeyRef> {
-        self.get_principal(scope, principal_id)
-            .and_then(|r| r.profile_ref.map(|pr| pr.key_ref))
+        self.try_profile_shred_key(scope, principal_id)
+            .unwrap_or_else(|e| panic!("principal store: erasure-key lookup failed loud: {e}"))
     }
 
-    /// List the principals in a `(tenant, region)` partition (for the directory / tests). There is
-    /// NO accessor that reads across partitions — a read is scoped to one verified `(tenant,
-    /// region)`, so cross-tenant reads are structurally impossible.
-    pub fn principals_in(&self, scope: &TenantScope) -> Vec<PrincipalRow> {
+    /// Fallible erasure-key lookup. A storage fault is not reported as "no key to shred".
+    pub fn try_profile_shred_key(
+        &self,
+        scope: &TenantScope,
+        principal_id: &PrincipalId,
+    ) -> Result<Option<PiiKeyRef>, PrincipalError> {
+        self.try_get_principal(scope, principal_id)
+            .map(|row| row.and_then(|r| r.profile_ref.map(|pr| pr.key_ref)))
+    }
+
+    /// Fallibly list the principals in a `(tenant, region)` partition. A durable scan fault remains
+    /// distinguishable from a genuinely empty directory.
+    pub fn try_principals_in(
+        &self,
+        scope: &TenantScope,
+    ) -> Result<Vec<PrincipalRow>, PrincipalError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             PrincipalBackend::Memory(inner_arc) => {
                 let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
-                inner
+                Ok(inner
                     .partitions
                     .get(&Self::part_key(scope))
                     .map(|p| p.values().cloned().collect())
-                    .unwrap_or_default()
+                    .unwrap_or_default())
             }
             PrincipalBackend::Pg(pg) => pg
                 .block(pg.backing.principals_in(&scope.tenant().0))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|drow| Self::durable_to_row(scope, drow))
-                .collect(),
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|drow| Self::durable_to_row(scope, drow))
+                        .collect()
+                })
+                .map_err(|e| PrincipalError::Storage(e.to_string())),
         }
+    }
+
+    /// List the principals in a `(tenant, region)` partition (for the directory / tests). There is
+    /// NO accessor that reads across partitions — a read is scoped to one verified `(tenant,
+    /// region)`, so cross-tenant reads are structurally impossible. Durable faults fail loud rather
+    /// than fabricating an empty directory; fallible callers should use [`Self::try_principals_in`].
+    pub fn principals_in(&self, scope: &TenantScope) -> Vec<PrincipalRow> {
+        self.try_principals_in(scope)
+            .unwrap_or_else(|e| panic!("principal store: principal scan failed loud: {e}"))
     }
 
     /// **Link a VERIFIED credential `(scheme, subject_key)` to a principal within the verified
@@ -883,17 +918,15 @@ impl PrincipalStore {
         }
     }
 
-    /// **Resolve a VERIFIED credential `(scheme, subject_key)` to its principal WITHIN the verified
-    /// `(tenant, region)` scope (the S1 lookup `authenticate` performs after verifying tenant).**
-    /// Returns the [`PrincipalRow`] the credential maps to, or `None` if no such link exists in the
-    /// verified partition. There is NO cross-partition lookup: a credential verified for one tenant
-    /// resolves only into that tenant's directory (the tenant-from-credential floor).
-    pub fn resolve_credential(
+    /// **Fallibly resolve a VERIFIED credential `(scheme, subject_key)` to its principal WITHIN the
+    /// verified `(tenant, region)` scope.** A durable lookup fault remains distinct from a missing
+    /// credential link.
+    pub fn try_resolve_credential(
         &self,
         scope: &TenantScope,
         scheme: &str,
         subject_key: &str,
-    ) -> Option<PrincipalRow> {
+    ) -> Result<Option<PrincipalRow>, PrincipalError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
         #[cfg(any(test, feature = "test-support"))]
         let part_key = Self::part_key(scope);
@@ -901,15 +934,17 @@ impl PrincipalStore {
             #[cfg(any(test, feature = "test-support"))]
             PrincipalBackend::Memory(inner_arc) => {
                 let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
-                let principal_id = inner
+                let Some(principal_id) = inner
                     .credential_links
                     .get(&part_key)
-                    .and_then(|m| m.get(&Self::link_key(scheme, subject_key)))?
-                    .clone();
-                inner
+                    .and_then(|m| m.get(&Self::link_key(scheme, subject_key)))
+                else {
+                    return Ok(None);
+                };
+                Ok(inner
                     .partitions
                     .get(&part_key)
-                    .and_then(|p| p.get(&principal_id).cloned())
+                    .and_then(|p| p.get(principal_id).cloned()))
             }
             PrincipalBackend::Pg(pg) => pg
                 .block(
@@ -918,10 +953,26 @@ impl PrincipalStore {
                         &Self::link_key(scheme, subject_key),
                     ),
                 )
-                .ok()
-                .flatten()
-                .map(|drow| Self::durable_to_row(scope, drow)),
+                .map(|row| row.map(|drow| Self::durable_to_row(scope, drow)))
+                .map_err(|e| PrincipalError::Storage(e.to_string())),
         }
+    }
+
+    /// **Resolve a VERIFIED credential `(scheme, subject_key)` to its principal WITHIN the verified
+    /// `(tenant, region)` scope (the S1 lookup `authenticate` performs after verifying tenant).**
+    /// Returns the [`PrincipalRow`] the credential maps to, or `None` if no such link exists in the
+    /// verified partition. There is NO cross-partition lookup: a credential verified for one tenant
+    /// resolves only into that tenant's directory (the tenant-from-credential floor). A durable
+    /// lookup fault fails static rather than becoming a false unknown credential; production callers
+    /// that can propagate errors should prefer [`Self::try_resolve_credential`].
+    pub fn resolve_credential(
+        &self,
+        scope: &TenantScope,
+        scheme: &str,
+        subject_key: &str,
+    ) -> Option<PrincipalRow> {
+        self.try_resolve_credential(scope, scheme, subject_key)
+            .unwrap_or_else(|e| panic!("principal store: credential lookup failed loud: {e}"))
     }
 
     /// The credential-link map key — `"<scheme>\x1f<subject_key>"`. The `\x1f` (ASCII unit
@@ -1095,7 +1146,8 @@ mod tests {
         );
 
         let read = store
-            .get_principal(&s, &PrincipalId("p:alice".into()))
+            .try_get_principal(&s, &PrincipalId("p:alice".into()))
+            .expect("principal directory read succeeds")
             .expect("the row round-trips under the same scope");
         assert_eq!(
             read, written,
@@ -1103,6 +1155,16 @@ mod tests {
         );
         assert_eq!(read.kind, PrincipalKind::Human);
         assert_eq!(read.status, PrincipalStatus::Active);
+        assert_eq!(
+            store.try_principals_in(&s).expect("directory scan succeeds"),
+            vec![written.clone()]
+        );
+        assert_eq!(
+            store
+                .try_profile_shred_key(&s, &PrincipalId("p:alice".into()))
+                .expect("erasure-key read succeeds"),
+            written.profile_ref.map(|profile| profile.key_ref)
+        );
     }
 
     /// **A cross-tenant read returns nothing (the RLS floor — mutation-tested mandatory-core).** A
@@ -1542,10 +1604,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .resolve_credential(&scope, "agent", "human:mcp-operator")
+                .try_resolve_credential(&scope, "agent", "human:mcp-operator")
+                .expect("credential directory read succeeds")
                 .unwrap()
                 .principal_id,
             principal_id
+        );
+        assert!(
+            store
+                .try_resolve_credential(&scope, "agent", "missing")
+                .expect("an absent link is not a read fault")
+                .is_none(),
+            "a genuine absence remains distinguishable from storage failure"
         );
     }
 
