@@ -268,8 +268,9 @@ pub use reindex::{
     SignalReindexSource, DEFAULT_RETENTION_DAYS, NOTIF_OWNER_TOKEN, NOTIF_SNAPSHOT_TYPE,
 };
 pub use router::{
-    build_router, signal_subject_prefix, InboxProjection, RoutedInboxItem, SignalRouter,
-    NOTIF_ESCALATION_ACKED, NOTIF_ITEM_CREATED, ROUTER_CONSUMER_NAME, SIGNAL_MENTIONS_KEY,
+    build_durable_router, build_router, signal_subject_prefix, InboxProjection, RoutedInboxItem,
+    SignalRouter, NOTIF_ESCALATION_ACKED, NOTIF_ITEM_CREATED, ROUTER_CONSUMER_NAME,
+    SIGNAL_MENTIONS_KEY,
 };
 pub use snooze_resurface::{
     snooze_and_arm, snooze_timer_key, ResurfaceOutcome, SnoozeResurfacer, SNOOZE_TIMER_NS,
@@ -295,6 +296,15 @@ pub use write_fanout::{
 /// `notif` binary (`src/main.rs`) and the `AppSpec::name` both read this so the deployable
 /// matches the trace identifier.
 pub const SERVICE_NAME: &str = "notif";
+pub const EVENT_STREAM_NAME: &str = "MYELIN_EVENTS";
+pub const EVENT_SUBJECT_ROOT: &str = "myelin.events";
+pub const EVENT_DURABLE_CONSUMER: &str = "notif-signal-router";
+
+/// Server-side JetStream filter for curated signal envelopes. Application consumers narrow this
+/// further to an exact `sig.<tenant>.` subject for each tenant homed in the cell.
+pub fn signal_intake_filter() -> String {
+    format!("{EVENT_SUBJECT_ROOT}.evt.*.signal.>")
+}
 
 // ===========================================================================================
 //  THE §4.1 EXPOSED CONTRACT CARRIERS (the glue role — frozen SHAPES, no bodies yet, ADR-01)
@@ -470,7 +480,7 @@ fn notif_migrations() -> Migrations {
 }
 
 /// Assemble the Notif service [`AppSpec`] (contract 1.1; architecture §5.1) the harness wires.
-/// The spec declares Notif's (empty) migration set, the in-process outbox, and holder
+/// The spec declares Notif's durable schema, the injected outbox, and holder
 /// auto-registration; the harness opens the three ports (public / internal-RPC / metrics-health)
 /// around it and starts the outbox relay (the ONLY emit path the router, NOTIF-P3, uses).
 ///
@@ -479,9 +489,8 @@ fn notif_migrations() -> Migrations {
 /// bus) as those consumer call-sites land (NOTIF-P3+) — at the shell, a healthy boot is ready
 /// once migrations apply.
 ///
-/// **Floors wired as empty seams:** the `consumers` slot is empty (the Signal-consumer router is
-/// NOTIF-P3); the migration set is empty (the data model is NOTIF-P2); holders auto-register but
-/// the references-not-payloads store-holder lands with the data model (NOTIF-P4).
+/// The bare shell keeps an empty `consumers` seam for deterministic lifecycle tests. Production
+/// uses [`notif_app_spec_with_ingestion`] with durable tenant-bound routers and broker intake.
 ///
 /// **The outbox is INJECTED (MR-009b W3b.4 — the composition root owns durability):** the
 /// production `main.rs` constructs `OutboxStore::durable(PgOutboxBacking)` over the MR-022
@@ -565,6 +574,22 @@ pub fn notif_app_spec_with_router(
     (spec, inbox)
 }
 
+/// Assemble production notification ingestion with an externally elected outbox relay and a
+/// dedicated durable pull consumer. The caller supplies only tenant-bound durable routers; this
+/// process cannot claim or mark shared outbox rows.
+pub fn notif_app_spec_with_ingestion(
+    config: Config,
+    outbox: OutboxStore,
+    consumers: Vec<ConsumerReg>,
+    intake: Box<dyn myelin_events::EventConsumer>,
+    delivery_quarantine: std::sync::Arc<dyn myelin_events::DurableDeliveryQuarantine>,
+) -> AppSpec {
+    let mut spec = notif_app_spec(config, outbox.clone());
+    spec.outbox = OutboxSpec::external_relay_with_consumer(outbox, intake, delivery_quarantine);
+    spec.consumers = consumers;
+    spec
+}
+
 /// Boot the Notif service shell under the harness (contract 1.1) up to the pre-serve state,
 /// returning the [`ServeHandle`] the lifecycle drives. A thin wrapper over
 /// [`boot`](myelin_substrate::boot) of [`notif_app_spec`] — separated so a test/drill can boot,
@@ -593,6 +618,26 @@ where
     F: std::future::Future<Output = ()>,
 {
     myelin_substrate::serve_until_shutdown(notif_app_spec(config, outbox), shutdown).await
+}
+
+/// Run the production durable signal intake until explicit shutdown, then stop pulls and settle
+/// every in-flight ACK/NAK/TERM before returning.
+pub async fn run_notif_ingestion_until_shutdown<F>(
+    config: Config,
+    outbox: OutboxStore,
+    consumers: Vec<ConsumerReg>,
+    intake: Box<dyn myelin_events::EventConsumer>,
+    delivery_quarantine: std::sync::Arc<dyn myelin_events::DurableDeliveryQuarantine>,
+    shutdown: F,
+) -> Result<(), ServeError>
+where
+    F: std::future::Future<Output = ()>,
+{
+    myelin_substrate::serve_until_shutdown(
+        notif_app_spec_with_ingestion(config, outbox, consumers, intake, delivery_quarantine),
+        shutdown,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -659,7 +704,7 @@ mod tests {
         assert_eq!(
             handle.metrics_health().startup(),
             Startup::Complete,
-            "boot completed → the migrate gate lifted (empty migration set still completes)"
+            "boot completed → the durable migration gate lifted"
         );
         assert_eq!(
             handle.metrics_health().readiness().verdict,
