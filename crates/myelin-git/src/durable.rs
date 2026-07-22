@@ -720,12 +720,26 @@ impl DurableGitRepo {
     /// List every ref `(name, tip)` on disk. The repo's entry points — loaded from disk, never an
     /// empty map (SI-012).
     pub fn list_refs(&self) -> Result<Vec<(String, Oid)>, DurableError> {
+        self.list_refs_bounded(usize::MAX)
+    }
+
+    /// List direct refs with an explicit materialization ceiling. Wire-facing callers use this
+    /// before advertising or walking all tips so tenant-created ref cardinality remains finite.
+    pub fn list_refs_bounded(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<(String, Oid)>, DurableError> {
         let repo = self.open_git()?;
         let refs = repo.references().map_err(|e| git_err("references", e))?;
         let mut out = Vec::new();
         for r in refs {
             let r = r.map_err(|e| git_err("reference iter", e))?;
             if let Some(oid) = r.target() {
+                if out.len() >= maximum {
+                    return Err(DurableError::Git(
+                        "wire ref limit exceeded: direct ref count".into(),
+                    ));
+                }
                 let name = r.name().map_err(|_| {
                     DurableError::Git("reference name is not valid UTF-8".into())
                 })?;
@@ -2489,6 +2503,11 @@ mod tests {
             "the durable commit carries the pseudonymous author"
         );
         // list_refs loads the entry point from disk (not an empty map).
+        assert!(matches!(
+            repo2.list_refs_bounded(0),
+            Err(DurableError::Git(message))
+                if message == "wire ref limit exceeded: direct ref count"
+        ));
         assert_eq!(
             repo2.list_refs().expect("list"),
             vec![("refs/heads/main".to_string(), commit)]
