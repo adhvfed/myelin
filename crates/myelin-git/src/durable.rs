@@ -28,7 +28,8 @@
 //!
 //! ## Scope — git object durability vs the generic blob tier (be precise, prompt §3)
 //! The **git object tier** is the on-disk **odb** ([`DurableGitRepo::write_blob`] /
-//! [`DurableGitRepo::read_object`]): real `fs`-backed git objects, `git fsck`-clean, survive restart.
+//! [`DurableGitRepo::read_object_bounded`]): real `fs`-backed git objects, `git fsck`-clean, survive
+//! restart.
 //! The generic content-addressed [`myelin_storage::FsBlobStore`] (the `Mutex<HashMap>` byte tier the
 //! [`crate::pack_tier`] rides) is a SEPARATE track — its real on-disk/object-store byte backing is
 //! P-ST-30 (census SI-014/015/029), already carried in the `no-in-memory-durable-store` baseline.
@@ -110,6 +111,20 @@ pub(crate) fn write_file_atomic(
     file: &Path,
     bytes: &[u8],
 ) -> Result<(), DurableError> {
+    write_file_atomic_with(dir, file, |handle| {
+        handle
+            .write_all(bytes)
+            .map_err(|e| DurableError::Io(format!("write {}: {e}", file.display())))
+    })
+}
+
+/// Durably replace `file` with bytes produced directly into its process-unique temporary file.
+/// This is the streaming form used by large bounded artifacts to avoid a second whole-body buffer.
+pub(crate) fn write_file_atomic_with(
+    dir: &Path,
+    file: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<(), DurableError>,
+) -> Result<(), DurableError> {
     std::fs::create_dir_all(dir)
         .map_err(|e| DurableError::Io(format!("create dir {}: {e}", dir.display())))?;
     let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -121,9 +136,7 @@ pub(crate) fn write_file_atomic(
             .write(true)
             .open(&tmp)
             .map_err(|e| DurableError::Io(format!("create {}: {e}", tmp.display())))?;
-        handle
-            .write_all(bytes)
-            .map_err(|e| DurableError::Io(format!("write {}: {e}", tmp.display())))?;
+        write(&mut handle)?;
         handle
             .sync_all()
             .map_err(|e| DurableError::Io(format!("sync {}: {e}", tmp.display())))?;

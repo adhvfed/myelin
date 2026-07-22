@@ -234,21 +234,36 @@ impl GitRepoBackup {
     /// reconstructable, and corruption in either the ref snapshot or pack is detected before parse.
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(MAGIC.len() + 16 + self.pack.len() + CHECKSUM_LEN);
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&(self.refs.len() as u32).to_be_bytes());
-        for (name, oid) in &self.refs {
-            let n = name.as_bytes();
-            let o = oid.as_str().as_bytes();
-            out.extend_from_slice(&(n.len() as u32).to_be_bytes());
-            out.extend_from_slice(n);
-            out.extend_from_slice(&(o.len() as u32).to_be_bytes());
-            out.extend_from_slice(o);
-        }
-        out.extend_from_slice(&(self.pack.len() as u64).to_be_bytes());
-        out.extend_from_slice(&self.pack);
-        let checksum = blake3::hash(&out);
-        out.extend_from_slice(checksum.as_bytes());
+        self.write_frame(&mut out)
+            .expect("writing a backup frame into Vec cannot fail");
         out
+    }
+
+    fn write_frame(&self, writer: &mut impl std::io::Write) -> Result<(), std::io::Error> {
+        fn hashed_write(
+            writer: &mut impl std::io::Write,
+            hasher: &mut blake3::Hasher,
+            bytes: &[u8],
+        ) -> Result<(), std::io::Error> {
+            writer.write_all(bytes)?;
+            hasher.update(bytes);
+            Ok(())
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hashed_write(writer, &mut hasher, MAGIC)?;
+        hashed_write(writer, &mut hasher, &(self.refs.len() as u32).to_be_bytes())?;
+        for (name, oid) in &self.refs {
+            let name = name.as_bytes();
+            let oid = oid.as_str().as_bytes();
+            hashed_write(writer, &mut hasher, &(name.len() as u32).to_be_bytes())?;
+            hashed_write(writer, &mut hasher, name)?;
+            hashed_write(writer, &mut hasher, &(oid.len() as u32).to_be_bytes())?;
+            hashed_write(writer, &mut hasher, oid)?;
+        }
+        hashed_write(writer, &mut hasher, &(self.pack.len() as u64).to_be_bytes())?;
+        hashed_write(writer, &mut hasher, &self.pack)?;
+        writer.write_all(hasher.finalize().as_bytes())
     }
 
     /// **Reconstruct a backup from its serialized bytes** — the artifact-alone path. Any shortfall
@@ -363,7 +378,11 @@ impl GitRepoBackup {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        crate::durable::write_file_atomic(parent, path, &self.serialize())
+        crate::durable::write_file_atomic_with(parent, path, |handle| {
+            self.write_frame(handle).map_err(|error| {
+                DurableError::Io(format!("write backup artifact {}: {error}", path.display()))
+            })
+        })
             .map_err(GitBackupError::Durable)
     }
 
