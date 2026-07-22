@@ -91,6 +91,10 @@ percent-encoding = "2.3"
 # promoting it to a direct dep adds ZERO new crates.
 base64 = "0.22"
 
+# Repository-list continuation cursors bind their last visible slug to the verified tenant/region
+# and the durable catalogue namespace without carrying either scope value in cleartext.
+blake3.workspace = true
+
 # chrono (the SAME parse/format-only spec myelin-identity-service uses — already in the lock) formats
 # the RFC-3339 revocation instant the `edge revoke` operator subcommand records in the durable S7 store.
 chrono = { version = "0.4", default-features = false, features = ["std"] }

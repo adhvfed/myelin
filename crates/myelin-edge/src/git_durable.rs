@@ -23,7 +23,7 @@
 //! `myelin-git` PG-home for PR/review rows (the MR-022 provider) is the named **GT-003b** follow-on; the
 //! durable medium here is on-disk repo metadata (path-isolated via the same resolver — GT-003 §2 option).
 
-use crate::catalogue::{page_envelope, Handler, HandlerCtx};
+use crate::catalogue::{page_envelope, Handler, HandlerCtx, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_edge::{map_method, num_param, param, reroot, tenant_of};
@@ -34,6 +34,7 @@ use crate::repo_authz::{DenyAllRepos, RepoAuthorizer, RepoPermission};
 use crate::repo_authz::AllowAllRepos;
 use crate::repo_authz_live::{NoRepoBootstrap, RepoBootstrapGrants};
 use crate::request::{EdgeRequest, EdgeResponse};
+use base64::Engine as _;
 use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
 // Used only by the `test-support`-gated `rooted_inmem_for_test` helper (MR-009b W3b.6).
 #[cfg(any(test, feature = "test-support"))]
@@ -49,7 +50,8 @@ use myelin_git::durable::{
     TREE_PAGE_MAX_QUERY_BYTES, WIRE_MAX_REFS,
 };
 use myelin_git::durable::{
-    DurableError, DurableGitRepo, DurableGitStore, RefKind, RefsPageError, RefsPageRequest,
+    CatalogueRepoState, DurableError, DurableGitRepo, DurableGitStore, RefKind, RefsPageError,
+    RefsPageRequest,
 };
 use myelin_git::events::pseudonymized_event_principal;
 use myelin_git::lifecycle::{
@@ -72,7 +74,7 @@ use myelin_git::receive_pack::{
 use myelin_git::refs_pagination::WIRE_MAX_REF_NAME_BYTES;
 use myelin_git::web::{
     CommitDiff, CommitRow, DiffFile, DiffLineView, PrDiffFile, PrDiffHunk, PrDiffLine, PrDiffVM,
-    RepoHome, WebEditOutcome,
+    RepoHome, RepoListRow, WebEditOutcome, REPO_LIST_ROW_MAX_SLUG_BYTES,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::{DurablePlacementBacking, KmsEngine, SubstrateProvider, TenantScope};
@@ -910,6 +912,55 @@ impl DurableGitBackend {
             out.push(self.repo_home(tenant, region, &slug, &repo)?);
         }
         Ok((out, has_more))
+    }
+
+    /// Build only the selected repository-catalogue rows. Candidate discovery and the complete
+    /// visibility intersection happen before the keyset continuation is applied; repository state
+    /// is opened and classified only for the final output page.
+    fn list_repo_summaries_visible(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal: &Principal,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<RepoListRow>, Option<String>), DurableError> {
+        let candidates = self.scan_repo_slugs(tenant, region)?;
+        let visible = self
+            .repo_authz
+            .visible_repos(principal, tenant, region, &candidates);
+        let mut page: Vec<String> = visible
+            .into_iter()
+            .filter(|slug| after.is_none_or(|last| slug.as_str() > last))
+            .take(limit.saturating_add(1))
+            .collect();
+        let has_more = page.len() > limit;
+        page.truncate(limit);
+        let next_slug = if has_more {
+            page.last().cloned()
+        } else {
+            None
+        };
+
+        let mut rows = Vec::with_capacity(page.len());
+        for slug in page {
+            let loc = Self::loc(tenant, region, &slug);
+            let repo = self.store.open_repo(&loc)?;
+            let full_slug = format!("{tenant}/{slug}");
+            let row = match repo.catalogue_repo_state()? {
+                CatalogueRepoState::Populated => {
+                    RepoListRow::populated(full_slug, self.clone_url(tenant, region, &slug))
+                }
+                CatalogueRepoState::Empty => RepoListRow::empty(full_slug),
+            }
+            .map_err(|error| {
+                DurableError::Git(format!(
+                    "repository catalogue projection invalid ({error:?})"
+                ))
+            })?;
+            rows.push(row);
+        }
+        Ok((rows, next_slug))
     }
 
     /// **F3 — the HTTP git-wire clone URL for a repo.** The wire path grammar is
@@ -3402,11 +3453,289 @@ fn map_durable_err(e: DurableError) -> EdgeError {
     }
 }
 
+fn map_repo_summary_durable_err(error: DurableError) -> EdgeError {
+    match error {
+        DurableError::Git(message) if message.starts_with("wire ref limit exceeded:") => {
+            EdgeError::PayloadTooLarge(
+                "repository catalogue exceeds the interactive list limit".into(),
+            )
+        }
+        other => map_durable_err(other),
+    }
+}
+
+const REPO_SUMMARY_QUERY_MAX_BYTES: usize = 16 * 1024;
+const REPO_SUMMARY_CURSOR_MAX_BYTES: usize = 512;
+const REPO_SUMMARY_CURSOR_PREFIX: &str = "rl1_";
+const REPO_SUMMARY_CURSOR_VERSION: u8 = 1;
+const REPO_SUMMARY_CURSOR_FIXED_BYTES: usize = 1 + 32 + 2;
+const REPO_SUMMARY_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+
+struct RepoSummaryQuery {
+    limit: usize,
+    cursor: Option<String>,
+}
+
+struct RepoSummaryCursor {
+    scope: [u8; 32],
+    last_slug: String,
+}
+
+fn repo_summary_requested(query: &str) -> bool {
+    query.split('&').any(|pair| {
+        let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        let form_name = raw_name.replace('+', " ");
+        percent_encoding::percent_decode_str(&form_name)
+            .decode_utf8()
+            .is_ok_and(|name| name == "view")
+    })
+}
+
+fn decode_repo_summary_query_component(raw: &str) -> Result<String, EdgeError> {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(EdgeError::BadRequest(
+                    "repository summary query contains malformed percent encoding".into(),
+                ));
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let form_value = raw.replace('+', " ");
+    let decoded = percent_encoding::percent_decode_str(&form_value)
+        .decode_utf8()
+        .map_err(|_| EdgeError::BadRequest("repository summary query is not valid UTF-8".into()))?
+        .into_owned();
+    if decoded.chars().any(char::is_control) {
+        return Err(EdgeError::BadRequest(
+            "repository summary query contains a control character".into(),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn parse_repo_summary_query(query: &str) -> Result<RepoSummaryQuery, EdgeError> {
+    if query.len() > REPO_SUMMARY_QUERY_MAX_BYTES {
+        return Err(EdgeError::BadRequest(
+            "repository summary query is too large".into(),
+        ));
+    }
+    let mut view = None;
+    let mut limit = None;
+    let mut cursor = None;
+    for pair in query.split('&') {
+        let (raw_name, raw_value) = pair.split_once('=').ok_or_else(|| {
+            EdgeError::BadRequest("malformed repository summary query parameter".into())
+        })?;
+        let name = decode_repo_summary_query_component(raw_name)?;
+        let value = decode_repo_summary_query_component(raw_value)?;
+        let duplicate = |field: &str| {
+            EdgeError::BadRequest(format!(
+                "duplicate repository summary query parameter `{field}`"
+            ))
+        };
+        match name.as_str() {
+            "view" => {
+                if view.is_some() {
+                    return Err(duplicate("view"));
+                }
+                if value != "summary" {
+                    return Err(EdgeError::BadRequest(
+                        "repository list view must be `summary`".into(),
+                    ));
+                }
+                view = Some(());
+            }
+            "limit" => {
+                if limit.is_some() {
+                    return Err(duplicate("limit"));
+                }
+                let parsed = value.parse::<usize>().ok().filter(|parsed| {
+                    value == parsed.to_string() && (1..=MAX_PAGE_LIMIT).contains(parsed)
+                });
+                limit = Some(parsed.ok_or_else(|| {
+                    EdgeError::BadRequest(format!(
+                        "repository summary limit must be canonical and within 1..={MAX_PAGE_LIMIT}"
+                    ))
+                })?);
+            }
+            "cursor" => {
+                if cursor.is_some() {
+                    return Err(duplicate("cursor"));
+                }
+                if !value.starts_with(REPO_SUMMARY_CURSOR_PREFIX)
+                    || value.len() > REPO_SUMMARY_CURSOR_MAX_BYTES
+                {
+                    return Err(EdgeError::BadRequest(
+                        "repository summary cursor is malformed".into(),
+                    ));
+                }
+                cursor = Some(value);
+            }
+            "" => {
+                return Err(EdgeError::BadRequest(
+                    "empty repository summary query parameter name".into(),
+                ))
+            }
+            _ => {
+                return Err(EdgeError::BadRequest(format!(
+                    "unknown repository summary query parameter `{name}`"
+                )))
+            }
+        }
+    }
+    if view.is_none() {
+        return Err(EdgeError::BadRequest(
+            "repository summary query requires `view=summary`".into(),
+        ));
+    }
+    Ok(RepoSummaryQuery {
+        limit: limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+        cursor,
+    })
+}
+
+fn repo_summary_cursor_scope(tenant: &str, region: &str) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"myelin.edge.durable-repository-catalogue.v1\0");
+    for value in [tenant, region] {
+        hash.update(&(value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    *hash.finalize().as_bytes()
+}
+
+fn valid_repo_summary_cursor_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= REPO_LIST_ROW_MAX_SLUG_BYTES
+        && slug != "."
+        && slug != ".."
+        && slug
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+impl RepoSummaryCursor {
+    fn new(tenant: &str, region: &str, last_slug: String) -> Self {
+        Self {
+            scope: repo_summary_cursor_scope(tenant, region),
+            last_slug,
+        }
+    }
+
+    fn encode(&self) -> String {
+        let slug = self.last_slug.as_bytes();
+        let mut frame = Vec::with_capacity(REPO_SUMMARY_CURSOR_FIXED_BYTES + slug.len());
+        frame.push(REPO_SUMMARY_CURSOR_VERSION);
+        frame.extend_from_slice(&self.scope);
+        frame.extend_from_slice(&(slug.len() as u16).to_be_bytes());
+        frame.extend_from_slice(slug);
+        format!(
+            "{REPO_SUMMARY_CURSOR_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(frame)
+        )
+    }
+
+    fn parse(value: &str, tenant: &str, region: &str) -> Result<Self, EdgeError> {
+        let encoded = value
+            .strip_prefix(REPO_SUMMARY_CURSOR_PREFIX)
+            .ok_or_else(|| {
+                EdgeError::BadRequest("repository summary cursor is malformed".into())
+            })?;
+        if encoded.is_empty() || value.len() > REPO_SUMMARY_CURSOR_MAX_BYTES {
+            return Err(EdgeError::BadRequest(
+                "repository summary cursor is malformed".into(),
+            ));
+        }
+        let frame = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| EdgeError::BadRequest("repository summary cursor is malformed".into()))?;
+        if base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&frame) != encoded
+            || frame.len() < REPO_SUMMARY_CURSOR_FIXED_BYTES
+            || frame[0] != REPO_SUMMARY_CURSOR_VERSION
+        {
+            return Err(EdgeError::BadRequest(
+                "repository summary cursor is malformed".into(),
+            ));
+        }
+        let mut scope = [0_u8; 32];
+        scope.copy_from_slice(&frame[1..33]);
+        if scope != repo_summary_cursor_scope(tenant, region) {
+            return Err(EdgeError::BadRequest(
+                "repository summary cursor scope mismatch".into(),
+            ));
+        }
+        let slug_len = usize::from(u16::from_be_bytes([frame[33], frame[34]]));
+        if slug_len == 0 || frame.len() != REPO_SUMMARY_CURSOR_FIXED_BYTES + slug_len {
+            return Err(EdgeError::BadRequest(
+                "repository summary cursor is malformed".into(),
+            ));
+        }
+        let last_slug = std::str::from_utf8(&frame[35..])
+            .map_err(|_| EdgeError::BadRequest("repository summary cursor is malformed".into()))?
+            .to_string();
+        if !valid_repo_summary_cursor_slug(&last_slug) {
+            return Err(EdgeError::BadRequest(
+                "repository summary cursor is malformed".into(),
+            ));
+        }
+        Ok(Self { scope, last_slug })
+    }
+}
+
+fn repo_summary_response(value: &Value) -> Result<EdgeResponse, EdgeError> {
+    let body = serde_json::to_vec(value)
+        .map_err(|error| EdgeError::Internal(format!("serialize repository summary: {error}")))?;
+    if body.len() > REPO_SUMMARY_RESPONSE_MAX_BYTES {
+        return Err(EdgeError::PayloadTooLarge(
+            "repository summary exceeds the response byte limit".into(),
+        ));
+    }
+    Ok(EdgeResponse::Bytes {
+        status: 200,
+        content_type: "application/json".into(),
+        headers: Vec::new(),
+        body,
+    })
+}
+
 struct DRepoList {
     be: Arc<DurableGitBackend>,
 }
 impl Handler for DRepoList {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if repo_summary_requested(&ctx.request.query) {
+            let query = parse_repo_summary_query(&ctx.request.query)?;
+            let cursor = query
+                .cursor
+                .as_deref()
+                .map(|value| RepoSummaryCursor::parse(value, tenant_of(ctx), region_of(ctx)))
+                .transpose()?;
+            let (rows, next_slug) = self
+                .be
+                .list_repo_summaries_visible(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    ctx.principal,
+                    cursor.as_ref().map(|cursor| cursor.last_slug.as_str()),
+                    query.limit,
+                )
+                .map_err(map_repo_summary_durable_err)?;
+            let items = rows.iter().map(RepoListRow::to_json).collect::<Vec<_>>();
+            let next_cursor = next_slug.map(|last_slug| {
+                RepoSummaryCursor::new(tenant_of(ctx), region_of(ctx), last_slug).encode()
+            });
+            let envelope = page_envelope(json!(items), next_cursor, query.limit);
+            return repo_summary_response(&envelope);
+        }
         // R2.1: the LIST endpoint is prefiltered to the principal's `pull`-visible set (the
         // `list_objects` seam) BEFORE pagination — an un-granted repo's existence is never leaked.
         let offset = ctx
@@ -6118,6 +6447,318 @@ mod create_compensation_tests {
             "granted only on the first create"
         );
         assert!(boot.revokes.lock().unwrap().is_empty(), "no compensation");
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod repo_summary_tests {
+    use super::*;
+    use crate::catalogue::Page;
+    use crate::repo_authz::GrantBackedRepos;
+    use crate::request::EdgeRequest;
+    use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
+    use myelin_storage::TenantScope;
+    use myelin_tenancy::{Region as IdRegion, TenantId};
+    use std::collections::BTreeMap;
+
+    const TENANT: &str = "acme";
+    const REGION: &str = "eu-west";
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "myelin-repo-summary-{tag}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn human(id: &str) -> Principal {
+        Principal::new(
+            TenantId(TENANT.into()),
+            IdRegion(REGION.into()),
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        )
+    }
+
+    fn serve(
+        handler: &dyn Handler,
+        viewer: &Principal,
+        query: &str,
+    ) -> Result<EdgeResponse, EdgeError> {
+        let scope = TenantScope::from_verified_token(viewer, viewer.region.clone());
+        let params = BTreeMap::new();
+        let request = EdgeRequest::new("GET", "/v1/git/repos", query, vec![], vec![]);
+        let page = Page::from_request(&request);
+        let identity = crate::catalogue::test_request_identity(viewer, &scope);
+        handler.handle(&HandlerCtx {
+            identity: &identity,
+            principal: viewer,
+            scope: &scope,
+            params: &params,
+            page: &page,
+            request: &request,
+        })
+    }
+
+    fn json(response: EdgeResponse) -> Value {
+        response.json_body().expect("JSON response")
+    }
+
+    fn create_repo(be: &DurableGitBackend, slug: &str, creator: &Principal) {
+        be.create_repo_as(TENANT, REGION, slug, creator)
+            .expect("create repository");
+    }
+
+    fn add_non_commit_main_target(be: &DurableGitBackend, slug: &str) {
+        let loc = DurableGitBackend::loc(TENANT, REGION, slug);
+        let repo = be.store.open_repo(&loc).expect("open repository");
+        let tree = repo.write_tree(&[]).expect("write bare tree object");
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&tree),
+            "create deliberately non-commit main target",
+            "psn@tenant.noreply",
+        )
+        .expect("create direct branch target");
+    }
+
+    #[test]
+    fn summary_rows_have_exact_shapes_and_skip_legacy_home_reads() {
+        let root = temp_root("exact-rows");
+        let viewer = human("u:viewer");
+        let authz = GrantBackedRepos::new()
+            .grant_read("u:viewer", TENANT, "empty")
+            .grant_read("u:viewer", TENANT, "populated");
+        let be =
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
+        create_repo(&be, "empty", &viewer);
+        create_repo(&be, "populated", &viewer);
+        add_non_commit_main_target(&be, "populated");
+        let handler = DRepoList { be: Arc::new(be) };
+
+        let body = json(serve(&handler, &viewer, "view=summary").expect("summary response"));
+        assert_eq!(
+            body,
+            json!({
+                "items": [
+                    { "state": "empty", "slug": "acme/empty" },
+                    {
+                        "state": "populated",
+                        "slug": "acme/populated",
+                        "clone_url": "/acme/eu-west/populated.git",
+                    },
+                ],
+                "page": { "next_cursor": null, "limit": DEFAULT_PAGE_LIMIT },
+            })
+        );
+        assert!(
+            serve(&handler, &viewer, "").is_err(),
+            "the deliberately non-commit branch breaks legacy RepoHome, proving summary did not use it"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn authorization_precedes_keyset_paging_and_continuation_has_no_gaps_or_duplicates() {
+        let root = temp_root("auth-before-page");
+        let viewer = human("u:viewer");
+        let authz = GrantBackedRepos::new()
+            .grant_read("u:viewer", TENANT, "alpha")
+            .grant_read("u:viewer", TENANT, "gamma")
+            .grant_read("u:viewer", TENANT, "omega");
+        let be =
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
+        for slug in ["alpha", "beta", "gamma", "omega"] {
+            create_repo(&be, slug, &viewer);
+        }
+        let handler = DRepoList { be: Arc::new(be) };
+
+        let mut query = "view=summary&limit=1".to_string();
+        let mut seen = Vec::new();
+        loop {
+            let body = json(serve(&handler, &viewer, &query).expect("summary page"));
+            let items = body["items"].as_array().expect("items");
+            seen.extend(
+                items
+                    .iter()
+                    .map(|item| item["slug"].as_str().expect("slug").to_string()),
+            );
+            let Some(cursor) = body["page"]["next_cursor"].as_str() else {
+                break;
+            };
+            assert!(cursor.starts_with(REPO_SUMMARY_CURSOR_PREFIX));
+            query = format!("view=summary&limit=1&cursor={cursor}");
+        }
+        assert_eq!(seen, ["acme/alpha", "acme/gamma", "acme/omega"]);
+        assert!(!seen.iter().any(|slug| slug == "acme/beta"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn summary_query_is_strict_and_limits_are_canonical_and_bounded() {
+        assert!(repo_summary_requested("limit=2&%76iew=summary"));
+        assert_eq!(
+            parse_repo_summary_query("%76iew=summary&limit=100")
+                .unwrap()
+                .limit,
+            100
+        );
+        for query in [
+            "view",
+            "view=other",
+            "view=summary&view=summary",
+            "view=summary&unknown=x",
+            "view=summary&unknown=%GG",
+            "view=summary%0A",
+            "view=summary&limit=0",
+            "view=summary&limit=01",
+            "view=summary&limit=101",
+            "view=summary&cursor=x",
+        ] {
+            assert!(
+                matches!(
+                    parse_repo_summary_query(query),
+                    Err(EdgeError::BadRequest(_))
+                ),
+                "query should be rejected: {query}"
+            );
+        }
+        assert!(matches!(
+            parse_repo_summary_query(&format!(
+                "view=summary&cursor=rl1_{}",
+                "a".repeat(REPO_SUMMARY_CURSOR_MAX_BYTES)
+            )),
+            Err(EdgeError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn cursor_is_canonical_bounded_and_scoped_to_verified_tenant_region() {
+        let cursor = RepoSummaryCursor::new(TENANT, REGION, "alpha".into()).encode();
+        let parsed = RepoSummaryCursor::parse(&cursor, TENANT, REGION).expect("canonical cursor");
+        assert_eq!(parsed.last_slug, "alpha");
+        for malformed in [
+            "rl1_".to_string(),
+            "rl1_not-base64!".to_string(),
+            format!("{cursor}="),
+            RepoSummaryCursor::new(TENANT, REGION, "..".into()).encode(),
+        ] {
+            assert!(matches!(
+                RepoSummaryCursor::parse(&malformed, TENANT, REGION),
+                Err(EdgeError::BadRequest(_))
+            ));
+        }
+        assert!(matches!(
+            RepoSummaryCursor::parse(&cursor, "other-tenant", REGION),
+            Err(EdgeError::BadRequest(message)) if message.contains("scope mismatch")
+        ));
+        assert!(matches!(
+            RepoSummaryCursor::parse(&cursor, TENANT, "other-region"),
+            Err(EdgeError::BadRequest(message)) if message.contains("scope mismatch")
+        ));
+
+        let root = temp_root("empty-scope");
+        let viewer = human("u:viewer");
+        let handler = DRepoList {
+            be: Arc::new(DurableGitBackend::rooted_inmem_for_test(&root)),
+        };
+        let empty = json(serve(&handler, &viewer, "view=summary").expect("empty tenant summary"));
+        assert_eq!(empty["items"], json!([]));
+        let wrong_scope = RepoSummaryCursor::new("other-tenant", REGION, "alpha".into()).encode();
+        assert!(matches!(
+            serve(
+                &handler,
+                &viewer,
+                &format!("view=summary&cursor={wrong_scope}")
+            ),
+            Err(EdgeError::BadRequest(message)) if message.contains("scope mismatch")
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn summary_response_and_candidate_cardinality_are_bounded() {
+        let small = page_envelope(json!([]), None, DEFAULT_PAGE_LIMIT);
+        assert_eq!(repo_summary_response(&small).unwrap().status(), 200);
+        assert!(matches!(
+            repo_summary_response(&json!({
+                "items": ["x".repeat(REPO_SUMMARY_RESPONSE_MAX_BYTES)],
+                "page": { "next_cursor": null, "limit": 1 },
+            })),
+            Err(EdgeError::PayloadTooLarge(_))
+        ));
+
+        let root = temp_root("candidate-cap");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root);
+        let viewer = human("u:viewer");
+        for slug in ["alpha", "beta"] {
+            create_repo(&be, slug, &viewer);
+        }
+        assert!(matches!(
+            be.scan_repo_slugs_bounded(TENANT, REGION, 1),
+            Err(DurableError::Git(message))
+                if message == "browse response limit exceeded: repository candidate count"
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn summary_capacity_errors_use_catalogue_specific_sanitized_text() {
+        let mapped = map_repo_summary_durable_err(DurableError::Git(
+            "wire ref limit exceeded: private branch detail".into(),
+        ));
+        assert_eq!(mapped.status(), 413);
+        assert_eq!(
+            mapped.to_string(),
+            "413 (payload_too_large): repository catalogue exceeds the interactive list limit"
+        );
+
+        let delegated = map_repo_summary_durable_err(DurableError::NotFound("missing".into()));
+        assert_eq!(
+            delegated,
+            map_durable_err(DurableError::NotFound("missing".into())),
+            "non-capacity errors retain the shared durable mapping"
+        );
+        assert_eq!(
+            map_durable_err(DurableError::Git(
+                "wire ref limit exceeded: private wire detail".into()
+            ))
+            .to_string(),
+            "413 (payload_too_large): repository exceeds the smart-HTTP ref limit",
+            "actual wire callers retain the established sanitized message"
+        );
+    }
+
+    #[test]
+    fn no_view_keeps_the_legacy_repo_home_projection_and_offset_cursor() {
+        let root = temp_root("legacy-compat");
+        let viewer = human("u:viewer");
+        let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "legacy");
+        let be =
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
+        create_repo(&be, "legacy", &viewer);
+        let handler = DRepoList { be: Arc::new(be) };
+
+        let body = json(serve(&handler, &viewer, "limit=1").expect("legacy response"));
+        assert_eq!(
+            body,
+            json!({
+                "items": [{
+                    "state": "empty",
+                    "slug": "acme/legacy",
+                    "clone_url": "/acme/eu-west/legacy.git",
+                }],
+                "page": { "next_cursor": null, "limit": 1 },
+            })
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }
