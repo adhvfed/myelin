@@ -276,7 +276,7 @@ serde_json = "1"
 # The versioned thresholds file (P-S22 / P-038) is a TOML config source every M0 drill reads
 # its quantified threshold from. `toml` (de)serializes it; preserve-order is irrelevant here
 # (the file is keyed, not positional), so the default feature set is enough.
-toml = "0.8"
+toml = "1.1"
 # BLAKE3 is the content-address hash for the BlobStore (P-ST-03 / contract 11.2): hash-on-write,
 # re-hash-on-read integrity. A cited, proven structure (BLAKE3 2020; storage.md §11) — VISION §4
 # (cite proven structures, do not hand-roll a hash). `hex` renders the multihash digest into the
@@ -293,13 +293,13 @@ siphasher = "1.0.3"
 # git object coexists with native BLAKE3 blobs, but the verification path for that tag was the
 # named P-ST-22 floor. `sha2` is the vetted RustCrypto FIPS-180-4 impl (never a hand-rolled
 # hash — VISION §4 / EI-01 §7), used ONLY to re-hash a `sha256:`-addressed object on read.
-sha2 = "0.10"
+sha2 = "0.11"
 # The proc-macro toolchain for the `#[derive(PersonalData)]` classify-derive BODY (contract 10.2,
 # P-GA-07 / P-107): parse the tagged struct + its `#[personal_data(...)]` helper args (syn), emit
 # the generated registry entry + the structural `subject_locator` accessor (quote). `full` is not
 # needed — we parse a `DeriveInput` (a struct) and field attributes, not whole expressions; the
 # default `derive` + `parsing` + `proc-macro` features cover it. proc-macro2 carries the Span type.
-syn = { version = "2", default-features = false, features = ["derive", "parsing", "proc-macro", "printing", "extra-traits"] }
+syn = { version = "3", default-features = false, features = ["derive", "parsing", "proc-macro", "printing", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
 
@@ -375,7 +375,7 @@ aws-credential-types = "1"
 fred = { version = "10", default-features = false, features = ["i-std"] }
 
 # Durable bus: NATS JetStream via async-nats.
-async-nats = "0.47"
+async-nats = "0.50"
 # Stream combinators (StreamExt) for draining the NATS JetStream pull-consumer batch. A tiny,
 # default-feature `futures` — pulled ONLY behind the events `integration` feature (the NATS bus).
 futures = "0.3"
