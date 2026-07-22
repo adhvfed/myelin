@@ -535,7 +535,15 @@ const server = createServer((req, res) => {
     }
     // R3.4: the ref switcher.
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/refs$/))) {
-      const v = refsJson(seg(m[1]));
+      const v = refsJson(seg(m[1]), {
+        limit: Number(url.searchParams.get("limit") ?? 100),
+        cursor: url.searchParams.get("cursor") ?? undefined,
+        q: url.searchParams.get("q") ?? "",
+        current: url.searchParams.get("current") ?? undefined,
+      });
+      if (v?.__status === 400) {
+        return send(res, 400, { error: { message: "invalid refs request", code: "bad_request" } });
+      }
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("repository"));
     }
     // R3.4: tree-at-path (root = /tree/{ref}; nested = /tree/{ref}/{...path}).

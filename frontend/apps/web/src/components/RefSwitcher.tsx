@@ -1,30 +1,57 @@
 // The branch/tag switcher (R3.4 / G-1) — a scoped in-context picker (NOT the ⌘K palette): a Popover
-// trigger showing the current ref, unfurling a filter input + two groups (Branches / Tags). Selecting
+// trigger showing the current ref, unfurling a search input + pinned/branch/tag groups. Selecting
 // a ref rewrites the current route's `[ref]` (the caller supplies `hrefFor`) and preserves the path.
 // The filter-input wrapper carries a `:focus-within` focus ring (the gate fix — never a bare
 // `outline:none`). Options are real links (keyboard-reachable, axe-clean). Semantic tokens only.
-import { For, Show, createSignal, createMemo } from "solid-js";
-import { A, createAsync } from "@solidjs/router";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import { A } from "@solidjs/router";
 import { Icon, Popover } from "@myelin/design-system";
-import { getRefs, type RefRow } from "~/lib/api";
+import { getRefs } from "~/lib/api";
+import { isFullGitRef } from "~/lib/git-read-input";
+import {
+  RefSwitcherController,
+  REF_SWITCHER_SEARCH_DEBOUNCE_MS,
+  visibleRefGroups,
+  type RefSwitcherSnapshot,
+  type SwitchRefRow,
+} from "~/lib/ref-switcher-state";
 
 export interface RefSwitcherProps {
   repo: string;
   currentRef: string;
+  /** Exact current ref when the caller knows its namespace. Ambiguous short route refs stay unset. */
+  currentFullRef?: string;
   /** Build the target route for a chosen ref (preserving the current surface + path). */
   hrefFor: (ref: string) => string;
 }
 
 export function RefSwitcher(props: RefSwitcherProps) {
-  const refs = createAsync(async () => getRefs(props.repo), { deferStream: true });
   const [filter, setFilter] = createSignal("");
+  const [state, setState] = createSignal<RefSwitcherSnapshot>({
+    query: "",
+    pins: [],
+    rows: [],
+    nextCursor: null,
+    loading: true,
+    capped: false,
+    error: null,
+  });
+  const currentFullRef = createMemo(() => {
+    // A short route ref may name both a branch and a tag. Keep it in the visible trigger, but never
+    // guess a namespace for server pins or option selection.
+    if (isFullGitRef(props.currentFullRef)) return props.currentFullRef;
+    return isFullGitRef(props.currentRef) ? props.currentRef : undefined;
+  });
+  const controller = new RefSwitcherController(getRefs, setState);
+  const groups = createMemo(() => visibleRefGroups(state()));
 
-  const match = (rows: RefRow[] | undefined): RefRow[] => {
-    const q = filter().toLowerCase();
-    return (rows ?? []).filter((r) => !q || r.name.toLowerCase().includes(q));
-  };
-  const branches = createMemo(() => match(refs()?.branches));
-  const tags = createMemo(() => match(refs()?.tags));
+  createEffect(() => {
+    const search = { repo: props.repo, query: filter(), current: currentFullRef() };
+    controller.prepare(search);
+    const timer = setTimeout(() => void controller.search(search), REF_SWITCHER_SEARCH_DEBOUNCE_MS);
+    onCleanup(() => clearTimeout(timer));
+  });
+  onCleanup(() => controller.dispose());
 
   return (
     <Popover
@@ -50,20 +77,69 @@ export function RefSwitcher(props: RefSwitcherProps) {
           <input
             type="text"
             class="ref-filter-input"
-            aria-label="Filter branches and tags"
-            placeholder="Filter…"
+            aria-label="Search branches and tags"
+            placeholder="Search refs…"
             value={filter()}
             onInput={(e) => setFilter(e.currentTarget.value)}
             autofocus
           />
         </div>
 
-        <RefGroup title="Branches" rows={branches()} defaultRef={refs()?.default_branch} hrefFor={props.hrefFor} current={props.currentRef} />
-        <RefGroup title="Tags" rows={tags()} hrefFor={props.hrefFor} current={props.currentRef} />
+        <RefGroup
+          title="Pinned"
+          rows={groups().pins}
+          hrefFor={props.hrefFor}
+          currentFullRef={currentFullRef()}
+        />
+        <RefGroup
+          title="Branches"
+          rows={groups().branches}
+          hrefFor={props.hrefFor}
+          currentFullRef={currentFullRef()}
+        />
+        <RefGroup
+          title="Tags"
+          rows={groups().tags}
+          hrefFor={props.hrefFor}
+          currentFullRef={currentFullRef()}
+        />
 
-        <Show when={branches().length === 0 && tags().length === 0}>
+        <Show when={!state().loading && groups().branches.length === 0 && groups().tags.length === 0}>
           <p style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)", margin: "var(--space-1) 0" }}>
-            No matching refs.
+            {filter() ? "No refs matched this server search." : "No refs."}
+          </p>
+        </Show>
+        <Show when={state().loading}>
+          <p aria-live="polite" style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)", margin: "var(--space-1) 0" }}>
+            Loading refs…
+          </p>
+        </Show>
+        <Show when={state().error}>
+          {(message) => (
+            <p role="alert" style={{ color: "var(--text-danger)", "font-size": "var(--fs-caption)", margin: "var(--space-1) 0" }}>
+              {message()}
+            </p>
+          )}
+        </Show>
+        <Show when={state().nextCursor && !state().loading}>
+          <button
+            type="button"
+            onClick={() => void controller.loadMore()}
+            style={{
+              padding: "var(--space-1) var(--space-2)",
+              border: "var(--hairline) solid var(--border)",
+              "border-radius": "var(--radius-1)",
+              background: "var(--surface-raised)",
+              color: "var(--text-primary)",
+              cursor: "pointer",
+            }}
+          >
+            Load more
+          </button>
+        </Show>
+        <Show when={state().capped}>
+          <p style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)", margin: "var(--space-1) 0" }}>
+            Showing 300 server results. Refine the search to see other refs.
           </p>
         </Show>
       </div>
@@ -73,22 +149,21 @@ export function RefSwitcher(props: RefSwitcherProps) {
 
 function RefGroup(props: {
   title: string;
-  rows: RefRow[];
-  defaultRef?: string;
-  current: string;
+  rows: SwitchRefRow[];
+  currentFullRef?: string;
   hrefFor: (ref: string) => string;
 }) {
   return (
     <Show when={props.rows.length > 0}>
       <div role="group" aria-label={props.title}>
         <p style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)", margin: "0 0 var(--space-1)", "text-transform": "uppercase", "letter-spacing": "0.04em" }}>
-          {props.title} <span aria-hidden="true">·</span> {props.rows.length}
+          {props.title}
         </p>
         <ul style={{ "list-style": "none", margin: "0", padding: "0", display: "flex", "flex-direction": "column" }}>
           <For each={props.rows}>
             {(r) => {
-              const isDefault = () => props.defaultRef === r.name || r.is_default;
-              const isCurrent = () => props.current === r.name;
+              const isDefault = () => r.isDefault;
+              const isCurrent = () => props.currentFullRef === r.fullName;
               return (
                 <li>
                   <A

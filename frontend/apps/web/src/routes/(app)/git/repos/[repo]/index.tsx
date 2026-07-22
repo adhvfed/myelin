@@ -82,7 +82,12 @@ export default function RepoHomeScreen() {
                         </Show>
                       </div>
                       <div style={{ display: "flex", gap: "var(--space-3)", "align-items": "center", "flex-wrap": "wrap" }}>
-                        <RefSwitcher repo={params.repo!} currentRef={defaultBranch()} hrefFor={(ref) => `/git/repos/${params.repo}/tree/${encodeURIComponent(ref)}`} />
+                        <RefSwitcher
+                          repo={params.repo!}
+                          currentRef={defaultBranch()}
+                          currentFullRef={`refs/heads/${defaultBranch()}`}
+                          hrefFor={(ref) => `/git/repos/${params.repo}/tree/${encodeURIComponent(ref)}`}
+                        />
                         <CloneUrl url={home.clone_url} onCopy={() => toast.show({ title: "Clone URL copied", variant: "info" })} />
                         <A href={`/git/repos/${params.repo}/commits/${encodeURIComponent(defaultBranch())}`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)" }}>
                           <Icon name="commit" /> Commits

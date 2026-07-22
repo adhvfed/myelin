@@ -10,6 +10,8 @@ import {
   parseGitPrInput,
   parseGitRepoInput,
   parseGitRepoPrsInput,
+  parseGitRefsInput,
+  gitRefsSearchParams,
 } from "./git-read-input";
 
 const OID = "0123456789abcdef0123456789abcdef01234567";
@@ -30,6 +32,30 @@ describe("Git read RPC inputs", () => {
       .toEqual({ repo: "core", n: 42, cursor: "50" });
     expect(parseGitPrDiffInput({ repo: "core", n: 42, view: "split" }))
       .toEqual({ repo: "core", n: 42, view: "split" });
+    expect(parseGitRefsInput({
+      repo: "core", limit: 25, cursor: "gr1_a-b_c", q: "feature & fixes",
+      current: "refs/heads/feature/x",
+    })).toEqual({
+      repo: "core", limit: 25, cursor: "gr1_a-b_c", q: "feature & fixes",
+      current: "refs/heads/feature/x",
+    });
+  });
+
+  it("encodes refs query values only through URLSearchParams", () => {
+    expect(gitRefsSearchParams({
+      repo: "core", limit: 25, cursor: "gr1_a-b_c", q: "feature & fixes",
+      current: "refs/heads/feature/x",
+    }).toString()).toBe(
+      "limit=25&cursor=gr1_a-b_c&q=feature+%26+fixes&current=refs%2Fheads%2Ffeature%2Fx",
+    );
+  });
+
+  it.each([
+    "refs/heads/feature@two",
+    "refs/heads/topic/a.b",
+    "refs/tags/release.locked",
+  ])("accepts a Git-valid full current ref at the boundary: %s", (current) => {
+    expect(parseGitRefsInput({ repo: "core", current })).toEqual({ repo: "core", current });
   });
 
   it.each([
@@ -47,6 +73,21 @@ describe("Git read RPC inputs", () => {
     () => parseGitMyPrsInput({ bucket: "all" }),
     () => parseGitPrCursorInput({ repo: "core", n: 1, cursor: "x\nsmuggled" }),
     () => parseGitPrDiffInput({ repo: "core", n: 1, view: "side-by-side" }),
+    () => parseGitRefsInput({ repo: "core", limit: 0 }),
+    () => parseGitRefsInput({ repo: "core", limit: 101 }),
+    () => parseGitRefsInput({ repo: "core", cursor: "x\nsmuggled" }),
+    () => parseGitRefsInput({ repo: "core", cursor: "opaque" }),
+    () => parseGitRefsInput({ repo: "core", q: "x".repeat(257) }),
+    () => parseGitRefsInput({ repo: "core", current: "main" }),
+    () => parseGitRefsInput({ repo: "core", current: "refs/remotes/origin/main" }),
+    () => parseGitRefsInput({ repo: "core", current: "refs/heads/../secret" }),
+    () => parseGitRefsInput({ repo: "core", current: "refs/heads/@" }),
+    () => parseGitRefsInput({ repo: "core", current: "refs/heads/topic." }),
+    () => parseGitRefsInput({ repo: "core", current: "refs/heads/.hidden" }),
+    () => parseGitRefsInput({ repo: "core", current: "refs/heads/topic/.hidden" }),
+    () => parseGitRefsInput({ repo: "core", current: "refs/heads/topic.lock" }),
+    () => parseGitRefsInput({ repo: "core", current: "refs/heads/topic/final.lock" }),
+    () => parseGitRefsInput({ repo: "core", surprise: true }),
   ])("rejects malformed, unsafe, or surplus input", (parse) => {
     expect(parse()).toBeNull();
   });
