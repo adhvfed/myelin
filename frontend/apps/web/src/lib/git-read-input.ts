@@ -5,6 +5,18 @@ export interface GitRepoInput { repo: string }
 export interface GitBrowseInput extends GitRepoInput { ref: string; path: string }
 export interface GitCommitsInput extends GitRepoInput { ref: string; cursor?: string }
 export interface GitCommitInput extends GitRepoInput { oid: string }
+export interface GitPrInput extends GitRepoInput { n: number }
+export interface GitRepoPrsInput extends GitRepoInput {
+  state?: "open" | "merged" | "closed" | "all";
+  sort?: "updated" | "created";
+  cursor?: string;
+}
+export interface GitMyPrsInput {
+  bucket: "needs-review" | "yours";
+  cursor?: string;
+}
+export interface GitPrCursorInput extends GitPrInput { cursor?: string }
+export interface GitPrDiffInput extends GitPrCursorInput { view?: "split" | "unified" }
 
 function record(value: unknown): WireRecord | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -46,6 +58,14 @@ function path(value: unknown, allowEmpty: boolean): value is string {
   );
 }
 
+function safeCursor(value: unknown): value is string {
+  return bounded(value, 4 * 1024) && !hasControl(value);
+}
+
+function prNumber(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
 export function parseGitRepoInput(value: unknown): GitRepoInput | null {
   if (typeof value === "string") return repo(value) ? { repo: value } : null;
   const input = record(value);
@@ -78,4 +98,60 @@ export function parseGitCommitInput(value: unknown): GitCommitInput | null {
     typeof input.oid === "string" && /^[0-9a-f]{40}$/.test(input.oid)
     ? { repo: input.repo, oid: input.oid }
     : null;
+}
+
+export function parseGitPrInput(value: unknown): GitPrInput | null {
+  const input = record(value);
+  return input && exact(input, ["repo", "n"]) && repo(input.repo) && prNumber(input.n)
+    ? { repo: input.repo, n: input.n }
+    : null;
+}
+
+export function parseGitRepoPrsInput(value: unknown): GitRepoPrsInput | null {
+  const input = record(value);
+  if (!input || !exact(input, ["repo", "state", "sort", "cursor"]) || !repo(input.repo) ||
+      (input.state !== undefined && !["open", "merged", "closed", "all"].includes(input.state as string)) ||
+      (input.sort !== undefined && input.sort !== "updated" && input.sort !== "created") ||
+      (input.cursor !== undefined && !safeCursor(input.cursor))) return null;
+  return {
+    repo: input.repo,
+    ...(input.state === undefined ? {} : { state: input.state as GitRepoPrsInput["state"] }),
+    ...(input.sort === undefined ? {} : { sort: input.sort as GitRepoPrsInput["sort"] }),
+    ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+  };
+}
+
+export function parseGitMyPrsInput(value: unknown): GitMyPrsInput | null {
+  const input = record(value);
+  if (!input || !exact(input, ["bucket", "cursor"]) ||
+      (input.bucket !== "needs-review" && input.bucket !== "yours") ||
+      (input.cursor !== undefined && !safeCursor(input.cursor))) return null;
+  return {
+    bucket: input.bucket,
+    ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+  };
+}
+
+export function parseGitPrCursorInput(value: unknown): GitPrCursorInput | null {
+  const input = record(value);
+  if (!input || !exact(input, ["repo", "n", "cursor"]) || !repo(input.repo) ||
+      !prNumber(input.n) || (input.cursor !== undefined && !safeCursor(input.cursor))) return null;
+  return {
+    repo: input.repo,
+    n: input.n,
+    ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+  };
+}
+
+export function parseGitPrDiffInput(value: unknown): GitPrDiffInput | null {
+  const input = record(value);
+  if (!input || !exact(input, ["repo", "n", "cursor", "view"]) || !repo(input.repo) ||
+      !prNumber(input.n) || (input.cursor !== undefined && !safeCursor(input.cursor)) ||
+      (input.view !== undefined && input.view !== "split" && input.view !== "unified")) return null;
+  return {
+    repo: input.repo,
+    n: input.n,
+    ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+    ...(input.view === undefined ? {} : { view: input.view }),
+  };
 }
