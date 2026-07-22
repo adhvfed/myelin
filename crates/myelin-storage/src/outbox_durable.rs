@@ -64,6 +64,7 @@ use sqlx::postgres::PgPool;
 use myelin_events::relay::{BusTransport, DrainReport, MAX_PUBLISH_ATTEMPTS};
 use myelin_events::{EventId, OutboxError, OutboxRow, Result, Timestamp};
 
+use crate::pg::PgError;
 use crate::pgrelay::PgRelay;
 
 /// The REAL durable `outbox` backing over the OLTP `PgPool` (SI-007). Cloneable (the pool is an
@@ -98,6 +99,16 @@ impl PgOutboxBacking {
     }
 }
 
+/// The legacy read half of `DurableOutboxBacking` is infallible, so a PostgreSQL read failure cannot
+/// be returned to its caller. It must nevertheless never masquerade as zero depth, no dead letters,
+/// or a missing row: those values can falsely certify a clean drain. Route every such failure through
+/// one redacted fail-static boundary until the trait's read surface becomes fallible.
+fn require_outbox_read<T>(operation: &str, result: std::result::Result<T, PgError>) -> T {
+    result.unwrap_or_else(|_| {
+        panic!("FAIL-STATIC: durable outbox {operation} read failed; state is unknown")
+    })
+}
+
 impl myelin_events::DurableOutboxBacking for PgOutboxBacking {
     fn commit_staged(&self, rows: Vec<OutboxRow>) -> Result<()> {
         self.block(async {
@@ -122,40 +133,33 @@ impl myelin_events::DurableOutboxBacking for PgOutboxBacking {
     }
 
     fn outbox_depth(&self) -> usize {
-        self.block(async { self.relay().unsent_depth().await.unwrap_or(0).max(0) as usize })
+        let depth = self.block(async { self.relay().unsent_depth().await });
+        require_outbox_read("depth", depth).max(0) as usize
     }
 
     fn dead_letter_count(&self) -> usize {
-        self.block(async { self.relay().dead_count().await.unwrap_or(0).max(0) as usize })
+        let count = self.block(async { self.relay().dead_count().await });
+        require_outbox_read("dead-letter count", count).max(0) as usize
     }
 
     fn oldest_unsent_recorded_at(&self) -> Option<Timestamp> {
-        self.block(async {
-            self.relay()
-                .oldest_unsent_recorded_at()
-                .await
-                .ok()
-                .flatten()
-                .map(Timestamp)
-        })
+        let timestamp = self.block(async { self.relay().oldest_unsent_recorded_at().await });
+        require_outbox_read("oldest-unsent timestamp", timestamp).map(Timestamp)
     }
 
     fn committed_count(&self) -> usize {
-        self.block(async {
-            self.relay()
-                .committed_live_count()
-                .await
-                .unwrap_or(0)
-                .max(0) as usize
-        })
+        let count = self.block(async { self.relay().committed_live_count().await });
+        require_outbox_read("committed count", count).max(0) as usize
     }
 
     fn row(&self, id: &EventId) -> Option<OutboxRow> {
-        self.block(async { self.relay().committed_row(id).await.ok().flatten() })
+        let row = self.block(async { self.relay().committed_row(id).await });
+        require_outbox_read("row", row)
     }
 
     fn committed_rows(&self) -> Vec<OutboxRow> {
-        self.block(async { self.relay().committed_live_rows().await.unwrap_or_default() })
+        let rows = self.block(async { self.relay().committed_live_rows().await });
+        require_outbox_read("committed rows", rows)
     }
 
     fn try_committed_rows(&self) -> Result<Vec<OutboxRow>> {
@@ -177,7 +181,8 @@ impl myelin_events::DurableOutboxBacking for PgOutboxBacking {
     }
 
     fn dead_letters(&self) -> Vec<OutboxRow> {
-        self.block(async { self.relay().dead_rows().await.unwrap_or_default() })
+        let rows = self.block(async { self.relay().dead_rows().await });
+        require_outbox_read("dead-letter rows", rows)
     }
 
     fn drain_once(&self, transport: &dyn BusTransport, batch: usize) -> Result<DrainReport> {
@@ -191,5 +196,29 @@ impl myelin_events::DurableOutboxBacking for PgOutboxBacking {
                 .await
                 .map_err(|e| OutboxError(e.to_string()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_outbox_read;
+    use crate::pg::PgError;
+
+    #[test]
+    fn infallible_read_boundary_fails_loud_without_logging_database_detail() {
+        let panic = std::panic::catch_unwind(|| {
+            require_outbox_read::<usize>(
+                "depth",
+                Err(PgError::Query("sentinel database detail".to_string())),
+            )
+        })
+        .expect_err("a durable read failure must not become a zero value");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("panic payload is a string");
+        assert!(message.contains("durable outbox depth read failed"));
+        assert!(!message.contains("sentinel database detail"));
     }
 }
