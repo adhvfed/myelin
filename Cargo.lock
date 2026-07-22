@@ -2505,6 +2505,7 @@ name = "myelin-edge"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "blake3",
  "bytes",
  "chrono",
  "http-body-util",
