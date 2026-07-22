@@ -771,6 +771,31 @@ impl DurableGitRepo {
         Ok(())
     }
 
+    /// Repair the one-step crash window where the ref CAS reached its committed new tip but the
+    /// following config-backed generation bump did not. The reconciler proves the witness is exactly
+    /// `expected_current + 1` and the tip already equals its new state before calling this method.
+    /// Rechecking the current generation here makes a concurrent or repeated repair fail safely.
+    pub(crate) fn repair_ref_generation(
+        &self,
+        name: &str,
+        expected_current: u64,
+    ) -> Result<u64, DurableError> {
+        let repo = self.open_git()?;
+        let cfg = repo
+            .config()
+            .map_err(|e| git_err("config (refgen repair check)", e))?;
+        let current = read_ref_generation(&cfg, name)?;
+        if current != expected_current {
+            return Err(DurableError::Git(format!(
+                "ref generation changed during repair for {name}: expected {expected_current}, actual {current}"
+            )));
+        }
+        drop(cfg);
+        self.bump_generation(&repo, name)?;
+        next_ref_generation(current)
+            .ok_or_else(|| DurableError::Git(format!("ref generation exhausted for {name}")))
+    }
+
     /// **The durable, monotonic per-ref generation** (R0.4 / git #1 HIGH — the recovery fence the
     /// reconciler compares `update_seq` against). Reads the `myelin.refgen.<encoded-ref>` config counter
     /// (0 if the ref was never written). Unlike [`Self::reflog_len`], this does NOT reset when a ref is

@@ -157,6 +157,8 @@ pub struct ReconcileReport {
     pub examined: usize,
     /// The records re-applied (the on-disk ref was behind) — `(ref_name, update_seq)`.
     pub reapplied: Vec<(String, u64)>,
+    /// Ref CASes that were already applied but whose generation fence required repair after a crash.
+    pub repaired_fences: Vec<(String, u64)>,
     /// The records already current on disk (idempotent skips — the common, no-crash case).
     pub already_current: usize,
 }
@@ -164,7 +166,7 @@ pub struct ReconcileReport {
 impl ReconcileReport {
     /// Whether any ref move was recovered (the crash window had to be healed).
     pub fn recovered_any(&self) -> bool {
-        !self.reapplied.is_empty()
+        !self.reapplied.is_empty() || !self.repaired_fences.is_empty()
     }
 }
 
@@ -199,16 +201,56 @@ pub fn reconcile_refs(
         // idempotent `<=` comparison below is exact even after a branch was deleted and recreated
         // (reflog length would have RESET on the recreate and mis-compared here).
         let on_disk_seq = repo.ref_generation(&rec.ref_name)?;
-        if rec.update_seq <= on_disk_seq {
-            // Already applied — the idempotent skip (the no-crash case + the re-run case).
+        if rec.update_seq < on_disk_seq {
+            // A historical record behind a later applied generation — the idempotent skip.
             report.already_current += 1;
+            continue;
+        }
+
+        let expected = repo.read_ref(&rec.ref_name)?;
+        let on_disk_matches_new = match (&expected, rec.new_is_delete()) {
+            (None, true) => true,
+            (Some(tip), false) => tip.as_str() == rec.new_oid,
+            _ => false,
+        };
+
+        if rec.update_seq == on_disk_seq {
+            // A witness claiming the CURRENT generation must describe the current tip. Reject a
+            // conflicting same-sequence committed witness instead of silently marking both current.
+            if !on_disk_matches_new {
+                return Err(DurableError::CasMismatch {
+                    ref_name: rec.ref_name.clone(),
+                    expected: if rec.new_is_delete() { None } else { Some(rec.new_oid.clone()) },
+                    actual: expected.map(|oid| oid.0),
+                });
+            }
+            report.already_current += 1;
+            continue;
+        }
+
+        let next_seq = crate::durable::next_ref_generation(on_disk_seq).ok_or_else(|| {
+            DurableError::Io(format!("ref generation exhausted for {}", rec.ref_name))
+        })?;
+        if rec.update_seq != next_seq {
+            return Err(DurableError::Io(format!(
+                "committed ref witness sequence gap for {}: on-disk {}, witness {}",
+                rec.ref_name, on_disk_seq, rec.update_seq
+            )));
+        }
+
+        // The ref mutation can become durable immediately before its generation config write. If the
+        // tip already equals the committed new state, repair only that missing fence; replaying the CAS
+        // would fail against `old_oid` and wedge boot. This applies equally to an absent deleted ref.
+        if on_disk_matches_new {
+            let repaired = repo.repair_ref_generation(&rec.ref_name, on_disk_seq)?;
+            debug_assert_eq!(repaired, rec.update_seq);
+            report.repaired_fences.push((rec.ref_name.clone(), rec.update_seq));
             continue;
         }
 
         // Behind: this committed move was not applied on disk (the crash window). Re-apply via the
         // durable per-ref CAS. The expected-old is the CURRENT on-disk tip (after any prior re-applies),
         // which equals the record's old_oid — so this is the real linearisation point, not a force.
-        let expected = repo.read_ref(&rec.ref_name)?;
         // Defensive consistency: the on-disk tip must match what the committed record moved FROM. If it
         // does not, the durable reflog disagrees with the committed event — surface loud (never a silent
         // wrong-bytes apply). A create record (`old` zero) expects no ref.
@@ -311,6 +353,94 @@ mod tests {
         assert!(!again.recovered_any(), "idempotent on update_seq");
         assert_eq!(again.already_current, 1);
         assert_eq!(repo.read_ref("refs/heads/main").unwrap(), Some(c1));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A crash can land after libgit2 mutates the ref but before the separate generation config
+    /// write. Recovery repairs only the missing fence for both an update and a deletion.
+    #[test]
+    fn reconcile_repairs_generation_when_update_or_delete_tip_already_landed() {
+        let root = temp_root("repair-fence");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let c1 = seed_commit(&repo, b"v1\n");
+        let blob2 = repo.write_blob(b"v2\n").unwrap();
+        let tree2 = repo.write_tree(&[("file.txt", &blob2)]).unwrap();
+        let c2 = repo
+            .write_commit(&tree2, &[&c1], "v2", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+
+        for ref_name in ["refs/heads/update", "refs/heads/delete"] {
+            repo.update_ref_cas(ref_name, None, Some(&c1), "create", "psn@acme.noreply")
+                .unwrap();
+            assert_eq!(repo.ref_generation(ref_name), Ok(1));
+        }
+
+        // Simulate interruption inside `update_ref_cas`: change the refs with raw libgit2 while
+        // deliberately leaving the config-backed generations at 1.
+        let raw = git2::Repository::open_bare(repo.path()).unwrap();
+        raw.reference_matching(
+            "refs/heads/update",
+            git2::Oid::from_str(&c2.0).unwrap(),
+            true,
+            git2::Oid::from_str(&c1.0).unwrap(),
+            "raw update before generation crash",
+        )
+        .unwrap();
+        raw.find_reference("refs/heads/delete").unwrap().delete().unwrap();
+
+        let records = vec![
+            GitRefUpdatedRecord {
+                repo: "core".into(), ref_name: "refs/heads/update".into(),
+                old_oid: c1.0.clone(), new_oid: c2.0.clone(), update_seq: 2,
+                pusher_pseudonym: "psn@acme.noreply".into(),
+            },
+            GitRefUpdatedRecord {
+                repo: "core".into(), ref_name: "refs/heads/delete".into(),
+                old_oid: c1.0.clone(), new_oid: "0".repeat(40), update_seq: 2,
+                pusher_pseudonym: "psn@acme.noreply".into(),
+            },
+        ];
+
+        let report = reconcile_refs(&repo, &records).expect("repair applied-but-unfenced refs");
+        assert!(report.reapplied.is_empty(), "the ref CASes had already landed");
+        assert_eq!(
+            report.repaired_fences,
+            vec![("refs/heads/update".into(), 2), ("refs/heads/delete".into(), 2)]
+        );
+        assert_eq!(repo.read_ref("refs/heads/update").unwrap(), Some(c2));
+        assert_eq!(repo.read_ref("refs/heads/delete").unwrap(), None);
+        assert_eq!(repo.ref_generation("refs/heads/update"), Ok(2));
+        assert_eq!(repo.ref_generation("refs/heads/delete"), Ok(2));
+
+        let again = reconcile_refs(&repo, &records).expect("repaired fences are idempotent");
+        assert_eq!(again.already_current, 2);
+        assert!(!again.recovered_any());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_rejects_a_conflicting_witness_at_the_current_generation() {
+        let root = temp_root("same-seq-conflict");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let landed = seed_commit(&repo, b"landed\n");
+        let conflicting = seed_commit(&repo, b"conflicting\n");
+        repo.update_ref_cas(
+            "refs/heads/main", None, Some(&landed), "create", "psn@acme.noreply",
+        )
+        .unwrap();
+        let record = GitRefUpdatedRecord {
+            repo: "core".into(), ref_name: "refs/heads/main".into(),
+            old_oid: "0".repeat(40), new_oid: conflicting.0, update_seq: 1,
+            pusher_pseudonym: "psn@acme.noreply".into(),
+        };
+
+        assert!(matches!(
+            reconcile_refs(&repo, &[record]),
+            Err(DurableError::CasMismatch { .. })
+        ));
+        assert_eq!(repo.read_ref("refs/heads/main").unwrap(), Some(landed));
         std::fs::remove_dir_all(&root).ok();
     }
 
