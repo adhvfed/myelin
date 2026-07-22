@@ -474,6 +474,73 @@ fn repository_list_cursor_codec_is_canonical_bounded_and_round_trips() {
 }
 
 #[test]
+fn pr_commit_cursor_codec_is_canonical_bounded_and_round_trips() {
+    fn mutate_cursor(cursor: &str, mutation: impl FnOnce(&mut Vec<u8>)) -> String {
+        let encoded = cursor.strip_prefix(PR_COMMIT_CURSOR_PREFIX).unwrap();
+        let mut frame = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+        mutation(&mut frame);
+        format!(
+            "{PR_COMMIT_CURSOR_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(frame)
+        )
+    }
+
+    let base = "11".repeat(20);
+    let head = "ab".repeat(20);
+    for cursor in [
+        PrCommitCursor::new([5; 32], Some(&base), &head, 37).unwrap(),
+        PrCommitCursor::new([6; 32], None, &head, 1).unwrap(),
+    ] {
+        let encoded = cursor.encode();
+        assert!(encoded.starts_with(PR_COMMIT_CURSOR_PREFIX));
+        assert!(encoded.len() <= PR_COMMIT_CURSOR_MAX_BYTES);
+        assert!(!encoded.contains('='), "the base64url token is unpadded");
+        assert_eq!(PrCommitCursor::parse(&encoded).unwrap(), cursor);
+    }
+
+    assert_eq!(
+        PrCommitCursor::new([0; 32], Some(&base), &head.to_uppercase(), 1),
+        Err(PrCommitCursorError)
+    );
+    for position in [0, PR_COMMIT_CURSOR_MAX_POSITION + 1] {
+        assert_eq!(
+            PrCommitCursor::new([0; 32], None, &head, position),
+            Err(PrCommitCursorError)
+        );
+    }
+
+    let encoded = PrCommitCursor::new([7; 32], Some(&base), &head, 2)
+        .unwrap()
+        .encode();
+    let absent_base = PrCommitCursor::new([7; 32], None, &head, 2)
+        .unwrap()
+        .encode();
+    let wrong_version = mutate_cursor(&encoded, |frame| frame[0] = 2);
+    let wrong_length = mutate_cursor(&encoded, |frame| {
+        frame.pop();
+    });
+    let invalid_absent_base_sentinel = mutate_cursor(&absent_base, |frame| frame[34] = 1);
+    let overflow = mutate_cursor(&encoded, |frame| {
+        frame[74..78].copy_from_slice(&u32::MAX.to_be_bytes());
+    });
+    for malformed in [
+        "pc1_".to_string(),
+        "pc1_not-base64!".to_string(),
+        format!("{encoded}="),
+        format!("pc1_{}", "a".repeat(PR_COMMIT_CURSOR_MAX_BYTES)),
+        encoded.replacen("pc1_", "pc2_", 1),
+        wrong_version,
+        wrong_length,
+        invalid_absent_base_sentinel,
+        overflow,
+    ] {
+        assert_eq!(PrCommitCursor::parse(&malformed), Err(PrCommitCursorError));
+    }
+}
+
+#[test]
 fn commit_row_and_diff_json_carry_the_browse_contract() {
     // GT-004 browse ViewModels: the JSON the Solid Git web UI renders (short_oid + the +/- diff
     // origins as the three-channel signal; PII-free pseudonymous author; unix `committed_at`).
