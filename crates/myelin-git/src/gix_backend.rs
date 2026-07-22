@@ -176,43 +176,94 @@ impl<P: RepoPathResolver> ReadBackend for GixCore<P> {
         Ok(blob.content().to_vec())
     }
 
-    fn diff_blobs(&self, repo: &RepoLoc, a: &Oid, b: &Oid) -> Result<Vec<DiffLine>, GitCoreError> {
+    fn diff_blobs_bounded(
+        &self,
+        repo: &RepoLoc,
+        a: &Oid,
+        b: &Oid,
+        maximum_blob_bytes: usize,
+        maximum_lines: usize,
+        maximum_output_bytes: usize,
+    ) -> Result<Vec<DiffLine>, GitCoreError> {
         let r = self.open(repo)?;
+        let a = Self::parse_oid(a)?;
+        let b = Self::parse_oid(b)?;
+        let odb = r
+            .odb()
+            .map_err(|e| GitCoreError::Read(format!("open object database: {e}")))?;
+        for (side, oid) in [("left", a), ("right", b)] {
+            let (size, kind) = odb.read_header(oid).map_err(|e| {
+                GitCoreError::Read(format!("read {side} diff blob header {oid}: {e}"))
+            })?;
+            if kind != git2::ObjectType::Blob {
+                return Err(GitCoreError::Read(format!(
+                    "{side} diff object {oid} is not a blob"
+                )));
+            }
+            if size > maximum_blob_bytes {
+                return Err(GitCoreError::Read(format!(
+                    "diff blob limit exceeded: {side} blob has {size} bytes, maximum is {maximum_blob_bytes}"
+                )));
+            }
+        }
         let blob_a = r
-            .find_blob(Self::parse_oid(a)?)
-            .map_err(|e| GitCoreError::Read(format!("find_blob {}: {e}", a.as_str())))?;
+            .find_blob(a)
+            .map_err(|e| GitCoreError::Read(format!("find_blob {a}: {e}")))?;
         let blob_b = r
-            .find_blob(Self::parse_oid(b)?)
-            .map_err(|e| GitCoreError::Read(format!("find_blob {}: {e}", b.as_str())))?;
+            .find_blob(b)
+            .map_err(|e| GitCoreError::Read(format!("find_blob {b}: {e}")))?;
 
         let mut lines: Vec<DiffLine> = Vec::new();
-        // libgit2's blob-to-blob diff = the Myers/Histogram unified diff the anchor remap feeds on.
-        let mut line_cb = |_delta: git2::DiffDelta<'_>,
-                           _hunk: Option<git2::DiffHunk<'_>>,
-                           line: git2::DiffLine<'_>| {
-            let origin = line.origin();
-            if matches!(origin, '+' | '-' | ' ') {
-                lines.push(DiffLine {
-                    origin,
-                    content: String::from_utf8_lossy(line.content())
+        let mut output_bytes = 0usize;
+        let mut limit_error = None;
+        let result = {
+            // libgit2's blob-to-blob diff = the Myers/Histogram unified diff the anchor remap feeds
+            // on. Scope the callback so its mutable borrows end before the limit verdict is read.
+            let mut line_cb = |_delta: git2::DiffDelta<'_>,
+                               _hunk: Option<git2::DiffHunk<'_>>,
+                               line: git2::DiffLine<'_>| {
+                let origin = line.origin();
+                if matches!(origin, '+' | '-' | ' ') {
+                    if lines.len() >= maximum_lines {
+                        limit_error = Some(format!(
+                            "diff output line limit exceeded: maximum is {maximum_lines}"
+                        ));
+                        return false;
+                    }
+                    let content = String::from_utf8_lossy(line.content())
                         .trim_end_matches('\n')
-                        .to_string(),
-                });
-            }
-            true
+                        .to_string();
+                    let Some(next_output_bytes) = output_bytes.checked_add(content.len()) else {
+                        limit_error = Some("diff output byte count overflowed".into());
+                        return false;
+                    };
+                    if next_output_bytes > maximum_output_bytes {
+                        limit_error = Some(format!(
+                            "diff output byte limit exceeded: maximum is {maximum_output_bytes}"
+                        ));
+                        return false;
+                    }
+                    output_bytes = next_output_bytes;
+                    lines.push(DiffLine { origin, content });
+                }
+                true
+            };
+            r.diff_blobs(
+                Some(&blob_a),
+                None,
+                Some(&blob_b),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut line_cb),
+            )
         };
-        r.diff_blobs(
-            Some(&blob_a),
-            None,
-            Some(&blob_b),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&mut line_cb),
-        )
-        .map_err(|e| GitCoreError::Read(format!("diff_blobs: {e}")))?;
+        if let Some(error) = limit_error {
+            return Err(GitCoreError::Read(error));
+        }
+        result.map_err(|e| GitCoreError::Read(format!("diff_blobs: {e}")))?;
         Ok(lines)
     }
 
@@ -354,6 +405,34 @@ mod tests {
             .read_blob_bounded(&repo, &oid, payload.len() - 1)
             .expect_err("cap plus one is rejected");
         assert!(error.to_string().contains("blob read limit exceeded"));
+
+        std::fs::remove_dir_all(&path).expect("remove isolated test repository");
+    }
+
+    #[test]
+    fn blob_diff_enforces_input_line_and_output_byte_limits() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "myelin-gix-diff-bound-{}-{nonce}.git",
+            std::process::id()
+        ));
+        let repository = git2::Repository::init_bare(&path).expect("init bare test repository");
+        let left = Oid::new(repository.blob(b"a\n").expect("write left blob").to_string());
+        let right = Oid::new(repository.blob(b"b\n").expect("write right blob").to_string());
+        drop(repository);
+
+        let reader = GixCore::new(FixedResolver(path.clone()));
+        let repo = RepoLoc::new("acme", "eu-west", "widgets");
+        let exact = reader
+            .diff_blobs_bounded(&repo, &left, &right, 2, 2, 2)
+            .expect("exact limits are accepted");
+        assert_eq!(exact.len(), 2);
+        assert!(reader.diff_blobs_bounded(&repo, &left, &right, 1, 2, 2).is_err());
+        assert!(reader.diff_blobs_bounded(&repo, &left, &right, 2, 1, 2).is_err());
+        assert!(reader.diff_blobs_bounded(&repo, &left, &right, 2, 2, 1).is_err());
 
         std::fs::remove_dir_all(&path).expect("remove isolated test repository");
     }

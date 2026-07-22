@@ -795,11 +795,14 @@ mod tests {
         ) -> Result<Vec<u8>, GitCoreError> {
             unreachable!()
         }
-        fn diff_blobs(
+        fn diff_blobs_bounded(
             &self,
             _r: &RepoLoc,
             _a: &crate::core::Oid,
             _b: &crate::core::Oid,
+            _maximum_blob_bytes: usize,
+            _maximum_lines: usize,
+            _maximum_output_bytes: usize,
         ) -> Result<Vec<crate::core::DiffLine>, GitCoreError> {
             unreachable!()
         }

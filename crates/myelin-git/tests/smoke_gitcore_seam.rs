@@ -180,10 +180,13 @@ fn gitcore_seam_clones_via_canonical_wire_then_diffs_and_blames_via_gix() {
 
     // diff the two blobs in-process — a real Myers diff.
     let diff = core
-        .diff_blobs(
+        .diff_blobs_bounded(
             &repo,
             &myelin_git::core::Oid::new(&blob1),
             &myelin_git::core::Oid::new(&blob2),
+            1024,
+            100,
+            8192,
         )
         .expect("in-process diff succeeds");
     let added: Vec<_> = diff.iter().filter(|l| l.origin == '+').collect();
