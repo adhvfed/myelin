@@ -789,6 +789,15 @@ impl DurableGitBackend {
     /// validated tenant/region path (no traversal). This is the CANDIDATE set the R2.1 list
     /// prefilter intersects with the principal's `pull`-visible set — never served raw.
     fn scan_repo_slugs(&self, tenant: &str, region: &str) -> Result<Vec<String>, DurableError> {
+        self.scan_repo_slugs_bounded(tenant, region, REPO_SCAN_MAX_CANDIDATES)
+    }
+
+    fn scan_repo_slugs_bounded(
+        &self,
+        tenant: &str,
+        region: &str,
+        maximum: usize,
+    ) -> Result<Vec<String>, DurableError> {
         let mut slugs: Vec<String> = Vec::new();
         let probe = Self::loc(tenant, region, "_probe");
         let probe_path = self.store.repo_path(&probe)?;
@@ -814,6 +823,11 @@ impl DurableGitBackend {
             })?;
             let name = entry.file_name().to_string_lossy().to_string();
             if let Some(slug) = name.strip_suffix(".git") {
+                if slugs.len() >= maximum {
+                    return Err(DurableError::Git(
+                        "browse response limit exceeded: repository candidate count".into(),
+                    ));
+                }
                 slugs.push(slug.to_string());
             }
         }
@@ -2992,6 +3006,11 @@ fn qualify_ref(gitref: &str) -> String {
 /// within this many commits render name-only (graceful degrade — never an N-walk-per-entry blow-up).
 const LATEST_COMMIT_WALK_CAP: usize = 500;
 
+/// Candidate repositories must be materialized before the permission list-object intersection.
+/// Bound that tenant-local directory scan so a pathological partition cannot grow one request
+/// without limit; normal response pagination happens after this leak-free authorization prefilter.
+const REPO_SCAN_MAX_CANDIDATES: usize = 10_000;
+
 /// The inline-text cap for a blob view (R3.4). The ODB header is checked first: a larger object gets
 /// a metadata-only download fallback and is never inflated merely to build the interactive page.
 const BLOB_INLINE_CAP: usize = 512 * 1024;
@@ -5084,6 +5103,30 @@ mod pr_list_tests {
         assert_eq!(body["items"].as_array().unwrap().len(), 1);
         assert_eq!(body["items"][0]["slug"], "acme/beta");
         assert_eq!(body["page"]["next_cursor"], "2");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repository_candidate_scan_stops_before_unbounded_materialization() {
+        let root = temp_root("repo-scan-bound");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root);
+        let viewer = human("u:viewer");
+        for slug in ["alpha", "beta"] {
+            be.create_repo_as(TENANT, REGION, slug, &viewer).unwrap();
+        }
+
+        let error = be
+            .scan_repo_slugs_bounded(TENANT, REGION, 1)
+            .expect_err("the second repository must trip the candidate ceiling");
+        assert!(matches!(
+            error,
+            DurableError::Git(message)
+                if message == "browse response limit exceeded: repository candidate count"
+        ));
+        assert_eq!(
+            be.scan_repo_slugs_bounded(TENANT, REGION, 2).unwrap(),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
