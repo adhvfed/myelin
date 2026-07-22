@@ -58,6 +58,9 @@ pub mod check_emitter;
 /// DAG, per-context check attempts, workflow code identity, and server-granted launch templates;
 /// secret values and minted token JTIs are structurally absent.
 pub mod ci_drive_manifest;
+/// Server-owned mapping from the authored `linux-small-v1` request to fixed default-deny runtime
+/// terms plus explicit durable budget/token authority handles.
+pub mod ci_launch_authority;
 /// Production manifest resolver and DAG-native durable `ci.pipeline` body.
 pub mod ci_manifest_pipeline;
 /// Exact manifest job identity, sandbox translation, and explicit token authority.
@@ -70,6 +73,10 @@ pub use ci_drive_manifest::{
     CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiMergeWaiterV1,
     GrantedCiJobV1, CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN, CI_DRIVE_MANIFEST_SCHEMA_V1,
     MAX_CI_DRIVE_MANIFEST_BYTES,
+};
+pub use ci_launch_authority::{
+    CiJobRuntimeAuthority, CiJobRuntimeAuthorityProvider, CiJobRuntimeAuthorityRequest,
+    LinuxSmallV1LaunchAuthority, LINUX_SMALL_V1_POLICY_REVISION,
 };
 pub use ci_manifest_pipeline::{
     decode_resolved_ci_manifest, drive_resolved_ci_manifest_pipeline, register_ci_manifest_pipeline,
