@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   parseRepoSummaryQuery,
+  parsePrCommitsQuery,
+  prCommitCursorExpiredEnvelope,
+  prCommitsEnvelope,
   parseTreeQuery,
   refsJson,
   repoHomeJson,
@@ -9,6 +12,73 @@ import {
   treeJson,
   validPrOperationId,
 } from "../../dev-edge/dev-contract.mjs";
+
+describe("the dev Edge PR commit pagination contract", () => {
+  it("mints canonical fixed-frame cursors and serves a distinct terminal page", () => {
+    const firstInput = parsePrCommitsQuery("myelin", 1, "limit=20");
+    expect(firstInput).toEqual({ limit: 20, position: 0 });
+    if (!firstInput) throw new Error("expected first-page input");
+    const first = prCommitsEnvelope("myelin", 1, firstInput);
+    if (!first || "expired" in first || !first.page.next_cursor) {
+      throw new Error("expected continuation cursor");
+    }
+    expect(first.items).toHaveLength(20);
+    expect(first.page.next_cursor).toMatch(/^pc1_[A-Za-z0-9_-]+$/);
+
+    const secondInput = parsePrCommitsQuery(
+      "myelin", 1, `cursor=${first.page.next_cursor}&limit=20`,
+    );
+    expect(secondInput).toEqual({
+      limit: 20,
+      position: 20,
+      snapshot: {
+        base_oid: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334",
+        head_oid: "b2c3d4e5f60718293a4b5c6d7e8f900112233445",
+        position: 20,
+      },
+    });
+    if (!secondInput) throw new Error("expected continuation input");
+    const second = prCommitsEnvelope("myelin", 1, secondInput);
+    if (!second || "expired" in second) throw new Error("expected terminal continuation page");
+    expect(second.items).toHaveLength(3);
+    expect(second.page).toEqual({ next_cursor: null, limit: 20 });
+    expect(new Set([...first.items, ...second.items].map((row) => row.oid)).size)
+      .toBe(23);
+  });
+
+  it("rejects malformed, duplicate, unknown, and cross-scope PR commit coordinates", () => {
+    const first = prCommitsEnvelope("myelin", 1, { limit: 20, position: 0 });
+    const cursor = first && !("expired" in first) ? first.page.next_cursor : null;
+    if (!cursor) throw new Error("expected fixture cursor");
+    for (const query of [
+      "limit=01", "limit=0", "limit=101", "limit=20&limit=20", "unknown=1",
+      "cursor=", "cursor=opaque", `cursor=${cursor}=`, `cursor=${cursor}&cursor=${cursor}`,
+      "x".repeat(16 * 1024 + 1),
+    ]) expect(parsePrCommitsQuery("myelin", 1, query), query).toBeNull();
+    expect(parsePrCommitsQuery("myelin", 2, `cursor=${cursor}&limit=20`)).toBeNull();
+  });
+
+  it("separates a canonical in-scope cursor with expired snapshot coordinates from malformed input", () => {
+    const first = prCommitsEnvelope("myelin", 1, { limit: 20, position: 0 });
+    const cursor = first && !("expired" in first) ? first.page.next_cursor : null;
+    if (!cursor) throw new Error("expected fixture cursor");
+    const frame = Buffer.from(cursor.slice(4), "base64url");
+    frame[54] = (frame[54] ?? 0) ^ 0xff;
+    const expiredCursor = `pc1_${frame.toString("base64url")}`;
+
+    const input = parsePrCommitsQuery("myelin", 1, `cursor=${expiredCursor}&limit=20`);
+    expect(input).toMatchObject({
+      limit: 20,
+      position: 20,
+      snapshot: { head_oid: expect.not.stringMatching(/^b2c3d4/) },
+    });
+    if (!input) throw new Error("expected structurally valid expired cursor input");
+    expect(prCommitsEnvelope("myelin", 1, input)).toEqual({ expired: true });
+    expect(prCommitCursorExpiredEnvelope()).toEqual({
+      error: { message: "pull request commit cursor expired", code: "conflict" },
+    });
+  });
+});
 
 describe("the dev Edge repository summary contract", () => {
   it("strictly parses summary coordinates and keyset-pages shape-separated fixtures", () => {

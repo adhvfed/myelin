@@ -38,6 +38,7 @@ import {
   getPrChecks,
   getPrThreads,
   getPrCommits,
+  PR_COMMITS_PAGE_LIMIT,
   RepoRouteError,
   prMutate,
   type MergeResult,
@@ -46,6 +47,7 @@ import {
   type PrThreadVM,
   type PrReviewVM,
   type PrincipalVM,
+  type PrCommitsPage,
 } from "~/lib/api";
 import { NotAvailable } from "~/components/NotAvailable";
 import { PrHeader } from "~/components/PrHeader";
@@ -66,6 +68,12 @@ const card = {
 /** The checks region degrades locally: a projection failure resolves to this sentinel (never a throw). */
 type ChecksUnavailableSentinel = { unavailable: true };
 type ChecksState = PrChecksVM | ChecksUnavailableSentinel | undefined;
+type PrCommitsState = {
+  repo: string;
+  n: number;
+  page: PrCommitsPage | null;
+  unavailable: boolean;
+} | undefined;
 function isUnavailable(c: ChecksState): c is ChecksUnavailableSentinel {
   return c != null && (c as ChecksUnavailableSentinel).unavailable === true;
 }
@@ -111,7 +119,26 @@ export default function PrOverviewScreen() {
     { deferStream: true },
   );
   const commits = createAsync(
-    async () => (ready() ? getPrCommits({ repo: repo(), n: n() }) : undefined),
+    async (): Promise<PrCommitsState> => {
+      if (!ready()) return undefined;
+      const requestRepo = repo();
+      const requestNumber = n();
+      try {
+        return {
+          repo: requestRepo,
+          n: requestNumber,
+          page: await getPrCommits({
+            repo: requestRepo,
+            n: requestNumber,
+            limit: PR_COMMITS_PAGE_LIMIT,
+          }),
+          unavailable: false,
+        };
+      } catch (error) {
+        if (error instanceof Response) throw error;
+        return { repo: requestRepo, n: requestNumber, page: null, unavailable: true };
+      }
+    },
     { deferStream: true },
   );
 
@@ -200,7 +227,7 @@ export default function PrOverviewScreen() {
                   />
 
                   {/* Commits IN this PR. */}
-                  <CommitsSection repo={repo()} items={commits()?.items ?? []} loading={commits() === undefined} />
+                  <CommitsSection repo={repo()} n={n()} initial={commits()} />
 
                   {/* Discussion (threads with anchor null) inline. */}
                   <DiscussionSection
@@ -500,16 +527,146 @@ function ReviewsSection(props: {
 
 // ── commits ─────────────────────────────────────────────────────────────────────────────────────
 
-function CommitsSection(props: { repo: string; items: { oid: string; short_oid: string; summary: string; author: string }[]; loading: boolean }) {
+function CommitsSection(props: { repo: string; n: number; initial: PrCommitsState }) {
+  const [firstPage, setFirstPage] = createSignal<PrCommitsPage | null>(null);
+  const [extraPages, setExtraPages] = createSignal<PrCommitsPage[]>([]);
+  const [initialError, setInitialError] = createSignal(false);
+  const [loadingMore, setLoadingMore] = createSignal(false);
+  const [loadMoreError, setLoadMoreError] = createSignal(false);
+  const [paginationCompleted, setPaginationCompleted] = createSignal(false);
+  const [retryingInitial, setRetryingInitial] = createSignal(false);
+  let completionStatus: HTMLParagraphElement | undefined;
+  let generation = 0;
+  let requestSequence = 0;
+  let identity = "";
+  let observedInitial: PrCommitsState;
+
+  const resetContinuation = () => {
+    generation += 1;
+    requestSequence += 1;
+    setExtraPages([]);
+    setLoadingMore(false);
+    setLoadMoreError(false);
+    setPaginationCompleted(false);
+  };
+
+  createEffect(() => {
+    const nextIdentity = `${props.repo}:${props.n}`;
+    const initial = props.initial;
+    if (identity !== nextIdentity) {
+      identity = nextIdentity;
+      observedInitial = undefined;
+      setFirstPage(null);
+      setInitialError(false);
+      setRetryingInitial(false);
+      resetContinuation();
+    }
+    if (!initial || initial.repo !== props.repo || initial.n !== props.n || initial === observedInitial) {
+      return;
+    }
+    observedInitial = initial;
+    setRetryingInitial(false);
+    if (initial.page) {
+      setFirstPage(initial.page);
+      setInitialError(false);
+      resetContinuation();
+    } else {
+      setInitialError(true);
+    }
+  });
+
+  const items = createMemo(() => [
+    ...(firstPage()?.items ?? []),
+    ...extraPages().flatMap((page) => page.items),
+  ]);
+  const nextCursor = () => {
+    const pages = extraPages();
+    return pages.length > 0
+      ? pages[pages.length - 1]!.page.next_cursor
+      : firstPage()?.page.next_cursor ?? null;
+  };
+  const retryInitial = async () => {
+    if (retryingInitial()) return;
+    setRetryingInitial(true);
+    try {
+      await revalidate("git-pr-commits");
+    } finally {
+      setRetryingInitial(false);
+    }
+  };
+  const loadMore = async (retry = false) => {
+    const cursor = nextCursor();
+    if (!cursor || loadingMore()) return;
+    const requestGeneration = generation;
+    const request = ++requestSequence;
+    const requestRepo = props.repo;
+    const requestNumber = props.n;
+    const continuationInput = {
+      repo: requestRepo,
+      n: requestNumber,
+      limit: PR_COMMITS_PAGE_LIMIT,
+      cursor,
+    };
+    setLoadingMore(true);
+    setLoadMoreError(false);
+    try {
+      if (retry) await revalidate(getPrCommits.keyFor(continuationInput));
+      const page = await getPrCommits(continuationInput);
+      if (requestGeneration !== generation || request !== requestSequence ||
+          requestRepo !== props.repo || requestNumber !== props.n) return;
+
+      const existingOids = new Set(items().map((item) => item.oid));
+      const knownCursors = new Set([
+        firstPage()?.page.next_cursor,
+        ...extraPages().map((candidate) => candidate.page.next_cursor),
+      ].filter((candidate): candidate is string => candidate !== null && candidate !== undefined));
+      const duplicates = page.items.some((item) => existingOids.has(item.oid));
+      const cursorCycle = page.page.next_cursor !== null && knownCursors.has(page.page.next_cursor);
+      const emptyContinuation = page.items.length === 0 && page.page.next_cursor !== null;
+      if (duplicates || cursorCycle || emptyContinuation ||
+          page.page.limit !== PR_COMMITS_PAGE_LIMIT) {
+        setLoadMoreError(true);
+        return;
+      }
+      setExtraPages((pages) => [...pages, page]);
+      if (page.page.next_cursor === null) {
+        setPaginationCompleted(true);
+        queueMicrotask(() => {
+          if (requestGeneration === generation && request === requestSequence) {
+            completionStatus?.focus();
+          }
+        });
+      }
+    } catch {
+      if (requestGeneration === generation && request === requestSequence) {
+        setLoadMoreError(true);
+      }
+    } finally {
+      if (requestGeneration === generation && request === requestSequence) {
+        setLoadingMore(false);
+      }
+    }
+  };
+
+  const loadingInitial = () => !firstPage() && !initialError() &&
+    (!props.initial || props.initial.repo !== props.repo || props.initial.n !== props.n);
   return (
-    <section aria-labelledby="commits-heading" style={{ ...card }}>
+    <section aria-labelledby="commits-heading" aria-busy={loadingMore()} style={{ ...card }} data-testid="pr-commits-card">
       <h2 id="commits-heading" style={{ "font-size": "var(--fs-h3)", margin: "0" }}>Commits</h2>
-      <Show when={!props.loading} fallback={<Skeleton label="Loading commits…" rows={2} rowHeight="1.5rem" />}>
-        <Show when={props.items.length > 0} fallback={<p style={{ color: "var(--text-muted)", margin: "0" }}>No commits in this pull request.</p>}>
-          <ul style={{ "list-style": "none", margin: "0", padding: "0", display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>
-            <For each={props.items}>
+      <Show when={!loadingInitial()} fallback={<Skeleton label="Loading commits…" rows={2} rowHeight="1.5rem" />}>
+        <Show when={!initialError() || firstPage()} fallback={
+          <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)", "align-items": "flex-start" }}>
+            <p role="alert" style={{ color: "var(--danger)", margin: "0" }}>Commits could not be loaded. The pull request is still available.</p>
+            <button type="button" class="btn-secondary" style={barBtn} disabled={retryingInitial()} onClick={() => void retryInitial()}>
+              {retryingInitial() ? "Retrying commits…" : "Retry commits"}
+            </button>
+          </div>
+        }>
+          <Show when={items().length > 0} fallback={<p style={{ color: "var(--text-muted)", margin: "0" }}>No commits in this pull request.</p>}>
+          <ul data-testid="pr-commits-list" style={{ "list-style": "none", margin: "0", padding: "0", display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>
+            <For each={items()}>
               {(c) => (
-                <li style={{ display: "flex", "align-items": "center", gap: "var(--space-2)" }}>
+                <li data-commit-oid={c.oid} style={{ display: "flex", "align-items": "center", gap: "var(--space-2)" }}>
                   <Icon name="commit" />
                   <A href={`/git/repos/${props.repo}/commit/${c.oid}`} style={{ "font-family": "var(--font-mono)", "font-size": "var(--fs-caption)" }}>{c.short_oid}</A>
                   <span>{c.summary}</span>
@@ -518,6 +675,33 @@ function CommitsSection(props: { repo: string; items: { oid: string; short_oid: 
               )}
             </For>
           </ul>
+          <Show when={initialError() && firstPage()}>
+            <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)", "align-items": "flex-start" }}>
+              <p role="alert" style={{ color: "var(--danger)", margin: "0" }}>Commits could not be refreshed. Already loaded commits are unchanged.</p>
+              <button type="button" class="btn-secondary" style={barBtn} disabled={retryingInitial()} onClick={() => void retryInitial()}>
+                {retryingInitial() ? "Retrying commits…" : "Retry commits"}
+              </button>
+            </div>
+          </Show>
+          <Show when={loadMoreError()}>
+            <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)", "align-items": "flex-start" }}>
+              <p role="alert" style={{ color: "var(--danger)", margin: "0" }}>Older commits could not be loaded. Already loaded commits are unchanged.</p>
+              <button type="button" class="btn-secondary" style={barBtn} disabled={loadingMore()} onClick={() => void loadMore(true)}>
+                Retry loading older commits
+              </button>
+            </div>
+          </Show>
+          <Show when={!loadMoreError() && nextCursor()}>
+            <button type="button" data-testid="load-older-commits" class="btn-secondary" style={{ ...barBtn, "align-self": "flex-start" }} disabled={loadingMore()} onClick={() => void loadMore()}>
+              {loadingMore() ? "Loading older commits…" : "Load older commits"}
+            </button>
+          </Show>
+          <Show when={paginationCompleted()}>
+            <p ref={completionStatus} tabindex={-1} role="status" aria-live="polite" data-testid="commits-pagination-complete" style={{ color: "var(--text-muted)", margin: "0" }}>
+              All commits loaded.
+            </p>
+          </Show>
+        </Show>
         </Show>
       </Show>
     </section>

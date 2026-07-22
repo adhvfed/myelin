@@ -1,5 +1,6 @@
-import { test, expect, request as pwRequest, type Page } from "@playwright/test";
+import { test, expect, request as pwRequest, type Locator, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
+import { DEV_ACCESS_TOKEN } from "../../dev-edge/dev-contract.mjs";
 
 const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 
@@ -10,6 +11,30 @@ async function resetPrFixtures() {
   });
   expect(response.ok(), "dev-edge PR fixture reset must be accepted").toBeTruthy();
   await context.dispose();
+}
+
+async function configurePrContinuation(data: {
+  prCommitContinuationFailures?: number;
+  prCommitContinuationMalformedPages?: number;
+}) {
+  const context = await pwRequest.newContext();
+  const response = await context.post(`${EDGE}/__test/config`, { data });
+  expect(response.ok(), "dev-edge PR continuation config must be accepted").toBeTruthy();
+  const body = await response.json() as {
+    state: { prCommitContinuationRequests: number };
+  };
+  await context.dispose();
+  return body.state;
+}
+
+async function prContinuationRequestCount() {
+  return (await configurePrContinuation({})).prCommitContinuationRequests;
+}
+
+async function commitOids(list: Locator) {
+  return list.locator("li").evaluateAll((rows) =>
+    rows.map((row) => row.getAttribute("data-commit-oid")),
+  );
 }
 
 // R3.3 — the PR overview + context pane (G-6) + review verdicts (G-8) + checks panel (G-9), driven in
@@ -60,6 +85,105 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     await expect(page.getByRole("complementary", { name: "Pull request context" })).toBeVisible();
 
     await expectNoAxeViolations(page, "PR overview");
+  });
+
+  test("PR commits append a distinct snapshot page and reset across navigation", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/1");
+
+    const list = page.getByTestId("pr-commits-list");
+    await expect(list.locator("li")).toHaveCount(20);
+    const loadOlder = page.getByTestId("load-older-commits");
+    await expect(loadOlder).toHaveText("Load older commits");
+    await loadOlder.click();
+
+    await expect(list.locator("li")).toHaveCount(23);
+    await expect(list.getByText("PR continuation commit 1", { exact: true })).toBeVisible();
+    await expect(loadOlder).toHaveCount(0);
+    const completed = page.getByTestId("commits-pagination-complete");
+    await expect(completed).toHaveText("All commits loaded.");
+    await expect(completed).toBeFocused();
+    const oids = await list.locator("li").evaluateAll((rows) =>
+      rows.map((row) => row.getAttribute("data-commit-oid")),
+    );
+    expect(new Set(oids).size).toBe(23);
+
+    await page.goto("/git/repos/myelin/prs/2");
+    await expect(page.getByTestId("pr-commits-list").locator("li")).toHaveCount(1);
+    await expect(page.getByTestId("load-older-commits")).toHaveCount(0);
+    await expect(page.getByTestId("commits-pagination-complete")).toHaveCount(0);
+    await page.goto("/git/repos/myelin/prs/1");
+    await expect(page.getByTestId("pr-commits-list").locator("li")).toHaveCount(20);
+    await expect(page.getByTestId("load-older-commits")).toBeVisible();
+    await expect(page.getByTestId("commits-pagination-complete")).toHaveCount(0);
+  });
+
+  test("a failed continuation retry evicts only that rejected page and preserves the first 20 commits", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/1");
+    const list = page.getByTestId("pr-commits-list");
+    await expect(list.locator("li")).toHaveCount(20);
+    const firstTwentyOids = await commitOids(list);
+    await configurePrContinuation({ prCommitContinuationFailures: 1 });
+
+    await page.getByTestId("load-older-commits").click();
+    await expect(page.getByText("Older commits could not be loaded.", { exact: false })).toBeVisible();
+    await expect(list.locator("li")).toHaveCount(20);
+    expect(await commitOids(list)).toEqual(firstTwentyOids);
+    expect(await prContinuationRequestCount()).toBe(1);
+
+    await page.getByRole("button", { name: "Retry loading older commits" }).click();
+    await expect(list.locator("li")).toHaveCount(23);
+    expect((await commitOids(list)).slice(0, 20)).toEqual(firstTwentyOids);
+    expect(await prContinuationRequestCount()).toBe(2);
+    await expect(page.getByTestId("commits-pagination-complete")).toBeFocused();
+  });
+
+  test("a retry evicts a cached successful continuation that fails local page validation", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/1");
+    const list = page.getByTestId("pr-commits-list");
+    await expect(list.locator("li")).toHaveCount(20);
+    const firstTwentyOids = await commitOids(list);
+    await configurePrContinuation({ prCommitContinuationMalformedPages: 1 });
+
+    await page.getByTestId("load-older-commits").click();
+    await expect(page.getByText("Older commits could not be loaded.", { exact: false })).toBeVisible();
+    await expect(list.locator("li")).toHaveCount(20);
+    expect(await commitOids(list)).toEqual(firstTwentyOids);
+    expect(await prContinuationRequestCount()).toBe(1);
+
+    await page.getByRole("button", { name: "Retry loading older commits" }).click();
+    await expect(list.locator("li")).toHaveCount(23);
+    expect((await commitOids(list)).slice(0, 20)).toEqual(firstTwentyOids);
+    expect(await prContinuationRequestCount()).toBe(2);
+    await expect(page.getByTestId("commits-pagination-complete")).toBeFocused();
+  });
+
+  test("the dev edge distinguishes malformed and scope-mismatched cursors from expired snapshots", async () => {
+    const context = await pwRequest.newContext({
+      extraHTTPHeaders: { authorization: `Bearer ${DEV_ACCESS_TOKEN}` },
+    });
+    const first = await context.get(`${EDGE}/v1/git/repos/myelin/prs/1/commits?limit=20`);
+    expect(first.status()).toBe(200);
+    const firstBody = await first.json() as { page: { next_cursor: string } };
+    const cursor = firstBody.page.next_cursor;
+    const frame = Buffer.from(cursor.slice(4), "base64url");
+    frame[54] = (frame[54] ?? 0) ^ 0xff;
+    const expiredCursor = `pc1_${frame.toString("base64url")}`;
+
+    const expired = await context.get(
+      `${EDGE}/v1/git/repos/myelin/prs/1/commits?cursor=${expiredCursor}&limit=20`,
+    );
+    expect(expired.status()).toBe(409);
+    await expect(expired.json()).resolves.toEqual({
+      error: { message: "pull request commit cursor expired", code: "conflict" },
+    });
+    const wrongScope = await context.get(
+      `${EDGE}/v1/git/repos/myelin/prs/2/commits?cursor=${cursor}&limit=20`,
+    );
+    expect(wrongScope.status()).toBe(400);
+    await context.dispose();
   });
 
   test("a checks-projection failure degrades LOCALLY — the PR stays live", async ({ page }) => {

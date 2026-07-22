@@ -5,7 +5,7 @@ import {
   parseGitCommitInput,
   parseGitCommitsInput,
   parseGitMyPrsInput,
-  parseGitPrCursorInput,
+  parseGitPrCommitsInput,
   parseGitPrDiffInput,
   parseGitPrInput,
   parseGitRepoListInput,
@@ -16,9 +16,21 @@ import {
   gitTreeSearchParams,
   gitRefsSearchParams,
   gitRepoListSearchParams,
+  gitPrCommitsSearchParams,
+  gitPrCommitsPath,
 } from "./git-read-input";
 
 const OID = "0123456789abcdef0123456789abcdef01234567";
+
+function prCommitCursor(position = 1): string {
+  const frame = new Uint8Array(78);
+  frame[0] = 1;
+  frame.set(Uint8Array.from({ length: 32 }, (_, index) => index), 1);
+  frame[33] = 0;
+  frame.set(Uint8Array.from(OID.match(/../g)!, (byte) => Number.parseInt(byte, 16)), 54);
+  new DataView(frame.buffer).setUint32(74, position, false);
+  return `pc1_${Buffer.from(frame).toString("base64url")}`;
+}
 
 describe("Git read RPC inputs", () => {
   it("admits canonical repository, browse, history, and commit coordinates", () => {
@@ -39,8 +51,9 @@ describe("Git read RPC inputs", () => {
     expect(parseGitRepoPrsInput({ repo: "core", state: "merged", sort: "created", cursor: "50" }))
       .toEqual({ repo: "core", state: "merged", sort: "created", cursor: "50" });
     expect(parseGitMyPrsInput({ bucket: "needs-review" })).toEqual({ bucket: "needs-review" });
-    expect(parseGitPrCursorInput({ repo: "core", n: 42, cursor: "50" }))
-      .toEqual({ repo: "core", n: 42, cursor: "50" });
+    const cursor = prCommitCursor(20);
+    expect(parseGitPrCommitsInput({ repo: "core", n: 42, limit: 20, cursor }))
+      .toEqual({ repo: "core", n: 42, limit: 20, cursor });
     expect(parseGitPrDiffInput({ repo: "core", n: 42, view: "split" }))
       .toEqual({ repo: "core", n: 42, view: "split" });
     expect(parseGitRefsInput({
@@ -87,6 +100,37 @@ describe("Git read RPC inputs", () => {
     }).toString()).toBe("limit=100&cursor=gt1_a-b_c&q=readme+%26+docs");
   });
 
+  it("accepts and forwards only exact canonical PR commit pagination", () => {
+    const cursor = prCommitCursor(20);
+    expect(gitPrCommitsSearchParams({ repo: "core", n: 7, limit: 20, cursor }).toString())
+      .toBe(`limit=20&cursor=${cursor}`);
+    expect(gitPrCommitsPath({ repo: "team/core", n: 7, limit: 20, cursor }))
+      .toBe(`/v1/git/repos/team%2Fcore/prs/7/commits?limit=20&cursor=${cursor}`);
+    expect(parseGitPrCommitsInput({ repo: "core", n: 7, limit: 1 })).toEqual({
+      repo: "core", n: 7, limit: 1,
+    });
+
+    const wrongVersion = prCommitCursor();
+    const wrongVersionFrame = Buffer.from(wrongVersion.slice(4), "base64url");
+    wrongVersionFrame[0] = 2;
+    const positionZeroFrame = Buffer.from(prCommitCursor().slice(4), "base64url");
+    positionZeroFrame.fill(0, 74, 78);
+    const tooDeepFrame = Buffer.from(prCommitCursor().slice(4), "base64url");
+    tooDeepFrame.writeUInt32BE(100_001, 74);
+    for (const value of [
+      { repo: "core", n: 7, limit: 0 },
+      { repo: "core", n: 7, limit: 101 },
+      { repo: "core", n: 7, limit: 20.5 },
+      { repo: "core", n: 7, cursor: "50" },
+      { repo: "core", n: 7, cursor: `${prCommitCursor()}=` },
+      { repo: "core", n: 7, cursor: `pc1_${wrongVersionFrame.toString("base64url")}` },
+      { repo: "core", n: 7, cursor: `pc1_${positionZeroFrame.toString("base64url")}` },
+      { repo: "core", n: 7, cursor: `pc1_${tooDeepFrame.toString("base64url")}` },
+      { repo: "core", n: 7, cursor: `pc1_${"a".repeat(253)}` },
+      { repo: "core", n: 7, surprise: true },
+    ]) expect(parseGitPrCommitsInput(value), JSON.stringify(value)).toBeNull();
+  });
+
   it.each([
     "refs/heads/feature@two",
     "refs/heads/topic/a.b",
@@ -115,7 +159,7 @@ describe("Git read RPC inputs", () => {
     () => parseGitRepoPrsInput({ repo: "core", state: "draft" }),
     () => parseGitRepoPrsInput({ repo: "core", sort: "oldest" }),
     () => parseGitMyPrsInput({ bucket: "all" }),
-    () => parseGitPrCursorInput({ repo: "core", n: 1, cursor: "x\nsmuggled" }),
+    () => parseGitPrCommitsInput({ repo: "core", n: 1, cursor: "x\nsmuggled" }),
     () => parseGitPrDiffInput({ repo: "core", n: 1, view: "side-by-side" }),
     () => parseGitRefsInput({ repo: "core", limit: 0 }),
     () => parseGitRefsInput({ repo: "core", limit: 101 }),
