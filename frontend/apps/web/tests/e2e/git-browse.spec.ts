@@ -141,10 +141,10 @@ test.describe("GT-004 Git web UI — real browser", () => {
     const fileLink = page.getByTestId("repo-tree").getByRole("link", { name: "README.md" });
     await fileLink.focus();
     await expect(fileLink).toBeFocused(); // keyboard-reachable (the WCAG 2.1.1 requirement)
-    await Promise.all([
-      page.waitForURL("**/git/repos/myelin/blob/main/README.md"),
-      page.keyboard.press("Enter"), // keyboard-operable: Enter on the focused link navigates
-    ]);
+    // Press through the locator so a deferred hydration replacement cannot move the global keyboard
+    // target in the gap after the focus assertion. This is still a real Enter key activation.
+    await fileLink.press("Enter");
+    await page.waitForURL("**/git/repos/myelin/blob/main/README.md");
     await expect(page.getByTestId("blob-contents")).toBeVisible();
   });
 
