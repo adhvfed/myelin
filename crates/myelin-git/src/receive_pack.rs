@@ -224,6 +224,12 @@ pub struct PushSession {
 /// rule that fired (a rejected push is LOUD, never a silent partial write).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RejectReason {
+    /// The same ref appeared more than once in one push. A push is a set of ref transitions; allowing
+    /// duplicates would plan multiple witnesses from one old generation and fail only after commit.
+    DuplicateRefUpdate {
+        /// the duplicated ref.
+        ref_name: RefName,
+    },
     /// A force-push (non-fast-forward) was attempted on a protected ref (ruleset force-push ban).
     ForcePushOnProtected {
         /// the protected ref.
@@ -1041,6 +1047,19 @@ impl RefStore {
         migration: &M,
         crash: CrashPoint,
     ) -> Result<PushOutcome, OutboxError> {
+        // A push is a SET of ref transitions. Reject duplicates before policy, object migration, or
+        // outbox work: otherwise both commands are planned from the same old tip/generation, both
+        // witnesses commit, and the second CAS can fail only after the first mutation was applied.
+        // The smart-HTTP parser enforces this too; this guard protects every direct/internal caller.
+        let mut unique_refs = std::collections::BTreeSet::new();
+        for update in &push.updates {
+            if !unique_refs.insert(update.ref_name.clone()) {
+                return Ok(PushOutcome::Rejected(RejectReason::DuplicateRefUpdate {
+                    ref_name: update.ref_name.clone(),
+                }));
+            }
+        }
+
         // ── Step 2: in-process policy — REJECT BEFORE THE REF MOVES (arch §2). ──
         // The policy is tenant-scoped: the pseudonymity rule (GIT-1) checks every pushed commit's
         // author/committer identity against the store's AUTHENTICATED tenant (from the token, X-1).
@@ -1614,6 +1633,90 @@ mod tests {
             ),
             Err(RejectReason::ProtectedRulesetNotSatisfied { .. })
         ));
+    }
+
+    /// Duplicate create, update, and delete commands are rejected before quarantine migration or
+    /// outbox work. This defensive boundary protects callers that do not enter through smart HTTP.
+    #[test]
+    fn duplicate_ref_updates_reject_the_whole_push_before_side_effects() {
+        fn assert_rejected(
+            store: &RefStore,
+            outbox: &OutboxStore,
+            mut push: PushSession,
+            expected_tip: Option<Oid>,
+            expected_commits: usize,
+        ) {
+            let ref_name = push.updates[0].ref_name.clone();
+            push.updates.push(push.updates[0].clone());
+            let migration = InMemoryObjectDb::new();
+
+            assert_eq!(
+                store.receive(&push, &migration, CrashPoint::None).unwrap(),
+                PushOutcome::Rejected(RejectReason::DuplicateRefUpdate {
+                    ref_name: ref_name.clone()
+                })
+            );
+            assert_eq!(store.tip(&ref_name), expected_tip, "the ref is unchanged");
+            assert_eq!(
+                outbox.committed_count(),
+                expected_commits,
+                "the rejection commits no witness"
+            );
+            assert_eq!(
+                outbox.outbox_depth(),
+                expected_commits,
+                "the rejection stages no outbox row"
+            );
+            assert!(
+                migration.is_empty(),
+                "structural validation precedes object migration"
+            );
+        }
+
+        let ref_name = "refs/heads/topic";
+
+        let (create_store, create_outbox) = store();
+        assert_rejected(
+            &create_store,
+            &create_outbox,
+            human_push(ref_name, Oid::zero(), Oid::new("create")),
+            None,
+            0,
+        );
+
+        let (update_store, update_outbox) = store();
+        let old = Oid::new("old-update");
+        update_store
+            .receive(
+                &human_push(ref_name, Oid::zero(), old.clone()),
+                &InMemoryObjectDb::new(),
+                CrashPoint::None,
+            )
+            .unwrap();
+        assert_rejected(
+            &update_store,
+            &update_outbox,
+            human_push(ref_name, old.clone(), Oid::new("new-update")),
+            Some(old),
+            1,
+        );
+
+        let (delete_store, delete_outbox) = store();
+        let old = Oid::new("old-delete");
+        delete_store
+            .receive(
+                &human_push(ref_name, Oid::zero(), old.clone()),
+                &InMemoryObjectDb::new(),
+                CrashPoint::None,
+            )
+            .unwrap();
+        assert_rejected(
+            &delete_store,
+            &delete_outbox,
+            human_push(ref_name, old.clone(), Oid::zero()),
+            Some(old),
+            1,
+        );
     }
 
     /// **The happy path: receive-pack → one-tx ref-CAS + outbox.** A push to a non-protected ref is
