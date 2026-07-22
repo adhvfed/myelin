@@ -1625,6 +1625,29 @@ impl DurableGitRepo {
         self.latest_commits_for_entries_from_tip(&repo, tip, clean_path, entries, cap)
     }
 
+    /// Read compact metadata for one exact immutable commit object id. This never accepts or
+    /// resolves a ref/revspec; malformed, absent, and non-commit object ids return `None`.
+    pub fn commit_meta_at_oid(&self, oid: &Oid) -> Result<Option<CommitMeta>, DurableError> {
+        let git_oid = match git2::Oid::from_str(oid.as_str()) {
+            Ok(oid) => oid,
+            Err(_) => return Ok(None),
+        };
+        let repo = self.open_git()?;
+        let result = match repo.find_commit(git_oid) {
+            Ok(commit) => Ok(Some(commit_meta(&commit))),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    git2::ErrorCode::NotFound | git2::ErrorCode::InvalidSpec
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(git_err("find commit metadata", error)),
+        };
+        result
+    }
+
     fn latest_commits_for_entries_from_tip(
         &self,
         repo: &git2::Repository,

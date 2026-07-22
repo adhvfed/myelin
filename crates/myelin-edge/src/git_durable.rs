@@ -42,9 +42,11 @@ use myelin_git::api::{http_catalogue, Method as GitMethod};
 use myelin_git::check_status::GitOid;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};
 use myelin_git::durable::{
-    BlobPathLookup, CommitDetail, CommitMeta, FileLinesLookup, PrDiff, TreePathLookup,
+    BlobPathLookup, CommitDetail, CommitMeta, FileLinesLookup, PrDiff, TreePage, TreePageError,
+    TreePageLookup, TreePageRequest,
     COMMIT_LOG_MAX_OFFSET, FILE_LINES_MAX_RANGE, REFS_PAGE_DEFAULT_LIMIT, REFS_PAGE_MAX_LIMIT,
-    REFS_PAGE_MAX_QUERY_BYTES, WIRE_MAX_REFS,
+    REFS_PAGE_MAX_QUERY_BYTES, TREE_PAGE_DEFAULT_LIMIT, TREE_PAGE_MAX_LIMIT,
+    TREE_PAGE_MAX_QUERY_BYTES, WIRE_MAX_REFS,
 };
 use myelin_git::durable::{
     DurableError, DurableGitRepo, DurableGitStore, RefKind, RefsPageError, RefsPageRequest,
@@ -927,25 +929,30 @@ impl DurableGitBackend {
     ) -> Result<RepoHome, DurableError> {
         let full_slug = format!("{tenant}/{slug}");
         let clone_url = self.clone_url(tenant, region, slug);
-        let entries = repo.tree_entries_at_ref("refs/heads/main")?;
-        if entries.is_empty() {
+        let refs = repo.refs_summary()?;
+        if refs.default_tip.is_none() {
             Ok(RepoHome::Empty {
                 slug: full_slug,
                 clone_url,
             })
         } else {
-            let readme = match repo.read_blob_at_path_bounded(
-                "refs/heads/main",
+            let branch_ref = format!("refs/heads/{}", refs.default_branch);
+            let page = first_root_tree_page(repo, &branch_ref)?;
+            let entries = page
+                .entries
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.is_dir))
+                .collect();
+            let readme = read_text_blob_at_snapshot_bounded(
+                repo,
+                &page.snapshot_oid,
                 "README.md",
                 64 * 1024,
-            )? {
-                BlobPathLookup::Found { bytes, .. } => {
-                    String::from_utf8_lossy(&bytes).chars().take(400).collect()
-                }
-                BlobPathLookup::TooLarge { .. }
-                | BlobPathLookup::IsDir
-                | BlobPathLookup::Missing => String::new(),
-            };
+            )?
+            .unwrap_or_default()
+            .chars()
+            .take(400)
+            .collect();
             Ok(RepoHome::Populated {
                 slug: full_slug,
                 readme_excerpt: readme,
@@ -1126,15 +1133,10 @@ impl DurableGitBackend {
         let repo = self.store.open_repo(&loc)?; // NotFound → 404 (0-leak)
         let full_slug = format!("{tenant}/{slug}");
         let clone_url = self.clone_url(tenant, region, slug);
-        let refs = repo.refs_view()?;
+        let refs = repo.refs_summary()?;
         let default_branch = refs.default_branch.clone();
-        let counts = json!({ "branches": refs.branches.len(), "tags": refs.tags.len() });
-        let branch_ref = format!("refs/heads/{default_branch}");
-        let entries = match repo.tree_at_path(&branch_ref, "")? {
-            TreePathLookup::Dir(e) => e,
-            _ => Vec::new(),
-        };
-        if entries.is_empty() {
+        let counts = json!({ "branches": refs.branch_count, "tags": refs.tag_count });
+        if refs.default_tip.is_none() {
             return Ok(json!({
                 "state": "empty",
                 "slug": full_slug,
@@ -1143,15 +1145,28 @@ impl DurableGitBackend {
                 "counts": counts,
             }));
         }
-        let readme = read_text_blob_bounded(&repo, &branch_ref, "README.md", README_MAX_BYTES)?;
-        let latest = repo.commit_log(&branch_ref, 0, 1)?.0.into_iter().next();
-        let per_entry = repo.latest_commits_for_entries(
-            &branch_ref,
+        let branch_ref = format!("refs/heads/{default_branch}");
+        let page = first_root_tree_page(&repo, &branch_ref)?;
+        let readme = read_text_blob_at_snapshot_bounded(
+            &repo,
+            &page.snapshot_oid,
+            "README.md",
+            README_MAX_BYTES,
+        )?;
+        let latest = repo.commit_meta_at_oid(&page.snapshot_oid)?;
+        let per_entry = repo.latest_commits_for_entries_at_snapshot(
+            &page.snapshot_oid,
             "",
-            &entries,
+            &page.entries,
             LATEST_COMMIT_WALK_CAP,
         )?;
-        let entries_json = tree_entries_json(&entries, "", &per_entry);
+        let entries_json = tree_entries_json(&page.entries, "", &per_entry);
+        let entries_page = json!({
+            "next_cursor": page.next_cursor,
+            "limit": TREE_PAGE_DEFAULT_LIMIT,
+            "ref": branch_ref,
+            "snapshot_oid": page.snapshot_oid.as_str(),
+        });
         Ok(json!({
             "state": "populated",
             "slug": full_slug,
@@ -1164,6 +1179,8 @@ impl DurableGitBackend {
             "latest_commit": latest.as_ref().map(commit_brief_json),
             "counts": counts,
             "entries": entries_json,
+            "entries_page": entries_page,
+            "snapshot_oid": page.snapshot_oid.0,
         }))
     }
 
@@ -1177,39 +1194,54 @@ impl DurableGitBackend {
         slug: &str,
         gitref: &str,
         path: &str,
-    ) -> Result<Value, DurableError> {
+        request: TreePageRequest,
+    ) -> Result<Value, TreePageError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?;
-        match repo.tree_at_path(gitref, path)? {
-            TreePathLookup::IsFile => {
+        let limit = request.limit;
+        let include_readme = request.cursor.is_none()
+            && request
+                .query
+                .as_deref()
+                .is_none_or(|query| query.trim().is_empty());
+        match repo.tree_page(gitref, path, request)? {
+            TreePageLookup::IsFile => {
                 Ok(json!({ "redirect_to_blob": true, "ref": gitref, "path": path }))
             }
-            TreePathLookup::Missing => Err(DurableError::NotFound(format!(
+            TreePageLookup::Missing => Err(TreePageError::Durable(DurableError::NotFound(format!(
                 "no such path `{path}` at `{gitref}`"
-            ))),
-            TreePathLookup::Dir(entries) => {
+            )))),
+            TreePageLookup::Dir(page) => {
                 let base = path.trim_matches('/');
-                let per_entry = repo.latest_commits_for_entries(
-                    gitref,
+                let snapshot_oid = page.snapshot_oid.clone();
+                let per_entry = repo.latest_commits_for_entries_at_snapshot(
+                    &snapshot_oid,
                     base,
-                    &entries,
+                    &page.entries,
                     LATEST_COMMIT_WALK_CAP,
                 )?;
-                let entries_json = tree_entries_json(&entries, base, &per_entry);
-                // A subtree README renders too (same read-path); binary/absent → no readme.
-                let readme_path = if base.is_empty() {
-                    "README.md".to_string()
-                } else {
-                    format!("{base}/README.md")
-                };
-                let readme =
-                    read_text_blob_bounded(&repo, gitref, &readme_path, README_MAX_BYTES)?;
-                Ok(json!({
+                let entries_json = tree_entries_json(&page.entries, base, &per_entry);
+                let mut response = json!({
                     "ref": gitref,
                     "path": base,
                     "entries": entries_json,
-                    "readme": readme,
-                }))
+                    "snapshot_oid": snapshot_oid.as_str(),
+                    "page": { "next_cursor": page.next_cursor, "limit": limit },
+                });
+                if include_readme {
+                    let readme_path = if base.is_empty() {
+                        "README.md".to_string()
+                    } else {
+                        format!("{base}/README.md")
+                    };
+                    response["readme"] = json!(read_text_blob_at_snapshot_bounded(
+                        &repo,
+                        &snapshot_oid,
+                        &readme_path,
+                        README_MAX_BYTES,
+                    )?);
+                }
+                Ok(response)
             }
         }
     }
@@ -3120,16 +3152,34 @@ const README_MAX_BYTES: usize = 512 * 1024;
 /// inflating a file the next hop must reject anyway.
 const RAW_BLOB_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-fn read_text_blob_bounded(
+fn first_root_tree_page(
     repo: &DurableGitRepo,
-    gitref: &str,
+    branch_ref: &str,
+) -> Result<TreePage, DurableError> {
+    match repo.tree_page(branch_ref, "", TreePageRequest::default()) {
+        Ok(TreePageLookup::Dir(page)) => Ok(page),
+        Ok(TreePageLookup::IsFile | TreePageLookup::Missing) => Err(DurableError::NotFound(
+            format!("default branch `{branch_ref}` did not resolve to a root tree"),
+        )),
+        Err(TreePageError::Durable(error)) => Err(error),
+        Err(error) => Err(DurableError::Git(format!(
+            "default root tree page failed: {error}"
+        ))),
+    }
+}
+
+fn read_text_blob_at_snapshot_bounded(
+    repo: &DurableGitRepo,
+    snapshot_oid: &CoreOid,
     path: &str,
     maximum_bytes: usize,
 ) -> Result<Option<String>, DurableError> {
-    match repo.read_blob_at_path_bounded(gitref, path, maximum_bytes)? {
-        BlobPathLookup::Found { bytes, is_binary: false, .. } => {
-            Ok(Some(String::from_utf8_lossy(&bytes).to_string()))
-        }
+    match repo.read_blob_at_commit_oid_bounded(snapshot_oid, path, maximum_bytes)? {
+        BlobPathLookup::Found {
+            bytes,
+            is_binary: false,
+            ..
+        } => Ok(Some(String::from_utf8_lossy(&bytes).to_string())),
         BlobPathLookup::Found { .. }
         | BlobPathLookup::TooLarge { .. }
         | BlobPathLookup::IsDir
@@ -3815,8 +3865,680 @@ impl Handler for DRefs {
 struct DTree {
     be: Arc<DurableGitBackend>,
 }
+
+const TREE_MAX_QUERY_BYTES: usize = 16 * 1024;
+const TREE_MAX_CURSOR_BYTES: usize = 8 * 1024;
+
+fn decode_tree_query_component(raw: &str) -> Result<String, EdgeError> {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(EdgeError::BadRequest(
+                    "git tree query contains malformed percent encoding".into(),
+                ));
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let form_value = raw.replace('+', " ");
+    let decoded = percent_encoding::percent_decode_str(&form_value)
+        .decode_utf8()
+        .map_err(|_| EdgeError::BadRequest("git tree query is not valid UTF-8".into()))?
+        .into_owned();
+    if decoded.chars().any(char::is_control) {
+        return Err(EdgeError::BadRequest(
+            "git tree query contains a control character".into(),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn parse_tree_query(query: &str) -> Result<TreePageRequest, EdgeError> {
+    if query.len() > TREE_MAX_QUERY_BYTES {
+        return Err(EdgeError::BadRequest("git tree query is too large".into()));
+    }
+    if query.is_empty() {
+        return Ok(TreePageRequest::default());
+    }
+    let mut limit = None;
+    let mut cursor = None;
+    let mut q = None;
+    for pair in query.split('&') {
+        let (raw_name, raw_value) = pair.split_once('=').ok_or_else(|| {
+            EdgeError::BadRequest("malformed git tree query parameter (missing `=`)".into())
+        })?;
+        let name = decode_tree_query_component(raw_name)?;
+        let value = decode_tree_query_component(raw_value)?;
+        if name.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "empty git tree query parameter name".into(),
+            ));
+        }
+        let duplicate = |field: &str| {
+            EdgeError::BadRequest(format!("duplicate git tree query parameter `{field}`"))
+        };
+        match name.as_str() {
+            "limit" => {
+                if limit.is_some() {
+                    return Err(duplicate("limit"));
+                }
+                let parsed = value.parse::<usize>().ok().filter(|parsed| {
+                    value == parsed.to_string() && (1..=TREE_PAGE_MAX_LIMIT).contains(parsed)
+                });
+                limit = Some(parsed.ok_or_else(|| {
+                    EdgeError::BadRequest(format!(
+                        "git tree limit must be canonical and within 1..={TREE_PAGE_MAX_LIMIT}"
+                    ))
+                })?);
+            }
+            "cursor" => {
+                if cursor.is_some() {
+                    return Err(duplicate("cursor"));
+                }
+                if value.is_empty() || value.len() > TREE_MAX_CURSOR_BYTES {
+                    return Err(EdgeError::BadRequest(
+                        "git tree cursor is empty or exceeds its byte limit".into(),
+                    ));
+                }
+                cursor = Some(value);
+            }
+            "q" => {
+                if q.is_some() {
+                    return Err(duplicate("q"));
+                }
+                if value.len() > TREE_PAGE_MAX_QUERY_BYTES {
+                    return Err(EdgeError::BadRequest(
+                        "git tree q exceeds its byte limit".into(),
+                    ));
+                }
+                q = Some(value);
+            }
+            other => {
+                return Err(EdgeError::BadRequest(format!(
+                    "unknown git tree query parameter `{other}`"
+                )))
+            }
+        }
+    }
+    Ok(TreePageRequest {
+        limit: limit.unwrap_or(TREE_PAGE_DEFAULT_LIMIT),
+        query: q,
+        cursor,
+    })
+}
+
+fn map_tree_page_err(error: TreePageError) -> EdgeError {
+    match error {
+        TreePageError::Durable(error) => map_durable_err(error),
+        TreePageError::CursorStale => {
+            EdgeError::Conflict("git tree cursor is stale; restart pagination".into())
+        }
+        TreePageError::InvalidLimit { .. } => EdgeError::BadRequest(format!(
+            "git tree limit must be canonical and within 1..={TREE_PAGE_MAX_LIMIT}"
+        )),
+        TreePageError::QueryTooLong { .. } | TreePageError::InvalidQuery => {
+            EdgeError::BadRequest("git tree q is invalid or exceeds its byte limit".into())
+        }
+        TreePageError::MalformedCursor | TreePageError::CursorScopeMismatch => {
+            EdgeError::BadRequest("git tree cursor is invalid for this request".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tree_query_tests {
+    use super::*;
+
+    #[test]
+    fn tree_query_defaults_and_exact_decoding_are_stable() {
+        assert_eq!(parse_tree_query("").unwrap(), TreePageRequest::default());
+        let parsed = parse_tree_query("limit=%37&q=Readme+File&cursor=gt1_abc")
+            .expect("strict decoded query");
+        assert_eq!(parsed.limit, 7);
+        assert_eq!(parsed.query.as_deref(), Some("Readme File"));
+        assert_eq!(parsed.cursor.as_deref(), Some("gt1_abc"));
+        assert_eq!(parse_tree_query("q=").unwrap().query.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn tree_query_rejects_noncanonical_ambiguous_and_unknown_inputs() {
+        for query in [
+            "limit",
+            "=1",
+            "unknown=1",
+            "q=a&q=b",
+            "q=a&%71=b",
+            "limit=",
+            "cursor=",
+            "limit=01",
+            "limit=+1",
+            "limit=%2B1",
+            "limit=0",
+            "limit=101",
+            "limit=-1",
+            "limit=1.0",
+            "q=%00",
+            "q=%FF",
+            "q=%",
+            "q=a&&limit=1",
+        ] {
+            assert!(
+                matches!(parse_tree_query(query), Err(EdgeError::BadRequest(_))),
+                "query must fail closed: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn tree_query_component_and_total_byte_limits_are_exact() {
+        parse_tree_query(&format!("q={}", "x".repeat(TREE_PAGE_MAX_QUERY_BYTES)))
+            .expect("exact q bound");
+        parse_tree_query(&format!("cursor={}", "x".repeat(TREE_MAX_CURSOR_BYTES)))
+            .expect("exact cursor bound");
+        for query in [
+            format!("q={}", "x".repeat(TREE_PAGE_MAX_QUERY_BYTES + 1)),
+            format!("cursor={}", "x".repeat(TREE_MAX_CURSOR_BYTES + 1)),
+            "x".repeat(TREE_MAX_QUERY_BYTES + 1),
+        ] {
+            assert!(matches!(
+                parse_tree_query(&query),
+                Err(EdgeError::BadRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn tree_cursor_errors_map_to_scoped_statuses() {
+        for error in [
+            TreePageError::MalformedCursor,
+            TreePageError::CursorScopeMismatch,
+            TreePageError::InvalidQuery,
+            TreePageError::InvalidLimit { supplied: 0 },
+        ] {
+            assert_eq!(map_tree_page_err(error).status(), 400);
+        }
+        assert_eq!(map_tree_page_err(TreePageError::CursorStale).status(), 409);
+        assert_eq!(
+            map_tree_page_err(TreePageError::Durable(DurableError::NotFound(
+                "missing".into()
+            )))
+            .status(),
+            404
+        );
+    }
+}
+
+#[cfg(test)]
+mod tree_page_backend_tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use base64::Engine as _;
+    use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
+    use myelin_storage::TenantScope;
+    use myelin_tenancy::{Region as IdRegion, TenantId};
+
+    use super::*;
+    use crate::catalogue::{test_request_identity, Page};
+    use crate::repo_authz::GrantBackedRepos;
+    use crate::request::EdgeRequest;
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    const TENANT: &str = "tree-page-tenant";
+    const REGION: &str = "eu-north";
+
+    struct Fixture {
+        root: PathBuf,
+        be: DurableGitBackend,
+        repo: DurableGitRepo,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "myelin-edge-tree-page-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            let be = DurableGitBackend::rooted_inmem_for_test(&root);
+            let loc = DurableGitBackend::loc(TENANT, REGION, label);
+            let repo = be.store.create_repo(&loc).expect("create repo");
+            Self { root, be, repo }
+        }
+
+        fn commit_shared_files(
+            &self,
+            count: usize,
+            parents: &[&CoreOid],
+            message: &str,
+        ) -> (CoreOid, CoreOid) {
+            let blob = self.repo.write_blob(b"page\n").expect("blob");
+            let names = (0..count)
+                .map(|index| format!("file-{index:04}.txt"))
+                .collect::<Vec<_>>();
+            let entries = names
+                .iter()
+                .map(|name| (name.as_str(), &blob))
+                .collect::<Vec<_>>();
+            let tree = self.repo.write_tree(&entries).expect("tree");
+            let commit = self
+                .repo
+                .write_commit(
+                    &tree,
+                    parents,
+                    message,
+                    "psn@tenant.noreply",
+                    "psn@tenant.noreply",
+                )
+                .expect("commit");
+            (tree, commit)
+        }
+
+        fn commit_named_files(
+            &self,
+            files: &[(&str, &[u8])],
+            parents: &[&CoreOid],
+            message: &str,
+        ) -> (CoreOid, CoreOid) {
+            let blobs = files
+                .iter()
+                .map(|(name, bytes)| ((*name).to_string(), self.repo.write_blob(bytes).unwrap()))
+                .collect::<Vec<_>>();
+            let entries = blobs
+                .iter()
+                .map(|(name, oid)| (name.as_str(), oid))
+                .collect::<Vec<_>>();
+            let tree = self.repo.write_tree(&entries).expect("tree");
+            let commit = self
+                .repo
+                .write_commit(
+                    &tree,
+                    parents,
+                    message,
+                    "psn@tenant.noreply",
+                    "psn@tenant.noreply",
+                )
+                .expect("commit");
+            (tree, commit)
+        }
+
+        fn create_main(&self, commit: &CoreOid) {
+            self.repo
+                .update_ref_cas(
+                    "refs/heads/main",
+                    None,
+                    Some(commit),
+                    "create main",
+                    "psn@tenant.noreply",
+                )
+                .expect("create main");
+        }
+
+        fn move_main(&self, old: &CoreOid, new: &CoreOid) {
+            self.repo
+                .update_ref_cas(
+                    "refs/heads/main",
+                    Some(old),
+                    Some(new),
+                    "move main",
+                    "psn@tenant.noreply",
+                )
+                .expect("move main");
+        }
+
+        fn tree_json(
+            &self,
+            request: TreePageRequest,
+        ) -> Result<Value, TreePageError> {
+            self.be.tree_json(
+                TENANT,
+                REGION,
+                self.label(),
+                "refs/heads/main",
+                "",
+                request,
+            )
+        }
+
+        fn label(&self) -> &str {
+            self.repo
+                .path()
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .expect("repo slug")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    fn oid_bytes(oid: &CoreOid) -> [u8; 20] {
+        let mut bytes = [0_u8; 20];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&oid.as_str()[index * 2..index * 2 + 2], 16)
+                .expect("hex oid");
+        }
+        bytes
+    }
+
+    fn forge_cursor_oids(cursor: &str, snapshot: &CoreOid, tree: &CoreOid) -> String {
+        let encoded = cursor.strip_prefix("gt1_").expect("tree cursor prefix");
+        let mut frame = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .expect("tree cursor frame");
+        frame[1..21].copy_from_slice(&oid_bytes(snapshot));
+        frame[21..41].copy_from_slice(&oid_bytes(tree));
+        format!(
+            "gt1_{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(frame)
+        )
+    }
+
+    fn human(id: &str) -> Principal {
+        Principal::new(
+            TenantId(TENANT.into()),
+            IdRegion(REGION.into()),
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        )
+    }
+
+    fn serve_tree(
+        handler: &dyn Handler,
+        viewer: &Principal,
+        slug: &str,
+        query: &str,
+    ) -> Result<EdgeResponse, EdgeError> {
+        let scope = TenantScope::from_verified_token(viewer, viewer.region.clone());
+        let params = BTreeMap::from([
+            ("repo".to_string(), slug.to_string()),
+            ("ref".to_string(), "refs/heads/main".to_string()),
+            ("path".to_string(), String::new()),
+        ]);
+        let request = EdgeRequest::new(
+            "GET",
+            "/v1/git/repos/core/tree/refs%2Fheads%2Fmain/",
+            query,
+            vec![],
+            vec![],
+        );
+        let page = Page::from_request(&request);
+        let identity = test_request_identity(viewer, &scope);
+        handler.handle(&HandlerCtx {
+            identity: &identity,
+            principal: viewer,
+            scope: &scope,
+            params: &params,
+            page: &page,
+            request: &request,
+        })
+    }
+
+    #[test]
+    fn tree_pull_guard_denies_before_malformed_query_or_cursor_parsing() {
+        let fixture = Fixture::new("guard-order");
+        let tree = fixture.repo.write_tree(&[]).expect("empty tree");
+        let commit = fixture
+            .repo
+            .write_commit(
+                &tree,
+                &[],
+                "guarded tree",
+                "psn@tenant.noreply",
+                "psn@tenant.noreply",
+            )
+            .expect("commit");
+        fixture.create_main(&commit);
+
+        let reader = human("u:reader");
+        let stranger = human("u:stranger");
+        let authorizer = GrantBackedRepos::new().grant_read("u:reader", TENANT, fixture.label());
+        let be = Arc::new(
+            DurableGitBackend::rooted_inmem_for_test(&fixture.root)
+                .with_repo_authorizer(Arc::new(authorizer)),
+        );
+        let handler = guarded(
+            &be,
+            RepoPermission::Pull,
+            Arc::new(DTree { be: be.clone() }),
+        );
+
+        for query in ["cursor=%", "cursor=not-a-tree-cursor"] {
+            let denied = match serve_tree(&*handler, &stranger, fixture.label(), query) {
+                Err(error) => error,
+                Ok(_) => panic!("the pull guard must deny before DTree parses the query"),
+            };
+            assert!(
+                matches!(denied, EdgeError::NotFound(_)) && denied.status() == 404,
+                "ungranted malformed tree request must be 0-leak 404: {denied:?}"
+            );
+
+            let admitted = match serve_tree(&*handler, &reader, fixture.label(), query) {
+                Err(error) => error,
+                Ok(_) => panic!("a granted reader must reach DTree's strict parser"),
+            };
+            assert!(
+                matches!(admitted, EdgeError::BadRequest(_)) && admitted.status() == 400,
+                "granted malformed tree request must reach DTree and return 400: {admitted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_home_pages_more_than_one_thousand_rows_with_its_qualified_continuation_ref() {
+        let fixture = Fixture::new("wide");
+        let (_, commit) = fixture.commit_shared_files(1_001, &[], "wide root");
+        fixture.create_main(&commit);
+
+        let home = fixture
+            .be
+            .repo_home_json(TENANT, REGION, fixture.label())
+            .expect("repo home");
+        assert_eq!(home["state"], "populated");
+        assert_eq!(home["entries"].as_array().unwrap().len(), 100);
+        assert_eq!(home["entries_page"]["limit"], 100);
+        assert_eq!(home["entries_page"]["ref"], "refs/heads/main");
+        assert_eq!(home["entries_page"]["snapshot_oid"], commit.as_str());
+        let mut names = home["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let mut cursor = home["entries_page"]["next_cursor"]
+            .as_str()
+            .map(str::to_string);
+        while let Some(next) = cursor {
+            let page = fixture
+                .tree_json(TreePageRequest {
+                    limit: 100,
+                    cursor: Some(next),
+                    ..TreePageRequest::default()
+                })
+                .expect("qualified continuation");
+            names.extend(
+                page["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["name"].as_str().unwrap().to_string()),
+            );
+            cursor = page["page"]["next_cursor"].as_str().map(str::to_string);
+        }
+        assert_eq!(names.len(), 1_001);
+        assert_eq!(names.first().unwrap(), "file-0000.txt");
+        assert_eq!(names.last().unwrap(), "file-1000.txt");
+    }
+
+    #[test]
+    fn branch_movement_is_a_typed_stale_tree_cursor() {
+        let fixture = Fixture::new("stale");
+        let (_, first) = fixture.commit_shared_files(3, &[], "first");
+        fixture.create_main(&first);
+        let first_page = fixture
+            .tree_json(TreePageRequest {
+                limit: 1,
+                ..TreePageRequest::default()
+            })
+            .expect("first page");
+        let cursor = first_page["page"]["next_cursor"]
+            .as_str()
+            .expect("cursor")
+            .to_string();
+        let (_, second) = fixture.commit_shared_files(4, &[&first], "second");
+        fixture.move_main(&first, &second);
+
+        let error = fixture
+            .tree_json(TreePageRequest {
+                limit: 1,
+                cursor: Some(cursor),
+                ..TreePageRequest::default()
+            })
+            .expect_err("moved branch must stale");
+        assert_eq!(error, TreePageError::CursorStale);
+        assert_eq!(map_tree_page_err(error).status(), 409);
+    }
+
+    #[test]
+    fn forged_cursor_oids_cannot_select_unreachable_tree_objects() {
+        let fixture = Fixture::new("forged");
+        let (_, visible) = fixture.commit_shared_files(3, &[], "visible");
+        fixture.create_main(&visible);
+        let first_page = fixture
+            .tree_json(TreePageRequest {
+                limit: 1,
+                ..TreePageRequest::default()
+            })
+            .expect("first page");
+        let cursor = first_page["page"]["next_cursor"].as_str().unwrap();
+        let (secret_tree, secret_commit) = fixture.commit_named_files(
+            &[("secret.txt", b"unreachable secret\n")],
+            &[],
+            "unreachable",
+        );
+        let forged = forge_cursor_oids(cursor, &secret_commit, &secret_tree);
+
+        let error = fixture
+            .tree_json(TreePageRequest {
+                limit: 1,
+                cursor: Some(forged),
+                ..TreePageRequest::default()
+            })
+            .expect_err("forged object ids are consistency-only");
+        assert_eq!(error, TreePageError::CursorStale);
+    }
+
+    #[test]
+    fn readme_is_present_only_on_the_first_unfiltered_tree_page() {
+        let fixture = Fixture::new("readme");
+        let (_, commit) = fixture.commit_named_files(
+            &[("README.md", b"# snapshot readme\n"), ("z.txt", b"z\n")],
+            &[],
+            "readme",
+        );
+        fixture.create_main(&commit);
+        let first = fixture
+            .tree_json(TreePageRequest {
+                limit: 1,
+                ..TreePageRequest::default()
+            })
+            .expect("first page");
+        assert_eq!(first["readme"], "# snapshot readme\n");
+        let cursor = first["page"]["next_cursor"].as_str().unwrap().to_string();
+        let continuation = fixture
+            .tree_json(TreePageRequest {
+                limit: 1,
+                cursor: Some(cursor),
+                ..TreePageRequest::default()
+            })
+            .expect("continuation");
+        assert!(continuation.get("readme").is_none());
+        let search = fixture
+            .tree_json(TreePageRequest {
+                query: Some("readme".into()),
+                ..TreePageRequest::default()
+            })
+            .expect("search");
+        assert!(search.get("readme").is_none());
+    }
+
+    #[test]
+    fn committed_empty_tree_is_populated_and_exposes_a_terminal_entries_page() {
+        let fixture = Fixture::new("empty-tree");
+        let tree = fixture.repo.write_tree(&[]).expect("empty tree");
+        let commit = fixture
+            .repo
+            .write_commit(
+                &tree,
+                &[],
+                "empty snapshot",
+                "psn@tenant.noreply",
+                "psn@tenant.noreply",
+            )
+            .expect("empty commit");
+        fixture.create_main(&commit);
+
+        let home = fixture
+            .be
+            .repo_home_json(TENANT, REGION, fixture.label())
+            .expect("repo home");
+        assert_eq!(home["state"], "populated");
+        assert_eq!(home["entries"], json!([]));
+        assert!(home["entries_page"]["next_cursor"].is_null());
+        assert!(matches!(
+            fixture
+                .be
+                .repo_home(TENANT, REGION, fixture.label(), &fixture.repo)
+                .expect("catalogue home"),
+            RepoHome::Populated { entries, .. } if entries.is_empty()
+        ));
+    }
+
+    #[test]
+    fn repo_and_tree_entry_metadata_share_the_selected_snapshot() {
+        let fixture = Fixture::new("snapshot-meta");
+        let (_, first) = fixture.commit_named_files(&[("file.txt", b"first\n")], &[], "first");
+        fixture.create_main(&first);
+        let (_, second) = fixture.commit_named_files(
+            &[("file.txt", b"second\n")],
+            &[&first],
+            "second",
+        );
+        fixture.move_main(&first, &second);
+
+        let tree = fixture
+            .tree_json(TreePageRequest::default())
+            .expect("tree page");
+        assert_eq!(tree["snapshot_oid"], second.as_str());
+        assert_eq!(tree["entries"][0]["latest_commit"]["oid"], second.as_str());
+        let home = fixture
+            .be
+            .repo_home_json(TENANT, REGION, fixture.label())
+            .expect("repo home");
+        assert_eq!(home["snapshot_oid"], second.as_str());
+        assert_eq!(home["entries_page"]["snapshot_oid"], second.as_str());
+        assert_eq!(home["latest_commit"]["oid"], second.as_str());
+        assert_eq!(home["entries"][0]["latest_commit"]["oid"], second.as_str());
+    }
+}
+
 impl Handler for DTree {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        // Registration wraps this handler in `RepoObjectGuard(Pull)`, so authorization has already
+        // succeeded before any strict query/cursor diagnostic becomes observable.
+        let request = parse_tree_query(&ctx.request.query)?;
         // The catch-all `{...path}` binds the whole nested path (empty at the tree root).
         let path = ctx.params.get("path").map(String::as_str).unwrap_or("");
         let vm = self
@@ -3827,8 +4549,9 @@ impl Handler for DTree {
                 param(ctx, "repo")?,
                 param(ctx, "ref")?,
                 path,
+                request,
             )
-            .map_err(map_durable_err)?;
+            .map_err(map_tree_page_err)?;
         Ok(EdgeResponse::json(200, &vm))
     }
 }
@@ -5823,7 +6546,7 @@ mod pr_list_tests {
             );
         assert!(matches!(oversized, Err(error) if error.status() == 413));
         assert_eq!(
-            read_text_blob_bounded(&repo, "refs/heads/feature", "f.txt", 1).unwrap(),
+            read_text_blob_at_snapshot_bounded(&repo, &tip, "f.txt", 1).unwrap(),
             None,
             "an oversized README-style preview must stop at the object header",
         );
