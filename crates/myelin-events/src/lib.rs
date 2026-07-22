@@ -377,8 +377,8 @@ pub use check_seam::{
     OrderedCheck, WakeOutcome,
 };
 pub use consumer::{
-    consume, Consumer, ConsumerName, ConsumerSpec, DeadLetter, Delivered, Message,
-    PerTenantInflight, PrefetchBound, SubscribeError, Subscription,
+    consume, install_payload_free_panic_hook, Consumer, ConsumerName, ConsumerSpec, DeadLetter,
+    Delivered, Message, PerTenantInflight, PrefetchBound, SubscribeError, Subscription,
 };
 /// The cross-cell bridge FRAME (contract 12.6, EB-14 / P-091), PINNED from the Bus side. The four
 /// frozen frame types are re-exported on the frozen `myelin_events::*` path; their definition site

@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    myelin_events::install_payload_free_panic_hook("issues");
     // Production is strict: validate every endpoint plus the split runtime/migration role pair
     // before any DDL or listener can be created. `PgBootstrap` alone owns the privileged pool.
     let bootstrap = match PgBootstrap::from_env(Mode::RequireEnv).await {

@@ -104,6 +104,7 @@ fn verify_startup_activation(
 
 #[tokio::main]
 async fn main() {
+    myelin_events::install_payload_free_panic_hook("ci-controlplane");
     // The former runner composition reached sandbox execution with accept-all billing/attribution
     // hooks, placeholder tenancy, and an unresolved stage-spec builder. Keep the flag reserved,
     // but refuse it before PostgreSQL bootstrap until all launch authorities are real and durable.

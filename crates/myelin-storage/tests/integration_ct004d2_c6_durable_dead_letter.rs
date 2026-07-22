@@ -269,7 +269,7 @@ async fn h2_panic_path_persists_the_poison_durably_and_pii_free() {
     );
 
     // (4) PII-SAFETY: the stored reason (the ONLY free-text column) carries NO raw payload/PII. The
-    // panic detail is developer text ("boom on a poison event"), never the envelope's payload.
+    // The panic payload is suppressed entirely, even when developer code interpolates event data.
     assert!(
         !reason.contains("SECRET") && !reason.contains("alice") && !reason.contains("@example.com"),
         "PII-safety: the durable reason must NOT echo the envelope payload PII: {reason}"
