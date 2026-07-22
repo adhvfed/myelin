@@ -123,6 +123,7 @@ impl GateApproverPolicy for GitMergeApproverPolicy {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    myelin_events::install_payload_free_panic_hook("mcp");
     if let Err(error) = dispatch().await {
         eprintln!("myelin-mcp: {error}");
         std::process::exit(1);

@@ -31,6 +31,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
+    myelin_events::install_payload_free_panic_hook("flow");
     let bootstrap = match PgBootstrap::from_env(Mode::RequireEnv).await {
         Ok(bootstrap) => bootstrap,
         Err(e) => {

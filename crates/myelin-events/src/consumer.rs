@@ -98,6 +98,15 @@ use myelin_tenancy::TenantId;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Install the production panic hook before any event worker starts. Rust's default hook prints a
+/// panic payload before `catch_unwind` can turn a handler bug into a dead letter, and that payload may
+/// interpolate event data. Service roots call this once at startup so stderr remains payload-free.
+pub fn install_payload_free_panic_hook(service: &'static str) {
+    std::panic::set_hook(Box::new(move |_| {
+        eprintln!("{service}: an internal task panicked; payload suppressed");
+    }));
+}
+
 /// The backoff (seconds) the runtime asks for when the co-commit COMMIT itself fails (a DB hiccup
 /// AFTER a `Done` handler — the mark + effect did not land, so the message redelivers; #7/MR-023b).
 const DEFAULT_COMMIT_RETRY_BACKOFF_SECS: u64 = 2;
@@ -690,32 +699,23 @@ impl<H: EventHandler> Consumer<H> {
         }));
         let outcome = match handled {
             Ok(outcome) => outcome,
-            Err(panic) => {
+            Err(_) => {
                 // The handler panicked (a bug). Roll back the co-commit tx (H2: mark + any partial
                 // effect vanish; the native `sqlx::Transaction` also rolls back on drop, so the pool
                 // connection is never leaked mid-tx), then dead-letter LOUDLY without a tombstone.
                 cotx.rollback();
-                let detail = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
-                // #7b PII-SAFETY: the panic `detail` is developer-authored but can interpolate event
-                // content (e.g. `panic!("bad {field}", …)`), so it may carry inline PII. It goes to the
-                // EPHEMERAL loud log ONLY — NEVER into the durable `consumer_dead_letter.reason` (a
-                // crypto-shred/erasure-strict store that subject erasure does not reach). The persisted
-                // reason is a PII-FREE constant; the event_id (a ULID) + this constant are enough for
-                // ops to find the poison and correlate it with the logged detail.
+                // #7b PII-SAFETY: panic payloads can interpolate event content, so neither this loud
+                // log nor the durable dead-letter reason formats the payload. The event id and
+                // payload-free diagnostic are sufficient to locate the quarantined delivery.
                 eprintln!(
                     "[consumer:{}] handler PANICKED for event {} — dead-lettered (no tombstone; effect \
-                     replayable): {detail}",
+                     replayable); payload suppressed",
                     self.name().0,
                     event_id.0
                 );
                 let reason = Reason(
                     "handler PANICKED (a bug, dead-lettered without a dedup tombstone so the valid \
-                     effect stays replayable; panic detail in the loud log, kept OUT of the durable \
-                     DLQ to stay PII-safe)"
+                     effect stays replayable; panic payload suppressed at production log boundaries)"
                         .to_string(),
                 );
                 return match self.push_dead_letter(envelope, reason.clone()) {

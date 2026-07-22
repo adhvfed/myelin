@@ -21,11 +21,10 @@
 //! the `event_id` (a globally-unique ULID, a telemetry/trace label — never personal data) + a
 //! **PII-free `reason`** string + the audit `occurred_at`. It NEVER stores the raw envelope /
 //! `payload`. The `reason` is a diagnostic label authored at the [`crate::Reason`] construction sites
-//! (`"malformed"`, `"subject … not on consumer whitelist"`, `"unbridgeable schema gap"`, …); the ONE
-//! wildcard is the H2 panic path, which interpolates the panic payload (`{detail}`) and could — in
-//! principle — echo event content. We therefore **bound** the stored reason ([`bounded_reason`],
-//! [`MAX_REASON_LEN`] bytes) so a panic message can never persist an unbounded blob, and we store
-//! only the bounded reason + `event_id`, never the envelope. The in-memory arm is unchanged (it holds
+//! (`"malformed"`, `"subject … not on consumer whitelist"`, `"unbridgeable schema gap"`, …). The H2
+//! panic path uses a fixed payload-free reason; it never formats the panic payload. We additionally
+//! **bound** every stored reason ([`bounded_reason`], [`MAX_REASON_LEN`] bytes), and store only the
+//! bounded reason + `event_id`, never the envelope. The in-memory arm is unchanged (it holds
 //! the full [`DeadLetter`] for the existing surfaced-in-process view); only the DURABLE row is the
 //! PII-free projection.
 //!
@@ -61,10 +60,8 @@ CREATE TABLE IF NOT EXISTS consumer_dead_letter (
     CONSTRAINT consumer_dead_letter_pk PRIMARY KEY (consumer, event_id)
 );";
 
-/// The cap (bytes) the durable `reason` is bounded to before persistence. PII-safety: the H2 panic
-/// path interpolates the panic payload into the reason, which could echo event content — a bound
-/// guarantees a panic message can never persist an unbounded blob. Diagnostic reasons are far shorter
-/// than this in practice; the cap is defense-in-depth, not a normal truncation.
+/// The cap (bytes) the durable `reason` is bounded to before persistence. Diagnostic reasons are far
+/// shorter than this in practice; the cap is defense-in-depth, not a normal truncation.
 pub const MAX_REASON_LEN: usize = 512;
 
 /// Bound a `reason` to [`MAX_REASON_LEN`] bytes at a UTF-8 char boundary (PII-safety: keep the durable

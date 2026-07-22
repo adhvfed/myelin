@@ -15,11 +15,19 @@ fn edge_panics_are_contained_without_logging_payloads() {
     let main = fs::read_to_string(root.join("crates/myelin-edge/src/main.rs")).expect("edge main");
     let server =
         fs::read_to_string(root.join("crates/myelin-edge/src/server.rs")).expect("edge server");
+    let consumer = fs::read_to_string(root.join("crates/myelin-events/src/consumer.rs"))
+        .expect("shared event consumer");
 
     assert!(
-        main.contains("std::panic::set_hook")
-            && main.contains("details suppressed at the public boundary"),
-        "production must replace the payload-printing default panic hook"
+        main.contains("install_payload_free_panic_hook(\"edge\")")
+            && consumer.contains("std::panic::set_hook")
+            && consumer.contains("payload suppressed"),
+        "production must install the shared payload-free panic hook"
+    );
+    assert!(
+        !consumer.contains("downcast_ref::<&str>")
+            && !consumer.contains("downcast_ref::<String>"),
+        "the event consumer must never inspect or format panic payloads"
     );
     for required in [
         "catch_unwind(AssertUnwindSafe(|| gw.handle(request)))",

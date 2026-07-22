@@ -532,12 +532,7 @@ async fn compose_core(cell_id: String) -> ComposedCore {
 
 #[tokio::main]
 async fn main() {
-    // The default Rust hook prints panic payloads, which may contain request-derived data. Keep
-    // production stderr useful but payload-free; the transport catches handler unwinds and returns
-    // the canonical generic 500 while startup/composition panics still fail loud.
-    std::panic::set_hook(Box::new(|_| {
-        eprintln!("edge: an internal task panicked; details suppressed at the public boundary");
-    }));
+    myelin_events::install_payload_free_panic_hook("edge");
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None => {

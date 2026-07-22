@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    myelin_events::install_payload_free_panic_hook("ci-dispatch");
     // Production is strict: validate every endpoint plus distinct migration/runtime PostgreSQL
     // roles before any DDL, durable store, consumer, or listener can be created. `PgBootstrap`
     // alone owns the privileged pool.
