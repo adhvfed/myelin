@@ -89,7 +89,8 @@ pub enum Mode {
 /// The validated, env-first runtime config — the dev<->prod swap target.
 ///
 /// R0.7-C: `Debug` is hand-written (NOT derived) because [`MyelinConfig::database_url`],
-/// [`MyelinConfig::database_migration_url`], and [`MyelinConfig::redis_url`] are connection DSNs
+/// [`MyelinConfig::database_migration_url`], [`MyelinConfig::redis_url`], and
+/// [`MyelinConfig::nats_url`] are connection DSNs
 /// that can embed a password in their userinfo
 /// (`postgres://user:PASSWORD@host/db`); a derived `{:?}` in a log line, a panic, or an error
 /// context would print that password in clear. The redacting impl below prints `<redacted>` for
@@ -195,15 +196,15 @@ impl core::fmt::Debug for S3Config {
 
 impl core::fmt::Debug for MyelinConfig {
     /// R0.7-C: redact every credential-bearing DSN so a `{:?}` never prints the password embedded
-    /// in its userinfo. `s3` defers to [`S3Config`]'s own redacting impl; `nats_url`/`region` carry
-    /// no credential and print normally.
+    /// in its userinfo. `s3` defers to [`S3Config`]'s own redacting impl; only `region` prints
+    /// normally.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MyelinConfig")
             .field("database_url", &"<redacted>")
             .field("database_migration_url", &"<redacted>")
             .field("s3", &self.s3)
             .field("redis_url", &"<redacted>")
-            .field("nats_url", &self.nats_url)
+            .field("nats_url", &"<redacted>")
             .field("region", &self.region)
             .field("oidc", &self.oidc)
             .finish()
@@ -506,7 +507,7 @@ mod tests {
         env::set_var("S3_SECRET_KEY", "TOP_SECRET_S3_KEY_MATERIAL");
         env::set_var("S3_BUCKET", "myelin-prod");
         env::set_var("REDIS_URL", "rediss://redisuser:REDIS_SECRET_PW@prod:6379");
-        env::set_var("NATS_URL", "nats://prod:4222");
+        env::set_var("NATS_URL", "nats://natsuser:NATS_SECRET_PW@prod:4222");
         let cfg = MyelinConfig::from_env(Mode::RequireEnv).unwrap();
 
         // S3Config on its own redacts both credential fields.
@@ -545,6 +546,10 @@ mod tests {
         assert!(
             !dbg.contains("REDIS_SECRET_PW"),
             "redis password leaked: {dbg}"
+        );
+        assert!(
+            !dbg.contains("NATS_SECRET_PW"),
+            "NATS password leaked: {dbg}"
         );
         assert!(
             dbg.contains("<redacted>"),
