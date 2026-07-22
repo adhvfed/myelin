@@ -721,11 +721,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         Ok(output)
     }
 
-    /// List every PR record under a repo (durable — loaded from disk).
-    pub fn list(&self, repo: &RepoLoc) -> Result<Vec<PrRecord>, DurableError> {
-        self.list_bounded(repo, usize::MAX, usize::MAX)
-    }
-
     /// List PR records while stopping before more than `maximum_records` JSON documents are read
     /// and parsed. Interactive callers use this to keep tenant-controlled record cardinality finite.
     pub fn list_bounded(
@@ -1205,7 +1200,10 @@ mod tests {
             "a point read must not expose the mismatched record"
         );
         assert!(
-            matches!(store.list(&loc()), Err(DurableError::Git(message)) if message.contains("identity mismatch")),
+            matches!(
+                store.list_bounded(&loc(), 10, 10 * PR_RECORD_MAX_BYTES),
+                Err(DurableError::Git(message)) if message.contains("identity mismatch")
+            ),
             "a list must not expose the mismatched record"
         );
         std::fs::remove_dir_all(&root).ok();
@@ -1271,7 +1269,7 @@ mod tests {
                 if message == "pull request record limit exceeded: serialized bytes"
         ));
         assert!(matches!(
-            store.list(&loc()),
+            store.list_bounded(&loc(), 10, 10 * PR_RECORD_MAX_BYTES),
             Err(DurableError::Git(message))
                 if message == "pull request record limit exceeded: serialized bytes"
         ));
@@ -1493,7 +1491,7 @@ mod tests {
         std::fs::write(&corrupt, b"{ this is not valid PrRecord json").unwrap();
 
         let list_error = store
-            .list(&loc())
+            .list_bounded(&loc(), 10, 10 * PR_RECORD_MAX_BYTES)
             .expect_err("the authoritative PR list must surface a corrupt record");
         assert!(list_error.to_string().contains("parse"));
         // But number allocation counts it → next is #4, NOT #3 (no reuse / no overwrite).

@@ -498,10 +498,6 @@ impl PgPrStore {
         .transpose()
     }
 
-    pub fn list(&self, scope: &TenantScope, repo: &str) -> Result<Vec<PrRecord>, DurableError> {
-        self.list_bounded(scope, repo, usize::MAX, usize::MAX)
-    }
-
     /// Fetch at most one row beyond the caller's ceiling, so interactive list/count projections can
     /// detect a pathological repository without materializing its entire PR relation in process.
     pub fn list_bounded(
@@ -2805,7 +2801,7 @@ mod tests {
                 &actor,
             )
             .is_err());
-        assert!(store.list(&scope_a, repo).unwrap().is_empty());
+        assert!(store.list_bounded(&scope_a, repo, 10, 10 * PR_RECORD_MAX_BYTES).unwrap().is_empty());
         let abort_events: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM outbox WHERE envelope->>'tenant'=$1 AND envelope->>'type_'=$2",
         )
