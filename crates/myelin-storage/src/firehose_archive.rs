@@ -501,7 +501,16 @@ impl FirehoseArchiver {
         lo: u64,
         hi: u64,
     ) -> Result<Option<SealedSegment>, ArchiveError> {
-        let frames = firehose.tail(stream, scope, lo, hi);
+        let frames = firehose
+            .tail_bounded(
+                stream,
+                scope,
+                lo,
+                hi,
+                FIREHOSE_MAX_SEGMENT_FRAMES,
+                FIREHOSE_MAX_SEGMENT_BYTES,
+            )
+            .map_err(|_| ArchiveError::LimitExceeded("firehose tail"))?;
         if frames.is_empty() {
             return Ok(None);
         }
