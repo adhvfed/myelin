@@ -939,7 +939,7 @@ impl StoreBackedCheck {
         scope: &myelin_storage::TenantScope,
         now: myelin_events::Timestamp,
     ) -> Result<pseudonym_erase::ReErasureReceipt, PseudonymError> {
-        let entries = self.erasure_ledger.entries_in(scope);
+        let entries = self.erasure_ledger.try_entries_in(scope)?;
         let mut per_subject = Vec::with_capacity(entries.len());
         let mut resurrected = 0usize;
         for entry in &entries {

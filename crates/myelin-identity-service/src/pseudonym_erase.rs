@@ -73,7 +73,7 @@ use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
 
-use crate::pseudonym_store::PseudonymStore;
+use crate::pseudonym_store::{PseudonymError, PseudonymStore};
 use myelin_identity::PrincipalId;
 
 /// The stable holder/ledger name of the PII-free erasure ledger (10.8). Named so the ledger appears
@@ -403,31 +403,46 @@ impl PseudonymErasureLedger {
     /// Every erasure entry in a `(tenant, region)` partition (the re-erasure pass replays THIS). No
     /// cross-partition accessor exists — a read is scoped to one verified `(tenant, region)`.
     pub fn entries_in(&self, scope: &TenantScope) -> Vec<ErasureLedgerEntry> {
+        self.try_entries_in(scope).unwrap_or_default()
+    }
+
+    /// Fallible ledger replay for restore verification. A backing fault or malformed key class
+    /// invalidates the re-erasure proof; neither may be reported as an empty ledger.
+    pub fn try_entries_in(
+        &self,
+        scope: &TenantScope,
+    ) -> Result<Vec<ErasureLedgerEntry>, PseudonymError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            ErasureLedgerBackend::Memory(inner_arc) => inner_arc
+            ErasureLedgerBackend::Memory(inner_arc) => Ok(inner_arc
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&Self::part_key(scope))
                 .map(|m| m.values().cloned().collect())
-                .unwrap_or_default(),
+                .unwrap_or_default()),
             ErasureLedgerBackend::Pg(pg) => pg
                 .block(pg.backing.entries_in(&scope.tenant().0))
-                .unwrap_or_default()
+                .map_err(|error| PseudonymError::Storage(error.to_string()))?
                 .into_iter()
-                .filter_map(|drow| {
-                    // Reconstruct the entry; a malformed dek_class token is a genuine corruption of our
-                    // own write — skipped rather than re-erased under a wrong key.
-                    myelin_storage::KeyClass::parse_token(&drow.dek_class).map(|dek_class| {
-                        ErasureLedgerEntry {
-                            subject: PrincipalId(drow.subject),
-                            dek_class,
-                            erased_at: myelin_events::Timestamp(drow.erased_at),
-                        }
-                    })
-                })
+                .map(Self::durable_to_entry)
                 .collect(),
         }
+    }
+
+    fn durable_to_entry(
+        row: myelin_storage::DurableErasureLedgerRow,
+    ) -> Result<ErasureLedgerEntry, PseudonymError> {
+        let dek_class = myelin_storage::KeyClass::parse_token(&row.dek_class).ok_or_else(|| {
+            PseudonymError::Storage(format!(
+                "malformed erasure-ledger DEK class `{}`",
+                row.dek_class
+            ))
+        })?;
+        Ok(ErasureLedgerEntry {
+            subject: PrincipalId(row.subject),
+            dek_class,
+            erased_at: myelin_events::Timestamp(row.erased_at),
+        })
     }
 
     /// `true` iff the subject is recorded erased in the verified scope (the ledger remembers an
@@ -680,5 +695,18 @@ mod tests {
         assert!(erased.contains("fails CLOSED"), "{erased}");
         assert!(no_map.contains("no pseudonym mapping"), "{no_map}");
         assert_ne!(erased, no_map);
+    }
+
+    #[test]
+    fn malformed_durable_ledger_key_invalidates_replay() {
+        let row = myelin_storage::DurableErasureLedgerRow {
+            subject: "p:alice".into(),
+            dek_class: "not-a-key-class".into(),
+            erased_at: "2026-06-19T00:00:00Z".into(),
+        };
+        assert!(matches!(
+            PseudonymErasureLedger::durable_to_entry(row),
+            Err(PseudonymError::Storage(message)) if message.contains("malformed erasure-ledger")
+        ));
     }
 }
