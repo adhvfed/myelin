@@ -171,4 +171,32 @@ mod tests {
             "myelin-client's default per-target timeout (the M0 floor) must be reachable from the shell"
         );
     }
+
+    #[test]
+    fn production_webview_policy_is_enabled_and_fail_closed() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let security = &config["app"]["security"];
+        let csp = security["csp"]
+            .as_str()
+            .expect("production CSP must be configured");
+        for directive in [
+            "default-src 'none'",
+            "connect-src ipc: http://ipc.localhost",
+            "object-src 'none'",
+            "frame-ancestors 'none'",
+            "form-action 'none'",
+        ] {
+            assert!(csp.contains(directive), "production CSP lacks {directive}");
+        }
+        assert!(!csp.contains("unsafe-eval"));
+        assert_eq!(
+            csp.matches("http://").count(),
+            1,
+            "only the Tauri IPC origin is allowed"
+        );
+        assert!(!csp.contains("https:"));
+        assert!(!csp.contains("ws:"));
+        assert_eq!(security["headers"]["X-Content-Type-Options"], "nosniff");
+    }
 }
