@@ -86,6 +86,7 @@ use crate::blob::{BlobError, BlobStore, ContentHash};
 
 /// Maximum CI cache artifact materialized by one namespace read.
 pub const CI_CACHE_MAX_ARTIFACT_BYTES: usize = 512 * 1024 * 1024;
+const CI_CACHE_MAX_KEY_PART_BYTES: usize = 1024;
 
 /// **The CI-stamped trust tier of a run (the INPUT, never recomputed here).** CI stamps a run's
 /// trust tier from its provenance (a PR from a fork → [`TrustTier::UntrustedFork`]; everything else
@@ -189,6 +190,8 @@ pub enum CacheScopeError {
     /// The underlying content-addressed [`BlobStore`] erred (e.g. a re-hash-on-read integrity
     /// failure on the cached blob bytes — the base tier's 0-silent-serve property still applies).
     Blob(BlobError),
+    /// A cache artifact or key component exceeded its bounded namespace ceiling.
+    LimitExceeded(&'static str),
 }
 
 impl std::fmt::Display for CacheScopeError {
@@ -207,6 +210,9 @@ impl std::fmt::Display for CacheScopeError {
                 write!(f, "cache miss: no entry '{name}' in scope '{scope}'")
             }
             CacheScopeError::Blob(e) => write!(f, "cache blob error: {e}"),
+            CacheScopeError::LimitExceeded(kind) => {
+                write!(f, "CI cache {kind} limit exceeded")
+            }
         }
     }
 }
@@ -313,6 +319,33 @@ impl<'b> CiCacheNamespace<'b> {
         name: &str,
         bytes: &[u8],
     ) -> Result<ContentHash, CacheScopeError> {
+        self.put_bounded(
+            trust_tier,
+            run_pr_id,
+            scope,
+            name,
+            bytes,
+            CI_CACHE_MAX_ARTIFACT_BYTES,
+        )
+    }
+
+    /// Write a cache entry under a caller-selected artifact byte ceiling.
+    pub fn put_bounded(
+        &self,
+        trust_tier: TrustTier,
+        run_pr_id: &str,
+        scope: &CacheScope,
+        name: &str,
+        bytes: &[u8],
+        maximum_artifact_bytes: usize,
+    ) -> Result<ContentHash, CacheScopeError> {
+        Self::validate_key_inputs(scope, name)?;
+        if run_pr_id.len() > CI_CACHE_MAX_KEY_PART_BYTES {
+            return Err(CacheScopeError::LimitExceeded("run PR id"));
+        }
+        if bytes.len() > maximum_artifact_bytes {
+            return Err(CacheScopeError::LimitExceeded("artifact bytes"));
+        }
         // THE C4 ENFORCEMENT (mandatory-core): a fork run may write ONLY its own fork:<pr_id> scope.
         if !scope.write_permitted_for(trust_tier, run_pr_id) {
             // The attempted poisoning is OBSERVED (telemetry), not silently dropped (EI-01 §3).
@@ -352,6 +385,7 @@ impl<'b> CiCacheNamespace<'b> {
         name: &str,
         maximum_bytes: usize,
     ) -> Result<Vec<u8>, CacheScopeError> {
+        Self::validate_key_inputs(scope, name)?;
         let key = self.scope_key(scope, name);
         let hash = {
             let index = self.index.lock().expect("ci cache index mutex");
@@ -372,11 +406,29 @@ impl<'b> CiCacheNamespace<'b> {
     /// (a fork's write to `trusted` never lands, so `contains(Trusted, name)` is false after a
     /// refused fork write: 0 cross-scope landings).
     pub fn contains(&self, scope: &CacheScope, name: &str) -> bool {
+        if Self::validate_key_inputs(scope, name).is_err() {
+            return false;
+        }
         let key = self.scope_key(scope, name);
         self.index
             .lock()
             .expect("ci cache index mutex")
             .contains_key(&key)
+    }
+
+    fn validate_key_inputs(scope: &CacheScope, name: &str) -> Result<(), CacheScopeError> {
+        if name.len() > CI_CACHE_MAX_KEY_PART_BYTES {
+            return Err(CacheScopeError::LimitExceeded("entry name"));
+        }
+        let scope_id = match scope {
+            CacheScope::Trusted => return Ok(()),
+            CacheScope::Fork { pr_id } => pr_id,
+            CacheScope::Branch { name } => name,
+        };
+        if scope_id.len() > CI_CACHE_MAX_KEY_PART_BYTES {
+            return Err(CacheScopeError::LimitExceeded("scope id"));
+        }
+        Ok(())
     }
 }
 
@@ -433,6 +485,31 @@ mod tests {
                 b"fork-bytes",
             )
             .expect("fork writes its own scope");
+        assert!(cache
+            .put_bounded(
+                TrustTier::UntrustedFork,
+                "42",
+                &scope,
+                "bounded",
+                b"fork-bytes",
+                b"fork-bytes".len(),
+            )
+            .is_ok());
+        assert_eq!(
+            cache.put_bounded(
+                TrustTier::UntrustedFork,
+                "42",
+                &scope,
+                "too-large",
+                b"fork-bytes",
+                b"fork-bytes".len() - 1,
+            ),
+            Err(CacheScopeError::LimitExceeded("artifact bytes"))
+        );
+        assert_eq!(
+            cache.get(&scope, &"x".repeat(CI_CACHE_MAX_KEY_PART_BYTES + 1)),
+            Err(CacheScopeError::LimitExceeded("entry name"))
+        );
 
         // It landed in the fork scope, NOT the trusted scope (0 cross-scope write).
         assert!(cache.contains(&scope, "build-cache"));
@@ -452,7 +529,7 @@ mod tests {
         );
         assert!(matches!(
             cache.get_bounded(&scope, "build-cache", b"fork-bytes".len() - 1),
-            Err(CacheScopeError::Blob(BlobError::ReadLimitExceeded { .. }))
+            Err(CacheScopeError::Blob(BlobError::SizeLimitExceeded { .. }))
         ));
         // Sanity: the stored content-address is the BLAKE3 of the bytes.
         assert_eq!(hash, ContentHash::blake3(b"fork-bytes"));

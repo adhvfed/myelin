@@ -192,6 +192,21 @@ impl<'a> CdnCloneClass<'a> {
     /// publishing is just a `put` through the unchanged base store; the returned [`ContentHash`] IS
     /// the bundle's CDN cache key (the content-address). No new store is created.
     pub fn publish_bundle(&self, bytes: &[u8]) -> Result<ContentHash, crate::blob::BlobError> {
+        self.publish_bundle_bounded(bytes, CDN_MAX_BUNDLE_BYTES)
+    }
+
+    /// Publish only when the bundle fits a caller-selected byte ceiling.
+    pub fn publish_bundle_bounded(
+        &self,
+        bytes: &[u8],
+        maximum_bytes: usize,
+    ) -> Result<ContentHash, crate::blob::BlobError> {
+        if bytes.len() > maximum_bytes {
+            return Err(crate::blob::BlobError::SizeLimitExceeded {
+                actual: bytes.len(),
+                maximum: maximum_bytes,
+            });
+        }
         self.base.put(&self.tenant, bytes)
     }
 
@@ -267,6 +282,15 @@ mod tests {
 
         let bundle_bytes = b"PACK\0clone-bundle-of-hot-repo";
         let addr = cdn.publish_bundle(bundle_bytes).expect("publish bundle");
+        assert_eq!(
+            cdn.publish_bundle_bounded(bundle_bytes, bundle_bytes.len())
+                .expect("exact publish limit accepted"),
+            addr
+        );
+        assert!(matches!(
+            cdn.publish_bundle_bounded(bundle_bytes, bundle_bytes.len() - 1),
+            Err(crate::blob::BlobError::SizeLimitExceeded { .. })
+        ));
         // The address IS the BLAKE3 of the bundle bytes (content-addressed like any T2 blob).
         assert_eq!(addr, ContentHash::blake3(bundle_bytes));
 
@@ -283,7 +307,7 @@ mod tests {
         );
         assert!(matches!(
             cdn.bundle_bounded(&addr, bundle_bytes.len() - 1),
-            Err(crate::blob::BlobError::ReadLimitExceeded { .. })
+            Err(crate::blob::BlobError::SizeLimitExceeded { .. })
         ));
 
         // A tampered bundle is REFUSED (the content-address is the validity check — no staleness).
