@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::task::{Context, Poll};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -57,6 +57,11 @@ const MAX_CONCURRENT_GIT_WIRE_OPERATIONS: usize = 4;
 const MAX_CONCURRENT_REQUEST_BODIES: usize = 64;
 const MAX_CONCURRENT_GIT_PUSH_BODIES: usize = 2;
 const MAX_CONCURRENT_GATEWAY_DISPATCHES: usize = 64;
+/// Git wire and raw/download handlers may each materialize a large bounded response. Keep their
+/// aggregate bounded independently of the general dispatch pool, and retain each permit while the
+/// response body is being pulled under Hyper's backpressure.
+const MAX_CONCURRENT_LARGE_RESPONSES: usize = 2;
+const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_HEADERS: usize = 64;
 const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -66,6 +71,15 @@ const GIT_WIRE_RETRY_AFTER_SECONDS: &str = "1";
 const READINESS_RETRY_AFTER_SECONDS: &str = "5";
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static CONNECTIONS_SHED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone)]
+struct AdmissionSlots {
+    git_wire: Arc<Semaphore>,
+    request_body: Arc<Semaphore>,
+    git_push_body: Arc<Semaphore>,
+    gateway_dispatch: Arc<Semaphore>,
+    large_response: Arc<Semaphore>,
+}
 
 /// Result of a requested listener shutdown. A forced result means the grace deadline expired and
 /// the remaining connection tasks were aborted; the count is the number active when draining began.
@@ -193,10 +207,13 @@ where
     let graceful = GracefulShutdown::new();
     let mut connections = JoinSet::new();
     let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let git_wire_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_WIRE_OPERATIONS));
-    let request_body_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUEST_BODIES));
-    let git_push_body_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_PUSH_BODIES));
-    let gateway_dispatch_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_GATEWAY_DISPATCHES));
+    let admission = AdmissionSlots {
+        git_wire: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_WIRE_OPERATIONS)),
+        request_body: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUEST_BODIES)),
+        git_push_body: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_PUSH_BODIES)),
+        gateway_dispatch: Arc::new(Semaphore::new(MAX_CONCURRENT_GATEWAY_DISPATCHES)),
+        large_response: Arc::new(Semaphore::new(MAX_CONCURRENT_LARGE_RESPONSES)),
+    };
     let mut accept_error = None;
 
     let shutdown_output = loop {
@@ -219,29 +236,20 @@ where
                 let io = TokioIo::new(stream);
                 let gw = gateway.clone();
                 let readiness = readiness.clone();
-                let git_wire_slots = git_wire_slots.clone();
-                let request_body_slots = request_body_slots.clone();
-                let git_push_body_slots = git_push_body_slots.clone();
-                let gateway_dispatch_slots = gateway_dispatch_slots.clone();
+                let admission = admission.clone();
                 let watcher = graceful.watcher();
                 connections.spawn(async move {
                     let _connection_permit = connection_permit;
                     let service = service_fn(move |req: Request<Incoming>| {
                         let gw = gw.clone();
                         let readiness = readiness.clone();
-                        let git_wire_slots = git_wire_slots.clone();
-                        let request_body_slots = request_body_slots.clone();
-                        let git_push_body_slots = git_push_body_slots.clone();
-                        let gateway_dispatch_slots = gateway_dispatch_slots.clone();
+                        let admission = admission.clone();
                         async move {
                             Ok::<_, Infallible>(
                                 handle_connection(
                                     gw,
                                     readiness,
-                                    git_wire_slots,
-                                    request_body_slots,
-                                    git_push_body_slots,
-                                    gateway_dispatch_slots,
+                                    admission,
                                     req,
                                 )
                                 .await,
@@ -294,10 +302,7 @@ where
 async fn handle_connection(
     gw: Arc<Gateway>,
     readiness: Arc<dyn ReadinessProbe>,
-    git_wire_slots: Arc<Semaphore>,
-    request_body_slots: Arc<Semaphore>,
-    git_push_body_slots: Arc<Semaphore>,
-    gateway_dispatch_slots: Arc<Semaphore>,
+    admission: AdmissionSlots,
     req: Request<Incoming>,
 ) -> Response<EdgeBody> {
     let request_id = next_request_id();
@@ -307,10 +312,7 @@ async fn handle_connection(
     let mut response = handle_connection_inner(
         gw,
         readiness,
-        git_wire_slots,
-        request_body_slots,
-        git_push_body_slots,
-        gateway_dispatch_slots,
+        admission,
         req,
     )
     .await;
@@ -349,10 +351,7 @@ fn harden_response_headers(response: &mut Response<EdgeBody>) {
 async fn handle_connection_inner(
     gw: Arc<Gateway>,
     readiness: Arc<dyn ReadinessProbe>,
-    git_wire_slots: Arc<Semaphore>,
-    request_body_slots: Arc<Semaphore>,
-    git_push_body_slots: Arc<Semaphore>,
-    gateway_dispatch_slots: Arc<Semaphore>,
+    admission: AdmissionSlots,
     req: Request<Incoming>,
 ) -> Response<EdgeBody> {
     let (parts, body) = req.into_parts();
@@ -395,7 +394,7 @@ async fn handle_connection_inner(
     // capacity, so GET/read traffic remains independent. The permit is acquired before reading and
     // remains owned by blocking dispatch, preventing completed bodies from piling up in a queue.
     let request_body_permit = if request_has_body(&parts.headers) {
-        match request_body_slots.try_acquire_owned() {
+        match admission.request_body.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
                 return unread_body_overloaded(
@@ -409,7 +408,7 @@ async fn handle_connection_inner(
     // At most two 64 MiB pushes may coexist within the general 64-body budget. A dedicated
     // semaphore keeps slow uploads from consuming clone/read execution capacity.
     let git_push_body_permit = if is_git_push {
-        match git_push_body_slots.try_acquire_owned() {
+        match admission.git_push_body.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
                 return unread_body_overloaded(
@@ -430,17 +429,31 @@ async fn handle_connection_inner(
         Err(BoundedCollectError::TimedOut) => return request_timeout(body_deadline),
     };
     let edge_req = EdgeRequest::new(method, path, query, headers, bytes);
+    // Raw/download and Git wire requests may materialize their full bounded output. Admit them
+    // before the blocking handler runs, then transfer the permit to the response body so slow
+    // clients cannot accumulate large allocations behind the much wider general gateway pool.
+    let large_response_permit =
+        if requires_large_response_budget(&edge_req.method, &edge_req.path) {
+            match admission.large_response.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return overloaded("the large response service is at capacity; retry later")
+                }
+            }
+        } else {
+            None
+        };
     // Acquire expensive Git capacity only after the bounded body has arrived; unauthenticated
     // trickle uploads cannot monopolize the four Git execution slots during their read deadline.
     let git_wire_permit = if is_git_wire {
-        match git_wire_slots.try_acquire_owned() {
+        match admission.git_wire.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => return overloaded("the Git wire service is at capacity; retry later"),
         }
     } else {
         None
     };
-    let gateway_permit = match gateway_dispatch_slots.try_acquire_owned() {
+    let gateway_permit = match admission.gateway_dispatch.try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => return overloaded("the edge request service is at capacity; retry later"),
     };
@@ -448,21 +461,27 @@ async fn handle_connection_inner(
     // Every gateway handler is synchronous and may reach blocking filesystem/Git/database adapters.
     // Keep all of it off Tokio workers. Move permits into the closure so request cancellation cannot
     // release capacity while the blocking work continues in the background.
-    let edge_response = match tokio::task::spawn_blocking(move || {
+    let (edge_response, large_response_permit) = match tokio::task::spawn_blocking(move || {
         let _gateway_permit = gateway_permit;
         let _git_wire_permit = git_wire_permit;
         let _request_body_permit = request_body_permit;
         let _git_push_body_permit = git_push_body_permit;
-        handle_gateway_safely(&gw, edge_req)
+        (
+            handle_gateway_safely(&gw, edge_req),
+            large_response_permit,
+        )
     })
     .await
     {
         Ok(response) => response,
-        Err(_) => EdgeResponse::error(&EdgeError::Internal(
-            "gateway dispatch task did not complete".into(),
-        )),
+        Err(_) => (
+            EdgeResponse::error(&EdgeError::Internal(
+                "gateway dispatch task did not complete".into(),
+            )),
+            None,
+        ),
     };
-    to_hyper(edge_response)
+    to_hyper_with_permit(edge_response, large_response_permit)
 }
 
 fn next_request_id() -> String {
@@ -542,6 +561,36 @@ fn is_git_wire_path(path: &str) -> bool {
     path.ends_with("/git-upload-pack")
         || path.ends_with("/git-receive-pack")
         || path.ends_with("/info/refs")
+}
+
+fn requires_large_response_budget(method: &str, path: &str) -> bool {
+    if is_git_wire_path(path) {
+        return true;
+    }
+    if method != "GET" {
+        return false;
+    }
+    let mut segments = path.strip_prefix('/').unwrap_or(path).split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some("v1"),
+            Some("git"),
+            Some("repos"),
+            Some(_),
+            Some("raw" | "download"),
+            Some(_),
+            Some(_),
+        )
+    )
 }
 
 fn request_body_cap(path: &str) -> usize {
@@ -654,6 +703,13 @@ fn payload_too_large(cap: usize) -> Response<EdgeBody> {
 
 /// Render an [`EdgeResponse`] as a hyper response (finished body or streamed SSE).
 fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
+    to_hyper_with_permit(resp, None)
+}
+
+fn to_hyper_with_permit(
+    resp: EdgeResponse,
+    large_response_permit: Option<OwnedSemaphorePermit>,
+) -> Response<EdgeBody> {
     match resp {
         EdgeResponse::Bytes { status, content_type, headers, body } => {
             if !response_content_type_is_safe(&content_type)
@@ -667,8 +723,12 @@ fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
             for (k, v) in headers {
                 builder = builder.header(k, v);
             }
+            let body = match large_response_permit {
+                Some(permit) => budgeted_bytes_body(body, permit),
+                None => full_body(body),
+            };
             builder
-                .body(full_body(body))
+                .body(body)
                 .unwrap_or_else(|_| response_render_failure())
         }
         EdgeResponse::Sse {
@@ -676,6 +736,7 @@ fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
             sub,
             expires_at_unix,
         } => {
+            drop(large_response_permit);
             if !handler_response_headers_are_safe(&headers) {
                 return response_render_failure();
             }
@@ -748,6 +809,54 @@ fn full_body(bytes: Vec<u8>) -> EdgeBody {
     Full::new(Bytes::from(bytes))
         .map_err(|never: Infallible| match never {})
         .boxed()
+}
+
+/// A bounded finished response split into transport-sized frames. `bytes` retains the single
+/// backing allocation until Hyper drops the body, while the permit prevents another large-output
+/// handler from materializing its own maximum-sized response. Slicing is zero-copy.
+fn budgeted_bytes_body(bytes: Vec<u8>, permit: OwnedSemaphorePermit) -> EdgeBody {
+    BudgetedBytesBody {
+        bytes: Bytes::from(bytes),
+        offset: 0,
+        _permit: permit,
+    }
+    .boxed()
+}
+
+struct BudgetedBytesBody {
+    bytes: Bytes,
+    offset: usize,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Body for BudgetedBytesBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.offset == self.bytes.len() {
+            return Poll::Ready(None);
+        }
+        let end = self
+            .offset
+            .saturating_add(MAX_RESPONSE_FRAME_BYTES)
+            .min(self.bytes.len());
+        let frame = self.bytes.slice(self.offset..end);
+        self.offset = end;
+        Poll::Ready(Some(Ok(Frame::data(frame))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        let remaining = self.bytes.len().saturating_sub(self.offset) as u64;
+        hyper::body::SizeHint::with_exact(remaining)
+    }
 }
 
 /// A streaming SSE body fed by the subscription's broadcast receiver: each frame is written as one
@@ -853,6 +962,76 @@ mod tests {
         assert!(body.frame().await.is_none());
         drop(body);
         assert_eq!(sender.receiver_count(), 0);
+    }
+
+    #[test]
+    fn only_bounded_large_response_routes_consume_large_response_capacity() {
+        for path in [
+            "/v1/git/repos/widgets/raw/main/src/lib.rs",
+            "/v1/git/repos/widgets/download/deadbeef/release.tar",
+        ] {
+            assert!(requires_large_response_budget("GET", path), "{path}");
+        }
+        for (method, path) in [
+            ("GET", "/acme/eu/widgets.git/info/refs"),
+            ("POST", "/acme/eu/widgets.git/git-upload-pack"),
+            ("POST", "/acme/eu/widgets.git/git-receive-pack"),
+        ] {
+            assert!(
+                requires_large_response_budget(method, path),
+                "{method} {path}"
+            );
+        }
+        for (method, path) in [
+            ("HEAD", "/v1/git/repos/widgets/raw/main/src/lib.rs"),
+            ("POST", "/v1/git/repos/widgets/download/main/archive"),
+            ("GET", "/v1/git/repos/widgets/raw/main"),
+            ("GET", "/v1/git/repos/widgets/rawish/main/file"),
+            ("GET", "/v1/git/raw/widgets/main/file"),
+            ("GET", "/v2/git/repos/widgets/raw/main/file"),
+        ] {
+            assert!(
+                !requires_large_response_budget(method, path),
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn budgeted_response_is_chunked_and_holds_capacity_until_body_drop() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().expect("one slot");
+        let payload = vec![7; MAX_RESPONSE_FRAME_BYTES * 2 + 7];
+        let mut body = budgeted_bytes_body(payload.clone(), permit);
+
+        assert_eq!(slots.available_permits(), 0);
+        let mut received = Vec::new();
+        let mut frame_lengths = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let data = frame
+                .expect("infallible response body")
+                .into_data()
+                .expect("data frame");
+            frame_lengths.push(data.len());
+            received.extend_from_slice(&data);
+        }
+
+        assert_eq!(received, payload);
+        assert_eq!(
+            frame_lengths,
+            [MAX_RESPONSE_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, 7]
+        );
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "the live body retains its capacity permit"
+        );
+        drop(body);
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "cancellation or completion releases capacity"
+        );
     }
 
     /// (a) A body under the cap collects fully and byte-for-byte.
