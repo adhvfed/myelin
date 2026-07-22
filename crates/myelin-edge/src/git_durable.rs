@@ -43,7 +43,7 @@ use myelin_git::check_status::GitOid;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};
 use myelin_git::durable::{
     BlobPathLookup, CommitDetail, CommitMeta, FileLinesLookup, PrDiff, TreePathLookup,
-    FILE_LINES_MAX_RANGE, WIRE_MAX_REFS,
+    COMMIT_LOG_MAX_OFFSET, FILE_LINES_MAX_RANGE, WIRE_MAX_REFS,
 };
 use myelin_git::durable::{DurableError, DurableGitRepo, DurableGitStore};
 use myelin_git::events::pseudonymized_event_principal;
@@ -3358,14 +3358,42 @@ impl Handler for DRepoHome {
 struct DCommitLog {
     be: Arc<DurableGitBackend>,
 }
+
+fn commit_log_offset(cursor: Option<&str>) -> Result<usize, EdgeError> {
+    match cursor {
+        None => Ok(0),
+        Some(cursor) => cursor
+            .parse::<usize>()
+            .ok()
+            .filter(|offset| *offset <= COMMIT_LOG_MAX_OFFSET)
+            .ok_or_else(|| EdgeError::BadRequest("invalid commit-log cursor".into())),
+    }
+}
+
+#[cfg(test)]
+mod commit_log_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn commit_log_cursor_is_strict_and_bounded() {
+        assert_eq!(commit_log_offset(None).unwrap(), 0);
+        assert_eq!(
+            commit_log_offset(Some(&COMMIT_LOG_MAX_OFFSET.to_string())).unwrap(),
+            COMMIT_LOG_MAX_OFFSET
+        );
+        let maximum = usize::MAX.to_string();
+        for cursor in ["", "-1", "1.5", "not-a-cursor", maximum.as_str()] {
+            assert!(matches!(
+                commit_log_offset(Some(cursor)),
+                Err(EdgeError::BadRequest(message)) if message == "invalid commit-log cursor"
+            ));
+        }
+    }
+}
+
 impl Handler for DCommitLog {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let offset = ctx
-            .page
-            .cursor
-            .as_deref()
-            .and_then(|c| c.parse::<usize>().ok())
-            .unwrap_or(0);
+        let offset = commit_log_offset(ctx.page.cursor.as_deref())?;
         let limit = ctx.page.limit;
         let (rows, has_more) = self
             .be
