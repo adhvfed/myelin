@@ -1899,12 +1899,10 @@ pub fn m6_required_rows() -> Vec<GateRow> {
 /// - **MR-013** — tenant isolation: `SET LOCAL` RLS + reset-on-release (the `set_config(..,false)`
 ///   bleed fixed) + identifier allowlist + mTLS/region fail-fast.
 ///
-/// **RED BY DEFAULT, by design.** Every proof command below is the `cargo test` target that the
-/// owning MR will make green; until that MR lands the command FAILS (the test does not yet exist
-/// or does not yet pass), so the row records claimed-not-proven and the gate reads RED. Running
-/// this gate over the incomplete spine SHOULD be red — that is correct, never faked green
-/// (EI-01 §1). MR-004's row is the one already-landed proof; the rest are forward references the
-/// gate enforces are filled before the spine can claim green.
+/// **RED BY DEFAULT, by design.** Every proof command below names the landed, non-vacuous evidence
+/// target for its MR. The live runner additionally requires the proof's output markers and refuses
+/// a graceful integration-test skip, so an unavailable backend or zero-test filter cannot mint a
+/// green. Any regression records claimed-not-proven and leaves the spine RED (L1 / EI-01 §1).
 pub fn make_it_real_required_rows() -> Vec<GateRow> {
     fn row(id: &'static str, title: &'static str, cmd: &'static [&'static str]) -> GateRow {
         GateRow {
@@ -1934,7 +1932,10 @@ pub fn make_it_real_required_rows() -> Vec<GateRow> {
                 "--features",
                 "integration",
                 "--test",
-                "durable_persistence_verify",
+                "integration_mr009_kill9_durability",
+                "--",
+                "--nocapture",
+                "--test-threads=1",
             ],
         ),
         row(
@@ -1944,8 +1945,9 @@ pub fn make_it_real_required_rows() -> Vec<GateRow> {
                 "test",
                 "-p",
                 "myelin-identity-service",
-                "--test",
-                "auth_human_negative_corpus",
+                "--lib",
+                "--",
+                "--nocapture",
             ],
         ),
         row(
@@ -1955,23 +1957,28 @@ pub fn make_it_real_required_rows() -> Vec<GateRow> {
                 "test",
                 "-p",
                 "myelin-identity-service",
+                "--features",
+                "integration",
+                "--lib",
                 "--test",
-                "auth_machine_negative_corpus",
+                "integration_mr011_machine_token_revocation_durable",
+                "--",
+                "--nocapture",
             ],
         ),
         row(
             "MR-012",
             "Structural* verifiers/signers REMOVED from the production graph — the no-structural-crypto absence scanner is green-on-prod, red-on-fixture",
-            // A DEDICATED test target (not a name filter on production_graph_absence): a name
-            // filter that matches zero tests makes `cargo test` exit 0 (a VACUOUS green the gate
-            // must never read as PASS). Pointing at a not-yet-existing --test target makes cargo
-            // ERROR (exit non-zero) until MR-012 lands the target — red by default, never vacuous.
+            // MR-012 landed inside the aggregate production-graph scanner. This names the whole
+            // target (not a libtest name filter), so the green cannot be vacuous.
             &[
                 "test",
                 "-p",
                 "myelin-lints",
                 "--test",
-                "no_structural_crypto_in_prod",
+                "production_graph_absence",
+                "--",
+                "--nocapture",
             ],
         ),
         row(
@@ -1984,7 +1991,10 @@ pub fn make_it_real_required_rows() -> Vec<GateRow> {
                 "--features",
                 "integration",
                 "--test",
-                "tenant_isolation_set_local",
+                "integration_mr013_rls_hardening",
+                "--",
+                "--nocapture",
+                "--test-threads=1",
             ],
         ),
     ]
@@ -2474,9 +2484,9 @@ impl Scorecard {
                      GREEN only when EVERY required row carries a FRESH, hash-VALID, attested PASS. \
                      Missing row → RED. Stale row (older than the freshness window) → RED. \
                      Tamper / hash-mismatch → RED. A green that cannot prove it bites is not \
-                     evidence (master-plan: \"attested, not hand-editable scorecards\"). Because the \
-                     spine work is not done, running this gate over the real tree is EXPECTED to be \
-                     RED — that is correct, and is never faked green (EI-01 §1).\n\n",
+                     evidence (master-plan: \"attested, not hand-editable scorecards\"). Every row \
+                     has landed, but any unavailable backend, skipped proof, stale artifact, or \
+                     regression re-arms RED instead of trusting the last green (L1 / EI-01 §1).\n\n",
                 );
                 out.push_str(
                     "**Attestation (the un-fakeable layer).** Each PASS is bound by a blake3 hash \
@@ -2489,8 +2499,8 @@ impl Scorecard {
                      it is the artifact the gate re-validates (this `.md` is the human mirror).\n\n",
                 );
                 out.push_str(
-                    "**Required rows → owning MR (each red until its MR lands):** MR-004 (absence \
-                     ratchet, the only already-landed proof) · MR-009 (durable-persistence verify) · \
+                    "**Required rows → owning MR (each re-run forever):** MR-004 (absence \
+                     ratchet) · MR-009 (durable-persistence verify) · \
                      MR-010 (human/SSO auth crypto + negative corpus) · MR-011 (machine/DPoP tokens \
                      + negative corpus) · MR-012 (Structural* removed, scanner green-on-prod) · \
                      MR-013 (tenant isolation, SET LOCAL RLS + reset-on-release).\n",

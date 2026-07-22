@@ -21,6 +21,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # L1: permanent evidence re-arms even when its source areas have not changed.
+    - cron: "17 4 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -51,10 +54,15 @@ jobs:
           toolchain: stable
       - name: The integration gate — up --wait → cargo test --features integration → infra scorecard (loud, non-zero on any red row)
         run: scripts/integration-test.sh --down
-      - name: Upload the dated infra scorecard artifact
+      - name: Upload the dated infra + make-it-real scorecard artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: infra-scorecard
-          path: testing/scorecards/infra.md
+          name: scheduled-evidence-scorecards
+          path: |
+            testing/scorecards/infra.md
+            testing/scorecards/make-it-real.json
+            testing/scorecards/make-it-real.md
+            thresholds.toml
           if-no-files-found: warn
+          retention-days: 35

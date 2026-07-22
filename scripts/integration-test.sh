@@ -13,7 +13,9 @@
 #      the two genuine-floor containerized smokes (hardened-container sandbox + 10× load);
 #   3. runs the infra scorecard runner (records each row, writes testing/scorecards/infra.md, and
 #      EXITS NON-ZERO if any row is missing or claimed-not-proven);
-#   4. optionally tears the stack down (`--down`) — by default it is LEFT UP for re-runs.
+#   4. re-arms the make-it-real evidence spine against the still-live stack and refreshes
+#      thresholds.toml's `as_of` only after every attested proof is green;
+#   5. optionally tears the stack down (`--down`) — by default it is LEFT UP for re-runs.
 #
 # There is deliberately NO `|| true` / swallow path: a red drill OR a red scorecard fails the gate.
 #
@@ -33,7 +35,7 @@ COMPOSE=(docker compose -f "${COMPOSE_FILE}")
 
 TEARDOWN="${1:-none}"
 
-echo "==> [1/3] bringing the dev data-layer stack up (blocks until healthchecks pass) …"
+echo "==> [1/4] bringing the dev data-layer stack up (blocks until healthchecks pass) …"
 "${COMPOSE[@]}" up -d --wait
 "${COMPOSE[@]}" ps
 
@@ -58,15 +60,19 @@ export NATS_URL="${NATS_URL:-nats://localhost:4222}"
 export MYELIN_REGION="${MYELIN_REGION:-fr-par}"
 
 echo
-echo "==> [2/3] running the workspace integration suite (cargo test --features integration) …"
+echo "==> [2/4] running the workspace integration suite (cargo test --features integration) …"
 # --features integration is a per-crate feature; running it workspace-wide compiles + runs every
 # crate's real-backend tests. The four retrofitted drills + the two floor smokes live in
 # myelin-storage; the bus/cache integration tests live in myelin-events / myelin-storage.
 cargo test --workspace --features integration -- --nocapture
 
 echo
-echo "==> [3/3] running the infra scorecard (red-until-proven; writes testing/scorecards/infra.md) …"
+echo "==> [3/4] running the infra scorecard (red-until-proven; writes testing/scorecards/infra.md) …"
 cargo run -p myelin-harness --bin infra-scorecard
+
+echo
+echo "==> [4/4] re-arming the make-it-real evidence spine (writes JSON + derived Markdown) …"
+cargo run -p myelin-harness --bin make-it-real-scorecard -- --refresh-thresholds-as-of
 
 echo
 echo "==> INTEGRATION GATE GREEN — every infra integration drill proven against the live stack."

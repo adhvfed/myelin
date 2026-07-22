@@ -51,7 +51,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::scorecard::{Band, RowVerdict, Scorecard};
+use crate::scorecard::{Band, RowResult, RowVerdict, Scorecard};
 
 /// Domain-separation tag for the attestation hash (so a make-it-real attestation can never
 /// collide with any other blake3 use in the workspace).
@@ -185,6 +185,8 @@ pub struct AttestedScorecard {
 /// [`GateVerdict`] so the binary can print exactly what failed closed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GateProblem {
+    /// The manifest shape/date/command identity is malformed or diverges from the frozen registry.
+    Malformed { id: String, detail: String },
     /// A required row id is absent from the manifest (the drop-a-row half of the ratchet).
     Missing(String),
     /// A required row is recorded but not a proven PASS (claimed-not-proven).
@@ -192,14 +194,24 @@ pub enum GateProblem {
     /// A PASS row's attestation is absent or its recomputed hash ≠ the stored hash (a tamper).
     Tampered { id: String, detail: String },
     /// A PASS row's date is older than the freshness window (stale evidence).
-    Stale { id: String, date: String, age_days: i64 },
+    Stale {
+        id: String,
+        date: String,
+        age_days: i64,
+    },
 }
 
 impl std::fmt::Display for GateProblem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            GateProblem::Malformed { id, detail } => {
+                write!(f, "MALFORMED `{id}` — {detail}")
+            }
             GateProblem::Missing(id) => {
-                write!(f, "MISSING required row `{id}` (the ratchet re-reds a dropped row)")
+                write!(
+                    f,
+                    "MISSING required row `{id}` (the ratchet re-reds a dropped row)"
+                )
             }
             GateProblem::NotProven { id, reason } => {
                 write!(f, "claimed-not-proven `{id}` — {reason}")
@@ -270,6 +282,34 @@ impl AttestedScorecard {
         serde_json::to_string_pretty(self).expect("AttestedScorecard serialises")
     }
 
+    /// Render the human mirror from this machine-readable source. The runner writes JSON first and
+    /// derives Markdown only through this method, so the two artifacts cannot acquire independent
+    /// verdicts or dates through separate editing paths.
+    pub fn render_markdown(&self) -> String {
+        let mut card = Scorecard::new(Band::MakeItReal);
+        for row in &self.rows {
+            if row.passed {
+                let result = match &row.attestation {
+                    Some(attestation) => RowResult::pass_attested(
+                        &row.id,
+                        &row.detail,
+                        &row.date,
+                        attestation.clone(),
+                    ),
+                    None => RowResult::pass(&row.id, &row.detail, &row.date),
+                };
+                card.record(result);
+            } else {
+                card.record(RowResult::claimed_not_proven(
+                    &row.id,
+                    &row.detail,
+                    &row.date,
+                ));
+            }
+        }
+        card.render_markdown(&self.generated_on)
+    }
+
     /// Parse a JSON manifest body. `Err` on malformed JSON (a corrupt manifest is itself a fail-
     /// closed condition — the caller reds the gate).
     pub fn from_json(s: &str) -> Result<Self, String> {
@@ -285,11 +325,68 @@ impl AttestedScorecard {
     pub fn validate(&self, today: &str, max_age_days: i64) -> GateVerdict {
         let mut problems = Vec::new();
         let today_days = days_from_iso(today);
+        if self.band != Band::MakeItReal.to_string() {
+            problems.push(GateProblem::Malformed {
+                id: "manifest.band".to_string(),
+                detail: format!("expected `{}`, got `{}`", Band::MakeItReal, self.band),
+            });
+        }
+        if today_days.is_none() {
+            problems.push(GateProblem::Malformed {
+                id: "validation.today".to_string(),
+                detail: format!("`{today}` is not a canonical calendar date"),
+            });
+        }
+        match (today_days, days_from_iso(&self.generated_on)) {
+            (_, None) => problems.push(GateProblem::Malformed {
+                id: "manifest.generated_on".to_string(),
+                detail: format!("`{}` is not a canonical calendar date", self.generated_on),
+            }),
+            (Some(today), Some(generated)) => {
+                let age = today - generated;
+                if age < 0 || age > max_age_days {
+                    problems.push(GateProblem::Stale {
+                        id: "manifest.generated_on".to_string(),
+                        date: self.generated_on.clone(),
+                        age_days: age,
+                    });
+                }
+            }
+            (None, Some(_)) => {}
+        }
+        let required_rows = Band::MakeItReal.required_rows();
+        for row in &self.rows {
+            if !required_rows.iter().any(|required| required.id == row.id) {
+                problems.push(GateProblem::Malformed {
+                    id: row.id.clone(),
+                    detail: "row is not in the frozen make-it-real registry".to_string(),
+                });
+            }
+        }
         for required in Band::MakeItReal.required_rows() {
-            let Some(row) = self.rows.iter().find(|r| r.id == required.id) else {
+            let matches = self
+                .rows
+                .iter()
+                .filter(|row| row.id == required.id)
+                .collect::<Vec<_>>();
+            if matches.len() > 1 {
+                problems.push(GateProblem::Malformed {
+                    id: required.id.to_string(),
+                    detail: format!("duplicate required row appears {} times", matches.len()),
+                });
+                continue;
+            }
+            let Some(row) = matches.first().copied() else {
                 problems.push(GateProblem::Missing(required.id.to_string()));
                 continue;
             };
+            let row_days = days_from_iso(&row.date);
+            if row_days.is_none() {
+                problems.push(GateProblem::Malformed {
+                    id: row.id.clone(),
+                    detail: format!("row date `{}` is not a canonical calendar date", row.date),
+                });
+            }
             if !row.passed {
                 problems.push(GateProblem::NotProven {
                     id: row.id.clone(),
@@ -307,6 +404,21 @@ impl AttestedScorecard {
                             .to_string(),
                 }),
                 Some(att) => {
+                    let expected = required
+                        .proof_command
+                        .iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>();
+                    if att.argv != expected {
+                        problems.push(GateProblem::Tampered {
+                            id: row.id.clone(),
+                            detail: format!(
+                                "attested argv {:?} does not equal frozen proof command {:?}",
+                                att.argv, expected
+                            ),
+                        });
+                        continue;
+                    }
                     if let Err(detail) = att.verify(&row.id, &row.date) {
                         problems.push(GateProblem::Tampered {
                             id: row.id.clone(),
@@ -317,7 +429,7 @@ impl AttestedScorecard {
                 }
             }
             // Freshness (only meaningful for a hash-valid PASS).
-            if let (Some(t), Some(d)) = (today_days, days_from_iso(&row.date)) {
+            if let (Some(t), Some(d)) = (today_days, row_days) {
                 let age = t - d;
                 if age < 0 || age > max_age_days {
                     problems.push(GateProblem::Stale {
@@ -336,11 +448,24 @@ impl AttestedScorecard {
 /// days-from-civil, the inverse of the algorithm in [`crate::scorecard::today_iso`]). Returns
 /// `None` on a malformed date so a corrupt date reds the gate rather than panicking.
 fn days_from_iso(s: &str) -> Option<i64> {
+    if s.len() != 10 || s.as_bytes().get(4) != Some(&b'-') || s.as_bytes().get(7) != Some(&b'-') {
+        return None;
+    }
     let mut parts = s.split('-');
     let y: i64 = parts.next()?.parse().ok()?;
     let m: i64 = parts.next()?.parse().ok()?;
     let d: i64 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    if parts.next().is_some() || !(1..=12).contains(&m) {
+        return None;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days_in_month = match m {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&d) {
         return None;
     }
     let y = if m <= 2 { y - 1 } else { y };

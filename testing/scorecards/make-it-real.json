@@ -1,12 +1,12 @@
 {
   "band": "make-it-real (evidence spine)",
-  "generated_on": "2026-06-26",
+  "generated_on": "2026-07-22",
   "rows": [
     {
       "id": "MR-004",
       "passed": true,
-      "date": "2026-06-26",
-      "detail": "[2026-06-26] PASS `cargo test -p myelin-lints --test production_graph_absence` (attested blake3:75efdb5045d8)",
+      "date": "2026-07-22",
+      "detail": "[2026-07-22] PASS `cargo test -p myelin-lints --test production_graph_absence` (attested blake3:7a8520f7dd88)",
       "attestation": {
         "argv": [
           "test",
@@ -15,44 +15,112 @@
           "--test",
           "production_graph_absence"
         ],
-        "output_digest": "c3e10e29812220ec8e3113932bcab614c82116cc0f6af6c29b0f289d57c717f8",
-        "hash": "75efdb5045d8749bda011bd655134357bdfc661b7af18698745ab2c54f38e56f"
+        "output_digest": "560daf5dd7f4c2ed16572a6b14263428b9afd80d29faf2d6e13cab08df12ae1b",
+        "hash": "7a8520f7dd88363c1ac773596338a8465502f73802d8ab27db622acc953cec8a"
       }
     },
     {
       "id": "MR-009",
-      "passed": false,
-      "date": "2026-06-26",
-      "detail": "`cargo test -p myelin-identity-service --features integration --test durable_persistence_verify` exited non-zero (101) — the drill read RED (this floor is not yet real)",
-      "attestation": null
+      "passed": true,
+      "date": "2026-07-22",
+      "detail": "[2026-07-22] PASS `cargo test -p myelin-identity-service --features integration --test integration_mr009_kill9_durability -- --nocapture --test-threads=1` (attested blake3:f95c2c391dae)",
+      "attestation": {
+        "argv": [
+          "test",
+          "-p",
+          "myelin-identity-service",
+          "--features",
+          "integration",
+          "--test",
+          "integration_mr009_kill9_durability",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "output_digest": "86280e71d7758fd3d0b2e6574ec64ec0414fbf911c393346197f055ab149ba78",
+        "hash": "f95c2c391dae60fc87f3a5776df59df8c68bbdf568e1d105fe37a0855db71a0e"
+      }
     },
     {
       "id": "MR-010",
-      "passed": false,
-      "date": "2026-06-26",
-      "detail": "`cargo test -p myelin-identity-service --test auth_human_negative_corpus` exited non-zero (101) — the drill read RED (this floor is not yet real)",
-      "attestation": null
+      "passed": true,
+      "date": "2026-07-22",
+      "detail": "[2026-07-22] PASS `cargo test -p myelin-identity-service --lib -- --nocapture` (attested blake3:904ed5ce576a)",
+      "attestation": {
+        "argv": [
+          "test",
+          "-p",
+          "myelin-identity-service",
+          "--lib",
+          "--",
+          "--nocapture"
+        ],
+        "output_digest": "1a86ad7314409c5845c8902ff5e89957d93546c8990d3ec4c2288ebd1fd70a10",
+        "hash": "904ed5ce576a82c9dbef280e37a89c0dd62cd7092a751df02ed78a1527cd136a"
+      }
     },
     {
       "id": "MR-011",
-      "passed": false,
-      "date": "2026-06-26",
-      "detail": "`cargo test -p myelin-identity-service --test auth_machine_negative_corpus` exited non-zero (101) — the drill read RED (this floor is not yet real)",
-      "attestation": null
+      "passed": true,
+      "date": "2026-07-22",
+      "detail": "[2026-07-22] PASS `cargo test -p myelin-identity-service --features integration --lib --test integration_mr011_machine_token_revocation_durable -- --nocapture` (attested blake3:00ecbdd53dbd)",
+      "attestation": {
+        "argv": [
+          "test",
+          "-p",
+          "myelin-identity-service",
+          "--features",
+          "integration",
+          "--lib",
+          "--test",
+          "integration_mr011_machine_token_revocation_durable",
+          "--",
+          "--nocapture"
+        ],
+        "output_digest": "85ecd6b4d8189d65dba8ed712d0c7aab243c4e96632d937c1af5a60d5f04a083",
+        "hash": "00ecbdd53dbd13b652d38c1a3c0d8afd6da0d30d4c3aaee2d01386e3c818628b"
+      }
     },
     {
       "id": "MR-012",
-      "passed": false,
-      "date": "2026-06-26",
-      "detail": "`cargo test -p myelin-lints --test no_structural_crypto_in_prod` exited non-zero (101) — the drill read RED (this floor is not yet real)",
-      "attestation": null
+      "passed": true,
+      "date": "2026-07-22",
+      "detail": "[2026-07-22] PASS `cargo test -p myelin-lints --test production_graph_absence -- --nocapture` (attested blake3:c41e142e1182)",
+      "attestation": {
+        "argv": [
+          "test",
+          "-p",
+          "myelin-lints",
+          "--test",
+          "production_graph_absence",
+          "--",
+          "--nocapture"
+        ],
+        "output_digest": "6306f2c94383e8625e1820ab6f431763821b8c503b3cae354b0ccf3df43d755a",
+        "hash": "c41e142e118226317568e1675a2f204c199f100a447cfd54cedd7a7d35e81805"
+      }
     },
     {
       "id": "MR-013",
-      "passed": false,
-      "date": "2026-06-26",
-      "detail": "`cargo test -p myelin-storage --features integration --test tenant_isolation_set_local` exited non-zero (101) — the drill read RED (this floor is not yet real)",
-      "attestation": null
+      "passed": true,
+      "date": "2026-07-22",
+      "detail": "[2026-07-22] PASS `cargo test -p myelin-storage --features integration --test integration_mr013_rls_hardening -- --nocapture --test-threads=1` (attested blake3:f441061b5996)",
+      "attestation": {
+        "argv": [
+          "test",
+          "-p",
+          "myelin-storage",
+          "--features",
+          "integration",
+          "--test",
+          "integration_mr013_rls_hardening",
+          "--",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "output_digest": "e797d09b90169c309be20388d4d85ca8d41df2da68311b4f7757a438164f6ed7",
+        "hash": "f441061b59964d0688ea6e144785fbef7c0f099a5d5fe61748586675676faf9e"
+      }
     }
   ]
 }
