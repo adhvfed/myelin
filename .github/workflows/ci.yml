@@ -194,6 +194,11 @@ jobs:
         run: scripts/check-plan-commit-subjects.sh "$PLAN_BASE_SHA" "$PLAN_HEAD_SHA"
       - name: L4 traceability green + red self-test
         run: scripts/test-plan-commit-subjects.sh
+      - name: L3 compounding-payoff metric (per plan row, derived from Git history)
+        run: |
+          scripts/test-plan-payoff-metrics.sh
+          scripts/plan-payoff-metrics.sh | tee /tmp/plan-payoff.md
+          cat /tmp/plan-payoff.md >> "$GITHUB_STEP_SUMMARY"
       # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
       # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
       - name: Free disk space
