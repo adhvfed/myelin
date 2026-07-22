@@ -253,7 +253,15 @@ impl GitCore for RecCore {
     ) -> Result<Vec<u8>, GitCoreError> {
         unreachable!()
     }
-    fn diff_blobs(&self, _r: &RepoLoc, _a: &Oid, _b: &Oid) -> Result<Vec<DiffLine>, GitCoreError> {
+    fn diff_blobs_bounded(
+        &self,
+        _r: &RepoLoc,
+        _a: &Oid,
+        _b: &Oid,
+        _maximum_blob_bytes: usize,
+        _maximum_lines: usize,
+        _maximum_output_bytes: usize,
+    ) -> Result<Vec<DiffLine>, GitCoreError> {
         unreachable!()
     }
     fn blame(&self, _r: &RepoLoc, _p: &str, _a: &Oid) -> Result<Vec<BlameHunk>, GitCoreError> {

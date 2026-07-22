@@ -305,8 +305,16 @@ pub trait ReadBackend {
         oid: &Oid,
         maximum_bytes: usize,
     ) -> Result<Vec<u8>, GitCoreError>;
-    /// Diff two blobs (a Myers/Histogram unified diff).
-    fn diff_blobs(&self, repo: &RepoLoc, a: &Oid, b: &Oid) -> Result<Vec<DiffLine>, GitCoreError>;
+    /// Diff two blobs with explicit input and output ceilings.
+    fn diff_blobs_bounded(
+        &self,
+        repo: &RepoLoc,
+        a: &Oid,
+        b: &Oid,
+        maximum_blob_bytes: usize,
+        maximum_lines: usize,
+        maximum_output_bytes: usize,
+    ) -> Result<Vec<DiffLine>, GitCoreError>;
     /// Blame a path at a commit.
     fn blame(&self, repo: &RepoLoc, path: &str, at: &Oid) -> Result<Vec<BlameHunk>, GitCoreError>;
 }
@@ -347,8 +355,16 @@ pub trait GitCore {
         oid: &Oid,
         maximum_bytes: usize,
     ) -> Result<Vec<u8>, GitCoreError>;
-    /// Diff two blobs — in-process.
-    fn diff_blobs(&self, repo: &RepoLoc, a: &Oid, b: &Oid) -> Result<Vec<DiffLine>, GitCoreError>;
+    /// Diff two blobs — in-process, with explicit input and output ceilings.
+    fn diff_blobs_bounded(
+        &self,
+        repo: &RepoLoc,
+        a: &Oid,
+        b: &Oid,
+        maximum_blob_bytes: usize,
+        maximum_lines: usize,
+        maximum_output_bytes: usize,
+    ) -> Result<Vec<DiffLine>, GitCoreError>;
     /// Blame a path at a commit — in-process.
     fn blame(&self, repo: &RepoLoc, path: &str, at: &Oid) -> Result<Vec<BlameHunk>, GitCoreError>;
 }
@@ -486,9 +502,24 @@ impl<E: WireExecutor, R: ReadBackend> GitCore for RoutedGitCore<E, R> {
         self.read.read_blob_bounded(repo, oid, maximum_bytes)
     }
 
-    fn diff_blobs(&self, repo: &RepoLoc, a: &Oid, b: &Oid) -> Result<Vec<DiffLine>, GitCoreError> {
+    fn diff_blobs_bounded(
+        &self,
+        repo: &RepoLoc,
+        a: &Oid,
+        b: &Oid,
+        maximum_blob_bytes: usize,
+        maximum_lines: usize,
+        maximum_output_bytes: usize,
+    ) -> Result<Vec<DiffLine>, GitCoreError> {
         Self::assert_backend(GitOp::Read(ReadOp::Diff), Backend::Gix)?;
-        self.read.diff_blobs(repo, a, b)
+        self.read.diff_blobs_bounded(
+            repo,
+            a,
+            b,
+            maximum_blob_bytes,
+            maximum_lines,
+            maximum_output_bytes,
+        )
     }
 
     fn blame(&self, repo: &RepoLoc, path: &str, at: &Oid) -> Result<Vec<BlameHunk>, GitCoreError> {
@@ -679,11 +710,14 @@ mod tests {
         ) -> Result<Vec<u8>, GitCoreError> {
             Ok(Vec::new())
         }
-        fn diff_blobs(
+        fn diff_blobs_bounded(
             &self,
             _r: &RepoLoc,
             _a: &Oid,
             _b: &Oid,
+            _maximum_blob_bytes: usize,
+            _maximum_lines: usize,
+            _maximum_output_bytes: usize,
         ) -> Result<Vec<DiffLine>, GitCoreError> {
             Ok(Vec::new())
         }
@@ -715,11 +749,14 @@ mod tests {
             ) -> Result<Vec<u8>, GitCoreError> {
                 Ok(b"blob".to_vec())
             }
-            fn diff_blobs(
+            fn diff_blobs_bounded(
                 &self,
                 _r: &RepoLoc,
                 _a: &Oid,
                 _b: &Oid,
+                _maximum_blob_bytes: usize,
+                _maximum_lines: usize,
+                _maximum_output_bytes: usize,
             ) -> Result<Vec<DiffLine>, GitCoreError> {
                 Ok(vec![DiffLine {
                     origin: '+',
@@ -763,7 +800,14 @@ mod tests {
             b"blob"
         );
         assert_eq!(
-            core.diff_blobs(&repo, &Oid::new("a"), &Oid::new("b"))
+            core.diff_blobs_bounded(
+                &repo,
+                &Oid::new("a"),
+                &Oid::new("b"),
+                1024,
+                100,
+                8192,
+            )
                 .unwrap()
                 .len(),
             1
