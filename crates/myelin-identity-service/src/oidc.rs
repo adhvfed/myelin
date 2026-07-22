@@ -57,6 +57,9 @@ use base64::Engine as _;
 const OIDC_LOGIN_MATERIAL_PREFIX: &str = "oidc-login.v1.";
 const JWKS_REFRESH_INTERVAL_SECS: i64 = 15 * 60;
 const JWKS_REFRESH_COOLDOWN_SECS: i64 = 30;
+const MAX_OIDC_SCOPE_CLAIM_BYTES: usize = 128;
+const MAX_OIDC_SUBJECT_BYTES: usize = 512;
+const MAX_OIDC_REPLAY_ID_BYTES: usize = 512;
 
 /// Bind an ID token to the browser transaction nonce that initiated its authorization-code flow.
 /// The returned opaque material is accepted only by [`OidcVerifier`]. Direct verifier callers may
@@ -83,6 +86,18 @@ fn valid_transaction_nonce(nonce: &str) -> bool {
         && nonce
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn valid_scope_claim(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_OIDC_SCOPE_CLAIM_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_opaque_claim(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
 }
 
 fn unwrap_login_material(material: &str) -> Result<(Cow<'_, str>, Option<String>), AuthzError> {
@@ -859,10 +874,7 @@ impl CredentialVerifier for OidcVerifier {
             .and_then(|i| i.as_str())
             .ok_or_else(|| refuse("token missing `iss`"))?;
         if iss != self.config.issuer {
-            return Err(refuse(format!(
-                "issuer mismatch: token `iss`=`{iss}` != configured `{}`",
-                self.config.issuer
-            )));
+            return Err(refuse("issuer mismatch"));
         }
 
         // (5b) aud — must name only this RP. A token shared with another client is rejected unless
@@ -910,26 +922,26 @@ impl CredentialVerifier for OidcVerifier {
         let sub = claims
             .get("sub")
             .and_then(|s| s.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| refuse("token missing `sub` (no subject)"))?;
+            .filter(|s| valid_opaque_claim(s, MAX_OIDC_SUBJECT_BYTES))
+            .ok_or_else(|| refuse("token has no valid bounded `sub` (no subject)"))?;
         let tenant = claims
             .get(&self.config.tenant_claim)
             .and_then(|t| t.as_str())
-            .filter(|t| !t.is_empty())
+            .filter(|t| valid_scope_claim(t))
             .ok_or_else(|| {
                 refuse(format!(
-                    "verified token carries no `{}` claim (the tenant is the trust root and must \
-                     come from the IdP-verified claims, never a path)",
+                    "verified token carries no valid bounded `{}` claim (the tenant is the trust \
+                     root and must come from the IdP-verified claims, never a path)",
                     self.config.tenant_claim
                 ))
             })?;
         let region = claims
             .get(&self.config.region_claim)
             .and_then(|r| r.as_str())
-            .filter(|r| !r.is_empty())
+            .filter(|r| valid_scope_claim(r))
             .ok_or_else(|| {
                 refuse(format!(
-                    "verified token carries no `{}` claim",
+                    "verified token carries no valid bounded `{}` claim",
                     self.config.region_claim
                 ))
             })?;
@@ -955,12 +967,12 @@ impl CredentialVerifier for OidcVerifier {
         let replay_id = claims
             .get("jti")
             .and_then(|j| j.as_str())
-            .filter(|id| !id.is_empty())
+            .filter(|id| valid_opaque_claim(id, MAX_OIDC_REPLAY_ID_BYTES))
             .or_else(|| {
                 claims
                     .get("nonce")
                     .and_then(|n| n.as_str())
-                    .filter(|id| !id.is_empty())
+                    .filter(|id| valid_opaque_claim(id, MAX_OIDC_REPLAY_ID_BYTES))
             });
         match replay_id {
             Some(id) => {
@@ -1808,6 +1820,34 @@ mod tests {
             matches!(&err, AuthzError::FailClosed(m) if m.contains("tenant")),
             "a token with no tenant claim must be refused, got {err:?}"
         );
+    }
+
+    #[test]
+    fn trust_rooted_claims_are_bounded_before_replay_or_storage() {
+        let key = RsaKey::generate();
+        let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
+        let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
+        for (field, value, expected) in [
+            ("tenant", "acme/foreign".to_string(), "tenant"),
+            ("region", "eu-west\nforged".to_string(), "region"),
+            ("sub", "s".repeat(MAX_OIDC_SUBJECT_BYTES + 1), "sub"),
+            (
+                "jti",
+                "j".repeat(MAX_OIDC_REPLAY_ID_BYTES + 1),
+                "replay-defence",
+            ),
+        ] {
+            let mut cl = claims("jti-bounded-default");
+            cl[field] = value.into();
+            let signature = key.sign(signing_input(&header, &cl).as_bytes());
+            let error = verifier(jwks.clone())
+                .verify(&cred(jwt(&header, &cl, &signature)))
+                .unwrap_err();
+            assert!(
+                matches!(&error, AuthzError::FailClosed(message) if message.contains(expected)),
+                "unexpected refusal for {field}: {error:?}"
+            );
+        }
     }
 
     #[test]
