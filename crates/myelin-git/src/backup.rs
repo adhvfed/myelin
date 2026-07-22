@@ -443,6 +443,17 @@ pub fn restore_repo<P: RepoPathResolver>(
             final_path.display()
         )));
     }
+    let parent = final_path.parent().ok_or_else(|| {
+        GitBackupError::Io(format!("restore target {} has no parent directory", final_path.display()))
+    })?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| {
+            GitBackupError::Io(format!(
+                "sync restore publish directory {}: {e}",
+                parent.display()
+            ))
+        })?;
 
     // Open the published repo through the validated store (the returned handle is on the final path).
     store.open_repo(loc).map_err(GitBackupError::Durable)
