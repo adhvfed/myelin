@@ -58,6 +58,10 @@ use myelin_git::lifecycle::{
     BranchProtectionRuleset, PrState, PullRequest, ReviewState, ReviewVerdict,
 };
 use myelin_git::pg_pr_store::{PgPrStore, PrMutation, PrOperationId};
+use myelin_git::pr_list_pagination::{
+    pr_list_static_scope, pr_list_visible_scope, PrListCursor, PrListCursorEndpoint,
+    PrListDirection, PrListKey, PrListPage, PR_LIST_CURSOR_PREFIX,
+};
 use myelin_git::pr_store::{
     effective_ruleset, evaluate_merge, merge_pr, BranchProtectionConfig, ChecksSummary,
     DurablePrStore, MergeAttempt, PrCrossListQuery, PrCrossListRecord, PrListBucket, PrListCounts,
@@ -290,7 +294,8 @@ struct EnrichedPrSlice {
     total: usize,
     offset: usize,
     limit: usize,
-    has_more: bool,
+    next_cursor: Option<String>,
+    prev_cursor: Option<String>,
 }
 
 struct EnrichedCrossPrSlice {
@@ -298,7 +303,8 @@ struct EnrichedCrossPrSlice {
     total: usize,
     offset: usize,
     limit: usize,
-    has_more: bool,
+    next_cursor: Option<String>,
+    prev_cursor: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1857,13 +1863,37 @@ impl DurableGitBackend {
         let loc = Self::loc(tenant, region, slug);
         self.store.open_repo(&loc)?; // 404 if the repo is absent (never a phantom empty list).
         let page = self.pr_list_page(&loc, principal, query)?;
+        let rows = self.enrich_pr_records(&loc, &query.viewer_pseudonym, None, page.records);
+        let endpoint = PrListCursorEndpoint::Repository(query.state);
+        let static_scope = pr_list_static_scope(
+            tenant,
+            region,
+            &query.viewer_pseudonym,
+            endpoint,
+            Some(slug),
+            query.sort,
+            query.limit,
+        );
+        let (next_cursor, prev_cursor) = mint_pr_list_cursors(
+            &rows,
+            endpoint,
+            query.sort,
+            query.limit,
+            page.offset,
+            page.has_older,
+            page.has_newer,
+            static_scope,
+            [0; 32],
+            &query.page,
+        )?;
         Ok(EnrichedPrSlice {
-            rows: self.enrich_pr_records(&loc, &query.viewer_pseudonym, None, page.records),
+            rows,
             counts: page.counts,
             total: page.total,
             offset: page.offset,
             limit: query.limit,
-            has_more: page.has_more,
+            next_cursor,
+            prev_cursor,
         })
     }
 
@@ -1976,23 +2006,57 @@ impl DurableGitBackend {
         query: &PrCrossListQuery,
     ) -> Result<EnrichedCrossPrSlice, DurableError> {
         let visible = self.visible_pr_repo_slugs(tenant, region, principal)?;
+        let visible_scope = pr_list_visible_scope(&visible);
+        if let PrListPage::Keyset(cursor) = &query.page {
+            if cursor.visible_scope() != visible_scope
+                || cursor
+                    .key()
+                    .repo_slug
+                    .as_ref()
+                    .is_none_or(|slug| !visible.contains(slug))
+            {
+                return Err(DurableError::Git(
+                    "pull request list cursor visible set changed".into(),
+                ));
+            }
+        }
+        let endpoint = PrListCursorEndpoint::CrossRepository(query.bucket);
+        let static_scope = pr_list_static_scope(
+            tenant,
+            region,
+            &query.viewer_pseudonym,
+            endpoint,
+            None,
+            query.sort,
+            query.limit,
+        );
         if let Some(store) = &self.pg_prs {
             let page = store.list_cross_page(
                 &Self::verified_pr_scope(principal, &Self::loc(tenant, region, "_visible"))?,
                 &visible,
                 query,
             )?;
+            let rows =
+                self.enrich_cross_pr_records(tenant, region, &query.viewer_pseudonym, page.records);
+            let (next_cursor, prev_cursor) = mint_pr_list_cursors(
+                &rows,
+                endpoint,
+                query.sort,
+                query.limit,
+                page.offset,
+                page.has_older,
+                page.has_newer,
+                static_scope,
+                visible_scope,
+                &query.page,
+            )?;
             return Ok(EnrichedCrossPrSlice {
-                rows: self.enrich_cross_pr_records(
-                    tenant,
-                    region,
-                    &query.viewer_pseudonym,
-                    page.records,
-                ),
+                rows,
                 total: page.total,
                 offset: page.offset,
                 limit: query.limit,
-                has_more: page.has_more,
+                next_cursor,
+                prev_cursor,
             });
         }
 
@@ -2028,19 +2092,63 @@ impl DurableGitBackend {
             }),
         }
         let total = rows.len();
-        let mut rows: Vec<_> = rows
+        let mut selected: Vec<(usize, EnrichedPr)> = match &query.page {
+            PrListPage::Initial => rows.into_iter().enumerate().collect(),
+            PrListPage::LegacyOffset(offset) => {
+                rows.into_iter().enumerate().skip(*offset).collect()
+            }
+            PrListPage::Keyset(cursor) => {
+                let mut selected: Vec<_> = rows
             .into_iter()
-            .skip(query.offset)
-            .take(query.limit.saturating_add(1))
+                    .enumerate()
+                    .filter(|(_, row)| {
+                        let before = cross_pr_before_key(row, cursor.key(), query.sort);
+                        let equal = row.rec.number == cursor.key().number
+                            && row.repo_slug.as_deref() == cursor.key().repo_slug.as_deref()
+                            && (query.sort == PrListSort::Created
+                                || row.rec.updated_at == cursor.key().updated_at);
+                        match cursor.direction() {
+                            PrListDirection::Newer => before,
+                            PrListDirection::Older => !before && !equal,
+                        }
+                    })
             .collect();
-        let has_more = rows.len() > query.limit;
-        rows.truncate(query.limit);
+                if cursor.direction() == PrListDirection::Newer {
+                    selected.reverse();
+                }
+                selected
+            }
+        };
+        selected.truncate(query.limit);
+        if matches!(&query.page, PrListPage::Keyset(cursor) if cursor.direction() == PrListDirection::Newer)
+        {
+            selected.reverse();
+        }
+        let has_newer = selected.first().is_some_and(|(position, _)| *position > 0);
+        let has_older = selected
+            .last()
+            .is_some_and(|(position, _)| position.saturating_add(1) < total);
+        let rows: Vec<_> = selected.into_iter().map(|(_, row)| row).collect();
+        let offset = query.page.display_offset();
+        let (next_cursor, prev_cursor) = mint_pr_list_cursors(
+            &rows,
+            endpoint,
+            query.sort,
+            query.limit,
+            offset,
+            has_older,
+            has_newer,
+            static_scope,
+            visible_scope,
+            &query.page,
+        )?;
         Ok(EnrichedCrossPrSlice {
             rows,
             total,
-            offset: query.offset,
+            offset,
             limit: query.limit,
-            has_more,
+            next_cursor,
+            prev_cursor,
         })
     }
 
@@ -3364,6 +3472,25 @@ fn viewed_threads_json(v: &ViewedThreads) -> Value {
 
 const PR_LIST_QUERY_MAX_BYTES: usize = 16 * 1024;
 
+enum ParsedPrListCursor {
+    Legacy(usize),
+    Keyset(PrListCursor),
+}
+
+fn parse_pr_list_cursor(value: &str) -> Result<ParsedPrListCursor, EdgeError> {
+    if let Ok(parsed) = value.parse::<usize>() {
+        if value == parsed.to_string() && parsed <= PR_LIST_OFFSET_MAX {
+            return Ok(ParsedPrListCursor::Legacy(parsed));
+        }
+    }
+    if value.starts_with(PR_LIST_CURSOR_PREFIX) {
+        return PrListCursor::parse(value)
+            .map(ParsedPrListCursor::Keyset)
+            .map_err(|_| EdgeError::BadRequest("invalid pull request cursor".into()));
+    }
+    Err(EdgeError::BadRequest("invalid pull request cursor".into()))
+}
+
 fn decode_pr_list_query_component(raw: &str) -> Result<String, EdgeError> {
     let bytes = raw.as_bytes();
     let mut index = 0;
@@ -3401,6 +3528,7 @@ fn decode_pr_list_query_component(raw: &str) -> Result<String, EdgeError> {
 fn repo_pr_list_query(
     ctx: &HandlerCtx<'_>,
     viewer_pseudonym: String,
+    repo_slug: &str,
 ) -> Result<PrListQuery, EdgeError> {
     if ctx.request.query.len() > PR_LIST_QUERY_MAX_BYTES {
         return Err(EdgeError::BadRequest(
@@ -3444,12 +3572,7 @@ fn repo_pr_list_query(
                     if cursor.is_some() {
                         return Err(duplicate("cursor"));
                     }
-                    let parsed = value.parse::<usize>().ok().filter(|parsed| {
-                        value == parsed.to_string() && *parsed <= PR_LIST_OFFSET_MAX
-                    });
-                    cursor = Some(parsed.ok_or_else(|| {
-                        EdgeError::BadRequest("invalid pull request cursor".into())
-                    })?);
+                    cursor = Some(parse_pr_list_cursor(&value)?);
                 }
                 "limit" => {
                     if limit.is_some() {
@@ -3472,11 +3595,57 @@ fn repo_pr_list_query(
             }
         }
     }
-    PrListQuery::new(
-        state.unwrap_or(PrListState::Open),
-        sort.unwrap_or(PrListSort::Updated),
-        cursor.unwrap_or(0),
-        limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+    let cursor_fields = match &cursor {
+        Some(ParsedPrListCursor::Keyset(cursor)) => {
+            let PrListCursorEndpoint::Repository(cursor_state) = cursor.endpoint() else {
+                return Err(EdgeError::BadRequest(
+                    "pull request list cursor scope mismatch".into(),
+                ));
+            };
+            Some((cursor_state, cursor.sort(), cursor.limit()))
+        }
+        _ => None,
+    };
+    let effective_state =
+        cursor_fields.map_or(state.unwrap_or(PrListState::Open), |fields| fields.0);
+    let effective_sort =
+        cursor_fields.map_or(sort.unwrap_or(PrListSort::Updated), |fields| fields.1);
+    let effective_limit =
+        cursor_fields.map_or(limit.unwrap_or(DEFAULT_PAGE_LIMIT), |fields| fields.2);
+    if state.is_some_and(|value| value != effective_state)
+        || sort.is_some_and(|value| value != effective_sort)
+        || limit.is_some_and(|value| value != effective_limit)
+    {
+        return Err(EdgeError::BadRequest(
+            "pull request list cursor scope mismatch".into(),
+        ));
+    }
+    let page = match cursor {
+        None => PrListPage::Initial,
+        Some(ParsedPrListCursor::Legacy(offset)) => PrListPage::LegacyOffset(offset),
+        Some(ParsedPrListCursor::Keyset(cursor)) => {
+            let expected = pr_list_static_scope(
+                tenant_of(ctx),
+                region_of(ctx),
+                &viewer_pseudonym,
+                PrListCursorEndpoint::Repository(effective_state),
+                Some(repo_slug),
+                effective_sort,
+                effective_limit,
+            );
+            if cursor.static_scope() != expected {
+                return Err(EdgeError::BadRequest(
+                    "pull request list cursor scope mismatch".into(),
+                ));
+            }
+            PrListPage::Keyset(cursor)
+        }
+    };
+    PrListQuery::from_page(
+        effective_state,
+        effective_sort,
+        page,
+        effective_limit,
         viewer_pseudonym,
     )
     .map_err(|_| EdgeError::BadRequest("invalid pull request page".into()))
@@ -3528,12 +3697,7 @@ fn cross_pr_list_query(
                     if cursor.is_some() {
                         return Err(duplicate("cursor"));
                     }
-                    let parsed = value.parse::<usize>().ok().filter(|parsed| {
-                        value == parsed.to_string() && *parsed <= PR_LIST_OFFSET_MAX
-                    });
-                    cursor = Some(parsed.ok_or_else(|| {
-                        EdgeError::BadRequest("invalid pull request cursor".into())
-                    })?);
+                    cursor = Some(parse_pr_list_cursor(&value)?);
                 }
                 "limit" => {
                     if limit.is_some() {
@@ -3556,11 +3720,59 @@ fn cross_pr_list_query(
             }
         }
     }
-    PrCrossListQuery::new(
-        bucket.unwrap_or(PrListBucket::NeedsReview),
-        sort.unwrap_or(PrListSort::Updated),
-        cursor.unwrap_or(0),
-        limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+    let cursor_fields = match &cursor {
+        Some(ParsedPrListCursor::Keyset(cursor)) => {
+            let PrListCursorEndpoint::CrossRepository(cursor_bucket) = cursor.endpoint() else {
+                return Err(EdgeError::BadRequest(
+                    "pull request list cursor scope mismatch".into(),
+                ));
+            };
+            Some((cursor_bucket, cursor.sort(), cursor.limit()))
+        }
+        _ => None,
+    };
+    let effective_bucket = cursor_fields
+        .map_or(bucket.unwrap_or(PrListBucket::NeedsReview), |fields| {
+            fields.0
+        });
+    let effective_sort =
+        cursor_fields.map_or(sort.unwrap_or(PrListSort::Updated), |fields| fields.1);
+    let effective_limit =
+        cursor_fields.map_or(limit.unwrap_or(DEFAULT_PAGE_LIMIT), |fields| fields.2);
+    if bucket.is_some_and(|value| value != effective_bucket)
+        || sort.is_some_and(|value| value != effective_sort)
+        || limit.is_some_and(|value| value != effective_limit)
+    {
+        return Err(EdgeError::BadRequest(
+            "pull request list cursor scope mismatch".into(),
+        ));
+    }
+    let page = match cursor {
+        None => PrListPage::Initial,
+        Some(ParsedPrListCursor::Legacy(offset)) => PrListPage::LegacyOffset(offset),
+        Some(ParsedPrListCursor::Keyset(cursor)) => {
+            let expected = pr_list_static_scope(
+                tenant_of(ctx),
+                region_of(ctx),
+                &viewer_pseudonym,
+                PrListCursorEndpoint::CrossRepository(effective_bucket),
+                None,
+                effective_sort,
+                effective_limit,
+            );
+            if cursor.static_scope() != expected {
+                return Err(EdgeError::BadRequest(
+                    "pull request list cursor scope mismatch".into(),
+                ));
+            }
+            PrListPage::Keyset(cursor)
+        }
+    };
+    PrCrossListQuery::from_page(
+        effective_bucket,
+        effective_sort,
+        page,
+        effective_limit,
         viewer_pseudonym,
     )
     .map_err(|_| EdgeError::BadRequest("invalid pull request page".into()))
@@ -3846,6 +4058,9 @@ fn pr_diff_vm(number: u64, base_ref: &str, diff: PrDiff, offset: usize, limit: u
 fn map_durable_err(e: DurableError) -> EdgeError {
     match e {
         DurableError::NotFound(m) => EdgeError::NotFound(m),
+        DurableError::Git(m) if m == "pull request list cursor visible set changed" => {
+            EdgeError::Conflict("pull request list cursor is stale; restart pagination".into())
+        }
         DurableError::Git(m) if m.starts_with("browse response limit exceeded:") => {
             EdgeError::PayloadTooLarge("repository view exceeds the interactive browse limit".into())
         }
@@ -6502,19 +6717,93 @@ impl Handler for DPrChecks {
     }
 }
 
+fn cross_pr_before_key(row: &EnrichedPr, key: &PrListKey, sort: PrListSort) -> bool {
+    let repo = row.repo_slug.as_deref().unwrap_or("");
+    let key_repo = key.repo_slug.as_deref().unwrap_or("");
+    if sort == PrListSort::Created {
+        return row.rec.number > key.number || (row.rec.number == key.number && repo < key_repo);
+    }
+    match (row.rec.updated_at, key.updated_at) {
+        (Some(row_time), Some(key_time)) if row_time != key_time => row_time > key_time,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        _ => row.rec.number > key.number || (row.rec.number == key.number && repo < key_repo),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mint_pr_list_cursors(
+    rows: &[EnrichedPr],
+    endpoint: PrListCursorEndpoint,
+    sort: PrListSort,
+    limit: usize,
+    offset: usize,
+    has_older: bool,
+    has_newer: bool,
+    static_scope: [u8; 32],
+    visible_scope: [u8; 32],
+    source_page: &PrListPage,
+) -> Result<(Option<String>, Option<String>), DurableError> {
+    let mint = |row: &EnrichedPr, direction, display_offset: usize| {
+        let display_offset = u32::try_from(display_offset).map_err(|_| {
+            DurableError::Git("pull request list cursor display offset exceeds u32".into())
+        })?;
+        PrListCursor::new(
+            endpoint,
+            direction,
+            sort,
+            limit,
+            display_offset,
+            PrListKey {
+                updated_at: (sort == PrListSort::Updated)
+                    .then_some(row.rec.updated_at)
+                    .flatten(),
+                number: row.rec.number,
+                repo_slug: row.repo_slug.clone(),
+            },
+            static_scope,
+            visible_scope,
+        )
+        .map(|cursor| cursor.encode())
+        .map_err(|_| DurableError::Git("mint pull request list cursor failed".into()))
+    };
+    let next_cursor = if has_older {
+        rows.last()
+            .zip(offset.checked_add(rows.len()))
+            .map(|(row, next_offset)| mint(row, PrListDirection::Older, next_offset))
+            .transpose()?
+    } else {
+        None
+    };
+    let prev_cursor = if has_newer {
+        rows.first()
+            .map(|row| {
+                mint(
+                    row,
+                    PrListDirection::Newer,
+                    offset.saturating_sub(rows.len()),
+                )
+            })
+            .transpose()?
+    } else if rows.is_empty() {
+        match source_page {
+            PrListPage::LegacyOffset(legacy) if *legacy > 0 => {
+                Some(legacy.saturating_sub(limit).to_string())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    Ok((next_cursor, prev_cursor))
+}
+
 fn cross_pr_list_envelope(page: EnrichedCrossPrSlice) -> Value {
-    let next_cursor = page
-        .offset
-        .checked_add(page.limit)
-        .filter(|offset| page.has_more && *offset <= PR_LIST_OFFSET_MAX)
-        .map(|offset| offset.to_string());
-    let prev_cursor =
-        (page.offset > 0).then(|| page.offset.saturating_sub(page.limit).to_string());
     json!({
         "items": page.rows.iter().map(DurableGitBackend::pr_list_row_json).collect::<Vec<_>>(),
         "page": {
-            "next_cursor": next_cursor,
-            "prev_cursor": prev_cursor,
+            "next_cursor": page.next_cursor,
+            "prev_cursor": page.prev_cursor,
             "limit": page.limit,
             "offset": page.offset,
             "total": page.total,
@@ -6526,11 +6815,6 @@ fn cross_pr_list_envelope(page: EnrichedCrossPrSlice) -> Value {
 /// Build the unchanged R3.1 wire envelope from a storage-paginated per-repository slice. Exact
 /// counts and filtered total came from the same authorized storage read as the bounded page.
 fn repo_pr_list_envelope(page: EnrichedPrSlice) -> Value {
-    let next_offset = page.offset.checked_add(page.limit);
-    let next_cursor = next_offset
-        .filter(|offset| page.has_more && *offset <= PR_LIST_OFFSET_MAX)
-        .map(|offset| offset.to_string());
-    let prev_cursor = (page.offset > 0).then(|| page.offset.saturating_sub(page.limit).to_string());
     let counts = json!({
         "open": page.counts.open,
         "merged": page.counts.merged,
@@ -6542,8 +6826,8 @@ fn repo_pr_list_envelope(page: EnrichedPrSlice) -> Value {
     json!({
         "items": page.rows.iter().map(DurableGitBackend::pr_list_row_json).collect::<Vec<_>>(),
         "page": {
-            "next_cursor": next_cursor,
-            "prev_cursor": prev_cursor,
+            "next_cursor": page.next_cursor,
+            "prev_cursor": page.prev_cursor,
             "limit": page.limit,
             "offset": page.offset,
             "total": page.total,
@@ -6563,13 +6847,14 @@ struct DRepoPrList {
 impl Handler for DRepoPrList {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let viewer = DurableGitBackend::pseudonym(tenant_of(ctx), ctx.principal);
-        let query = repo_pr_list_query(ctx, viewer)?;
+        let repo_slug = param(ctx, "repo")?;
+        let query = repo_pr_list_query(ctx, viewer, repo_slug)?;
         let page = self
             .be
             .list_prs_for_repo(
                 tenant_of(ctx),
                 region_of(ctx),
-                param(ctx, "repo")?,
+                repo_slug,
                 ctx.principal,
                 &query,
             )
@@ -8080,7 +8365,8 @@ mod pr_list_tests {
             total: PR_LIST_OFFSET_MAX + 1,
             offset: PR_LIST_OFFSET_MAX,
             limit: 100,
-            has_more: true,
+            next_cursor: None,
+            prev_cursor: None,
         });
         assert!(
             capped["page"]["next_cursor"].is_null(),
@@ -8238,13 +8524,9 @@ mod pr_list_tests {
         );
         assert_eq!(first["counts"]["bucket"], 2);
         assert_eq!(first["items"][0]["repo"], "alpha");
-        assert_eq!(first["page"]["next_cursor"], "1");
-        let second = serve(
-            &handler,
-            &viewer,
-            None,
-            "bucket=yours&sort=created&limit=1&cursor=1",
-        );
+        let next = first["page"]["next_cursor"].as_str().unwrap();
+        assert!(next.starts_with(PR_LIST_CURSOR_PREFIX));
+        let second = serve(&handler, &viewer, None, &format!("cursor={next}"));
         assert_eq!(second["items"][0]["repo"], "beta");
         assert!(second["page"]["next_cursor"].is_null());
 
@@ -8253,7 +8535,8 @@ mod pr_list_tests {
             total: PR_LIST_OFFSET_MAX + 1,
             offset: PR_LIST_OFFSET_MAX,
             limit: 100,
-            has_more: true,
+            next_cursor: None,
+            prev_cursor: None,
         });
         assert!(capped["page"]["next_cursor"].is_null());
         std::fs::remove_dir_all(&root).ok();
@@ -8456,30 +8739,25 @@ mod pr_list_tests {
         }
         let handler = DRepoPrList { be: Arc::new(be) };
 
-        // Page 1 (limit 2): head → prev None, next = "2".
+        // Page 1 (limit 2): head → prev None, next is an opaque Older keyset.
         let p1 = serve(&handler, &viewer, Some("core"), "state=all&limit=2");
         assert_eq!(p1["items"].as_array().unwrap().len(), 2);
         assert_eq!(p1["page"]["total"], 5);
         assert!(p1["page"]["prev_cursor"].is_null(), "head has no Newer");
-        assert_eq!(p1["page"]["next_cursor"], "2");
+        let c2 = p1["page"]["next_cursor"].as_str().unwrap();
+        assert!(c2.starts_with(PR_LIST_CURSOR_PREFIX));
 
-        // Page 2: prev = "0", next = "4".
-        let p2 = serve(
-            &handler,
-            &viewer,
-            Some("core"),
-            "state=all&limit=2&cursor=2",
-        );
-        assert_eq!(p2["page"]["prev_cursor"], "0");
-        assert_eq!(p2["page"]["next_cursor"], "4");
+        // Omitted filter/sort/limit inherit from the cursor. Page 2 has both directions.
+        let p2 = serve(&handler, &viewer, Some("core"), &format!("cursor={c2}"));
+        let c1 = p2["page"]["prev_cursor"].as_str().unwrap();
+        let c3 = p2["page"]["next_cursor"].as_str().unwrap();
+        assert!(c1.starts_with(PR_LIST_CURSOR_PREFIX));
+        assert!(c3.starts_with(PR_LIST_CURSOR_PREFIX));
+        let back = serve(&handler, &viewer, Some("core"), &format!("cursor={c1}"));
+        assert_eq!(back["items"], p1["items"], "Newer returns the prior page");
 
         // Page 3 (tail): 1 row, next None.
-        let p3 = serve(
-            &handler,
-            &viewer,
-            Some("core"),
-            "state=all&limit=2&cursor=4",
-        );
+        let p3 = serve(&handler, &viewer, Some("core"), &format!("cursor={c3}"));
         assert_eq!(p3["items"].as_array().unwrap().len(), 1);
         assert!(p3["page"]["next_cursor"].is_null(), "tail has no Older");
 
@@ -8492,6 +8770,180 @@ mod pr_list_tests {
         }
         seen.sort_unstable();
         assert_eq!(seen, vec![1, 2, 3, 4, 5]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn live_keyset_survives_anchor_removal_and_newer_insert_but_does_not_claim_snapshot_history() {
+        let root = temp_root("cursor-live-mutation");
+        let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "core");
+        let be = Arc::new(
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz)),
+        );
+        let viewer = human("u:viewer");
+        for i in 1..=5 {
+            open_pr(&be, "core", &format!("PR {i}"), &viewer);
+        }
+        let handler = DRepoPrList { be: be.clone() };
+        let first = serve(
+            &handler,
+            &viewer,
+            Some("core"),
+            "state=open&sort=created&limit=2",
+        );
+        let cursor = first["page"]["next_cursor"].as_str().unwrap().to_string();
+
+        // Remove the anchor (#4) from the selected relation and insert a newer row. A keyset does
+        // not need to find the anchor by equality, and the newer insertion cannot shift Older.
+        be.prs
+            .update(
+                &DurableGitBackend::loc(TENANT, REGION, "core"),
+                4,
+                |record| {
+                    record.state = PrState::Closed;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        open_pr(&be, "core", "PR 6", &viewer);
+        let second = serve(&handler, &viewer, Some("core"), &format!("cursor={cursor}"));
+        assert_eq!(
+            second["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["number"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [3, 2]
+        );
+        assert_eq!(
+            second["page"]["total"], 5,
+            "total is the current live total"
+        );
+
+        for number in [1_u64, 2, 3, 5, 6] {
+            be.prs
+                .update(
+                    &DurableGitBackend::loc(TENANT, REGION, "core"),
+                    number,
+                    |record| {
+                        record.updated_at = Some((number * 10) as i64);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+        let updated_first = serve(
+            &handler,
+            &viewer,
+            Some("core"),
+            "state=open&sort=updated&limit=2",
+        );
+        let updated_cursor = updated_first["page"]["next_cursor"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Moving an unseen ordering key across the boundary is intentionally live, not historical:
+        // #2 is now Newer and therefore is not returned by this Older continuation.
+        be.prs
+            .update(
+                &DurableGitBackend::loc(TENANT, REGION, "core"),
+                2,
+                |record| {
+                    record.updated_at = Some(i64::MAX - 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let repeated = serve(
+            &handler,
+            &viewer,
+            Some("core"),
+            &format!("cursor={updated_cursor}"),
+        );
+        assert!(repeated["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["number"] != 2));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cursor_scope_replay_and_cross_visible_set_changes_are_typed() {
+        let root = temp_root("cursor-scopes");
+        let viewer = human("u:viewer");
+        let authz = GrantBackedRepos::new()
+            .grant_read("u:viewer", TENANT, "alpha")
+            .grant_read("u:viewer", TENANT, "beta");
+        let be = Arc::new(DurableGitBackend::rooted_inmem_for_test(&root));
+        open_pr(&be, "alpha", "Alpha", &viewer);
+        open_pr(&be, "alpha", "Alpha two", &viewer);
+        open_pr(&be, "beta", "Beta", &viewer);
+        let be = Arc::new(
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz)),
+        );
+
+        let repo_handler = DRepoPrList { be: be.clone() };
+        let alpha = serve(
+            &repo_handler,
+            &viewer,
+            Some("alpha"),
+            "state=all&sort=created&limit=1",
+        );
+        let repo_cursor = alpha["page"]["next_cursor"].as_str().unwrap();
+        assert!(matches!(
+            serve_result(
+                &repo_handler,
+                &viewer,
+                Some("beta"),
+                &format!("cursor={repo_cursor}")
+            ),
+            Err(EdgeError::BadRequest(message)) if message.contains("scope mismatch")
+        ));
+
+        let cross_handler = DMyPrs { be: be.clone() };
+        let first = serve(
+            &cross_handler,
+            &viewer,
+            None,
+            "bucket=yours&sort=created&limit=1",
+        );
+        let cross_cursor = first["page"]["next_cursor"].as_str().unwrap();
+        let narrowed = DMyPrs {
+            be: Arc::new(
+                DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(
+                    GrantBackedRepos::new().grant_read("u:viewer", TENANT, "alpha"),
+                )),
+            ),
+        };
+        assert!(matches!(
+            serve_result(&narrowed, &viewer, None, &format!("cursor={cross_cursor}")),
+            Err(EdgeError::Conflict(message)) if message.contains("stale")
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pull_denial_precedes_pr_list_cursor_decoding() {
+        let root = temp_root("cursor-auth-order");
+        let be = Arc::new(
+            DurableGitBackend::rooted_inmem_for_test(&root)
+                .with_repo_authorizer(Arc::new(GrantBackedRepos::new())),
+        );
+        let guarded_handler = guarded(
+            &be,
+            RepoPermission::Pull,
+            Arc::new(DRepoPrList { be: be.clone() }),
+        );
+        let error = serve_result(
+            guarded_handler.as_ref(),
+            &human("u:denied"),
+            Some("hidden"),
+            "cursor=pl1_malformed",
+        )
+        .unwrap_err();
+        assert_eq!(error, EdgeError::NotFound("repository not found".into()));
         std::fs::remove_dir_all(&root).ok();
     }
 

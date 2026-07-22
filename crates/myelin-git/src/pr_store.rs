@@ -468,13 +468,31 @@ impl PrListSort {
     }
 }
 
-/// Storage-neutral, already-authorized per-repository PR-list request. `offset` is the bounded
-/// transitional v1 cursor coordinate; storage owns filtering/sorting before applying it.
+fn pr_record_before_key(
+    record: &PrRecord,
+    key: &crate::pr_list_pagination::PrListKey,
+    sort: PrListSort,
+) -> bool {
+    if sort == PrListSort::Created {
+        return record.number > key.number;
+    }
+    match (record.updated_at, key.updated_at) {
+        (Some(record_time), Some(key_time)) => {
+            record_time > key_time || (record_time == key_time && record.number > key.number)
+        }
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => record.number > key.number,
+    }
+}
+
+/// Storage-neutral, already-authorized per-repository PR-list request. New requests use live
+/// keysets; bounded numeric offsets remain only as a transitional compatibility input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrListQuery {
     pub state: PrListState,
     pub sort: PrListSort,
-    pub offset: usize,
+    pub page: crate::pr_list_pagination::PrListPage,
     pub limit: usize,
     pub viewer_pseudonym: String,
 }
@@ -490,7 +508,40 @@ impl PrListQuery {
         let query = Self {
             state,
             sort,
-            offset,
+            page: crate::pr_list_pagination::PrListPage::LegacyOffset(offset),
+            limit,
+            viewer_pseudonym: viewer_pseudonym.into(),
+        };
+        query.validate()?;
+        Ok(query)
+    }
+
+    pub fn initial(
+        state: PrListState,
+        sort: PrListSort,
+        limit: usize,
+        viewer_pseudonym: impl Into<String>,
+    ) -> Result<Self, DurableError> {
+        Self::from_page(
+            state,
+            sort,
+            crate::pr_list_pagination::PrListPage::Initial,
+            limit,
+            viewer_pseudonym,
+        )
+    }
+
+    pub fn from_page(
+        state: PrListState,
+        sort: PrListSort,
+        page: crate::pr_list_pagination::PrListPage,
+        limit: usize,
+        viewer_pseudonym: impl Into<String>,
+    ) -> Result<Self, DurableError> {
+        let query = Self {
+            state,
+            sort,
+            page,
             limit,
             viewer_pseudonym: viewer_pseudonym.into(),
         };
@@ -501,7 +552,8 @@ impl PrListQuery {
     /// Recheck bounds at a storage entry point. This also protects a backend from callers that
     /// construct this public transport struct directly instead of using [`Self::new`].
     pub fn validate(&self) -> Result<(), DurableError> {
-        if self.offset > PR_LIST_OFFSET_MAX {
+        if matches!(self.page, crate::pr_list_pagination::PrListPage::LegacyOffset(offset) if offset > PR_LIST_OFFSET_MAX)
+        {
             return Err(DurableError::Git(format!(
                 "pull request page offset must be at most {PR_LIST_OFFSET_MAX}"
             )));
@@ -510,6 +562,17 @@ impl PrListQuery {
             return Err(DurableError::Git(
                 "pull request page limit must be between 1 and 100".into(),
             ));
+        }
+        if let crate::pr_list_pagination::PrListPage::Keyset(cursor) = &self.page {
+            if cursor.endpoint()
+                != crate::pr_list_pagination::PrListCursorEndpoint::Repository(self.state)
+                || cursor.sort() != self.sort
+                || cursor.limit() != self.limit
+            {
+                return Err(DurableError::Git(
+                    "pull request keyset does not match repository list query".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -552,15 +615,15 @@ impl PrListCounts {
     }
 }
 
-/// One bounded storage page plus exact counts. `records` never exceeds the requested limit;
-/// `has_more` is detected by fetching/selecting at most one surplus row.
+/// One bounded storage page plus exact counts and exact live navigation flags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrListSlice {
     pub records: Vec<PrRecord>,
     pub counts: PrListCounts,
     pub total: usize,
     pub offset: usize,
-    pub has_more: bool,
+    pub has_newer: bool,
+    pub has_older: bool,
 }
 
 /// Cross-repository inbox bucket selected by `/v1/git/prs`.
@@ -585,7 +648,7 @@ impl PrListBucket {
 pub struct PrCrossListQuery {
     pub bucket: PrListBucket,
     pub sort: PrListSort,
-    pub offset: usize,
+    pub page: crate::pr_list_pagination::PrListPage,
     pub limit: usize,
     pub viewer_pseudonym: String,
 }
@@ -601,7 +664,40 @@ impl PrCrossListQuery {
         let query = Self {
             bucket,
             sort,
-            offset,
+            page: crate::pr_list_pagination::PrListPage::LegacyOffset(offset),
+            limit,
+            viewer_pseudonym: viewer_pseudonym.into(),
+        };
+        query.validate()?;
+        Ok(query)
+    }
+
+    pub fn initial(
+        bucket: PrListBucket,
+        sort: PrListSort,
+        limit: usize,
+        viewer_pseudonym: impl Into<String>,
+    ) -> Result<Self, DurableError> {
+        Self::from_page(
+            bucket,
+            sort,
+            crate::pr_list_pagination::PrListPage::Initial,
+            limit,
+            viewer_pseudonym,
+        )
+    }
+
+    pub fn from_page(
+        bucket: PrListBucket,
+        sort: PrListSort,
+        page: crate::pr_list_pagination::PrListPage,
+        limit: usize,
+        viewer_pseudonym: impl Into<String>,
+    ) -> Result<Self, DurableError> {
+        let query = Self {
+            bucket,
+            sort,
+            page,
             limit,
             viewer_pseudonym: viewer_pseudonym.into(),
         };
@@ -610,7 +706,8 @@ impl PrCrossListQuery {
     }
 
     pub fn validate(&self) -> Result<(), DurableError> {
-        if self.offset > PR_LIST_OFFSET_MAX {
+        if matches!(self.page, crate::pr_list_pagination::PrListPage::LegacyOffset(offset) if offset > PR_LIST_OFFSET_MAX)
+        {
             return Err(DurableError::Git(format!(
                 "pull request page offset must be at most {PR_LIST_OFFSET_MAX}"
             )));
@@ -619,6 +716,17 @@ impl PrCrossListQuery {
             return Err(DurableError::Git(
                 "pull request page limit must be between 1 and 100".into(),
             ));
+        }
+        if let crate::pr_list_pagination::PrListPage::Keyset(cursor) = &self.page {
+            if cursor.endpoint()
+                != crate::pr_list_pagination::PrListCursorEndpoint::CrossRepository(self.bucket)
+                || cursor.sort() != self.sort
+                || cursor.limit() != self.limit
+            {
+                return Err(DurableError::Git(
+                    "pull request keyset does not match cross-repository list query".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -635,7 +743,8 @@ pub struct PrCrossListSlice {
     pub records: Vec<PrCrossListRecord>,
     pub total: usize,
     pub offset: usize,
-    pub has_more: bool,
+    pub has_newer: bool,
+    pub has_older: bool,
 }
 
 // ───────────────────────────── the merge-gate evaluation (reused logic) ───────────────────────────
@@ -1062,19 +1171,56 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
             }),
         }
         let total = records.len();
-        let mut page: Vec<PrRecord> = records
+        let mut selected: Vec<(usize, PrRecord)> = match &query.page {
+            crate::pr_list_pagination::PrListPage::Initial => {
+                records.into_iter().enumerate().collect()
+            }
+            crate::pr_list_pagination::PrListPage::LegacyOffset(offset) => {
+                records.into_iter().enumerate().skip(*offset).collect()
+            }
+            crate::pr_list_pagination::PrListPage::Keyset(cursor) => {
+                let direction = cursor.direction();
+                let key = cursor.key();
+                let mut rows: Vec<_> = records
             .into_iter()
-            .skip(query.offset)
-            .take(query.limit.saturating_add(1))
+                    .enumerate()
+                    .filter(|(_, record)| {
+                        let before = pr_record_before_key(record, key, query.sort);
+                        let equal = record.number == key.number
+                            && (query.sort == PrListSort::Created
+                                || record.updated_at == key.updated_at);
+                        match direction {
+                            crate::pr_list_pagination::PrListDirection::Newer => before,
+                            crate::pr_list_pagination::PrListDirection::Older => !before && !equal,
+                        }
+                    })
             .collect();
-        let has_more = page.len() > query.limit;
-        page.truncate(query.limit);
+                if direction == crate::pr_list_pagination::PrListDirection::Newer {
+                    rows.reverse();
+                }
+                rows
+            }
+        };
+        selected.truncate(query.limit);
+        if matches!(
+            query.page,
+            crate::pr_list_pagination::PrListPage::Keyset(ref cursor)
+                if cursor.direction() == crate::pr_list_pagination::PrListDirection::Newer
+        ) {
+            selected.reverse();
+        }
+        let first_position = selected.first().map(|(position, _)| *position);
+        let last_position = selected.last().map(|(position, _)| *position);
+        let has_newer = first_position.is_some_and(|position| position > 0);
+        let has_older = last_position.is_some_and(|position| position.saturating_add(1) < total);
+        let page = selected.into_iter().map(|(_, record)| record).collect();
         Ok(PrListSlice {
             records: page,
             counts,
             total,
-            offset: query.offset,
-            has_more,
+            offset: query.page.display_offset(),
+            has_newer,
+            has_older,
         })
     }
 
@@ -1572,7 +1718,10 @@ mod tests {
             first.records.iter().map(|r| r.number).collect::<Vec<_>>(),
             [2, 1]
         );
-        assert!(first.has_more, "the third open row is the limit+1 probe");
+        assert!(
+            first.has_older,
+            "the third open row is an Older continuation"
+        );
         assert_eq!(first.total, 3);
         assert_eq!(
             first.counts,
@@ -1595,7 +1744,7 @@ mod tests {
             tail.records.iter().map(|r| r.number).collect::<Vec<_>>(),
             [5]
         );
-        assert!(!tail.has_more);
+        assert!(!tail.has_older);
         assert_eq!(
             tail.counts, first.counts,
             "counts never narrow with the page"

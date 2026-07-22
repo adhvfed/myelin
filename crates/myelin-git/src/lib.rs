@@ -259,6 +259,7 @@ pub mod reconcile;
 pub mod pr_store;
 /// GT-003b — the forward-only PostgreSQL PR lifecycle schema and provider-backed store.
 pub mod pg_pr_store;
+pub mod pr_list_pagination;
 /// **R3.3 / R3.2 (shared) — the DURABLE PR review-thread / comment / review-batch store.** The ONE
 /// canonical conversation store both R3 packs consume (the `_gate.md` §02/§03 cross-pack
 /// reconciliation): the model is THREADS (an optional content anchor; comments belong to threads);
