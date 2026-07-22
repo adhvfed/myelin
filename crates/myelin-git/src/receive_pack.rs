@@ -1133,7 +1133,7 @@ impl RefStore {
                 OutboxError(format!("read durable ref tip for {}: {e}", u.ref_name.0))
             })?;
             let prev_seq = self.seq_of(&u.ref_name)?;
-            let new_seq = prev_seq.checked_add(1).ok_or_else(|| {
+            let new_seq = crate::durable::next_ref_generation(prev_seq).ok_or_else(|| {
                 OutboxError(format!("ref generation exhausted for {}", u.ref_name.0))
             })?;
 
