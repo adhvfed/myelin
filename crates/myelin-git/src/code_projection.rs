@@ -204,30 +204,76 @@ impl BlobChange {
 /// oid at the same path) is OMITTED (the incremental skip — what makes a 3-file push of a 10k-file
 /// repo emit 3 docs). The set's length is the **changed-blob-count** the GATE asserts the emit count
 /// equals.
-pub fn diff_trees(last_indexed: &Tree, new_tip: &Tree) -> Vec<BlobChange> {
+pub fn diff_trees_bounded(
+    last_indexed: &Tree,
+    new_tip: &Tree,
+    maximum_changes: usize,
+    maximum_blob_bytes: usize,
+    maximum_total_blob_bytes: usize,
+    maximum_path_bytes: usize,
+) -> Result<Vec<BlobChange>, String> {
     let mut changes = Vec::new();
+    let mut total_blob_bytes = 0usize;
     // Upserts: a path in new_tip that is new OR whose oid changed.
     for (path, new_blob) in &new_tip.entries {
         match last_indexed.entries.get(path) {
             // Unchanged (same oid at the same path) — the incremental skip (no emit).
             Some(old) if old.oid == new_blob.oid => {}
             // Added or modified — one Upsert.
-            _ => changes.push(BlobChange::Upserted {
-                path: path.clone(),
-                blob: new_blob.clone(),
-            }),
+            _ => {
+                ensure_projection_change_capacity(
+                    &changes,
+                    path,
+                    maximum_changes,
+                    maximum_path_bytes,
+                )?;
+                if new_blob.bytes.len() > maximum_blob_bytes {
+                    return Err("code projection blob limit exceeded".into());
+                }
+                total_blob_bytes = total_blob_bytes
+                    .checked_add(new_blob.bytes.len())
+                    .ok_or_else(|| "code projection blob byte count overflowed".to_string())?;
+                if total_blob_bytes > maximum_total_blob_bytes {
+                    return Err("code projection aggregate blob limit exceeded".into());
+                }
+                changes.push(BlobChange::Upserted {
+                    path: path.clone(),
+                    blob: new_blob.clone(),
+                });
+            }
         }
     }
     // Deletes: a path in last_indexed that is absent in new_tip.
     for (path, old_blob) in &last_indexed.entries {
         if !new_tip.entries.contains_key(path) {
+            ensure_projection_change_capacity(
+                &changes,
+                path,
+                maximum_changes,
+                maximum_path_bytes,
+            )?;
             changes.push(BlobChange::Deleted {
                 path: path.clone(),
                 oid: old_blob.oid.clone(),
             });
         }
     }
-    changes
+    Ok(changes)
+}
+
+fn ensure_projection_change_capacity(
+    changes: &[BlobChange],
+    path: &str,
+    maximum_changes: usize,
+    maximum_path_bytes: usize,
+) -> Result<(), String> {
+    if changes.len() >= maximum_changes {
+        return Err("code projection changed-blob limit exceeded".into());
+    }
+    if path.len() > maximum_path_bytes {
+        return Err("code projection path limit exceeded".into());
+    }
+    Ok(())
 }
 
 // ───────────────────────────── language detection (the `language` facet) ─────────────────────────
@@ -560,6 +606,12 @@ pub struct ProjectionEmit {
     pub changed_blob_count: usize,
 }
 
+const PROJECTION_MAX_CHANGED_BLOBS: usize = 1_000;
+const PROJECTION_MAX_BLOB_BYTES: usize = 1024 * 1024;
+const PROJECTION_MAX_TOTAL_BLOB_BYTES: usize = 64 * 1024 * 1024;
+const PROJECTION_MAX_PATH_BYTES: usize = 4 * 1024;
+const PROJECTION_MAX_COMMIT_MESSAGE_BYTES: usize = 8 * 1024;
+
 /// **The code-projection emitter (GIT-P25 / P-287, §9).** Hooks the receive-pack post-commit path:
 /// on a `git.ref.updated` to an indexed ref it diffs `new_tip ∖ last_indexed`, builds the per-blob
 /// projection doc, and emits one `git.blob.snapshot` per changed blob through the outbox — then
@@ -675,10 +727,23 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
         if !is_indexed_ref(ref_name, &self.default_branch) {
             return Ok(None);
         }
+        if commit_message.len() > PROJECTION_MAX_COMMIT_MESSAGE_BYTES {
+            return Err(OutboxError(
+                "code projection commit message limit exceeded".into(),
+            ));
+        }
 
         // The diff — the changed-blob set (new ∖ last, path granularity). UNCHANGED blobs are omitted
         // (the incremental skip). Its length is the changed-blob-count the GATE pins the emit to.
-        let changes = diff_trees(last_indexed_tree, new_tip_tree);
+        let changes = diff_trees_bounded(
+            last_indexed_tree,
+            new_tip_tree,
+            PROJECTION_MAX_CHANGED_BLOBS,
+            PROJECTION_MAX_BLOB_BYTES,
+            PROJECTION_MAX_TOTAL_BLOB_BYTES,
+            PROJECTION_MAX_PATH_BYTES,
+        )
+        .map_err(OutboxError)?;
         let changed_blob_count = changes.len();
 
         // Stage one git.blob.snapshot per change in ONE outbox transaction (co-commit — the emits are
@@ -991,6 +1056,10 @@ mod tests {
 
     // ── the diff unit tests (the incremental invariant) ──
 
+    fn diff_for_test(old: &Tree, new: &Tree) -> Vec<BlobChange> {
+        diff_trees_bounded(old, new, 100, 1024, 4096, 256).expect("small test diff")
+    }
+
     #[test]
     fn diff_emits_only_changed_blobs_not_the_whole_tree() {
         let old = Tree::empty()
@@ -1002,7 +1071,7 @@ mod tests {
             .with("a.rs", Blob::new("oid-a1", b"fn a() {}".to_vec())) // unchanged
             .with("b.rs", Blob::new("oid-b2", b"fn b2() {}".to_vec())) // modified
             .with("d.rs", Blob::new("oid-d1", b"fn d() {}".to_vec())); // added
-        let changes = diff_trees(&old, &new);
+        let changes = diff_for_test(&old, &new);
         // 3 changes: b modified, d added, c deleted. NOT a (unchanged → no emit).
         assert_eq!(changes.len(), 3, "{changes:?}");
         let paths: Vec<&str> = changes.iter().map(|c| c.path()).collect();
@@ -1024,12 +1093,65 @@ mod tests {
         let new = Tree::empty()
             .with("a.rs", Blob::new("oid-a", b"fn a() {}".to_vec()))
             .with("b.rs", Blob::new("oid-b", b"fn b() {}".to_vec()));
-        let changes = diff_trees(&Tree::empty(), &new);
+        let changes = diff_for_test(&Tree::empty(), &new);
         assert_eq!(
             changes.len(),
             2,
             "the first index of a ref projects every blob once"
         );
+    }
+
+    #[test]
+    fn tree_diff_enforces_every_projection_materialization_limit() {
+        let old = Tree::empty();
+        let new = Tree::empty()
+            .with("a.rs", Blob::new("a", vec![1; 4]))
+            .with("b.rs", Blob::new("b", vec![2; 4]));
+        assert_eq!(
+            diff_trees_bounded(&old, &new, 2, 4, 8, 4)
+                .expect("exact limits accepted")
+                .len(),
+            2
+        );
+        assert!(diff_trees_bounded(&old, &new, 1, 4, 8, 4).is_err());
+        assert!(diff_trees_bounded(&old, &new, 2, 3, 8, 4).is_err());
+        assert!(diff_trees_bounded(&old, &new, 2, 4, 7, 4).is_err());
+        assert!(diff_trees_bounded(&old, &new, 2, 4, 8, 3).is_err());
+    }
+
+    #[test]
+    fn emitter_rejects_oversized_projection_input_before_staging() {
+        let outbox = OutboxStore::new();
+        let cursor = CodeProjectionCursor::new();
+        let r = NoRestrictions;
+        let e = emitter(&outbox, &cursor, &r);
+        let oversized_blob = Tree::empty().with(
+            "large.rs",
+            Blob::new("large", vec![b'x'; PROJECTION_MAX_BLOB_BYTES + 1]),
+        );
+
+        assert!(
+            e.emit_for_push(
+                "refs/heads/main",
+                "blob-tip",
+                &Tree::empty(),
+                &oversized_blob,
+                "small",
+            )
+            .is_err()
+        );
+        assert!(
+            e.emit_for_push(
+                "refs/heads/main",
+                "message-tip",
+                &Tree::empty(),
+                &Tree::empty(),
+                &"x".repeat(PROJECTION_MAX_COMMIT_MESSAGE_BYTES + 1),
+            )
+            .is_err()
+        );
+        assert_eq!(outbox.committed_count(), 0);
+        assert!(cursor.last_indexed("core", "refs/heads/main").is_none());
     }
 
     // ── the GATE: emit-count == changed-blob-count, incremental ──
