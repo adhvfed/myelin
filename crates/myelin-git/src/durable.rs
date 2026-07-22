@@ -426,6 +426,33 @@ pub const BROWSE_MAX_REFS: usize = 1_000;
 pub const BROWSE_MAX_TREE_ENTRIES: usize = 1_000;
 /// Maximum changed files computed for one interactive pull-request diff.
 pub const PR_DIFF_MAX_FILES: usize = 1_000;
+/// Maximum files materialized for one interactive commit diff.
+pub const COMMIT_DIFF_MAX_FILES: usize = 1_000;
+/// Maximum rendered lines materialized for one file in an interactive commit diff.
+pub const COMMIT_DIFF_MAX_LINES_PER_FILE: usize = 4_000;
+/// Maximum UTF-8 bytes accepted for one rendered diff line.
+pub const DIFF_MAX_LINE_BYTES: usize = 64 * 1024;
+/// Maximum aggregate rendered line bytes retained for one interactive diff computation.
+pub const DIFF_MAX_RENDERED_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum commit message bytes copied into an interactive commit response.
+pub const COMMIT_DIFF_MAX_MESSAGE_BYTES: usize = 512 * 1024;
+
+#[derive(Clone, Copy)]
+struct CommitDiffLimits {
+    files: usize,
+    lines_per_file: usize,
+    line_bytes: usize,
+    rendered_bytes: usize,
+    message_bytes: usize,
+}
+
+const COMMIT_DIFF_LIMITS: CommitDiffLimits = CommitDiffLimits {
+    files: COMMIT_DIFF_MAX_FILES,
+    lines_per_file: COMMIT_DIFF_MAX_LINES_PER_FILE,
+    line_bytes: DIFF_MAX_LINE_BYTES,
+    rendered_bytes: DIFF_MAX_RENDERED_BYTES,
+    message_bytes: COMMIT_DIFF_MAX_MESSAGE_BYTES,
+};
 
 /// **Nested-path traversal guard (R3.4).** A tree-relative path may never carry a `..` or `.` segment
 /// or be absolute — such a path can only be an attempt to escape the committed tree (or a malformed
@@ -1444,6 +1471,14 @@ impl DurableGitRepo {
     /// message, and the per-file unified diff against the FIRST parent (the root commit diffs against
     /// the empty tree). Reuses libgit2's `diff_tree_to_tree` over the REAL on-disk trees.
     pub fn commit_detail(&self, oid_str: &str) -> Result<Option<CommitDetail>, DurableError> {
+        self.commit_detail_bounded(oid_str, COMMIT_DIFF_LIMITS)
+    }
+
+    fn commit_detail_bounded(
+        &self,
+        oid_str: &str,
+        limits: CommitDiffLimits,
+    ) -> Result<Option<CommitDetail>, DurableError> {
         let repo = self.open_git()?;
         let goid = match git2::Oid::from_str(oid_str) {
             Ok(o) => o,
@@ -1470,10 +1505,25 @@ impl DurableGitRepo {
         let diff = repo
             .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))
             .map_err(|e| git_err("diff_tree_to_tree", e))?;
+        if diff.deltas().len() > limits.files {
+            return Err(DurableError::Git(format!(
+                "commit diff computation limit exceeded: commit changes more than {} files",
+                limits.files
+            )));
+        }
+        let message = commit.message().unwrap_or("");
+        if message.len() > limits.message_bytes {
+            return Err(DurableError::Git(format!(
+                "commit diff computation limit exceeded: commit message exceeds {} bytes",
+                limits.message_bytes
+            )));
+        }
 
         // Two cooperating callbacks share one accumulator via RefCell: file_cb opens a new file delta,
         // line_cb appends lines to the current (last) one. libgit2 calls file_cb before its lines.
         let files: std::cell::RefCell<Vec<FileDelta>> = std::cell::RefCell::new(Vec::new());
+        let rendered_bytes = std::cell::Cell::new(0usize);
+        let limit_exceeded = std::cell::Cell::new(false);
         let mut file_cb = |delta: git2::DiffDelta<'_>, _progress: f32| {
             let path = delta
                 .new_file()
@@ -1510,17 +1560,31 @@ impl DurableGitRepo {
                     .trim_end_matches('\n')
                     .to_string();
                 if let Some(f) = files.borrow_mut().last_mut() {
+                    let next_bytes = rendered_bytes.get().checked_add(content.len());
+                    if f.lines.len() == limits.lines_per_file
+                        || content.len() > limits.line_bytes
+                        || next_bytes.is_none_or(|bytes| bytes > limits.rendered_bytes)
+                    {
+                        limit_exceeded.set(true);
+                        return false;
+                    }
+                    rendered_bytes.set(next_bytes.unwrap_or(limits.rendered_bytes));
                     f.lines.push((origin, content));
                 }
             }
             true
         };
-        diff.foreach(&mut file_cb, None, None, Some(&mut line_cb))
-            .map_err(|e| git_err("diff foreach", e))?;
+        let traversal = diff.foreach(&mut file_cb, None, None, Some(&mut line_cb));
+        if limit_exceeded.get() {
+            return Err(DurableError::Git(
+                "commit diff computation limit exceeded: commit diff content is too large".into(),
+            ));
+        }
+        traversal.map_err(|e| git_err("diff foreach", e))?;
 
         Ok(Some(CommitDetail {
             meta: commit_meta(&commit),
-            message: commit.message().unwrap_or("").to_string(),
+            message: message.to_string(),
             files: files.into_inner(),
         }))
     }
@@ -1594,7 +1658,7 @@ impl DurableGitRepo {
             .map_err(|e| git_err("pr diff_tree_to_tree", e))?;
         if diff.deltas().len() > maximum_files {
             return Err(DurableError::Git(format!(
-                "diff computation limit exceeded: pull request changes more than {maximum_files} files"
+                "pr diff computation limit exceeded: pull request changes more than {maximum_files} files"
             )));
         }
 
@@ -2512,6 +2576,19 @@ mod tests {
             .iter()
             .any(|(o, c)| *o == '+' && c == "line two"));
 
+        for limits in [
+            CommitDiffLimits { files: 0, ..COMMIT_DIFF_LIMITS },
+            CommitDiffLimits { lines_per_file: 0, ..COMMIT_DIFF_LIMITS },
+            CommitDiffLimits { line_bytes: 1, ..COMMIT_DIFF_LIMITS },
+            CommitDiffLimits { rendered_bytes: 1, ..COMMIT_DIFF_LIMITS },
+            CommitDiffLimits { message_bytes: 1, ..COMMIT_DIFF_LIMITS },
+        ] {
+            assert!(matches!(
+                repo.commit_detail_bounded(&c2.0, limits),
+                Err(DurableError::Git(message)) if message.starts_with("commit diff computation limit exceeded:")
+            ));
+        }
+
         // The ROOT commit diffs against the empty tree → file.txt ADDED.
         let root_detail = repo.commit_detail(&c1.0).unwrap().unwrap();
         assert_eq!(root_detail.files[0].status, 'A');
@@ -2581,7 +2658,7 @@ mod tests {
 
         assert!(matches!(
             repo.pr_diff_bounded("refs/heads/main", &head.0, 4000, 0),
-            Err(DurableError::Git(message)) if message.starts_with("diff computation limit exceeded:")
+            Err(DurableError::Git(message)) if message.starts_with("pr diff computation limit exceeded:")
         ));
 
         // A malformed/absent head → None (the edge renders the empty state, not a 500).

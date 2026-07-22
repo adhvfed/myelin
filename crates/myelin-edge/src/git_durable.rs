@@ -3110,8 +3110,11 @@ fn map_durable_err(e: DurableError) -> EdgeError {
         DurableError::Git(m) if m.starts_with("browse response limit exceeded:") => {
             EdgeError::PayloadTooLarge("repository view exceeds the interactive browse limit".into())
         }
-        DurableError::Git(m) if m.starts_with("diff computation limit exceeded:") => {
+        DurableError::Git(m) if m.starts_with("pr diff computation limit exceeded:") => {
             EdgeError::PayloadTooLarge("pull request diff exceeds the interactive file limit".into())
+        }
+        DurableError::Git(m) if m.starts_with("commit diff computation limit exceeded:") => {
+            EdgeError::PayloadTooLarge("commit diff exceeds the interactive content limit".into())
         }
         // A traversal-rejected slug / malformed body (e.g. R3.1 open-PR with no `title`) surfaces as a
         // clean 400 (never a silent wrong path, never a 500 for a client input error).
@@ -5274,8 +5277,12 @@ mod pr_list_tests {
                 "repository view exceeds the interactive browse limit",
             ),
             (
-                "diff computation limit exceeded: private repository detail",
+                "pr diff computation limit exceeded: private repository detail",
                 "pull request diff exceeds the interactive file limit",
+            ),
+            (
+                "commit diff computation limit exceeded: private repository detail",
+                "commit diff exceeds the interactive content limit",
             ),
         ] {
             let mapped = map_durable_err(DurableError::Git(private.into()));
