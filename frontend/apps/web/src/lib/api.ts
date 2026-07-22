@@ -39,8 +39,11 @@ import {
   parseGitRepoInput,
   parseGitRepoPrsInput,
   parseGitRefsInput,
+  parseGitTreeInput,
   gitRefsSearchParams,
+  gitTreeSearchParams,
   type GitRefsInput,
+  type GitTreeInput,
 } from "./git-read-input";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
@@ -79,6 +82,8 @@ export interface RepoHomeVM {
   default_branch?: string;
   latest_commit?: CommitBriefVM;
   counts?: { branches: number; tags: number };
+  snapshot_oid?: string;
+  entries_page?: TreePageVM & { ref: string; snapshot_oid: string };
 }
 
 /** One ref row for the switcher. */
@@ -111,6 +116,13 @@ export interface TreeVM {
   entries?: RepoEntry[];
   readme?: string;
   redirect_to_blob?: boolean;
+  snapshot_oid?: string;
+  page?: TreePageVM;
+}
+
+export interface TreePageVM {
+  next_cursor: string | null;
+  limit: number;
 }
 
 /** The MR-014 uniform list envelope `{ items, page }`. */
@@ -433,7 +445,7 @@ export class IssueRouteError extends Error {
 
 /** The dignified error trio (R-21). `no-access` and `not-found` are calm notes; `error` is a
  *  retryable failure. The route maps this to `<RepoErrorState kind>`. */
-export type RepoErrorKind = "no-access" | "not-found" | "error";
+export type RepoErrorKind = "no-access" | "not-found" | "stale-tree" | "error";
 
 /** The message-prefix carrying the kind across the server→client boundary (the class fields don't
  *  survive serialization, but the message string does). `<RepoErrorState>` parses this. */
@@ -469,6 +481,19 @@ async function authed<T>(fetcher: () => Promise<T>): Promise<T> {
     if (e instanceof Unauthorized) throw redirect("/login");
     if (e instanceof GatewayError) throw new RepoRouteError(mapStatusToKind(e.status));
     // A transport/parse failure with no HTTP status is the retryable error kind.
+    throw new RepoRouteError("error");
+  }
+}
+
+async function treeAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
+  try {
+    return await fetcher();
+  } catch (e) {
+    if (e instanceof Unauthorized) throw redirect("/login");
+    if (e instanceof GatewayError) {
+      if (e.status === 409) throw new RepoRouteError("stale-tree");
+      throw new RepoRouteError(mapStatusToKind(e.status));
+    }
     throw new RepoRouteError("error");
   }
 }
@@ -543,14 +568,15 @@ export const getRefs = query(async (request: GitRefsInput): Promise<RefsVM> => {
 
 /** A tree at a ref + nested path (GET /v1/git/repos/{repo}/tree/{ref}/{...path}). Root = empty path. */
 export const getTree = query(
-  async (input: { repo: string; ref: string; path: string }): Promise<TreeVM> => {
+  async (input: GitTreeInput): Promise<TreeVM> => {
     "use server";
-    const parsed = parseGitBrowseInput(input, true);
+    const parsed = parseGitTreeInput(input);
     if (!parsed) throw new RepoRouteError("error");
     const tail = parsed.path ? `/${nestedPath(parsed.path)}` : "";
-    return authed(async () => {
+    return treeAuthed(async () => {
+      const search = gitTreeSearchParams(parsed).toString();
       const tree = parseTree(await edgeGet(
-        `/v1/git/repos/${seg(parsed.repo)}/tree/${seg(parsed.ref)}${tail}`,
+        `/v1/git/repos/${seg(parsed.repo)}/tree/${seg(parsed.ref)}${tail}${search ? `?${search}` : ""}`,
       ));
       if (!tree) throw new RepoRouteError("error");
       return tree;

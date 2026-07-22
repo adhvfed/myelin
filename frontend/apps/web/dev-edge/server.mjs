@@ -33,6 +33,7 @@ import {
   myPrsEnvelope,
   refsJson,
   treeJson,
+  parseTreeQuery,
   rawBytes,
   DEV_ISSUE_TARGET,
   freshIssueFixtures,
@@ -548,8 +549,23 @@ const server = createServer((req, res) => {
     }
     // R3.4: tree-at-path (root = /tree/{ref}; nested = /tree/{ref}/{...path}).
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/tree\/([^/]+)(?:\/(.+))?$/))) {
-      const v = treeJson(seg(m[1]), seg(m[2]), m[3] ? nested(m[3]) : "");
+      const treeRequest = parseTreeQuery(url.search.slice(1));
+      if (!treeRequest) {
+        return send(res, 400, { error: { message: "invalid tree request", code: "bad_request" } });
+      }
+      const v = treeJson(
+        seg(m[1]),
+        seg(m[2]),
+        m[3] ? nested(m[3]) : "",
+        treeRequest,
+      );
       if (!v || v.__status === 404) return send(res, 404, notFoundEnvelope("path"));
+      if (v.__status === 400) {
+        return send(res, 400, { error: { message: "invalid tree request", code: "bad_request" } });
+      }
+      if (v.__status === 409) {
+        return send(res, 409, { error: { message: "tree cursor is stale", code: "conflict" } });
+      }
       return send(res, 200, v);
     }
     // R3.4: raw/download byte-serving (Content-Disposition set here).

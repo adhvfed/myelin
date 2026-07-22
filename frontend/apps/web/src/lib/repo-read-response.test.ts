@@ -28,6 +28,25 @@ describe("repository read response projection", () => {
     });
   });
 
+  it("decodes the repo-home tree continuation with its exact qualified snapshot", () => {
+    expect(parseRepoHome({
+      state: "populated",
+      slug: "acme/core",
+      default_branch: "main",
+      snapshot_oid: OID,
+      entries: [{ path: "src", is_dir: true }],
+      entries_page: {
+        ref: "refs/heads/main", next_cursor: "gt1_a-b_c", limit: 1,
+        snapshot_oid: OID, internal: "drop",
+      },
+    })).toMatchObject({
+      snapshot_oid: OID,
+      entries_page: {
+        ref: "refs/heads/main", next_cursor: "gt1_a-b_c", limit: 1, snapshot_oid: OID,
+      },
+    });
+  });
+
   it("projects the page envelope without totals or internal metadata", () => {
     expect(parseReposPage({
       items: [{ state: "empty", slug: "acme/core", default_branch: "main" }],
@@ -49,6 +68,15 @@ describe("repository read response projection", () => {
     });
     expect(parseTree({ ref: "main", path: "", entries: [{ path: "x", is_dir: false }], readme: null, secret: "drop" }))
       .toEqual({ ref: "main", path: "", entries: [{ path: "x", is_dir: false }] });
+    expect(parseTree({
+      ref: "refs/heads/main", path: "", snapshot_oid: OID,
+      entries: [{ path: "x", is_dir: false }], readme: "# readme",
+      page: { next_cursor: "gt1_a-b_c", limit: 1, secret: "drop" }, secret: "drop",
+    })).toEqual({
+      ref: "refs/heads/main", path: "", snapshot_oid: OID,
+      entries: [{ path: "x", is_dir: false }], readme: "# readme",
+      page: { next_cursor: "gt1_a-b_c", limit: 1 },
+    });
     expect(parseBlob({
       path: "x", contents: "hello", base_oid: "blake3:value", viewer_may_edit: false,
       preview_unavailable: false, download_available: true, raw_url: "/raw/x", secret: "drop",
@@ -81,6 +109,63 @@ describe("repository read response projection", () => {
     expect(parseTree({ path: "../secret", entries: [] })).toBeNull();
     expect(parseBlob({ path: "x", contents: "x", base_oid: "x", viewer_may_edit: false, raw_url: "https://evil.test/x" })).toBeNull();
     expect(parseBlob({ path: "x", contents: "not empty", base_oid: OID, viewer_may_edit: false, preview_unavailable: true })).toBeNull();
+  });
+
+  it("keeps bounded page-less tree compatibility", () => {
+    expect(parseTree({
+      ref: "main", path: "",
+      entries: Array.from({ length: 1_000 }, (_, index) => ({ path: `file-${index}`, is_dir: false })),
+    })?.entries).toHaveLength(1_000);
+    expect(parseTree({
+      ref: "main", path: "", entries: Array(1_001).fill({ path: "x", is_dir: false }),
+    })).toBeNull();
+  });
+
+  it.each([
+    {
+      ref: "main", path: "", snapshot_oid: OID, entries: [],
+    },
+    {
+      ref: "main", path: "", entries: [], page: { next_cursor: null, limit: 1 },
+    },
+    {
+      ref: "main", path: "", snapshot_oid: "A".repeat(40), entries: [],
+      page: { next_cursor: null, limit: 1 },
+    },
+    {
+      ref: "main", path: "", snapshot_oid: OID, entries: [],
+      page: { next_cursor: "not-a-tree-cursor", limit: 1 },
+    },
+    {
+      ref: "main", path: "", snapshot_oid: OID,
+      entries: [{ path: "a", is_dir: false }, { path: "b", is_dir: false }],
+      page: { next_cursor: null, limit: 1 },
+    },
+    {
+      state: "populated", slug: "acme/core", default_branch: "main", entries: [],
+      entries_page: { ref: "main", next_cursor: null, limit: 100, snapshot_oid: OID },
+    },
+    {
+      state: "populated", slug: "acme/core", default_branch: "main", entries: [],
+      snapshot_oid: OID,
+      entries_page: {
+        ref: "refs/heads/main", next_cursor: null, limit: 100,
+        snapshot_oid: "1".repeat(40),
+      },
+    },
+    {
+      state: "populated", slug: "acme/core", default_branch: "main", entries: [],
+      snapshot_oid: OID,
+    },
+    {
+      state: "populated", slug: "acme/core", default_branch: "main", entries: [],
+      entries_page: {
+        ref: "refs/heads/main", next_cursor: null, limit: 100, snapshot_oid: OID,
+      },
+    },
+  ])("rejects malformed modern tree pagination %#", (value) => {
+    const parsed = "state" in value ? parseRepoHome(value) : parseTree(value);
+    expect(parsed).toBeNull();
   });
 
   it("projects the paginated refs contract freshly, including pins outside the page", () => {

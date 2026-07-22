@@ -6,8 +6,11 @@ import { parseRefs } from "./repo-read-response";
 import {
   REF_SWITCHER_ROW_CAP,
   RefSwitcherController,
+  friendlyRefName,
+  refOptionHref,
   visibleRefGroups,
   type RefSwitcherSnapshot,
+  type SwitchRefRow,
 } from "./ref-switcher-state";
 
 const OID = "0123456789abcdef0123456789abcdef01234567";
@@ -32,6 +35,22 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 }
 
 describe("RefSwitcher pagination state", () => {
+  it("routes same-named branches and tags through distinct qualified refs", () => {
+    const branch: SwitchRefRow = {
+      kind: "branch", fullName: "refs/heads/release", name: "release", oid: OID,
+      isDefault: false,
+    };
+    const tag: SwitchRefRow = {
+      kind: "tag", fullName: "refs/tags/release", name: "release", oid: OID,
+      isDefault: false,
+    };
+    const hrefFor = (ref: string) => `/tree/${encodeURIComponent(ref)}`;
+    expect(refOptionHref(branch, hrefFor)).toBe("/tree/refs%2Fheads%2Frelease");
+    expect(refOptionHref(tag, hrefFor)).toBe("/tree/refs%2Ftags%2Frelease");
+    expect(refOptionHref(branch, hrefFor)).not.toBe(refOptionHref(tag, hrefFor));
+    expect(friendlyRefName(branch.fullName)).toBe("release");
+    expect(friendlyRefName(tag.fullName)).toBe("release");
+  });
   it("resets pages on search and ignores a stale older response", async () => {
     const requests: GitRefsInput[] = [];
     const first = deferred<RefsVM>();

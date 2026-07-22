@@ -15,7 +15,7 @@ export function errKind(err: unknown): RepoErrorKind {
   const msg = err instanceof Error ? err.message : String(err ?? "");
   if (msg.startsWith(REPO_ERR_PREFIX)) {
     const k = msg.slice(REPO_ERR_PREFIX.length);
-    if (k === "no-access" || k === "not-found" || k === "error") return k;
+    if (k === "no-access" || k === "not-found" || k === "stale-tree" || k === "error") return k;
   }
   return "error";
 }
@@ -54,7 +54,7 @@ export interface RepoErrorStateProps {
 
 export function RepoErrorState(props: RepoErrorStateProps) {
   return (
-    <Show when={props.kind === "no-access"} fallback={<NotFoundOrError {...props} />}>
+    <Show when={props.kind === "no-access"} fallback={<NotFoundStaleOrError {...props} />}>
       <div role="note" data-testid="repo-error" data-kind="no-access" style={card}>
         <Icon name="gate" size={28} title="No access" />
         <h2 style={{ "font-size": "var(--fs-h3)", margin: "0" }}>
@@ -71,9 +71,9 @@ export function RepoErrorState(props: RepoErrorStateProps) {
   );
 }
 
-function NotFoundOrError(props: RepoErrorStateProps) {
+function NotFoundStaleOrError(props: RepoErrorStateProps) {
   return (
-    <Show when={props.kind === "not-found"} fallback={<RetryableError {...props} />}>
+    <Show when={props.kind === "not-found"} fallback={<StaleOrError {...props} />}>
       <div role="note" data-testid="repo-error" data-kind="not-found" style={card}>
         <Icon name="search" size={28} title="Not found" />
         <h2 style={{ "font-size": "var(--fs-h3)", margin: "0" }}>We couldn&rsquo;t find that</h2>
@@ -90,6 +90,25 @@ function NotFoundOrError(props: RepoErrorStateProps) {
             <Icon name="nav-code" /> Repositories
           </A>
         </div>
+      </div>
+    </Show>
+  );
+}
+
+function StaleOrError(props: RepoErrorStateProps) {
+  return (
+    <Show when={props.kind === "stale-tree"} fallback={<RetryableError {...props} />}>
+      <div role="alert" aria-live="assertive" data-testid="repo-error" data-kind="stale-tree" style={card}>
+        <Icon name="cycle" size={28} title="Branch changed" />
+        <h2 style={{ "font-size": "var(--fs-h3)", margin: "0" }}>This branch changed</h2>
+        <p style={{ color: "var(--text-muted)", margin: "0", "max-width": "40ch" }}>
+          The directory changed while you were paging. Reload it to continue from the latest version.
+        </p>
+        <Show when={props.onRetry}>
+          <button type="button" style={btn} onClick={() => props.onRetry?.()}>
+            <Icon name="cycle" /> Reload directory
+          </button>
+        </Show>
       </div>
     </Show>
   );

@@ -81,6 +81,13 @@ export const SEED_REPOS = [
       { name: "Cargo.toml", path: "Cargo.toml", is_dir: false, size: 34, latest_commit: LATEST },
       { name: "README.md", path: "README.md", is_dir: false, size: 120, latest_commit: LATEST },
     ],
+    snapshot_oid: LATEST.oid,
+    entries_page: {
+      ref: "refs/heads/main",
+      next_cursor: null,
+      limit: 100,
+      snapshot_oid: LATEST.oid,
+    },
   },
   {
     state: "empty",
@@ -184,15 +191,116 @@ export function refsJson(repo, options = {}) {
   };
 }
 
-/** GET /v1/git/repos/{repo}/tree/{ref}/{...path} → the TreeVM (null = 404). */
-export function treeJson(repo, _ref, path) {
+const TREE_QUERY_MAX_BYTES = 16 * 1024;
+const TREE_Q_MAX_BYTES = 256;
+const TREE_CURSOR_MAX_BYTES = 8 * 1024;
+const textEncoder = new TextEncoder();
+
+function decodeQueryComponent(raw) {
+  for (let index = 0; index < raw.length; index += 1) {
+    if (raw[index] !== "%") continue;
+    if (!/^[0-9a-fA-F]{2}$/.test(raw.slice(index + 1, index + 3))) return null;
+    index += 2;
+  }
+  try {
+    const decoded = decodeURIComponent(raw.replace(/\+/g, " "));
+    return /\p{Cc}/u.test(decoded) ? null : decoded;
+  } catch {
+    return null;
+  }
+}
+
+/** Strictly parse the raw query string with the same exact allowlist and bounds as myelin-edge. */
+export function parseTreeQuery(rawQuery) {
+  if (typeof rawQuery !== "string" || textEncoder.encode(rawQuery).byteLength > TREE_QUERY_MAX_BYTES) {
+    return null;
+  }
+  if (!rawQuery) return { limit: 100 };
+  const parsed = {};
+  for (const pair of rawQuery.split("&")) {
+    const equals = pair.indexOf("=");
+    if (equals <= 0) return null;
+    const name = decodeQueryComponent(pair.slice(0, equals));
+    const value = decodeQueryComponent(pair.slice(equals + 1));
+    if (name === null || value === null || !["limit", "cursor", "q"].includes(name) ||
+        Object.hasOwn(parsed, name)) return null;
+    if (name === "limit") {
+      const limit = Number(value);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || String(limit) !== value) {
+        return null;
+      }
+      parsed.limit = limit;
+    } else if (name === "cursor") {
+      if (!value || textEncoder.encode(value).byteLength > TREE_CURSOR_MAX_BYTES) return null;
+      parsed.cursor = value;
+    } else {
+      if (textEncoder.encode(value).byteLength > TREE_Q_MAX_BYTES) return null;
+      parsed.q = value;
+    }
+  }
+  return { limit: parsed.limit ?? 100, ...("cursor" in parsed ? { cursor: parsed.cursor } : {}),
+    ...("q" in parsed ? { q: parsed.q } : {}) };
+}
+
+function treeCursor(offset, ref, path, query, snapshot = LATEST.oid) {
+  const frame = JSON.stringify([offset, ref, path, query, snapshot]);
+  return `gt1_${Buffer.from(frame).toString("base64url")}`;
+}
+
+function decodeTreeCursor(cursor) {
+  if (typeof cursor !== "string" || textEncoder.encode(cursor).byteLength > TREE_CURSOR_MAX_BYTES ||
+      !/^gt1_[A-Za-z0-9_-]+$/.test(cursor)) return null;
+  try {
+    const encoded = cursor.slice(4);
+    const bytes = Buffer.from(encoded, "base64url");
+    if (bytes.toString("base64url") !== encoded) return null;
+    const frame = JSON.parse(bytes.toString("utf8"));
+    if (!Array.isArray(frame) || frame.length !== 5 || !Number.isSafeInteger(frame[0]) ||
+        frame[0] < 0 || frame.slice(1).some((value) => typeof value !== "string")) return null;
+    return { offset: frame[0], ref: frame[1], path: frame[2], query: frame[3], snapshot: frame[4] };
+  } catch {
+    return null;
+  }
+}
+
+/** GET /v1/git/repos/{repo}/tree/{ref}/{...path} → the modern paginated TreeVM. */
+export function treeJson(repo, ref, path, options = {}) {
   if (repo !== "myelin") return null;
   const hit = walkTree(path);
   if (!hit) return { __status: 404 };
-  if (hit.kind === "file") return { redirect_to_blob: true, ref: _ref, path };
+  if (hit.kind === "file") return { redirect_to_blob: true, ref, path };
   const base = (path ?? "").replace(/^\/+|\/+$/g, "");
-  const readme = hit.node["README.md"]?.file ?? null;
-  return { ref: _ref, path: base, entries: entriesOf(hit.node, base), readme };
+  const limit = options.limit ?? 100;
+  const normalizedQuery = (options.q ?? "").trim().toLowerCase();
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
+      textEncoder.encode(options.q ?? "").byteLength > TREE_Q_MAX_BYTES ||
+      /\p{Cc}/u.test(options.q ?? "")) return { __status: 400 };
+  let offset = 0;
+  if (options.cursor !== undefined) {
+    const decoded = decodeTreeCursor(options.cursor);
+    if (!decoded || decoded.ref !== ref || decoded.path !== base ||
+        decoded.query !== normalizedQuery) return { __status: 400 };
+    if (decoded.snapshot !== LATEST.oid) return { __status: 409 };
+    offset = decoded.offset;
+  }
+  const matches = entriesOf(hit.node, base)
+    .filter((entry) => !normalizedQuery || entry.name.toLowerCase().includes(normalizedQuery));
+  if (offset > matches.length) return { __status: 400 };
+  const entries = matches.slice(offset, offset + limit);
+  const nextOffset = offset + entries.length;
+  const next = nextOffset < matches.length
+    ? treeCursor(nextOffset, ref, base, normalizedQuery)
+    : null;
+  return {
+    ref,
+    path: base,
+    snapshot_oid: LATEST.oid,
+    entries,
+    ...(options.cursor === undefined && !normalizedQuery
+      ? { readme: hit.node["README.md"]?.file ?? null }
+      : {}),
+    page: { next_cursor: next, limit },
+  };
 }
 
 /** GET /v1/git/repos/{repo}/blob/{ref}/{...path} → the enriched BlobVM (null = 404). */

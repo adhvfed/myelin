@@ -9,6 +9,11 @@ export interface GitRefsInput extends GitRepoInput {
   current?: string;
 }
 export interface GitBrowseInput extends GitRepoInput { ref: string; path: string }
+export interface GitTreeInput extends GitBrowseInput {
+  limit?: number;
+  cursor?: string;
+  q?: string;
+}
 export interface GitCommitsInput extends GitRepoInput { ref: string; cursor?: string }
 export interface GitCommitInput extends GitRepoInput { oid: string }
 export interface GitPrInput extends GitRepoInput { n: number }
@@ -72,6 +77,10 @@ function refsCursor(value: unknown): value is string {
   return bounded(value, 8 * 1024) && /^gr1_[A-Za-z0-9_-]+$/.test(value) && !hasControl(value);
 }
 
+function treeCursor(value: unknown): value is string {
+  return bounded(value, 8 * 1024) && /^gt1_[A-Za-z0-9_-]+$/.test(value) && !hasControl(value);
+}
+
 export function isFullGitRef(value: unknown): value is string {
   if (!bounded(value, 4 * 1024) || hasControl(value)) return false;
   const name = value.startsWith("refs/heads/")
@@ -129,6 +138,32 @@ export function parseGitBrowseInput(value: unknown, allowEmptyPath: boolean): Gi
     refName(input.ref) && path(input.path, allowEmptyPath)
     ? { repo: input.repo, ref: input.ref, path: input.path }
     : null;
+}
+
+export function parseGitTreeInput(value: unknown): GitTreeInput | null {
+  const input = record(value);
+  if (!input || !exact(input, ["repo", "ref", "path", "limit", "cursor", "q"]) ||
+      !repo(input.repo) || !refName(input.ref) || !path(input.path, true) ||
+      (input.limit !== undefined && (!Number.isSafeInteger(input.limit) ||
+        (input.limit as number) < 1 || (input.limit as number) > 100)) ||
+      (input.cursor !== undefined && !treeCursor(input.cursor)) ||
+      (input.q !== undefined && (!bounded(input.q, 256) || hasControl(input.q)))) return null;
+  return {
+    repo: input.repo,
+    ref: input.ref,
+    path: input.path,
+    ...(input.limit === undefined ? {} : { limit: input.limit as number }),
+    ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+    ...(input.q === undefined ? {} : { q: input.q }),
+  };
+}
+
+export function gitTreeSearchParams(input: GitTreeInput): URLSearchParams {
+  const params = new URLSearchParams();
+  if (input.limit !== undefined) params.set("limit", String(input.limit));
+  if (input.cursor !== undefined) params.set("cursor", input.cursor);
+  if (input.q !== undefined) params.set("q", input.q);
+  return params;
 }
 
 export function parseGitCommitsInput(value: unknown): GitCommitsInput | null {

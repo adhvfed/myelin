@@ -31,6 +31,19 @@ export interface RefSearch {
 
 export type RefFetcher = (input: GitRefsInput) => Promise<RefsVM>;
 
+export function friendlyRefName(ref: string): string {
+  if (ref.startsWith("refs/heads/")) return ref.slice("refs/heads/".length);
+  if (ref.startsWith("refs/tags/")) return ref.slice("refs/tags/".length);
+  return ref;
+}
+
+export function refOptionHref(
+  row: SwitchRefRow,
+  hrefFor: (fullRef: string) => string,
+): string {
+  return hrefFor(row.fullName);
+}
+
 function switchRow(
   kind: "branch" | "tag",
   row: { name: string; oid: string; is_default?: boolean },

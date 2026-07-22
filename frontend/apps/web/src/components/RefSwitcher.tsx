@@ -11,6 +11,8 @@ import { isFullGitRef } from "~/lib/git-read-input";
 import {
   RefSwitcherController,
   REF_SWITCHER_SEARCH_DEBOUNCE_MS,
+  friendlyRefName,
+  refOptionHref,
   visibleRefGroups,
   type RefSwitcherSnapshot,
   type SwitchRefRow,
@@ -63,7 +65,7 @@ export function RefSwitcher(props: RefSwitcherProps) {
           data-testid="ref-switcher-trigger"
         >
           <Icon name="branch" />
-          <span style={{ "font-family": "var(--font-mono)" }}>{props.currentRef}</span>
+          <span style={{ "font-family": "var(--font-mono)" }}>{friendlyRefName(props.currentRef)}</span>
           <Icon name="chevron" />
         </span>
       }
@@ -167,7 +169,7 @@ function RefGroup(props: {
               return (
                 <li>
                   <A
-                    href={props.hrefFor(r.name)}
+                    href={refOptionHref(r, props.hrefFor)}
                     aria-current={isCurrent() ? "true" : undefined}
                     style={{
                       display: "flex",

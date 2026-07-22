@@ -12,6 +12,7 @@ import { fmtDate } from "~/lib/format";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { RefSwitcher } from "~/components/RefSwitcher";
 import { Markdown } from "~/components/Markdown";
+import { repoHomeContinuationHref } from "~/lib/tree-browse-state";
 
 const card = {
   border: "var(--hairline) solid var(--border)",
@@ -111,7 +112,23 @@ export default function RepoHomeScreen() {
                       )}
                     </Show>
 
-                    <TreeList repo={params.repo!} refName={defaultBranch()} entries={home.entries ?? []} heading={`Files on ${defaultBranch()}`} />
+                    <TreeList
+                      repo={params.repo!}
+                      refName={home.entries_page?.ref ?? defaultBranch()}
+                      entries={home.entries ?? []}
+                      heading={`Files on ${defaultBranch()}`}
+                    />
+                    <Show when={home.entries_page && repoHomeContinuationHref(params.repo!, home.entries_page)}>
+                      {(href) => (
+                        <A
+                          data-testid="repo-tree-next-page"
+                          href={href()}
+                          style={{ color: "var(--text-primary)", "align-self": "flex-start" }}
+                        >
+                          Next {home.entries_page?.limit ?? 100}
+                        </A>
+                      )}
+                    </Show>
 
                     <Show when={home.readme}>
                       {(readme) => (
