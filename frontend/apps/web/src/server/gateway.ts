@@ -24,6 +24,7 @@ export { GatewayError, Unauthorized } from "./gateway-core";
 export const DEFAULT_EDGE_REQUEST_TIMEOUT_MS = 15_000;
 export const MAX_EDGE_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;
 export const MAX_EDGE_RAW_RESPONSE_BYTES = 64 * 1024 * 1024;
+export const MAX_EDGE_PUBLIC_RESPONSE_BYTES = 64 * 1024;
 
 export interface GatewayRequestOptions {
   /** One deadline spans the edge attempt, token refresh, and single retry. Defaults to 15 seconds. */
@@ -68,7 +69,7 @@ export async function edgeGetPublic<T = unknown>(path: string): Promise<T> {
     redirect: "error",
     signal: gatewayRequestSignal(),
   });
-  const bodyText = await readLimitedText(res, MAX_EDGE_JSON_RESPONSE_BYTES);
+  const bodyText = await readLimitedText(res, MAX_EDGE_PUBLIC_RESPONSE_BYTES);
   if (res.status < 200 || res.status >= 300) {
     throw new GatewayError(`auth/config GET failed (${res.status})`, res.status, undefined, bodyText);
   }
