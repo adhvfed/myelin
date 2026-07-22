@@ -3073,6 +3073,19 @@ mod tests {
         assert_eq!(lines[0].content, "two");
         assert_eq!(lines[0].new_no, Some(2));
         assert_eq!(lines[2].content, "four");
+
+        let exact_body = (1..=FILE_LINES_MAX_RANGE)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let exact_blob = repo.write_blob(exact_body.as_bytes()).unwrap();
+        let FileLinesLookup::Found(exact_lines) = repo
+            .file_lines(&exact_blob.0, 1, FILE_LINES_MAX_RANGE)
+            .unwrap()
+        else {
+            panic!("the exact line-range cap must remain valid")
+        };
+        assert_eq!(exact_lines.len(), FILE_LINES_MAX_RANGE);
+        assert_eq!(exact_lines.last().unwrap().new_no, Some(FILE_LINES_MAX_RANGE as u32));
         // A malformed oid → Missing (a stale expand never 500s).
         assert_eq!(
             repo.file_lines("not-an-oid", 1, 10).unwrap(),
