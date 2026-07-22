@@ -989,32 +989,6 @@ impl DurableGitRepo {
         }
     }
 
-    /// Read a single TOP-LEVEL file at a ref (`Some((bytes, blob_oid))`, or `None` if the ref/file is
-    /// absent). The blob oid is the GF-6 content-address base the web-edit CAS keys on. (The edge router
-    /// matches a single path segment — nested paths are the URL-codec follow-on; this reads the top tree.)
-    pub fn read_file_at_ref(
-        &self,
-        ref_name: &str,
-        path: &str,
-    ) -> Result<Option<(Vec<u8>, Oid)>, DurableError> {
-        let repo = self.open_git()?;
-        let Some(tip) = self.tip_commit(&repo, ref_name)? else {
-            return Ok(None);
-        };
-        let commit = repo.find_commit(tip).map_err(|e| git_err("find commit", e))?;
-        let tree = commit.tree().map_err(|e| git_err("commit tree", e))?;
-        let entry = match tree.get_name(path) {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-        let obj = entry.to_object(&repo).map_err(|e| git_err("entry object", e))?;
-        let blob = match obj.as_blob() {
-            Some(b) => b,
-            None => return Ok(None), // a dir at that name — not a file
-        };
-        Ok(Some((blob.content().to_vec(), Oid::new(entry.id().to_string()))))
-    }
-
     /// List a ref's TOP-LEVEL tree entries `(name, is_dir)` (empty if the ref does not exist). The repo
     /// home ViewModel's file tree (durable — read from the real on-disk tree, never a seeded list).
     pub fn tree_entries_at_ref(&self, ref_name: &str) -> Result<Vec<(String, bool)>, DurableError> {
@@ -1131,19 +1105,6 @@ impl DurableGitRepo {
         Ok(TreePathLookup::Dir(out))
     }
 
-    /// Resolve a `{...path}` under a ref as a BLOB (R3.4 — the nested blob read). Navigates the nested
-    /// path via `Tree::get_path`; a directory requested under `blob/` returns [`BlobPathLookup::IsDir`]
-    /// (the caller client-redirects to the tree route), an absent path is [`BlobPathLookup::Missing`].
-    /// **Binary detection is server-side** (a NUL byte in the first 8000 bytes — the git heuristic) so
-    /// the UI never `split('\n')`s a binary into a garbled dump; the byte size is the real blob size.
-    pub fn read_blob_at_path(
-        &self,
-        ref_name: &str,
-        path: &str,
-    ) -> Result<BlobPathLookup, DurableError> {
-        self.read_blob_at_path_bounded(ref_name, path, usize::MAX)
-    }
-
     /// Read a blob from one exact immutable commit object id. Unlike the browse-oriented
     /// [`Self::read_blob_at_path_bounded`], this API never accepts a revspec.
     pub fn read_blob_at_commit_oid_bounded(
@@ -1165,7 +1126,10 @@ impl DurableGitRepo {
         Self::read_blob_from_commit(&repo, &commit, path, maximum_bytes)
     }
 
-    /// Resolve a blob while checking its ODB header before inflating/materializing content.
+    /// Resolve a nested blob while checking its ODB header before inflating/materializing content.
+    /// A directory returns [`BlobPathLookup::IsDir`], an absent or unsafe path returns
+    /// [`BlobPathLookup::Missing`], and binary detection happens server-side only after the header
+    /// admits the allocation.
     pub fn read_blob_at_path_bounded(
         &self,
         ref_name: &str,
@@ -3366,7 +3330,7 @@ mod tests {
         );
         // blob-at-path: clean Missing, not Err.
         assert!(matches!(
-            repo.read_blob_at_path(tree_spec, "README.md").unwrap(),
+            repo.read_blob_at_path_bounded(tree_spec, "README.md", 1024).unwrap(),
             BlobPathLookup::Missing
         ));
         std::fs::remove_dir_all(&root).ok();
@@ -3380,7 +3344,7 @@ mod tests {
 
         // A nested TEXT blob: not binary, real size, real oid.
         let BlobPathLookup::Found { bytes, oid, is_binary, size } =
-            repo.read_blob_at_path("main", "crates/inner/deep.rs").unwrap()
+            repo.read_blob_at_path_bounded("main", "crates/inner/deep.rs", 1024).unwrap()
         else {
             panic!("deep.rs is a blob");
         };
@@ -3398,7 +3362,7 @@ mod tests {
 
         // A BINARY blob (NUL bytes): flagged binary so the UI never split('\n')s it.
         let BlobPathLookup::Found { is_binary, .. } =
-            repo.read_blob_at_path("main", "assets/logo.bin").unwrap()
+            repo.read_blob_at_path_bounded("main", "assets/logo.bin", 1024).unwrap()
         else {
             panic!("logo.bin is a blob");
         };
@@ -3406,17 +3370,17 @@ mod tests {
 
         // A DIRECTORY requested under blob/ → IsDir (the client redirects to tree), not a 404.
         assert!(matches!(
-            repo.read_blob_at_path("main", "crates/inner").unwrap(),
+            repo.read_blob_at_path_bounded("main", "crates/inner", 1024).unwrap(),
             BlobPathLookup::IsDir
         ));
         // The repo root under blob/ is a dir too.
         assert!(matches!(
-            repo.read_blob_at_path("main", "").unwrap(),
+            repo.read_blob_at_path_bounded("main", "", 1024).unwrap(),
             BlobPathLookup::IsDir
         ));
         // An absent file → Missing.
         assert!(matches!(
-            repo.read_blob_at_path("main", "no/such/file").unwrap(),
+            repo.read_blob_at_path_bounded("main", "no/such/file", 1024).unwrap(),
             BlobPathLookup::Missing
         ));
         std::fs::remove_dir_all(&root).ok();
@@ -3446,7 +3410,7 @@ mod tests {
             // and deep `../` escapes resolve to Missing (no host-file bytes).
             if escape.contains("etc/passwd") || escape.contains("secret") {
                 assert!(
-                    matches!(repo.read_blob_at_path("main", escape).unwrap(), BlobPathLookup::Missing),
+                    matches!(repo.read_blob_at_path_bounded("main", escape, 1024).unwrap(), BlobPathLookup::Missing),
                     "traversal `{escape}` must not read host bytes"
                 );
             }
