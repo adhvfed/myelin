@@ -678,6 +678,123 @@ fn pr_state_label(s: PrState) -> &'static str {
 // Repo home + file view (architecture view doc §2.1)
 // ---------------------------------------------------------------------------
 
+/// Maximum UTF-8 bytes accepted for a repository-list row slug.
+pub const REPO_LIST_ROW_MAX_SLUG_BYTES: usize = 255;
+/// Maximum UTF-8 bytes accepted for a repository-list row clone URL.
+pub const REPO_LIST_ROW_MAX_CLONE_URL_BYTES: usize = 4 * 1024;
+
+/// Invalid input for the lightweight repository-list row projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoListRowError {
+    InvalidSlug,
+    InvalidCloneUrl,
+}
+
+impl std::fmt::Display for RepoListRowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSlug => {
+                f.write_str("repository-list slug is invalid or exceeds its byte limit")
+            }
+            Self::InvalidCloneUrl => {
+                f.write_str("repository-list clone URL is invalid or exceeds its byte limit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RepoListRowError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RepoListRowState {
+    Populated,
+    Empty,
+    Restricted,
+}
+
+/// A lightweight repository catalogue row. Unlike [`RepoHome`], this never carries a tree, README,
+/// ref counts, default branch, or history metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoListRow {
+    state: RepoListRowState,
+    slug: Option<String>,
+    clone_url: Option<String>,
+}
+
+impl RepoListRow {
+    pub fn populated(
+        slug: impl Into<String>,
+        clone_url: impl Into<String>,
+    ) -> Result<Self, RepoListRowError> {
+        let slug = validated_repo_list_slug(slug.into())?;
+        let clone_url = validated_repo_list_clone_url(clone_url.into())?;
+        Ok(Self {
+            state: RepoListRowState::Populated,
+            slug: Some(slug),
+            clone_url: Some(clone_url),
+        })
+    }
+
+    pub fn empty(slug: impl Into<String>) -> Result<Self, RepoListRowError> {
+        Ok(Self {
+            state: RepoListRowState::Empty,
+            slug: Some(validated_repo_list_slug(slug.into())?),
+            clone_url: None,
+        })
+    }
+
+    pub fn restricted() -> Self {
+        Self {
+            state: RepoListRowState::Restricted,
+            slug: None,
+            clone_url: None,
+        }
+    }
+
+    /// Exact compatibility projection for the repository catalogue endpoint.
+    pub fn to_json(&self) -> Value {
+        match self.state {
+            RepoListRowState::Populated => json!({
+                "state": "populated",
+                "slug": self.slug.as_deref().expect("validated populated row has a slug"),
+                "clone_url": self
+                    .clone_url
+                    .as_deref()
+                    .expect("validated populated row has a clone URL"),
+            }),
+            RepoListRowState::Empty => json!({
+                "state": "empty",
+                "slug": self.slug.as_deref().expect("validated empty row has a slug"),
+            }),
+            RepoListRowState::Restricted => json!({ "state": "restricted" }),
+        }
+    }
+}
+
+fn validated_repo_list_slug(slug: String) -> Result<String, RepoListRowError> {
+    let valid = !slug.is_empty()
+        && slug.len() <= REPO_LIST_ROW_MAX_SLUG_BYTES
+        && slug.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        });
+    valid.then_some(slug).ok_or(RepoListRowError::InvalidSlug)
+}
+
+fn validated_repo_list_clone_url(clone_url: String) -> Result<String, RepoListRowError> {
+    let valid = !clone_url.is_empty()
+        && clone_url.len() <= REPO_LIST_ROW_MAX_CLONE_URL_BYTES
+        && !clone_url.chars().any(char::is_whitespace)
+        && !clone_url.chars().any(char::is_control);
+    valid
+        .then_some(clone_url)
+        .ok_or(RepoListRowError::InvalidCloneUrl)
+}
+
 /// The **repo home page view-model** (architecture view doc §2.1) — README render, branch switcher,
 /// the default-branch file tree, quick actions (clone URL). Carries the per-viewer projection (a repo
 /// the viewer cannot see is a tombstone — 0 leak) and the empty state (no commits → clone/push
