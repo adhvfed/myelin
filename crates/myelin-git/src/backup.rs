@@ -58,9 +58,12 @@ use crate::gix_backend::RepoPathResolver;
 /// (NOT re-minted): the git odb is the content-addressed T2 object tier.
 pub use myelin_storage::backup::StoreTier;
 
-/// The artifact magic + version. Bumping the version is a format break (the deserializer refuses an
-/// unknown magic loudly — never a silent mis-parse).
-const MAGIC: &[u8] = b"MYELIN-GIT-BACKUP-v1\0";
+/// Artifact magic + versions. v2 adds a BLAKE3 checksum over the entire preceding frame; the reader
+/// retains v1 compatibility so existing off-host backups remain restorable.
+const MAGIC_V1: &[u8] = b"MYELIN-GIT-BACKUP-v1\0";
+const MAGIC_V2: &[u8] = b"MYELIN-GIT-BACKUP-v2\0";
+const MAGIC: &[u8] = MAGIC_V2;
+const CHECKSUM_LEN: usize = 32;
 const MAX_BACKUP_REFS: usize = 1_000_000;
 
 // ───────────────────────────── errors ────────────────────────────────────────────────────────────
@@ -194,9 +197,10 @@ impl GitRepoBackup {
 
     /// **Serialize to a single self-describing artifact** (the off-host backup blob). Length-prefixed
     /// binary frame: `MAGIC · u32 ref_count · {u32 name_len · name · u32 oid_len · oid}* · u64
-    /// pack_len · pack`. Big-endian. From these bytes alone the repo is reconstructable.
+    /// pack_len · pack · blake3(frame)`. Big-endian. From these bytes alone the repo is
+    /// reconstructable, and corruption in either the ref snapshot or pack is detected before parse.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(MAGIC.len() + 16 + self.pack.len());
+        let mut out = Vec::with_capacity(MAGIC.len() + 16 + self.pack.len() + CHECKSUM_LEN);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&(self.refs.len() as u32).to_be_bytes());
         for (name, oid) in &self.refs {
@@ -209,6 +213,8 @@ impl GitRepoBackup {
         }
         out.extend_from_slice(&(self.pack.len() as u64).to_be_bytes());
         out.extend_from_slice(&self.pack);
+        let checksum = blake3::hash(&out);
+        out.extend_from_slice(checksum.as_bytes());
         out
     }
 
@@ -216,15 +222,39 @@ impl GitRepoBackup {
     /// (bad magic, a truncated length, non-utf8 ref) is a LOUD [`GitBackupError::BadArtifact`],
     /// never a silent partial parse.
     pub fn deserialize(bytes: &[u8]) -> Result<GitRepoBackup, GitBackupError> {
-        let mut cur = Cursor::new(bytes);
-        let magic = cur.take(MAGIC.len())?;
-        if magic != MAGIC {
+        if bytes.len() < MAGIC.len() {
+            return Err(GitBackupError::BadArtifact("artifact is shorter than its magic".into()));
+        }
+        let magic = &bytes[..MAGIC.len()];
+        let frame = if magic == MAGIC_V2 {
+            let frame_len = bytes.len().checked_sub(CHECKSUM_LEN).ok_or_else(|| {
+                GitBackupError::BadArtifact("v2 artifact is missing its checksum".into())
+            })?;
+            if frame_len < MAGIC.len() {
+                return Err(GitBackupError::BadArtifact(
+                    "v2 artifact is missing its checksum".into(),
+                ));
+            }
+            let (frame, stored_checksum) = bytes.split_at(frame_len);
+            let actual = blake3::hash(frame);
+            if actual.as_bytes().as_slice() != stored_checksum {
+                return Err(GitBackupError::BadArtifact(
+                    "v2 artifact checksum mismatch".into(),
+                ));
+            }
+            frame
+        } else if magic == MAGIC_V1 {
+            bytes
+        } else {
             return Err(GitBackupError::BadArtifact(format!(
-                "bad magic: expected {:?}, got {:?}",
-                MAGIC,
+                "unknown backup artifact magic {:?}",
                 &magic[..magic.len().min(MAGIC.len())]
             )));
-        }
+        };
+
+        let mut cur = Cursor::new(frame);
+        let magic = cur.take(MAGIC.len())?;
+        debug_assert!(magic == MAGIC_V1 || magic == MAGIC_V2);
         let ref_count = cur.take_u32()? as usize;
         let minimum_ref_bytes = ref_count.checked_mul(8).ok_or_else(|| {
             GitBackupError::BadArtifact("ref-count size overflow in artifact frame".into())
@@ -552,6 +582,23 @@ mod tests {
             GitRepoBackup::deserialize(&trailing),
             Err(GitBackupError::BadArtifact(_))
         ));
+
+        let mut valid = empty.serialize();
+        let ref_count_offset = MAGIC.len();
+        valid[ref_count_offset + 3] ^= 1;
+        assert!(matches!(
+            GitRepoBackup::deserialize(&valid),
+            Err(GitBackupError::BadArtifact(message)) if message.contains("checksum")
+        ));
+
+        let mut legacy_v1 = MAGIC_V1.to_vec();
+        legacy_v1.extend_from_slice(&0u32.to_be_bytes());
+        legacy_v1.extend_from_slice(&0u64.to_be_bytes());
+        assert_eq!(
+            GitRepoBackup::deserialize(&legacy_v1).unwrap(),
+            empty,
+            "existing v1 artifacts remain readable"
+        );
     }
 
     /// **DESTRUCTIVE round-trip into a CLEAN target (the unit slice).** Back up → restore into a
