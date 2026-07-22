@@ -855,7 +855,7 @@ budget/remint hooks and the live reserve/settle bookend; atomically settle `ci_r
 posture; run the exact-tenant region poller/worker composition; and close the myelin-flow M2 durable
 `RunStore` floor. Production execution remains startup-refused.
 
-**CI `linux-small-v1` launch-policy boundary (2026-07-22, `fd6f3bc4`).** The first real
+**CI `linux-small-v1` launch-policy boundary (2026-07-22, `fd6f3bc4` + `de581870`).** The first real
 `CiLaunchAuthorityMaterializer` now converts the customer-authored profile into fixed server-owned,
 default-deny grants: zero egress, environment, or secret handles; 1 vCPU, 256 MiB RAM, 1 GiB disk,
 128 PIDs, and a 600-second timeout; batch scheduling with frozen labels and project fair-share
@@ -864,9 +864,12 @@ external request to tenant, region, run/workflow/project, stage and concrete nam
 source snapshot digest, workflow definition pin, policy revision, and exact limits, and refuses
 malformed locked scope, invalid handles, or a reservation reused across jobs. Only retry-stable
 budget-reservation and token-authority handle materialization remain behind an explicit provider;
-there is no default implementation. Proof: all 405 control-plane library tests, warnings-denied
-all-target/all-feature clippy, five focused policy tests (including provider refusal and pre-call
-scope rejection), and the L2 erosion/dependency gate are green. **Honest remaining activation floor:**
+there is no permissive implementation. The no-authority starter constructor is now test-support-only:
+production must call `new_with_authority`, and the dormant composition binds this real policy to an
+explicit unavailable external provider that fabricates no handles. Proof: all 406 control-plane
+library tests, warnings-denied all-target/all-feature clippy, six focused policy tests (including
+provider refusal, pre-call scope rejection, and the dormant no-fabrication path), the production
+bootstrap source guard, and the L2 erosion/dependency gate are green. **Honest remaining activation floor:**
 compose the concrete durable money-reservation and Identity token-authority provider, then the
 exact-tenant region poller/worker and terminal bookends. `MYELIN_CI_RUNNER=1` remains startup-refused.
 
