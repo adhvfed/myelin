@@ -53,6 +53,7 @@ const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
 const MAX_JSON_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_CONCURRENT_GIT_WIRE_OPERATIONS: usize = 4;
+const MAX_CONCURRENT_GATEWAY_DISPATCHES: usize = 64;
 const MAX_REQUEST_HEADERS: usize = 64;
 const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -190,6 +191,7 @@ where
     let mut connections = JoinSet::new();
     let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let git_wire_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_WIRE_OPERATIONS));
+    let gateway_dispatch_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_GATEWAY_DISPATCHES));
     let mut accept_error = None;
 
     let shutdown_output = loop {
@@ -213,6 +215,7 @@ where
                 let gw = gateway.clone();
                 let readiness = readiness.clone();
                 let git_wire_slots = git_wire_slots.clone();
+                let gateway_dispatch_slots = gateway_dispatch_slots.clone();
                 let watcher = graceful.watcher();
                 connections.spawn(async move {
                     let _connection_permit = connection_permit;
@@ -220,9 +223,17 @@ where
                         let gw = gw.clone();
                         let readiness = readiness.clone();
                         let git_wire_slots = git_wire_slots.clone();
+                        let gateway_dispatch_slots = gateway_dispatch_slots.clone();
                         async move {
                             Ok::<_, Infallible>(
-                                handle_connection(gw, readiness, git_wire_slots, req).await,
+                                handle_connection(
+                                    gw,
+                                    readiness,
+                                    git_wire_slots,
+                                    gateway_dispatch_slots,
+                                    req,
+                                )
+                                .await,
                             )
                         }
                     });
@@ -273,13 +284,21 @@ async fn handle_connection(
     gw: Arc<Gateway>,
     readiness: Arc<dyn ReadinessProbe>,
     git_wire_slots: Arc<Semaphore>,
+    gateway_dispatch_slots: Arc<Semaphore>,
     req: Request<Incoming>,
 ) -> Response<EdgeBody> {
     let request_id = next_request_id();
     let method = observable_method(req.method());
     let route_class = route_class(req.uri().path());
     let started = std::time::Instant::now();
-    let mut response = handle_connection_inner(gw, readiness, git_wire_slots, req).await;
+    let mut response = handle_connection_inner(
+        gw,
+        readiness,
+        git_wire_slots,
+        gateway_dispatch_slots,
+        req,
+    )
+    .await;
     harden_response_headers(&mut response);
     response.headers_mut().insert(
         hyper::header::HeaderName::from_static("x-request-id"),
@@ -316,6 +335,7 @@ async fn handle_connection_inner(
     gw: Arc<Gateway>,
     readiness: Arc<dyn ReadinessProbe>,
     git_wire_slots: Arc<Semaphore>,
+    gateway_dispatch_slots: Arc<Semaphore>,
     req: Request<Incoming>,
 ) -> Response<EdgeBody> {
     let (parts, body) = req.into_parts();
@@ -340,14 +360,6 @@ async fn handle_connection_inner(
         return probe_response(status, body);
     }
     let is_git_wire = is_git_wire_path(&path);
-    let _git_wire_permit = if is_git_wire {
-        match git_wire_slots.try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => return overloaded(),
-        }
-    } else {
-        None
-    };
     let body_cap = request_body_cap(&path);
     let body_deadline = request_body_deadline(&path);
     let query = parts.uri.query().unwrap_or("").to_string();
@@ -371,15 +383,35 @@ async fn handle_connection_inner(
         Err(BoundedCollectError::TimedOut) => return request_timeout(body_deadline),
     };
     let edge_req = EdgeRequest::new(method, path, query, headers, bytes);
-    let edge_response = if is_git_wire {
-        match tokio::task::spawn_blocking(move || handle_gateway_safely(&gw, edge_req)).await {
-            Ok(response) => response,
-            Err(_) => EdgeResponse::error(&EdgeError::Internal(
-                "Git wire dispatch task did not complete".into(),
-            )),
+    // Acquire expensive Git capacity only after the bounded body has arrived; unauthenticated
+    // trickle uploads cannot monopolize the four Git execution slots during their read deadline.
+    let git_wire_permit = if is_git_wire {
+        match git_wire_slots.try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => return overloaded(),
         }
     } else {
+        None
+    };
+    let gateway_permit = match gateway_dispatch_slots.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return overloaded(),
+    };
+
+    // Every gateway handler is synchronous and may reach blocking filesystem/Git/database adapters.
+    // Keep all of it off Tokio workers. Move permits into the closure so request cancellation cannot
+    // release capacity while the blocking work continues in the background.
+    let edge_response = match tokio::task::spawn_blocking(move || {
+        let _gateway_permit = gateway_permit;
+        let _git_wire_permit = git_wire_permit;
         handle_gateway_safely(&gw, edge_req)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => EdgeResponse::error(&EdgeError::Internal(
+            "gateway dispatch task did not complete".into(),
+        )),
     };
     to_hyper(edge_response)
 }
