@@ -32,6 +32,16 @@ describe("file-lines boundary codec", () => {
     });
   });
 
+  it("admits exactly the maximum inclusive line range", () => {
+    expect(parseFileLinesInput({
+      repo: "core",
+      oid: OID,
+      path: "src/main.rs",
+      start: 37,
+      end: 37 + MAX_FILE_LINES_RANGE - 1,
+    })).not.toBeNull();
+  });
+
   it.each([
     null,
     { repo: "core", oid: OID, path: "x", start: 1, end: 1, extra: true },
