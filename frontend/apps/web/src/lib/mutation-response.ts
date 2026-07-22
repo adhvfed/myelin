@@ -10,6 +10,8 @@ import type {
   PrCommentVM,
   PrReviewVM,
   PrThreadVM,
+  PrThreadsVM,
+  IssuesPage,
 } from "./api";
 
 type WireRecord = Record<string, unknown>;
@@ -110,6 +112,22 @@ export function parseIssueAuthorizationStatus(value: unknown): IssueAuthorizatio
   if (input.status !== "pending" || !issue || !Number.isSafeInteger(input.retry_after_ms) ||
       (input.retry_after_ms as number) < 0 || (input.retry_after_ms as number) > 60_000) return null;
   return { status: "pending", issue, retry_after_ms: input.retry_after_ms as number };
+}
+
+export function parseIssuesPage(value: unknown): IssuesPage | null {
+  const input = record(value);
+  const page = record(input?.page);
+  if (!input || !Array.isArray(input.items) || input.items.length > 100 || !page ||
+      !(page.next_cursor === null || boundedString(page.next_cursor, 192)) ||
+      !Number.isSafeInteger(page.limit) || (page.limit as number) < 1 || (page.limit as number) > 100) {
+    return null;
+  }
+  const items = input.items.map(parseIssue);
+  if (items.some((item) => item === null)) return null;
+  return {
+    items: items as IssueVM[],
+    page: { next_cursor: page.next_cursor, limit: page.limit as number },
+  };
 }
 
 function principal(value: unknown): PrCommentVM["author"] | null {
@@ -213,6 +231,35 @@ export function parseAppliedComment(value: unknown, action: "git.pr.comment.crea
 export function parseAppliedReview(value: unknown): PrReviewVM | null {
   const payload = applied(value, "git.pr.review.start");
   return payload ? review(payload.review) : null;
+}
+
+function threadArray(value: unknown, expected: "discussion" | "anchored" | "all"): PrThreadVM[] | null {
+  if (!Array.isArray(value) || value.length > 4_096) return null;
+  const parsed = value.map(thread);
+  if (parsed.some((entry) => entry === null)) return null;
+  const threads = parsed as PrThreadVM[];
+  if (expected === "discussion" && threads.some((entry) => entry.anchor !== null)) return null;
+  if (expected === "anchored" && threads.some((entry) => entry.anchor === null)) return null;
+  return threads;
+}
+
+export function parsePrThreads(value: unknown): PrThreadsVM | null {
+  const input = record(value);
+  if (!input || input.durable !== true || !Array.isArray(input.reviews) || input.reviews.length > 1_024) {
+    return null;
+  }
+  const discussion = threadArray(input.discussion, "discussion");
+  const anchored = threadArray(input.anchored, "anchored");
+  const threads = threadArray(input.threads, "all");
+  const reviews = input.reviews.map(review);
+  if (!discussion || !anchored || !threads || reviews.some((entry) => entry === null)) return null;
+  return {
+    discussion,
+    anchored,
+    threads,
+    reviews: reviews as PrReviewVM[],
+    durable: true,
+  };
 }
 
 export function hasAppliedAction(value: unknown, action: "git.pr.review.submit" | "git.pr.review.discard"): boolean {

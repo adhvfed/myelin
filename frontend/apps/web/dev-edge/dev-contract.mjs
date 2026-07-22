@@ -360,16 +360,16 @@ const SEED_PR_DIFFS = {
 const SEED_ANCHORED = {
   1: [
     {
-      id: "seed-t1",
-      anchor: { path: "src/list_filter.rs", line: 2, anchor_state: "live" },
+      id: "t-1001",
+      anchor: { path: "src/list_filter.rs", line: 2, side: "new", base_oid: C1, head_oid: C2, anchor_state: "live" },
       resolved: false,
-      comments: [{ id: "seed-c1", author: { kind: "human", display: "u_dev_operator@acme.noreply", on_behalf_of: null, trigger: null }, body_md: "Clamp looks right — nice.", created_at: 1719450500, edited_at: null, state: "visible", review_id: null, pending: false }],
+      comments: [{ id: "c-1001", author: { kind: "human", display: "u_dev_operator@acme.noreply", on_behalf_of: null, trigger: null }, body_md: "Clamp looks right — nice.", created_at: 1719450500, edited_at: null, state: "visible", review_id: null, pending: false }],
     },
     {
-      id: "seed-t2",
-      anchor: { path: "src/list_filter.rs", line: 87, anchor_state: "outdated" },
+      id: "t-1002",
+      anchor: { path: "src/list_filter.rs", line: 87, side: "new", base_oid: C1, head_oid: C2, anchor_state: "outdated" },
       resolved: false,
-      comments: [{ id: "seed-c2", author: { kind: "human", display: "u_dev_operator@acme.noreply", on_behalf_of: null, trigger: null }, body_md: "This was flagged before the rebase.", created_at: 1719450400, edited_at: null, state: "visible", review_id: null, pending: false }],
+      comments: [{ id: "c-1002", author: { kind: "human", display: "u_dev_operator@acme.noreply", on_behalf_of: null, trigger: null }, body_md: "This was flagged before the rebase.", created_at: 1719450400, edited_at: null, state: "visible", review_id: null, pending: false }],
     },
   ],
 };

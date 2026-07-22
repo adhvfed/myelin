@@ -8,7 +8,9 @@ import {
   parseIssue,
   parseIssueAuthorizationStatus,
   parseIssueCreateReceipt,
+  parseIssuesPage,
   parsePrChecks,
+  parsePrThreads,
 } from "./mutation-response";
 
 const SHA1 = "a".repeat(40);
@@ -71,6 +73,18 @@ describe("issue mutation response decoders", () => {
       .toBeNull();
     expect(parseIssue({ ...issue, state_category: "deleted" })).toBeNull();
     expect(parseIssue({ ...issue, updated_at: "not-a-date" })).toBeNull();
+  });
+
+  it("bounds and projects an Issues page", () => {
+    expect(parseIssuesPage({
+      items: [{ ...issue, internal_relation: "must not cross" }],
+      page: { next_cursor: null, limit: 50, total: 1 },
+      internal: "drop",
+    })).toEqual({ items: [issue], page: { next_cursor: null, limit: 50 } });
+    expect(parseIssuesPage({ items: Array(101).fill(issue), page: { next_cursor: null, limit: 100 } }))
+      .toBeNull();
+    expect(parseIssuesPage({ items: [], page: { next_cursor: "x".repeat(193), limit: 50 } }))
+      .toBeNull();
   });
 });
 
@@ -159,5 +173,58 @@ describe("PR mutation response decoders", () => {
     expect(parsePrChecks(checks)).toEqual(checks);
     expect(parsePrChecks({ ...checks, gate_admitted: "false" })).toBeNull();
     expect(parsePrChecks({ ...checks, required_contexts: Array(4_097).fill("build") })).toBeNull();
+  });
+
+  it("projects viewer-scoped conversation arrays and enforces their classification", () => {
+    const discussion = { id: "t-1", anchor: null, resolved: false, comments: [comment] };
+    const anchored = {
+      id: "t-2",
+      anchor: {
+        path: "src/lib.rs",
+        line: 7,
+        side: "new",
+        base_oid: SHA1,
+        head_oid: "b".repeat(40),
+        anchor_state: "live",
+      },
+      resolved: false,
+      comments: [{ ...comment, id: "c-3" }],
+    };
+    const review = {
+      id: "r-1",
+      reviewer: principal,
+      verdict: "in_progress",
+      advisory: false,
+      submitted_at: null,
+      summary_md: null,
+    };
+    expect(parsePrThreads({
+      discussion: [{ ...discussion, private_storage_key: "drop" }],
+      anchored: [anchored],
+      threads: [discussion, anchored],
+      reviews: [{ ...review, internal: "drop" }],
+      durable: true,
+      internal: "drop",
+    })).toEqual({
+      discussion: [discussion],
+      anchored: [anchored],
+      threads: [discussion, anchored],
+      reviews: [review],
+      durable: true,
+    });
+    expect(parsePrThreads({
+      discussion: [],
+      anchored: [discussion],
+      threads: [discussion],
+      reviews: [],
+      durable: true,
+    })).toBeNull();
+    expect(parsePrThreads({
+      discussion: [],
+      anchored: [],
+      threads: [],
+      reviews: [],
+      durable: false,
+    })).toBeNull();
   });
 });

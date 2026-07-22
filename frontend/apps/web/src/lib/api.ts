@@ -19,7 +19,9 @@ import {
   parseIssue,
   parseIssueAuthorizationStatus,
   parseIssueCreateReceipt,
+  parseIssuesPage,
   parsePrChecks,
+  parsePrThreads,
 } from "./mutation-response";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
@@ -605,9 +607,12 @@ export const getPr = query(
 export const getPrChecks = query(
   async (input: { repo: string; n: number }): Promise<PrChecksVM> => {
     "use server";
-    return authed(() =>
-      edgeGet<PrChecksVM>(`/v1/git/repos/${seg(input.repo)}/prs/${input.n}/checks`),
-    );
+    return authed(async () => {
+      const response = await edgeGet(`/v1/git/repos/${seg(input.repo)}/prs/${input.n}/checks`);
+      const checks = parsePrChecks(response);
+      if (!checks) throw new RepoRouteError("error");
+      return checks;
+    });
   },
   "git-pr-checks",
 );
@@ -617,9 +622,12 @@ export const getPrChecks = query(
 export const getPrThreads = query(
   async (input: { repo: string; n: number }): Promise<PrThreadsVM> => {
     "use server";
-    return authed(() =>
-      edgeGet<PrThreadsVM>(`/v1/git/repos/${seg(input.repo)}/prs/${input.n}/threads`),
-    );
+    return authed(async () => {
+      const response = await edgeGet(`/v1/git/repos/${seg(input.repo)}/prs/${input.n}/threads`);
+      const threads = parsePrThreads(response);
+      if (!threads) throw new RepoRouteError("error");
+      return threads;
+    });
   },
   "git-pr-threads",
 );
@@ -691,14 +699,24 @@ export const getIssues = query(
     if (input.key) p.set("key", input.key);
     if (input.cursor) p.set("cursor", input.cursor);
     if (input.limit) p.set("limit", String(input.limit));
-    return issueAuthed(() => edgeGet<IssuesPage>(`/v1/issues?${p.toString()}`));
+    return issueAuthed(async () => {
+      const response = await edgeGet(`/v1/issues?${p.toString()}`);
+      const page = parseIssuesPage(response);
+      if (!page) throw new IssueRouteError("error");
+      return page;
+    });
   },
   "issues-list",
 );
 
 export const getIssue = query(async (id: string): Promise<IssueVM> => {
   "use server";
-  return issueAuthed(() => edgeGet<IssueVM>(`/v1/issues/${seg(id)}`));
+  return issueAuthed(async () => {
+    const response = await edgeGet(`/v1/issues/${seg(id)}`);
+    const issue = parseIssue(response);
+    if (!issue) throw new IssueRouteError("error");
+    return issue;
+  });
 }, "issue-detail");
 
 export type IssueMutationResult =
