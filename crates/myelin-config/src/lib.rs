@@ -33,7 +33,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::env;
+use std::{env, io::Read as _};
+
+/// Maximum accepted OIDC JWK Set document size for both bootstrap and HTTPS refresh paths.
+pub const OIDC_JWKS_MAX_BYTES: usize = 1024 * 1024;
 
 /// An error reading the env config. Loud + typed: a missing required var in prod is a
 /// fail-fast at boot (architecture §3.2 — never a silent fallback to a wrong endpoint).
@@ -305,6 +308,47 @@ fn req(mode: Mode, var: &'static str, dev_default: &str) -> Result<String, Confi
     }
 }
 
+fn non_empty(value: String, var: &'static str) -> Result<String, ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::Invalid {
+            var,
+            reason: "must not be empty".into(),
+        });
+    }
+    Ok(value)
+}
+
+fn bounded_jwks(document: String, var: &'static str) -> Result<String, ConfigError> {
+    if document.trim().is_empty() {
+        return Err(ConfigError::Invalid {
+            var,
+            reason: "must not be empty".into(),
+        });
+    }
+    if document.len() > OIDC_JWKS_MAX_BYTES {
+        return Err(ConfigError::Invalid {
+            var,
+            reason: format!("must not exceed {OIDC_JWKS_MAX_BYTES} bytes"),
+        });
+    }
+    Ok(document)
+}
+
+fn read_jwks_file(path: &str) -> Result<String, ConfigError> {
+    let file = std::fs::File::open(path).map_err(|error| ConfigError::Invalid {
+        var: "MYELIN_OIDC_JWKS_FILE",
+        reason: format!("cannot open JWKS file: {error}"),
+    })?;
+    let mut document = String::new();
+    file.take((OIDC_JWKS_MAX_BYTES + 1) as u64)
+        .read_to_string(&mut document)
+        .map_err(|error| ConfigError::Invalid {
+            var: "MYELIN_OIDC_JWKS_FILE",
+            reason: format!("cannot read JWKS file: {error}"),
+        })?;
+    bounded_jwks(document, "MYELIN_OIDC_JWKS_FILE")
+}
+
 /// Resolve the OPTIONAL OIDC login surface (R2.5). OIDC is opt-in in BOTH modes:
 /// - **absent** (none of the OIDC vars set) → `Ok(None)` — the edge keeps refuse-not-mock human
 ///   login and boot succeeds (we do NOT force every prod deploy to configure an IdP before this
@@ -332,8 +376,14 @@ fn oidc_from_env(mode: Mode) -> Result<Option<OidcSettings>, ConfigError> {
     }
 
     // Any OIDC var present ⇒ the full set is required (partial config fails loud).
-    let issuer = issuer.ok_or(ConfigError::Missing("MYELIN_OIDC_ISSUER"))?;
-    let audience = audience.ok_or(ConfigError::Missing("MYELIN_OIDC_AUDIENCE"))?;
+    let issuer = non_empty(
+        issuer.ok_or(ConfigError::Missing("MYELIN_OIDC_ISSUER"))?,
+        "MYELIN_OIDC_ISSUER",
+    )?;
+    let audience = non_empty(
+        audience.ok_or(ConfigError::Missing("MYELIN_OIDC_AUDIENCE"))?,
+        "MYELIN_OIDC_AUDIENCE",
+    )?;
     let jwks_json = match (jwks_inline, jwks_file) {
         (Some(_), Some(_)) => {
             return Err(ConfigError::Invalid {
@@ -343,15 +393,8 @@ fn oidc_from_env(mode: Mode) -> Result<Option<OidcSettings>, ConfigError> {
                     .into(),
             })
         }
-        (Some(json), None) => Some(json),
-        (None, Some(path)) => {
-            Some(
-                std::fs::read_to_string(&path).map_err(|e| ConfigError::Invalid {
-                    var: "MYELIN_OIDC_JWKS_FILE",
-                    reason: format!("cannot read JWKS file `{path}`: {e}"),
-                })?,
-            )
-        }
+        (Some(json), None) => Some(bounded_jwks(json, "MYELIN_OIDC_JWKS")?),
+        (None, Some(path)) => Some(read_jwks_file(&path)?),
         (None, None) => None,
     };
     if mode == Mode::RequireEnv && jwks_uri.is_none() {
@@ -365,7 +408,9 @@ fn oidc_from_env(mode: Mode) -> Result<Option<OidcSettings>, ConfigError> {
         issuer,
         audience,
         jwks_json,
-        jwks_uri,
+        jwks_uri: jwks_uri
+            .map(|value| non_empty(value, "MYELIN_OIDC_JWKS_URI"))
+            .transpose()?,
     }))
 }
 
@@ -699,6 +744,33 @@ mod tests {
                 var: "MYELIN_OIDC_JWKS",
                 ..
             }
+        ));
+        clear();
+    }
+
+    #[test]
+    fn oidc_rejects_blank_identity_and_oversized_bootstrap() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear();
+        env::set_var("MYELIN_OIDC_ISSUER", "   ");
+        env::set_var("MYELIN_OIDC_AUDIENCE", "myelin-rp");
+        env::set_var("MYELIN_OIDC_JWKS", "{}");
+        assert!(matches!(
+            oidc_from_env(Mode::DevDefaults),
+            Err(ConfigError::Invalid {
+                var: "MYELIN_OIDC_ISSUER",
+                ..
+            })
+        ));
+
+        env::set_var("MYELIN_OIDC_ISSUER", "https://idp.example.com");
+        env::set_var("MYELIN_OIDC_JWKS", "x".repeat(OIDC_JWKS_MAX_BYTES + 1));
+        assert!(matches!(
+            oidc_from_env(Mode::DevDefaults),
+            Err(ConfigError::Invalid {
+                var: "MYELIN_OIDC_JWKS",
+                ..
+            })
         ));
         clear();
     }
