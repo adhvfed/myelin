@@ -144,6 +144,10 @@ pub const CI_JOB_QUEUE_COMPLETION_MIGRATION_ID: &str = "ci_0004a_job_queue_compl
 /// Forward-only follow-on for the unguessable claim nonce and queue-authority stage. Kept separate
 /// from `ci_0004a` because that migration was already applied with only epoch + receipt columns.
 pub const CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID: &str = "ci_0004b_job_queue_claim_authority";
+/// Forward-only persisted initial claim timestamps. These are immutable within one lease generation
+/// even when heartbeat extends `lease_expires`, allowing claim-time Identity minting to verify the
+/// exact timestamps returned by the scheduler rather than trusting caller memory.
+pub const CI_JOB_QUEUE_CLAIM_TIME_MIGRATION_ID: &str = "ci_0004c_job_queue_claim_time";
 /// Forward-only migration id for [`GRANT_SCHEDULER_LEASE_EPOCH_DDL`]. A follow-on to the already-applied
 /// `ci_0016_region_scheduler_rls` grant (byte-frozen), extending the region scheduler's column-scoped
 /// `UPDATE` grant to the new `lease_epoch` column the claim bumps — least-privilege preserved (no new
@@ -153,6 +157,8 @@ pub const CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID: &str =
 /// Additive scheduler grant for the fresh per-claim nonce, without changing applied `ci_0016a`.
 pub const CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID: &str =
     "ci_0016b_scheduler_claim_nonce_grant";
+/// Additive least-privilege grant for the two initial-claim timestamp columns.
+pub const CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID: &str = "ci_0016c_scheduler_claim_time_grant";
 /// Additive queued-run discovery index, kept separate from the byte-frozen `ci_run` table create.
 pub const CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID: &str = "ci_0018_ci_run_queued_region";
 /// Additive, column-minimal queued-run discovery grant for the constrained region scheduler.
@@ -599,6 +605,12 @@ pub const ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL: &str = "ALTER TABLE job_queue
 ADD COLUMN IF NOT EXISTS claim_nonce uuid, \
 ADD COLUMN IF NOT EXISTS stage text";
 
+/// Persist the original claim window separately from the heartbeat-extended execution lease. Both
+/// values are written from the same PostgreSQL `statement_timestamp()` as the claim response.
+pub const ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL: &str = "ALTER TABLE job_queue \
+ADD COLUMN IF NOT EXISTS claim_started_at timestamptz, \
+ADD COLUMN IF NOT EXISTS claim_expires_at timestamptz";
+
 /// **The immutable forward-only grant for the original claim epoch.**
 /// The `ci_0016_region_scheduler_rls` boundary grants `UPDATE (state, lease_owner, lease_expires)` (that
 /// applied migration stays byte-frozen). The claim now also bumps `lease_epoch`, so the least-privilege
@@ -612,6 +624,10 @@ pub const GRANT_SCHEDULER_LEASE_EPOCH_DDL: &str =
 /// Add only the nonce capability in a new migration; `ci_0016a` remains checksum-compatible.
 pub const GRANT_SCHEDULER_CLAIM_NONCE_DDL: &str =
     "GRANT UPDATE (claim_nonce) ON job_queue TO myelin_ci_region_scheduler";
+
+/// Add only the two timestamp columns the scheduler writes when minting a claim generation.
+pub const GRANT_SCHEDULER_CLAIM_TIME_DDL: &str = "GRANT UPDATE \
+(claim_started_at, claim_expires_at) ON job_queue TO myelin_ci_region_scheduler";
 
 /// Every CI Control-Plane CREATE-TABLE DDL paired with its table name + a stable migration id, in
 /// FK-dependency order (`ci_run` before `ci_job`). Indexes are deliberately not bundled here:
@@ -894,6 +910,11 @@ pub fn ci_controlplane_migrations() -> Migrations {
                 ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
                 JOB_QUEUE_TABLE,
             ));
+            migrations.push(Migration::plain_on(
+                CI_JOB_QUEUE_CLAIM_TIME_MIGRATION_ID,
+                ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+                JOB_QUEUE_TABLE,
+            ));
         }
         if table == CI_JOB_SPEC_TABLE {
             // The durable stage column (CT-004d.2 rewire) — a forward-only sub-migration applied
@@ -926,6 +947,11 @@ pub fn ci_controlplane_migrations() -> Migrations {
     migrations.push(Migration::plain_on(
         CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
         GRANT_SCHEDULER_CLAIM_NONCE_DDL,
+        JOB_QUEUE_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID,
+        GRANT_SCHEDULER_CLAIM_TIME_DDL,
         JOB_QUEUE_TABLE,
     ));
     migrations.push(Migration::plain_on(
@@ -1123,8 +1149,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            32,
-            "17 table/RLS + 1 ci_run causal ALTER + 5 concurrent-index + 1 index-validation + 2 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 2 scheduler claim grants + 1 scheduler ci_run discovery grant"
+            34,
+            "17 table/RLS + 1 ci_run causal ALTER + 5 concurrent-index + 1 index-validation + 3 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 1 scheduler ci_run discovery grant"
         );
         for m in &migrations.0 {
             assert!(
@@ -1156,10 +1182,14 @@ mod tests {
                 assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL);
             } else if m.id == CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL);
+            } else if m.id == CI_JOB_QUEUE_CLAIM_TIME_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL);
             } else if m.id == CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_LEASE_EPOCH_DDL);
             } else if m.id == CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CLAIM_NONCE_DDL);
+            } else if m.id == CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID {
+                assert_eq!(m.ddl, GRANT_SCHEDULER_CLAIM_TIME_DDL);
             } else if m.id == CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL);
             } else if m.id == CI_REGION_SCHEDULER_RLS_MIGRATION_ID {
@@ -1194,8 +1224,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            32,
-            "the runner applied all 17 table/RLS, 1 ci_run causal ALTER, 5 concurrent-index, 1 index-validation, 2 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 2 scheduler claim grants, and 1 scheduler ci_run discovery grant"
+            34,
+            "the runner applied all 17 table/RLS, 1 ci_run causal ALTER, 5 concurrent-index, 1 index-validation, 3 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, and 1 scheduler ci_run discovery grant"
         );
         assert_eq!(
             runner.applied()[0],
@@ -1246,6 +1276,12 @@ mod tests {
             .find(|m| m.id == CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID)
             .expect("immutable nonce grant remains present");
         assert_eq!(nonce_grant.ddl, GRANT_SCHEDULER_CLAIM_NONCE_DDL);
+        let claim_time_grant = migrations
+            .0
+            .iter()
+            .find(|m| m.id == CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID)
+            .expect("claim-time grant is present");
+        assert_eq!(claim_time_grant.ddl, GRANT_SCHEDULER_CLAIM_TIME_DDL);
         let scheduler = migrations
             .0
             .iter()

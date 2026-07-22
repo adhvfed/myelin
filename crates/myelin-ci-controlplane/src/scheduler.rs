@@ -121,13 +121,15 @@ SET state = 'leased',
     lease_owner = $4,
     lease_expires = statement_timestamp() + ($5 || ' seconds')::interval,
     lease_epoch = j.lease_epoch + 1,
-    claim_nonce = gen_random_uuid()
+    claim_nonce = gen_random_uuid(),
+    claim_started_at = statement_timestamp(),
+    claim_expires_at = statement_timestamp() + ($5 || ' seconds')::interval
 FROM eligible e
 WHERE j.tenant_id = e.tenant_id AND j.job_id = e.job_id
 RETURNING j.tenant_id, j.job_id, j.run_id, j.lane, j.concurrency_group, j.fair_key, j.trust_tier,
           j.lease_epoch, j.claim_nonce::text AS claim_nonce,
-          EXTRACT(EPOCH FROM statement_timestamp())::bigint AS claim_started_at_epoch_secs,
-          EXTRACT(EPOCH FROM j.lease_expires)::bigint AS claim_expires_at_epoch_secs";
+          EXTRACT(EPOCH FROM j.claim_started_at)::bigint AS claim_started_at_epoch_secs,
+          EXTRACT(EPOCH FROM j.claim_expires_at)::bigint AS claim_expires_at_epoch_secs";
 
 /// **Cancel-superseded (arch 02 §2.3) — a new push to a PR cancels the in-flight run for that group.**
 /// On a new enqueue for a `pr:%` concurrency group, the prior `queued`/`leased` rows for that group

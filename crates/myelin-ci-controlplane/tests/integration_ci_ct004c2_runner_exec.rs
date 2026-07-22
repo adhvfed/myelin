@@ -34,9 +34,9 @@ use std::sync::{Arc, Mutex};
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_region_queue_store_test_support, DurableEnqueue, DurableLeaseAdapter,
     DurableLogPersist, EnqueueOutcome, JobSpecResolver, Lane, LeasedJob, LogPipelineSink,
-    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
-    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
-    CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
 };
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
@@ -109,6 +109,10 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL)
         .await
         .expect("add job_queue claim nonce + stage authority");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL)
+        .await
+        .expect("add persisted job_queue claim times");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin.execute(idx.as_str()).await.expect("index");

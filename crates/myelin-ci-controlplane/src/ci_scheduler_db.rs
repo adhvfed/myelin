@@ -247,6 +247,8 @@ struct SchedulerProbe {
     job_update_expiry: bool,
     job_update_epoch: bool,
     job_update_nonce: bool,
+    job_update_claim_started_at: bool,
+    job_update_claim_expires_at: bool,
     fair_select: bool,
     run_select_tenant: bool,
     run_select_region: bool,
@@ -340,6 +342,8 @@ fn validate_probe_before_mapping(
         && scheduler.job_update_expiry
         && scheduler.job_update_epoch
         && scheduler.job_update_nonce
+        && scheduler.job_update_claim_started_at
+        && scheduler.job_update_claim_expires_at
         && scheduler.fair_select
         && scheduler.run_select_tenant
         && scheduler.run_select_region
@@ -442,6 +446,8 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'lease_expires', 'UPDATE') AS job_update_expiry,
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'lease_epoch', 'UPDATE') AS job_update_epoch,
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'claim_nonce', 'UPDATE') AS job_update_nonce,
+                pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'claim_started_at', 'UPDATE') AS job_update_claim_started_at,
+                pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'claim_expires_at', 'UPDATE') AS job_update_claim_expires_at,
                 pg_catalog.has_table_privilege(session_user, 'public.fair_deficit', 'SELECT') AS fair_select,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'tenant_id', 'SELECT') AS run_select_tenant,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'region', 'SELECT') AS run_select_region,
@@ -464,7 +470,10 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                      WHERE column_grant.attrelid = 'public.job_queue'::regclass
                        AND column_grant.attnum > 0
                        AND NOT column_grant.attisdropped
-                       AND column_grant.attname NOT IN ('state', 'lease_owner', 'lease_expires', 'lease_epoch', 'claim_nonce')
+                       AND column_grant.attname NOT IN (
+                         'state', 'lease_owner', 'lease_expires', 'lease_epoch', 'claim_nonce',
+                         'claim_started_at', 'claim_expires_at'
+                       )
                        AND pg_catalog.has_column_privilege(
                          session_user, column_grant.attrelid, column_grant.attnum, 'UPDATE'
                        )
@@ -602,6 +611,8 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
         job_update_expiry: row.get("job_update_expiry"),
         job_update_epoch: row.get("job_update_epoch"),
         job_update_nonce: row.get("job_update_nonce"),
+        job_update_claim_started_at: row.get("job_update_claim_started_at"),
+        job_update_claim_expires_at: row.get("job_update_claim_expires_at"),
         fair_select: row.get("fair_select"),
         run_select_tenant: row.get("run_select_tenant"),
         run_select_region: row.get("run_select_region"),
