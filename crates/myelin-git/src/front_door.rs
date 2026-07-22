@@ -806,11 +806,14 @@ mod tests {
         ) -> Result<Vec<crate::core::DiffLine>, GitCoreError> {
             unreachable!()
         }
-        fn blame(
+        fn blame_bounded(
             &self,
             _r: &RepoLoc,
             _p: &str,
             _a: &crate::core::Oid,
+            _maximum_path_bytes: usize,
+            _maximum_blob_bytes: usize,
+            _maximum_hunks: usize,
         ) -> Result<Vec<crate::core::BlameHunk>, GitCoreError> {
             unreachable!()
         }

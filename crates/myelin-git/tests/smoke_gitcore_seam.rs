@@ -203,7 +203,14 @@ fn gitcore_seam_clones_via_canonical_wire_then_diffs_and_blames_via_gix() {
 
     // blame file.txt at c2 in-process — real line provenance across the two commits.
     let blame = core
-        .blame(&repo, "file.txt", &myelin_git::core::Oid::new(&c2))
+        .blame_bounded(
+            &repo,
+            "file.txt",
+            &myelin_git::core::Oid::new(&c2),
+            128,
+            1024,
+            100,
+        )
         .expect("in-process blame succeeds");
     assert!(!blame.is_empty(), "blame produced hunks");
     let total_lines: usize = blame.iter().map(|h| h.lines).sum();
@@ -216,6 +223,22 @@ fn gitcore_seam_clones_via_canonical_wire_then_diffs_and_blames_via_gix() {
     assert!(
         attributed.contains(&c1) && attributed.contains(&c2),
         "blame attributes lines to BOTH commits (c1 unchanged, c2 changed); got {attributed:?}"
+    );
+    let c2_oid = myelin_git::core::Oid::new(&c2);
+    assert!(
+        core.blame_bounded(&repo, "file.txt", &c2_oid, 7, 1024, 100)
+            .is_err(),
+        "path cap plus one is rejected"
+    );
+    assert!(
+        core.blame_bounded(&repo, "file.txt", &c2_oid, 128, 1, 100)
+            .is_err(),
+        "blob cap plus one is rejected from the target tree"
+    );
+    assert!(
+        core.blame_bounded(&repo, "file.txt", &c2_oid, 128, 1024, 0)
+            .is_err(),
+        "hunk cap plus one is rejected"
     );
 
     // read_blob in-process returns the exact bytes.
