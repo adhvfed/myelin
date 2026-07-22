@@ -45,7 +45,7 @@ use crate::{ArtifactRef, EventEnvelope, EventId};
 /// There are deliberately no unlimited defaults: callers must choose finite byte and message
 /// bounds, a retention age, a deduplication window, and a replica count appropriate for the NATS
 /// cluster they operate.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JetStreamPublisherConfig {
     pub nats_url: String,
     pub stream_name: String,
@@ -58,7 +58,7 @@ pub struct JetStreamPublisherConfig {
 }
 
 /// Explicit bounded-capacity policy for a durable JetStream pull consumer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JetStreamConsumerConfig {
     pub nats_url: String,
     pub stream_name: String,
@@ -70,6 +70,40 @@ pub struct JetStreamConsumerConfig {
     pub max_ack_pending: i64,
     pub max_batch: usize,
     pub max_expires: std::time::Duration,
+}
+
+impl core::fmt::Debug for JetStreamPublisherConfig {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("JetStreamPublisherConfig")
+            .field("nats_url", &"<redacted>")
+            .field("stream_name", &self.stream_name)
+            .field("subject_root", &self.subject_root)
+            .field("max_age", &self.max_age)
+            .field("max_bytes", &self.max_bytes)
+            .field("max_messages", &self.max_messages)
+            .field("replicas", &self.replicas)
+            .field("duplicate_window", &self.duplicate_window)
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for JetStreamConsumerConfig {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("JetStreamConsumerConfig")
+            .field("nats_url", &"<redacted>")
+            .field("stream_name", &self.stream_name)
+            .field("subject_root", &self.subject_root)
+            .field("filter_subject", &self.filter_subject)
+            .field("consumer_name", &self.consumer_name)
+            .field("ack_wait", &self.ack_wait)
+            .field("max_deliver", &self.max_deliver)
+            .field("max_ack_pending", &self.max_ack_pending)
+            .field("max_batch", &self.max_batch)
+            .field("max_expires", &self.max_expires)
+            .finish()
+    }
 }
 
 impl JetStreamConsumerConfig {
@@ -1006,6 +1040,25 @@ mod publisher_tests {
         assert_eq!(stream.num_replicas, cfg.replicas);
         assert_eq!(stream.subjects, vec!["myelin.events.>"]);
         assert_eq!(stream.duplicate_window, cfg.duplicate_window);
+    }
+
+    #[test]
+    fn config_debug_redacts_nats_credentials() {
+        let secret = "unique-nats-password";
+        let mut publisher = config();
+        publisher.nats_url = format!("nats://operator:{secret}@127.0.0.1:4222");
+        let consumer = JetStreamConsumerConfig::bounded(
+            publisher.nats_url.clone(),
+            "MYELIN_EVENTS",
+            "myelin.events",
+            "myelin.events.git",
+            "git-consumer",
+        );
+
+        for rendered in [format!("{publisher:?}"), format!("{consumer:?}")] {
+            assert!(rendered.contains("<redacted>"));
+            assert!(!rendered.contains(secret));
+        }
     }
 
     #[test]
