@@ -727,12 +727,6 @@ impl DurableGitRepo {
         }
     }
 
-    /// List every ref `(name, tip)` on disk. The repo's entry points — loaded from disk, never an
-    /// empty map (SI-012).
-    pub fn list_refs(&self) -> Result<Vec<(String, Oid)>, DurableError> {
-        self.list_refs_bounded(usize::MAX)
-    }
-
     /// List direct refs with an explicit materialization ceiling. Wire-facing callers use this
     /// before advertising or walking all tips so tenant-created ref cardinality remains finite.
     pub fn list_refs_bounded(
@@ -2126,7 +2120,7 @@ impl DurableGitRepo {
         })
         .map_err(|e| git_err("odb foreach (corrupt object?)", e))?;
         // (b) every ref points at an object present in the odb (no dangling ref).
-        for (name, tip) in self.list_refs()? {
+        for (name, tip) in self.list_refs_bounded(WIRE_MAX_REFS)? {
             let goid = Self::parse_oid(&tip)?;
             if !odb.exists(goid) {
                 return Err(DurableError::Git(format!(
@@ -2585,7 +2579,7 @@ mod tests {
                 if message == "wire ref limit exceeded: direct ref count"
         ));
         assert_eq!(
-            repo2.list_refs().expect("list"),
+            repo2.list_refs_bounded(WIRE_MAX_REFS).expect("list"),
             vec![("refs/heads/main".to_string(), commit)]
         );
 

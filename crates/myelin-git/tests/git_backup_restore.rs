@@ -146,7 +146,9 @@ fn destructive_round_trip_into_a_clean_target_is_git_fsck_clean() {
 
     // Every ref reads back identical (same name → same oid).
     assert_eq!(
-        restored.list_refs().expect("list restored refs"),
+        restored
+            .list_refs_bounded(1_000_000)
+            .expect("list restored refs"),
         want,
         "every ref restored identical (name → oid)"
     );
@@ -252,7 +254,11 @@ fn a_failed_restore_does_not_poison_the_target() {
     // (2) Retry with the GOOD artifact into the SAME target → succeeds (no TargetNotClean block).
     let restored = restore_repo(&dst_store, &loc, &good)
         .expect("retry with a good artifact must succeed on the un-poisoned target");
-    assert_eq!(restored.list_refs().unwrap(), want, "the retry restored every ref");
+    assert_eq!(
+        restored.list_refs_bounded(1_000_000).unwrap(),
+        want,
+        "the retry restored every ref"
+    );
     assert_git_fsck_clean(restored.path());
 
     std::fs::remove_dir_all(&src_root).ok();
@@ -292,8 +298,8 @@ fn multiple_repos_restore_independently_and_tenant_scoped() {
     let restored_b = restore_repo(&dst_store, &b, &backup_b).expect("restore b");
 
     // Each restored repo holds exactly its own refs.
-    assert_eq!(restored_a.list_refs().unwrap(), want_a);
-    assert_eq!(restored_b.list_refs().unwrap(), want_b);
+    assert_eq!(restored_a.list_refs_bounded(1_000_000).unwrap(), want_a);
+    assert_eq!(restored_b.list_refs_bounded(1_000_000).unwrap(), want_b);
 
     // Tenant/region pathing preserved.
     assert_eq!(
