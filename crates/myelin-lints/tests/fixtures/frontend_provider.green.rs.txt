@@ -1,0 +1,2 @@
+// FRONTEND-CONTRACT: fixture-frontend-parity
+const GOLDEN: &str = "crates/myelin-lints/tests/fixtures/frontend_contract.green.json";

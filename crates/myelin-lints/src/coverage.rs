@@ -31,6 +31,9 @@
 //!        or
 //!      - `status = "deferred"` + a `landing` prompt id (`P-NNN` / `P-S21` etc.) — the row is not
 //!        yet implemented and names exactly which prompt will ship its pair.
+//!   3. the **frontend registry** — every `[[frontend]]` entry names one golden vector artifact,
+//!      its Rust provider test, frontend mock consumer test, and browser proof. Zero entries or a
+//!      test that stops naming the shared artifact is a loud failure.
 //!
 //! The scanner FAILS LOUDLY (a typed [`CoverageError`], a non-zero process exit in the
 //! [`contract-coverage` binary](../bin/contract-coverage.rs)) on ANY of:
@@ -109,6 +112,17 @@ pub struct ManifestEntry {
     pub row: RowId,
     pub title: String,
     pub coverage: Coverage,
+}
+
+/// One browser-facing contract whose golden vectors must be consumed on both sides of the mock
+/// seam and whose user flow must have a named browser proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontendContract {
+    pub id: String,
+    pub golden: String,
+    pub rust_tests: Vec<String>,
+    pub frontend_tests: Vec<String>,
+    pub e2e_tests: Vec<String>,
 }
 
 /// A single, LOUD coverage failure. Each variant is a way a row can LIE about its coverage — the
@@ -256,6 +270,7 @@ pub fn parse_manifest(toml: &str) -> Result<Vec<ManifestEntry>, String> {
         }
     }
 
+    let mut skipping_frontend = false;
     for (lineno, line) in logical {
         let line = line.trim();
         if line.is_empty() {
@@ -266,6 +281,17 @@ pub fn parse_manifest(toml: &str) -> Result<Vec<ManifestEntry>, String> {
                 entries.push(e.finish(lineno)?);
             }
             cur = Some(RawEntry::default());
+            skipping_frontend = false;
+            continue;
+        }
+        if line == "[[frontend]]" {
+            if let Some(e) = cur.take() {
+                entries.push(e.finish(lineno)?);
+            }
+            skipping_frontend = true;
+            continue;
+        }
+        if skipping_frontend {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
@@ -295,6 +321,102 @@ pub fn parse_manifest(toml: &str) -> Result<Vec<ManifestEntry>, String> {
         entries.push(e.finish(usize::MAX)?);
     }
     Ok(entries)
+}
+
+/// Parse the independent `[[frontend]]` registry from the same manifest. These entries are not
+/// architecture row aliases: they gate executable parity between a browser mock and its real
+/// provider, plus the browser flow that relies on it.
+pub fn parse_frontend_contracts(toml: &str) -> Result<Vec<FrontendContract>, String> {
+    let mut entries = Vec::new();
+    let mut cur: Option<RawFrontendContract> = None;
+    let raw_lines: Vec<&str> = toml.lines().collect();
+    let mut i = 0;
+    while i < raw_lines.len() {
+        let lineno = i;
+        let mut line = strip_toml_comment(raw_lines[i]).trim().to_string();
+        let mut opens = line.matches('[').count();
+        let mut closes = line.matches(']').count();
+        i += 1;
+        while !line.starts_with("[[") && opens > closes && i < raw_lines.len() {
+            let next = strip_toml_comment(raw_lines[i]).trim();
+            line.push(' ');
+            line.push_str(next);
+            opens += next.matches('[').count();
+            closes += next.matches(']').count();
+            i += 1;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "[[frontend]]" {
+            if let Some(entry) = cur.take() {
+                entries.push(entry.finish(lineno)?);
+            }
+            cur = Some(RawFrontendContract::default());
+            continue;
+        }
+        if line == "[[contract]]" {
+            if let Some(entry) = cur.take() {
+                entries.push(entry.finish(lineno)?);
+            }
+            continue;
+        }
+        let Some(entry) = cur.as_mut() else {
+            continue;
+        };
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!(
+                "line {}: not a key = value pair: {line}",
+                lineno + 1
+            ));
+        };
+        match key.trim() {
+            "id" => entry.id = Some(unquote(value.trim(), lineno)?),
+            "golden" => entry.golden = Some(unquote(value.trim(), lineno)?),
+            "rust_tests" => entry.rust_tests = Some(parse_string_array(value.trim(), lineno)?),
+            "frontend_tests" => {
+                entry.frontend_tests = Some(parse_string_array(value.trim(), lineno)?)
+            }
+            "e2e_tests" => entry.e2e_tests = Some(parse_string_array(value.trim(), lineno)?),
+            other => {
+                return Err(format!(
+                    "line {}: unknown frontend key `{other}`",
+                    lineno + 1
+                ))
+            }
+        }
+    }
+    if let Some(entry) = cur.take() {
+        entries.push(entry.finish(usize::MAX)?);
+    }
+    Ok(entries)
+}
+
+#[derive(Default)]
+struct RawFrontendContract {
+    id: Option<String>,
+    golden: Option<String>,
+    rust_tests: Option<Vec<String>>,
+    frontend_tests: Option<Vec<String>>,
+    e2e_tests: Option<Vec<String>>,
+}
+
+impl RawFrontendContract {
+    fn finish(self, lineno: usize) -> Result<FrontendContract, String> {
+        let near = lineno.saturating_add(1);
+        Ok(FrontendContract {
+            id: self
+                .id
+                .ok_or_else(|| format!("frontend entry near line {near} has no `id`"))?,
+            golden: self
+                .golden
+                .ok_or_else(|| format!("frontend entry near line {near} has no `golden`"))?,
+            rust_tests: self.rust_tests.unwrap_or_default(),
+            frontend_tests: self.frontend_tests.unwrap_or_default(),
+            e2e_tests: self.e2e_tests.unwrap_or_default(),
+        })
+    }
 }
 
 #[derive(Default)]
@@ -452,6 +574,77 @@ impl ScanReport {
 pub trait CdcSource {
     /// Return the source text of `file` (workspace-relative), or `None` if it does not exist.
     fn read(&self, file: &str) -> Option<String>;
+}
+
+/// Verify that frontend contracts are registered and mechanically tied to one shared artifact.
+/// Both provider/consumer tests must name the artifact and contract marker; browser proofs must
+/// name the marker. Returning strings keeps the existing architecture-row error type stable.
+pub fn scan_frontend_contracts(
+    contracts: &[FrontendContract],
+    source: &dyn CdcSource,
+) -> Vec<String> {
+    if contracts.is_empty() {
+        return vec!["frontend contracts: manifest has zero `[[frontend]]` entries".into()];
+    }
+    let mut errors = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for contract in contracts {
+        let id = contract.id.trim();
+        if id.is_empty() {
+            errors.push("frontend contract has an empty id".into());
+            continue;
+        }
+        if !ids.insert(id.to_string()) {
+            errors.push(format!(
+                "frontend contract `{id}` is registered more than once"
+            ));
+        }
+        let marker = format!("FRONTEND-CONTRACT: {id}");
+        match source.read(&contract.golden) {
+            None => errors.push(format!(
+                "frontend contract `{id}` golden `{}` does not exist",
+                contract.golden
+            )),
+            Some(golden) => {
+                if !golden.contains(id) || !golden.contains("\"vectors\"") {
+                    errors.push(format!(
+                        "frontend contract `{id}` golden `{}` lacks its id or vectors",
+                        contract.golden
+                    ));
+                }
+            }
+        }
+        for (kind, files, must_name_golden) in [
+            ("Rust provider", &contract.rust_tests, true),
+            ("frontend consumer", &contract.frontend_tests, true),
+            ("browser proof", &contract.e2e_tests, false),
+        ] {
+            if files.is_empty() {
+                errors.push(format!("frontend contract `{id}` has no {kind} files"));
+            }
+            for file in files {
+                match source.read(file) {
+                    None => errors.push(format!(
+                        "frontend contract `{id}` {kind} file `{file}` does not exist"
+                    )),
+                    Some(body) => {
+                        if !body.contains(&marker) {
+                            errors.push(format!(
+                                "frontend contract `{id}` {kind} file `{file}` lacks `{marker}`"
+                            ));
+                        }
+                        if must_name_golden && !body.contains(&contract.golden) {
+                            errors.push(format!(
+                                "frontend contract `{id}` {kind} file `{file}` does not consume `{}`",
+                                contract.golden
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    errors
 }
 
 /// The production [`CdcSource`]: reads real files relative to a workspace root.

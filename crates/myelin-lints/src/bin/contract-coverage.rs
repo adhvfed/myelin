@@ -6,8 +6,10 @@
 //! (`planning/05-refined-shared-systems-architecture/contract-index.md`) against the coverage
 //! manifest (`contract-coverage.toml` at the workspace root), verifying every `covered` row's
 //! named provider+consumer CDC file exists on disk and carries both sides, and that every
-//! `deferred` row names its landing prompt. It **exits NON-ZERO on any falsely-claimed or dropped
-//! row** — the gate is the process exit code itself, so there is no `... || true` swallow path
+//! `deferred` row names its landing prompt. Browser-facing entries additionally bind one shared
+//! golden artifact to their Rust provider, frontend consumer, and browser proof. It **exits
+//! NON-ZERO on any falsely-claimed or dropped contract** — the gate is the process exit code
+//! itself, so there is no `... || true` swallow path
 //! (doctrine EI-01 §5: "an uncommitted gate is no gate; make violations loud").
 //!
 //! Usage:
@@ -16,7 +18,8 @@
 //!                                                to point at a red fixture).
 
 use myelin_lints::coverage::{
-    parse_contract_index_rows, parse_manifest, scan, workspace_root, FsCdc,
+    parse_contract_index_rows, parse_frontend_contracts, parse_manifest, scan,
+    scan_frontend_contracts, workspace_root, FsCdc,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -78,28 +81,42 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let frontend = match parse_frontend_contracts(&manifest_src) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("contract-coverage: FAIL — malformed frontend coverage registry: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let cdc = FsCdc {
         workspace_root: root,
     };
     let report = scan(&rows, &manifest, &cdc);
+    let frontend_errors = scan_frontend_contracts(&frontend, &cdc);
 
-    if report.is_green() {
+    if report.is_green() && frontend_errors.is_empty() {
         eprintln!(
             "contract-coverage: OK — {} contract rows reconciled ({} covered with a verified \
-             provider+consumer CDC pair, {} deferred with a named landing prompt), 0 \
-             falsely-claimed.",
-            report.rows_checked, report.covered, report.deferred
+             provider+consumer CDC pair, {} deferred with a named landing prompt), {} frontend \
+             contract(s) tied to shared provider/consumer vectors, 0 falsely-claimed.",
+            report.rows_checked,
+            report.covered,
+            report.deferred,
+            frontend.len()
         );
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "contract-coverage: FAIL — {} contract row(s) lie about coverage (loud, never \
-             swallowed — ship the missing CDC pair or mark the row deferred with its landing \
-             prompt; NEVER weaken the gate):",
-            report.errors.len()
+            "contract-coverage: FAIL — {} contract coverage violation(s) (loud, never swallowed — \
+             ship the missing CDC pair/shared frontend vectors or name the deferred landing; \
+             NEVER weaken the gate):",
+            report.errors.len() + frontend_errors.len()
         );
         for err in &report.errors {
+            eprintln!("  {err}");
+        }
+        for err in &frontend_errors {
             eprintln!("  {err}");
         }
         ExitCode::FAILURE

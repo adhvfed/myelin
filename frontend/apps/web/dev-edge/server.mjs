@@ -379,6 +379,14 @@ const server = createServer((req, res) => {
     return send(res, 200, whoamiJson());
   }
 
+  if (method === "GET" && path === "/v1/notif/inbox") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (url.search !== "?view=all&limit=50") {
+      return send(res, 400, { error: { message: "invalid inbox request", code: "bad_request" } });
+    }
+    return send(res, 200, { items: [], page: { next_cursor: null, limit: 50 } });
+  }
+
   if (method === "GET" && path === "/v1/git/repos") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
     if (url.searchParams.has("view")) {
@@ -603,6 +611,9 @@ const server = createServer((req, res) => {
       });
       if (v?.__status === 400) {
         return send(res, 400, { error: { message: "invalid refs request", code: "bad_request" } });
+      }
+      if (v?.__status === 409) {
+        return send(res, 409, { error: { message: "refs cursor is stale", code: "conflict" } });
       }
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("repository"));
     }

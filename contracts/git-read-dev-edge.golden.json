@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "contract_id": "git-read-dev-edge-parity",
+  "vectors": [
+    {
+      "id": "refs-first-page-utf8",
+      "endpoint": "refs",
+      "request": {
+        "limit": 3,
+        "current": "refs/heads/é"
+      },
+      "expected": {
+        "status": 200,
+        "branch_names": ["A", "a", "é"],
+        "tag_names": [],
+        "default_branch": "main",
+        "pinned_full_names": ["refs/heads/é", "refs/heads/main"],
+        "limit": 3,
+        "next_cursor": "gr1_<opaque>"
+      }
+    },
+    {
+      "id": "refs-next-page-keyset",
+      "endpoint": "refs",
+      "after": "refs-first-page-utf8",
+      "request": {
+        "limit": 2,
+        "current": "refs/heads/é"
+      },
+      "expected": {
+        "status": 200,
+        "branch_names": ["feature", "main"],
+        "tag_names": [],
+        "default_branch": "main",
+        "pinned_full_names": ["refs/heads/é", "refs/heads/main"],
+        "limit": 2,
+        "next_cursor": "gr1_<opaque>"
+      }
+    },
+    {
+      "id": "refs-stale-cursor",
+      "endpoint": "refs",
+      "after": "refs-first-page-utf8",
+      "mutation": "add-ref",
+      "request": {
+        "limit": 3,
+        "current": "refs/heads/é"
+      },
+      "expected": {
+        "status": 409
+      }
+    },
+    {
+      "id": "tree-first-page-utf8",
+      "endpoint": "tree",
+      "request": {
+        "ref": "refs/heads/main",
+        "path": "",
+        "limit": 3,
+        "q": ".txt"
+      },
+      "expected": {
+        "status": 200,
+        "entry_names": ["A.txt", "a.txt", "é.txt"],
+        "path": "",
+        "limit": 3,
+        "next_cursor": "gt1_<opaque>"
+      }
+    },
+    {
+      "id": "tree-next-page-utf8",
+      "endpoint": "tree",
+      "after": "tree-first-page-utf8",
+      "request": {
+        "ref": "refs/heads/main",
+        "path": "",
+        "limit": 3,
+        "q": ".txt"
+      },
+      "expected": {
+        "status": 200,
+        "entry_names": ["é.txt", "😀.txt"],
+        "path": "",
+        "limit": 3,
+        "next_cursor": null
+      }
+    }
+  ]
+}
