@@ -669,7 +669,10 @@ impl Gateway {
                     }
                 };
                 let sub = self.sse.subscribe(stream, &sse_scope);
-                Ok(EdgeResponse::sse(sub))
+                Ok(EdgeResponse::sse(
+                    sub,
+                    identity.capability().expires_at_unix,
+                ))
             }
         }
     }

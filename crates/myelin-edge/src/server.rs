@@ -26,11 +26,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::task::{Context, Poll};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
 
 /// The response body type the adapter emits — a boxed body of [`Bytes`] frames (finished or
 /// streamed), with an `io::Error` error channel.
@@ -597,7 +597,11 @@ fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
                 .body(full_body(body))
                 .unwrap_or_else(|_| response_render_failure())
         }
-        EdgeResponse::Sse { headers, sub } => {
+        EdgeResponse::Sse {
+            headers,
+            sub,
+            expires_at_unix,
+        } => {
             if !handler_response_headers_are_safe(&headers) {
                 return response_render_failure();
             }
@@ -610,7 +614,7 @@ fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
                 builder = builder.header(k, v);
             }
             builder
-                .body(sse_body(sub.into_receiver()))
+                .body(sse_body(sub.into_receiver(), expires_at_unix))
                 .unwrap_or_else(|_| response_render_failure())
         }
     }
@@ -675,20 +679,57 @@ fn full_body(bytes: Vec<u8>) -> EdgeBody {
 /// A streaming SSE body fed by the subscription's broadcast receiver: each frame is written as one
 /// SSE event. A lagged receiver terminates immediately so the client observes a disconnect and
 /// resynchronizes; it must never cross an invisible event gap on an apparently healthy stream.
-fn sse_body(rx: tokio::sync::broadcast::Receiver<crate::sse::SseEvent>) -> EdgeBody {
-    let stream = BroadcastStream::new(rx)
-        .map_while(|res| match res {
-            Ok(ev) => Some(Ok::<Frame<Bytes>, std::io::Error>(Frame::data(
-                Bytes::from(ev.frame()),
-            ))),
-            // BroadcastStream yields `Err(Lagged(_))`; return end-of-stream on the gap. Channel
-            // closure already ends the source stream without producing an item.
-            Err(_) => None,
-        })
-        // Tokio's `map_while` is intentionally not fused; without this, a later poll could resume
-        // with a newer event after the gap. Once ended, this HTTP body must stay ended.
-        .fuse();
+fn sse_body(
+    rx: tokio::sync::broadcast::Receiver<crate::sse::SseEvent>,
+    expires_at_unix: i64,
+) -> EdgeBody {
+    let expiry = u64::try_from(expires_at_unix)
+        .ok()
+        .and_then(|seconds| std::time::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)));
+    let remaining = expiry
+        .and_then(|instant| instant.duration_since(std::time::SystemTime::now()).ok())
+        .unwrap_or_default();
+    let stream = ExpiringSseStream {
+        events: BroadcastStream::new(rx),
+        expiry: Box::pin(tokio::time::sleep(remaining)),
+        done: false,
+    };
     StreamBody::new(stream).boxed()
+}
+
+struct ExpiringSseStream {
+    events: BroadcastStream<crate::sse::SseEvent>,
+    expiry: Pin<Box<tokio::time::Sleep>>,
+    done: bool,
+}
+
+impl tokio_stream::Stream for ExpiringSseStream {
+    type Item = Result<Frame<Bytes>, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        // Authentication is not a one-time permission to stream forever: poll the signed
+        // capability deadline before every event, including an event already waiting in the hub.
+        if this.expiry.as_mut().poll(cx).is_ready() {
+            this.done = true;
+            return Poll::Ready(None);
+        }
+        match tokio_stream::Stream::poll_next(Pin::new(&mut this.events), cx) {
+            Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(Ok(Frame::data(Bytes::from(
+                event.frame(),
+            ))))),
+            // Lagged streams close instead of skipping across an invisible event gap. Closure also
+            // ends permanently; `done` prevents a later poll from resuming either condition.
+            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                this.done = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -699,6 +740,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio_stream::StreamExt;
 
     #[tokio::test]
     async fn lagged_sse_body_terminates_instead_of_skipping_to_newer_events() {
@@ -709,7 +751,15 @@ mod tests {
                 .unwrap();
         }
 
-        let mut body = sse_body(receiver);
+        let future_expiry = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock after epoch")
+                .as_secs(),
+        )
+        .expect("test clock fits i64")
+            + 60;
+        let mut body = sse_body(receiver, future_expiry);
         assert!(
             body.frame().await.is_none(),
             "a lagged stream closes before exposing a newer frame after the invisible gap"
@@ -718,6 +768,17 @@ mod tests {
             body.frame().await.is_none(),
             "termination is permanent, not a one-item filter"
         );
+    }
+
+    #[tokio::test]
+    async fn expired_capability_deadline_terminates_sse_body() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(2);
+        let mut body = sse_body(receiver, 0);
+
+        tokio::task::yield_now().await;
+        assert!(body.frame().await.is_none());
+        drop(body);
+        assert_eq!(sender.receiver_count(), 0);
     }
 
     /// (a) A body under the cap collects fully and byte-for-byte.
