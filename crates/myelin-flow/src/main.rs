@@ -138,12 +138,11 @@ async fn main() {
     };
     let mut worker_task = worker_task;
     let mut service_tick = tokio::time::interval(Duration::from_millis(250));
+    let mut shutdown_error = None;
     let early_worker_result = loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                if let Err(e) = signal {
-                    eprintln!("myelin-flow: cannot install shutdown signal handler: {e}");
-                }
+            signal = shutdown_signal() => {
+                shutdown_error = signal.err();
                 break None;
             }
             result = &mut worker_task => break Some(result),
@@ -171,5 +170,37 @@ async fn main() {
             eprintln!("myelin-flow PostgreSQL worker did not drain within 10 seconds");
             std::process::exit(1);
         }
+    }
+    if let Some(error) = shutdown_error {
+        eprintln!("myelin-flow shutdown signal failed: {error}");
+        std::process::exit(1);
+    }
+}
+
+/// Wait for the process-manager shutdown contract. Containers and service managers send SIGTERM;
+/// terminals send SIGINT. Both stop the worker and enter the same service-drain path. Signal setup
+/// and stream failures are returned so the process drains first and then exits non-zero.
+async fn shutdown_signal() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|error| format!("failed to install SIGTERM handler: {error}"))?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.map_err(|error| format!("failed while waiting for SIGINT: {error}"))
+            }
+            signal = terminate.recv() => {
+                signal
+                    .map(|_| ())
+                    .ok_or_else(|| "SIGTERM stream closed unexpectedly".to_string())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| format!("failed while waiting for shutdown signal: {error}"))
     }
 }
