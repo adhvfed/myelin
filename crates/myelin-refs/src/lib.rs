@@ -32,7 +32,8 @@
 //! - **The resolver** over `ArtifactRef` — `resolve(ref, viewer, mode) -> Projection | Tombstone`,
 //!   the 4-step tombstone ladder (contract 5.7 / §4.6) and the permission-filtered backlink read
 //!   (5.3) — is the **R-M2 follow-on**: `reference-graph.md` REF-P9..REF-P11 (resolution chokepoint,
-//!   backlink crux). `Refs::edges` / `Refs::backlinks` here are deferred (`todo!()`).
+//!   backlink crux). The working implementation lives in `myelin-refs-service`; the stateless codec
+//!   returns [`RefError::ProjectionUnavailable`] for these calls.
 //! - **The four architecture lints** Refs leans on (tenant-predicate, no-raw-publish, no-cross-db,
 //!   no-cross-sync-cycle) are wired with Refs-specific red+green fixtures in **REF-P2 (P-053)**.
 //!
@@ -169,6 +170,9 @@ pub enum RefError {
     /// A malformed / ambiguous URN (the value-type half, REF-P1). Carries the precise grammar rule
     /// broken (REF-3 — never silently coerced).
     Parse(ParseError),
+    /// The stateless codec has no edge projection attached. Callers must use the refs-service
+    /// resolver for edge walks; this typed refusal prevents a production panic or silent empty set.
+    ProjectionUnavailable,
 }
 
 impl From<ParseError> for RefError {
@@ -181,6 +185,12 @@ impl core::fmt::Display for RefError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             RefError::Parse(e) => write!(f, "{e}"),
+            RefError::ProjectionUnavailable => {
+                write!(
+                    f,
+                    "refs edge projection is not available on the stateless codec"
+                )
+            }
         }
     }
 }
@@ -193,24 +203,23 @@ pub type Result<T> = core::result::Result<T, RefError>;
 /// The one refs library (architecture §2.3; contract 5.1/5.3; REF-3). `parse`/`format` are
 /// associated (no `&self`) — they are the canonical URN codec, **implemented at M0** (REF-P1) over
 /// the [`parse`] module. `edges`/`backlinks` take `&self` (they read the edge projection);
-/// `backlinks` is permission-filtered via the viewer (REF-1) and is **deferred to the resolver
-/// (REF-P9+)** — its body is `todo!()` here.
+/// `backlinks` is permission-filtered via the viewer (REF-1) and is implemented by the refs-service
+/// resolver. The stateless codec returns a typed projection-unavailable refusal for edge walks.
 pub trait Refs {
     /// Parse a canonical URN, rejecting ambiguity; never guesses scope (REF-3). Implemented at M0.
     fn parse(s: &str) -> Result<ArtifactRef>;
     /// Render an `ArtifactRef` to its canonical string. Implemented at M0; round-trips with `parse`.
     fn format(r: &ArtifactRef) -> String;
-    /// Outbound edges. **Floor:** deferred to the resolver (REF-P11); `todo!()`.
+    /// Outbound edges. The stateless codec refuses; the refs-service resolver owns the projection.
     fn edges(&self, r: &ArtifactRef) -> Result<Vec<Edge>>;
-    /// Permission-filtered inbound edges (REF-1). **Floor:** deferred to the backlink crux (REF-P11);
-    /// `todo!()`.
+    /// Permission-filtered inbound edges (REF-1). The stateless codec refuses; the refs-service
+    /// resolver owns the projection.
     fn backlinks(&self, r: &ArtifactRef, viewer: &Principal) -> Result<Vec<Edge>>;
 }
 
 /// The platform's canonical [`Refs`] codec implementation. The parse/format half (REF-P1, contract
-/// 5.1) is real; the edge-walk half (5.3) lands with the resolver (REF-P9..REF-P11). A unit struct
-/// because the codec is stateless — the edge methods will take the projection store by `&self` once
-/// the engine lands (a future field), preserving this frozen trait shape.
+/// 5.1) is real; edge walks (5.3) live in the refs-service resolver. A unit struct because this codec
+/// is intentionally stateless; edge methods fail typed instead of panicking or fabricating emptiness.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RefsCodec;
 
@@ -224,15 +233,11 @@ impl Refs for RefsCodec {
     }
 
     fn edges(&self, _r: &ArtifactRef) -> Result<Vec<Edge>> {
-        // FLOOR: the edge walk over the inverse index lands with the resolver (REF-P5 schema +
-        // REF-P11 backlink crux). The value-type crate ships parse/format only (REF-P1 / P-052).
-        todo!("edge walk lands in the Refs resolver (contract 5.3; REF-P11)")
+        Err(RefError::ProjectionUnavailable)
     }
 
     fn backlinks(&self, _r: &ArtifactRef, _viewer: &Principal) -> Result<Vec<Edge>> {
-        // FLOOR: the permission-filtered backlink read (the SetExpr lowering over source_root) lands
-        // in REF-P11 (the crux). REF-P1 / P-052 ships the value type only.
-        todo!("permission-filtered backlinks land in the Refs resolver (contract 5.3; REF-P11)")
+        Err(RefError::ProjectionUnavailable)
     }
 }
 
@@ -243,19 +248,24 @@ mod tests {
     use myelin_tenancy::TenantId;
 
     /// The `Refs` trait's associated `parse`/`format` are wired to the real codec (REF-P1) and
-    /// round-trip; the `&self` edge methods are the named floor (REF-P11). A stub `Principal` proves
-    /// the `backlinks` viewer signature still compiles to the frozen shape.
+    /// round-trip; the stateless `&self` edge methods refuse typed rather than panicking or returning
+    /// a misleading empty projection.
     #[test]
     fn refs_codec_parse_format_round_trips_and_edge_methods_are_the_named_floor() {
         let s = "myelin://acme/issue/issue/ENG-1421";
         let r = <RefsCodec as Refs>::parse(s).expect("canonical URN parses");
         assert_eq!(<RefsCodec as Refs>::format(&r), s);
 
-        // The viewer-threaded signature compiles (REF-1) — the body is the named floor.
-        let _viewer = Principal::stub(
+        let viewer = Principal::stub(
             PrincipalId("p".into()),
             PrincipalKind::Human,
             TenantId("acme".into()),
+        );
+        let codec = RefsCodec;
+        assert_eq!(codec.edges(&r), Err(RefError::ProjectionUnavailable));
+        assert_eq!(
+            codec.backlinks(&r, &viewer),
+            Err(RefError::ProjectionUnavailable)
         );
     }
 
