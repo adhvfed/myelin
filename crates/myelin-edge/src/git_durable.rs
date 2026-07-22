@@ -1097,7 +1097,7 @@ impl DurableGitBackend {
                 };
                 json!({
                     "kind": kind,
-                    "full_name": item.full_name,
+                    "full_name": item.qualified_name,
                     "name": item.name,
                     "oid": item.tip.0,
                     "is_default": is_default,
