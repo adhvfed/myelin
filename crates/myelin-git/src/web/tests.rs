@@ -452,6 +452,28 @@ fn repository_list_rows_reject_unsafe_or_oversized_fields() {
 }
 
 #[test]
+fn repository_list_cursor_codec_is_canonical_bounded_and_round_trips() {
+    let cursor = RepoListCursor::new([7; 32], "alpha").unwrap();
+    let encoded = cursor.encode();
+    assert!(encoded.starts_with(REPO_LIST_CURSOR_PREFIX));
+    assert!(!encoded.contains('='), "the base64url token is unpadded");
+    assert_eq!(RepoListCursor::parse(&encoded).unwrap(), cursor);
+
+    for malformed in [
+        "rl1_".to_string(),
+        "rl1_not-base64!".to_string(),
+        format!("{encoded}="),
+        RepoListCursor::new([7; 32], "alpha").unwrap().encode() + "%",
+        format!("rl1_{}", "a".repeat(REPO_LIST_CURSOR_MAX_BYTES)),
+    ] {
+        assert_eq!(RepoListCursor::parse(&malformed), Err(RepoListCursorError));
+    }
+    for slug in ["", ".", "..", "a/b", "white space"] {
+        assert_eq!(RepoListCursor::new([0; 32], slug), Err(RepoListCursorError));
+    }
+}
+
+#[test]
 fn commit_row_and_diff_json_carry_the_browse_contract() {
     // GT-004 browse ViewModels: the JSON the Solid Git web UI renders (short_oid + the +/- diff
     // origins as the three-channel signal; PII-free pseudonymous author; unix `committed_at`).

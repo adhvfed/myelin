@@ -42,7 +42,8 @@ enum Command {
     Login,
     /// Show the authenticated principal (GET /v1/whoami) — proves the Bearer presentation + edge auth.
     Whoami,
-    /// Git commands — REUSES myelin-git's grammar: `repo list` | `pr view <n>` | `search code <q>` | …
+    /// Git commands — REUSES myelin-git's grammar: `repo list [--limit 1..100] [--cursor <rl1_…>]`
+    /// | `pr view <repo> <n>` | `search code <q>` | …
     Git {
         /// The git subcommand + args, parsed by git's own `parse_cli`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

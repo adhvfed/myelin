@@ -7,6 +7,7 @@
 //!   item, the `whoami` principal as a single line, and an unknown shape falls back to terminal-safe
 //!   JSON (total — it never panics on an unexpected shape).
 
+use myelin_git::web::RepoListCursor;
 use serde_json::Value;
 use std::fmt::Write as _;
 
@@ -51,13 +52,19 @@ pub fn render(value: &Value, json_mode: bool) -> String {
             out.push_str(&render_item(item));
             out.push('\n');
         }
-        if value
+        if let Some(cursor) = value
             .get("page")
             .and_then(|p| p.get("next_cursor"))
-            .map(|c| !c.is_null())
-            .unwrap_or(false)
+            .and_then(Value::as_str)
         {
-            out.push_str("… (more — pass --cursor to page)\n");
+            if RepoListCursor::parse(cursor).is_ok() {
+                let cursor = terminal_safe_single_line(cursor);
+                out.push_str(&format!(
+                    "… (more — run: myelin git repo list --cursor {cursor})\n"
+                ));
+            } else {
+                out.push_str("… (more — pass --cursor to page)\n");
+            }
         }
         return out;
     }
@@ -111,7 +118,7 @@ fn render_item(item: &Value) -> String {
         let state = item.get("state").and_then(Value::as_str).unwrap_or("?");
         let slug = terminal_safe_single_line(slug);
         let state = terminal_safe_single_line(state);
-        return format!("{slug}  [{state}]");
+        return format!("{slug} [{state}]");
     }
     if let (Some(repo), Some(path)) = (
         item.get("repo").and_then(Value::as_str),
@@ -149,9 +156,21 @@ mod tests {
 
     #[test]
     fn json_mode_is_pretty_raw() {
-        let v = json!({"items":[{"slug":"acme/alpha","state":"populated"}],"page":{"next_cursor":null,"limit":50}});
+        let v = json!({
+            "items": [
+                {
+                    "state": "populated",
+                    "slug": "acme/alpha",
+                    "clone_url": "/acme/eu-west/alpha.git"
+                },
+                {"state": "empty", "slug": "acme/empty"}
+            ],
+            "page": {"next_cursor": null, "limit": 50}
+        });
         let out = render(&v, true);
         assert!(out.contains("\"slug\": \"acme/alpha\""));
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), v);
+        assert!(!out.contains("readme_excerpt") && !out.contains("entries"));
     }
 
     #[test]
@@ -164,8 +183,8 @@ mod tests {
             "page":{"next_cursor":null,"limit":50}
         });
         let out = render(&v, false);
-        assert!(out.contains("acme/alpha  [populated]"));
-        assert!(out.contains("acme/beta  [populated]"));
+        assert!(out.contains("acme/alpha [populated]"));
+        assert!(out.contains("acme/beta [populated]"));
         assert!(!out.contains("more"), "no cursor → no more hint");
     }
 
@@ -173,6 +192,33 @@ mod tests {
     fn human_list_shows_more_hint_when_cursor_present() {
         let v = json!({"items":[{"slug":"a","state":"populated"}],"page":{"next_cursor":"2","limit":2}});
         assert!(render(&v, false).contains("more"));
+    }
+
+    #[test]
+    fn repository_next_cursor_hint_round_trips_through_git_parser_and_dispatch() {
+        let cursor = RepoListCursor::new([8; 32], "alpha").unwrap().encode();
+        let rendered = render(
+            &json!({
+                "items": [{"slug": "acme/alpha", "state": "populated"}],
+                "page": {"next_cursor": cursor, "limit": 1}
+            }),
+            false,
+        );
+        let command = rendered
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("… (more — run: ")
+                    .and_then(|line| line.strip_suffix(')'))
+            })
+            .expect("actionable next-page command");
+        let words = command.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(&words[..4], &["myelin", "git", "repo", "list"]);
+        let call = crate::dispatch::git_dispatch(&words[2..]).expect("hint parses and dispatches");
+        assert_eq!(call.path, "/v1/git/repos");
+        assert_eq!(
+            call.query.as_deref(),
+            Some(format!("view=summary&cursor={cursor}").as_str())
+        );
     }
 
     #[test]

@@ -42,6 +42,9 @@ myelin-notif = { path = "../myelin-notif" }
 # (the one workspace-pinned JSON shape) — the CLI parses/renders them directly.
 serde_json = { workspace = true }
 
+# Build strict form-query strings for paginated Edge calls without interpolating cursor bytes.
+percent-encoding = "2.3"
+
 # ----------------------------------------------------------------------------------------------
 # THE HTTP CLIENT — hyper 1.x + rustls DIRECTLY (no reqwest). Every crate below is ALREADY in
 # Cargo.lock through the storage/AWS stack, so promoting verified HTTPS support adds no new package.

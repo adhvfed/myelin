@@ -2446,6 +2446,7 @@ dependencies = [
  "myelin-notif",
  "myelin-storage",
  "myelin-tenancy",
+ "percent-encoding",
  "rustls",
  "serde_json",
  "tokio",

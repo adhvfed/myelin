@@ -23,7 +23,61 @@
 use crate::error::CliError;
 use myelin_git::api::{parse_cli, CliCommand, CliParseError};
 use myelin_issues::api::{parse_cli as parse_issues_cli, CliCommand as IssuesCliCommand};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::json;
+
+const FORM_QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'!')
+    .add(b'"')
+    .add(b'#')
+    .add(b'$')
+    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'(')
+    .add(b')')
+    .add(b'*')
+    .add(b'+')
+    .add(b',')
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'<')
+    .add(b'=')
+    .add(b'>')
+    .add(b'?')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+#[derive(Default)]
+struct FormQuery {
+    encoded: String,
+}
+
+impl FormQuery {
+    fn push(&mut self, name: &str, value: &str) {
+        if !self.encoded.is_empty() {
+            self.encoded.push('&');
+        }
+        self.encoded
+            .push_str(&utf8_percent_encode(name, FORM_QUERY_COMPONENT_ENCODE_SET).to_string());
+        self.encoded.push('=');
+        self.encoded
+            .push_str(&utf8_percent_encode(value, FORM_QUERY_COMPONENT_ENCODE_SET).to_string());
+    }
+
+    fn finish(self) -> String {
+        self.encoded
+    }
+}
 
 /// The HTTP method an [`EdgeCall`] uses (the CLI only issues reads + simple writes today).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +137,8 @@ fn usage_from_git(e: CliParseError) -> CliError {
         CliParseError::Empty => "no git command given (try: repo list | pr view <n> | search code <q>)".to_string(),
         CliParseError::Unknown { token } => format!("unknown git command token `{token}`"),
         CliParseError::MissingArg { what } => format!("missing argument: {what}"),
+        CliParseError::DuplicateFlag { flag } => format!("duplicate flag: {flag}"),
+        CliParseError::MissingValue { flag } => format!("missing value for flag: {flag}"),
         CliParseError::BadArg { value } => format!("malformed argument: `{value}`"),
     };
     CliError::Usage(m)
@@ -107,8 +163,24 @@ pub fn git_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
 pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
     match command {
         // ── Reads ──
-        // GET /v1/git/repos → the leak-free repo list ViewModel (the {items,page} envelope).
-        CliCommand::RepoList => Ok(EdgeCall::get("/v1/git/repos")),
+        // GET /v1/git/repos?view=summary → the bounded lightweight catalogue rows. The CLI never
+        // requests the legacy RepoHome list projection.
+        CliCommand::RepoList { limit, cursor } => {
+            let mut query = FormQuery::default();
+            query.push("view", "summary");
+            if let Some(limit) = limit {
+                query.push("limit", &limit.to_string());
+            }
+            if let Some(cursor) = cursor {
+                query.push("cursor", cursor);
+            }
+            Ok(EdgeCall {
+                method: HttpMethod::Get,
+                path: "/v1/git/repos".into(),
+                query: Some(query.finish()),
+                payload: None,
+            })
+        }
         // GET /v1/git/repos/<repo> → the per-repo home projection (durable on-disk state).
         CliCommand::RepoView { repo } => Ok(EdgeCall::get(format!("/v1/git/repos/{repo}"))),
         // GET /v1/git/repos/<repo>/prs/<n> → the durable PR overview.
@@ -283,14 +355,43 @@ fn flag_value(args: &[&str], flag: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// **The REAL command — `myelin git repo list` maps to GET /v1/git/repos through git's OWN
-    /// grammar** (the reuse proof: `parse_cli(["repo","list"])` is git's, not re-declared here).
+    /// **The REAL command — `myelin git repo list` maps to the opt-in lightweight summary through
+    /// git's OWN grammar** (the reuse proof: `parse_cli(["repo","list"])` is git's).
     #[test]
     fn git_repo_list_maps_to_the_edge_repos_route() {
         let call = git_dispatch(&["repo", "list"]).unwrap();
         assert_eq!(call.method, HttpMethod::Get);
         assert_eq!(call.path, "/v1/git/repos");
-        assert!(call.query.is_none() && call.payload.is_none());
+        assert_eq!(call.query.as_deref(), Some("view=summary"));
+        assert!(call.payload.is_none());
+    }
+
+    #[test]
+    fn git_repo_list_pagination_builds_exact_safe_summary_queries() {
+        let cursor = myelin_git::web::RepoListCursor::new([4; 32], "alpha")
+            .unwrap()
+            .encode();
+        let limit = git_dispatch(&["repo", "list", "--limit", "25"]).unwrap();
+        assert_eq!(limit.query.as_deref(), Some("view=summary&limit=25"));
+
+        let cursor_only = git_dispatch(&["repo", "list", "--cursor", &cursor]).unwrap();
+        assert_eq!(
+            cursor_only.query.as_deref(),
+            Some(format!("view=summary&cursor={cursor}").as_str())
+        );
+
+        let both = git_dispatch(&[
+            "repo", "list", "--cursor", &cursor, "--limit", "2",
+        ])
+        .unwrap();
+        assert_eq!(
+            both.query.as_deref(),
+            Some(format!("view=summary&limit=2&cursor={cursor}").as_str())
+        );
+
+        let mut encoded = FormQuery::default();
+        encoded.push("cursor", "rl1_a&b%= ?");
+        assert_eq!(encoded.finish(), "cursor=rl1_a%26b%25%3D%20%3F");
     }
 
     /// A git command defined in `api.rs` is reachable WITHOUT re-declaring it here: `search code`

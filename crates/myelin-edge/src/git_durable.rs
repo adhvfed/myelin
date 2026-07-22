@@ -34,7 +34,6 @@ use crate::repo_authz::{DenyAllRepos, RepoAuthorizer, RepoPermission};
 use crate::repo_authz::AllowAllRepos;
 use crate::repo_authz_live::{NoRepoBootstrap, RepoBootstrapGrants};
 use crate::request::{EdgeRequest, EdgeResponse};
-use base64::Engine as _;
 use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
 // Used only by the `test-support`-gated `rooted_inmem_for_test` helper (MR-009b W3b.6).
 #[cfg(any(test, feature = "test-support"))]
@@ -74,7 +73,8 @@ use myelin_git::receive_pack::{
 use myelin_git::refs_pagination::WIRE_MAX_REF_NAME_BYTES;
 use myelin_git::web::{
     CommitDiff, CommitRow, DiffFile, DiffLineView, PrDiffFile, PrDiffHunk, PrDiffLine, PrDiffVM,
-    RepoHome, RepoListRow, WebEditOutcome, REPO_LIST_ROW_MAX_SLUG_BYTES,
+    RepoHome, RepoListCursor, RepoListRow, WebEditOutcome, REPO_LIST_CURSOR_MAX_BYTES,
+    REPO_LIST_CURSOR_PREFIX,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::{DurablePlacementBacking, KmsEngine, SubstrateProvider, TenantScope};
@@ -3465,20 +3465,11 @@ fn map_repo_summary_durable_err(error: DurableError) -> EdgeError {
 }
 
 const REPO_SUMMARY_QUERY_MAX_BYTES: usize = 16 * 1024;
-const REPO_SUMMARY_CURSOR_MAX_BYTES: usize = 512;
-const REPO_SUMMARY_CURSOR_PREFIX: &str = "rl1_";
-const REPO_SUMMARY_CURSOR_VERSION: u8 = 1;
-const REPO_SUMMARY_CURSOR_FIXED_BYTES: usize = 1 + 32 + 2;
 const REPO_SUMMARY_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 
 struct RepoSummaryQuery {
     limit: usize,
     cursor: Option<String>,
-}
-
-struct RepoSummaryCursor {
-    scope: [u8; 32],
-    last_slug: String,
 }
 
 fn repo_summary_requested(query: &str) -> bool {
@@ -3571,8 +3562,8 @@ fn parse_repo_summary_query(query: &str) -> Result<RepoSummaryQuery, EdgeError> 
                 if cursor.is_some() {
                     return Err(duplicate("cursor"));
                 }
-                if !value.starts_with(REPO_SUMMARY_CURSOR_PREFIX)
-                    || value.len() > REPO_SUMMARY_CURSOR_MAX_BYTES
+                if !value.starts_with(REPO_LIST_CURSOR_PREFIX)
+                    || value.len() > REPO_LIST_CURSOR_MAX_BYTES
                 {
                     return Err(EdgeError::BadRequest(
                         "repository summary cursor is malformed".into(),
@@ -3613,82 +3604,19 @@ fn repo_summary_cursor_scope(tenant: &str, region: &str) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
-fn valid_repo_summary_cursor_slug(slug: &str) -> bool {
-    !slug.is_empty()
-        && slug.len() <= REPO_LIST_ROW_MAX_SLUG_BYTES
-        && slug != "."
-        && slug != ".."
-        && slug
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
-impl RepoSummaryCursor {
-    fn new(tenant: &str, region: &str, last_slug: String) -> Self {
-        Self {
-            scope: repo_summary_cursor_scope(tenant, region),
-            last_slug,
-        }
+fn parse_repo_summary_cursor(
+    value: &str,
+    tenant: &str,
+    region: &str,
+) -> Result<RepoListCursor, EdgeError> {
+    let cursor = RepoListCursor::parse(value)
+        .map_err(|_| EdgeError::BadRequest("repository summary cursor is malformed".into()))?;
+    if cursor.scope() != repo_summary_cursor_scope(tenant, region) {
+        return Err(EdgeError::BadRequest(
+            "repository summary cursor scope mismatch".into(),
+        ));
     }
-
-    fn encode(&self) -> String {
-        let slug = self.last_slug.as_bytes();
-        let mut frame = Vec::with_capacity(REPO_SUMMARY_CURSOR_FIXED_BYTES + slug.len());
-        frame.push(REPO_SUMMARY_CURSOR_VERSION);
-        frame.extend_from_slice(&self.scope);
-        frame.extend_from_slice(&(slug.len() as u16).to_be_bytes());
-        frame.extend_from_slice(slug);
-        format!(
-            "{REPO_SUMMARY_CURSOR_PREFIX}{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(frame)
-        )
-    }
-
-    fn parse(value: &str, tenant: &str, region: &str) -> Result<Self, EdgeError> {
-        let encoded = value
-            .strip_prefix(REPO_SUMMARY_CURSOR_PREFIX)
-            .ok_or_else(|| {
-                EdgeError::BadRequest("repository summary cursor is malformed".into())
-            })?;
-        if encoded.is_empty() || value.len() > REPO_SUMMARY_CURSOR_MAX_BYTES {
-            return Err(EdgeError::BadRequest(
-                "repository summary cursor is malformed".into(),
-            ));
-        }
-        let frame = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(|_| EdgeError::BadRequest("repository summary cursor is malformed".into()))?;
-        if base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&frame) != encoded
-            || frame.len() < REPO_SUMMARY_CURSOR_FIXED_BYTES
-            || frame[0] != REPO_SUMMARY_CURSOR_VERSION
-        {
-            return Err(EdgeError::BadRequest(
-                "repository summary cursor is malformed".into(),
-            ));
-        }
-        let mut scope = [0_u8; 32];
-        scope.copy_from_slice(&frame[1..33]);
-        if scope != repo_summary_cursor_scope(tenant, region) {
-            return Err(EdgeError::BadRequest(
-                "repository summary cursor scope mismatch".into(),
-            ));
-        }
-        let slug_len = usize::from(u16::from_be_bytes([frame[33], frame[34]]));
-        if slug_len == 0 || frame.len() != REPO_SUMMARY_CURSOR_FIXED_BYTES + slug_len {
-            return Err(EdgeError::BadRequest(
-                "repository summary cursor is malformed".into(),
-            ));
-        }
-        let last_slug = std::str::from_utf8(&frame[35..])
-            .map_err(|_| EdgeError::BadRequest("repository summary cursor is malformed".into()))?
-            .to_string();
-        if !valid_repo_summary_cursor_slug(&last_slug) {
-            return Err(EdgeError::BadRequest(
-                "repository summary cursor is malformed".into(),
-            ));
-        }
-        Ok(Self { scope, last_slug })
-    }
+    Ok(cursor)
 }
 
 fn repo_summary_response(value: &Value) -> Result<EdgeResponse, EdgeError> {
@@ -3717,7 +3645,7 @@ impl Handler for DRepoList {
             let cursor = query
                 .cursor
                 .as_deref()
-                .map(|value| RepoSummaryCursor::parse(value, tenant_of(ctx), region_of(ctx)))
+                .map(|value| parse_repo_summary_cursor(value, tenant_of(ctx), region_of(ctx)))
                 .transpose()?;
             let (rows, next_slug) = self
                 .be
@@ -3725,14 +3653,25 @@ impl Handler for DRepoList {
                     tenant_of(ctx),
                     region_of(ctx),
                     ctx.principal,
-                    cursor.as_ref().map(|cursor| cursor.last_slug.as_str()),
+                    cursor.as_ref().map(RepoListCursor::last_slug),
                     query.limit,
                 )
                 .map_err(map_repo_summary_durable_err)?;
             let items = rows.iter().map(RepoListRow::to_json).collect::<Vec<_>>();
-            let next_cursor = next_slug.map(|last_slug| {
-                RepoSummaryCursor::new(tenant_of(ctx), region_of(ctx), last_slug).encode()
-            });
+            let next_cursor = next_slug
+                .map(|last_slug| {
+                    RepoListCursor::new(
+                        repo_summary_cursor_scope(tenant_of(ctx), region_of(ctx)),
+                        last_slug,
+                    )
+                    .map(|cursor| cursor.encode())
+                    .map_err(|error| {
+                        EdgeError::Internal(format!(
+                            "mint repository summary cursor failed: {error}"
+                        ))
+                    })
+                })
+                .transpose()?;
             let envelope = page_envelope(json!(items), next_cursor, query.limit);
             return repo_summary_response(&envelope);
         }
@@ -6594,7 +6533,7 @@ mod repo_summary_tests {
             let Some(cursor) = body["page"]["next_cursor"].as_str() else {
                 break;
             };
-            assert!(cursor.starts_with(REPO_SUMMARY_CURSOR_PREFIX));
+            assert!(cursor.starts_with(REPO_LIST_CURSOR_PREFIX));
             query = format!("view=summary&limit=1&cursor={cursor}");
         }
         assert_eq!(seen, ["acme/alpha", "acme/gamma", "acme/omega"]);
@@ -6634,7 +6573,7 @@ mod repo_summary_tests {
         assert!(matches!(
             parse_repo_summary_query(&format!(
                 "view=summary&cursor=rl1_{}",
-                "a".repeat(REPO_SUMMARY_CURSOR_MAX_BYTES)
+                "a".repeat(REPO_LIST_CURSOR_MAX_BYTES)
             )),
             Err(EdgeError::BadRequest(_))
         ));
@@ -6642,26 +6581,27 @@ mod repo_summary_tests {
 
     #[test]
     fn cursor_is_canonical_bounded_and_scoped_to_verified_tenant_region() {
-        let cursor = RepoSummaryCursor::new(TENANT, REGION, "alpha".into()).encode();
-        let parsed = RepoSummaryCursor::parse(&cursor, TENANT, REGION).expect("canonical cursor");
-        assert_eq!(parsed.last_slug, "alpha");
+        let cursor = RepoListCursor::new(repo_summary_cursor_scope(TENANT, REGION), "alpha")
+            .unwrap()
+            .encode();
+        let parsed = parse_repo_summary_cursor(&cursor, TENANT, REGION).expect("canonical cursor");
+        assert_eq!(parsed.last_slug(), "alpha");
         for malformed in [
             "rl1_".to_string(),
             "rl1_not-base64!".to_string(),
             format!("{cursor}="),
-            RepoSummaryCursor::new(TENANT, REGION, "..".into()).encode(),
         ] {
             assert!(matches!(
-                RepoSummaryCursor::parse(&malformed, TENANT, REGION),
+                parse_repo_summary_cursor(&malformed, TENANT, REGION),
                 Err(EdgeError::BadRequest(_))
             ));
         }
         assert!(matches!(
-            RepoSummaryCursor::parse(&cursor, "other-tenant", REGION),
+            parse_repo_summary_cursor(&cursor, "other-tenant", REGION),
             Err(EdgeError::BadRequest(message)) if message.contains("scope mismatch")
         ));
         assert!(matches!(
-            RepoSummaryCursor::parse(&cursor, TENANT, "other-region"),
+            parse_repo_summary_cursor(&cursor, TENANT, "other-region"),
             Err(EdgeError::BadRequest(message)) if message.contains("scope mismatch")
         ));
 
@@ -6672,7 +6612,10 @@ mod repo_summary_tests {
         };
         let empty = json(serve(&handler, &viewer, "view=summary").expect("empty tenant summary"));
         assert_eq!(empty["items"], json!([]));
-        let wrong_scope = RepoSummaryCursor::new("other-tenant", REGION, "alpha".into()).encode();
+        let wrong_scope =
+            RepoListCursor::new(repo_summary_cursor_scope("other-tenant", REGION), "alpha")
+                .unwrap()
+                .encode();
         assert!(matches!(
             serve(
                 &handler,

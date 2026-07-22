@@ -12,7 +12,8 @@
 //! - `pr endorse-fork-ci` / `POST …/endorse-fork-ci` → [`crate::fork_gate`] (the `approve_untrusted_ci`
 //!   endorsement);
 //! - `pr checks` / `GET …/checks` → [`crate::check_status`] (the X-1 projection);
-//! - `repo list` / `GET /api/git/repos` → [`crate::list_filter`] (the leak-free `SetExpr` push-down);
+//! - `repo list [--limit 1..100] [--cursor <rl1_…>]` / `GET /api/git/repos?view=summary` →
+//!   [`crate::list_filter`] (the leak-free `SetExpr` push-down);
 //! - `search code` / `GET …/search/code` → [`crate::list_filter::code_search_pre_filter`] (the ACL
 //!   pre-filter conjoined before scoring);
 //! - `GET …/prs/{n}` / `GET …/blob/…` → [`crate::project`] (the per-viewer 0-leak projection).
@@ -219,8 +220,14 @@ pub fn http_catalogue() -> Vec<Endpoint> {
 /// note — the alias is render-time only). Each variant lowers to the [`Handler`] its `handler()` names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliCommand {
-    /// `myelin repo list` — the leak-free repo list (the `SetExpr` push-down).
-    RepoList,
+    /// `myelin git repo list [--limit 1..100] [--cursor <rl1_…>]` — the leak-free lightweight repo
+    /// catalogue.
+    RepoList {
+        /// Optional requested page size; the Edge default applies when absent.
+        limit: Option<usize>,
+        /// Optional canonical repository-list continuation token.
+        cursor: Option<String>,
+    },
     /// `myelin repo create <slug>` — create a durable bare repo (the GT-003 `create_repo` write). The
     /// tenant is the token's; the body carries only the `slug`.
     RepoCreate {
@@ -309,10 +316,10 @@ impl CliCommand {
     /// The already-built handler this CLI command lowers to (no new handler — the surface is thin).
     pub fn handler(&self) -> Handler {
         match self {
-            CliCommand::RepoList | CliCommand::PrList { .. } => Handler::ListFilter,
-            CliCommand::RepoCreate { .. } | CliCommand::PrOpen { .. } | CliCommand::PrReview { .. } => {
-                Handler::Lifecycle
-            }
+            CliCommand::RepoList { .. } | CliCommand::PrList { .. } => Handler::ListFilter,
+            CliCommand::RepoCreate { .. }
+            | CliCommand::PrOpen { .. }
+            | CliCommand::PrReview { .. } => Handler::Lifecycle,
             CliCommand::RepoView { .. } | CliCommand::PrView { .. } => Handler::Project,
             CliCommand::PrChecks { .. } => Handler::CheckStatus,
             CliCommand::PrMerge { .. } => Handler::MergeGate,
@@ -349,12 +356,25 @@ pub enum CliParseError {
         /// What argument is missing.
         what: &'static str,
     },
+    /// A flag occurred more than once.
+    DuplicateFlag {
+        /// The duplicated flag.
+        flag: &'static str,
+    },
+    /// A flag was not followed by its required value.
+    MissingValue {
+        /// The flag requiring a value.
+        flag: &'static str,
+    },
     /// An argument was malformed (e.g. a non-numeric PR number).
     BadArg {
         /// The argument value that failed to parse.
         value: String,
     },
 }
+
+/// Maximum page size accepted by `myelin git repo list`.
+pub const REPO_LIST_CLI_MAX_LIMIT: usize = 100;
 
 /// Parse a `myelin …` git CLI invocation (the args AFTER `myelin`, arch §3.2). A thin, total parser
 /// over the frozen verb grammar — the noun alias `repo` is accepted (render-time alias for `git`). The
@@ -377,7 +397,7 @@ fn parse_repo(rest: &[&str]) -> Result<CliCommand, CliParseError> {
         .split_first()
         .ok_or(CliParseError::MissingArg { what: "repo verb" })?;
     match *verb {
-        "list" => Ok(CliCommand::RepoList),
+        "list" => parse_repo_list(args),
         "create" => {
             let slug = positional(args, 0).ok_or(CliParseError::MissingArg { what: "slug" })?;
             Ok(CliCommand::RepoCreate {
@@ -394,6 +414,59 @@ fn parse_repo(rest: &[&str]) -> Result<CliCommand, CliParseError> {
             token: other.to_string(),
         }),
     }
+}
+
+fn parse_repo_list(args: &[&str]) -> Result<CliCommand, CliParseError> {
+    let mut limit = None;
+    let mut cursor = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index];
+        match flag {
+            "--limit" => {
+                if limit.is_some() {
+                    return Err(CliParseError::DuplicateFlag { flag: "--limit" });
+                }
+                let value = required_flag_value(args, index, "--limit")?;
+                let parsed = value.parse::<usize>().ok().filter(|parsed| {
+                    value == parsed.to_string()
+                        && (1..=REPO_LIST_CLI_MAX_LIMIT).contains(parsed)
+                });
+                limit = Some(parsed.ok_or_else(|| CliParseError::BadArg {
+                    value: value.to_string(),
+                })?);
+                index += 2;
+            }
+            "--cursor" => {
+                if cursor.is_some() {
+                    return Err(CliParseError::DuplicateFlag { flag: "--cursor" });
+                }
+                let value = required_flag_value(args, index, "--cursor")?;
+                crate::web::RepoListCursor::parse(value).map_err(|_| CliParseError::BadArg {
+                    value: value.to_string(),
+                })?;
+                cursor = Some(value.to_string());
+                index += 2;
+            }
+            other => {
+                return Err(CliParseError::Unknown {
+                    token: other.to_string(),
+                })
+            }
+        }
+    }
+    Ok(CliCommand::RepoList { limit, cursor })
+}
+
+fn required_flag_value<'a>(
+    args: &'a [&str],
+    index: usize,
+    flag: &'static str,
+) -> Result<&'a str, CliParseError> {
+    args.get(index + 1)
+        .copied()
+        .filter(|value| !value.starts_with("--"))
+        .ok_or(CliParseError::MissingValue { flag })
 }
 
 fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
