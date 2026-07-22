@@ -22,6 +22,7 @@
 //! (the URL `{tenant}` only detects/rejects a cross-tenant IDOR) — identical to the upload-pack routes.
 
 use crate::git_wire_http::pkt_line;
+use std::collections::BTreeSet;
 
 /// The receive-pack capabilities Myelin advertises. Deliberately MINIMAL + server-controlled: enough for
 /// a real `git push` (`report-status` so the client expects a status report; `delete-refs` so a branch
@@ -67,6 +68,7 @@ fn read_pkt(buf: &[u8]) -> Result<(Option<&[u8]>, &[u8]), String> {
 pub(crate) fn parse_push_request(body: &[u8]) -> Result<(Vec<RefCommand>, Vec<u8>), String> {
     let mut rest = body;
     let mut cmds = Vec::new();
+    let mut ref_names = BTreeSet::new();
     loop {
         let (payload, next) = read_pkt(rest)?;
         rest = next;
@@ -81,10 +83,14 @@ pub(crate) fn parse_push_request(body: &[u8]) -> Result<(Vec<RefCommand>, Vec<u8
         if parts.len() != 3 || parts[0].len() != 40 || parts[1].len() != 40 {
             return Err(format!("malformed ref-update command {s:?}"));
         }
+        let ref_name = parts[2].to_string();
+        if !ref_names.insert(ref_name.clone()) {
+            return Err(format!("duplicate ref-update command for {ref_name:?}"));
+        }
         cmds.push(RefCommand {
             old: parts[0].to_string(),
             new: parts[1].to_string(),
-            ref_name: parts[2].to_string(),
+            ref_name,
         });
     }
     Ok((cmds, rest.to_vec()))
@@ -196,6 +202,24 @@ mod tests {
         let (cmds, pack) = parse_push_request(&body).unwrap();
         assert_eq!(cmds[0].new, z, "delete sets new to all-zeros");
         assert!(pack.is_empty(), "a delete-only push carries no packfile");
+    }
+
+    #[test]
+    fn duplicate_ref_commands_are_rejected_before_pack_ingest() {
+        let z = "0".repeat(40);
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let first = format!("{z} {a} refs/heads/topic\0report-status\n");
+        let second = format!("{z} {b} refs/heads/topic\n");
+        let mut body = format!("{:04x}{first}", first.len() + 4).into_bytes();
+        body.extend_from_slice(format!("{:04x}{second}", second.len() + 4).as_bytes());
+        body.extend_from_slice(b"0000PACKmust-not-be-ingested");
+
+        let error = parse_push_request(&body).expect_err("one ref may appear only once per push");
+        assert!(
+            error.contains("duplicate ref-update command for \"refs/heads/topic\""),
+            "the parser names the conflicting ref: {error}"
+        );
     }
 
     #[test]
