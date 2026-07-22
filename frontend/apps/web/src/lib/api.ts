@@ -118,6 +118,8 @@ export interface BlobVM {
   is_binary?: boolean;
   size_bytes?: number;
   is_truncated?: boolean;
+  preview_unavailable?: boolean;
+  download_available?: boolean;
   raw_url?: string;
   download_url?: string;
   redirect_to_tree?: boolean;

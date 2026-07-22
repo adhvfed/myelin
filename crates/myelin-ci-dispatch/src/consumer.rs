@@ -1286,7 +1286,7 @@ impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> GitConfigReader
             .map_err(|e| GitReadError::Unavailable(format!("read {path}@{}: {e}", oid.as_str())))?
         {
             myelin_git::durable::BlobPathLookup::Found { bytes, .. } => Ok(Some(bytes)),
-            myelin_git::durable::BlobPathLookup::TooLarge { size, maximum } => Err(GitReadError::Invalid(format!("{path}@{} is {size} bytes, above the {maximum}-byte config limit", oid.as_str()))),
+            myelin_git::durable::BlobPathLookup::TooLarge { size, maximum, .. } => Err(GitReadError::Invalid(format!("{path}@{} is {size} bytes, above the {maximum}-byte config limit", oid.as_str()))),
             // Absent or a directory at that name → no config file (a clean skip).
             myelin_git::durable::BlobPathLookup::Missing
             | myelin_git::durable::BlobPathLookup::IsDir => Ok(None),

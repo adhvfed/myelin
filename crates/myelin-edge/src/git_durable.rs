@@ -1116,10 +1116,10 @@ impl DurableGitBackend {
         }
     }
 
-    /// The enriched BlobVM (`GET /repos/{repo}/blob/{ref}/{...path}`, nested). Adds server-side binary
-    /// detection, byte size, truncation head, and the gateway-proxied raw/download URLs. A directory
-    /// requested under `blob/` returns `{ redirect_to_tree: true }` (kind mismatch → client redirect);
-    /// an absent path is `NotFound` (404).
+    /// The enriched BlobVM (`GET /repos/{repo}/blob/{ref}/{...path}`, nested). Small files include a
+    /// server-classified inline preview; larger files stop at the ODB header and return an honest
+    /// metadata-only fallback. A directory requested under `blob/` returns
+    /// `{ redirect_to_tree: true }` (kind mismatch → client redirect); an absent path is `NotFound`.
     fn blob_json(
         &self,
         tenant: &str,
@@ -1128,51 +1128,79 @@ impl DurableGitBackend {
         gitref: &str,
         path: &str,
     ) -> Result<Value, DurableError> {
+        self.blob_json_bounded(
+            tenant,
+            region,
+            slug,
+            gitref,
+            path,
+            BlobViewOptions {
+                maximum_preview_bytes: BLOB_INLINE_CAP,
+                maximum_transfer_bytes: RAW_BLOB_MAX_BYTES,
+            },
+        )
+    }
+
+    fn blob_json_bounded(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        gitref: &str,
+        path: &str,
+        options: BlobViewOptions,
+    ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?;
-        match repo.read_blob_at_path(gitref, path)? {
+        let raw = format!(
+            "/{}/git/repos/{slug}/raw/{gitref}/{path}",
+            crate::catalogue::API_VERSION
+        );
+        let download = format!(
+            "/{}/git/repos/{slug}/download/{gitref}/{path}",
+            crate::catalogue::API_VERSION
+        );
+        match repo.read_blob_at_path_bounded(gitref, path, options.maximum_preview_bytes)? {
             BlobPathLookup::IsDir => {
                 Ok(json!({ "redirect_to_tree": true, "ref": gitref, "path": path }))
             }
             BlobPathLookup::Missing => Err(DurableError::NotFound(format!(
                 "no such file `{path}` at `{gitref}`"
             ))),
-            BlobPathLookup::TooLarge { .. } => Err(DurableError::Git(
-                "unbounded edge blob read unexpectedly returned TooLarge".into(),
-            )),
+            BlobPathLookup::TooLarge { size, oid, .. } => Ok(json!({
+                "path": path,
+                "contents": "",
+                "base_oid": oid.0,
+                "viewer_may_edit": false,
+                "size_bytes": size,
+                "preview_unavailable": true,
+                "download_available": size <= options.maximum_transfer_bytes as u64,
+                "raw_url": raw,
+                "download_url": download,
+            })),
             BlobPathLookup::Found {
                 bytes,
                 oid,
                 is_binary,
                 size,
             } => {
-                let is_truncated = !is_binary && size as usize > BLOB_INLINE_CAP;
-                // The inline text: empty for binary (the download fallback renders instead), a head for a
-                // large file, the whole content otherwise. NEVER a `split('\n')` of binary bytes.
+                // Binary bytes never enter a text projection. Large objects never reach this branch:
+                // the bounded reader returns metadata from the object header before inflation.
                 let contents = if is_binary {
                     String::new()
-                } else if is_truncated {
-                    let head: Vec<u8> = bytes.iter().take(BLOB_INLINE_CAP).copied().collect();
-                    String::from_utf8_lossy(&head).to_string()
                 } else {
                     String::from_utf8_lossy(&bytes).to_string()
                 };
-                let raw = format!(
-                    "/{}/git/repos/{slug}/raw/{gitref}/{path}",
-                    crate::catalogue::API_VERSION
-                );
-                let download = format!(
-                    "/{}/git/repos/{slug}/download/{gitref}/{path}",
-                    crate::catalogue::API_VERSION
-                );
                 Ok(json!({
                     "path": path,
                     "contents": contents,
                     "base_oid": oid.0,
-                    "viewer_may_edit": true,
+                    "viewer_may_edit": false,
                     "is_binary": is_binary,
                     "size_bytes": size,
-                    "is_truncated": is_truncated,
+                    "is_truncated": false,
+                    "preview_unavailable": false,
+                    "download_available": true,
                     "raw_url": raw,
                     "download_url": download,
                 }))
@@ -2964,8 +2992,8 @@ fn qualify_ref(gitref: &str) -> String {
 /// within this many commits render name-only (graceful degrade — never an N-walk-per-entry blow-up).
 const LATEST_COMMIT_WALK_CAP: usize = 500;
 
-/// The inline-text cap for a blob view (R3.4). A text blob larger than this renders a head + a
-/// "download full file" affordance; binary blobs never render inline at all (download fallback).
+/// The inline-text cap for a blob view (R3.4). The ODB header is checked first: a larger object gets
+/// a metadata-only download fallback and is never inflated merely to build the interactive page.
 const BLOB_INLINE_CAP: usize = 512 * 1024;
 
 /// README markdown shares the JSON response budget with tree metadata and is checked at the ODB
@@ -3412,6 +3440,12 @@ struct DRawFile {
 struct RawResponseOptions {
     attachment: bool,
     maximum_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct BlobViewOptions {
+    maximum_preview_bytes: usize,
+    maximum_transfer_bytes: usize,
 }
 impl Handler for DRawFile {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
@@ -5365,6 +5399,68 @@ mod pr_list_tests {
             None,
             "an oversized README-style preview must stop at the object header",
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn blob_view_stops_at_the_object_header_for_oversized_previews() {
+        let root = temp_root("blob-preview-bound");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root);
+        let author = human("u:author");
+        be.create_repo_as(TENANT, REGION, "core", &author).unwrap();
+        let loc = DurableGitBackend::loc(TENANT, REGION, "core");
+        let repo = be.store.open_repo(&loc).expect("open repo");
+        let blob = repo.write_blob(b"hello\n").expect("blob");
+        let tree = repo.write_tree(&[("large.txt", &blob)]).expect("tree");
+        let tip = repo
+            .write_commit(&tree, &[], "seed", "psn@acme.noreply", "psn@acme.noreply")
+            .expect("commit");
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&tip),
+            "create",
+            "psn@acme.noreply",
+        )
+        .expect("create main");
+
+        let metadata = be
+            .blob_json_bounded(
+                TENANT,
+                REGION,
+                "core",
+                "main",
+                "large.txt",
+                BlobViewOptions {
+                    maximum_preview_bytes: 1,
+                    maximum_transfer_bytes: 4,
+                },
+            )
+            .expect("metadata-only blob view");
+        assert_eq!(metadata["contents"], "");
+        assert_eq!(metadata["base_oid"], blob.as_str());
+        assert_eq!(metadata["size_bytes"], 6);
+        assert_eq!(metadata["preview_unavailable"], true);
+        assert_eq!(metadata["download_available"], false);
+        assert_eq!(metadata["viewer_may_edit"], false);
+
+        let inline = be
+            .blob_json_bounded(
+                TENANT,
+                REGION,
+                "core",
+                "main",
+                "large.txt",
+                BlobViewOptions {
+                    maximum_preview_bytes: 6,
+                    maximum_transfer_bytes: 6,
+                },
+            )
+            .expect("inline blob view");
+        assert_eq!(inline["contents"], "hello\n");
+        assert_eq!(inline["preview_unavailable"], false);
+        assert_eq!(inline["download_available"], true);
+        assert_eq!(inline["viewer_may_edit"], false);
         std::fs::remove_dir_all(&root).ok();
     }
 
