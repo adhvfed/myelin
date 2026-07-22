@@ -16,10 +16,13 @@ import {
   updateSessionToken,
 } from "./session";
 import { edgeOrigin } from "./edge-origin";
+import { readLimitedBytes, readLimitedText } from "./bounded-response";
 
 export { GatewayError, Unauthorized } from "./gateway-core";
 
 export const DEFAULT_EDGE_REQUEST_TIMEOUT_MS = 15_000;
+export const MAX_EDGE_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;
+export const MAX_EDGE_RAW_RESPONSE_BYTES = 64 * 1024 * 1024;
 
 export interface GatewayRequestOptions {
   /** One deadline spans the edge attempt, token refresh, and single retry. Defaults to 15 seconds. */
@@ -64,7 +67,7 @@ export async function edgeGetPublic<T = unknown>(path: string): Promise<T> {
     redirect: "error",
     signal: gatewayRequestSignal(),
   });
-  const bodyText = await res.text();
+  const bodyText = await readLimitedText(res, MAX_EDGE_JSON_RESPONSE_BYTES);
   if (res.status < 200 || res.status >= 300) {
     throw new GatewayError(`auth/config GET failed (${res.status})`, res.status, undefined, bodyText);
   }
@@ -106,8 +109,8 @@ export async function edgeLoginWithOidc(
     redirect: "error",
     signal: gatewayRequestSignal(),
   });
-  const text = await res.text();
-  if (res.status !== 200 || text.length > 64 * 1024) {
+  const text = await readLimitedText(res, 64 * 1024);
+  if (res.status !== 200) {
     throw new Unauthorized(`OIDC login failed (HTTP ${res.status})`);
   }
   let body: unknown;
@@ -120,6 +123,7 @@ export async function edgeLoginWithOidc(
   if (
     typeof login.access_token !== "string" ||
     !login.access_token ||
+    login.access_token.length > 32 * 1024 ||
     login.scheme !== "session" ||
     login.token_type !== "Bearer" ||
     typeof login.expires_at !== "number" ||
@@ -156,7 +160,7 @@ export async function edgeWhoamiWithToken(token: string, scheme = "agent"): Prom
     // Do NOT attach the response body — it could echo the token or an internal error. Honest, opaque.
     throw new Unauthorized(`token verification failed (HTTP ${res.status})`);
   }
-  const who = (await res.json().catch(() => null)) as EdgeWhoami | null;
+  const who = parseJson(await readLimitedText(res, 64 * 1024)) as EdgeWhoami | null;
   if (
     !who ||
     typeof who.principal_id !== "string" ||
@@ -195,7 +199,10 @@ async function edgeRequest<T>(
         redirect: "error",
         signal,
       });
-      return { status: res.status, bodyText: await res.text() };
+      return {
+        status: res.status,
+        bodyText: await readLimitedText(res, MAX_EDGE_JSON_RESPONSE_BYTES),
+      };
     },
     refresh: async () => {
       const rec = await getSessionRecord();
@@ -211,8 +218,8 @@ async function edgeRequest<T>(
       });
       if (res.status !== 200) return null;
       // The refresh response may rotate the access token; persist it server-side and use it for the retry.
-      const json = (await res.json().catch(() => null)) as { access_token?: string } | null;
-      const fresh = json?.access_token ?? rec.token;
+      const fresh = refreshAccessToken(await readLimitedText(res, 64 * 1024), rec.token);
+      if (!fresh) return null;
       // Revocation/expiry may delete the session while refresh is in flight. Never authorize the
       // retry unless the fresh credential was persisted onto that still-live session.
       return (await updateSessionToken(fresh)) ? fresh : null;
@@ -261,9 +268,8 @@ export async function edgeGetRaw(
         signal,
       });
       if (rr.status === 200) {
-        const json = (await rr.json().catch(() => null)) as { access_token?: string } | null;
-        const candidate = json?.access_token ?? rec.token;
-        if (await updateSessionToken(candidate)) fresh = candidate;
+        const candidate = refreshAccessToken(await readLimitedText(rr, 64 * 1024), rec.token);
+        if (candidate && (await updateSessionToken(candidate))) fresh = candidate;
       }
     }
     if (!fresh) {
@@ -271,10 +277,33 @@ export async function edgeGetRaw(
       throw new Unauthorized("still unauthorized after one refresh");
     }
     res = await doFetch(fresh);
+    if (res.status === 401) {
+      await clearCurrentSession();
+      throw new Unauthorized("still unauthorized after one refresh");
+    }
   }
+  const body = await readLimitedBytes(res, MAX_EDGE_RAW_RESPONSE_BYTES);
   return {
     status: res.status,
     contentType: res.headers.get("content-type") ?? "application/octet-stream",
-    body: await res.arrayBuffer(),
+    body: body.buffer,
   };
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function refreshAccessToken(text: string, current: string): string | null {
+  const parsed = parseJson(text);
+  if (!parsed || typeof parsed !== "object") return null;
+  const candidate = (parsed as Record<string, unknown>).access_token;
+  if (candidate === undefined) return current;
+  return typeof candidate === "string" && candidate.length > 0 && candidate.length <= 32 * 1024
+    ? candidate
+    : null;
 }

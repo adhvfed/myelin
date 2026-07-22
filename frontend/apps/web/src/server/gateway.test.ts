@@ -10,6 +10,8 @@ vi.mock("./session", () => session);
 
 import {
   DEFAULT_EDGE_REQUEST_TIMEOUT_MS,
+  MAX_EDGE_JSON_RESPONSE_BYTES,
+  MAX_EDGE_RAW_RESPONSE_BYTES,
   edgeGet,
   edgeGetRaw,
   edgeLoginWithOidc,
@@ -133,6 +135,26 @@ describe("gateway request deadlines", () => {
   });
 });
 
+describe("gateway response limits", () => {
+  it("rejects an oversized JSON response before buffering it", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("{}", {
+      status: 200,
+      headers: { "content-length": String(MAX_EDGE_JSON_RESPONSE_BYTES + 1) },
+    })));
+
+    await expect(edgeGet("/v1/issues")).rejects.toThrow(/byte limit/);
+  });
+
+  it("rejects an oversized raw response before buffering it", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("raw", {
+      status: 200,
+      headers: { "content-length": String(MAX_EDGE_RAW_RESPONSE_BYTES + 1) },
+    })));
+
+    await expect(edgeGetRaw("/v1/git/raw")).rejects.toThrow(/byte limit/);
+  });
+});
+
 describe("gateway refresh revocation races", () => {
   it("does not send a refresh request for a non-refreshable SSO session", async () => {
     session.getSessionRecord.mockReturnValue({
@@ -182,6 +204,38 @@ describe("gateway refresh revocation races", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(session.updateSessionToken).toHaveBeenCalledWith("fresh-token");
+    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the session when a refreshed raw request is still unauthorized", async () => {
+    const refresh = new Response(JSON.stringify({ access_token: "fresh-token" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(unauthorized())
+      .mockResolvedValueOnce(refresh)
+      .mockResolvedValueOnce(unauthorized());
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(edgeGetRaw("/v1/git/raw")).rejects.toMatchObject({ name: "Unauthorized" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(session.updateSessionToken).toHaveBeenCalledWith("fresh-token");
+    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not persist a malformed token from a successful refresh response", async () => {
+    const refresh = new Response(JSON.stringify({ access_token: 42 }), { status: 200 });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(unauthorized())
+      .mockResolvedValueOnce(refresh);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(edgeGet("/v1/issues")).rejects.toMatchObject({ name: "Unauthorized" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(session.updateSessionToken).not.toHaveBeenCalled();
     expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
   });
 });
