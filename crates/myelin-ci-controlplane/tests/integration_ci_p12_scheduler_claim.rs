@@ -24,9 +24,9 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
-    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
-    CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
-    REAP_QUERY,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL, REAP_QUERY,
 };
 
 fn app_url() -> String {
@@ -192,6 +192,11 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         .execute(&admin)
         .await
         .expect("apply the job_queue claim-authority ALTER");
+    let alter = ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL.replace("job_queue", &tbl);
+    sqlx::query(&alter)
+        .execute(&admin)
+        .await
+        .expect("apply the job_queue claim-time ALTER");
     // The indexes (rewritten to the suffixed table; CONCURRENTLY needs its own tx outside a pool tx —
     // a fresh empty table makes a plain index create lock-free, so drop CONCURRENTLY for the test DDL).
     for (name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
@@ -289,7 +294,7 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
             .replacen("$2", runner_labels, 1)
             .replacen("$3", allowed, 1)
             .replacen("$4", &format!("'{owner}'"), 1)
-            .replacen("$5", "'30'", 1)
+            .replace("$5", "'30'")
     };
     // The claim returns `job_id` as a uuid; format it back to the string form `id()` produced.
     let claimed_uuid =

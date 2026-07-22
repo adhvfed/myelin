@@ -54,6 +54,8 @@
 
 pub mod artifact_cache;
 pub mod check_emitter;
+/// Claim-time durable authority verification in front of the raw Identity credential minter.
+pub mod ci_claim_token_issuer;
 /// Canonical, insert-only replay authority for a durable CI workflow. The manifest binds the exact
 /// DAG, per-context check attempts, workflow code identity, and server-granted launch templates;
 /// secret values and minted token JTIs are structurally absent.
@@ -67,6 +69,7 @@ pub mod ci_manifest_pipeline;
 pub mod ci_manifest_job_runner;
 pub mod ci_pipeline;
 pub mod ci_result_signal;
+pub use ci_claim_token_issuer::{CiJobCredentialMinter, LockedManifestCiJobTokenIssuer};
 pub use ci_drive_manifest::{
     ci_check_context_v1, CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1,
     CiJobLaunchGrantV1, CiLaunchAuthorityV1, CiManifestLaneV1, CiManifestLimitsV1,
@@ -505,6 +508,7 @@ pub use scheduler::{
 pub use job_queue_region::CiRegionQueueStore;
 pub use job_queue_store::{
     CiJobQueueStore, DurableEnqueue, JobQueueReaper, JobQueueStoreError, LeasedJob,
+    LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY,
 };
 
 // CT-004d.1: the durable `JobSpec` store + the dispatch→durable co-persist + the fail-closed
@@ -530,8 +534,8 @@ pub use ci_run_store::{
     CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationOutcome, CiRunFinalizationWrite,
     CiRunFinalizer, CiRunInsert, CiRunRecord, CiRunStore, CiRunStoreError, CiRunTerminalState,
     DurableCiRunFinalizer, FINALIZE_CI_RUN_QUERY, INSERT_CI_RUN_QUERY,
-    LOCK_CI_RUN_FOR_FINALIZE_QUERY, SELECT_CI_RUN_ACCOUNTING_QUERY, SELECT_CI_RUN_QUERY,
-    VERIFY_CI_RUN_REPLAY_QUERY,
+    LOCK_CI_RUN_FOR_FINALIZE_QUERY, LOCK_CI_RUN_FOR_TOKEN_MINT_QUERY,
+    SELECT_CI_RUN_ACCOUNTING_QUERY, SELECT_CI_RUN_QUERY, VERIFY_CI_RUN_REPLAY_QUERY,
 };
 pub use ci_run_region::{CiRegionRunDiscovery, DISCOVER_QUEUED_CI_RUN_TENANT_QUERY};
 pub use ci_run_starter_poller::{
@@ -544,6 +548,8 @@ pub use ci_scheduler_db::{
 // CT-004c.2: the runner exec binding — the durable-store lease adapter + the bounded runner loop the
 // service `main` spawns (WIRES `RunnerAgent` to `CiJobQueueStore` + a real gVisor backend). CT-004d.1
 // adds the REAL spec resolver (`durable_spec_resolver`) + the lease-TTL floor (`CI_RUNNER_LEASE_TTL_SECS`).
+#[cfg(any(test, feature = "test-support"))]
+pub use runner_bind::durable_spec_resolver_test_support;
 pub use runner_bind::{
     durable_spec_resolver, spec_store_unavailable_resolver, CiRunnerLoop, DurableLeaseAdapter,
     JobSpecResolver, CI_RUNNER_LEASE_TTL_SECS,
@@ -591,30 +597,29 @@ pub use migrations::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, ci_durable_hot_tables,
     ci_durable_migrations, make_tenant_scoped_ddl, ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL,
     ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ARTIFACT_TABLE,
-    CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DRIVE_MANIFEST_TABLE,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ARTIFACT_TABLE, CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE,
+    CI_COST_EVENT_TABLE, CI_DRIVE_MANIFEST_TABLE, CI_DURABLE_WRITER_IDS,
     CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID, CI_JOB_ACCOUNTING_TABLE,
-    CI_DURABLE_WRITER_IDS, CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID,
+    CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_JOB_QUEUE_CLAIM_TIME_MIGRATION_ID,
     CI_JOB_QUEUE_COMPLETION_MIGRATION_ID, CI_JOB_RUN_LEDGER_INDEX,
     CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID, CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID,
     CI_JOB_SPEC_STAGE_MIGRATION_ID, CI_JOB_SPEC_TABLE, CI_JOB_TABLE,
-    CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID, CI_RUN_TABLE,
-    CI_RUN_QUEUED_REGION_INDEX, CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID,
+    CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
+    CI_RUN_QUEUED_REGION_INDEX, CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID, CI_RUN_TABLE,
     CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
-    CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID,
+    CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID, CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID,
     CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL, CREATE_CHECK_ATTEMPT_DDL,
     CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_ACCOUNTING_DDL,
     CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL,
-    CREATE_CI_REGION_SCHEDULER_RLS_DDL, CREATE_CI_RUN_DDL,
-    CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL, CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL,
-    CREATE_FAIR_DEFICIT_DDL,
-    CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL,
-    CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL, CREATE_SECRET_BINDING_DDL, DEPLOYMENT_TABLE,
-    ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE, GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL,
-    GRANT_SCHEDULER_CLAIM_NONCE_DDL, GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE,
-    JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX,
-    JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE, RUNNER_TABLE, SECRET_BINDING_TABLE,
-    VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+    CREATE_CI_REGION_SCHEDULER_RLS_DDL, CREATE_CI_RUN_DDL, CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL,
+    CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL,
+    CREATE_SECRET_BINDING_DDL, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE,
+    GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL, GRANT_SCHEDULER_CLAIM_NONCE_DDL,
+    GRANT_SCHEDULER_CLAIM_TIME_DDL, GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE,
+    JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE,
+    RUNNER_TABLE, SECRET_BINDING_TABLE, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
 };
 
 pub use permanent_gates::{
@@ -1001,8 +1006,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            32,
-            "all 17 tables, ci_run causal provenance, 5 concurrent indexes, the ledger validator, 2 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 2 claim-column grants, and the ci_run discovery grant are present"
+            34,
+            "all 17 tables, ci_run causal provenance, 5 concurrent indexes, the ledger validator, 3 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, and the ci_run discovery grant are present"
         );
         assert!(
             spec.consumers.is_empty(),

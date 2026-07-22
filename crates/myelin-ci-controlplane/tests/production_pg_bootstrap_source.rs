@@ -5,7 +5,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let source = include_str!("../src/main.rs");
     let library_source = include_str!("../src/lib.rs");
     let launch_authority_source = include_str!("../src/ci_launch_authority.rs");
+    let claim_issuer_source = include_str!("../src/ci_claim_token_issuer.rs");
     let region_store_source = include_str!("../src/job_queue_region.rs");
+    let runner_bind_source = include_str!("../src/runner_bind.rs");
 
     assert!(source.contains("MyelinConfig::from_env(Mode::RequireEnv)"));
     assert!(source.contains("CiSchedulerDbConfig::from_env(&platform_config)"));
@@ -64,9 +66,30 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(source.contains("let runner_host_requested = matches!(&runner_setting"));
     assert!(library_source.contains("LinuxSmallV1LaunchAuthority::new"));
     assert!(library_source.contains("UnavailableCiJobBudgetReservation"));
-    assert!(launch_authority_source
-        .contains("ManifestBoundCiJobTokenAuthority::handle_for(request)"));
+    assert!(
+        launch_authority_source.contains("ManifestBoundCiJobTokenAuthority::handle_for(request)")
+    );
     assert!(!launch_authority_source.contains("CiJobTokenAuthorityProvider"));
+    assert!(runner_bind_source.contains("token_issuer: LockedManifestCiJobTokenIssuer"));
+    assert!(runner_bind_source.contains("pub fn durable_spec_resolver_test_support"));
+    assert!(runner_bind_source.contains("#[cfg(any(test, feature = \"test-support\"))]"));
+    assert!(!runner_bind_source.contains("#[cfg(any(test, feature = \"integration\"))]"));
+    let claim_lock = claim_issuer_source
+        .find("CiJobQueueStore::lock_for_token_mint_on_conn")
+        .expect("claim-time issuer must lock the durable scheduler claim");
+    let run_lock = claim_issuer_source
+        .find("CiRunStore::lock_for_token_mint_on_conn")
+        .expect("claim-time issuer must lock the durable run");
+    let manifest = claim_issuer_source
+        .find(".load_by_identity_on_conn(")
+        .expect("claim-time issuer must reload the immutable manifest");
+    let verify = claim_issuer_source
+        .find("authority_from_durable_claim(&request, &run, &manifest)")
+        .expect("claim-time issuer must reconstruct and verify durable authority");
+    let mint = claim_issuer_source
+        .find(".mint_verified(request.clone(), authority)")
+        .expect("raw Identity mint must be last");
+    assert!(claim_lock < run_lock && run_lock < manifest && manifest < verify && verify < mint);
     assert!(library_source.contains("PgCiRunStarterFactory::new_with_authority"));
     // It routes an AUTHORITATIVE tenant, never a synthetic one — no starter is constructed for a fixed
     // service tenant at the root (the factory mints per discovered ci_run.tenant_id).

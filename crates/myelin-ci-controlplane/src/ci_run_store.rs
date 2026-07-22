@@ -221,6 +221,31 @@ SELECT
   correlation_id          AS correlation_id
 FROM ci_run WHERE tenant_id = $1 AND run_id = $2::uuid";
 
+/// Lock the exact live run while a claim-bound Identity credential is minted. The lock and the
+/// immutable-manifest read share one tenant-scoped transaction, so a terminal transition cannot
+/// race between authority verification and minting.
+pub const LOCK_CI_RUN_FOR_TOKEN_MINT_QUERY: &str = "\
+SELECT
+  tenant_id              AS tenant_id,
+  run_id::text            AS run_id,
+  region                  AS region,
+  project_id::text        AS project_id,
+  pipeline_id::text       AS pipeline_id,
+  wf_run_id::text         AS wf_run_id,
+  repo_ref                AS repo_ref,
+  commit_oid              AS commit_oid,
+  cause_event_id          AS cause_event_id,
+  cause_depth             AS cause_depth,
+  caused_by               AS caused_by,
+  definition_snapshot     AS definition_snapshot,
+  trigger_kind            AS trigger_kind,
+  trust_tier              AS trust_tier,
+  state                   AS state,
+  correlation_id          AS correlation_id
+FROM ci_run
+WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND wf_run_id = $4::uuid
+FOR UPDATE";
+
 /// Lock the run-of-record before its one-way terminal transition. Any persisted completion timestamp
 /// is rendered canonically so an acknowledgement-loss replay can reuse it byte-for-byte.
 pub const LOCK_CI_RUN_FOR_FINALIZE_QUERY: &str = "\
@@ -676,24 +701,27 @@ impl CiRunStore {
         .await
         .map_err(CiRunStoreError::from)?;
 
-        Ok(row.map(|r| CiRunRecord {
-            tenant_id: r.get("tenant_id"),
-            run_id: r.get("run_id"),
-            region: r.get("region"),
-            project_id: r.get("project_id"),
-            pipeline_id: r.get("pipeline_id"),
-            wf_run_id: r.get("wf_run_id"),
-            repo_ref: r.get("repo_ref"),
-            commit_oid: r.get("commit_oid"),
-            cause_event_id: r.get("cause_event_id"),
-            cause_depth: r.get("cause_depth"),
-            caused_by: r.get("caused_by"),
-            definition_snapshot: r.get("definition_snapshot"),
-            trigger_kind: r.get("trigger_kind"),
-            trust_tier: r.get("trust_tier"),
-            state: r.get("state"),
-            correlation_id: r.get("correlation_id"),
-        }))
+        Ok(row.map(ci_run_record_from_row))
+    }
+
+    /// Caller-transaction variant used only by the claim-time token issuer. The caller owns the
+    /// transaction-local tenant scope and keeps this `FOR UPDATE` lock through credential minting.
+    pub(crate) async fn lock_for_token_mint_on_conn(
+        connection: &mut sqlx::PgConnection,
+        tenant_id: &str,
+        region: &str,
+        run_id: &str,
+        wf_run_id: &str,
+    ) -> Result<Option<CiRunRecord>, CiRunStoreError> {
+        let row = sqlx::query(LOCK_CI_RUN_FOR_TOKEN_MINT_QUERY)
+            .bind(tenant_id)
+            .bind(region)
+            .bind(run_id)
+            .bind(wf_run_id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|error| CiRunStoreError::Db(format!("lock CI run for token mint: {error}")))?;
+        Ok(row.map(ci_run_record_from_row))
     }
 
     /// Finalize one run only after the manifest's complete job set has exact immutable accounting.
@@ -729,6 +757,27 @@ impl CiRunStore {
     ) -> Result<CiRunFinalizationOutcome, CiRunStoreError> {
         validate_finalization_scope(scope, finalization)?;
         finalize_on_conn(conn, scope, finalization).await
+    }
+}
+
+fn ci_run_record_from_row(row: sqlx::postgres::PgRow) -> CiRunRecord {
+    CiRunRecord {
+        tenant_id: row.get("tenant_id"),
+        run_id: row.get("run_id"),
+        region: row.get("region"),
+        project_id: row.get("project_id"),
+        pipeline_id: row.get("pipeline_id"),
+        wf_run_id: row.get("wf_run_id"),
+        repo_ref: row.get("repo_ref"),
+        commit_oid: row.get("commit_oid"),
+        cause_event_id: row.get("cause_event_id"),
+        cause_depth: row.get("cause_depth"),
+        caused_by: row.get("caused_by"),
+        definition_snapshot: row.get("definition_snapshot"),
+        trigger_kind: row.get("trigger_kind"),
+        trust_tier: row.get("trust_tier"),
+        state: row.get("state"),
+        correlation_id: row.get("correlation_id"),
     }
 }
 

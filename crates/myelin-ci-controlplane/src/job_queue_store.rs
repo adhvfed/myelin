@@ -196,6 +196,33 @@ pub struct LeasedJob {
     pub claim_expires_at_epoch_secs: i64,
 }
 
+/// Scheduler claim facts reloaded under a row lock immediately before token minting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LockedJobClaim {
+    pub state: String,
+    pub idem_token: String,
+    pub stage: Option<String>,
+    pub trust_tier: String,
+    pub lease_owner: Option<String>,
+    pub lease_epoch: i64,
+    pub claim_nonce: Option<String>,
+    pub claim_started_at_epoch_secs: Option<i64>,
+    pub claim_expires_at_epoch_secs: Option<i64>,
+    pub claim_is_live: bool,
+}
+
+/// Lock one exact scheduler row and recover its persisted initial claim generation. Job-queue lock
+/// precedes the CI-run lock everywhere token minting needs both, matching reporter/reaper ownership.
+pub const LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY: &str = "\
+SELECT state, idem_token, stage, trust_tier, lease_owner, lease_epoch,
+       claim_nonce::text AS claim_nonce,
+       EXTRACT(EPOCH FROM claim_started_at)::bigint AS claim_started_at_epoch_secs,
+       EXTRACT(EPOCH FROM claim_expires_at)::bigint AS claim_expires_at_epoch_secs,
+       COALESCE(claim_expires_at > statement_timestamp(), false) AS claim_is_live
+FROM job_queue
+WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid AND run_id = $4::uuid
+FOR UPDATE";
+
 /// **The outcome of the claim CAS joined to durable signal delivery by the completion reporter.**
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClaimConsumeOutcome {
@@ -249,6 +276,39 @@ impl CiJobQueueStore {
     /// The pool this store is bound to (for a co-commit caller that wants to begin its own tx).
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Caller-transaction claim lock used by the production token issuer. It performs no fallback
+    /// or coercion; the issuer compares every returned generation field before invoking Identity.
+    pub(crate) async fn lock_for_token_mint_on_conn(
+        connection: &mut sqlx::PgConnection,
+        tenant_id: &str,
+        region: &str,
+        job_id: &str,
+        run_id: &str,
+    ) -> Result<Option<LockedJobClaim>, JobQueueStoreError> {
+        let row = sqlx::query(LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY)
+            .bind(tenant_id)
+            .bind(region)
+            .bind(job_id)
+            .bind(run_id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|error| {
+                JobQueueStoreError::Db(format!("lock job claim for token mint: {error}"))
+            })?;
+        Ok(row.map(|row| LockedJobClaim {
+            state: row.get("state"),
+            idem_token: row.get("idem_token"),
+            stage: row.get("stage"),
+            trust_tier: row.get("trust_tier"),
+            lease_owner: row.get("lease_owner"),
+            lease_epoch: row.get("lease_epoch"),
+            claim_nonce: row.get("claim_nonce"),
+            claim_started_at_epoch_secs: row.get("claim_started_at_epoch_secs"),
+            claim_expires_at_epoch_secs: row.get("claim_expires_at_epoch_secs"),
+            claim_is_live: row.get("claim_is_live"),
+        }))
     }
 
     /// **Enqueue a job, idempotent on `(tenant_id, idem_token)` (arch 02 §2.1; [`INSERT_JOB_QUEUE_QUERY`]).**
@@ -632,6 +692,14 @@ mod tests {
         // The claim BUMPS the monotone claim generation so a stale re-claim is a higher epoch.
         assert!(CLAIM_QUERY.contains("lease_epoch = j.lease_epoch + 1"));
         assert!(CLAIM_QUERY.contains("claim_nonce = gen_random_uuid()"));
+        assert!(CLAIM_QUERY.contains("claim_started_at = statement_timestamp()"));
+        assert!(CLAIM_QUERY
+            .contains("claim_expires_at = statement_timestamp() + ($5 || ' seconds')::interval"));
+        // Mint authority reloads the exact persisted claim and treats legacy/null expiry as dead.
+        assert!(LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY.contains("$4::uuid"));
+        assert!(LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY.contains("FOR UPDATE"));
+        assert!(LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY
+            .contains("COALESCE(claim_expires_at > statement_timestamp(), false)"));
         // Completion binds nonce + stage and records the receipt only for that exact claim.
         assert!(CONSUME_CLAIM_QUERY.contains("$7") && !CONSUME_CLAIM_QUERY.contains("$8"));
         assert!(CONSUME_CLAIM_QUERY.contains("claim_nonce = $5::uuid"));

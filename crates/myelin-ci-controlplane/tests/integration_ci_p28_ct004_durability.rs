@@ -27,10 +27,11 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
-    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
-    BUMP_CHECK_ATTEMPT_SQL, CLAIM_QUERY, CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL,
-    CREATE_CI_JOB_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL, CREATE_LOG_ANCHOR_DDL,
-    INSERT_COST_EVENT_QUERY, REAP_QUERY, SELECT_COST_EVENTS_FOR_RUN_QUERY, UPSERT_LOG_ANCHOR_QUERY,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, BUMP_CHECK_ATTEMPT_SQL, CLAIM_QUERY,
+    CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL, CREATE_CI_JOB_DDL, CREATE_CI_RUN_DDL,
+    CREATE_JOB_QUEUE_DDL, CREATE_LOG_ANCHOR_DDL, INSERT_COST_EVENT_QUERY, REAP_QUERY,
+    SELECT_COST_EVENTS_FOR_RUN_QUERY, UPSERT_LOG_ANCHOR_QUERY,
 };
 use sqlx::types::Uuid;
 use sqlx::{PgPool, Row};
@@ -125,6 +126,11 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
         .execute(&p1)
         .await
         .expect("apply job_queue claim-authority columns");
+    let alter = ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL.replace("job_queue", &tbl);
+    sqlx::query(&alter)
+        .execute(&p1)
+        .await
+        .expect("apply job_queue claim-time columns");
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS {fair} (tenant_id text NOT NULL, region text NOT NULL, \
          fair_key text NOT NULL, deficit bigint NOT NULL DEFAULT 0, \
@@ -163,7 +169,7 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
             .replacen("$2", "ARRAY['linux']::text[]", 1)
             .replacen("$3", "ARRAY['trusted']::text[]", 1)
             .replacen("$4", &format!("'{owner}'"), 1)
-            .replacen("$5", "'30'", 1)
+            .replace("$5", "'30'")
     };
 
     // ── COMMITTED claim: lease `kept` (the older job wins) on the pool (autocommit) — durable. ──

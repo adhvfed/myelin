@@ -56,6 +56,7 @@ use myelin_ci_sandbox::{JobSpec, LeaseStore, QueuedJob, RunnerError, RunnerHooks
 use myelin_storage::s3blob::S3BlobStore;
 use myelin_tenancy::{Region, TenantId};
 
+use crate::ci_claim_token_issuer::LockedManifestCiJobTokenIssuer;
 use crate::ci_manifest_job_runner::{validate_run_token, CiJobTokenIssuer, CiJobTokenRequest};
 use crate::ci_pipeline_reporter_router::CiPipelineReporterRouter;
 use crate::job_spec_store::MAX_JOB_TIMEOUT_SECS;
@@ -541,6 +542,28 @@ pub fn spec_store_unavailable_resolver() -> JobSpecResolver {
 /// row stays leased, and the reaper recovers it. The runner NEVER launches a fabricated/default spec;
 /// the stored spec is the only thing that executes.
 pub fn durable_spec_resolver(
+    store: CiJobSpecStore,
+    region: impl Into<String>,
+    rt: tokio::runtime::Handle,
+    token_issuer: LockedManifestCiJobTokenIssuer,
+) -> JobSpecResolver {
+    durable_spec_resolver_with_issuer(store, region, rt, Arc::new(token_issuer))
+}
+
+/// Legacy V1 fixture seam under the crate's established dev-only `test-support` boundary. The
+/// default production dependency graph cannot name it or pass an issuer that bypasses the locked
+/// manifest verifier to [`durable_spec_resolver`].
+#[cfg(any(test, feature = "test-support"))]
+pub fn durable_spec_resolver_test_support(
+    store: CiJobSpecStore,
+    region: impl Into<String>,
+    rt: tokio::runtime::Handle,
+    token_issuer: Arc<dyn CiJobTokenIssuer>,
+) -> JobSpecResolver {
+    durable_spec_resolver_with_issuer(store, region, rt, token_issuer)
+}
+
+fn durable_spec_resolver_with_issuer(
     store: CiJobSpecStore,
     region: impl Into<String>,
     rt: tokio::runtime::Handle,

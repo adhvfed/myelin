@@ -136,6 +136,14 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
         column_exists(&pool, &schema, "job_queue", "stage").await,
         "ci_0004b added job_queue.stage on the upgrade"
     );
+    assert!(
+        column_exists(&pool, &schema, "job_queue", "claim_started_at").await,
+        "ci_0004c added job_queue.claim_started_at on the upgrade"
+    );
+    assert!(
+        column_exists(&pool, &schema, "job_queue", "claim_expires_at").await,
+        "ci_0004c added job_queue.claim_expires_at on the upgrade"
+    );
 
     // ── 4. Idempotent re-apply is a clean no-op (every id already recorded). ──
     PgMigrator::apply_validated(
