@@ -473,6 +473,11 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
                     .map_err(|e| DurableError::Io(format!("parse {}: {e}", path.display())))?;
                 if doc.object_key.is_empty() {
                     doc.object_key = object_key.to_string();
+                } else if doc.object_key != object_key {
+                    return Err(DurableError::Git(format!(
+                        "thread document subject mismatch: requested `{object_key}` but stored key is `{}`",
+                        doc.object_key
+                    )));
                 }
                 Ok(doc)
             }
@@ -1136,6 +1141,24 @@ mod tests {
         assert_eq!(key_stem("issue:PROJ-1"), "issue_PROJ-1");
         assert_eq!(key_stem("repo:team/app"), "repo_team_app");
         assert!(!key_stem("pr:../../etc").contains('/'));
+    }
+
+    #[test]
+    fn lossy_filename_collision_cannot_cross_object_boundaries() {
+        let root = temp_root("subject-key-collision");
+        let store = DurablePrThreadStore::rooted(&root);
+        let first = "pr:a/b";
+        let colliding = "pr:a:b";
+        assert_eq!(key_stem(first), key_stem(colliding), "the regression needs a collision");
+
+        store
+            .create_thread(&loc(), first, None, human("psn:a@acme"), "private", 1)
+            .unwrap();
+        let err = store
+            .load(&loc(), colliding)
+            .expect_err("a colliding filename must not expose another object's threads");
+        assert!(err.to_string().contains("subject mismatch"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
