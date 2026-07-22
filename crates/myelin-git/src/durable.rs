@@ -391,17 +391,6 @@ pub struct TreeEntryInfo {
     pub size: Option<u64>,
 }
 
-/// Resolving a `{...path}` under a ref as a TREE (R3.4). [`TreePathLookup::IsFile`] drives the
-/// tree→blob client redirect (the gate's kind-mismatch decision), never a spurious 404.
-pub enum TreePathLookup {
-    /// The path is a directory — its immediate entries (dirs first, then files, each sorted).
-    Dir(Vec<TreeEntryInfo>),
-    /// The path resolves to a blob → the caller redirects to the blob route.
-    IsFile,
-    /// No such path under the ref.
-    Missing,
-}
-
 /// Resolving a `{...path}` under a ref as a BLOB (R3.4). [`BlobPathLookup::IsDir`] drives the
 /// blob→tree client redirect (kind mismatch).
 pub enum BlobPathLookup {
@@ -430,16 +419,6 @@ pub enum BlobPathLookup {
     Missing,
 }
 
-/// Branches + tags + the default branch for the ref switcher (R3.4). Names are SHORT (no `refs/…`).
-pub struct RefsView {
-    /// `refs/heads/*` as `(short_name, tip)`, sorted.
-    pub branches: Vec<(String, Oid)>,
-    /// `refs/tags/*` as `(short_name, tip)`, sorted.
-    pub tags: Vec<(String, Oid)>,
-    /// HEAD's symbolic target (short), falling back to `main`.
-    pub default_branch: String,
-}
-
 /// The git binary-file heuristic: a NUL byte within the first 8000 bytes marks the content binary
 /// (so the UI renders the download fallback instead of a garbled `split('\n')` text dump — R3.4).
 fn looks_binary(bytes: &[u8]) -> bool {
@@ -450,8 +429,6 @@ fn looks_binary(bytes: &[u8]) -> bool {
 pub const FILE_LINES_MAX_RANGE: usize = 1_000;
 /// Maximum blob size inflated by the expand-context API. Checked through the ODB header first.
 pub const FILE_LINES_MAX_BLOB_BYTES: usize = 512 * 1024;
-/// Maximum refs materialized for an interactive browse response.
-pub const BROWSE_MAX_REFS: usize = 1_000;
 /// Maximum direct refs materialized by smart-HTTP and push-adjacent recovery/audit paths.
 pub const WIRE_MAX_REFS: usize = 100_000;
 /// Maximum entries materialized from one durable reflog during audit/export.
@@ -462,14 +439,8 @@ pub const REFLOG_MAX_BYTES_PER_REF: usize = 32 * 1024 * 1024;
 pub const REFLOG_MAX_TOTAL_ENTRIES: usize = 100_000;
 /// Maximum reflog input/output string bytes materialized by one durable audit/export view.
 pub const REFLOG_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
-/// Maximum entries materialized from one tree directory for an interactive browse response.
-pub const BROWSE_MAX_TREE_ENTRIES: usize = 1_000;
 /// Maximum encoded bytes loaded for one tree object during interactive browsing.
-pub const BROWSE_MAX_TREE_OBJECT_BYTES: usize = 8 * 1024 * 1024;
-/// Maximum UTF-8 bytes copied from one tree entry name into an interactive response.
-pub const BROWSE_MAX_TREE_ENTRY_NAME_BYTES: usize = 4 * 1024;
-/// Maximum aggregate tree-entry name bytes copied into one interactive response.
-pub const BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const TREE_OBJECT_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum changed files computed for one interactive pull-request diff.
 pub const PR_DIFF_MAX_FILES: usize = 1_000;
 /// Maximum commit parents represented in interactive metadata (matching the web read contract).
@@ -1151,195 +1122,6 @@ impl DurableGitRepo {
         }
     }
 
-    /// List a ref's TOP-LEVEL tree entries `(name, is_dir)` (empty if the ref does not exist). The repo
-    /// home ViewModel's file tree (durable — read from the real on-disk tree, never a seeded list).
-    pub fn tree_entries_at_ref(&self, ref_name: &str) -> Result<Vec<(String, bool)>, DurableError> {
-        self.tree_entries_at_ref_bounded(
-            ref_name,
-            BROWSE_MAX_TREE_ENTRIES,
-            BROWSE_MAX_TREE_OBJECT_BYTES,
-            BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
-            BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES,
-        )
-    }
-
-    fn tree_entries_at_ref_bounded(
-        &self,
-        ref_name: &str,
-        maximum_entries: usize,
-        maximum_tree_bytes: usize,
-        maximum_name_bytes: usize,
-        maximum_total_name_bytes: usize,
-    ) -> Result<Vec<(String, bool)>, DurableError> {
-        let repo = self.open_git()?;
-        let Some(tip) = self.tip_commit(&repo, ref_name)? else {
-            return Ok(Vec::new());
-        };
-        let commit = repo.find_commit(tip).map_err(|e| git_err("find commit", e))?;
-        let tree = Self::find_tree_bounded(&repo, commit.tree_id(), maximum_tree_bytes)?;
-        if tree.len() > maximum_entries {
-            return Err(DurableError::Git(format!(
-                "browse response limit exceeded: tree contains more than {maximum_entries} entries"
-            )));
-        }
-        let mut out = Vec::new();
-        let mut total_name_bytes = 0usize;
-        for entry in tree.iter() {
-            let is_dir = matches!(entry.kind(), Some(git2::ObjectType::Tree));
-            let name = entry.name().map_err(|_| {
-                DurableError::Git("tree entry name is not valid UTF-8".into())
-            })?;
-            Self::account_tree_entry_name(
-                name,
-                &mut total_name_bytes,
-                maximum_name_bytes,
-                maximum_total_name_bytes,
-            )?;
-            out.push((name.to_string(), is_dir));
-        }
-        out.sort();
-        Ok(out)
-    }
-
-    // ── nested tree-at-path + blob-at-path + ref switcher (R3.4 repo-browsing completeness) ──
-
-    /// Resolve a `{...path}` under a ref as a TREE (R3.4). The root (empty `path`) lists the top-level
-    /// tree; a nested `path` navigates via libgit2's `Tree::get_path` (never a reimplemented walk). If
-    /// the path resolves to a BLOB (a file requested under `tree/`), returns [`TreePathLookup::IsFile`]
-    /// so the caller can client-redirect to the blob route (the gate's kind-mismatch decision) rather
-    /// than a spurious 404; a wholly-absent path is [`TreePathLookup::Missing`]. Entry sizes are read for
-    /// blob children (dirs carry `None`). An absent ref lists as an empty dir (not an error).
-    pub fn tree_at_path(
-        &self,
-        ref_name: &str,
-        path: &str,
-    ) -> Result<TreePathLookup, DurableError> {
-        self.tree_at_path_bounded(
-            ref_name,
-            path,
-            BROWSE_MAX_TREE_ENTRIES,
-            BROWSE_MAX_TREE_OBJECT_BYTES,
-            BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
-            BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES,
-        )
-    }
-
-    fn tree_at_path_bounded(
-        &self,
-        ref_name: &str,
-        path: &str,
-        maximum_entries: usize,
-        maximum_tree_bytes: usize,
-        maximum_name_bytes: usize,
-        maximum_total_name_bytes: usize,
-    ) -> Result<TreePathLookup, DurableError> {
-        let repo = self.open_git()?;
-        let Some(commit) = self.resolve_commit(&repo, ref_name)? else {
-            return Ok(TreePathLookup::Dir(Vec::new()));
-        };
-        let root = Self::find_tree_bounded(&repo, commit.tree_id(), maximum_tree_bytes)?;
-        let clean = path.trim_matches('/');
-        if !is_safe_tree_path(clean) {
-            return Ok(TreePathLookup::Missing); // a `..`/absolute path cannot name an in-tree entry.
-        }
-        let tree = if clean.is_empty() {
-            root
-        } else {
-            let entry = match root.get_path(std::path::Path::new(clean)) {
-                Ok(e) => e,
-                Err(e) if e.code() == git2::ErrorCode::NotFound => {
-                    return Ok(TreePathLookup::Missing)
-                }
-                Err(e) => return Err(git_err("tree get_path", e)),
-            };
-            match entry.kind() {
-                Some(git2::ObjectType::Tree) => {
-                    Self::find_tree_bounded(&repo, entry.id(), maximum_tree_bytes)?
-                }
-                // A file requested under `tree/` → tell the caller to redirect to the blob route.
-                Some(git2::ObjectType::Blob) => return Ok(TreePathLookup::IsFile),
-                _ => return Ok(TreePathLookup::Missing),
-            }
-        };
-        if tree.len() > maximum_entries {
-            return Err(DurableError::Git(format!(
-                "browse response limit exceeded: tree contains more than {maximum_entries} entries"
-            )));
-        }
-        let mut out = Vec::new();
-        let mut total_name_bytes = 0usize;
-        let odb = repo.odb().map_err(|e| git_err("open object database", e))?;
-        for entry in tree.iter() {
-            let is_dir = matches!(entry.kind(), Some(git2::ObjectType::Tree));
-            let size = if is_dir {
-                None
-            } else {
-                let (object_size, object_kind) = odb
-                    .read_header(entry.id())
-                    .map_err(|e| git_err("read tree entry header", e))?;
-                (object_kind == git2::ObjectType::Blob).then_some(object_size as u64)
-            };
-            let name = entry.name().map_err(|_| {
-                DurableError::Git("tree entry name is not valid UTF-8".into())
-            })?;
-            Self::account_tree_entry_name(
-                name,
-                &mut total_name_bytes,
-                maximum_name_bytes,
-                maximum_total_name_bytes,
-            )?;
-            out.push(TreeEntryInfo {
-                name: name.to_string(),
-                is_dir,
-                size,
-            });
-        }
-        out.sort_by(|a, b| (!a.is_dir, &a.name).cmp(&(!b.is_dir, &b.name)));
-        Ok(TreePathLookup::Dir(out))
-    }
-
-    fn find_tree_bounded<'r>(
-        repo: &'r git2::Repository,
-        oid: git2::Oid,
-        maximum_bytes: usize,
-    ) -> Result<git2::Tree<'r>, DurableError> {
-        let odb = repo.odb().map_err(|e| git_err("open object database", e))?;
-        let (object_size, object_kind) = odb
-            .read_header(oid)
-            .map_err(|e| git_err("read tree header", e))?;
-        if object_kind != git2::ObjectType::Tree {
-            return Err(DurableError::Git("tree object has the wrong kind".into()));
-        }
-        if object_size > maximum_bytes {
-            return Err(DurableError::Git(format!(
-                "browse response limit exceeded: tree object is larger than {maximum_bytes} bytes"
-            )));
-        }
-        repo.find_tree(oid).map_err(|e| git_err("find tree", e))
-    }
-
-    fn account_tree_entry_name(
-        name: &str,
-        total_name_bytes: &mut usize,
-        maximum_name_bytes: usize,
-        maximum_total_name_bytes: usize,
-    ) -> Result<(), DurableError> {
-        if name.len() > maximum_name_bytes {
-            return Err(DurableError::Git(format!(
-                "browse response limit exceeded: tree entry name is longer than {maximum_name_bytes} bytes"
-            )));
-        }
-        *total_name_bytes = total_name_bytes.checked_add(name.len()).ok_or_else(|| {
-            DurableError::Git("browse response limit exceeded: tree entry name bytes overflowed".into())
-        })?;
-        if *total_name_bytes > maximum_total_name_bytes {
-            return Err(DurableError::Git(format!(
-                "browse response limit exceeded: tree entry names exceed {maximum_total_name_bytes} bytes"
-            )));
-        }
-        Ok(())
-    }
-
     /// Read a blob from one exact immutable commit object id. Unlike the browse-oriented
     /// [`Self::read_blob_at_path_bounded`], this API never accepts a revspec.
     pub fn read_blob_at_commit_oid_bounded(
@@ -1444,77 +1226,6 @@ impl DurableGitRepo {
         }
     }
 
-    /// The branches + tags + default branch for the ref switcher (R3.4). Branches are `refs/heads/*`,
-    /// tags `refs/tags/*` (both as SHORT names); the default branch is HEAD's symbolic target (falling
-    /// back to `main`). Reads the on-disk refdb — never a seeded list.
-    pub fn refs_view(&self) -> Result<RefsView, DurableError> {
-        self.refs_view_bounded(BROWSE_MAX_REFS)
-    }
-
-    fn refs_view_bounded(&self, maximum: usize) -> Result<RefsView, DurableError> {
-        let repo = self.open_git()?;
-        let mut branches = Vec::new();
-        let mut tags = Vec::new();
-        let refs = repo.references().map_err(|e| git_err("references", e))?;
-        let mut materialized = 0usize;
-        for reference in refs {
-            let reference = reference.map_err(|e| git_err("reference iter", e))?;
-            let Some(target) = reference.target() else {
-                continue;
-            };
-            let name = reference.name().map_err(|_| {
-                DurableError::Git("reference name is not valid UTF-8".into())
-            })?;
-            let short = name
-                .strip_prefix("refs/heads/")
-                .map(|name| (true, name))
-                .or_else(|| name.strip_prefix("refs/tags/").map(|name| (false, name)));
-            let Some((is_branch, short)) = short else {
-                continue;
-            };
-            if materialized == maximum {
-                return Err(DurableError::Git(format!(
-                    "browse response limit exceeded: repository contains more than {maximum} branches and tags"
-                )));
-            }
-            materialized += 1;
-            let item = (short.to_string(), Oid::new(target.to_string()));
-            if is_branch {
-                branches.push(item);
-            } else {
-                tags.push(item);
-            }
-        }
-        branches.sort();
-        tags.sort();
-        // HEAD's symbolic target names the default branch — but only if that branch actually EXISTS
-        // (libgit2 `init.bare` may leave HEAD pointing at `master` while pushes land on `main`). Resolve
-        // to: HEAD's target if it exists, else `main` if present, else the first branch, else `main`.
-        let head_target = match repo.find_reference("HEAD") {
-            Ok(head) => head
-                .symbolic_target()
-                .map_err(|_| DurableError::Git("HEAD target is not valid UTF-8".into()))?
-                .and_then(|target| target.strip_prefix("refs/heads/"))
-                .map(String::from),
-            Err(e) if e.code() == git2::ErrorCode::NotFound => None,
-            Err(e) => return Err(git_err("find HEAD", e)),
-        };
-        let has = |name: &str| branches.iter().any(|(n, _)| n == name);
-        let default_branch = match head_target {
-            Some(t) if has(&t) => t,
-            _ if has("main") => "main".to_string(),
-            _ => branches
-                .first()
-                .map(|(n, _)| n.clone())
-                .unwrap_or_else(|| "main".to_string()),
-        };
-        Ok(RefsView {
-            branches,
-            tags,
-            default_branch,
-        })
-    }
-
     /// **F9 (R4.1 dogfood) — heal a dangling HEAD symref so a fresh `git clone` checks out.** libgit2's
     /// `init_bare` leaves HEAD symbolically pointing at `refs/heads/master`, but Myelin pushes land on
     /// `main` (or whatever the FIRST branch pushed is) — so a freshly-created repo has a DANGLING HEAD
@@ -1522,7 +1233,7 @@ impl DurableGitRepo {
     /// objects ARE present; only the HEAD pointer is wrong). Call on the first push that lands a branch:
     /// if HEAD does NOT already resolve to a live branch, repoint it (the WRITE side) at the default
     /// branch — `main` if present, else the first branch by sorted name — mirroring the read-side
-    /// resolution in [`Self::refs_view`]. A HEAD that already resolves to a live branch is left
+    /// paginated ref summary. A HEAD that already resolves to a live branch is left
     /// UNTOUCHED (an admin-chosen default is preserved). No-op when the repo has no branch yet (an
     /// empty repo clones cleanly with a still-symbolic HEAD). Idempotent.
     pub fn heal_head_symref(&self) -> Result<(), DurableError> {
@@ -1549,42 +1260,9 @@ impl DurableGitRepo {
         Ok(())
     }
 
-    /// **Per-entry latest commit via ONE bounded history walk (R3.4 gate decision).** Walks the ref's
-    /// history newest-first up to `cap` commits, resolving only the supplied current directory
-    /// entries. Exact literal pathspecs keep deleted historical siblings out of the diff and result
-    /// map. Entries not resolved within the cap are absent (the caller renders name-only).
-    pub fn latest_commits_for_entries(
-        &self,
-        ref_name: &str,
-        dir_path: &str,
-        entries: &[TreeEntryInfo],
-        cap: usize,
-    ) -> Result<std::collections::BTreeMap<String, CommitMeta>, DurableError> {
-        if entries.len() > BROWSE_MAX_TREE_ENTRIES {
-            return Err(DurableError::Git(
-                "browse response limit exceeded: tree entry count".into(),
-            ));
-        }
-        if entries.is_empty() || cap == 0 {
-            return Ok(Default::default());
-        }
-        let repo = self.open_git()?;
-        let Some(tip_commit) = self.resolve_commit(&repo, ref_name)? else {
-            return Ok(Default::default());
-        };
-        self.latest_commits_for_entries_from_tip(
-            &repo,
-            tip_commit.id(),
-            dir_path,
-            entries,
-            cap,
-        )
-    }
-
     /// Resolve latest-commit metadata for one already-selected tree page against its immutable
-    /// commit snapshot. Unlike [`Self::latest_commits_for_entries`], this never re-resolves a mutable
-    /// branch between page selection and metadata projection. Tree pages contain at most 100 rows and
-    /// this snapshot walk is capped at 500 commits.
+    /// commit snapshot. This never re-resolves a mutable branch between page selection and metadata
+    /// projection. Tree pages contain at most 100 rows and this snapshot walk is capped at 500 commits.
     pub fn latest_commits_for_entries_at_snapshot(
         &self,
         snapshot_oid: &Oid,
@@ -1607,7 +1285,7 @@ impl DurableGitRepo {
             || !is_safe_tree_path(clean_path)
             || entries.iter().any(|entry| {
                 entry.name.is_empty()
-                    || entry.name.len() > BROWSE_MAX_TREE_ENTRY_NAME_BYTES
+                    || entry.name.len() > TREE_PAGE_SCAN_MAX_NAME_BYTES
                     || entry.name.contains(['\0', '/'])
             })
         {
@@ -3687,42 +3365,6 @@ mod tests {
         repo
     }
 
-    /// **Nested tree navigation + the tree→file kind-mismatch hint (R3.4).**
-    #[test]
-    fn tree_at_path_navigates_nested_dirs_and_flags_a_file() {
-        let root = temp_root("tree-nested");
-        let repo = seed_nested_repo(&root);
-
-        // Root lists README.md + crates/ + assets/, dirs sorted before files.
-        let TreePathLookup::Dir(top) = repo.tree_at_path("main", "").unwrap() else {
-            panic!("root is a dir");
-        };
-        let names: Vec<&str> = top.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["assets", "crates", "README.md"], "dirs first, then files");
-        assert!(top.iter().find(|e| e.name == "assets").unwrap().is_dir);
-        assert!(!top.iter().find(|e| e.name == "README.md").unwrap().is_dir);
-
-        // Nested dir navigation.
-        let TreePathLookup::Dir(inner) = repo.tree_at_path("main", "crates/inner").unwrap() else {
-            panic!("crates/inner is a dir");
-        };
-        assert_eq!(inner.len(), 1);
-        assert_eq!(inner[0].name, "deep.rs");
-        assert!(inner[0].size.unwrap() > 0, "a file entry carries its size");
-
-        // A FILE requested under tree/ → IsFile (the client redirects to blob), not a 404.
-        assert!(matches!(
-            repo.tree_at_path("main", "crates/inner/deep.rs").unwrap(),
-            TreePathLookup::IsFile
-        ));
-        // An absent path → Missing.
-        assert!(matches!(
-            repo.tree_at_path("main", "crates/nope").unwrap(),
-            TreePathLookup::Missing
-        ));
-        std::fs::remove_dir_all(&root).ok();
-    }
-
     /// **A ref that resolves to a NON-commit object (a bare tree oid, `main^{tree}`) is a clean
     /// empty browse, never a 500 (R3.4 verifier finding 1).** `revparse_single` succeeds but
     /// `peel_to_commit` fails with InvalidSpec; `resolve_commit` maps that to `None`, so the browse
@@ -3733,13 +3375,7 @@ mod tests {
         let repo = seed_nested_repo(&root);
         // `main^{tree}` peels the tip to its TREE object — a non-commit revspec a client can supply.
         let tree_spec = "main^{tree}";
-        // tree-at-path: a non-resolving ref is an empty browse (empty root dir), returned cleanly —
-        // the load-bearing point is `.unwrap()` does NOT panic on an Err (no 500), not the variant.
-        assert!(
-            matches!(repo.tree_at_path(tree_spec, "").unwrap(), TreePathLookup::Dir(ref v) if v.is_empty()),
-            "a tree-oid ref browses as an empty dir, never a 500"
-        );
-        // blob-at-path: clean Missing, not Err.
+        // Blob resolution stays a clean Missing, not an internal error.
         assert!(matches!(
             repo.read_blob_at_path_bounded(tree_spec, "README.md", 1024).unwrap(),
             BlobPathLookup::Missing
@@ -3810,15 +3446,7 @@ mod tests {
             "crates/inner/../../../../secret",
             "/etc/passwd",
         ] {
-            // Neither tree nor blob resolution may reach OUTSIDE the committed tree.
-            let t = repo.tree_at_path("main", escape).unwrap();
-            assert!(
-                matches!(t, TreePathLookup::Missing | TreePathLookup::Dir(_) | TreePathLookup::IsFile),
-                "no panic for `{escape}`"
-            );
-            // The load-bearing property: it never yields bytes from OUTSIDE the tree. `../` that happens
-            // to normalise back INTO the tree is fine; what must never happen is escaping it. `/etc/passwd`
-            // and deep `../` escapes resolve to Missing (no host-file bytes).
+            // The load-bearing property: blob resolution never yields bytes from outside the tree.
             if escape.contains("etc/passwd") || escape.contains("secret") {
                 assert!(
                     matches!(repo.read_blob_at_path_bounded("main", escape, 1024).unwrap(), BlobPathLookup::Missing),
@@ -3826,200 +3454,6 @@ mod tests {
                 );
             }
         }
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// **The ref switcher source separates branches from tags + names the default (R3.4).**
-    #[test]
-    fn refs_view_separates_branches_tags_and_default() {
-        let root = temp_root("refs-view");
-        let repo = seed_nested_repo(&root);
-        let view = repo.refs_view().unwrap();
-        assert!(view.branches.iter().any(|(n, _)| n == "main"));
-        assert!(view.tags.iter().any(|(n, _)| n == "v1.0"));
-        assert!(!view.branches.iter().any(|(n, _)| n == "v1.0"), "a tag is not a branch");
-        // The default branch is HEAD's target (init_bare points HEAD at main).
-        assert_eq!(view.default_branch, "main");
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn interactive_browse_rejects_oversized_ref_and_tree_views_before_materializing_them() {
-        let root = temp_root("browse-cardinality");
-        let repo = seed_nested_repo(&root);
-
-        assert!(matches!(
-            repo.refs_view_bounded(1),
-            Err(DurableError::Git(message)) if message.starts_with("browse response limit exceeded:")
-        ));
-        assert!(matches!(
-            repo.tree_at_path_bounded(
-                "main",
-                "",
-                2,
-                BROWSE_MAX_TREE_OBJECT_BYTES,
-                BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
-                BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES,
-            ),
-            Err(DurableError::Git(message)) if message.starts_with("browse response limit exceeded:")
-        ));
-        assert!(matches!(
-            repo.tree_entries_at_ref_bounded(
-                "refs/heads/main",
-                2,
-                BROWSE_MAX_TREE_OBJECT_BYTES,
-                BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
-                BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES,
-            ),
-            Err(DurableError::Git(message)) if message.starts_with("browse response limit exceeded:")
-        ));
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn interactive_browse_bounds_tree_object_and_copied_name_bytes() {
-        let root = temp_root("browse-tree-bytes");
-        let repo = seed_nested_repo(&root);
-        let TreePathLookup::Dir(entries) = repo.tree_at_path("main", "").unwrap() else {
-            panic!("root is a directory")
-        };
-        let exact_name_bytes: usize = entries.iter().map(|entry| entry.name.len()).sum();
-
-        assert!(repo
-            .tree_at_path_bounded(
-                "main",
-                "",
-                BROWSE_MAX_TREE_ENTRIES,
-                BROWSE_MAX_TREE_OBJECT_BYTES,
-                BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
-                exact_name_bytes,
-            )
-            .is_ok());
-        assert!(repo
-            .tree_at_path_bounded(
-                "main",
-                "",
-                BROWSE_MAX_TREE_ENTRIES,
-                BROWSE_MAX_TREE_OBJECT_BYTES,
-                BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
-                exact_name_bytes - 1,
-            )
-            .is_err());
-        assert!(repo
-            .tree_at_path_bounded(
-                "main",
-                "",
-                BROWSE_MAX_TREE_ENTRIES,
-                BROWSE_MAX_TREE_OBJECT_BYTES,
-                1,
-                BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES,
-            )
-            .is_err());
-        assert!(repo
-            .tree_at_path_bounded(
-                "main",
-                "",
-                BROWSE_MAX_TREE_ENTRIES,
-                1,
-                BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
-                BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES,
-            )
-            .is_err());
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn refs_view_rejects_a_corrupt_head_instead_of_guessing_main() {
-        let root = temp_root("refs-view-corrupt-head");
-        let repo = seed_nested_repo(&root);
-        std::fs::write(repo.path().join("HEAD"), b"ref: refs/heads/\xff\n")
-            .expect("corrupt HEAD fixture");
-
-        assert!(
-            matches!(repo.refs_view(), Err(DurableError::Git(_))),
-            "an unreadable HEAD must not be rendered as a valid main default"
-        );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// **The bounded per-entry latest-commit walk resolves the newest touching commit (R3.4).**
-    #[test]
-    fn latest_commits_in_dir_bounded_walk_resolves_entries() {
-        let root = temp_root("latest-walk");
-        let repo = seed_nested_repo(&root);
-        let entries = match repo.tree_at_path("main", "").unwrap() {
-            TreePathLookup::Dir(entries) => entries,
-            _ => panic!("expected root directory"),
-        };
-        let map = repo
-            .latest_commits_for_entries("main", "", &entries, 500)
-            .unwrap();
-        // Every top-level entry was introduced by the single seed commit → all resolved.
-        assert!(map.contains_key("README.md"));
-        assert!(map.contains_key("crates"));
-        assert!(map.contains_key("assets"));
-        assert_eq!(map["README.md"].summary, "feat: nested seed");
-        // A cap of ZERO resolves nothing (graceful degrade → name-only rows), never an error.
-        let none = repo
-            .latest_commits_for_entries("main", "", &entries, 0)
-            .unwrap();
-        assert!(none.is_empty(), "cap 0 → no per-entry commits, degrade to name-only");
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn latest_commit_lookup_ignores_deleted_historical_siblings() {
-        let root = temp_root("latest-current-entries");
-        let store = DurableGitStore::rooted(&root);
-        let repo = store.create_repo(&loc()).expect("create");
-        let blob = repo.write_blob(b"same\n").expect("blob");
-        let names: Vec<String> = std::iter::once("keep.txt".to_string())
-            .chain((0..=BROWSE_MAX_TREE_ENTRIES).map(|index| format!("removed-{index}.txt")))
-            .collect();
-        let wide_entries: Vec<(&str, &Oid)> = names
-            .iter()
-            .map(|name| (name.as_str(), &blob))
-            .collect();
-        let wide_tree = repo.write_tree(&wide_entries).expect("wide tree");
-        let parent = repo
-            .write_commit(
-                &wide_tree,
-                &[],
-                "wide parent",
-                "psn@acme.noreply",
-                "psn@acme.noreply",
-            )
-            .expect("parent commit");
-        let narrow_tree = repo.write_tree(&[("keep.txt", &blob)]).expect("narrow tree");
-        let head = repo
-            .write_commit(
-                &narrow_tree,
-                &[&parent],
-                "delete historical siblings",
-                "psn@acme.noreply",
-                "psn@acme.noreply",
-            )
-            .expect("head commit");
-        repo.update_ref_cas(
-            "refs/heads/main",
-            None,
-            Some(&head),
-            "create",
-            "psn@acme.noreply",
-        )
-        .expect("create ref");
-
-        let entries = match repo.tree_at_path("main", "").unwrap() {
-            TreePathLookup::Dir(entries) => entries,
-            _ => panic!("expected root directory"),
-        };
-        assert_eq!(entries.len(), 1, "the current directory is safely narrow");
-        let map = repo
-            .latest_commits_for_entries("main", "", &entries, 500)
-            .expect("latest commit lookup");
-        assert_eq!(map.len(), 1, "deleted siblings never enter the result map");
-        assert!(map.contains_key("keep.txt"));
-
         std::fs::remove_dir_all(&root).ok();
     }
 

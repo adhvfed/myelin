@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use base64::Engine as _;
 
 use crate::core::Oid;
-use crate::durable::{BROWSE_MAX_TREE_OBJECT_BYTES, DurableError, DurableGitRepo, TreeEntryInfo};
+use crate::durable::{DurableError, DurableGitRepo, TreeEntryInfo, TREE_OBJECT_MAX_BYTES};
 
 /// Default and maximum number of rows in one tree page.
 pub const TREE_PAGE_DEFAULT_LIMIT: usize = 100;
@@ -283,7 +283,7 @@ impl DurableGitRepo {
         let Some(commit) = self.resolve_commit(&repo, ref_name)? else {
             return Ok(TreePageLookup::Missing);
         };
-        let root = find_tree_bounded(&repo, commit.tree_id(), BROWSE_MAX_TREE_OBJECT_BYTES)?;
+        let root = find_tree_bounded(&repo, commit.tree_id(), TREE_OBJECT_MAX_BYTES)?;
         let Some(clean_path) = normalize_safe_path(path) else {
             return Ok(TreePageLookup::Missing);
         };
@@ -301,7 +301,7 @@ impl DurableGitRepo {
             };
             match entry.kind() {
                 Some(git2::ObjectType::Tree) => {
-                    find_tree_bounded(&repo, entry.id(), BROWSE_MAX_TREE_OBJECT_BYTES)?
+                    find_tree_bounded(&repo, entry.id(), TREE_OBJECT_MAX_BYTES)?
                 }
                 Some(git2::ObjectType::Blob) => return Ok(TreePageLookup::IsFile),
                 _ => return Ok(TreePageLookup::Missing),
@@ -1072,7 +1072,25 @@ mod tests {
             fixture.repo.tree_page("main", "dir", request(100)),
             Ok(TreePageLookup::Dir(_))
         ));
-        for missing in ["missing", "../dir", "dir/../../secret", "/dir"] {
+        let nested = dir_page(
+            fixture
+                .repo
+                .tree_page("main", "dir", request(100))
+                .expect("nested directory"),
+        );
+        assert_eq!(nested.entries.len(), 1);
+        assert_eq!(nested.entries[0].name, "child.txt");
+        assert_eq!(nested.entries[0].size, Some(b"nested\n".len() as u64));
+        for missing in [
+            "missing",
+            "../dir",
+            "dir/../../secret",
+            "../../../etc/passwd",
+            "crates/../../etc/passwd",
+            "crates/inner/../../../../secret",
+            "/dir",
+            "/etc/passwd",
+        ] {
             assert!(matches!(
                 fixture.repo.tree_page("main", missing, request(100)),
                 Ok(TreePageLookup::Missing)
@@ -1080,6 +1098,10 @@ mod tests {
         }
         assert!(matches!(
             fixture.repo.tree_page("missing-ref", "", request(100)),
+            Ok(TreePageLookup::Missing)
+        ));
+        assert!(matches!(
+            fixture.repo.tree_page("main^{tree}", "", request(100)),
             Ok(TreePageLookup::Missing)
         ));
     }
@@ -1123,7 +1145,7 @@ mod tests {
         let (tree_oid, _) = fixture.flat_files(3);
         let git = fixture.git();
         let tree =
-            find_tree_bounded(&git, tree_oid, BROWSE_MAX_TREE_OBJECT_BYTES).expect("bounded tree");
+            find_tree_bounded(&git, tree_oid, TREE_OBJECT_MAX_BYTES).expect("bounded tree");
         assert!(
             scan_tree(
                 &tree,
@@ -1247,12 +1269,6 @@ mod tests {
             .commit_meta_at_oid(&Oid::new(first_tree.to_string()))
             .expect("tree oid is not a commit")
             .is_none());
-        let mutable = fixture
-            .repo
-            .latest_commits_for_entries("main", "", &page.entries, 500)
-            .expect("mutable comparison");
-        assert_eq!(mutable["file.txt"].summary, "second snapshot");
-
         let too_many = vec![
             TreeEntryInfo {
                 name: "x".into(),
@@ -1294,5 +1310,61 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn snapshot_metadata_ignores_deleted_historical_siblings() {
+        let fixture = Fixture::new("historical-siblings");
+        let git = fixture.git();
+        let blob = git.blob(b"same\n").expect("blob");
+        let mut wide_builder = git.treebuilder(None).expect("wide tree builder");
+        wide_builder
+            .insert("keep.txt", blob, 0o100644)
+            .expect("kept entry");
+        for index in 0..=1_000 {
+            wide_builder
+                .insert(format!("removed-{index}.txt"), blob, 0o100644)
+                .expect("historical sibling");
+        }
+        let wide_tree = wide_builder.write().expect("wide tree");
+        drop(wide_builder);
+        let mut narrow_builder = git.treebuilder(None).expect("narrow tree builder");
+        narrow_builder
+            .insert("keep.txt", blob, 0o100644)
+            .expect("kept entry");
+        let narrow_tree = narrow_builder.write().expect("narrow tree");
+        drop(narrow_builder);
+        drop(git);
+
+        let parent = fixture.commit_tree(wide_tree, &[], "wide parent");
+        let head = fixture.commit_tree(narrow_tree, &[parent], "delete historical siblings");
+        fixture.set_main(head);
+        let page = dir_page(
+            fixture
+                .repo
+                .tree_page("main", "", request(100))
+                .expect("narrow current page"),
+        );
+        assert_eq!(
+            page.entries.len(),
+            1,
+            "the current directory is safely narrow"
+        );
+
+        let metadata = fixture
+            .repo
+            .latest_commits_for_entries_at_snapshot(
+                &page.snapshot_oid,
+                "",
+                &page.entries,
+                TREE_PAGE_LATEST_COMMIT_WALK_MAX,
+            )
+            .expect("snapshot metadata");
+        assert_eq!(
+            metadata.len(),
+            1,
+            "deleted siblings never enter the result map"
+        );
+        assert!(metadata.contains_key("keep.txt"));
     }
 }
