@@ -13,6 +13,10 @@
 
 use serde::Serialize;
 
+/// IPC payload ceiling shared with the browser bridge. The command returns both input and output,
+/// so this bound also caps the response and the parser's proportional intermediate allocations.
+pub const MAX_RENDER_MARKDOWN_BYTES: usize = 64 * 1024;
+
 /// The result of round-tripping a markdown-subset string through the shared myelin-content path.
 /// Serialized to the Solid side as `{ input, output, roundTrips }`.
 #[derive(Debug, Clone, Serialize)]
@@ -26,26 +30,46 @@ pub struct RenderResult {
     pub round_trips: bool,
 }
 
+/// Stable, serializable Tauri rejection. No submitted markdown is reflected in the error channel.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderError {
+    pub code: &'static str,
+    pub max_bytes: usize,
+}
+
 /// The pure core of the [`render_markdown`] command (no Tauri types, so it is unit-testable
 /// directly). REUSES `myelin_content`'s frozen render path — it does not parse markdown itself.
-pub fn render_markdown_core(md: &str) -> RenderResult {
+pub fn render_markdown_core(md: &str) -> Result<RenderResult, RenderError> {
+    if md.len() > MAX_RENDER_MARKDOWN_BYTES {
+        return Err(RenderError {
+            code: "markdown_too_large",
+            max_bytes: MAX_RENDER_MARKDOWN_BYTES,
+        });
+    }
     // The positional structured-node array sized to the input's object-replacement count, exactly
     // as the editor supplies it (reused from the content crate so the binding stays single-sourced).
     let nodes = myelin_content::corpus::synthetic_nodes_for(md);
     // The ONE render path — the same `render_parse`/`render_serialize` the server + WASM editor use.
     let inline = myelin_content::wasm::render_parse(md, &nodes);
     let output = myelin_content::wasm::render_serialize(&inline);
+    if output.len() > MAX_RENDER_MARKDOWN_BYTES {
+        return Err(RenderError {
+            code: "markdown_output_too_large",
+            max_bytes: MAX_RENDER_MARKDOWN_BYTES,
+        });
+    }
     let round_trips = output == md;
-    RenderResult {
+    Ok(RenderResult {
         input: md.to_string(),
         output,
         round_trips,
-    }
+    })
 }
 
 /// Tauri command: round-trip `md` through the shared myelin-content render path.
 #[tauri::command]
-fn render_markdown(md: String) -> RenderResult {
+fn render_markdown(md: String) -> Result<RenderResult, RenderError> {
     render_markdown_core(&md)
 }
 
@@ -98,7 +122,7 @@ mod tests {
     /// genuinely calls myelin-content (not a stub).
     #[test]
     fn render_markdown_round_trips_through_shared_myelin_content() {
-        let r = render_markdown_core("**hello, shared myelin-content**");
+        let r = render_markdown_core("**hello, shared myelin-content**").unwrap();
         assert_eq!(
             r.output, "**hello, shared myelin-content**",
             "the shared myelin-content render path must re-serialize canonical bold markdown byte-for-byte"
@@ -110,9 +134,23 @@ mod tests {
     /// A plain-text payload also round-trips (the simplest "hello").
     #[test]
     fn render_markdown_round_trips_plain_text() {
-        let r = render_markdown_core("hello world, a plain paragraph.");
+        let r = render_markdown_core("hello world, a plain paragraph.").unwrap();
         assert!(r.round_trips);
         assert_eq!(r.output, "hello world, a plain paragraph.");
+    }
+
+    #[test]
+    fn render_markdown_rejects_oversized_ipc_without_reflecting_input() {
+        let md = "ø".repeat(MAX_RENDER_MARKDOWN_BYTES / 2 + 1);
+        let error =
+            render_markdown_core(&md).expect_err("UTF-8 bytes, not characters, set the cap");
+        assert_eq!(
+            error,
+            RenderError {
+                code: "markdown_too_large",
+                max_bytes: MAX_RENDER_MARKDOWN_BYTES,
+            }
+        );
     }
 
     /// `core_info` reads BOTH shared crates: the myelin-content corpus is fully green and the

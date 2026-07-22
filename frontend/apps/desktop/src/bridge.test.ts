@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock the Tauri IPC boundary: in a test runner there is no native host, so we assert the bridge
 // shapes the `invoke` call correctly (command name + args) and passes the Rust result through. The
@@ -7,9 +7,11 @@ import { describe, expect, it, vi } from "vitest";
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
 
-import { coreInfo, renderMarkdown } from "./bridge";
+import { coreInfo, MAX_RENDER_MARKDOWN_BYTES, renderMarkdown } from "./bridge";
 
 describe("the Tauri shared-core bridge", () => {
+  beforeEach(() => vi.clearAllMocks());
+
   it("invokes render_markdown with the md arg and returns the Rust result", async () => {
     invoke.mockResolvedValueOnce({
       input: "**x**",
@@ -20,6 +22,17 @@ describe("the Tauri shared-core bridge", () => {
     expect(invoke).toHaveBeenCalledWith("render_markdown", { md: "**x**" });
     expect(r.roundTrips).toBe(true);
     expect(r.output).toBe("**x**");
+  });
+
+  it("rejects oversized UTF-8 before invoking the native command", async () => {
+    await expect(renderMarkdown("ø".repeat(MAX_RENDER_MARKDOWN_BYTES / 2 + 1)))
+      .rejects.toThrow(RangeError);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed or inconsistent native result", async () => {
+    invoke.mockResolvedValueOnce({ input: "**x**", output: "changed", roundTrips: true });
+    await expect(renderMarkdown("**x**")).rejects.toThrow("invalid result");
   });
 
   it("invokes core_info and surfaces the shared-crate facts", async () => {

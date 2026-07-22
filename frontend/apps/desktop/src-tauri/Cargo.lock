@@ -1792,6 +1792,7 @@ version = "0.0.0"
 dependencies = [
  "myelin-tenancy",
  "serde",
+ "zeroize",
 ]
 
 [[package]]
@@ -1800,9 +1801,20 @@ version = "0.0.0"
 dependencies = [
  "myelin-events",
  "myelin-identity",
+ "myelin-refs",
  "myelin-tenancy",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "myelin-refs"
+version = "0.0.0"
+dependencies = [
+ "myelin-events",
+ "myelin-identity",
+ "myelin-tenancy",
+ "serde",
 ]
 
 [[package]]
@@ -4409,6 +4421,12 @@ dependencies = [
  "syn 2.0.118",
  "synstructure",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zerotrie"
