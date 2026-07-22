@@ -60,10 +60,10 @@ use std::{
 
 /// The default operator-token scheme the edge resolves a bearer/basic credential under when the client
 /// sends no `X-Myelin-Token-Scheme` header. R4.0 sets this to `agent` (the scheme `edge bootstrap`
-/// mints under): it is the only mintable token type today (a `pat` requires DPoP that git/curl cannot
-/// produce; human login is deferred), so a bootstrap token authenticates over git (Bearer or Basic) and
-/// curl with ZERO extra headers. Every edge test already sets its own scheme explicitly, so this is a
-/// no-op for them; a real `pat` presented WITH an explicit `pat` scheme header is still DPoP-enforced.
+/// mints under): a `pat` requires DPoP that git/curl cannot produce, while a human session is only
+/// issued by the browser login flow. A bootstrap token therefore authenticates over git (Bearer or
+/// Basic) and curl with ZERO extra headers. Every edge test sets its scheme explicitly, so this is a
+/// no-op for them; a real `pat` presented WITH an explicit `pat` scheme header remains DPoP-enforced.
 const EDGE_DEFAULT_TOKEN_SCHEME: &str = "agent";
 const EDGE_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 const EDGE_READINESS_DEADLINE: Duration = Duration::from_secs(2);
@@ -770,6 +770,7 @@ async fn serve(
         Arc::new(AuthenticatedActionPolicy::mounted()),
     )
     .default_token_scheme(EDGE_DEFAULT_TOKEN_SCHEME)
+    .with_human_session_issuer(cell.clone())
     .with_public_base_url(public_base_url)
     .with_auth_config(auth_config)
     .route(

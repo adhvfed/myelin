@@ -770,6 +770,7 @@ impl CredentialVerifier for OidcVerifier {
             region: Region(region.to_string()),
             scheme: scheme::OIDC.to_string(),
             subject_key: sub.to_string(),
+            expires_at_unix: Some(exp),
         })
     }
 }
