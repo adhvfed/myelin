@@ -148,11 +148,31 @@ impl<P: RepoPathResolver> GixCore<P> {
 }
 
 impl<P: RepoPathResolver> ReadBackend for GixCore<P> {
-    fn read_blob(&self, repo: &RepoLoc, oid: &Oid) -> Result<Vec<u8>, GitCoreError> {
+    fn read_blob_bounded(
+        &self,
+        repo: &RepoLoc,
+        oid: &Oid,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, GitCoreError> {
         let r = self.open(repo)?;
+        let oid = Self::parse_oid(oid)?;
+        let odb = r
+            .odb()
+            .map_err(|e| GitCoreError::Read(format!("open object database: {e}")))?;
+        let (size, kind) = odb
+            .read_header(oid)
+            .map_err(|e| GitCoreError::Read(format!("read blob header {oid}: {e}")))?;
+        if kind != git2::ObjectType::Blob {
+            return Err(GitCoreError::Read(format!("object {oid} is not a blob")));
+        }
+        if size > maximum_bytes {
+            return Err(GitCoreError::Read(format!(
+                "blob read limit exceeded: {size} bytes exceeds {maximum_bytes}"
+            )));
+        }
         let blob = r
-            .find_blob(Self::parse_oid(oid)?)
-            .map_err(|e| GitCoreError::Read(format!("find_blob {}: {e}", oid.as_str())))?;
+            .find_blob(oid)
+            .map_err(|e| GitCoreError::Read(format!("find_blob {oid}: {e}")))?;
         Ok(blob.content().to_vec())
     }
 
@@ -218,6 +238,14 @@ impl<P: RepoPathResolver> ReadBackend for GixCore<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FixedResolver(PathBuf);
+
+    impl RepoPathResolver for FixedResolver {
+        fn repo_path(&self, _repo: &RepoLoc) -> Result<PathBuf, GitCoreError> {
+            Ok(self.0.clone())
+        }
+    }
 
     fn root() -> RootedResolver {
         RootedResolver::new("/srv/git-root")
@@ -296,5 +324,37 @@ mod tests {
                 "expected refusal for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn blob_read_rejects_from_header_above_the_caller_limit() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "myelin-gix-read-bound-{}-{nonce}.git",
+            std::process::id()
+        ));
+        let repository = git2::Repository::init_bare(&path).expect("init bare test repository");
+        let payload = b"bounded blob";
+        let oid = repository.blob(payload).expect("write test blob");
+        drop(repository);
+
+        let reader = GixCore::new(FixedResolver(path.clone()));
+        let repo = RepoLoc::new("acme", "eu-west", "widgets");
+        let oid = Oid::new(oid.to_string());
+        assert_eq!(
+            reader
+                .read_blob_bounded(&repo, &oid, payload.len())
+                .expect("exact limit is accepted"),
+            payload
+        );
+        let error = reader
+            .read_blob_bounded(&repo, &oid, payload.len() - 1)
+            .expect_err("cap plus one is rejected");
+        assert!(error.to_string().contains("blob read limit exceeded"));
+
+        std::fs::remove_dir_all(&path).expect("remove isolated test repository");
     }
 }

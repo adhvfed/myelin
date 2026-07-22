@@ -368,7 +368,8 @@ fn path_traversal_cross_tenant_breakout_is_rejected_on_read_and_write() {
 
     // ---- READ path: GixCore (the read backend) shares the SAME resolver → also refuses. ----
     let reader = GixCore::new(RootedResolver::new(&root));
-    let read_attempt = reader.read_blob(&attack, &CoreOid::new(secret.0.clone()));
+    let read_attempt =
+        reader.read_blob_bounded(&attack, &CoreOid::new(secret.0.clone()), 1024);
     assert!(
         read_attempt.is_err(),
         "GixCore read through a traversing slug must be refused (read path closed), got {read_attempt:?}"

@@ -245,7 +245,12 @@ impl GitCore for RecCore {
     fn maintenance(&self, _r: &RepoLoc, _m: Maintenance) -> Result<WireOutput, GitCoreError> {
         unreachable!("the front door never runs maintenance")
     }
-    fn read_blob(&self, _r: &RepoLoc, _o: &Oid) -> Result<Vec<u8>, GitCoreError> {
+    fn read_blob_bounded(
+        &self,
+        _r: &RepoLoc,
+        _o: &Oid,
+        _maximum_bytes: usize,
+    ) -> Result<Vec<u8>, GitCoreError> {
         unreachable!()
     }
     fn diff_blobs(&self, _r: &RepoLoc, _a: &Oid, _b: &Oid) -> Result<Vec<DiffLine>, GitCoreError> {

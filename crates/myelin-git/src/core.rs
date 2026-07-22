@@ -298,8 +298,13 @@ pub struct BlameHunk {
 /// `Command`). The v1 impl ([`GixCore`]) is over `git2` (libgit2), the architecture-named fallback;
 /// the gix-preferred swap is the OQ-1 floor (GIT-P33), a per-op flip behind this port.
 pub trait ReadBackend {
-    /// Read an object's bytes.
-    fn read_blob(&self, repo: &RepoLoc, oid: &Oid) -> Result<Vec<u8>, GitCoreError>;
+    /// Read an object's bytes, rejecting from its header before allocation above `maximum_bytes`.
+    fn read_blob_bounded(
+        &self,
+        repo: &RepoLoc,
+        oid: &Oid,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, GitCoreError>;
     /// Diff two blobs (a Myers/Histogram unified diff).
     fn diff_blobs(&self, repo: &RepoLoc, a: &Oid, b: &Oid) -> Result<Vec<DiffLine>, GitCoreError>;
     /// Blame a path at a commit.
@@ -335,8 +340,13 @@ pub trait GitCore {
     fn maintenance(&self, repo: &RepoLoc, m: Maintenance) -> Result<WireOutput, GitCoreError>;
 
     // ── READ — in-process gix (libgit2 fallback) (Backend::Gix) ──
-    /// Read object bytes — in-process.
-    fn read_blob(&self, repo: &RepoLoc, oid: &Oid) -> Result<Vec<u8>, GitCoreError>;
+    /// Read object bytes — in-process, with an explicit allocation ceiling.
+    fn read_blob_bounded(
+        &self,
+        repo: &RepoLoc,
+        oid: &Oid,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, GitCoreError>;
     /// Diff two blobs — in-process.
     fn diff_blobs(&self, repo: &RepoLoc, a: &Oid, b: &Oid) -> Result<Vec<DiffLine>, GitCoreError>;
     /// Blame a path at a commit — in-process.
@@ -466,9 +476,14 @@ impl<E: WireExecutor, R: ReadBackend> GitCore for RoutedGitCore<E, R> {
         self.wire.maintenance(repo, m)
     }
 
-    fn read_blob(&self, repo: &RepoLoc, oid: &Oid) -> Result<Vec<u8>, GitCoreError> {
+    fn read_blob_bounded(
+        &self,
+        repo: &RepoLoc,
+        oid: &Oid,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, GitCoreError> {
         Self::assert_backend(GitOp::Read(ReadOp::ReadBlob), Backend::Gix)?;
-        self.read.read_blob(repo, oid)
+        self.read.read_blob_bounded(repo, oid, maximum_bytes)
     }
 
     fn diff_blobs(&self, repo: &RepoLoc, a: &Oid, b: &Oid) -> Result<Vec<DiffLine>, GitCoreError> {
@@ -656,7 +671,12 @@ mod tests {
     }
     struct NoRead;
     impl ReadBackend for NoRead {
-        fn read_blob(&self, _r: &RepoLoc, _o: &Oid) -> Result<Vec<u8>, GitCoreError> {
+        fn read_blob_bounded(
+            &self,
+            _r: &RepoLoc,
+            _o: &Oid,
+            _maximum_bytes: usize,
+        ) -> Result<Vec<u8>, GitCoreError> {
             Ok(Vec::new())
         }
         fn diff_blobs(
@@ -687,7 +707,12 @@ mod tests {
         }
         struct StubRead;
         impl ReadBackend for StubRead {
-            fn read_blob(&self, _r: &RepoLoc, _o: &Oid) -> Result<Vec<u8>, GitCoreError> {
+            fn read_blob_bounded(
+                &self,
+                _r: &RepoLoc,
+                _o: &Oid,
+                _maximum_bytes: usize,
+            ) -> Result<Vec<u8>, GitCoreError> {
                 Ok(b"blob".to_vec())
             }
             fn diff_blobs(
@@ -732,7 +757,11 @@ mod tests {
             b"ok"
         );
         // Read op succeeds through the in-process backend.
-        assert_eq!(core.read_blob(&repo, &Oid::new("abc")).unwrap(), b"blob");
+        assert_eq!(
+            core.read_blob_bounded(&repo, &Oid::new("abc"), 16)
+                .unwrap(),
+            b"blob"
+        );
         assert_eq!(
             core.diff_blobs(&repo, &Oid::new("a"), &Oid::new("b"))
                 .unwrap()

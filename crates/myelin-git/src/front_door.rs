@@ -787,7 +787,12 @@ mod tests {
         ) -> Result<WireOutput, GitCoreError> {
             unreachable!("front door never runs maintenance")
         }
-        fn read_blob(&self, _r: &RepoLoc, _o: &crate::core::Oid) -> Result<Vec<u8>, GitCoreError> {
+        fn read_blob_bounded(
+            &self,
+            _r: &RepoLoc,
+            _o: &crate::core::Oid,
+            _maximum_bytes: usize,
+        ) -> Result<Vec<u8>, GitCoreError> {
             unreachable!()
         }
         fn diff_blobs(
