@@ -1202,10 +1202,32 @@ impl DurableGitBackend {
         path: &str,
         attachment: bool,
     ) -> Result<EdgeResponse, EdgeError> {
+        self.raw_response_bounded(
+            tenant,
+            region,
+            slug,
+            gitref,
+            path,
+            RawResponseOptions {
+                attachment,
+                maximum_bytes: RAW_BLOB_MAX_BYTES,
+            },
+        )
+    }
+
+    fn raw_response_bounded(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        gitref: &str,
+        path: &str,
+        options: RawResponseOptions,
+    ) -> Result<EdgeResponse, EdgeError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc).map_err(map_durable_err)?;
         let (bytes, is_binary) = match repo
-            .read_blob_at_path(gitref, path)
+            .read_blob_at_path_bounded(gitref, path, options.maximum_bytes)
             .map_err(map_durable_err)?
         {
             BlobPathLookup::Found {
@@ -1219,10 +1241,10 @@ impl DurableGitBackend {
             BlobPathLookup::Missing => {
                 return Err(EdgeError::NotFound("no such file at that ref".into()))
             }
-            BlobPathLookup::TooLarge { .. } => {
-                return Err(EdgeError::Internal(
-                    "unbounded blob read returned TooLarge".into(),
-                ))
+            BlobPathLookup::TooLarge { maximum, .. } => {
+                return Err(EdgeError::PayloadTooLarge(format!(
+                    "raw file exceeds the {maximum}-byte transfer limit"
+                )))
             }
         };
         // A conservative content-type: text stays `text/plain; charset=utf-8` (never executed),
@@ -1235,7 +1257,7 @@ impl DurableGitBackend {
         let filename = path.rsplit('/').next().unwrap_or("download");
         let mut headers = vec![(
             "content-disposition".to_string(),
-            if attachment {
+            if options.attachment {
                 format!("attachment; filename=\"{}\"", sanitize_filename(filename))
             } else {
                 format!("inline; filename=\"{}\"", sanitize_filename(filename))
@@ -2954,6 +2976,10 @@ const LATEST_COMMIT_WALK_CAP: usize = 500;
 /// "download full file" affordance; binary blobs never render inline at all (download fallback).
 const BLOB_INLINE_CAP: usize = 512 * 1024;
 
+/// Match the web gateway's raw-response ceiling so the Edge rejects from the ODB header before
+/// inflating a file the next hop must reject anyway.
+const RAW_BLOB_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 /// The short oid (first 12 chars) — the browse log/tree short form.
 fn short_oid12(oid: &str) -> String {
     oid.chars().take(12).collect()
@@ -3367,6 +3393,12 @@ impl Handler for DTree {
 struct DRawFile {
     be: Arc<DurableGitBackend>,
     attachment: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RawResponseOptions {
+    attachment: bool,
+    maximum_bytes: usize,
 }
 impl Handler for DRawFile {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
@@ -5306,6 +5338,15 @@ mod pr_list_tests {
             400,
             "F8: a non-existent head_ref is a 400 at open, not a merge-time surprise"
         );
+        let oversized = be.raw_response_bounded(
+                TENANT,
+                REGION,
+                "core",
+                "refs/heads/feature",
+                "f.txt",
+                RawResponseOptions { attachment: true, maximum_bytes: 1 },
+            );
+        assert!(matches!(oversized, Err(error) if error.status() == 413));
         std::fs::remove_dir_all(&root).ok();
     }
 
