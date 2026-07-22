@@ -190,6 +190,24 @@ async fn durable_create_open_view_round_trip() {
         slugs.iter().any(|s| s.contains("alpha")),
         "repo list reflects create; got {lout}"
     );
+    let alpha = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["slug"] == "acme/alpha")
+        .expect("created repository summary row");
+    assert_eq!(
+        alpha
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["slug".to_string(), "state".to_string()]
+            .into_iter()
+            .collect(),
+        "--json intentionally emits the lightweight empty summary row, not RepoHome"
+    );
 
     // pr open → a durable PR #1.
     let (oc, _oout, oerr) = run_cli(

@@ -73,7 +73,13 @@ fn the_catalogue_covers_the_arch_section_4_endpoints() {
 
 #[test]
 fn cli_parses_the_arch_section_3_2_verbs() {
-    assert_eq!(parse_cli(&["repo", "list"]).unwrap(), CliCommand::RepoList);
+    assert_eq!(
+        parse_cli(&["repo", "list"]).unwrap(),
+        CliCommand::RepoList {
+            limit: None,
+            cursor: None,
+        }
+    );
     assert_eq!(
         parse_cli(&["repo", "view", "core"]).unwrap(),
         CliCommand::RepoView {
@@ -161,9 +167,82 @@ fn cli_parses_the_arch_section_3_2_verbs() {
 }
 
 #[test]
+fn repo_list_cli_parses_strict_order_independent_pagination_flags() {
+    let cursor = crate::web::RepoListCursor::new([9; 32], "alpha")
+        .unwrap()
+        .encode();
+    assert_eq!(
+        parse_cli(&["repo", "list", "--limit", "25"]).unwrap(),
+        CliCommand::RepoList {
+            limit: Some(25),
+            cursor: None,
+        }
+    );
+    assert_eq!(
+        parse_cli(&["repo", "list", "--cursor", &cursor]).unwrap(),
+        CliCommand::RepoList {
+            limit: None,
+            cursor: Some(cursor.clone()),
+        }
+    );
+    assert_eq!(
+        parse_cli(&["repo", "list", "--cursor", &cursor, "--limit", "100",]).unwrap(),
+        CliCommand::RepoList {
+            limit: Some(100),
+            cursor: Some(cursor.clone()),
+        }
+    );
+    assert_eq!(
+        parse_cli(&["repo", "list", "--limit", "1", "--cursor", &cursor,]).unwrap(),
+        CliCommand::RepoList {
+            limit: Some(1),
+            cursor: Some(cursor),
+        }
+    );
+}
+
+#[test]
+fn repo_list_cli_rejects_ambiguous_or_noncanonical_pagination_flags() {
+    let cursor = crate::web::RepoListCursor::new([3; 32], "alpha")
+        .unwrap()
+        .encode();
+    let padded_cursor = format!("{cursor}=");
+    let oversized_cursor = format!("rl1_{}", "a".repeat(crate::web::REPO_LIST_CURSOR_MAX_BYTES));
+    for args in [
+        vec!["repo", "list", "--limit"],
+        vec!["repo", "list", "--cursor"],
+        vec!["repo", "list", "--limit", "1", "--limit", "2"],
+        vec!["repo", "list", "--cursor", &cursor, "--cursor", &cursor],
+        vec!["repo", "list", "--unknown", "x"],
+        vec!["repo", "list", "--limit", "0"],
+        vec!["repo", "list", "--limit", "01"],
+        vec!["repo", "list", "--limit", "101"],
+        vec!["repo", "list", "--cursor", "rl1_not-base64!"],
+        vec!["repo", "list", "--cursor", &padded_cursor],
+        vec!["repo", "list", "--cursor", &oversized_cursor],
+    ] {
+        assert!(
+            parse_cli(&args).is_err(),
+            "arguments should be rejected: {args:?}"
+        );
+    }
+    assert!(matches!(
+        parse_cli(&["repo", "list", "--limit", "--cursor", &cursor]),
+        Err(CliParseError::MissingValue { flag: "--limit" })
+    ));
+}
+
+#[test]
 fn cli_each_verb_lowers_to_an_existing_handler() {
     // No new handler — every CLI verb maps to an already-built module.
-    assert_eq!(CliCommand::RepoList.handler(), Handler::ListFilter);
+    assert_eq!(
+        CliCommand::RepoList {
+            limit: None,
+            cursor: None,
+        }
+        .handler(),
+        Handler::ListFilter
+    );
     assert_eq!(
         CliCommand::PrChecks {
             repo: "r".into(),
@@ -230,7 +309,11 @@ fn cli_write_commands_are_classified_for_the_bus2_gate() {
     }
     .is_write());
     // Reads are not writes.
-    assert!(!CliCommand::RepoList.is_write());
+    assert!(!CliCommand::RepoList {
+        limit: None,
+        cursor: None,
+    }
+    .is_write());
     assert!(!CliCommand::PrChecks {
         repo: "r".into(),
         number: 1

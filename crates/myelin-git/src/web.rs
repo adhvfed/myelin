@@ -42,6 +42,7 @@ use crate::check_status::{CheckState, CheckStatusRow, TrustTier};
 use crate::lifecycle::PrState;
 use crate::merge_gate::{MergeGateOutcome, UnmetContext, UnmetReason};
 use crate::project::{ChecksSummary, Projected, RenderHint};
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 /// Minimal HTML-escape for text interpolated into the rendered view-model. The view-model never
@@ -682,6 +683,107 @@ fn pr_state_label(s: PrState) -> &'static str {
 pub const REPO_LIST_ROW_MAX_SLUG_BYTES: usize = 255;
 /// Maximum UTF-8 bytes accepted for a repository-list row clone URL.
 pub const REPO_LIST_ROW_MAX_CLONE_URL_BYTES: usize = 4 * 1024;
+/// Prefix for the versioned repository-list continuation token.
+pub const REPO_LIST_CURSOR_PREFIX: &str = "rl1_";
+/// Maximum encoded repository-list continuation-token bytes.
+pub const REPO_LIST_CURSOR_MAX_BYTES: usize = 512;
+
+const REPO_LIST_CURSOR_VERSION: u8 = 1;
+const REPO_LIST_CURSOR_FIXED_BYTES: usize = 1 + 32 + 2;
+
+/// A malformed or non-canonical repository-list continuation token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepoListCursorError;
+
+impl std::fmt::Display for RepoListCursorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("repository-list cursor is malformed")
+    }
+}
+
+impl std::error::Error for RepoListCursorError {}
+
+/// Canonical continuation state for the lightweight repository list. The opaque scope is owned by
+/// the transport; the cursor only carries it alongside the last visible bare slug.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoListCursor {
+    scope: [u8; 32],
+    last_slug: String,
+}
+
+impl RepoListCursor {
+    /// Construct a cursor from an opaque transport scope and a validated bare repository slug.
+    pub fn new(scope: [u8; 32], last_slug: impl Into<String>) -> Result<Self, RepoListCursorError> {
+        let last_slug = last_slug.into();
+        if !valid_repo_list_cursor_slug(&last_slug) {
+            return Err(RepoListCursorError);
+        }
+        Ok(Self { scope, last_slug })
+    }
+
+    /// Parse the exact versioned, unpadded base64url token representation.
+    pub fn parse(value: &str) -> Result<Self, RepoListCursorError> {
+        let encoded = value
+            .strip_prefix(REPO_LIST_CURSOR_PREFIX)
+            .ok_or(RepoListCursorError)?;
+        if encoded.is_empty() || value.len() > REPO_LIST_CURSOR_MAX_BYTES {
+            return Err(RepoListCursorError);
+        }
+        let frame = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| RepoListCursorError)?;
+        if base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&frame) != encoded
+            || frame.len() < REPO_LIST_CURSOR_FIXED_BYTES
+            || frame[0] != REPO_LIST_CURSOR_VERSION
+        {
+            return Err(RepoListCursorError);
+        }
+        let mut scope = [0_u8; 32];
+        scope.copy_from_slice(&frame[1..33]);
+        let slug_len = usize::from(u16::from_be_bytes([frame[33], frame[34]]));
+        if slug_len == 0 || frame.len() != REPO_LIST_CURSOR_FIXED_BYTES + slug_len {
+            return Err(RepoListCursorError);
+        }
+        let last_slug = std::str::from_utf8(&frame[35..])
+            .map_err(|_| RepoListCursorError)?
+            .to_string();
+        Self::new(scope, last_slug)
+    }
+
+    /// Render the canonical versioned, unpadded base64url token.
+    pub fn encode(&self) -> String {
+        let slug = self.last_slug.as_bytes();
+        let mut frame = Vec::with_capacity(REPO_LIST_CURSOR_FIXED_BYTES + slug.len());
+        frame.push(REPO_LIST_CURSOR_VERSION);
+        frame.extend_from_slice(&self.scope);
+        frame.extend_from_slice(&(slug.len() as u16).to_be_bytes());
+        frame.extend_from_slice(slug);
+        format!(
+            "{REPO_LIST_CURSOR_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(frame)
+        )
+    }
+
+    /// The opaque scope bytes the transport must compare with its verified request scope.
+    pub fn scope(&self) -> [u8; 32] {
+        self.scope
+    }
+
+    /// The last visible bare slug used only as a keyset continuation.
+    pub fn last_slug(&self) -> &str {
+        &self.last_slug
+    }
+}
+
+fn valid_repo_list_cursor_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= REPO_LIST_ROW_MAX_SLUG_BYTES
+        && slug != "."
+        && slug != ".."
+        && slug
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
 
 /// Invalid input for the lightweight repository-list row projection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
