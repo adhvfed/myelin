@@ -48,6 +48,20 @@ use crate::receive_pack::{
     Pusher, RefName, RefStore,
 };
 
+/// A PR record accumulates checks and reviews over its lifetime. Keep one corrupted or adversarial
+/// record from becoming an unbounded point read/list row, and refuse mutations before they persist a
+/// document beyond the same ceiling.
+pub(crate) const PR_RECORD_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+pub(crate) fn ensure_pr_record_size(size: usize) -> Result<(), DurableError> {
+    if size > PR_RECORD_MAX_BYTES {
+        return Err(DurableError::Git(
+            "pull request record limit exceeded: serialized bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
 // ───────────────────────────── repo-owned branch-protection policy ────────────────────────────────
 
 /// **The repo-owned branch-protection config** — the durable POLICY, set ONLY by an authorized repo
@@ -624,12 +638,22 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         let dir = self.prs_dir(repo)?;
         let bytes = serde_json::to_vec_pretty(rec)
             .map_err(|e| DurableError::Io(format!("serialize PR {}: {e}", rec.number)))?;
+        ensure_pr_record_size(bytes.len())?;
         self.write_atomic(&dir, &self.pr_path(repo, rec.number)?, &bytes)
     }
 
     /// Read a PR record from disk (`None` if absent). A FRESH store over the same root reads it back.
     pub fn get(&self, repo: &RepoLoc, number: u64) -> Result<Option<PrRecord>, DurableError> {
         let path = self.pr_path(repo, number)?;
+        match std::fs::metadata(&path) {
+            Ok(metadata) => ensure_pr_record_size(
+                usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+            )?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(DurableError::Io(format!("stat {}: {error}", path.display())))
+            }
+        }
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let record: PrRecord = serde_json::from_slice(&bytes)
@@ -715,6 +739,12 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
                             path.display()
                         ))
                     })?;
+                let file_size = entry.metadata().map_err(|error| {
+                    DurableError::Io(format!("stat {}: {error}", path.display()))
+                })?;
+                ensure_pr_record_size(
+                    usize::try_from(file_size.len()).unwrap_or(usize::MAX),
+                )?;
                 let bytes = std::fs::read(&path)
                     .map_err(|e| DurableError::Io(format!("read {}: {e}", path.display())))?;
                 let rec = serde_json::from_slice::<PrRecord>(&bytes)
@@ -1143,6 +1173,36 @@ mod tests {
                 if message == "pull request list limit exceeded: record count"
         ));
         assert_eq!(store.list_bounded(&loc(), 2).unwrap().len(), 2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn oversized_record_is_rejected_before_read_or_write() {
+        let root = temp_root("record-size-bound");
+        let gitstore = DurableGitStore::rooted(&root);
+        gitstore.create_repo(&loc()).unwrap();
+        let store = DurablePrStore::rooted(&root);
+        let mut record = open_record(1, "refs/heads/main", &"a".repeat(40), "psn:author@acme");
+        record.body_md = Some("x".repeat(PR_RECORD_MAX_BYTES));
+        assert!(matches!(
+            store.open_pr(&loc(), &record),
+            Err(DurableError::Git(message))
+                if message == "pull request record limit exceeded: serialized bytes"
+        ));
+
+        let path = store.pr_path(&loc(), 1).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b'x'; PR_RECORD_MAX_BYTES + 1]).unwrap();
+        assert!(matches!(
+            store.get(&loc(), 1),
+            Err(DurableError::Git(message))
+                if message == "pull request record limit exceeded: serialized bytes"
+        ));
+        assert!(matches!(
+            store.list(&loc()),
+            Err(DurableError::Git(message))
+                if message == "pull request record limit exceeded: serialized bytes"
+        ));
         std::fs::remove_dir_all(&root).ok();
     }
 

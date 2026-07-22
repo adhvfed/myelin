@@ -31,7 +31,9 @@ use crate::events::{
     GIT_PR_UPDATED,
 };
 use crate::lifecycle::PrState;
-use crate::pr_store::{evaluate_merge, DurablePrStore, MergeAttempt, MergeEval, PrRecord};
+use crate::pr_store::{
+    ensure_pr_record_size, evaluate_merge, DurablePrStore, MergeAttempt, MergeEval, PrRecord,
+};
 use crate::receive_pack::{
     CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushSession,
     Pusher, RefName, RefStore, RejectReason,
@@ -2127,6 +2129,9 @@ fn seal_pr_record(
             "PR author subject locator is missing".into(),
         ));
     }
+    let encoded = serde_json::to_vec(record)
+        .map_err(|_| DurableError::Io("encode PR record failed".into()))?;
+    ensure_pr_record_size(encoded.len())?;
     kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
     let cryptor = ColumnCryptor::new(kms, region);
     let subject = SubjectId::new(record.author_subject_id.clone());
@@ -2501,6 +2506,28 @@ mod tests {
         let command = serde_json::to_string(&command_projection(&record).unwrap()).unwrap();
         assert!(!command.contains("private launch"));
         assert!(!command.contains("principal-123"));
+    }
+
+    #[test]
+    fn postgres_record_sealing_enforces_the_shared_size_ceiling() {
+        let kms = KmsEngine::new();
+        let tenant = TenantId("acme".into());
+        let pr = crate::lifecycle::PullRequest::open(
+            1,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "author@acme.noreply",
+            false,
+        );
+        let mut record = PrRecord::open(&pr, "a".repeat(40));
+        record.head_repo_slug = "core".into();
+        record.author_subject_id = "principal-123".into();
+        record.body_md = Some("x".repeat(crate::pr_store::PR_RECORD_MAX_BYTES));
+        assert!(matches!(
+            seal_pr_record(&kms, Region("fr-par".into()), &tenant, &record),
+            Err(DurableError::Git(message))
+                if message == "pull request record limit exceeded: serialized bytes"
+        ));
     }
 
     #[test]
