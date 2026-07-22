@@ -397,6 +397,61 @@ fn escape_neutralises_html_metacharacters() {
 }
 
 #[test]
+fn repository_list_rows_have_exact_lightweight_json_shapes() {
+    assert_eq!(
+        RepoListRow::populated("acme/myelin", "/acme/eu-north/myelin.git")
+            .unwrap()
+            .to_json(),
+        serde_json::json!({
+            "state": "populated",
+            "slug": "acme/myelin",
+            "clone_url": "/acme/eu-north/myelin.git",
+        })
+    );
+    assert_eq!(
+        RepoListRow::empty("acme/empty").unwrap().to_json(),
+        serde_json::json!({ "state": "empty", "slug": "acme/empty" })
+    );
+    assert_eq!(
+        RepoListRow::restricted().to_json(),
+        serde_json::json!({ "state": "restricted" })
+    );
+}
+
+#[test]
+fn repository_list_rows_reject_unsafe_or_oversized_fields() {
+    for slug in [
+        "",
+        "/repo",
+        "acme/",
+        "acme/../repo",
+        "acme/re po",
+        "acme/repo\\escape",
+    ] {
+        assert_eq!(RepoListRow::empty(slug), Err(RepoListRowError::InvalidSlug));
+    }
+    assert!(RepoListRow::empty("a".repeat(REPO_LIST_ROW_MAX_SLUG_BYTES)).is_ok());
+    assert_eq!(
+        RepoListRow::empty("a".repeat(REPO_LIST_ROW_MAX_SLUG_BYTES + 1)),
+        Err(RepoListRowError::InvalidSlug)
+    );
+
+    let exact_url = format!("/{}", "a".repeat(REPO_LIST_ROW_MAX_CLONE_URL_BYTES - 1));
+    assert!(RepoListRow::populated("acme/repo", exact_url).is_ok());
+    for clone_url in [
+        String::new(),
+        "https://git.example/repo with space.git".into(),
+        "https://git.example/repo.git\nsecret".into(),
+        "x".repeat(REPO_LIST_ROW_MAX_CLONE_URL_BYTES + 1),
+    ] {
+        assert_eq!(
+            RepoListRow::populated("acme/repo", clone_url),
+            Err(RepoListRowError::InvalidCloneUrl)
+        );
+    }
+}
+
+#[test]
 fn commit_row_and_diff_json_carry_the_browse_contract() {
     // GT-004 browse ViewModels: the JSON the Solid Git web UI renders (short_oid + the +/- diff
     // origins as the three-channel signal; PII-free pseudonymous author; unix `committed_at`).

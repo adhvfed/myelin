@@ -119,6 +119,13 @@ pub struct RefsSummary {
     pub default_tip: Option<Oid>,
 }
 
+/// Lightweight repository-catalogue classification based only on direct branch presence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogueRepoState {
+    Populated,
+    Empty,
+}
+
 /// Additive page request. `current_ref`, when present, must be a fully-qualified branch/tag ref.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefsPageRequest {
@@ -343,6 +350,67 @@ struct ScanResult {
 }
 
 impl DurableGitRepo {
+    /// Classify a repository for catalogue display without building a repository home. A repository
+    /// is populated iff at least one direct `refs/heads/*` target exists. The lookup checks a live
+    /// symbolic HEAD branch, then `main`, then a bounded branch-only iterator that stops at the first
+    /// direct target. It never scans tags or reads trees, blobs, README content, counts, or history.
+    pub fn catalogue_repo_state(&self) -> Result<CatalogueRepoState, DurableError> {
+        self.catalogue_repo_state_with_limits(WIRE_SCAN_LIMITS)
+    }
+
+    fn catalogue_repo_state_with_limits(
+        &self,
+        limits: ScanLimits,
+    ) -> Result<CatalogueRepoState, DurableError> {
+        let repo = self.open_git()?;
+        if let Some(head_target) = read_head_target(&repo)? {
+            if head_target.starts_with("refs/heads/") && direct_ref_has_target(&repo, &head_target)?
+            {
+                return Ok(CatalogueRepoState::Populated);
+            }
+        }
+        if direct_ref_has_target(&repo, "refs/heads/main")? {
+            return Ok(CatalogueRepoState::Populated);
+        }
+
+        let branches = repo
+            .branches(Some(git2::BranchType::Local))
+            .map_err(|error| DurableError::Git(format!("catalogue branches: {error}")))?;
+        let mut total_name_bytes = 0_usize;
+        for (scanned, branch) in branches.enumerate() {
+            let (branch, _) = branch
+                .map_err(|error| DurableError::Git(format!("catalogue branch iter: {error}")))?;
+            if scanned == limits.refs {
+                return Err(DurableError::Git(
+                    "wire ref limit exceeded: catalogue branch count".into(),
+                ));
+            }
+            let reference = branch.get();
+            let full_name = reference.name().map_err(|_| {
+                DurableError::Git("catalogue branch name is not valid UTF-8".into())
+            })?;
+            if full_name.len() > limits.one_name_bytes {
+                return Err(DurableError::Git(
+                    "wire ref limit exceeded: one ref name".into(),
+                ));
+            }
+            total_name_bytes = total_name_bytes
+                .checked_add(full_name.len())
+                .ok_or_else(|| {
+                    DurableError::Git("wire ref limit exceeded: ref name bytes".into())
+                })?;
+            if total_name_bytes > limits.total_name_bytes {
+                return Err(DurableError::Git(
+                    "wire ref limit exceeded: ref name bytes".into(),
+                ));
+            }
+            if reference.target().is_some() {
+                return Ok(CatalogueRepoState::Populated);
+            }
+        }
+        Ok(CatalogueRepoState::Empty)
+    }
+
     /// Scan branch/tag summary facts without retaining the namespace.
     pub fn refs_summary(&self) -> Result<RefsSummary, DurableError> {
         let repo = self.open_git()?;
@@ -445,6 +513,14 @@ impl DurableGitRepo {
             }
         }
         Ok(*hash.finalize().as_bytes())
+    }
+}
+
+fn direct_ref_has_target(repo: &git2::Repository, name: &str) -> Result<bool, DurableError> {
+    match repo.find_reference(name) {
+        Ok(reference) => Ok(reference.target().is_some()),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(false),
+        Err(error) => Err(DurableError::Git(format!("find catalogue branch: {error}"))),
     }
 }
 
@@ -770,6 +846,121 @@ mod tests {
             matches!(fixture.repo.refs_summary(), Err(DurableError::Git(_))),
             "an unreadable HEAD must not be represented as a valid main default"
         );
+    }
+
+    #[test]
+    fn catalogue_state_uses_direct_branch_presence_only() {
+        let unborn = Fixture::new("catalogue-unborn");
+        assert_eq!(
+            unborn.repo.catalogue_repo_state().unwrap(),
+            CatalogueRepoState::Empty
+        );
+
+        let tag_only = Fixture::new("catalogue-tag-only");
+        tag_only.add_ref("refs/tags/v1", &tag_only.first_tip);
+        assert_eq!(
+            tag_only.repo.catalogue_repo_state().unwrap(),
+            CatalogueRepoState::Empty,
+            "tags do not populate a repository catalogue row"
+        );
+        let tag_oid = git2::Oid::from_str(tag_only.first_tip.as_str()).unwrap();
+        tag_only
+            .git()
+            .set_head_detached(tag_oid)
+            .expect("detached HEAD");
+        assert_eq!(
+            tag_only.repo.catalogue_repo_state().unwrap(),
+            CatalogueRepoState::Empty,
+            "a detached HEAD is not a direct branch"
+        );
+
+        let live_head = Fixture::new("catalogue-live-head");
+        live_head.add_ref("refs/heads/feature", &live_head.first_tip);
+        live_head
+            .git()
+            .set_head("refs/heads/feature")
+            .expect("live HEAD");
+        assert_eq!(
+            live_head.repo.catalogue_repo_state().unwrap(),
+            CatalogueRepoState::Populated
+        );
+
+        let stale_main = Fixture::new("catalogue-stale-main");
+        stale_main.add_ref("refs/heads/main", &stale_main.first_tip);
+        stale_main
+            .git()
+            .set_head("refs/heads/missing")
+            .expect("stale HEAD");
+        assert_eq!(
+            stale_main.repo.catalogue_repo_state().unwrap(),
+            CatalogueRepoState::Populated
+        );
+
+        let stale_arbitrary = Fixture::new("catalogue-stale-arbitrary");
+        stale_arbitrary.add_ref("refs/heads/zeta", &stale_arbitrary.first_tip);
+        stale_arbitrary
+            .git()
+            .set_head("refs/heads/missing")
+            .expect("stale HEAD");
+        assert_eq!(
+            stale_arbitrary.repo.catalogue_repo_state().unwrap(),
+            CatalogueRepoState::Populated
+        );
+    }
+
+    #[test]
+    fn catalogue_state_ignores_symbolic_non_direct_branch_refs() {
+        let fixture = Fixture::new("catalogue-symbolic-branch");
+        fixture.add_ref("refs/tags/v1", &fixture.first_tip);
+        fixture
+            .git()
+            .reference_symbolic("refs/heads/alias", "refs/tags/v1", true, "symbolic branch")
+            .expect("symbolic branch");
+        fixture
+            .git()
+            .set_head("refs/heads/alias")
+            .expect("symbolic HEAD");
+
+        assert_eq!(
+            fixture.repo.catalogue_repo_state().unwrap(),
+            CatalogueRepoState::Empty,
+            "only direct refs/heads targets count as populated"
+        );
+    }
+
+    #[test]
+    fn catalogue_branch_scan_enforces_exact_count_and_name_bounds() {
+        let fixture = Fixture::new("catalogue-scan-bounds");
+        let branch = "refs/heads/arbitrary";
+        fixture.add_ref(branch, &fixture.first_tip);
+        let exact = ScanLimits {
+            refs: 1,
+            one_name_bytes: branch.len(),
+            total_name_bytes: branch.len(),
+        };
+        assert_eq!(
+            fixture
+                .repo
+                .catalogue_repo_state_with_limits(exact)
+                .unwrap(),
+            CatalogueRepoState::Populated
+        );
+        for limits in [
+            ScanLimits { refs: 0, ..exact },
+            ScanLimits {
+                one_name_bytes: branch.len() - 1,
+                ..exact
+            },
+            ScanLimits {
+                total_name_bytes: branch.len() - 1,
+                ..exact
+            },
+        ] {
+            assert!(matches!(
+                fixture.repo.catalogue_repo_state_with_limits(limits),
+                Err(DurableError::Git(message)) if message.starts_with("wire ref limit exceeded:")
+            ));
+        }
     }
 
     #[test]

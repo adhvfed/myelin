@@ -45,8 +45,8 @@ use std::path::{Path, PathBuf};
 use crate::core::{Oid, RepoLoc};
 use crate::gix_backend::{RepoPathResolver, RootedResolver};
 pub use crate::refs_pagination::{
-    RefKind, RefPageItem, RefsPage, RefsPageError, RefsPageRequest, RefsSummary,
-    REFS_PAGE_DEFAULT_LIMIT, REFS_PAGE_MAX_LIMIT, REFS_PAGE_MAX_QUERY_BYTES,
+    CatalogueRepoState, RefKind, RefPageItem, RefsPage, RefsPageError, RefsPageRequest,
+    RefsSummary, REFS_PAGE_DEFAULT_LIMIT, REFS_PAGE_MAX_LIMIT, REFS_PAGE_MAX_QUERY_BYTES,
 };
 pub use crate::tree_pagination::{
     TreePage, TreePageError, TreePageLookup, TreePageRequest, TREE_PAGE_DEFAULT_LIMIT,
