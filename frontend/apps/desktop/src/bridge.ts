@@ -6,6 +6,9 @@
 // in JS — it calls the same Rust crates the server uses, over the Tauri IPC boundary.
 import { invoke } from "@tauri-apps/api/core";
 
+export const MAX_RENDER_MARKDOWN_BYTES = 64 * 1024;
+const utf8 = new TextEncoder();
+
 /** The result of round-tripping a markdown-subset string through the SHARED myelin-content path. */
 export interface RenderResult {
   /** The input markdown-subset string. */
@@ -23,7 +26,30 @@ export interface RenderResult {
  * shared Rust crate, not by JS.
  */
 export async function renderMarkdown(md: string): Promise<RenderResult> {
-  return await invoke<RenderResult>("render_markdown", { md });
+  if (utf8.encode(md).byteLength > MAX_RENDER_MARKDOWN_BYTES) {
+    throw new RangeError(`markdown exceeds ${MAX_RENDER_MARKDOWN_BYTES} bytes`);
+  }
+  const value: unknown = await invoke("render_markdown", { md });
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("render_markdown returned an invalid result");
+  }
+  const result = value as Record<string, unknown>;
+  if (
+    typeof result.input !== "string" ||
+    typeof result.output !== "string" ||
+    typeof result.roundTrips !== "boolean" ||
+    utf8.encode(result.input).byteLength > MAX_RENDER_MARKDOWN_BYTES ||
+    utf8.encode(result.output).byteLength > MAX_RENDER_MARKDOWN_BYTES ||
+    result.input !== md ||
+    result.roundTrips !== (result.output === result.input)
+  ) {
+    throw new Error("render_markdown returned an invalid result");
+  }
+  return {
+    input: result.input,
+    output: result.output,
+    roundTrips: result.roundTrips,
+  };
 }
 
 /** Liveness facts pulled straight from the shared crates, proving both link into the shell. */
