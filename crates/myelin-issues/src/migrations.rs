@@ -786,9 +786,17 @@ mod tests {
             .iter()
             .map(|migration| migration.id)
             .collect();
-        assert_eq!(
-            durable_ids.last(),
-            Some(&"0069_authz_projection_invalidator")
+        let invalidator = durable_ids
+            .iter()
+            .position(|id| *id == "0069_authz_projection_invalidator")
+            .expect("the storage aggregate carries the projection invalidator");
+        let first_later_storage_migration = durable_ids
+            .iter()
+            .position(|id| *id == "0070_auth_replay")
+            .expect("later append-only storage migrations remain in the same aggregate");
+        assert!(
+            invalidator < first_later_storage_migration,
+            "the projection invalidator must retain its append-only migration position"
         );
         let issues = issues_migrations();
         assert!(issues
