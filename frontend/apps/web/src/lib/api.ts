@@ -4,6 +4,14 @@
 // 401→/login behaviour, applied centrally.
 import { action, json, query, redirect } from "@solidjs/router";
 import { edgeGet, edgePost, GatewayError, Unauthorized } from "../server/gateway";
+import {
+  parseIssueMutation,
+  parsePrMutation,
+  type IssueMutation,
+  type PrMutation,
+} from "./mutation-input";
+
+export type { IssueMutation, PrMutation } from "./mutation-input";
 
 /** A brief commit projection for the latest-commit bar / per-entry activity (R3.4). */
 export interface CommitBriefVM {
@@ -679,13 +687,6 @@ export const getIssue = query(async (id: string): Promise<IssueVM> => {
   return issueAuthed(() => edgeGet<IssueVM>(`/v1/issues/${seg(id)}`));
 }, "issue-detail");
 
-export type IssueMutation =
-  | { op: "create"; title: string }
-  | { op: "close"; issueId: string }
-  // Activation polling deliberately goes through the uncached action. A cached query could pin the
-  // first 202 response and leave an activated issue looking pending forever.
-  | { op: "activation"; requestEventId: string };
-
 export type IssueMutationResult =
   | { ok: true; op: "create"; receipt: IssueCreateReceipt }
   | { ok: true; op: "close"; issue: IssueVM }
@@ -722,28 +723,26 @@ export const issuesMutate = action(async (mutation: IssueMutation) => {
   "use server";
   const result = (value: IssueMutationResult) => json(value, { revalidate: [] });
   try {
-    if (mutation.op === "create") {
-      const title = mutation.title.trim();
-      if (!title || new TextEncoder().encode(title).byteLength > 512) {
-        return result({ ok: false, error: "bad-input" });
-      }
+    const parsed = parseIssueMutation(mutation);
+    if (!parsed) return result({ ok: false, error: "bad-input" });
+    if (parsed.op === "create") {
       const target = dogfoodIssueTarget();
       const receipt = await issueAuthed(() =>
-        edgePost<IssueCreateReceipt>("/v1/issues", { ...target, title }),
+        edgePost<IssueCreateReceipt>("/v1/issues", { ...target, title: parsed.title }),
       );
       return result({ ok: true, op: "create", receipt });
     }
-    if (mutation.op === "activation") {
+    if (parsed.op === "activation") {
       const status = await issueAuthed(() =>
         edgeGet<IssueAuthorizationStatus>(
-          `/v1/issues/authorization-requests/${seg(mutation.requestEventId)}`,
+          `/v1/issues/authorization-requests/${seg(parsed.requestEventId)}`,
           { timeoutMs: ISSUE_ACTIVATION_STATUS_TIMEOUT_MS },
         ),
       );
       return result({ ok: true, op: "activation", status });
     }
     const issue = await issueAuthed(() =>
-      edgePost<IssueVM>(`/v1/issues/${seg(mutation.issueId)}/close`, {}),
+      edgePost<IssueVM>(`/v1/issues/${seg(parsed.issueId)}/close`, {}),
     );
     return result({ ok: true, op: "close", issue });
   } catch (e) {
@@ -773,15 +772,6 @@ export type MergeResult = MergeOk | MergeBlocked;
  *  resolved to the first and returned null), so a single server function keyed by `op` is the robust
  *  shape. The server-RPC (`action`) is the proven path with request/session context (a bare
  *  `"use server"` function did not bind reliably here). */
-export type PrMutation =
-  | { op: "thread"; repo: string; n: number; body_md: string; anchor?: { path: string; line: number; side?: "old" | "new" } }
-  | { op: "comment"; repo: string; n: number; threadId: string; body_md: string }
-  | { op: "review-start"; repo: string; n: number }
-  | { op: "review-comment"; repo: string; n: number; reviewId: string; body_md: string }
-  | { op: "review-submit"; repo: string; n: number; reviewId: string; verdict: "approved" | "changes_requested" | "commented"; summary_md?: string }
-  | { op: "review-discard"; repo: string; n: number; reviewId: string }
-  | { op: "merge"; repo: string; n: number };
-
 /** The union of every mutation's result (the caller narrows by `op`). */
 export type PrMutationResult =
   | { thread: PrThreadVM }
@@ -792,22 +782,20 @@ export type PrMutationResult =
 
 export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> => {
   "use server";
-  const base = `/v1/git/repos/${seg(m.repo)}/prs/${m.n}`;
+  const parsed = parsePrMutation(m);
+  if (!parsed) throw new RepoRouteError("error");
+  const base = `/v1/git/repos/${seg(parsed.repo)}/prs/${parsed.n}`;
   return authed(async () => {
-    switch (m.op) {
+    switch (parsed.op) {
       case "thread": {
-        const body = m.body_md.trim();
-        if (!body) throw new Error("thread body must not be empty");
         const r = await edgePost<{ applied: { thread: PrThreadVM } }>(`${base}/threads`, {
-          body_md: body,
-          ...(m.anchor ? { anchor: m.anchor } : {}),
+          body_md: parsed.body_md,
+          ...(parsed.anchor ? { anchor: parsed.anchor } : {}),
         });
         return { thread: r.applied.thread };
       }
       case "comment": {
-        const body = m.body_md.trim();
-        if (!body) throw new Error("comment body must not be empty");
-        const r = await edgePost<{ applied: { comment: PrCommentVM } }>(`${base}/threads/${seg(m.threadId)}/comments`, { body_md: body });
+        const r = await edgePost<{ applied: { comment: PrCommentVM } }>(`${base}/threads/${seg(parsed.threadId)}/comments`, { body_md: parsed.body_md });
         return { comment: r.applied.comment };
       }
       case "review-start": {
@@ -815,17 +803,15 @@ export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> 
         return { review: r.applied.review };
       }
       case "review-comment": {
-        const body = m.body_md.trim();
-        if (!body) throw new Error("review comment body must not be empty");
-        const r = await edgePost<{ applied: { comment: PrCommentVM } }>(`${base}/reviews/${seg(m.reviewId)}/comments`, { body_md: body });
+        const r = await edgePost<{ applied: { comment: PrCommentVM } }>(`${base}/reviews/${seg(parsed.reviewId)}/comments`, { body_md: parsed.body_md });
         return { comment: r.applied.comment };
       }
       case "review-submit": {
-        await edgePost(`${base}/reviews/${seg(m.reviewId)}/submit`, { verdict: m.verdict, summary_md: m.summary_md });
+        await edgePost(`${base}/reviews/${seg(parsed.reviewId)}/submit`, { verdict: parsed.verdict, summary_md: parsed.summary_md });
         return { ok: true };
       }
       case "review-discard": {
-        await edgePost(`${base}/reviews/${seg(m.reviewId)}/discard`, {});
+        await edgePost(`${base}/reviews/${seg(parsed.reviewId)}/discard`, {});
         return { ok: true };
       }
       case "merge": {
