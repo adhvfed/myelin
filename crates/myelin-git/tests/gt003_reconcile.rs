@@ -17,7 +17,8 @@ use myelin_events::{
 use myelin_git::core::RepoLoc;
 use myelin_git::durable::{DurableGitRepo, DurableGitStore};
 use myelin_git::reconcile::{
-    reconcile_refs, refs_from_outbox_scoped_bounded, repo_slugs_from_outbox_scoped_bounded,
+    reconcile_refs, refs_by_repo_from_outbox_scoped_bounded, refs_from_outbox_scoped_bounded,
+    repo_slugs_from_outbox_scoped_bounded,
 };
 use myelin_git::receive_pack::{
     CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher, RefName,
@@ -158,6 +159,16 @@ fn malformed_scoped_retained_witnesses_fail_discovery_and_replay_loudly() {
             "new_oid":"bbbb", "update_seq":1, "pusher_pseudonym":"git-event:pusher"
         }),
     ));
+    let grouped = refs_by_repo_from_outbox_scoped_bounded(
+        &replay,
+        "acme",
+        "fr-par",
+        SNAPSHOT_MAX_ROWS,
+        SNAPSHOT_MAX_BYTES,
+    )
+    .unwrap();
+    assert_eq!(grouped.keys().map(String::as_str).collect::<Vec<_>>(), ["other"]);
+    assert_eq!(grouped["other"].len(), 1);
     assert!(
         refs_from_outbox_scoped_bounded(
             &replay,

@@ -30,7 +30,7 @@ use crate::core::Oid;
 use crate::durable::{DurableError, DurableGitRepo};
 use crate::events::GIT_REF_UPDATED;
 use myelin_events::OutboxStore;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One committed `git.ref.updated` record — the durable witness of a ref move (the payload
 /// [`crate::receive_pack::RefStore::receive`] emits). The reconciler replays these; the durable per-ref
@@ -117,15 +117,43 @@ pub fn refs_from_outbox_scoped_bounded(
     maximum_retained_rows: usize,
     maximum_envelope_bytes: usize,
 ) -> Result<Vec<GitRefUpdatedRecord>, DurableError> {
-    outbox
+    Ok(refs_by_repo_from_outbox_scoped_bounded(
+        outbox,
+        tenant,
+        region,
+        maximum_retained_rows,
+        maximum_envelope_bytes,
+    )?
+    .remove(repo)
+    .unwrap_or_default())
+}
+
+/// Parse one bounded retained snapshot into repository groups for a tenant/region. Boot recovery
+/// consumes this once and reuses the groups, rather than cloning and parsing the same retained
+/// outbox once per discovered repository.
+pub fn refs_by_repo_from_outbox_scoped_bounded(
+    outbox: &OutboxStore,
+    tenant: &str,
+    region: &str,
+    maximum_retained_rows: usize,
+    maximum_envelope_bytes: usize,
+) -> Result<BTreeMap<String, Vec<GitRefUpdatedRecord>>, DurableError> {
+    let rows = outbox
         .try_retained_rows_bounded(maximum_retained_rows, maximum_envelope_bytes)
-        .map_err(|_| DurableError::Io("durable outbox witness snapshot failed".into()))?
-        .into_iter()
-        .filter(|row| row.envelope.type_.0 == GIT_REF_UPDATED)
-        .filter(|row| row.envelope.tenant.0 == tenant && row.envelope.region.0 == region)
-        .map(|row| GitRefUpdatedRecord::from_payload(Some(repo), &row.envelope.payload))
-        .filter_map(Result::transpose)
-        .collect()
+        .map_err(|_| DurableError::Io("durable outbox witness snapshot failed".into()))?;
+    let mut grouped = BTreeMap::<String, Vec<GitRefUpdatedRecord>>::new();
+    for row in rows {
+        if row.envelope.type_.0 != GIT_REF_UPDATED
+            || row.envelope.tenant.0 != tenant
+            || row.envelope.region.0 != region
+        {
+            continue;
+        }
+        let record = GitRefUpdatedRecord::from_payload(None, &row.envelope.payload)?
+            .ok_or_else(|| DurableError::Io("valid ref witness unexpectedly skipped".into()))?;
+        grouped.entry(record.repo.clone()).or_default().push(record);
+    }
+    Ok(grouped)
 }
 
 /// Repository slugs that have committed ref witnesses in one exact tenant/region partition. This is
@@ -138,20 +166,15 @@ pub fn repo_slugs_from_outbox_scoped_bounded(
     maximum_retained_rows: usize,
     maximum_envelope_bytes: usize,
 ) -> Result<BTreeSet<String>, DurableError> {
-    outbox
-        .try_retained_rows_bounded(maximum_retained_rows, maximum_envelope_bytes)
-        .map_err(|_| DurableError::Io("durable outbox witness snapshot failed".into()))?
-        .into_iter()
-        .filter(|row| row.envelope.type_.0 == GIT_REF_UPDATED)
-        .filter(|row| row.envelope.tenant.0 == tenant && row.envelope.region.0 == region)
-        .map(|row| {
-            GitRefUpdatedRecord::from_payload(None, &row.envelope.payload).and_then(|record| {
-                record
-                    .map(|record| record.repo)
-                    .ok_or_else(|| DurableError::Io("valid ref witness unexpectedly skipped".into()))
-            })
-        })
-        .collect()
+    Ok(refs_by_repo_from_outbox_scoped_bounded(
+        outbox,
+        tenant,
+        region,
+        maximum_retained_rows,
+        maximum_envelope_bytes,
+    )?
+    .into_keys()
+    .collect())
 }
 
 /// What the reconciler did — the loud, inspectable recovery report (a recovery is diagnosable, never a

@@ -434,8 +434,6 @@ impl DurableGitBackend {
         region: &str,
         slug: &str,
     ) -> Result<myelin_git::reconcile::ReconcileReport, DurableError> {
-        let loc = Self::loc(tenant, region, slug);
-        let repo = self.store.open_repo(&loc)?;
         let records = myelin_git::reconcile::refs_from_outbox_scoped_bounded(
             &self.outbox,
             tenant,
@@ -444,7 +442,19 @@ impl DurableGitBackend {
             BOOT_RECOVERY_MAX_RETAINED_OUTBOX_ROWS,
             BOOT_RECOVERY_MAX_RETAINED_OUTBOX_BYTES,
         )?;
-        myelin_git::reconcile::reconcile_refs(&repo, &records)
+        self.reconcile_repo_records(tenant, region, slug, &records)
+    }
+
+    fn reconcile_repo_records(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        records: &[myelin_git::reconcile::GitRefUpdatedRecord],
+    ) -> Result<myelin_git::reconcile::ReconcileReport, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        let repo = self.store.open_repo(&loc)?;
+        myelin_git::reconcile::reconcile_refs(&repo, records)
     }
 
     /// Recover every durable Git write known for a placement-validated tenant before serving. The
@@ -472,18 +482,23 @@ impl DurableGitBackend {
             )?,
             None => Vec::new(),
         };
-        let mut repos = myelin_git::reconcile::repo_slugs_from_outbox_scoped_bounded(
+        let mut ref_records = myelin_git::reconcile::refs_by_repo_from_outbox_scoped_bounded(
             &self.outbox,
             tenant,
             region,
             BOOT_RECOVERY_MAX_RETAINED_OUTBOX_ROWS,
             BOOT_RECOVERY_MAX_RETAINED_OUTBOX_BYTES,
         )?;
+        let mut repos = ref_records
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         repos.extend(pending.iter().map(|item| item.repo_slug.clone()));
 
         let mut report = GitBootRecoveryReport::default();
         for slug in &repos {
-            let reconciled = self.reconcile_repo(tenant, region, slug)?;
+            let records = ref_records.remove(slug).unwrap_or_default();
+            let reconciled = self.reconcile_repo_records(tenant, region, slug, &records)?;
             report.repos_reconciled += 1;
             report.refs_reapplied += reconciled.reapplied.len();
         }
