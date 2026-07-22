@@ -723,7 +723,7 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
 
     /// List every PR record under a repo (durable — loaded from disk).
     pub fn list(&self, repo: &RepoLoc) -> Result<Vec<PrRecord>, DurableError> {
-        self.list_bounded(repo, usize::MAX)
+        self.list_bounded(repo, usize::MAX, usize::MAX)
     }
 
     /// List PR records while stopping before more than `maximum_records` JSON documents are read
@@ -732,9 +732,11 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         &self,
         repo: &RepoLoc,
         maximum_records: usize,
+        maximum_bytes: usize,
     ) -> Result<Vec<PrRecord>, DurableError> {
         let dir = self.prs_dir(repo)?;
         let mut out = Vec::new();
+        let mut total_bytes = 0usize;
         let rd = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
@@ -762,9 +764,18 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
                 let file_size = entry.metadata().map_err(|error| {
                     DurableError::Io(format!("stat {}: {error}", path.display()))
                 })?;
-                ensure_pr_record_size(
-                    usize::try_from(file_size.len()).unwrap_or(usize::MAX),
-                )?;
+                let file_size = usize::try_from(file_size.len()).unwrap_or(usize::MAX);
+                ensure_pr_record_size(file_size)?;
+                total_bytes = total_bytes.checked_add(file_size).ok_or_else(|| {
+                    DurableError::Git(
+                        "pull request list limit exceeded: serialized bytes".into(),
+                    )
+                })?;
+                if total_bytes > maximum_bytes {
+                    return Err(DurableError::Git(
+                        "pull request list limit exceeded: serialized bytes".into(),
+                    ));
+                }
                 let bytes = std::fs::read(&path)
                     .map_err(|e| DurableError::Io(format!("read {}: {e}", path.display())))?;
                 let rec = serde_json::from_slice::<PrRecord>(&bytes)
@@ -1221,11 +1232,19 @@ mod tests {
         }
 
         assert!(matches!(
-            store.list_bounded(&loc(), 1),
+            store.list_bounded(&loc(), 1, usize::MAX),
             Err(DurableError::Git(message))
                 if message == "pull request list limit exceeded: record count"
         ));
-        assert_eq!(store.list_bounded(&loc(), 2).unwrap().len(), 2);
+        assert_eq!(
+            store.list_bounded(&loc(), 2, usize::MAX).unwrap().len(),
+            2
+        );
+        assert!(matches!(
+            store.list_bounded(&loc(), 2, 1),
+            Err(DurableError::Git(message))
+                if message == "pull request list limit exceeded: serialized bytes"
+        ));
         std::fs::remove_dir_all(&root).ok();
     }
 

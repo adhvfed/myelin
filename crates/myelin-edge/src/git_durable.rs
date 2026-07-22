@@ -567,8 +567,11 @@ impl DurableGitBackend {
                 &Self::verified_pr_scope(principal, loc)?,
                 &loc.repo,
                 PR_LIST_MAX_RECORDS,
+                PR_LIST_MAX_BYTES,
             ),
-            None => self.prs.list_bounded(loc, PR_LIST_MAX_RECORDS),
+            None => self
+                .prs
+                .list_bounded(loc, PR_LIST_MAX_RECORDS, PR_LIST_MAX_BYTES),
         }
     }
 
@@ -3019,6 +3022,7 @@ const REPO_SCAN_MAX_CANDIDATES: usize = 10_000;
 /// Counts and bucket badges require the full already-authorized PR set. Cap that set at the storage
 /// query itself so exact list semantics cannot turn into an unbounded filesystem/SQL materialization.
 const PR_LIST_MAX_RECORDS: usize = 10_000;
+const PR_LIST_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// The inline-text cap for a blob view (R3.4). The ODB header is checked first: a larger object gets
 /// a metadata-only download fallback and is never inflated merely to build the interactive page.
