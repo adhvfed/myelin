@@ -180,8 +180,8 @@ impl CiLaunchAuthorityMaterializer for TestLaunchAuthority {
                             concurrency_group: None,
                             fair_key: format!("project:{}", record.project_id),
                         },
-                        reserve_handle: format!("reserve:{}", record.run_id),
-                        token_authority_handle: format!("mint:{}", record.run_id),
+                        reserve_handle: format!("reserve:{}:{}", record.run_id, job.name),
+                        token_authority_handle: format!("mint:{}:{}", record.run_id, job.name),
                     })
                     .collect(),
                 merge_waiter: None,
