@@ -23,9 +23,9 @@
 //! 2. **The service shell (the impl role).** [`notif_app_spec`] assembles an [`AppSpec`] the
 //!    harness wires (boot → migrate → outbox relay → consumer-seam → three ports → graceful
 //!    drain, liveness≠readiness), passed to [`serve`](myelin_substrate::serve) by `main` — NOT a
-//!    hand-rolled lifecycle (contract 1.1). The migration set is empty (the nine tables land in
-//!    NOTIF-P2); there are no consumers yet (the Signal-consumer router is NOTIF-P3); holders
-//!    auto-register (the references-not-payloads holder is NOTIF-P4).
+//!    hand-rolled lifecycle (contract 1.1). The migration set carries the nine-table model plus the
+//!    online durable-inbox read index. The bare production spec still has no Signal consumers;
+//!    holders auto-register (the references-not-payloads holder is NOTIF-P4).
 //!
 //! ## FLOORS named (this shell is explicitly NOT the working inbox)
 //!
@@ -126,6 +126,8 @@ pub mod holder;
 pub mod humanise;
 pub mod list_inbox;
 pub mod migrations;
+/// Durable PostgreSQL inbox persistence and bounded recipient-scoped keyset reads.
+pub mod pg_inbox;
 // prefs / quiet-hours over the frozen QueryAst (NOTIF-P10 / P-188 — contract 7.4): get_prefs /
 // set_prefs, the per-channel matcher (the frozen `myelin-query` QueryAst — Notif invents no second
 // predicate language), quiet-hours in the recipient tz, and `pierce_classes` (critical pierces by
@@ -680,7 +682,7 @@ mod tests {
     /// prompt, NOTIF-P2 / P-180, ships). This asserts the shell still has NO writer (the inbox is not
     /// working until NOTIF-P3 UPSERTs items), but the SCHEMA exists.
     #[test]
-    fn shell_carries_empty_consumer_seam_and_the_nine_table_data_model() {
+    fn shell_carries_empty_consumer_seam_and_durable_inbox_schema() {
         let spec = notif_app_spec(Config::default(), OutboxStore::new());
         assert!(
             spec.consumers.is_empty(),
@@ -688,8 +690,8 @@ mod tests {
         );
         assert_eq!(
             spec.migrations.0.len(),
-            9,
-            "the nine-table data model landed at NOTIF-P2 (P-180): the migration set is non-empty"
+            10,
+            "the nine-table data model plus the durable-read index are wired"
         );
         assert_eq!(
             spec.migrations,
@@ -718,11 +720,11 @@ mod tests {
             "the Signal-consumer router is registered for each homed tenant (the seam is wired)"
         );
         assert_eq!(spec.name, SERVICE_NAME);
-        // the wired spec STILL carries the nine-table data model + boots.
+        // The wired spec still carries the nine-table data model + additive durable-read index.
         assert_eq!(
             spec.migrations.0.len(),
-            9,
-            "the NOTIF-P2 data model is still wired"
+            10,
+            "the NOTIF-P2 data model and durable-read index are wired"
         );
         let handle = boot(spec).expect("the router-wired notif spec boots under the harness");
         assert_eq!(

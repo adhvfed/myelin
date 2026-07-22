@@ -103,6 +103,32 @@ CREATE TABLE notif_inbox_item (\
   PRIMARY KEY (tenant_id, region, recipient, item_id), \
   UNIQUE (tenant_id, recipient, dedup_key))";
 
+/// The SQL form of the frozen deterministic-v1 base-priority table. The durable inbox has no live
+/// Identity/Refs affinity source yet, so its honest persisted ordering is the neutral-affinity
+/// `(base_priority DESC, item_id ASC)` order used by `ranking::DeterministicV1::default()`.
+pub const INBOX_PRIORITY_CASE_SQL: &str = "CASE reason \
+WHEN 'approval_requested' THEN 90 WHEN 'escalated' THEN 90 WHEN 'sla' THEN 90 \
+WHEN 'review_requested' THEN 70 WHEN 'assigned' THEN 70 WHEN 'mentioned' THEN 70 \
+WHEN 'shared' THEN 70 WHEN 'replied' THEN 55 WHEN 'agent_proposal' THEN 55 \
+WHEN 'comments' THEN 55 WHEN 'watched' THEN 35 WHEN 'state_changed' THEN 35 \
+WHEN 'thread_watched' THEN 35 WHEN 'blocked' THEN 35 WHEN 'unblocked' THEN 35 \
+WHEN 'fyi' THEN 15 ELSE NULL END";
+
+/// Additive online index for the recipient-scoped deterministic-v1 keyset read. Kept as a separate
+/// top-level concurrent migration because PostgreSQL cannot build it concurrently inside a
+/// transaction or a multi-statement migration.
+pub const INBOX_KEYSET_INDEX_MIGRATION_ID: &str = "notif_0010_inbox_recipient_keyset";
+pub const INBOX_KEYSET_INDEX_DDL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+notif_inbox_recipient_keyset ON notif_inbox_item \
+(tenant_id, region, recipient, \
+(CASE reason \
+WHEN 'approval_requested' THEN 90 WHEN 'escalated' THEN 90 WHEN 'sla' THEN 90 \
+WHEN 'review_requested' THEN 70 WHEN 'assigned' THEN 70 WHEN 'mentioned' THEN 70 \
+WHEN 'shared' THEN 70 WHEN 'replied' THEN 55 WHEN 'agent_proposal' THEN 55 \
+WHEN 'comments' THEN 55 WHEN 'watched' THEN 35 WHEN 'state_changed' THEN 35 \
+WHEN 'thread_watched' THEN 35 WHEN 'blocked' THEN 35 WHEN 'unblocked' THEN 35 \
+WHEN 'fyi' THEN 15 ELSE NULL END) DESC, item_id ASC)";
+
 /// The `notif_pref` table DDL (§2.2) — per-principal channel routing; `(tenant, region)`-first. The
 /// matcher binds the frozen `QueryAst` (NOTIF-P10). `routing` / `digest` are `jsonb` config blobs.
 pub const NOTIF_PREF_DDL: &str = "\
@@ -283,17 +309,27 @@ pub fn rls_scope_sql(table: &str) -> String {
 /// constants (NOT mistaken for live Rust by the lint), then assembled + `'static`-leaked once at
 /// boot (the same shape the framework expects, like `myelin-refs-service`).
 pub fn migrations() -> Migrations {
-    Migrations::of(TABLE_DDLS.iter().map(|(id, create_ddl, table)| {
-        let mut ddl = String::new();
-        ddl.push_str(create_ddl);
-        ddl.push_str(";\n");
-        ddl.push_str(&rls_scope_sql(table));
-        ddl.push(';');
-        // One-time, bounded leak — the migration set is built once at boot/serve; the substrate
-        // `Migration` holds `&'static str` (the same pattern `myelin-refs-service` uses).
-        let ddl: &'static str = Box::leak(ddl.into_boxed_str());
-        Migration::phased(id, ddl, MigrationPhase::Plain, table)
-    }))
+    let mut migrations = TABLE_DDLS
+        .iter()
+        .map(|(id, create_ddl, table)| {
+            let mut ddl = String::new();
+            ddl.push_str(create_ddl);
+            ddl.push_str(";\n");
+            ddl.push_str(&rls_scope_sql(table));
+            ddl.push(';');
+            // One-time, bounded leak — the migration set is built once at boot/serve; the substrate
+            // `Migration` holds `&'static str` (the same pattern `myelin-refs-service` uses).
+            let ddl: &'static str = Box::leak(ddl.into_boxed_str());
+            Migration::phased(id, ddl, MigrationPhase::Plain, table)
+        })
+        .collect::<Vec<_>>();
+    migrations.push(Migration::phased(
+        INBOX_KEYSET_INDEX_MIGRATION_ID,
+        INBOX_KEYSET_INDEX_DDL,
+        MigrationPhase::Expand,
+        "notif_inbox_item",
+    ));
+    Migrations::of(migrations)
 }
 
 /// Whether `ddl` is forward-only-LEGAL (no destructive `DROP`, no down/rollback). The framework's
@@ -309,22 +345,22 @@ mod tests {
     use super::*;
     use myelin_substrate::{HotTables, MigrationRunner};
 
-    /// THE forward-only ADMIT proof (the GATE): the nine `(tenant, region)`-first migrations apply
-    /// forward-only through the substrate runner — 9 tables created, 0 destructive, in order. The
+    /// THE forward-only ADMIT proof (the GATE): nine table migrations plus the additive online
+    /// keyset index apply forward-only, 0 destructive, in order. The
     /// applied ids are recorded in migration order (contract 1.5).
     #[test]
-    fn the_nine_migrations_apply_forward_only_in_order() {
+    fn notification_migrations_apply_forward_only_in_order() {
         let migrations = migrations();
         assert_eq!(
             migrations.0.len(),
-            9,
-            "the nine-table data model (§2.1..§2.6)"
+            10,
+            "nine tables plus the additive inbox keyset index"
         );
         let mut runner = MigrationRunner::new();
         // The nine tables are brand-new `CREATE TABLE`s (cold at creation) — `none()` hot set.
         runner
             .run(&migrations, &HotTables::none())
-            .expect("the nine migrations apply forward-only");
+            .expect("the notification migrations apply forward-only");
         assert_eq!(
             runner.applied(),
             &[
@@ -337,8 +373,9 @@ mod tests {
                 "notif_0007_escalation_run",
                 "notif_0008_humanise_template",
                 "notif_0009_mute",
+                "notif_0010_inbox_recipient_keyset",
             ],
-            "9 tables created, in order — 0 backward migration"
+            "9 tables + 1 online index, in order — 0 backward migration"
         );
     }
 
