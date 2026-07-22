@@ -21,12 +21,16 @@ EU digital-commons grants whose applications start now because their lead times 
 |---|---|
 | [01-technical-release-plan.md](01-technical-release-plan.md) | The R-track: phases R0–R6 from HEAD to GA, with entry/exit gates, mapped 1:1 to review findings and existing ledgers. Defines the three release tiers (Dogfood → Design-Partner Beta → GA). |
 | [02-commercial-plan.md](02-commercial-plan.md) | Positioning, ICP, licensing (decision: open-core, FSL), pricing, GTM sequence, funding, solo-dev operations, and the numeric viability gates. |
+| [03-personal-production-plan.md](03-personal-production-plan.md) | _2026-07-22 amendment._ The P-track: inserts **Tier P — Personal production** between Dogfood and Design Partners, re-scopes R5/R6 around a personal launch in 2027-01→07, adds the standing longevity ratchets (L1–L5), and re-keys Tier B to a founder decision. Governs everything after R4. |
 
-## The three release tiers (shared vocabulary)
+## The release tiers (shared vocabulary)
 
 - **Tier D — Dogfood** (founder's own data only): Myelin hosts Myelin's git + CI. Gate: R0–R3 complete.
+- **Tier P — Personal production** (_added 2026-07-22, doc 03_): Myelin is the founder's daily driver
+  for all engineering work, on a real EU production cell, with the builder agent operating through the
+  platform itself. Gate: TP-1..TP-6 in doc 03. **This is the primary launch.**
 - **Tier B — Design-partner beta** (3–5 friendly teams, free, under agreement): first external data.
-  Gate: R4–R5 complete + the graduation subset marked `B` in R6.
+  Gate: Tier P held + the graduation subset marked `B` in R6 + founder go decision (doc 03 §6).
 - **Tier GA — Paid general availability**: Gate: all of R6, including external pentest and legal pack.
 
 ## Standing process
