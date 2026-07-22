@@ -1053,9 +1053,7 @@ impl DurableGitBackend {
                 "counts": counts,
             }));
         }
-        let readme = repo
-            .read_file_at_ref(&branch_ref, "README.md")?
-            .map(|(b, _)| String::from_utf8_lossy(&b).to_string());
+        let readme = read_text_blob_bounded(&repo, &branch_ref, "README.md", README_MAX_BYTES)?;
         let latest = repo.commit_log(&branch_ref, 0, 1)?.0.into_iter().next();
         let per_entry = repo
             .latest_commits_in_dir(&branch_ref, "", LATEST_COMMIT_WALK_CAP)?;
@@ -1106,14 +1104,8 @@ impl DurableGitBackend {
                 } else {
                     format!("{base}/README.md")
                 };
-                let readme = match repo.read_blob_at_path(gitref, &readme_path)? {
-                    BlobPathLookup::Found {
-                        bytes,
-                        is_binary: false,
-                        ..
-                    } => Some(String::from_utf8_lossy(&bytes).to_string()),
-                    _ => None,
-                };
+                let readme =
+                    read_text_blob_bounded(&repo, gitref, &readme_path, README_MAX_BYTES)?;
                 Ok(json!({
                     "ref": gitref,
                     "path": base,
@@ -2976,9 +2968,30 @@ const LATEST_COMMIT_WALK_CAP: usize = 500;
 /// "download full file" affordance; binary blobs never render inline at all (download fallback).
 const BLOB_INLINE_CAP: usize = 512 * 1024;
 
+/// README markdown shares the JSON response budget with tree metadata and is checked at the ODB
+/// header before inflation. Oversized or binary README files simply omit the optional preview.
+const README_MAX_BYTES: usize = 512 * 1024;
+
 /// Match the web gateway's raw-response ceiling so the Edge rejects from the ODB header before
 /// inflating a file the next hop must reject anyway.
 const RAW_BLOB_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+fn read_text_blob_bounded(
+    repo: &DurableGitRepo,
+    gitref: &str,
+    path: &str,
+    maximum_bytes: usize,
+) -> Result<Option<String>, DurableError> {
+    match repo.read_blob_at_path_bounded(gitref, path, maximum_bytes)? {
+        BlobPathLookup::Found { bytes, is_binary: false, .. } => {
+            Ok(Some(String::from_utf8_lossy(&bytes).to_string()))
+        }
+        BlobPathLookup::Found { .. }
+        | BlobPathLookup::TooLarge { .. }
+        | BlobPathLookup::IsDir
+        | BlobPathLookup::Missing => Ok(None),
+    }
+}
 
 /// The short oid (first 12 chars) — the browse log/tree short form.
 fn short_oid12(oid: &str) -> String {
@@ -5347,6 +5360,11 @@ mod pr_list_tests {
                 RawResponseOptions { attachment: true, maximum_bytes: 1 },
             );
         assert!(matches!(oversized, Err(error) if error.status() == 413));
+        assert_eq!(
+            read_text_blob_bounded(&repo, "refs/heads/feature", "f.txt", 1).unwrap(),
+            None,
+            "an oversized README-style preview must stop at the object header",
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
