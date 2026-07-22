@@ -41,16 +41,45 @@ export interface EdgeAuthConfig {
  *    switch). Both default fail-closed to false (unset field, or the caller's edge-unreachable stub).
  */
 export function toAuthConfig(
-  edge: EdgeAuthConfig,
+  edge: unknown,
   env: DevLoginEnv,
   isProdBuild: boolean,
   interactiveSsoConfigured = false,
 ): AuthConfig {
-  const ssoConfigured = edge.sso_configured === true && interactiveSsoConfigured;
+  const raw = edge && typeof edge === "object" && !Array.isArray(edge)
+    ? edge as Record<string, unknown>
+    : {};
+  const ssoConfigured = raw.sso_configured === true && interactiveSsoConfigured;
   return {
     sso_configured: ssoConfigured,
-    providers: ssoConfigured ? (edge.providers ?? []) : [],
-    dev_login_enabled: devSeamAllowed(edge.dev_login_enabled ?? false, env, isProdBuild),
-    token_login_enabled: edge.token_login_enabled ?? false,
+    providers: ssoConfigured ? validProviders(raw.providers) : [],
+    dev_login_enabled: devSeamAllowed(raw.dev_login_enabled === true, env, isProdBuild),
+    token_login_enabled: raw.token_login_enabled === true,
   };
+}
+
+function validProviders(value: unknown): AuthProvider[] {
+  if (!Array.isArray(value)) return [];
+  const providers: AuthProvider[] = [];
+  for (const candidate of value.slice(0, 16)) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const provider = candidate as Record<string, unknown>;
+    if (
+      typeof provider.id !== "string" ||
+      !/^[a-z][a-z0-9_-]{0,63}$/.test(provider.id) ||
+      !boundedLabel(provider.label)
+    ) continue;
+    providers.push({ id: provider.id, label: provider.label });
+  }
+  return providers;
+}
+
+function boundedLabel(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 128) return false;
+  if (new TextEncoder().encode(value).byteLength > 128) return false;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint <= 0x1f || codePoint === 0x7f) return false;
+  }
+  return true;
 }

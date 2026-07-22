@@ -131,7 +131,7 @@ export const loginDev = action(async () => {
  */
 export const getAuthConfig = query(async (): Promise<AuthConfig> => {
   "use server";
-  let edge: EdgeAuthConfig = {};
+  let edge: unknown = {};
   try {
     edge = await edgeGetPublic<EdgeAuthConfig>("/v1/auth/config");
   } catch {
