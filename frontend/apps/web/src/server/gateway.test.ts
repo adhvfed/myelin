@@ -238,6 +238,21 @@ describe("gateway refresh revocation races", () => {
     expect(session.updateSessionToken).not.toHaveBeenCalled();
     expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
   });
+
+  it("treats a control-bearing refresh token as authentication failure", async () => {
+    const refresh = new Response(JSON.stringify({ access_token: "fresh\r\nsmuggled" }), {
+      status: 200,
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(unauthorized())
+      .mockResolvedValueOnce(refresh);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(edgeGet("/v1/issues")).rejects.toMatchObject({ name: "Unauthorized" });
+
+    expect(session.updateSessionToken).not.toHaveBeenCalled();
+    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("edgeLoginWithOidc", () => {
@@ -268,6 +283,19 @@ describe("edgeLoginWithOidc", () => {
       access_token: "wrong-purpose",
       token_type: "Bearer",
       scheme: "agent",
+      expires_at: 1_800_000_000,
+    }), { status: 200 })));
+
+    await expect(edgeLoginWithOidc("id-token", "nonce")).rejects.toMatchObject({
+      name: "Unauthorized",
+    });
+  });
+
+  it("rejects a control-bearing human-session token", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
+      access_token: "signed\nsession",
+      token_type: "Bearer",
+      scheme: "session",
       expires_at: 1_800_000_000,
     }), { status: 200 })));
 

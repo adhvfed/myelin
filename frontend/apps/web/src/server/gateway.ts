@@ -17,6 +17,7 @@ import {
 } from "./session";
 import { edgeOrigin } from "./edge-origin";
 import { readLimitedBytes, readLimitedText } from "./bounded-response";
+import { validSessionToken } from "./session-store";
 
 export { GatewayError, Unauthorized } from "./gateway-core";
 
@@ -121,9 +122,7 @@ export async function edgeLoginWithOidc(
   }
   const login = body as Record<string, unknown>;
   if (
-    typeof login.access_token !== "string" ||
-    !login.access_token ||
-    login.access_token.length > 32 * 1024 ||
+    !validSessionToken(login.access_token) ||
     login.scheme !== "session" ||
     login.token_type !== "Bearer" ||
     typeof login.expires_at !== "number" ||
@@ -303,7 +302,7 @@ function refreshAccessToken(text: string, current: string): string | null {
   if (!parsed || typeof parsed !== "object") return null;
   const candidate = (parsed as Record<string, unknown>).access_token;
   if (candidate === undefined) return current;
-  return typeof candidate === "string" && candidate.length > 0 && candidate.length <= 32 * 1024
+  return validSessionToken(candidate)
     ? candidate
     : null;
 }
