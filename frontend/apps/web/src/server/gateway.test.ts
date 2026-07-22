@@ -11,8 +11,10 @@ vi.mock("./session", () => session);
 import {
   DEFAULT_EDGE_REQUEST_TIMEOUT_MS,
   MAX_EDGE_JSON_RESPONSE_BYTES,
+  MAX_EDGE_PUBLIC_RESPONSE_BYTES,
   MAX_EDGE_RAW_RESPONSE_BYTES,
   edgeGet,
+  edgeGetPublic,
   edgeGetRaw,
   edgeLoginWithOidc,
   gatewayRequestSignal,
@@ -152,6 +154,15 @@ describe("gateway response limits", () => {
     })));
 
     await expect(edgeGetRaw("/v1/git/raw")).rejects.toThrow(/byte limit/);
+  });
+
+  it("uses a small dedicated cap for the unauthenticated auth config", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("{}", {
+      status: 200,
+      headers: { "content-length": String(MAX_EDGE_PUBLIC_RESPONSE_BYTES + 1) },
+    })));
+
+    await expect(edgeGetPublic("/v1/auth/config")).rejects.toThrow(/byte limit/);
   });
 });
 
