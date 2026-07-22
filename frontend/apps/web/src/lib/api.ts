@@ -23,6 +23,7 @@ import {
   parsePrChecks,
   parsePrThreads,
 } from "./mutation-response";
+import { parseFileLinesInput, parseFileLinesResponse } from "./file-lines";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
 
@@ -672,16 +673,21 @@ export const getFileLines = query(
     end: number;
   }): Promise<{ lines: DiffLineVM[] }> => {
     "use server";
+    const parsed = parseFileLinesInput(input);
+    if (!parsed) throw new RepoRouteError("error");
     const p = new URLSearchParams({
-      path: input.path,
-      start: String(input.start),
-      end: String(input.end),
+      path: parsed.path,
+      start: String(parsed.start),
+      end: String(parsed.end),
     });
-    return authed(() =>
-      edgeGet<{ lines: DiffLineVM[] }>(
-        `/v1/git/repos/${seg(input.repo)}/file-lines/${seg(input.oid)}?${p.toString()}`,
-      ),
-    );
+    return authed(async () => {
+      const response = await edgeGet(
+        `/v1/git/repos/${seg(parsed.repo)}/file-lines/${seg(parsed.oid)}?${p.toString()}`,
+      );
+      const lines = parseFileLinesResponse(response);
+      if (!lines) throw new RepoRouteError("error");
+      return lines;
+    });
   },
   "git-file-lines",
 );
