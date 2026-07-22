@@ -309,11 +309,12 @@ Grounding surveys done for all of R2.1a, R2.2, R2.3, R2.4, R2.7 before dispatch.
   composition root MUST inject `HitlVerdictStore::with_pg`. Release must not claim MCP execution live.
 
 - **R2.5 DONE (`fb7fd1e`)** — real OidcVerifier (already tested in oidc.rs) routed via `production_with_oidc`;
-  `MyelinConfig` gains `Option<OidcSettings>` (issuer/audience + static JWKS, no jwks_uri fetch — tracked);
+  `MyelinConfig` gains `Option<OidcSettings>` (issuer/audience + optional bootstrap JWKS and a required
+  production `jwks_uri`); the follow-on now uses bounded, certificate-verified refresh with a
+  serialized/rate-limited last-good cache;
   opt-in (absent→refuse-not-mock/boot-ok, partial→fail-loud); NO fail-open. Part B: frontend `loginDev`
   build-time dead in prod (verified the dev token is ABSENT from the `.output` deployable). Self-reviewed
-  (fail-open surface clean; crypto pre-audited). Residual: jwks_uri fetch/rotation; SAML/SCIM/passkey/SSH
-  stay refuse-not-mock.
+  (fail-open surface clean; crypto pre-audited). SAML/SCIM/passkey/SSH stay refuse-not-mock.
 - **R2.1 DONE (`083831d`)** — verifier CONFIRMED-SOUND. Closed the LIVE JSON-API object-authz bypass: the
   `repo_authz` field git_durable.rs carried was never called, so a git action-grant reached ANY repo's
   PR/blob/branch-protection. `RepoAuthorizer` extended to `RepoPermission {Pull,Push,ProtectedPush,
