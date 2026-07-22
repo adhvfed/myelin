@@ -418,6 +418,15 @@ pub trait TokenVerifier: Send + Sync {
         &self,
         credential: &myelin_identity::Credential,
     ) -> myelin_identity::Result<CapabilityToken>;
+
+    /// Verify a credential for one concrete HTTP request. Each verifier must make an explicit choice:
+    /// proof-of-possession implementations bind to the method/URI, while implementations that cannot
+    /// carry DPoP delegate deliberately to ordinary verification.
+    fn verify_for_request(
+        &self,
+        credential: &myelin_identity::Credential,
+        binding: &crate::capability_crypto::DpopBinding,
+    ) -> myelin_identity::Result<CapabilityToken>;
 }
 
 /// **The floor token verifier (the EI-01 §1 documented deviation).** It parses the frozen verified-
@@ -578,6 +587,14 @@ impl TokenVerifier for StructuralTokenVerifier {
             exp_unix: i64::MAX,
         })
     }
+
+    fn verify_for_request(
+        &self,
+        credential: &myelin_identity::Credential,
+        _binding: &crate::capability_crypto::DpopBinding,
+    ) -> myelin_identity::Result<CapabilityToken> {
+        self.verify(credential)
+    }
 }
 
 /// The grant prefix a repo-scoped deploy key's authority is ceiling-bounded to (`"repo:"`). A deploy
@@ -695,12 +712,35 @@ impl CapabilityAuthenticator {
         credential: &myelin_identity::Credential,
         path_tenant: Option<&TenantId>,
     ) -> myelin_identity::Result<RequestIdentity> {
+        self.authenticate_identity_with_binding(credential, path_tenant, None)
+    }
+
+    /// Authenticate a machine credential for one concrete HTTP request. The request binding comes
+    /// from the trusted transport adapter, never from token material or client-selected headers.
+    pub fn authenticate_identity_for_request(
+        &self,
+        credential: &myelin_identity::Credential,
+        path_tenant: Option<&TenantId>,
+        binding: &crate::capability_crypto::DpopBinding,
+    ) -> myelin_identity::Result<RequestIdentity> {
+        self.authenticate_identity_with_binding(credential, path_tenant, Some(binding))
+    }
+
+    fn authenticate_identity_with_binding(
+        &self,
+        credential: &myelin_identity::Credential,
+        path_tenant: Option<&TenantId>,
+        binding: Option<&crate::capability_crypto::DpopBinding>,
+    ) -> myelin_identity::Result<RequestIdentity> {
         // (0) Observability is part of the pass: every decision (success OR failure) emits exactly
         //     one auth_decision_latency observation, recorded FIRST so no early return can skip it.
         self.telemetry.observe();
 
         // (1) Verify the credential → the trust-rooted token. An unverifiable token is a LOUD error.
-        let token = self.verifier.verify(credential)?;
+        let token = match binding {
+            Some(binding) => self.verifier.verify_for_request(credential, binding)?,
+            None => self.verifier.verify(credential)?,
+        };
 
         // Build the verified `(tenant, region)` scope from the token (tenant-from-token, ID-3) — used
         // for BOTH the revocation consult (partitioned) and the S1 lookup. No path-derived scope.

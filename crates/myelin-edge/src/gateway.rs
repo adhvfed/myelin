@@ -26,7 +26,9 @@ use crate::request::{EdgeRequest, EdgeResponse};
 use crate::session::{SessionStore, SESSION_COOKIE};
 use crate::sse::{SseEvent, SseHub};
 use myelin_identity::{AuthzError, Credential, Principal, PrincipalKind};
-use myelin_identity_service::{CapabilityAuthenticator, HumanSsoAuthenticator, RequestIdentity};
+use myelin_identity_service::{
+    CapabilityAuthenticator, DpopBinding, HumanSsoAuthenticator, RequestIdentity,
+};
 use myelin_storage::TenantScope;
 use myelin_substrate::{Authorizer, InjectedIdentity, PublicSurface};
 use myelin_tenancy::{Region, TenantId};
@@ -214,6 +216,7 @@ pub struct GatewayBuilder {
     sessions: SessionStore,
     public_surface: PublicSurface,
     auth_config: AuthPublicConfig,
+    public_base_url: Option<String>,
 }
 
 impl GatewayBuilder {
@@ -356,6 +359,26 @@ impl GatewayBuilder {
         self
     }
 
+    /// Bind proof-of-possession credentials to this trusted public edge base URL. Production passes
+    /// the validated deployment origin; request headers never select this value.
+    pub fn with_public_base_url(
+        mut self,
+        public_base_url: impl Into<String>,
+    ) -> GatewayBuilder {
+        let public_base_url = public_base_url.into();
+        let uri = public_base_url
+            .parse::<hyper::Uri>()
+            .expect("public base URL must be an absolute HTTP(S) URL");
+        assert!(
+            matches!(uri.scheme_str(), Some("http" | "https"))
+                && uri.authority().is_some()
+                && uri.query().is_none(),
+            "public base URL must be an absolute, query-free HTTP(S) URL"
+        );
+        self.public_base_url = Some(public_base_url.trim_end_matches('/').to_string());
+        self
+    }
+
     /// Finish building the gateway.
     pub fn build(self) -> Gateway {
         Gateway {
@@ -368,6 +391,7 @@ impl GatewayBuilder {
             sessions: self.sessions,
             public_surface: self.public_surface,
             auth_config: self.auth_config,
+            public_base_url: self.public_base_url,
         }
     }
 }
@@ -384,6 +408,7 @@ pub struct Gateway {
     sessions: SessionStore,
     public_surface: PublicSurface,
     auth_config: AuthPublicConfig,
+    public_base_url: Option<String>,
 }
 
 impl Gateway {
@@ -403,6 +428,7 @@ impl Gateway {
             sessions: SessionStore::new(),
             public_surface: PublicSurface::default(),
             auth_config: AuthPublicConfig::default(),
+            public_base_url: None,
         }
     }
 
@@ -588,6 +614,18 @@ impl Gateway {
         path_tenant: Option<&TenantId>,
         allow_basic: bool,
     ) -> Result<RequestIdentity, EdgeError> {
+        let request_binding = self.public_base_url.as_ref().map(|base| DpopBinding {
+            htm: req.method.clone(),
+            htu: format!("{base}{}", req.path),
+        });
+        let authenticate = |credential: &Credential| match request_binding.as_ref() {
+            Some(binding) => self.authn.authenticate_identity_for_request(
+                credential,
+                path_tenant,
+                binding,
+            ),
+            None => self.authn.authenticate_identity(credential, path_tenant),
+        };
         let scheme_of = || {
             req.header("x-myelin-token-scheme")
                 .unwrap_or(&self.default_scheme)
@@ -598,9 +636,7 @@ impl Gateway {
                 scheme: scheme_of(),
                 material: material.to_string(),
             };
-            return self
-                .authn
-                .authenticate_identity(&cred, path_tenant)
+            return authenticate(&cred)
                 .map_err(|e| EdgeError::Unauthorized(format!("bearer auth failed: {e:?}")));
         }
         // R4.0 item C — git smart-HTTP WIRE ONLY: accept HTTP Basic where the PASSWORD is the
@@ -615,9 +651,7 @@ impl Gateway {
                     scheme: scheme_of(),
                     material,
                 };
-                return self
-                    .authn
-                    .authenticate_identity(&cred, path_tenant)
+                return authenticate(&cred)
                     .map_err(|e| EdgeError::Unauthorized(format!("basic auth failed: {e:?}")));
             }
         }
@@ -628,9 +662,7 @@ impl Gateway {
                     scheme: rec.scheme,
                     material: rec.material,
                 };
-                return self
-                    .authn
-                    .authenticate_identity(&cred, path_tenant)
+                return authenticate(&cred)
                     .map_err(|e| EdgeError::Unauthorized(format!("session auth failed: {e:?}")));
             }
             return Err(EdgeError::Unauthorized(
@@ -947,6 +979,92 @@ mod tests {
                 Arc::new(WhoamiHandler),
             )
             .build()
+    }
+
+    #[derive(Clone, Copy)]
+    struct ExactDpopBindingVerifier;
+
+    impl myelin_identity_service::TokenVerifier for ExactDpopBindingVerifier {
+        fn verify(
+            &self,
+            _credential: &Credential,
+        ) -> myelin_identity::Result<myelin_identity_service::CapabilityToken> {
+            Err(AuthzError::FailClosed(
+                "request binding was not carried to the token verifier".into(),
+            ))
+        }
+
+        fn verify_for_request(
+            &self,
+            _credential: &Credential,
+            binding: &DpopBinding,
+        ) -> myelin_identity::Result<myelin_identity_service::CapabilityToken> {
+            if binding.htm != "GET" || binding.htu != "https://myelin.example/base/v1/whoami" {
+                return Err(AuthzError::FailClosed(format!(
+                    "unexpected DPoP request binding: {} {}",
+                    binding.htm, binding.htu
+                )));
+            }
+            Ok(myelin_identity_service::CapabilityToken {
+                tenant: TenantId("acme".into()),
+                region: Region("eu-west".into()),
+                kind: myelin_identity_service::MachineKind::Pat,
+                subject_key: "pat-subject".into(),
+                authority: myelin_identity_service::Authority::of(["edge.identity.read"]),
+                jti: "pat-jti".into(),
+                dpop_bound: true,
+                purpose: myelin_identity_service::CredentialPurpose::Pat,
+                audience: myelin_identity_service::CredentialAudience::Edge,
+                exp_unix: i64::MAX,
+            })
+        }
+    }
+
+    #[test]
+    fn gateway_carries_canonical_request_binding_to_dpop_verifier() {
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let principal = Principal::stub(
+            myelin_identity::PrincipalId("pat-principal".into()),
+            PrincipalKind::Service,
+            TenantId("acme".into()),
+        );
+        let scope = TenantScope::from_verified_token(&principal, Region("eu-west".into()));
+        store
+            .put_principal(
+                &scope,
+                principal.principal_id.clone(),
+                PrincipalKind::Service,
+                myelin_identity::DataRole::Controller,
+                myelin_identity::PrincipalStatus::Active,
+                None,
+            )
+            .unwrap();
+        store
+            .link_credential(&scope, "pat", "pat-subject", &principal.principal_id)
+            .unwrap();
+        let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+            store,
+            Arc::new(ExactDpopBindingVerifier),
+            RevocationStore::new(),
+        ));
+        let gateway = Gateway::builder(authn, human_login(), Arc::new(AllowAll))
+            .with_public_base_url("https://myelin.example/base/")
+            .route(
+                Method::Get,
+                "/v1/whoami",
+                "edge.whoami",
+                Arc::new(WhoamiHandler),
+            )
+            .build();
+
+        let response = gateway.handle(EdgeRequest::new(
+            "GET",
+            "/v1/whoami",
+            "query-is-excluded-from-dpop-htu=1",
+            vec![("Authorization".into(), "Bearer opaque-proof".into())],
+            vec![],
+        ));
+        assert_eq!(response.status(), 200);
     }
 
     #[test]

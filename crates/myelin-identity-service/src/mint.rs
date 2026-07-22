@@ -1293,6 +1293,14 @@ mod tests {
             );
             Ok(self.0.clone())
         }
+
+        fn verify_for_request(
+            &self,
+            credential: &Credential,
+            _binding: &crate::capability_crypto::DpopBinding,
+        ) -> myelin_identity::Result<CapabilityToken> {
+            self.verify(credential)
+        }
     }
 
     fn fixed_capability(kind: MachineKind, purpose: CredentialPurpose) -> CapabilityToken {

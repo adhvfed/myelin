@@ -36,9 +36,9 @@ use myelin_edge::{
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget};
 use myelin_identity_service::{
-    CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, JwkSet, OidcConfig,
-    PasetoCapabilityVerifier, PrincipalStore, ReplayGuard, RevocationStore, StoreBackedCheck,
-    TupleStore,
+    CapabilityAuthenticator, CellTokenAuthority, DpopReplayGuard, HumanSsoAuthenticator, JwkSet,
+    OidcConfig, PasetoCapabilityVerifier, PrincipalStore, ReplayGuard, RevocationStore,
+    StoreBackedCheck, TupleStore,
 };
 use myelin_storage::{
     all_durable_migrations, seal_key_from_env, DurableCellRootBacking, DurableKmsBacking,
@@ -159,6 +159,7 @@ struct EdgeRuntimeConfig {
     cell_id: String,
     git_root: Option<PathBuf>,
     git_wire: Option<GitWireRuntime>,
+    public_base_url: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -225,12 +226,32 @@ impl EdgeRuntimeConfig {
         } else {
             None
         };
+        let public_base_url = if serving {
+            Some(validated_public_base_url(read("MYELIN_PUBLIC_BASE_URL"))?)
+        } else {
+            None
+        };
         Ok(Self {
             cell_id,
             git_root,
             git_wire,
+            public_base_url,
         })
     }
+}
+
+fn validated_public_base_url(value: Result<String, VarError>) -> Result<String, String> {
+    let raw = required_runtime_value("MYELIN_PUBLIC_BASE_URL", value)?;
+    let uri = raw
+        .parse::<hyper::Uri>()
+        .map_err(|_| "MYELIN_PUBLIC_BASE_URL must be an absolute HTTP(S) URL".to_string())?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
+        return Err("MYELIN_PUBLIC_BASE_URL must be an absolute HTTP(S) URL".into());
+    }
+    if uri.query().is_some() {
+        return Err("MYELIN_PUBLIC_BASE_URL must not contain a query string".into());
+    }
+    Ok(raw.trim_end_matches('/').to_string())
 }
 
 fn validate_git_wire_host() -> Result<(), String> {
@@ -499,6 +520,9 @@ async fn main() {
                 compose_core(runtime.cell_id).await,
                 runtime.git_root.expect("serving config carries a Git root"),
                 runtime.git_wire.expect("serving config carries a Git wire runtime"),
+                runtime
+                    .public_base_url
+                    .expect("serving config carries a public base URL"),
             )
             .await;
         }
@@ -523,7 +547,12 @@ async fn main() {
 // serve — the request-lifecycle gateway (unchanged behaviour; now over the DURABLE cell authority).
 // =================================================================================================
 
-async fn serve(core: ComposedCore, git_root: PathBuf, git_wire: GitWireRuntime) {
+async fn serve(
+    core: ComposedCore,
+    git_root: PathBuf,
+    git_wire: GitWireRuntime,
+    public_base_url: String,
+) {
     let ComposedCore {
         provider,
         kms,
@@ -563,7 +592,14 @@ async fn serve(core: ComposedCore, git_root: PathBuf, git_wire: GitWireRuntime) 
             DurablePrincipalBacking::new(provider.clone()),
             handle.clone(),
         ),
-        Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+        Arc::new(
+            PasetoCapabilityVerifier::new(cell.trust_anchor()).with_replay_guard(
+                DpopReplayGuard::with_pg(
+                    DurableReplayBacking::new(provider.clone()),
+                    handle.clone(),
+                ),
+            ),
+        ),
         RevocationStore::with_pg(
             DurableRevocationBacking::new(provider.clone()),
             handle.clone(),
@@ -733,6 +769,7 @@ async fn serve(core: ComposedCore, git_root: PathBuf, git_wire: GitWireRuntime) 
         Arc::new(AuthenticatedActionPolicy::mounted()),
     )
     .default_token_scheme(EDGE_DEFAULT_TOKEN_SCHEME)
+    .with_public_base_url(public_base_url)
     .with_auth_config(auth_config)
     .route(
         Method::Get,
@@ -1043,12 +1080,20 @@ mod runtime_config_tests {
                 ("MYELIN_GIT_ROOT", root.display().to_string()),
                 ("MYELIN_GVISOR_GIT_ROOTFS", rootfs),
                 ("MYELIN_RUNSC_BIN", runsc),
+                (
+                    "MYELIN_PUBLIC_BASE_URL",
+                    "https://myelin.example/base/".into(),
+                ),
             ],
         )
         .unwrap();
         assert_eq!(config.cell_id, "cell-eu-1");
         assert_eq!(config.git_root.as_deref(), Some(root.as_path()));
         assert!(config.git_wire.is_some());
+        assert_eq!(
+            config.public_base_url.as_deref(),
+            Some("https://myelin.example/base")
+        );
     }
 
     #[test]
@@ -1057,6 +1102,24 @@ mod runtime_config_tests {
         assert_eq!(config.cell_id, "cell-eu-1");
         assert_eq!(config.git_root, None);
         assert_eq!(config.git_wire, None);
+        assert_eq!(config.public_base_url, None);
+    }
+
+    #[test]
+    fn serving_public_base_url_is_absolute_and_query_free() {
+        assert_eq!(
+            validated_public_base_url(Ok("ftp://myelin.example".into())).unwrap_err(),
+            "MYELIN_PUBLIC_BASE_URL must be an absolute HTTP(S) URL"
+        );
+        assert_eq!(
+            validated_public_base_url(Ok("/relative".into())).unwrap_err(),
+            "MYELIN_PUBLIC_BASE_URL must be an absolute HTTP(S) URL"
+        );
+        assert_eq!(
+            validated_public_base_url(Ok("https://myelin.example/?tenant=acme".into()))
+                .unwrap_err(),
+            "MYELIN_PUBLIC_BASE_URL must not contain a query string"
+        );
     }
 
     #[test]
