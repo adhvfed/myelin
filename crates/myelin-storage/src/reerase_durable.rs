@@ -133,7 +133,10 @@ impl DurablePostPitLedger {
     /// The async form of the §7.5 selection: every erasure in this region completed strictly AFTER
     /// `pit` (the resurrection-risk set the pass re-applies). Ordered by subject for a deterministic
     /// re-apply order.
-    async fn completed_after_async(&self, pit: WalOffset) -> Result<Vec<ErasureRecord>, ProviderError> {
+    async fn completed_after_async(
+        &self,
+        pit: WalOffset,
+    ) -> Result<Vec<ErasureRecord>, ProviderError> {
         let region = self.region();
         let pit_i = pit as i64;
         let rows = sqlx::query(
@@ -147,16 +150,27 @@ impl DurablePostPitLedger {
         .fetch_all(self.provider.db_pool())
         .await
         .map_err(|e| ProviderError::from(crate::pg::PgError::Query(e.to_string())))?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                let tenant: String = r.get("tenant_id");
-                let subject: String = r.get("subject");
-                let offset: i64 = r.get("completed_at_offset");
-                ErasureRecord::new(SubjectId::new(subject), TenantId(tenant), offset as WalOffset)
+        rows.iter()
+            .map(|row| {
+                let tenant: String = row.try_get("tenant_id").map_err(post_pit_row_decode)?;
+                let subject: String = row.try_get("subject").map_err(post_pit_row_decode)?;
+                let offset: i64 = row
+                    .try_get("completed_at_offset")
+                    .map_err(post_pit_row_decode)?;
+                Ok(ErasureRecord::new(
+                    SubjectId::new(subject),
+                    TenantId(tenant),
+                    offset as WalOffset,
+                ))
             })
-            .collect())
+            .collect()
     }
+}
+
+fn post_pit_row_decode(error: sqlx::Error) -> ProviderError {
+    ProviderError::from(crate::pg::PgError::Query(format!(
+        "post-PIT erasure ledger row decode failed: {error}"
+    )))
 }
 
 impl PostRestoreErasureLedger for DurablePostPitLedger {
