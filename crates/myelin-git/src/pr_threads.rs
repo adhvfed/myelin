@@ -33,7 +33,9 @@
 //! backed in production by the deny-by-default `CheckBackedRepoAuthorizer`, never a permissive
 //! authorizer). This store holds no authorizer — it is the durable medium; the edge is the chokepoint.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, Weak};
 
 use serde::{Deserialize, Serialize};
 
@@ -414,6 +416,7 @@ pub struct SubmittedBatch {
 /// [`RepoPathResolver`] the durable git + PR stores use (tenant/region path-isolated + traversal-safe).
 pub struct DurablePrThreadStore<P: RepoPathResolver = RootedResolver> {
     resolver: P,
+    subject_locks: Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>,
 }
 
 impl DurablePrThreadStore<RootedResolver> {
@@ -421,6 +424,7 @@ impl DurablePrThreadStore<RootedResolver> {
     pub fn rooted(root: impl Into<PathBuf>) -> Self {
         Self {
             resolver: RootedResolver::new(root),
+            subject_locks: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -447,7 +451,10 @@ fn key_stem(object_key: &str) -> String {
 impl<P: RepoPathResolver> DurablePrThreadStore<P> {
     /// Build over a resolver (the placement resolver swaps in here behind the same port).
     pub fn new(resolver: P) -> Self {
-        Self { resolver }
+        Self {
+            resolver,
+            subject_locks: Mutex::new(BTreeMap::new()),
+        }
     }
 
     fn threads_dir(&self, repo: &RepoLoc) -> Result<PathBuf, DurableError> {
@@ -462,6 +469,21 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         Ok(self
             .threads_dir(repo)?
             .join(format!("{}.json", key_stem(object_key))))
+    }
+
+    fn subject_lock(
+        &self,
+        repo: &RepoLoc,
+        object_key: &str,
+    ) -> Result<Arc<Mutex<()>>, DurableError> {
+        let path = self.subject_path(repo, object_key)?;
+        let mut locks = self.subject_locks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(path, Arc::downgrade(&lock));
+        Ok(lock)
     }
 
     /// Load the subject document (an empty, `object_key`-stamped default if none persisted yet).
@@ -520,6 +542,8 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         body_md: impl Into<String>,
         now: i64,
     ) -> Result<ThreadRecord, DurableError> {
+        let lock = self.subject_lock(repo, object_key)?;
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
         let tid = doc.next_id("t")?;
         let cid = doc.next_id("c")?;
@@ -553,6 +577,8 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         body_md: impl Into<String>,
         now: i64,
     ) -> Result<CommentRecord, DurableError> {
+        let lock = self.subject_lock(repo, object_key)?;
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
         let cid = doc.next_id("c")?;
         let thread = doc
@@ -583,6 +609,8 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         thread_id: &str,
         resolved: bool,
     ) -> Result<(), DurableError> {
+        let lock = self.subject_lock(repo, object_key)?;
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
         let thread = doc
             .threads
@@ -604,6 +632,8 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         object_key: &str,
         reviewer: ThreadPrincipal,
     ) -> Result<ReviewBatch, DurableError> {
+        let lock = self.subject_lock(repo, object_key)?;
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
         let rid = doc.next_id("r")?;
         let batch = ReviewBatch {
@@ -635,6 +665,8 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             body_md,
             now,
         } = request;
+        let lock = self.subject_lock(&repo, &object_key)?;
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(&repo, &object_key)?;
         match doc.review(&review_id) {
             None => return Err(DurableError::NotFound(format!("review {review_id}"))),
@@ -693,6 +725,8 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             summary_md,
             now,
         } = request;
+        let lock = self.subject_lock(&repo, &object_key)?;
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(&repo, &object_key)?;
         let (owner_display, already) = match doc.review(&review_id) {
             None => return Err(DurableError::NotFound(format!("review {review_id}"))),
@@ -749,6 +783,8 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         review_id: &str,
         actor: &ThreadPrincipal,
     ) -> Result<(), DurableError> {
+        let lock = self.subject_lock(repo, object_key)?;
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
         match doc.review(review_id) {
             None => return Err(DurableError::NotFound(format!("review {review_id}"))),
@@ -888,6 +924,45 @@ mod tests {
         assert_eq!(back.threads.len(), 1);
         assert!(back.threads[0].is_discussion());
         assert_eq!(back.threads[0].comments[0].body_md, "first post");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn concurrent_subject_writes_preserve_every_thread() {
+        const WRITERS: usize = 32;
+        let root = temp_root("concurrent-writes");
+        let store = Arc::new(DurablePrThreadStore::rooted(&root));
+        let barrier = Arc::new(std::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::with_capacity(WRITERS);
+        for writer in 0..WRITERS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.create_thread(
+                    &loc(),
+                    KEY,
+                    None,
+                    human(&format!("psn:writer-{writer}@acme")),
+                    format!("comment-{writer}"),
+                    writer as i64,
+                )
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer must not panic").expect("writer must persist");
+        }
+
+        let doc = store.load(&loc(), KEY).unwrap();
+        assert_eq!(doc.threads.len(), WRITERS, "no concurrent write may be lost");
+        assert_eq!(doc.seq, (WRITERS * 2) as u64, "thread and comment ids stay monotonic");
+        let bodies: std::collections::BTreeSet<_> = doc
+            .threads
+            .iter()
+            .map(|thread| thread.comments[0].body_md.as_str())
+            .collect();
+        assert_eq!(bodies.len(), WRITERS, "every writer remains distinguishable");
+        drop(store);
         std::fs::remove_dir_all(&root).ok();
     }
 
