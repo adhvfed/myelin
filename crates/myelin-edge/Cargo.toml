@@ -81,6 +81,10 @@ myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Decode URI path captures only after the router has matched literal segments. This crate is already
+# pinned in Cargo.lock through the HTTP stack; making it direct adds no dependency subtree.
+percent-encoding = "2.3"
+
 # base64 (0.22 — the SAME pin myelin-identity-service uses) decodes the git smart-HTTP `Authorization:
 # Basic base64(user:pass)` header on the WIRE routes only: `git push/clone http://…` sends Basic, and
 # the PASSWORD carries the capability-token material (R4.0 item C). Already in Cargo.lock via identity —

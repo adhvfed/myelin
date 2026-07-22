@@ -161,6 +161,8 @@ enum Seg {
     Rest(String),
 }
 
+type RouteMatch = (usize, BTreeMap<String, String>);
+
 /// What a matched route dispatches to.
 enum RouteKind {
     /// A normal handler (a JSON view-model response).
@@ -455,8 +457,8 @@ impl Gateway {
             return false;
         };
         match self.match_route(method, &req.path) {
-            Some((idx, _)) => self.routes[idx].action.starts_with("git.wire."),
-            None => false,
+            Ok(Some((idx, _))) => self.routes[idx].action.starts_with("git.wire."),
+            Ok(None) | Err(_) => false,
         }
     }
 
@@ -477,7 +479,7 @@ impl Gateway {
         }
 
         // Route match (404 if none) — total over an arbitrary path.
-        let (idx, params) = self.match_route(method, &req.path).ok_or_else(|| {
+        let (idx, params) = self.match_route(method, &req.path)?.ok_or_else(|| {
             EdgeError::NotFound(format!("no route for {} {}", method.as_str(), req.path))
         })?;
         let route = &self.routes[idx];
@@ -787,7 +789,11 @@ impl Gateway {
 
     /// Match `(method, path)` against the registered routes, extracting path params. Total over an
     /// arbitrary path.
-    fn match_route(&self, method: Method, path: &str) -> Option<(usize, BTreeMap<String, String>)> {
+    fn match_route(
+        &self,
+        method: Method,
+        path: &str,
+    ) -> Result<Option<RouteMatch>, EdgeError> {
         let parts: Vec<&str> = path
             .trim_matches('/')
             .split('/')
@@ -808,31 +814,72 @@ impl Gateway {
             } else if r.segs.len() != parts.len() {
                 continue;
             }
+
+            // Match literals against the RAW URI path before decoding captures. Decoding first could
+            // turn `%2F` into a structural separator or let an encoded literal alter route selection.
+            if r.segs.iter().enumerate().any(|(idx, seg)| {
+                matches!(seg, Seg::Lit(literal) if parts.get(idx) != Some(&literal.as_str()))
+            }) {
+                continue;
+            }
+
             let mut params = BTreeMap::new();
             for (idx, seg) in r.segs.iter().enumerate() {
                 match seg {
-                    Seg::Lit(l) => {
-                        if parts.get(idx) != Some(&l.as_str()) {
-                            continue 'routes;
-                        }
-                    }
+                    Seg::Lit(_) => {}
                     Seg::Param(name) => match parts.get(idx) {
                         Some(part) => {
-                            params.insert(name.clone(), (*part).to_string());
+                            params.insert(name.clone(), decode_route_component(part)?);
                         }
                         None => continue 'routes,
                     },
                     // The catch-all: everything from here on, joined by `/` (empty for the root path).
                     Seg::Rest(name) => {
-                        let rest = parts[idx..].join("/");
+                        let rest = parts[idx..]
+                            .iter()
+                            .map(|part| decode_route_component(part))
+                            .collect::<Result<Vec<_>, _>>()?
+                            .join("/");
                         params.insert(name.clone(), rest);
                     }
                 }
             }
-            return Some((i, params));
+            return Ok(Some((i, params)));
         }
-        None
+        Ok(None)
     }
+}
+
+/// Decode one already-captured URI path component exactly once. Invalid percent triplets, non-UTF-8
+/// output, and decoded control characters are malformed requests rather than literal backend names.
+fn decode_route_component(raw: &str) -> Result<String, EdgeError> {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(EdgeError::BadRequest(
+                    "route parameter contains malformed percent encoding".into(),
+                ));
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+
+    let decoded = percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map_err(|_| EdgeError::BadRequest("route parameter is not valid UTF-8".into()))?;
+    if decoded.chars().any(char::is_control) {
+        return Err(EdgeError::BadRequest(
+            "route parameter contains a control character".into(),
+        ));
+    }
+    Ok(decoded.into_owned())
 }
 
 /// The map from a `PrincipalKind` to a PII-free label for the whoami view-model.
@@ -926,6 +973,59 @@ mod tests {
         // A plain `{path}` is NOT a catch-all.
         let single = parse_pattern("/v1/git/repos/{repo}/blob/{ref}/{path}");
         assert!(matches!(single.last(), Some(Seg::Param(n)) if n == "path"));
+    }
+
+    #[test]
+    fn route_captures_decode_encoded_refs_and_unicode_paths_exactly_once() {
+        let gateway = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll))
+            .route(
+                Method::Get,
+                "/v1/git/repos/{repo}/tree/{ref}/{...path}",
+                "git.tree.read",
+                Arc::new(WhoamiHandler),
+            )
+            .build();
+
+        let (_, params) = gateway
+            .match_route(
+                Method::Get,
+                "/v1/git/repos/my%20repo/tree/feature%2Ffoo/docs/hello%20world%23%E2%9C%93.md",
+            )
+            .expect("encoded captures are well formed")
+            .expect("the raw literal segments match");
+        assert_eq!(params.get("repo").map(String::as_str), Some("my repo"));
+        assert_eq!(params.get("ref").map(String::as_str), Some("feature/foo"));
+        assert_eq!(
+            params.get("path").map(String::as_str),
+            Some("docs/hello world#✓.md")
+        );
+    }
+
+    #[test]
+    fn malformed_non_utf8_and_control_route_captures_are_bad_requests() {
+        let gateway = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll))
+            .route(
+                Method::Get,
+                "/v1/git/repos/{repo}",
+                "git.repo.read",
+                Arc::new(WhoamiHandler),
+            )
+            .build();
+
+        for path in [
+            "/v1/git/repos/bad%",
+            "/v1/git/repos/bad%GG",
+            "/v1/git/repos/bad%FF",
+            "/v1/git/repos/bad%00name",
+        ] {
+            assert!(
+                matches!(
+                    gateway.match_route(Method::Get, path),
+                    Err(EdgeError::BadRequest(_))
+                ),
+                "malformed capture must fail as a bad request: {path}"
+            );
+        }
     }
 
     #[test]
