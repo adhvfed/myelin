@@ -499,7 +499,7 @@ impl PgPrStore {
     }
 
     pub fn list(&self, scope: &TenantScope, repo: &str) -> Result<Vec<PrRecord>, DurableError> {
-        self.list_bounded(scope, repo, usize::MAX)
+        self.list_bounded(scope, repo, usize::MAX, usize::MAX)
     }
 
     /// Fetch at most one row beyond the caller's ceiling, so interactive list/count projections can
@@ -509,6 +509,7 @@ impl PgPrStore {
         scope: &TenantScope,
         repo: &str,
         maximum_records: usize,
+        maximum_bytes: usize,
     ) -> Result<Vec<PrRecord>, DurableError> {
         let target = self.scoped_target(scope, repo)?;
         let provider = self.provider.clone();
@@ -520,11 +521,40 @@ impl PgPrStore {
         let crypto_region = region.clone();
         let expected_tenant = tenant_id.0.clone();
         let fetch_limit = i64::try_from(maximum_records.saturating_add(1)).unwrap_or(i64::MAX);
+        let record_limit = i64::try_from(maximum_records).unwrap_or(i64::MAX);
+        let byte_limit = i64::try_from(maximum_bytes).unwrap_or(i64::MAX);
         let rows = self
             .block_on(async move {
                 provider
                     .with_tenant_tx(&transaction_tenant.clone(), move |conn| {
                         Box::pin(async move {
+                            let summary = sqlx::query(
+                                "SELECT count(*) AS record_count, \
+                                 COALESCE(sum(pg_column_size(git_pr)), 0)::bigint AS total_bytes \
+                                 FROM git_pr WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3",
+                            )
+                            .bind(&tenant_id.0)
+                            .bind(&region.0)
+                            .bind(&loc.repo)
+                            .fetch_one(&mut *conn)
+                            .await
+                            .map_err(|_| pg_query("measure PR list"))?;
+                            let record_count: i64 = summary
+                                .try_get("record_count")
+                                .map_err(|_| pg_query("decode PR list count"))?;
+                            let total_bytes: i64 = summary
+                                .try_get("total_bytes")
+                                .map_err(|_| pg_query("decode PR list size"))?;
+                            if record_count > record_limit {
+                                return Err(myelin_storage::PgError::Query(
+                                    "pull request list limit exceeded: record count".into(),
+                                ));
+                            }
+                            if total_bytes > byte_limit {
+                                return Err(myelin_storage::PgError::Query(
+                                    "pull request list limit exceeded: serialized bytes".into(),
+                                ));
+                            }
                             let list_sql = format!(
                                 "SELECT {PR_RECORD_COLUMNS} FROM git_pr \
                                  WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 \
@@ -2302,7 +2332,11 @@ fn encrypted_column(
 
 fn pg_error(error: impl std::fmt::Display) -> DurableError {
     let message = error.to_string();
-    if message.contains("not found") {
+    if message.contains("pull request list limit exceeded: record count") {
+        DurableError::Git("pull request list limit exceeded: record count".into())
+    } else if message.contains("pull request list limit exceeded: serialized bytes") {
+        DurableError::Git("pull request list limit exceeded: serialized bytes".into())
+    } else if message.contains("not found") {
         DurableError::NotFound("pull request not found".into())
     } else if message.contains("different repository")
         || message.contains("different command")
