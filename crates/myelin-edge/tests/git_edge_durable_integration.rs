@@ -1245,3 +1245,192 @@ async fn refs_are_stably_paginated_pinned_and_cursor_scoped() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// FRONTEND-CONTRACT: git-read-dev-edge-parity
+///
+/// Provider half of the dev-edge parity gate. The frontend consumer loads the same committed
+/// request/response vectors from `contracts/git-read-dev-edge.golden.json`; only opaque cursor and
+/// object-id bytes are normalized before comparison.
+#[tokio::test]
+async fn git_read_endpoints_match_the_shared_dev_edge_golden_vectors() {
+    const GOLDEN: &str = include_str!("../../../contracts/git-read-dev-edge.golden.json");
+    let golden: serde_json::Value =
+        serde_json::from_str(GOLDEN).expect("valid Git read golden JSON");
+    assert_eq!(golden["contract_id"], "git-read-dev-edge-parity");
+
+    let root = temp_root("git-read-golden");
+    let (gw, cell) = build(&root);
+    let addr = spawn(gw).await;
+    let h = bearer(&mint(&cell, "acme", "jti-git-read-golden"));
+    let (create_status, create_body) = http(
+        addr,
+        "POST",
+        "/v1/git/repos",
+        &hdr(&h),
+        br#"{"slug":"golden"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(create_status, 201, "create golden repo: {create_body}");
+
+    let store = DurableGitStore::rooted(&root);
+    let repo = store
+        .open_repo(&RepoLoc::new("acme", REGION, "golden"))
+        .expect("open golden repo");
+    let names = ["A.txt", "a.txt", "e\u{301}.txt", "é.txt", "😀.txt"];
+    let blobs = names
+        .iter()
+        .map(|name| {
+            (
+                *name,
+                repo.write_blob(name.as_bytes()).expect("write golden blob"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let root_entries = blobs
+        .iter()
+        .map(|(name, oid)| (*name, oid))
+        .collect::<Vec<_>>();
+    let tree = repo.write_tree(&root_entries).expect("write golden tree");
+    let commit = repo
+        .write_commit(
+            &tree,
+            &[],
+            "golden snapshot",
+            "psn@acme.noreply",
+            "psn@acme.noreply",
+        )
+        .expect("write golden commit");
+    repo.update_ref_cas(
+        "refs/heads/main",
+        None,
+        Some(&commit),
+        "seed golden main",
+        "psn@acme.noreply",
+    )
+    .expect("create golden main");
+    for full_name in [
+        "refs/heads/A",
+        "refs/heads/a",
+        "refs/heads/e\u{301}",
+        "refs/heads/feature",
+        "refs/heads/é",
+        "refs/heads/😀",
+        "refs/tags/v0.1",
+    ] {
+        repo.update_ref_cas(
+            full_name,
+            None,
+            Some(&commit),
+            "seed golden ref",
+            "psn@acme.noreply",
+        )
+        .unwrap_or_else(|error| panic!("create {full_name}: {error}"));
+    }
+
+    let mut cursors = std::collections::HashMap::<String, String>::new();
+    for vector in golden["vectors"].as_array().expect("golden vectors") {
+        let id = vector["id"].as_str().expect("vector id");
+        let endpoint = vector["endpoint"].as_str().expect("endpoint");
+        let after = vector["after"].as_str();
+        let cursor = after.map(|source| {
+            cursors
+                .get(source)
+                .unwrap_or_else(|| panic!("{id}: missing cursor from {source}"))
+                .clone()
+        });
+        if vector["mutation"] == "add-ref" {
+            repo.update_ref_cas(
+                "refs/tags/stale-add",
+                None,
+                Some(&commit),
+                "stale golden cursor",
+                "psn@acme.noreply",
+            )
+            .expect("mutate golden refs namespace");
+        }
+        let request = &vector["request"];
+        let limit = request["limit"].as_u64().expect("limit");
+        let path = if endpoint == "refs" {
+            let mut query = format!("limit={limit}");
+            if let Some(current) = request["current"].as_str() {
+                query.push_str("&current=");
+                query.push_str(
+                    &percent_encoding::utf8_percent_encode(
+                        current,
+                        percent_encoding::NON_ALPHANUMERIC,
+                    )
+                    .to_string(),
+                );
+            }
+            if let Some(cursor) = &cursor {
+                query.push_str("&cursor=");
+                query.push_str(cursor);
+            }
+            format!("/v1/git/repos/golden/refs?{query}")
+        } else {
+            let ref_name = request["ref"].as_str().expect("tree ref");
+            let encoded_ref =
+                percent_encoding::utf8_percent_encode(ref_name, percent_encoding::NON_ALPHANUMERIC);
+            let mut query = format!("limit={limit}");
+            if let Some(search) = request["q"].as_str() {
+                query.push_str("&q=");
+                query.push_str(
+                    &percent_encoding::utf8_percent_encode(
+                        search,
+                        percent_encoding::NON_ALPHANUMERIC,
+                    )
+                    .to_string(),
+                );
+            }
+            if let Some(cursor) = &cursor {
+                query.push_str("&cursor=");
+                query.push_str(cursor);
+            }
+            format!("/v1/git/repos/golden/tree/{encoded_ref}?{query}")
+        };
+        let (status, body) = http(addr, "GET", &path, &hdr(&h), vec![]).await;
+        let mut normalized = serde_json::json!({ "status": status });
+        if status == 200 && endpoint == "refs" {
+            let next = body["page"]["next_cursor"].as_str();
+            if let Some(next) = next {
+                assert!(next.starts_with("gr1_"), "{id}: cursor prefix: {body}");
+                assert!(
+                    !next["gr1_".len()..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit()),
+                    "{id}: cursor must not expose a decimal offset: {next}"
+                );
+                cursors.insert(id.to_string(), next.to_string());
+            }
+            normalized = serde_json::json!({
+                "status": status,
+                "branch_names": body["branches"].as_array().unwrap().iter()
+                    .map(|row| row["name"].clone()).collect::<Vec<_>>(),
+                "tag_names": body["tags"].as_array().unwrap().iter()
+                    .map(|row| row["name"].clone()).collect::<Vec<_>>(),
+                "default_branch": body["default_branch"],
+                "pinned_full_names": body["pinned"].as_array().unwrap().iter()
+                    .map(|row| row["full_name"].clone()).collect::<Vec<_>>(),
+                "limit": body["page"]["limit"],
+                "next_cursor": next.map_or(serde_json::Value::Null, |_| serde_json::json!("gr1_<opaque>")),
+            });
+        } else if status == 200 && endpoint == "tree" {
+            let next = body["page"]["next_cursor"].as_str();
+            if let Some(next) = next {
+                assert!(next.starts_with("gt1_"), "{id}: cursor prefix: {body}");
+                cursors.insert(id.to_string(), next.to_string());
+            }
+            normalized = serde_json::json!({
+                "status": status,
+                "entry_names": body["entries"].as_array().unwrap().iter()
+                    .map(|row| row["name"].clone()).collect::<Vec<_>>(),
+                "path": body["path"],
+                "limit": body["page"]["limit"],
+                "next_cursor": next.map_or(serde_json::Value::Null, |_| serde_json::json!("gt1_<opaque>")),
+            });
+        }
+        assert_eq!(normalized, vector["expected"], "golden vector {id}: {body}");
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}

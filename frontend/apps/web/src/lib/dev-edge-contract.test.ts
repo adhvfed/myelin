@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -9,9 +10,28 @@ import {
   refsJson,
   repoHomeJson,
   repoSummaryEnvelope,
+  SEED_REFS,
   treeJson,
   validPrOperationId,
 } from "../../dev-edge/dev-contract.mjs";
+
+// FRONTEND-CONTRACT: git-read-dev-edge-parity
+// Both this consumer and the Rust provider integration load this exact committed artifact.
+const GIT_READ_GOLDEN_PATH = "contracts/git-read-dev-edge.golden.json";
+const gitReadGolden = JSON.parse(readFileSync(
+  new URL(`../../../../../${GIT_READ_GOLDEN_PATH}`, import.meta.url),
+  "utf8",
+)) as {
+  contract_id: string;
+  vectors: Array<{
+    id: string;
+    endpoint: "refs" | "tree";
+    after?: string;
+    mutation?: "add-ref";
+    request: { limit: number; current?: string; ref?: string; path?: string; q?: string };
+    expected: Record<string, unknown>;
+  }>;
+};
 
 describe("the dev Edge PR commit pagination contract", () => {
   it("mints canonical fixed-frame cursors and serves a distinct terminal page", () => {
@@ -147,14 +167,14 @@ describe("the dev Edge refs contract", () => {
     });
 
     expect(first).toMatchObject({
-      branches: [{ name: "main", is_default: true }],
+      branches: [{ name: "A", is_default: false }],
       tags: [],
       default_branch: "main",
       pinned: [
         { kind: "branch", full_name: "refs/heads/feature", name: "feature", is_default: false },
         { kind: "branch", full_name: "refs/heads/main", name: "main", is_default: true },
       ],
-      page: { next_cursor: "gr1_1", limit: 1 },
+      page: { next_cursor: expect.stringMatching(/^gr1_[A-Za-z0-9_-]+$/), limit: 1 },
     });
 
     expect(
@@ -172,6 +192,80 @@ describe("the dev Edge refs contract", () => {
       ],
       page: { next_cursor: null, limit: 100 },
     });
+  });
+});
+
+describe("the shared Git read golden contract", () => {
+  it("matches the same request/response vectors as the Rust Edge integration", () => {
+    expect(gitReadGolden.contract_id).toBe("git-read-dev-edge-parity");
+    const cursors = new Map<string, string>();
+    let refsNamespace = [...SEED_REFS];
+
+    for (const vector of gitReadGolden.vectors) {
+      const cursor = vector.after ? cursors.get(vector.after) : undefined;
+      if (vector.after && !cursor) throw new Error(`missing cursor from ${vector.after}`);
+      if (vector.mutation === "add-ref") {
+        refsNamespace = [...refsNamespace, {
+          kind: "tag",
+          full_name: "refs/tags/stale-add",
+          name: "stale-add",
+          oid: SEED_REFS[0]?.oid ?? "b2c3d4e5f60718293a4b5c6d7e8f900112233445",
+          is_default: false,
+        }];
+      }
+
+      const response = vector.endpoint === "refs"
+        ? refsJson("myelin", { ...vector.request, cursor }, refsNamespace)
+        : treeJson(
+            "myelin",
+            vector.request.ref ?? "refs/heads/main",
+            vector.request.path ?? "",
+            { limit: vector.request.limit, q: vector.request.q, cursor },
+          );
+      if (!response) throw new Error(`no response for ${vector.id}`);
+      const status = "__status" in response ? response.__status : 200;
+      let normalized: Record<string, unknown> = { status };
+      if (status === 200 && vector.endpoint === "refs" && "branches" in response) {
+        const refs = response as {
+          branches: Array<{ name: string }>;
+          tags: Array<{ name: string }>;
+          default_branch: string;
+          pinned: Array<{ full_name: string }>;
+          page: { next_cursor: string | null; limit: number };
+        };
+        const next = refs.page.next_cursor;
+        if (next) {
+          expect(next).toMatch(/^gr1_[A-Za-z0-9_-]+$/);
+          expect(next).not.toMatch(/^gr1_\d+$/);
+          cursors.set(vector.id, next);
+        }
+        normalized = {
+          status,
+          branch_names: refs.branches.map((row) => row.name),
+          tag_names: refs.tags.map((row) => row.name),
+          default_branch: refs.default_branch,
+          pinned_full_names: refs.pinned.map((row) => row.full_name),
+          limit: refs.page.limit,
+          next_cursor: next ? "gr1_<opaque>" : null,
+        };
+      } else if (status === 200 && vector.endpoint === "tree" && "entries" in response) {
+        const tree = response as {
+          entries: Array<{ name: string }>;
+          path: string;
+          page: { next_cursor: string | null; limit: number };
+        };
+        const next = tree.page.next_cursor;
+        if (next) cursors.set(vector.id, next);
+        normalized = {
+          status,
+          entry_names: tree.entries.map((row) => row.name),
+          path: tree.path,
+          limit: tree.page.limit,
+          next_cursor: next ? "gt1_<opaque>" : null,
+        };
+      }
+      expect(normalized, vector.id).toEqual(vector.expected);
+    }
   });
 });
 

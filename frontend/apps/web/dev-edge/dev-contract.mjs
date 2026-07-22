@@ -48,6 +48,11 @@ const LATEST = {
 // The acme/myelin working tree (R3.4) — a NESTED structure so the browse surface exercises tree-at-path
 // + nested blobs. `{ file }` = a blob (text unless `binary`), `{ dir }` = a subtree.
 const MYELIN_TREE = {
+  "A.txt": { file: "ASCII uppercase\n" },
+  "a.txt": { file: "ASCII lowercase\n" },
+  "e\u0301.txt": { file: "decomposed accent\n" },
+  "é.txt": { file: "composed accent\n" },
+  "😀.txt": { file: "emoji\n" },
   "README.md": {
     file:
       "# acme/myelin\n\nThe make-it-real spine.\n\n## Usage\n\n- Browse the tree\n- Open a file\n\nSee `crates/` for the code.\n",
@@ -225,32 +230,98 @@ function entriesOf(dirNode, base) {
       if (!is_dir) row.size = (e.file ?? "").length;
       return row;
     })
-    .sort((a, b) => (a.is_dir === b.is_dir ? a.name.localeCompare(b.name) : a.is_dir ? -1 : 1));
+    .sort((a, b) => (a.is_dir === b.is_dir ? compareUtf8(a.name, b.name) : a.is_dir ? -1 : 1));
+}
+
+/** Git names are byte strings. The product Edge orders valid UTF-8 names by their UTF-8 bytes. */
+export function compareUtf8(left, right) {
+  return Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8"));
+}
+
+export const SEED_REFS = [
+  { kind: "branch", full_name: "refs/heads/main", name: "main", oid: LATEST.oid, is_default: true },
+  { kind: "branch", full_name: "refs/heads/feature", name: "feature", oid: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334", is_default: false },
+  { kind: "branch", full_name: "refs/heads/A", name: "A", oid: LATEST.oid, is_default: false },
+  { kind: "branch", full_name: "refs/heads/a", name: "a", oid: LATEST.oid, is_default: false },
+  { kind: "branch", full_name: "refs/heads/e\u0301", name: "e\u0301", oid: LATEST.oid, is_default: false },
+  { kind: "branch", full_name: "refs/heads/é", name: "é", oid: LATEST.oid, is_default: false },
+  { kind: "branch", full_name: "refs/heads/😀", name: "😀", oid: LATEST.oid, is_default: false },
+  { kind: "tag", full_name: "refs/tags/v0.1", name: "v0.1", oid: LATEST.oid, is_default: false },
+];
+
+function compareRefs(left, right) {
+  if (left.kind !== right.kind) return left.kind === "branch" ? -1 : 1;
+  return compareUtf8(left.name, right.name) || compareUtf8(left.full_name, right.full_name);
+}
+
+function refsSnapshot(refs) {
+  return createHash("sha256")
+    .update(JSON.stringify([...refs].sort(compareRefs)
+      .map(({ kind, full_name, oid, is_default }) => [kind, full_name, oid, is_default])))
+    .digest("hex");
+}
+
+function refsScope(repo, query) {
+  return createHash("sha256")
+    .update(`myelin.git.refs.scope.v1\0${repo}\0${query}`)
+    .digest("hex");
+}
+
+function refsCursor(repo, query, snapshot, row) {
+  const frame = JSON.stringify([1, snapshot, refsScope(repo, query), row.kind, row.full_name]);
+  return `gr1_${Buffer.from(frame, "utf8").toString("base64url")}`;
+}
+
+function decodeRefsCursor(cursor) {
+  if (typeof cursor !== "string" || !/^gr1_[A-Za-z0-9_-]+$/.test(cursor)) return null;
+  try {
+    const encoded = cursor.slice("gr1_".length);
+    const bytes = Buffer.from(encoded, "base64url");
+    if (bytes.toString("base64url") !== encoded) return null;
+    const frame = JSON.parse(bytes.toString("utf8"));
+    if (!Array.isArray(frame) || frame.length !== 5 || frame[0] !== 1 ||
+        frame.slice(1).some((value) => typeof value !== "string")) {
+      return null;
+    }
+    return { snapshot: frame[1], scope: frame[2], kind: frame[3], fullName: frame[4] };
+  } catch {
+    return null;
+  }
 }
 
 /**
  * GET /v1/git/repos/{repo}/refs → the paginated RefsVM (null = 404).
  * @param {string} repo
  * @param {{ limit?: number, cursor?: string, q?: string, current?: string }} [options]
+ * @param {Array<object>} [namespace] Injectable only so the contract test can move the ref namespace.
  */
-export function refsJson(repo, options = {}) {
+export function refsJson(repo, options = {}, namespace = SEED_REFS) {
   if (repo !== "myelin") return null;
   const { limit = 100, cursor, q = "", current } = options;
-  const refs = [
-    { kind: "branch", full_name: "refs/heads/main", name: "main", oid: LATEST.oid, is_default: true },
-    { kind: "branch", full_name: "refs/heads/feature", name: "feature", oid: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334", is_default: false },
-    { kind: "tag", full_name: "refs/tags/v0.1", name: "v0.1", oid: LATEST.oid, is_default: false },
-  ];
-  const offset = cursor === undefined ? 0 : Number(/^gr1_(\d+)$/.exec(cursor)?.[1]);
-  if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isInteger(offset)) {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
     return { __status: 400 };
   }
   const needle = q.trim().toLowerCase();
+  const refs = [...namespace].sort(compareRefs);
+  const snapshot = refsSnapshot(refs);
   const matches = refs.filter((row) => !needle || row.name.toLowerCase().includes(needle));
+  let offset = 0;
+  if (cursor !== undefined) {
+    const decoded = decodeRefsCursor(cursor);
+    if (!decoded || decoded.scope !== refsScope(repo, needle)) {
+      return { __status: 400 };
+    }
+    if (decoded.snapshot !== snapshot) return { __status: 409 };
+    offset = matches.findIndex((row) =>
+      row.kind === decoded.kind && row.full_name === decoded.fullName) + 1;
+    if (offset === 0) return { __status: 400 };
+  }
   const selected = matches.slice(offset, offset + limit);
-  const next = offset + selected.length < matches.length ? `gr1_${offset + selected.length}` : null;
+  const next = offset + selected.length < matches.length && selected.length > 0
+    ? refsCursor(repo, needle, snapshot, selected.at(-1))
+    : null;
   const currentPin = refs.find((row) => row.full_name === current);
-  const defaultPin = refs[0];
+  const defaultPin = refs.find((row) => row.kind === "branch" && row.is_default);
   const pinned = [currentPin, defaultPin]
     .filter(Boolean)
     .filter((row, index, rows) => rows.findIndex((candidate) => candidate.full_name === row.full_name) === index);
@@ -1245,7 +1316,7 @@ export function issuesEnvelope(rows, state = "open", key, limit = 50, cursor) {
           : issue.state_category === "unstarted" || issue.state_category === "started",
     )
     .filter((issue) => !key || issue.key.startsWith(key.toUpperCase()))
-    .sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id.localeCompare(a.id));
+    .sort((a, b) => compareUtf8(b.updated_at, a.updated_at) || compareUtf8(b.id, a.id));
   const offset = cursor?.startsWith("ic_dev_") ? Number(cursor.slice("ic_dev_".length)) || 0 : 0;
   const items = wanted.slice(offset, offset + limit);
   const next = offset + items.length < wanted.length ? `ic_dev_${offset + items.length}` : null;

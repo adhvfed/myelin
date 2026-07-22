@@ -4,6 +4,7 @@ import AxeBuilder from "@axe-core/playwright";
 // GT-004: the Git web UI browse surface + PR overview, driven in a REAL cached chromium against the
 // dev-edge contract. Each screen renders the genuine edge ViewModel JSON; each is axe-clean and
 // keyboard-navigable; a blocked merge shows WHY; the 401→/login floor still holds on a deep screen.
+// FRONTEND-CONTRACT: git-read-dev-edge-parity
 
 const C2 = "b2c3d4e5f60718293a4b5c6d7e8f900112233445";
 const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
@@ -170,6 +171,45 @@ test.describe("GT-004 Git web UI — real browser", () => {
     // The Download affordance is present (gateway-proxied attachment).
     await expect(page.getByTestId("blob-download")).toBeVisible();
     await expectNoAxeViolations(page, "nested blob");
+  });
+
+  test("tree next-page follows the server cursor and renders the next UTF-8-ordered row", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/tree/refs%2Fheads%2Fmain?limit=1");
+
+    const tree = page.getByTestId("repo-tree");
+    await expect(tree.getByText("crates/", { exact: true })).toBeVisible();
+    const next = page.getByTestId("tree-next-page");
+    await expect(next).toBeVisible();
+    await next.click();
+
+    await expect(page).toHaveURL(/cursor=gt1_[A-Za-z0-9_-]+/);
+    await expect(tree.getByText("A.txt", { exact: true })).toBeVisible();
+    await expect(tree.getByText("crates/", { exact: true })).toHaveCount(0);
+  });
+
+  test("a stale tree cursor renders the 409 state and reload drops the cursor", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/tree/refs%2Fheads%2Fmain?limit=1");
+    const href = await page.getByTestId("tree-next-page").getAttribute("href");
+    if (!href) throw new Error("expected a tree continuation href");
+    const target = new URL(href, "http://myelin.test");
+    const cursor = target.searchParams.get("cursor");
+    if (!cursor?.startsWith("gt1_")) throw new Error("expected an opaque tree cursor");
+    const frame = JSON.parse(Buffer.from(cursor.slice("gt1_".length), "base64url").toString("utf8"));
+    frame[4] = "1".repeat(40);
+    target.searchParams.set(
+      "cursor",
+      `gt1_${Buffer.from(JSON.stringify(frame), "utf8").toString("base64url")}`,
+    );
+
+    await page.goto(`${target.pathname}${target.search}`);
+    await expect(page.getByTestId("repo-error")).toHaveAttribute("data-kind", "stale-tree");
+    await page.getByRole("button", { name: "Reload directory" }).click();
+
+    await expect(page).not.toHaveURL(/(?:\?|&)cursor=/);
+    await expect(page.getByTestId("repo-tree")).toBeVisible();
+    await expect(page.getByTestId("repo-error")).toHaveCount(0);
   });
 
   test("the breadcrumb path segments are clickable (ref-true, no hardcoded main)", async ({ page }) => {

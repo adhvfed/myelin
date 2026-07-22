@@ -10,3 +10,10 @@ row = "4.3"
 title = "list_objects"
 status = "deferred"
 landing = "P-070"
+
+[[frontend]]
+id = "fixture-frontend-parity"
+golden = "crates/myelin-lints/tests/fixtures/frontend_contract.green.json"
+rust_tests = ["crates/myelin-lints/tests/fixtures/frontend_provider.green.rs.txt"]
+frontend_tests = ["crates/myelin-lints/tests/fixtures/frontend_consumer.green.ts.txt"]
+e2e_tests = ["crates/myelin-lints/tests/fixtures/frontend_e2e.green.ts.txt"]
