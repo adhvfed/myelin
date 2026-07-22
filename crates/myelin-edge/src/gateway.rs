@@ -764,13 +764,23 @@ impl Gateway {
             .get("scheme")
             .and_then(|v| v.as_str())
             .ok_or_else(|| EdgeError::BadRequest("login body missing `scheme`".into()))?;
-        let material = body
+        let raw_material = body
             .get("material")
             .and_then(|v| v.as_str())
             .ok_or_else(|| EdgeError::BadRequest("login body missing `material`".into()))?;
+        let material = if scheme == myelin_identity_service::scheme::OIDC {
+            let nonce = body
+                .get("nonce")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| EdgeError::BadRequest("OIDC login body missing `nonce`".into()))?;
+            myelin_identity_service::oidc_login_material(raw_material, nonce)
+                .map_err(|_| EdgeError::BadRequest("OIDC login body has an invalid `nonce`".into()))?
+        } else {
+            raw_material.to_string()
+        };
         let cred = Credential {
             scheme: scheme.to_string(),
-            material: material.to_string(),
+            material,
         };
         match self.human_login.authenticate(&cred, None) {
             Ok(_principal) => Err(EdgeError::Unavailable(
@@ -1488,8 +1498,12 @@ mod tests {
     fn login_refuses_not_mocks() {
         // The production human verifier is config-deferred (MR-012) → login REFUSES (503), never a
         // mock session (no Set-Cookie).
-        let body =
-            serde_json::to_vec(&json!({"scheme":"oidc","material":"acme|eu-west|subj-1"})).unwrap();
+        let body = serde_json::to_vec(&json!({
+            "scheme":"oidc",
+            "material":"acme|eu-west|subj-1",
+            "nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }))
+        .unwrap();
         let resp = gw().handle(EdgeRequest::new("POST", "/v1/auth/login", "", vec![], body));
         assert_eq!(
             resp.status(),
@@ -1508,6 +1522,23 @@ mod tests {
             b"{garbage".to_vec(),
         ));
         assert_eq!(resp.status(), 400);
+    }
+
+    #[test]
+    fn oidc_login_requires_a_well_formed_browser_transaction_nonce() {
+        for body in [
+            json!({"scheme":"oidc", "material":"id-token"}),
+            json!({"scheme":"oidc", "material":"id-token", "nonce":"short"}),
+        ] {
+            let resp = gw().handle(EdgeRequest::new(
+                "POST",
+                "/v1/auth/login",
+                "",
+                vec![],
+                serde_json::to_vec(&body).unwrap(),
+            ));
+            assert_eq!(resp.status(), 400);
+        }
     }
 
     // ── R2.2: the SSE scope registration-time contract ──────────────────────────────────────────
