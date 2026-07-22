@@ -76,6 +76,7 @@ test.describe("R3.5 first-run — empty tenant onboarding", () => {
   test("a fresh empty tenant TEACHES push-to-create with copyable CTAs + a dismissable checklist; axe green", async ({ page }) => {
     await setEdgeConfig({ emptyRepos: true, devLoginEnabled: true });
     await page.goto("/login");
+    await page.waitForLoadState("networkidle");
     await page.getByTestId("dev-login").click();
     await page.waitForURL("**/git/repos");
 
@@ -104,6 +105,7 @@ test.describe("R3.5 first-run — honest inbox", () => {
   test("the inbox is honest at zero: no '2 unread' badge, and an 'all caught up' empty state", async ({ page }) => {
     await setEdgeConfig({ emptyRepos: false, devLoginEnabled: true });
     await page.goto("/login");
+    await page.waitForLoadState("networkidle");
     await page.getByTestId("dev-login").click();
     await page.waitForURL("**/git/repos");
 

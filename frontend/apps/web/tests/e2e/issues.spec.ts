@@ -41,6 +41,7 @@ async function edgeIssueState(): Promise<{
 
 async function devLogin(page: Page) {
   await page.goto("/login");
+  await page.waitForLoadState("networkidle");
   await page.getByTestId("dev-login").click();
   await page.waitForURL("**/git/repos");
 }

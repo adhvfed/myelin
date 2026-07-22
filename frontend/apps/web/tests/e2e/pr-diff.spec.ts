@@ -30,6 +30,7 @@ async function expectNoAxeViolations(page: Page, context: string) {
 
 async function devLogin(page: Page) {
   await page.goto("/login");
+  await page.waitForLoadState("networkidle");
   await page.getByTestId("dev-login").click();
   await page.waitForURL("**/git/repos");
 }

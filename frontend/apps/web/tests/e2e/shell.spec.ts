@@ -14,6 +14,9 @@ async function expectNoAxeViolations(page: Page, context?: string) {
 
 async function devLogin(page: Page) {
   await page.goto("/login");
+  // SolidStart installs the server-action submission during hydration. A pre-hydration click can
+  // remain on /login even though the button is already painted by SSR.
+  await page.waitForLoadState("networkidle");
   await page.getByTestId("dev-login").click();
   await page.waitForURL("**/git/repos");
   // URL commit and SSR visibility can precede Solid's client mount. This marker flips only after
@@ -125,6 +128,7 @@ test.describe("MR-019 app shell — real browser", () => {
     expect(first!.expires - Date.now() / 1_000).toBeGreaterThan(7 * 60 * 60);
 
     await page.goto("/login");
+    await page.waitForLoadState("networkidle");
     await page.getByTestId("dev-login").click();
     await page.waitForURL("**/git/repos");
     const second = (await page.context().cookies()).find((cookie) => cookie.name === "myelin_session");
