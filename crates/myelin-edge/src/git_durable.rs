@@ -3360,6 +3360,11 @@ fn map_durable_err(e: DurableError) -> EdgeError {
         DurableError::Git(m) if m.starts_with("browse response limit exceeded:") => {
             EdgeError::PayloadTooLarge("repository view exceeds the interactive browse limit".into())
         }
+        DurableError::Git(m) if m.starts_with("tree page limit exceeded:") => {
+            EdgeError::PayloadTooLarge(
+                "repository tree exceeds the interactive browse limit".into(),
+            )
+        }
         DurableError::Git(m) if m.starts_with("pr diff computation limit exceeded:") => {
             EdgeError::PayloadTooLarge("pull request diff exceeds the interactive file limit".into())
         }
@@ -4071,6 +4076,42 @@ mod tree_query_tests {
             )))
             .status(),
             404
+        );
+    }
+
+    #[test]
+    fn tree_capacity_errors_are_sanitized_payload_too_large_responses() {
+        for private in [
+            "tree page limit exceeded: tree object is larger than 8388608 bytes",
+            "tree page limit exceeded: scanned entry count",
+            "tree page limit exceeded: one entry name",
+            "tree page limit exceeded: name bytes",
+        ] {
+            let mapped =
+                map_tree_page_err(TreePageError::Durable(DurableError::Git(private.into())));
+            assert_eq!(mapped.status(), 413);
+            assert_eq!(
+                mapped.to_string(),
+                "413 (payload_too_large): repository tree exceeds the interactive browse limit"
+            );
+        }
+    }
+
+    #[test]
+    fn non_capacity_tree_errors_keep_their_existing_classification() {
+        assert_eq!(
+            map_tree_page_err(TreePageError::Durable(DurableError::Git(
+                "tree path segment is invalid".into(),
+            )))
+            .status(),
+            400
+        );
+        assert_eq!(
+            map_tree_page_err(TreePageError::Durable(DurableError::Git(
+                "tree object has the wrong kind".into(),
+            )))
+            .status(),
+            500
         );
     }
 }
