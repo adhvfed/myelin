@@ -29,6 +29,7 @@ describe.runIf(Boolean(redisUrl))("ValkeySessionStore integration", () => {
       token: "access-one",
       refreshToken: "refresh-one",
       scheme: "agent",
+      credentialExpiresAtMs: Date.now() + 60_000,
       principalId: "principal-one",
       displayName: "Operator",
       region: "fr-par",
@@ -86,6 +87,33 @@ describe.runIf(Boolean(redisUrl))("ValkeySessionStore integration", () => {
     }
   });
 
+  it("bounds the server-side key by the credential expiry", async () => {
+    const sessionStore = store();
+    const admin = new Redis(redisUrl!);
+    const id = `credential_expiry_${randomBytes(8).toString("hex")}`;
+    const credentialExpiresAtMs = Date.now() + 10_000;
+    const record: SessionRecord = {
+      token: "short-access",
+      refreshToken: "",
+      scheme: "session",
+      credentialExpiresAtMs,
+      principalId: "principal-short",
+      displayName: "Short Session",
+      region: "fr-par",
+      tenant: "acme",
+    };
+
+    try {
+      await sessionStore.issue(id, record);
+      const ttl = await admin.pttl(`${SESSION_KEY_PREFIX}${id}`);
+      expect(ttl).toBeGreaterThan(0);
+      expect(ttl).toBeLessThanOrEqual(credentialExpiresAtMs - Date.now());
+    } finally {
+      await sessionStore.delete(id);
+      admin.disconnect(false);
+    }
+  });
+
   it("rejects a valid encrypted record transplanted to a different session id", async () => {
     const sessionStore = store();
     const admin = new Redis(redisUrl!);
@@ -97,6 +125,7 @@ describe.runIf(Boolean(redisUrl))("ValkeySessionStore integration", () => {
       token: "access-bound",
       refreshToken: "refresh-bound",
       scheme: "agent",
+      credentialExpiresAtMs: Date.now() + 60_000,
       principalId: "principal-bound",
       displayName: "Bound Operator",
       region: "fr-par",

@@ -183,6 +183,7 @@ export async function completeOidcLogin(requestUrl: string): Promise<boolean> {
           token: login.accessToken,
           refreshToken: "",
           scheme: login.scheme,
+          credentialExpiresAtMs: Math.min(login.expiresAt, who.expires_at) * 1_000,
           principalId: who.principal_id,
           displayName: who.principal_id,
           region: who.region,

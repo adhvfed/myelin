@@ -11,6 +11,7 @@ const record: SessionRecord = {
   token: "access-one",
   refreshToken: "refresh-one",
   scheme: "agent",
+  credentialExpiresAtMs: Number.MAX_SAFE_INTEGER,
   principalId: "principal-one",
   displayName: "Operator",
   region: "fr-par",
@@ -33,6 +34,16 @@ describe("MemorySessionStore", () => {
 
     expect(store.get("session-one", 5_000 + SESSION_IDLE_TTL_MS)).toBeNull();
     expect(store.get("session-one", 5_001)).toBeNull();
+  });
+
+  it("ends at credential expiry and refuses an elapsed credential", () => {
+    const store = new MemorySessionStore();
+    const expiring = { ...record, credentialExpiresAtMs: 15_000 };
+    store.issue("session-one", expiring, 10_000);
+
+    expect(store.get("session-one", 14_999)).toEqual(expiring);
+    expect(store.get("session-one", 15_000)).toBeNull();
+    expect(() => store.issue("session-two", expiring, 15_000)).toThrow(/expiry/);
   });
 
   it("refreshes idle activity without extending the absolute deadline", () => {

@@ -14,6 +14,7 @@ const whoami = (over: Partial<TokenWhoami> = {}): TokenWhoami => ({
   tenant: "acme",
   region: "eu-west",
   kind: "human",
+  expires_at: 4_102_444_800,
   ...over,
 });
 
@@ -34,6 +35,7 @@ describe("runTokenLogin (R4.0 — the operator-token login decision)", () => {
       // A pasted operator token has NO refresh credential — empty is deliberate (re-paste on expiry).
       refreshToken: "",
       scheme: DEFAULT_TOKEN_SCHEME,
+      credentialExpiresAtMs: 4_102_444_800_000,
       principalId: "u_founder",
       // No human name in whoami → the PII-free principal id IS the honest display label.
       displayName: "u_founder",
@@ -85,6 +87,19 @@ describe("runTokenLogin (R4.0 — the operator-token login decision)", () => {
     });
     expect(out.redirectTo).toBe(TOKEN_LOGIN_ERROR);
     expect(issue).not.toHaveBeenCalled();
+  });
+
+  it("refuses an elapsed or unrepresentable capability expiry", async () => {
+    for (const expires_at of [1, Number.MAX_SAFE_INTEGER]) {
+      const issue = vi.fn();
+      const out = await runTokenLogin("tok", undefined, {
+        isEnabled: async () => true,
+        verify: async () => whoami({ expires_at }),
+        issue,
+      });
+      expect(out.redirectTo).toBe(TOKEN_LOGIN_ERROR);
+      expect(issue).not.toHaveBeenCalled();
+    }
   });
 
   it("when the edge disables token login: refuses before token verification or session issuance", async () => {

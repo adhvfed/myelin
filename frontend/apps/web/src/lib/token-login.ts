@@ -13,6 +13,7 @@ export interface TokenWhoami {
   tenant: string;
   region: string;
   kind?: string;
+  expires_at: number;
 }
 
 /** The session record the login mints (mirrors {@link ../server/session#SessionRecord}). */
@@ -20,6 +21,7 @@ export interface TokenSessionInput {
   token: string;
   refreshToken: string;
   scheme: string;
+  credentialExpiresAtMs: number;
   principalId: string;
   displayName: string;
   region: string;
@@ -99,7 +101,14 @@ export async function runTokenLogin(
     return { redirectTo: TOKEN_LOGIN_ERROR };
   }
 
-  if (!who || typeof who.principal_id !== "string" || !who.principal_id) {
+  if (
+    !who ||
+    typeof who.principal_id !== "string" ||
+    !who.principal_id ||
+    !Number.isSafeInteger(who.expires_at) ||
+    who.expires_at > Math.floor(Number.MAX_SAFE_INTEGER / 1_000) ||
+    who.expires_at <= Math.floor(Date.now() / 1_000)
+  ) {
     return { redirectTo: TOKEN_LOGIN_ERROR };
   }
 
@@ -110,6 +119,7 @@ export async function runTokenLogin(
     // gateway clears the session → /login. The founder simply re-pastes a fresh bootstrap token.
     refreshToken: "",
     scheme,
+    credentialExpiresAtMs: who.expires_at * 1_000,
     principalId: who.principal_id,
     displayName: deriveDisplayName(who.principal_id),
     region: who.region,

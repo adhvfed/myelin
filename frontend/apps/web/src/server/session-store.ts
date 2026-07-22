@@ -5,6 +5,9 @@ export interface SessionRecord {
   token: string;
   refreshToken: string;
   scheme: string;
+  /** Absolute expiry of the credential carried by this session. The browser session may end
+   * earlier because of idle or platform limits, but it must never outlive this instant. */
+  credentialExpiresAtMs: number;
   principalId: string;
   displayName: string;
   region: string;
@@ -35,11 +38,12 @@ export class MemorySessionStore {
   ready(): void {}
 
   issue(id: string, record: SessionRecord, nowMs = Date.now()): void {
+    assertUsableCredentialExpiry(record.credentialExpiresAtMs, nowMs);
     this.#sessions.set(id, {
       record: { ...record },
       createdAtMs: nowMs,
       lastSeenAtMs: nowMs,
-      expiresAtMs: nowMs + SESSION_ABSOLUTE_TTL_MS,
+      expiresAtMs: Math.min(nowMs + SESSION_ABSOLUTE_TTL_MS, record.credentialExpiresAtMs),
     });
   }
 
@@ -80,5 +84,11 @@ export class MemorySessionStore {
 
   size(): number {
     return this.#sessions.size;
+  }
+}
+
+export function assertUsableCredentialExpiry(expiresAtMs: number, nowMs = Date.now()): void {
+  if (!Number.isSafeInteger(expiresAtMs) || expiresAtMs <= nowMs) {
+    throw new Error("session credential expiry is invalid or elapsed");
   }
 }

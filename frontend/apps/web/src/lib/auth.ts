@@ -18,6 +18,7 @@ import {
 } from "../../dev-edge/dev-contract.mjs";
 import { devLoginAllowed, type DevLoginEnv } from "./dev-login-guard";
 import { runTokenLogin } from "./token-login";
+import { SESSION_ABSOLUTE_TTL_MS } from "../server/session-store";
 import {
   toAuthConfig,
   type AuthConfig,
@@ -111,6 +112,7 @@ export const loginDev = action(async () => {
     token: DEV_ACCESS_TOKEN,
     refreshToken: DEV_REFRESH_TOKEN,
     scheme: DEV_SCHEME,
+    credentialExpiresAtMs: Date.now() + SESSION_ABSOLUTE_TTL_MS,
     principalId: DEV_PRINCIPAL.principalId,
     displayName: DEV_PRINCIPAL.displayName,
     region: DEV_PRINCIPAL.region,

@@ -77,12 +77,21 @@ export interface EdgeWhoami {
   tenant: string;
   region: string;
   kind: string;
+  expires_at: number;
 }
 
 export interface EdgeOidcLogin {
   accessToken: string;
   scheme: "session";
   expiresAt: number;
+}
+
+function validCredentialExpirySeconds(value: unknown): value is number {
+  return (
+    Number.isSafeInteger(value) &&
+    (value as number) <= Math.floor(Number.MAX_SAFE_INTEGER / 1_000) &&
+    (value as number) > Math.floor(Date.now() / 1_000)
+  );
 }
 
 /** Exchange a verified OIDC ID token + browser nonce for the edge's bounded human capability. */
@@ -114,7 +123,7 @@ export async function edgeLoginWithOidc(
     login.scheme !== "session" ||
     login.token_type !== "Bearer" ||
     typeof login.expires_at !== "number" ||
-    !Number.isSafeInteger(login.expires_at)
+    !validCredentialExpirySeconds(login.expires_at)
   ) {
     throw new Unauthorized("OIDC login returned an unexpected shape");
   }
@@ -148,7 +157,16 @@ export async function edgeWhoamiWithToken(token: string, scheme = "agent"): Prom
     throw new Unauthorized(`token verification failed (HTTP ${res.status})`);
   }
   const who = (await res.json().catch(() => null)) as EdgeWhoami | null;
-  if (!who || typeof who.principal_id !== "string" || !who.principal_id) {
+  if (
+    !who ||
+    typeof who.principal_id !== "string" ||
+    !who.principal_id ||
+    typeof who.tenant !== "string" ||
+    !who.tenant ||
+    typeof who.region !== "string" ||
+    !who.region ||
+    !validCredentialExpirySeconds(who.expires_at)
+  ) {
     throw new Unauthorized("token verification returned an unexpected shape");
   }
   return who;
