@@ -108,6 +108,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
 /// request header or the resolved principal kind, selects one of these classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcceptedPurpose {
+    HumanSession,
     OperatorBootstrap,
     AgentRun,
     Pat,
@@ -116,12 +117,18 @@ pub enum AcceptedPurpose {
 }
 
 const OP_AGENT_PAT: &[AcceptedPurpose] = &[
+    AcceptedPurpose::HumanSession,
     AcceptedPurpose::OperatorBootstrap,
     AcceptedPurpose::AgentRun,
     AcceptedPurpose::Pat,
 ];
-const OP_PAT: &[AcceptedPurpose] = &[AcceptedPurpose::OperatorBootstrap, AcceptedPurpose::Pat];
+const OP_PAT: &[AcceptedPurpose] = &[
+    AcceptedPurpose::HumanSession,
+    AcceptedPurpose::OperatorBootstrap,
+    AcceptedPurpose::Pat,
+];
 const OP_AGENT_PAT_DEPLOY: &[AcceptedPurpose] = &[
+    AcceptedPurpose::HumanSession,
     AcceptedPurpose::OperatorBootstrap,
     AcceptedPurpose::AgentRun,
     AcceptedPurpose::Pat,
@@ -213,6 +220,7 @@ pub fn action_requirement(action: &str) -> Option<&'static ActionRequirement> {
 
 fn purpose_class(purpose: &CredentialPurpose) -> Option<AcceptedPurpose> {
     match purpose {
+        CredentialPurpose::HumanSession => Some(AcceptedPurpose::HumanSession),
         CredentialPurpose::OperatorBootstrap => Some(AcceptedPurpose::OperatorBootstrap),
         CredentialPurpose::AgentRun { .. } => Some(AcceptedPurpose::AgentRun),
         CredentialPurpose::Pat => Some(AcceptedPurpose::Pat),
@@ -220,6 +228,19 @@ fn purpose_class(purpose: &CredentialPurpose) -> Option<AcceptedPurpose> {
         CredentialPurpose::DeployKey => Some(AcceptedPurpose::DeployKey),
         CredentialPurpose::PerJob { .. } => None,
     }
+}
+
+/// The explicit coarse capability set a human browser session needs. It is derived from the same
+/// action catalogue the final boundary enforces, so adding a route never silently grants it to old
+/// sessions. CI-only actions remain excluded by their accepted-purpose rule.
+pub fn human_session_authority() -> Vec<String> {
+    ACTION_REQUIREMENTS
+        .iter()
+        .filter(|rule| rule.accepted_purposes.contains(&AcceptedPurpose::HumanSession))
+        .map(|rule| rule.required_capability.to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Final coarse Edge action boundary. Both the injected verb policy and this signed capability
@@ -434,6 +455,17 @@ mod tests {
             mapped, mounted,
             "mounted actions and capability rules drifted"
         );
+    }
+
+    #[test]
+    fn human_session_authority_covers_ui_actions_but_never_ci_attestation() {
+        let authority = Authority::of(human_session_authority());
+        assert!(authority.holds("edge.identity.read"));
+        assert!(authority.holds("repo.pull"));
+        assert!(authority.holds("repo.push"));
+        assert!(authority.holds("issue.view"));
+        assert!(!authority.holds("ci.checks.report"));
+        assert!(!authority.holds("edge.operator"));
     }
 
     #[test]

@@ -1433,6 +1433,7 @@ impl CredentialVerifier for SamlVerifier {
             region: Region(region),
             scheme: scheme::SAML.to_string(),
             subject_key: name_id,
+            expires_at_unix: Some(assertion_expiry.min(confirmation_expiry)),
         })
     }
 }

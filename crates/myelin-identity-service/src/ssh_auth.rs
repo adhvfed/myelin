@@ -843,6 +843,7 @@ impl CredentialVerifier for SshVerifier {
             region: binding.region.clone(),
             scheme: scheme::SSH.to_string(),
             subject_key: binding.subject_key.clone(),
+            expires_at_unix: None,
         })
     }
 }

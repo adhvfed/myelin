@@ -805,6 +805,7 @@ impl PasetoCapabilityVerifier {
             )
         })?;
         let purpose = match purpose_claim.as_str() {
+            "human_session" => CredentialPurpose::HumanSession,
             "operator_bootstrap" => CredentialPurpose::OperatorBootstrap,
             "agent_run" => CredentialPurpose::AgentRun {
                 run_id: str_claim(&claims, "run_id").map_err(|_| {
@@ -974,15 +975,17 @@ impl PasetoCapabilityVerifier {
 impl crate::machine_auth::TokenVerifier for PasetoCapabilityVerifier {
     fn verify(&self, credential: &Credential) -> myelin_identity::Result<CapabilityToken> {
         // The kind is read from the credential scheme (the SAME posture as the structural floor — the
-        // five machine schemes map to a MachineKind; a human/SSO scheme is refused here loudly).
+        // capability schemes map to a MachineKind; a raw human/SSO scheme is refused here loudly).
         let kind = MachineKind::from_scheme(&credential.scheme).ok_or_else(|| {
             AuthzError::BadRequest(format!(
                 "scheme `{}` is not a capability-token / machine-identity surface \
-                 (pat/ci/agent/deploy_key/per_job)",
+                 (session/pat/ci/agent/deploy_key/per_job)",
                 credential.scheme
             ))
         })?;
-        self.verify_material(&credential.material, kind)
+        let token = self.verify_material(&credential.material, kind)?;
+        enforce_session_purpose(&credential.scheme, &token)?;
+        Ok(token)
     }
 
     fn verify_for_request(
@@ -997,8 +1000,21 @@ impl crate::machine_auth::TokenVerifier for PasetoCapabilityVerifier {
                 credential.scheme
             ))
         })?;
-        self.verify_material_with_binding(&credential.material, kind, Some(binding))
+        let token = self.verify_material_with_binding(&credential.material, kind, Some(binding))?;
+        enforce_session_purpose(&credential.scheme, &token)?;
+        Ok(token)
     }
+}
+
+fn enforce_session_purpose(scheme: &str, token: &CapabilityToken) -> Result<(), AuthzError> {
+    if (scheme == crate::machine_auth::scheme::SESSION)
+        != matches!(token.purpose, CredentialPurpose::HumanSession)
+    {
+        return Err(refuse(
+            "the `session` scheme and signed `human_session` purpose must be used together",
+        ));
+    }
+    Ok(())
 }
 
 /// Read a non-empty string claim from the VERIFIED body (else a loud refusal — never a fabricated

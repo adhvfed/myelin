@@ -99,6 +99,8 @@ type NowFn = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 /// free-string carrier, P-ID-01) so a new surface is an additive change. The five human/SSO schemes
 /// (`oidc`/`saml`/`scim`/`passkey`/`ssh`) are P-ID-06's ([`crate::authenticate::scheme`]).
 pub mod scheme {
+    /// A short-lived browser session capability minted only after a human SSO assertion verifies.
+    pub const SESSION: &str = "session";
     /// A scoped **Personal Access Token** — a Human or Service with capability caveats
     /// (attenuate-only, §6 delegation algebra). DPoP sender-constrains a long-lived PAT (§4).
     pub const PAT: &str = "pat";
@@ -116,9 +118,9 @@ pub mod scheme {
     pub const PER_JOB: &str = "per_job";
 
     /// The complete token/machine-identity scheme set (the surfaces this prompt ships).
-    pub const MACHINE_SCHEMES: &[&str] = &[PAT, CI, AGENT, DEPLOY_KEY, PER_JOB];
+    pub const MACHINE_SCHEMES: &[&str] = &[SESSION, PAT, CI, AGENT, DEPLOY_KEY, PER_JOB];
 
-    /// Is `s` one of the five token/machine-identity schemes this body owns? (A human/SSO scheme is
+    /// Is `s` one of the token/capability schemes this body owns? (A raw human/SSO scheme is
     /// P-ID-06's — this body refuses it with `BadRequest`.)
     pub fn is_machine(s: &str) -> bool {
         MACHINE_SCHEMES.contains(&s)
@@ -148,6 +150,8 @@ pub enum MachineKind {
 /// the `agent` verifier, but have deliberately different authorization semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CredentialPurpose {
+    /// A short-lived human browser session minted from a verified SSO assertion.
+    HumanSession,
     /// A human-operated bootstrap credential minted by the offline operator command.
     OperatorBootstrap,
     /// A short-lived delegated credential bound to one durable run.
@@ -171,6 +175,7 @@ impl CredentialPurpose {
     /// The stable signed claim token for this purpose.
     pub fn claim(&self) -> &'static str {
         match self {
+            CredentialPurpose::HumanSession => "human_session",
             CredentialPurpose::OperatorBootstrap => "operator_bootstrap",
             CredentialPurpose::AgentRun { .. } => "agent_run",
             CredentialPurpose::Pat => "pat",
@@ -183,7 +188,9 @@ impl CredentialPurpose {
     /// The machine verifier kind this signed purpose is valid under.
     pub fn machine_kind(&self) -> MachineKind {
         match self {
-            CredentialPurpose::OperatorBootstrap | CredentialPurpose::AgentRun { .. } => {
+            CredentialPurpose::HumanSession
+            | CredentialPurpose::OperatorBootstrap
+            | CredentialPurpose::AgentRun { .. } => {
                 MachineKind::Agent
             }
             CredentialPurpose::Pat => MachineKind::Pat,
@@ -255,6 +262,7 @@ impl MachineKind {
     /// the SAME way the structural floor does (the kind is not in the signed body — MR-011b hardening).
     pub fn from_scheme(s: &str) -> Option<MachineKind> {
         match s {
+            scheme::SESSION => Some(MachineKind::Agent),
             scheme::PAT => Some(MachineKind::Pat),
             scheme::CI => Some(MachineKind::Ci),
             scheme::AGENT => Some(MachineKind::Agent),
@@ -454,20 +462,20 @@ impl TokenVerifier for StructuralTokenVerifier {
         &self,
         credential: &myelin_identity::Credential,
     ) -> myelin_identity::Result<CapabilityToken> {
-        // This body owns ONLY the five token/machine schemes; a human/SSO scheme belongs to P-ID-06
+        // This body owns only capability schemes; a raw human/SSO scheme belongs to P-ID-06
         // and is refused here loudly (never silently mis-resolved through the wrong authenticator).
         let kind = MachineKind::from_scheme(&credential.scheme).ok_or_else(|| {
             // Make the human/SSO redirection explicit when the scheme is a known human surface.
             if human_scheme::is_human_sso(&credential.scheme) {
                 AuthzError::BadRequest(format!(
                     "scheme `{}` is a v1 human/SSO surface (P-ID-06), not a capability-token / \
-                     machine-identity surface (pat/ci/agent/deploy_key/per_job)",
+                     machine-identity surface (session/pat/ci/agent/deploy_key/per_job)",
                     credential.scheme
                 ))
             } else {
                 AuthzError::BadRequest(format!(
                     "scheme `{}` is not a capability-token / machine-identity surface \
-                     (pat/ci/agent/deploy_key/per_job)",
+                     (session/pat/ci/agent/deploy_key/per_job)",
                     credential.scheme
                 ))
             }
@@ -520,6 +528,7 @@ impl TokenVerifier for StructuralTokenVerifier {
             Authority::of(grants_csv.split(',').map(str::to_string))
         };
         let purpose = match purpose {
+            "human_session" => CredentialPurpose::HumanSession,
             "operator_bootstrap" => CredentialPurpose::OperatorBootstrap,
             "agent_run" if !run_id.is_empty() => CredentialPurpose::AgentRun {
                 run_id: run_id.to_string(),
@@ -563,6 +572,14 @@ impl TokenVerifier for StructuralTokenVerifier {
                 "credential scheme kind `{kind:?}` does not match signed purpose `{}`",
                 purpose.claim()
             )));
+        }
+        if (credential.scheme == scheme::SESSION)
+            != matches!(purpose, CredentialPurpose::HumanSession)
+        {
+            return Err(AuthzError::FailClosed(
+                "the `session` scheme and signed `human_session` purpose must be used together"
+                    .into(),
+            ));
         }
         let audience = match audience {
             "edge" => CredentialAudience::Edge,
@@ -820,9 +837,19 @@ impl CapabilityAuthenticator {
         // (6) Resolve the token's subject key to a principal in the VERIFIED tenant directory (the S1
         //     token-record index). No cross-tenant lookup: a token verified for tenant A resolves
         //     only into A's partition.
-        let row = self
-            .store
-            .try_resolve_credential(&scope, credential.scheme.as_str(), &token.subject_key)
+        let row = if matches!(token.purpose, CredentialPurpose::HumanSession) {
+            // The cell minted this subject only after the human authenticator resolved the OIDC
+            // link, so `sub` is the signed principal id itself. Re-read that row on every request so
+            // suspension/disable takes effect immediately without creating a second credential link.
+            self.store
+                .try_get_principal(&scope, &PrincipalId(token.subject_key.clone()))
+        } else {
+            self.store.try_resolve_credential(
+                &scope,
+                credential.scheme.as_str(),
+                &token.subject_key,
+            )
+        }
             .map_err(|e| {
                 AuthzError::FailClosed(format!(
                     "identity directory lookup failed for verified `{}` token — fail-closed: {e}",
@@ -1049,7 +1076,7 @@ mod tests {
 
     /// **One happy-path per credential kind resolves to the correct polymorphic Principal (4.1, the
     /// token/machine half).** PAT / CI / agent / deploy-key / per-job each resolve to a
-    /// `Principal{kind, tenant, region}` from S1 — the five token/machine surfaces.
+    /// `Principal{kind, tenant, region}` from S1 — the original five machine surfaces.
     #[test]
     fn each_machine_scheme_resolves_to_its_principal() {
         // (scheme, dpop_required, ceiling-legal grant)
@@ -1669,7 +1696,7 @@ mod tests {
     }
 
     /// **A human/SSO scheme is REFUSED by this body (it is P-ID-06's).** The capability authenticator
-    /// owns only the five token/machine surfaces; an `oidc`/`saml`/… credential is refused loudly
+    /// owns only token/capability surfaces; an `oidc`/`saml`/… credential is refused loudly
     /// (never silently mis-resolved through the wrong authenticator).
     #[test]
     fn human_sso_scheme_is_refused_here() {
@@ -1759,7 +1786,7 @@ mod tests {
     /// **The `Authority` set predicates are exact (pins the monotone-law helpers).** `is_subset_of`
     /// distinguishes a strict subset / equal / non-subset; `is_empty`/`len`/`holds` agree with the
     /// grant set; `MachineKind::is_self_hosted_runner` is true ONLY for the per-job kind; `is_machine`
-    /// recognises exactly the five machine schemes. These pin the helper predicates the attenuation
+    /// recognises exactly the declared capability schemes. These pin the helper predicates the attenuation
     /// monotone law and the C6 ceiling rest on (a flipped predicate would mis-decide a real grant).
     #[test]
     fn authority_and_kind_predicates_are_exact() {
@@ -1798,7 +1825,7 @@ mod tests {
             );
         }
 
-        // is_machine recognises exactly the five machine schemes (and nothing human/SSO).
+        // is_machine recognises exactly the declared capability schemes (and no raw human/SSO).
         for s in scheme::MACHINE_SCHEMES {
             assert!(scheme::is_machine(s), "`{s}` is a machine scheme");
         }

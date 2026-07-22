@@ -115,6 +115,9 @@ pub struct VerifiedAssertion {
     pub scheme: String,
     /// The per-scheme stable subject key the S1 SSO/SCIM-link index resolves (e.g. the OIDC `sub`).
     pub subject_key: String,
+    /// Signed credential expiry, when the authentication protocol carries one. A downstream
+    /// platform session must never outlive this instant.
+    pub expires_at_unix: Option<i64>,
 }
 
 /// The pluggable credential-verification seam (the EI-01 §1 named floor). A verifier turns a
@@ -211,6 +214,7 @@ impl CredentialVerifier for StructuralVerifier {
             region: Region(parts[1].to_string()),
             scheme: credential.scheme.clone(),
             subject_key: parts[2].to_string(),
+            expires_at_unix: None,
         })
     }
 }
@@ -421,6 +425,18 @@ impl HumanSsoAuthenticator {
         credential: &Credential,
         path_tenant: Option<&TenantId>,
     ) -> myelin_identity::Result<Principal> {
+        self.authenticate_with_assertion(credential, path_tenant)
+            .map(|(principal, _)| principal)
+    }
+
+    /// Run the same authentication decision while retaining the verified protocol assertion for a
+    /// downstream session issuer. Verification, directory lookup, telemetry, and IDOR accounting
+    /// happen exactly once.
+    pub fn authenticate_with_assertion(
+        &self,
+        credential: &Credential,
+        path_tenant: Option<&TenantId>,
+    ) -> myelin_identity::Result<(Principal, VerifiedAssertion)> {
         // (0) Observability is part of the pass: every decision (success OR failure) emits exactly
         //     one auth_decision_latency observation. Recorded FIRST so no early-return path can skip
         //     the per-request emission (the EI-01 §3 "emit a signal on every path" discipline).
@@ -493,14 +509,15 @@ impl HumanSsoAuthenticator {
 
         // The one polymorphic Principal (architecture §3): the kind discriminant changes governance
         // metadata, never the authz code path. tenant/region are the VERIFIED credential's.
-        Ok(Principal::new(
-            assertion.tenant,
-            assertion.region,
+        let principal = Principal::new(
+            assertion.tenant.clone(),
+            assertion.region.clone(),
             row.principal_id,
             row.kind,
             row.data_role,
             row.status,
-        ))
+        );
+        Ok((principal, assertion))
     }
 
     /// The frozen-4.1 trait form of `authenticate` (no `path_tenant`) — the version the

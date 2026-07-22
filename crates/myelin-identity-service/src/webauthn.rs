@@ -1154,6 +1154,7 @@ impl CredentialVerifier for WebauthnVerifier {
             region: accepted.region,
             scheme: scheme::PASSKEY.to_string(),
             subject_key: accepted.subject_key,
+            expires_at_unix: None,
         })
     }
 }

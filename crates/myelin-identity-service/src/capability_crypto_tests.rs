@@ -147,6 +147,31 @@ fn signed_purpose_must_match_the_transport_selected_machine_kind() {
 }
 
 #[test]
+fn human_session_purpose_is_accepted_only_under_the_session_scheme() {
+    let c = cell();
+    let mut session = spec("acme", &["repo.pull"], None);
+    session.purpose = CredentialPurpose::HumanSession;
+    session.subject_key = "p:alice".into();
+    let material = c.mint(&session);
+    let verifier = verifier(c.trust_anchor());
+
+    let accepted = verifier
+        .verify(&Credential {
+            scheme: crate::machine_auth::scheme::SESSION.into(),
+            material: material.clone(),
+        })
+        .expect("a signed human session verifies under the session scheme");
+    assert_eq!(accepted.purpose, CredentialPurpose::HumanSession);
+    assert!(matches!(
+        verifier.verify(&Credential {
+            scheme: crate::machine_auth::scheme::AGENT.into(),
+            material,
+        }),
+        Err(AuthzError::FailClosed(_))
+    ));
+}
+
+#[test]
 fn purpose_less_legacy_capability_is_refused_with_rebootstrap_guidance() {
     let c = cell();
     let material = mint_raw_claims(

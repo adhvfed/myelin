@@ -19,7 +19,7 @@
 //! a failure is a clean typed [`EdgeError`], never a panic), and FAIL-CLOSED (any authenticate failure
 //! → a uniform 401; an authorize denial → 403).
 
-use crate::authz::authorize_edge_action;
+use crate::authz::{authorize_edge_action, human_session_authority};
 use crate::catalogue::{Handler, HandlerCtx, Method, Page};
 use crate::error::EdgeError;
 use crate::request::{EdgeRequest, EdgeResponse};
@@ -27,8 +27,10 @@ use crate::session::{SessionStore, SESSION_COOKIE};
 use crate::sse::{SseEvent, SseHub};
 use myelin_identity::{AuthzError, Credential, Principal, PrincipalKind};
 use myelin_identity_service::{
-    CapabilityAuthenticator, DpopBinding, HumanSsoAuthenticator, RequestIdentity,
+    CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, CredentialAudience,
+    CredentialPurpose, DpopBinding, HumanSsoAuthenticator, RequestIdentity, VerifiedAssertion,
 };
+use myelin_events::{IdMinter, UlidMinter};
 use myelin_storage::TenantScope;
 use myelin_substrate::{Authorizer, InjectedIdentity, PublicSurface};
 use myelin_tenancy::{Region, TenantId};
@@ -40,6 +42,45 @@ use std::sync::Arc;
 /// `X-Myelin-Token-Scheme` header. `pat` is the primary edge consumer (the UI/CLI cookie gateway
 /// carries a PAT bearer server-side).
 const DEFAULT_TOKEN_SCHEME: &str = "pat";
+const HUMAN_SESSION_TTL_SECS: i64 = 8 * 60 * 60;
+
+#[derive(Clone)]
+struct HumanSessionIssuer {
+    cell: Arc<CellTokenAuthority>,
+    jtis: Arc<UlidMinter>,
+}
+
+impl HumanSessionIssuer {
+    fn mint(
+        &self,
+        principal: &Principal,
+        assertion: &VerifiedAssertion,
+    ) -> Result<(String, i64), EdgeError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let expiry = assertion
+            .expires_at_unix
+            .unwrap_or_else(|| now.saturating_add(HUMAN_SESSION_TTL_SECS))
+            .min(now.saturating_add(HUMAN_SESSION_TTL_SECS));
+        if expiry <= now {
+            return Err(EdgeError::Unauthorized("verified login credential has expired".into()));
+        }
+        let token = self.cell.mint(&CapabilityMintSpec {
+            tenant: principal.tenant.0.clone(),
+            region: principal.region.0.clone(),
+            subject_key: principal.principal_id.0.clone(),
+            jti: format!("session-{}", self.jtis.mint().0),
+            exp_unix: expiry,
+            authority: human_session_authority(),
+            dpop_jkt: None,
+            purpose: CredentialPurpose::HumanSession,
+            audience: CredentialAudience::Edge,
+        });
+        Ok((token, expiry))
+    }
+}
 
 /// The bounded SSE scope for a verified tenant — `tenant:<t>` (never a client-supplied `*` selector;
 /// the §7.7 "never `*`" stream-IDOR floor). A subsystem publishes to this same key. This scope is
@@ -217,6 +258,7 @@ pub struct GatewayBuilder {
     public_surface: PublicSurface,
     auth_config: AuthPublicConfig,
     public_base_url: Option<String>,
+    human_session_issuer: Option<HumanSessionIssuer>,
 }
 
 impl GatewayBuilder {
@@ -359,6 +401,18 @@ impl GatewayBuilder {
         self
     }
 
+    /// Enable short-lived human session capability minting under the durable cell authority.
+    pub fn with_human_session_issuer(
+        mut self,
+        cell: Arc<CellTokenAuthority>,
+    ) -> GatewayBuilder {
+        self.human_session_issuer = Some(HumanSessionIssuer {
+            cell,
+            jtis: Arc::new(UlidMinter::new()),
+        });
+        self
+    }
+
     /// Bind proof-of-possession credentials to this trusted public edge base URL. Production passes
     /// the validated deployment origin; request headers never select this value.
     pub fn with_public_base_url(
@@ -392,6 +446,7 @@ impl GatewayBuilder {
             public_surface: self.public_surface,
             auth_config: self.auth_config,
             public_base_url: self.public_base_url,
+            human_session_issuer: self.human_session_issuer,
         }
     }
 }
@@ -409,6 +464,7 @@ pub struct Gateway {
     public_surface: PublicSurface,
     auth_config: AuthPublicConfig,
     public_base_url: Option<String>,
+    human_session_issuer: Option<HumanSessionIssuer>,
 }
 
 impl Gateway {
@@ -429,6 +485,7 @@ impl Gateway {
             public_surface: PublicSurface::default(),
             auth_config: AuthPublicConfig::default(),
             public_base_url: None,
+            human_session_issuer: None,
         }
     }
 
@@ -753,11 +810,9 @@ impl Gateway {
         );
     }
 
-    /// `POST /v1/auth/login` — runs the REAL production human verifier (refuse-not-mock). The human
-    /// verifier config (JWKS/trust-anchors) is MR-012-deferred, so this REFUSES loudly (503) and
-    /// never mints a mock session. On success (unreachable until the verifier is config-wired) it
-    /// would issue a session carrying a server-side bearer — the issuance machinery is real
-    /// ([`SessionStore::issue`]) but the token mint for a human principal is the named follow-on.
+    /// `POST /v1/auth/login` — verifies a human assertion through the production trust configuration
+    /// and mints a short-lived capability whose expiry cannot outlive that assertion. Unsupported or
+    /// incompletely configured login schemes refuse loudly; this route never fabricates a session.
     fn login(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
         let body = req.json_body()?;
         let scheme = body
@@ -782,12 +837,24 @@ impl Gateway {
             scheme: scheme.to_string(),
             material,
         };
-        match self.human_login.authenticate(&cred, None) {
-            Ok(_principal) => Err(EdgeError::Unavailable(
-                "human login verified, but server-side token minting for a human principal is not \
-                 yet wired (MR-012 deferred) — refused, not mocked"
-                    .into(),
-            )),
+        match self.human_login.authenticate_with_assertion(&cred, None) {
+            Ok((principal, assertion)) => {
+                let issuer = self.human_session_issuer.as_ref().ok_or_else(|| {
+                    EdgeError::Unavailable(
+                        "human login verified, but the session issuer is unavailable".into(),
+                    )
+                })?;
+                let (access_token, expires_at) = issuer.mint(&principal, &assertion)?;
+                Ok(EdgeResponse::json(
+                    200,
+                    &json!({
+                        "access_token": access_token,
+                        "token_type": "Bearer",
+                        "scheme": myelin_identity_service::machine_scheme::SESSION,
+                        "expires_at": expires_at,
+                    }),
+                ))
+            }
             // The production human verifier refuses every not-yet-configured scheme (refuse-not-mock).
             Err(AuthzError::NotYetImplemented(_)) | Err(AuthzError::Unavailable(_)) => {
                 Err(EdgeError::Unavailable(
@@ -1510,6 +1577,116 @@ mod tests {
             503,
             "human login refuses-not-mocks until configured"
         );
+    }
+
+    #[derive(Clone, Copy)]
+    struct SuccessfulOidcVerifier {
+        expires_at: i64,
+    }
+
+    impl myelin_identity_service::CredentialVerifier for SuccessfulOidcVerifier {
+        fn verify(
+            &self,
+            credential: &Credential,
+        ) -> myelin_identity::Result<VerifiedAssertion> {
+            assert_eq!(credential.scheme, myelin_identity_service::scheme::OIDC);
+            Ok(VerifiedAssertion {
+                tenant: TenantId("acme".into()),
+                region: Region("eu-west".into()),
+                scheme: myelin_identity_service::scheme::OIDC.into(),
+                subject_key: "oidc-sub-1".into(),
+                expires_at_unix: Some(self.expires_at),
+            })
+        }
+    }
+
+    #[test]
+    fn verified_oidc_login_mints_a_bounded_human_session_capability() {
+        use myelin_identity::{DataRole, PrincipalId, PrincipalStatus};
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let upstream_expiry = now + 120;
+        let cell = Arc::new(CellTokenAuthority::from_seed(&[31u8; 32], &[32u8; 32]).unwrap());
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let scope = TenantScope::from_verified_token(
+            &Principal::stub(
+                PrincipalId("p:alice".into()),
+                PrincipalKind::Human,
+                TenantId("acme".into()),
+            ),
+            Region("eu-west".into()),
+        );
+        store
+            .put_principal(
+                &scope,
+                PrincipalId("p:alice".into()),
+                PrincipalKind::Human,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                None,
+            )
+            .unwrap();
+        store
+            .link_credential(
+                &scope,
+                myelin_identity_service::scheme::OIDC,
+                "oidc-sub-1",
+                &PrincipalId("p:alice".into()),
+            )
+            .unwrap();
+        let human = Arc::new(HumanSsoAuthenticator::with_verifier(
+            store.clone(),
+            Arc::new(SuccessfulOidcVerifier {
+                expires_at: upstream_expiry,
+            }),
+        ));
+        let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+            store,
+            Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+            RevocationStore::new(),
+        ));
+        let gateway = Gateway::builder(authn, human, Arc::new(AllowAll))
+            .with_human_session_issuer(cell)
+            .route(
+                Method::Get,
+                "/v1/whoami",
+                "edge.whoami",
+                Arc::new(WhoamiHandler),
+            )
+            .build();
+        let login = gateway.handle(EdgeRequest::new(
+            "POST",
+            "/v1/auth/login",
+            "",
+            vec![],
+            serde_json::to_vec(&json!({
+                "scheme": "oidc",
+                "material": "signed-id-token",
+                "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            }))
+            .unwrap(),
+        ));
+        assert_eq!(login.status(), 200);
+        let body = login.json_body().unwrap();
+        assert_eq!(body["scheme"], "session");
+        assert_eq!(body["expires_at"], upstream_expiry);
+        let token = body["access_token"].as_str().unwrap();
+
+        let whoami = gateway.handle(EdgeRequest::new(
+            "GET",
+            "/v1/whoami",
+            "",
+            vec![
+                ("authorization".into(), format!("Bearer {token}")),
+                ("x-myelin-token-scheme".into(), "session".into()),
+            ],
+            vec![],
+        ));
+        assert_eq!(whoami.status(), 200);
+        assert_eq!(whoami.json_body().unwrap()["principal_id"], "p:alice");
     }
 
     #[test]

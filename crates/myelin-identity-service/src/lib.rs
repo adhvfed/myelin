@@ -156,9 +156,9 @@ pub use capability_crypto::{
     DpopClientKey, DpopReplayGuard, PasetoCapabilitySigner, PasetoCapabilityVerifier,
 };
 pub use machine_auth::{
-    Authority, CapabilityAuthenticator, CapabilityToken, CredentialAudience, CredentialContext,
-    CredentialPurpose, DpopState, MachineKind, RequestIdentity, StructuralTokenVerifier,
-    TokenVerifier, VerifiedCapabilityContext,
+    scheme as machine_scheme, Authority, CapabilityAuthenticator, CapabilityToken,
+    CredentialAudience, CredentialContext, CredentialPurpose, DpopState, MachineKind,
+    RequestIdentity, StructuralTokenVerifier, TokenVerifier, VerifiedCapabilityContext,
 };
 pub use mint::{
     expires_at_of, run_token_jti, CiJobAuthorizationError, MintError, RevocationProof,
