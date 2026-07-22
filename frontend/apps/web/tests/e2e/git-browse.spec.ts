@@ -136,14 +136,12 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await expectNoAxeViolations(page, "PR not-available");
   });
 
-  test("keyboard: the repo-home tree file link is reachable and activates the blob view", async ({ page }) => {
+  test("keyboard: Enter on the repo-home tree file link activates the blob view", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin");
     const fileLink = page.getByTestId("repo-tree").getByRole("link", { name: "README.md" });
-    await fileLink.focus();
-    await expect(fileLink).toBeFocused(); // keyboard-reachable (the WCAG 2.1.1 requirement)
-    // Press through the locator so a deferred hydration replacement cannot move the global keyboard
-    // target in the gap after the focus assertion. This is still a real Enter key activation.
+    // Locator.press focuses the semantic link and dispatches a real Enter key event. The resulting
+    // navigation is the user-observable proof; a programmatic focus assertion proves nothing more.
     await fileLink.press("Enter");
     await page.waitForURL("**/git/repos/myelin/blob/refs%2Fheads%2Fmain/README.md");
     await expect(page.getByTestId("blob-contents")).toBeVisible();
