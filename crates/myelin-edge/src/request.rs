@@ -148,6 +148,8 @@ pub enum EdgeResponse {
         headers: Vec<(String, String)>,
         /// The subscription the server streams frames from.
         sub: SseSubscription,
+        /// The verified capability deadline. The transport closes the stream at this instant.
+        expires_at_unix: i64,
     },
 }
 
@@ -168,8 +170,12 @@ impl EdgeResponse {
     }
 
     /// A live SSE response over `sub`.
-    pub fn sse(sub: SseSubscription) -> EdgeResponse {
-        EdgeResponse::Sse { headers: Vec::new(), sub }
+    pub fn sse(sub: SseSubscription, expires_at_unix: i64) -> EdgeResponse {
+        EdgeResponse::Sse {
+            headers: Vec::new(),
+            sub,
+            expires_at_unix,
+        }
     }
 
     /// Add a header (builder form) — works on either variant.
