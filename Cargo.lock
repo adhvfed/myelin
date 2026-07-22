@@ -2815,7 +2815,9 @@ dependencies = [
 name = "myelin-notif"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "blake3",
+ "chrono",
  "myelin-config",
  "myelin-content",
  "myelin-events",

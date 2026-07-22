@@ -26,9 +26,9 @@ path = "src/lib.rs"
 #      silently in prod (ADR-01). No bodies yet (NOTIF-P2..P18 fill them); just the frozen
 #      signatures every later Notif prompt and every consumer compiles against.
 #   2. The SERVICE SHELL (the impl role). An AppSpec passed to serve(AppSpec) — boot → migrate
-#      → outbox relay → (consumer seam, empty until NOTIF-P3) → three ports → graceful drain,
-#      liveness ≠ readiness, an empty forward-only migration set (the nine tables land in
-#      NOTIF-P2). NOT a hand-rolled main.
+#      → outbox relay → consumer seam → three ports → graceful drain, liveness ≠ readiness. Its
+#      forward-only set creates the nine-table data model plus the online durable-inbox read index.
+#      NOT a hand-rolled main.
 #
 # DAG POSITION (a documented, NAMED leaf consumer, like myelin-identity-service / myelin-search
 # / myelin-refs-service / myelin-gdpr-service): it sits ABOVE the glue crates and the harness —
@@ -76,6 +76,9 @@ blake3 = { workspace = true }
 # The router (NOTIF-P3) deserializes the curated `Signal` out of the envelope payload (a poison
 # payload → NonRetryable) and builds the `notif.item.created` references-not-payloads emit payload.
 serde_json = { workspace = true }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+sqlx = { workspace = true }
 
 # MR-009b W3b.4 — the DURABLE composition root in `src/main.rs` (SubstrateProvider from env →
 # foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
@@ -87,10 +90,8 @@ serde_json = { workspace = true }
 myelin-storage = { path = "../myelin-storage" }
 myelin-config = { path = "../myelin-config" }
 tokio = { workspace = true, features = ["signal"] }
-# REAL Postgres raw-sqlx test harness behind the `integration` feature (Stage 1 / infra): pulled
-# ONLY by `--features integration` (tests/integration_notif_schema.rs against the docker dev
-# stack). The default `cargo build --workspace` stays DB-free (the binding-policy floor).
-sqlx = { workspace = true, optional = true }
+# The durable inbox repository is production code, so sqlx is a normal dependency above. The
+# `integration` feature gates only live-stack tests; connecting happens at runtime, never at build.
 
 [dev-dependencies]
 # MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
@@ -109,10 +110,9 @@ myelin-harness = { path = "../myelin-harness" }
 myelin-lints = { path = "../myelin-lints" }
 
 [features]
-# The live-PG integration test (tests/integration_notif_schema.rs). DB-free by default.
-# (tokio + myelin-config are regular deps since W3b.4 — the durable main.rs needs them; the
-# feature now only pulls the raw-sqlx test harness.)
-integration = ["dep:sqlx"]
+# Live-PG tests. Database clients are normal production dependencies; this flag only opts into tests
+# that require the running dev/prod-compatible stack.
+integration = []
 # MR-009b W3b.5 — gates the E2E wedge drill runners (they construct the now-gated in-memory
 # `OutboxStore::new()` double), forwarding to `myelin-events/test-support`. DEV/TEST only.
 test-support = ["myelin-events/test-support"]
