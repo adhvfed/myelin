@@ -1051,11 +1051,15 @@ impl DurableGitRepo {
         // HEAD's symbolic target names the default branch — but only if that branch actually EXISTS
         // (libgit2 `init.bare` may leave HEAD pointing at `master` while pushes land on `main`). Resolve
         // to: HEAD's target if it exists, else `main` if present, else the first branch, else `main`.
-        let head_target = repo
-            .find_reference("HEAD")
-            .ok()
-            .and_then(|h| h.symbolic_target().ok().flatten().map(String::from))
-            .and_then(|t| t.strip_prefix("refs/heads/").map(String::from));
+        let head_target = match repo.find_reference("HEAD") {
+            Ok(head) => head
+                .symbolic_target()
+                .map_err(|_| DurableError::Git("HEAD target is not valid UTF-8".into()))?
+                .and_then(|target| target.strip_prefix("refs/heads/"))
+                .map(String::from),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+            Err(e) => return Err(git_err("find HEAD", e)),
+        };
         let has = |name: &str| branches.iter().any(|(n, _)| n == name);
         let default_branch = match head_target {
             Some(t) if has(&t) => t,
@@ -2976,6 +2980,20 @@ mod tests {
         assert!(!view.branches.iter().any(|(n, _)| n == "v1.0"), "a tag is not a branch");
         // The default branch is HEAD's target (init_bare points HEAD at main).
         assert_eq!(view.default_branch, "main");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn refs_view_rejects_a_corrupt_head_instead_of_guessing_main() {
+        let root = temp_root("refs-view-corrupt-head");
+        let repo = seed_nested_repo(&root);
+        std::fs::write(repo.path().join("HEAD"), b"ref: refs/heads/\xff\n")
+            .expect("corrupt HEAD fixture");
+
+        assert!(
+            matches!(repo.refs_view(), Err(DurableError::Git(_))),
+            "an unreadable HEAD must not be rendered as a valid main default"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
