@@ -43,12 +43,18 @@
 //!   closure. Incremental / continuous git backup (a since-marker thin pack, or WAL-style ref-log
 //!   shipping) is NOT done here — full-only. The artifact is genuinely reconstructable alone, which
 //!   is the GT-002 bar; incremental is a later optimisation.
+//! - **Bounded Rust pack buffering, not a hard process-RSS claim.** The production
+//!   [`GitRepoBackup::create_to_file`] / [`restore_repo_from_file`] path keeps bulk Rust-owned memory
+//!   to bounded ref metadata plus one fixed-size copy buffer. libgit2 still retains per-object maps,
+//!   delta-selection windows/cache while building, and index state while ingesting. Those costs are
+//!   object-count/content dependent and require an outer worker/cgroup limit if a hard RSS ceiling is
+//!   needed; streaming the pack bytes cannot remove them through the current `git2` API.
 //! - **Git-tier-real.** The repo bytes round-trip through a real libgit2 pack + a real
 //!   destructive restore onto a clean target, proven by the real `git fsck --full --strict`
 //!   external oracle (see `tests/git_backup_restore.rs`). The DB-PITR floor (live `pg_basebackup`
 //!   / WAL replay) remains deferred — that is not this module.
 
-use std::io::Read as _;
+use std::io::{Read as _, Seek as _, Write as _};
 use std::path::Path;
 
 use crate::core::{Oid, RepoLoc};
@@ -65,6 +71,9 @@ const MAGIC_V1: &[u8] = b"MYELIN-GIT-BACKUP-v1\0";
 const MAGIC_V2: &[u8] = b"MYELIN-GIT-BACKUP-v2\0";
 const MAGIC: &[u8] = MAGIC_V2;
 const CHECKSUM_LEN: usize = 32;
+/// The only whole-body storage used by the disk-backed path. Ref metadata remains bounded
+/// separately; pack bytes are copied between libgit2 and disk in chunks of this size.
+const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_BACKUP_REFS: usize = crate::durable::WIRE_MAX_REFS;
 /// The present backup object owns one complete pack in memory. Refuse beyond this operational
 /// ceiling during construction, before a second repo-sized allocation can occur.
@@ -122,6 +131,61 @@ fn git_err(ctx: &str, e: git2::Error) -> GitBackupError {
     GitBackupError::Git(format!("{ctx}: {e}"))
 }
 
+fn ref_frame_bytes(refs: &[(String, Oid)], checksum_bytes: usize) -> Result<usize, GitBackupError> {
+    refs.iter().try_fold(
+        MAGIC.len() + 4 + 8 + checksum_bytes,
+        |total, (name, oid)| {
+            u32::try_from(name.len()).map_err(|_| {
+                GitBackupError::BadArtifact("backup ref name exceeds the u32 frame limit".into())
+            })?;
+            u32::try_from(oid.as_str().len()).map_err(|_| {
+                GitBackupError::BadArtifact("backup ref oid exceeds the u32 frame limit".into())
+            })?;
+            total
+                .checked_add(4)
+                .and_then(|total| total.checked_add(name.len()))
+                .and_then(|total| total.checked_add(4))
+                .and_then(|total| total.checked_add(oid.as_str().len()))
+                .ok_or_else(|| {
+                    GitBackupError::BadArtifact("backup ref frame length overflow".into())
+                })
+        },
+    )
+}
+
+fn snapshot_refs(repo: &DurableGitRepo) -> Result<Vec<(String, Oid)>, GitBackupError> {
+    let refs = repo.list_refs_bounded(MAX_BACKUP_REFS)?;
+    let bytes = ref_frame_bytes(&refs, CHECKSUM_LEN)?;
+    if bytes > MAX_BACKUP_REF_FRAME_BYTES {
+        return Err(GitBackupError::BadArtifact(format!(
+            "backup ref frame exceeds the {MAX_BACKUP_REF_FRAME_BYTES}-byte artifact limit"
+        )));
+    }
+    Ok(refs)
+}
+
+fn with_packbuilder<T>(
+    repo: &DurableGitRepo,
+    refs: &[(String, Oid)],
+    consume: impl FnOnce(&mut git2::PackBuilder<'_>) -> Result<T, GitBackupError>,
+) -> Result<T, GitBackupError> {
+    let git = git2::Repository::open(repo.path())
+        .map_err(|e| git_err(&format!("open {}", repo.path().display()), e))?;
+    let mut pb = git.packbuilder().map_err(|e| git_err("packbuilder", e))?;
+    let mut walk = git.revwalk().map_err(|e| git_err("revwalk", e))?;
+    for (name, oid) in refs {
+        let goid = git2::Oid::from_str(oid.as_str())
+            .map_err(|e| GitBackupError::Git(format!("bad oid for {name}: {e}")))?;
+        // Preserve the tag/non-commit tip itself, then add full commit ancestry below.
+        pb.insert_recursive(goid, None)
+            .map_err(|e| git_err(&format!("insert_recursive {name}"), e))?;
+        let _ = walk.push(goid);
+    }
+    pb.insert_walk(&mut walk)
+        .map_err(|e| git_err("insert_walk", e))?;
+    consume(&mut pb)
+}
+
 // ───────────────────────────── the backup artifact ────────────────────────────────────────────────
 
 /// **A real, self-contained backup of a single bare repo** — a ref-tip snapshot + a non-thin
@@ -160,57 +224,189 @@ impl GitRepoBackup {
     ) -> Result<GitRepoBackup, GitBackupError> {
         // (1) Ref-snapshot point FIRST. Objects are immutable/append-only, so the closure reachable
         // from these exact tips is frozen — the backed-up refs will only point at backed-up objects.
-        let refs = repo.list_refs_bounded(MAX_BACKUP_REFS)?;
-        let ref_frame_bytes = refs.iter().try_fold(MAGIC.len() + 4 + 8 + CHECKSUM_LEN, |total, (name, oid)| {
-            total
-                .checked_add(4 + name.len())
-                .and_then(|total| total.checked_add(4 + oid.as_str().len()))
-        });
-        if ref_frame_bytes.is_none_or(|bytes| bytes > MAX_BACKUP_REF_FRAME_BYTES) {
-            return Err(GitBackupError::BadArtifact(format!(
-                "backup ref frame exceeds the {MAX_BACKUP_REF_FRAME_BYTES}-byte artifact limit"
-            )));
-        }
+        let refs = snapshot_refs(repo)?;
 
-        // (2) Pack the full closure with libgit2. Open the same on-disk bare repo GT-001 manages.
-        let git = git2::Repository::open(repo.path())
-            .map_err(|e| git_err(&format!("open {}", repo.path().display()), e))?;
-        let mut pb = git.packbuilder().map_err(|e| git_err("packbuilder", e))?;
-        let mut walk = git.revwalk().map_err(|e| git_err("revwalk", e))?;
-        for (name, oid) in &refs {
-            let goid = git2::Oid::from_str(oid.as_str())
-                .map_err(|e| GitBackupError::Git(format!("bad oid for {name}: {e}")))?;
-            // The tip's own object closure — captures an annotated TAG object (a revwalk peels tags
-            // to their commit, so the tag object itself would otherwise be missed), and is a no-op
-            // dedup for a commit tip. libgit2's insert_commit does NOT walk parents, hence the walk
-            // below for full ancestry.
-            pb.insert_recursive(goid, None)
-                .map_err(|e| git_err(&format!("insert_recursive {name}"), e))?;
-            // Full ancestor history. A tip that does not peel to a commit (a ref straight at a
-            // blob/tree) is already covered by insert_recursive above — ignore the push error.
-            let _ = walk.push(goid);
-        }
-        // insert_walk packs every commit in the walk + its tree + blobs (full history closure).
-        pb.insert_walk(&mut walk).map_err(|e| git_err("insert_walk", e))?;
-
-        let mut pack = Vec::new();
-        let mut exceeded = false;
-        let result = pb.foreach(|chunk| {
-            if chunk.len() > maximum_pack_bytes.saturating_sub(pack.len()) {
-                exceeded = true;
-                return false;
+        // (2) Pack the full closure with libgit2. The compatibility object still owns the complete
+        // pack; production file callers use `create_to_file` below to keep these bytes on disk.
+        let pack = with_packbuilder(repo, &refs, |pb| {
+            let mut pack = Vec::new();
+            let mut exceeded = false;
+            let result = pb.foreach(|chunk| {
+                if chunk.len() > maximum_pack_bytes.saturating_sub(pack.len()) {
+                    exceeded = true;
+                    return false;
+                }
+                pack.extend_from_slice(chunk);
+                true
+            });
+            if exceeded {
+                return Err(GitBackupError::BadArtifact(format!(
+                    "backup pack exceeds the {maximum_pack_bytes}-byte construction limit"
+                )));
             }
-            pack.extend_from_slice(chunk);
-            true
-        });
-        if exceeded {
-            return Err(GitBackupError::BadArtifact(format!(
-                "backup pack exceeds the {maximum_pack_bytes}-byte construction limit"
-            )));
-        }
-        result.map_err(|e| git_err("stream pack bytes", e))?;
+            result.map_err(|e| git_err("stream pack bytes", e))?;
+            Ok(pack)
+        })?;
 
         Ok(GitRepoBackup { refs, pack })
+    }
+
+    /// Create the current v2 artifact directly on disk without owning the pack or complete frame in
+    /// Rust memory. The process-unique temp file is fsynced and atomically renamed only after the
+    /// pack length is patched and the checksum over the corrected frame has been appended.
+    pub fn create_to_file(
+        repo: &DurableGitRepo,
+        path: &Path,
+    ) -> Result<VerifiedGitRepoBackupFile, GitBackupError> {
+        Self::create_to_file_bounded(repo, path, MAX_BACKUP_PACK_BYTES)
+    }
+
+    fn create_to_file_bounded(
+        repo: &DurableGitRepo,
+        path: &Path,
+        maximum_pack_bytes: usize,
+    ) -> Result<VerifiedGitRepoBackupFile, GitBackupError> {
+        // The refs are the consistency point and MUST precede any pack traversal.
+        let refs = snapshot_refs(repo)?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut construction_error = None;
+        let atomic_result = crate::durable::write_file_atomic_with(parent, path, |handle| {
+            let result = Self::write_created_frame(
+                repo,
+                &refs,
+                handle,
+                path,
+                maximum_pack_bytes.min(MAX_BACKUP_PACK_BYTES),
+            );
+            match result {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    construction_error = Some(error);
+                    Err(DurableError::Io(format!(
+                        "construct backup artifact {} failed",
+                        path.display()
+                    )))
+                }
+            }
+        });
+        if let Some(error) = construction_error {
+            return Err(error);
+        }
+        atomic_result.map_err(GitBackupError::Durable)?;
+        VerifiedGitRepoBackupFile::open(path)
+    }
+
+    fn write_created_frame(
+        repo: &DurableGitRepo,
+        refs: &[(String, Oid)],
+        handle: &mut std::fs::File,
+        path: &Path,
+        maximum_pack_bytes: usize,
+    ) -> Result<(), GitBackupError> {
+        let io = |operation: &str, error: std::io::Error| {
+            GitBackupError::Io(format!(
+                "{operation} backup artifact {}: {error}",
+                path.display()
+            ))
+        };
+        handle.write_all(MAGIC).map_err(|e| io("write", e))?;
+        let ref_count = u32::try_from(refs.len())
+            .map_err(|_| GitBackupError::BadArtifact("backup ref count exceeds u32".into()))?;
+        handle
+            .write_all(&ref_count.to_be_bytes())
+            .map_err(|e| io("write", e))?;
+        for (name, oid) in refs {
+            let name = name.as_bytes();
+            let oid = oid.as_str().as_bytes();
+            let name_len = u32::try_from(name.len()).map_err(|_| {
+                GitBackupError::BadArtifact("backup ref name exceeds the u32 frame limit".into())
+            })?;
+            let oid_len = u32::try_from(oid.len()).map_err(|_| {
+                GitBackupError::BadArtifact("backup ref oid exceeds the u32 frame limit".into())
+            })?;
+            handle
+                .write_all(&name_len.to_be_bytes())
+                .and_then(|()| handle.write_all(name))
+                .and_then(|()| handle.write_all(&oid_len.to_be_bytes()))
+                .and_then(|()| handle.write_all(oid))
+                .map_err(|e| io("write", e))?;
+        }
+        let pack_len_offset = handle.stream_position().map_err(|e| io("seek", e))?;
+        handle
+            .write_all(&0u64.to_be_bytes())
+            .map_err(|e| io("write", e))?;
+        let pack_offset = handle.stream_position().map_err(|e| io("seek", e))?;
+        let maximum_frame_pack = (MAX_BACKUP_ARTIFACT_BYTES as u64)
+            .checked_sub(pack_offset)
+            .and_then(|remaining| remaining.checked_sub(CHECKSUM_LEN as u64))
+            .ok_or_else(|| {
+                GitBackupError::BadArtifact("backup ref frame leaves no room for a pack".into())
+            })?;
+
+        let pack_len = with_packbuilder(repo, refs, |pb| {
+            let mut pack_len = 0u64;
+            let mut callback_error = None;
+            let result = pb.foreach(|chunk| {
+                let next = match pack_len.checked_add(chunk.len() as u64) {
+                    Some(next) => next,
+                    None => {
+                        callback_error = Some(GitBackupError::BadArtifact(
+                            "backup pack length overflow".into(),
+                        ));
+                        return false;
+                    }
+                };
+                if next > maximum_pack_bytes as u64 || next > maximum_frame_pack {
+                    callback_error = Some(GitBackupError::BadArtifact(format!(
+                        "backup pack exceeds the {maximum_pack_bytes}-byte construction limit"
+                    )));
+                    return false;
+                }
+                if let Err(error) = handle.write_all(chunk) {
+                    callback_error = Some(io("write", error));
+                    return false;
+                }
+                pack_len = next;
+                true
+            });
+            if let Some(error) = callback_error {
+                return Err(error);
+            }
+            result.map_err(|e| git_err("stream pack bytes", e))?;
+            Ok(pack_len)
+        })?;
+
+        let frame_len = pack_offset
+            .checked_add(pack_len)
+            .ok_or_else(|| GitBackupError::BadArtifact("backup artifact length overflow".into()))?;
+        handle
+            .seek(std::io::SeekFrom::Start(pack_len_offset))
+            .and_then(|_| handle.write_all(&pack_len.to_be_bytes()))
+            .and_then(|()| handle.seek(std::io::SeekFrom::Start(0)).map(|_| ()))
+            .map_err(|e| io("patch", e))?;
+
+        // The length field precedes the pack, so preserving the exact v2 wire format requires a
+        // second disk pass after it is known. This pass is fixed-memory and hashes the corrected
+        // frame, not the placeholder bytes.
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = frame_len;
+        let mut buffer = [0u8; STREAM_BUFFER_BYTES];
+        while remaining != 0 {
+            let take = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+            handle
+                .read_exact(&mut buffer[..take])
+                .map_err(|e| io("read for checksum", e))?;
+            hasher.update(&buffer[..take]);
+            remaining -= take as u64;
+        }
+        handle
+            .seek(std::io::SeekFrom::Start(frame_len))
+            .and_then(|_| handle.write_all(hasher.finalize().as_bytes()))
+            .map_err(|e| io("append checksum to", e))?;
+        Ok(())
     }
 
     /// The ref snapshot captured in this backup.
@@ -270,11 +466,7 @@ impl GitRepoBackup {
     /// (bad magic, a truncated length, non-utf8 ref) is a LOUD [`GitBackupError::BadArtifact`],
     /// never a silent partial parse.
     pub fn deserialize(bytes: &[u8]) -> Result<GitRepoBackup, GitBackupError> {
-        Self::deserialize_bounded(
-            bytes,
-            MAX_BACKUP_ARTIFACT_BYTES,
-            MAX_BACKUP_PACK_BYTES,
-        )
+        Self::deserialize_bounded(bytes, MAX_BACKUP_ARTIFACT_BYTES, MAX_BACKUP_PACK_BYTES)
     }
 
     fn deserialize_bounded(
@@ -288,7 +480,9 @@ impl GitRepoBackup {
             )));
         }
         if bytes.len() < MAGIC.len() {
-            return Err(GitBackupError::BadArtifact("artifact is shorter than its magic".into()));
+            return Err(GitBackupError::BadArtifact(
+                "artifact is shorter than its magic".into(),
+            ));
         }
         let magic = &bytes[..MAGIC.len()];
         let frame = if magic == MAGIC_V2 {
@@ -324,9 +518,7 @@ impl GitRepoBackup {
         let minimum_ref_bytes = ref_count.checked_mul(8).ok_or_else(|| {
             GitBackupError::BadArtifact("ref-count size overflow in artifact frame".into())
         })?;
-        if ref_count > MAX_BACKUP_REFS
-            || minimum_ref_bytes.saturating_add(8) > cur.remaining()
-        {
+        if ref_count > MAX_BACKUP_REFS || minimum_ref_bytes.saturating_add(8) > cur.remaining() {
             return Err(GitBackupError::BadArtifact(format!(
                 "impossible or excessive ref count {ref_count}"
             )));
@@ -383,7 +575,7 @@ impl GitRepoBackup {
                 DurableError::Io(format!("write backup artifact {}: {error}", path.display()))
             })
         })
-            .map_err(GitBackupError::Durable)
+        .map_err(GitBackupError::Durable)
     }
 
     /// Read + reconstruct the artifact from an off-host file.
@@ -421,6 +613,297 @@ impl GitRepoBackup {
             MAX_BACKUP_PACK_BYTES.min(maximum_artifact_bytes),
         )
     }
+}
+
+/// A bounded, verified backup artifact whose pack remains on disk. The private fields ensure a
+/// streamed restore can only start from an artifact that passed exact framing/ref validation and,
+/// for v2, the outer BLAKE3 checksum. The opened handle is retained so replacing `path` after
+/// verification cannot swap in different bytes at restore time.
+#[derive(Debug)]
+pub struct VerifiedGitRepoBackupFile {
+    file: std::fs::File,
+    refs: Vec<(String, Oid)>,
+    pack_offset: u64,
+    pack_len: u64,
+    pack_digest: [u8; CHECKSUM_LEN],
+}
+
+impl VerifiedGitRepoBackupFile {
+    /// Open and fully verify a v1 or v2 artifact with fixed-size pack reads. v1 remains readable for
+    /// compatibility; it has no outer checksum by definition, but its pack digest is still pinned
+    /// here and rechecked while libgit2 ingests the pack during restore.
+    pub fn open(path: &Path) -> Result<Self, GitBackupError> {
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| GitBackupError::Io(format!("open artifact {}: {e}", path.display())))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| GitBackupError::Io(format!("stat artifact {}: {e}", path.display())))?
+            .len();
+        if file_len > MAX_BACKUP_ARTIFACT_BYTES as u64 {
+            return Err(GitBackupError::BadArtifact(format!(
+                "backup artifact exceeds the {MAX_BACKUP_ARTIFACT_BYTES}-byte read limit"
+            )));
+        }
+        if file_len < MAGIC.len() as u64 {
+            return Err(GitBackupError::BadArtifact(
+                "artifact is shorter than its magic".into(),
+            ));
+        }
+
+        let mut position = 0u64;
+        let mut frame_hasher = blake3::Hasher::new();
+        let mut magic = vec![0u8; MAGIC.len()];
+        read_artifact_exact(&mut file, &mut magic, path)?;
+        position += magic.len() as u64;
+        frame_hasher.update(&magic);
+        let checksum_bytes = if magic == MAGIC_V2 {
+            CHECKSUM_LEN
+        } else if magic == MAGIC_V1 {
+            0
+        } else {
+            return Err(GitBackupError::BadArtifact(format!(
+                "unknown backup artifact magic {:?}",
+                &magic[..magic.len().min(MAGIC.len())]
+            )));
+        };
+        let frame_end = file_len.checked_sub(checksum_bytes as u64).ok_or_else(|| {
+            GitBackupError::BadArtifact("v2 artifact is missing its checksum".into())
+        })?;
+        if frame_end < position {
+            return Err(GitBackupError::BadArtifact(
+                "v2 artifact is missing its checksum".into(),
+            ));
+        }
+
+        let ref_count =
+            read_frame_u32(&mut file, &mut position, frame_end, &mut frame_hasher, path)? as usize;
+        if ref_count > MAX_BACKUP_REFS {
+            return Err(GitBackupError::BadArtifact(format!(
+                "impossible or excessive ref count {ref_count}"
+            )));
+        }
+        let minimum_ref_bytes = (ref_count as u64).checked_mul(8).ok_or_else(|| {
+            GitBackupError::BadArtifact("ref-count size overflow in artifact frame".into())
+        })?;
+        if minimum_ref_bytes.saturating_add(8) > frame_end.saturating_sub(position) {
+            return Err(GitBackupError::BadArtifact(format!(
+                "impossible or excessive ref count {ref_count}"
+            )));
+        }
+
+        let mut refs = Vec::new();
+        refs.try_reserve(ref_count.min(1024)).map_err(|_| {
+            GitBackupError::BadArtifact("cannot allocate backup ref parser state".into())
+        })?;
+        let mut ref_bytes = MAGIC.len() + 4 + 8 + checksum_bytes;
+        for _ in 0..ref_count {
+            let name_len =
+                read_frame_u32(&mut file, &mut position, frame_end, &mut frame_hasher, path)?
+                    as usize;
+            ref_bytes = ref_bytes
+                .checked_add(4)
+                .and_then(|bytes| bytes.checked_add(name_len))
+                .ok_or_else(|| GitBackupError::BadArtifact("ref frame length overflow".into()))?;
+            if ref_bytes > MAX_BACKUP_REF_FRAME_BYTES
+                || name_len as u64 > frame_end.saturating_sub(position)
+            {
+                return Err(GitBackupError::BadArtifact(
+                    "backup ref frame exceeds its bounded length".into(),
+                ));
+            }
+            let mut name = vec![0u8; name_len];
+            read_hashed_frame_exact(
+                &mut file,
+                &mut name,
+                &mut position,
+                frame_end,
+                &mut frame_hasher,
+                path,
+            )?;
+            let name = String::from_utf8(name)
+                .map_err(|e| GitBackupError::BadArtifact(format!("ref name not utf8: {e}")))?;
+            if !git2::Reference::is_valid_name(&name) {
+                return Err(GitBackupError::BadArtifact(format!(
+                    "invalid fully-qualified ref name `{name}`"
+                )));
+            }
+
+            let oid_len =
+                read_frame_u32(&mut file, &mut position, frame_end, &mut frame_hasher, path)?
+                    as usize;
+            ref_bytes = ref_bytes
+                .checked_add(4)
+                .and_then(|bytes| bytes.checked_add(oid_len))
+                .ok_or_else(|| GitBackupError::BadArtifact("ref frame length overflow".into()))?;
+            if ref_bytes > MAX_BACKUP_REF_FRAME_BYTES
+                || oid_len as u64 > frame_end.saturating_sub(position)
+            {
+                return Err(GitBackupError::BadArtifact(
+                    "backup ref frame exceeds its bounded length".into(),
+                ));
+            }
+            let mut oid = vec![0u8; oid_len];
+            read_hashed_frame_exact(
+                &mut file,
+                &mut oid,
+                &mut position,
+                frame_end,
+                &mut frame_hasher,
+                path,
+            )?;
+            let oid = String::from_utf8(oid)
+                .map_err(|e| GitBackupError::BadArtifact(format!("ref oid not utf8: {e}")))?;
+            git2::Oid::from_str(&oid).map_err(|e| {
+                GitBackupError::BadArtifact(format!("invalid oid for ref `{name}`: {e}"))
+            })?;
+            refs.push((name, Oid::new(oid)));
+        }
+
+        let pack_len =
+            read_frame_u64(&mut file, &mut position, frame_end, &mut frame_hasher, path)?;
+        if pack_len > MAX_BACKUP_PACK_BYTES as u64 {
+            return Err(GitBackupError::BadArtifact(format!(
+                "backup pack exceeds the {MAX_BACKUP_PACK_BYTES}-byte parse limit"
+            )));
+        }
+        let pack_offset = position;
+        let declared_end = pack_offset.checked_add(pack_len).ok_or_else(|| {
+            GitBackupError::BadArtifact("pack length overflows the artifact frame".into())
+        })?;
+        if declared_end != frame_end {
+            let detail = if declared_end < frame_end {
+                format!(
+                    "{} trailing bytes after backup frame",
+                    frame_end - declared_end
+                )
+            } else {
+                "artifact is truncated within its declared pack".into()
+            };
+            return Err(GitBackupError::BadArtifact(detail));
+        }
+
+        let mut pack_hasher = blake3::Hasher::new();
+        let mut remaining = pack_len;
+        let mut buffer = [0u8; STREAM_BUFFER_BYTES];
+        while remaining != 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            read_hashed_frame_exact(
+                &mut file,
+                &mut buffer[..take],
+                &mut position,
+                frame_end,
+                &mut frame_hasher,
+                path,
+            )?;
+            pack_hasher.update(&buffer[..take]);
+            remaining -= take as u64;
+        }
+
+        if checksum_bytes != 0 {
+            let mut stored_checksum = [0u8; CHECKSUM_LEN];
+            read_artifact_exact(&mut file, &mut stored_checksum, path)?;
+            if frame_hasher.finalize().as_bytes() != &stored_checksum {
+                return Err(GitBackupError::BadArtifact(
+                    "v2 artifact checksum mismatch".into(),
+                ));
+            }
+        }
+        let mut trailing = [0u8; 1];
+        if file
+            .read(&mut trailing)
+            .map_err(|e| GitBackupError::Io(format!("read artifact {}: {e}", path.display())))?
+            != 0
+        {
+            return Err(GitBackupError::BadArtifact(
+                "trailing bytes after backup artifact".into(),
+            ));
+        }
+
+        Ok(Self {
+            file,
+            refs,
+            pack_offset,
+            pack_len,
+            pack_digest: *pack_hasher.finalize().as_bytes(),
+        })
+    }
+
+    /// The validated ref snapshot stored outside the on-disk pack.
+    pub fn refs(&self) -> &[(String, Oid)] {
+        &self.refs
+    }
+
+    /// The number of validated refs in the artifact.
+    pub fn ref_count(&self) -> usize {
+        self.refs.len()
+    }
+
+    /// The pack length without materialising the pack.
+    pub fn pack_len(&self) -> u64 {
+        self.pack_len
+    }
+}
+
+fn read_artifact_exact(
+    file: &mut std::fs::File,
+    bytes: &mut [u8],
+    path: &Path,
+) -> Result<(), GitBackupError> {
+    file.read_exact(bytes).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            GitBackupError::BadArtifact("artifact is truncated".into())
+        } else {
+            GitBackupError::Io(format!("read artifact {}: {error}", path.display()))
+        }
+    })
+}
+
+fn read_hashed_frame_exact(
+    file: &mut std::fs::File,
+    bytes: &mut [u8],
+    position: &mut u64,
+    frame_end: u64,
+    hasher: &mut blake3::Hasher,
+    path: &Path,
+) -> Result<(), GitBackupError> {
+    let end = position
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| GitBackupError::BadArtifact("length overflow in artifact frame".into()))?;
+    if end > frame_end {
+        return Err(GitBackupError::BadArtifact(format!(
+            "artifact truncated: needed {} bytes at offset {}",
+            bytes.len(),
+            position
+        )));
+    }
+    read_artifact_exact(file, bytes, path)?;
+    hasher.update(bytes);
+    *position = end;
+    Ok(())
+}
+
+fn read_frame_u32(
+    file: &mut std::fs::File,
+    position: &mut u64,
+    frame_end: u64,
+    hasher: &mut blake3::Hasher,
+    path: &Path,
+) -> Result<u32, GitBackupError> {
+    let mut bytes = [0u8; 4];
+    read_hashed_frame_exact(file, &mut bytes, position, frame_end, hasher, path)?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn read_frame_u64(
+    file: &mut std::fs::File,
+    position: &mut u64,
+    frame_end: u64,
+    hasher: &mut blake3::Hasher,
+    path: &Path,
+) -> Result<u64, GitBackupError> {
+    let mut bytes = [0u8; 8];
+    read_hashed_frame_exact(file, &mut bytes, position, frame_end, hasher, path)?;
+    Ok(u64::from_be_bytes(bytes))
 }
 
 // ───────────────────────────── a tiny bounds-checked cursor (artifact parse) ───────────────────────
@@ -500,6 +983,26 @@ pub fn restore_repo<P: RepoPathResolver>(
     loc: &RepoLoc,
     backup: &GitRepoBackup,
 ) -> Result<DurableGitRepo, GitBackupError> {
+    restore_repo_staged(store, loc, |repo| build_repo_from_memory(repo, backup))
+}
+
+/// Restore a verified file-backed artifact without allocating its pack. The held file handle is
+/// sought to the verified pack offset and copied into libgit2's indexer in fixed-size chunks. Its
+/// pack digest is recomputed during that copy and must still match before the indexer is committed,
+/// refs are recreated, or the staging repo is published; this catches post-open inode mutation.
+pub fn restore_repo_from_file<P: RepoPathResolver>(
+    store: &DurableGitStore<P>,
+    loc: &RepoLoc,
+    backup: &mut VerifiedGitRepoBackupFile,
+) -> Result<DurableGitRepo, GitBackupError> {
+    restore_repo_staged(store, loc, |repo| build_repo_from_file(repo, backup))
+}
+
+fn restore_repo_staged<P: RepoPathResolver>(
+    store: &DurableGitStore<P>,
+    loc: &RepoLoc,
+    build: impl FnOnce(&DurableGitRepo) -> Result<(), GitBackupError>,
+) -> Result<DurableGitRepo, GitBackupError> {
     // (1) Clean-target guard — never clobber a live repo (genuine recovery only).
     if store.repo_exists(loc) {
         let path = store
@@ -532,7 +1035,11 @@ pub fn restore_repo<P: RepoPathResolver>(
 
     // Build the full repo at the staging path. On ANY failure, remove the staging dir and return —
     // the final path is never touched (it stays CLEAN for an immediate retry).
-    if let Err(e) = build_repo_at(store, &staging_loc, backup) {
+    let build_result = store
+        .create_repo(&staging_loc)
+        .map_err(GitBackupError::Durable)
+        .and_then(|repo| build(&repo));
+    if let Err(e) = build_result {
         let _ = std::fs::remove_dir_all(&staging_path);
         return Err(e);
     }
@@ -547,7 +1054,10 @@ pub fn restore_repo<P: RepoPathResolver>(
         )));
     }
     let parent = final_path.parent().ok_or_else(|| {
-        GitBackupError::Io(format!("restore target {} has no parent directory", final_path.display()))
+        GitBackupError::Io(format!(
+            "restore target {} has no parent directory",
+            final_path.display()
+        ))
     })?;
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
@@ -562,35 +1072,95 @@ pub fn restore_repo<P: RepoPathResolver>(
     store.open_repo(loc).map_err(GitBackupError::Durable)
 }
 
-/// Build a complete bare repo (init_bare + pack ingest + ref recreate) at `loc`. Used to materialise
-/// the restore at a STAGING locator; the caller atomically publishes it (or rolls it back on error).
-fn build_repo_at<P: RepoPathResolver>(
-    store: &DurableGitStore<P>,
-    loc: &RepoLoc,
+fn build_repo_from_memory(
+    repo: &DurableGitRepo,
     backup: &GitRepoBackup,
 ) -> Result<(), GitBackupError> {
-    // init_bare a FRESH repo through the validated resolver (tenant/region-scoped).
-    let repo = store.create_repo(loc)?;
-
     // Ingest the self-contained pack into the empty odb (libgit2 indexes + verifies it).
     if !backup.pack.is_empty() {
         let git = git2::Repository::open(repo.path())
             .map_err(|e| git_err(&format!("open restore target {}", repo.path().display()), e))?;
         let odb = git.odb().map_err(|e| git_err("restore odb", e))?;
-        let mut pw = odb.packwriter().map_err(|e| git_err("restore packwriter", e))?;
+        let mut pw = odb
+            .packwriter()
+            .map_err(|e| git_err("restore packwriter", e))?;
         {
             use std::io::Write;
             pw.write_all(&backup.pack)
                 .map_err(|e| GitBackupError::Io(format!("feed pack to indexer: {e}")))?;
         }
-        pw.commit().map_err(|e| git_err("commit ingested pack", e))?;
+        pw.commit()
+            .map_err(|e| git_err("commit ingested pack", e))?;
     }
 
-    // Recreate each ref through the durable CAS create path (on-disk, reflog-logged). The restored
-    // ref points at an object the ingested pack brought back (a flipped oid → missing object → Err).
-    for (name, oid) in &backup.refs {
-        repo.update_ref_cas(name, None, Some(oid), "restore: recreate ref", "restore@myelin.noreply")
-            .map_err(GitBackupError::Durable)?;
+    recreate_refs(repo, &backup.refs)
+}
+
+fn build_repo_from_file(
+    repo: &DurableGitRepo,
+    backup: &mut VerifiedGitRepoBackupFile,
+) -> Result<(), GitBackupError> {
+    backup
+        .file
+        .seek(std::io::SeekFrom::Start(backup.pack_offset))
+        .map_err(|e| GitBackupError::Io(format!("seek verified backup pack: {e}")))?;
+    let mut pack_hasher = blake3::Hasher::new();
+    if backup.pack_len != 0 {
+        let git = git2::Repository::open(repo.path())
+            .map_err(|e| git_err(&format!("open restore target {}", repo.path().display()), e))?;
+        let odb = git.odb().map_err(|e| git_err("restore odb", e))?;
+        let mut pw = odb
+            .packwriter()
+            .map_err(|e| git_err("restore packwriter", e))?;
+        let mut remaining = backup.pack_len;
+        let mut buffer = [0u8; STREAM_BUFFER_BYTES];
+        while remaining != 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            backup
+                .file
+                .read_exact(&mut buffer[..take])
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                        GitBackupError::BadArtifact(
+                            "verified backup pack was truncated after open".into(),
+                        )
+                    } else {
+                        GitBackupError::Io(format!("read verified backup pack: {error}"))
+                    }
+                })?;
+            pack_hasher.update(&buffer[..take]);
+            pw.write_all(&buffer[..take])
+                .map_err(|e| GitBackupError::Io(format!("feed pack to indexer: {e}")))?;
+            remaining -= take as u64;
+        }
+        if pack_hasher.finalize().as_bytes() != &backup.pack_digest {
+            return Err(GitBackupError::BadArtifact(
+                "verified backup pack changed after open".into(),
+            ));
+        }
+        pw.commit()
+            .map_err(|e| git_err("commit ingested pack", e))?;
+    } else if pack_hasher.finalize().as_bytes() != &backup.pack_digest {
+        return Err(GitBackupError::BadArtifact(
+            "verified backup pack changed after open".into(),
+        ));
+    }
+
+    recreate_refs(repo, &backup.refs)
+}
+
+fn recreate_refs(repo: &DurableGitRepo, refs: &[(String, Oid)]) -> Result<(), GitBackupError> {
+    // Recreate each ref through the durable CAS create path (on-disk, reflog-logged). A ref can only
+    // publish after its object was accepted by the indexer above.
+    for (name, oid) in refs {
+        repo.update_ref_cas(
+            name,
+            None,
+            Some(oid),
+            "restore: recreate ref",
+            "restore@myelin.noreply",
+        )
+        .map_err(GitBackupError::Durable)?;
     }
 
     Ok(())
@@ -655,11 +1225,17 @@ mod tests {
 
         let backup = GitRepoBackup::create(&repo).unwrap();
         assert_eq!(backup.refs(), want.as_slice());
-        assert!(backup.pack_len() > 0, "a real packfile, not an empty modeled blob");
+        assert!(
+            backup.pack_len() > 0,
+            "a real packfile, not an empty modeled blob"
+        );
 
         let bytes = backup.serialize();
         let back = GitRepoBackup::deserialize(&bytes).unwrap();
-        assert_eq!(back, backup, "artifact reconstructs identically from its bytes alone");
+        assert_eq!(
+            back, backup,
+            "artifact reconstructs identically from its bytes alone"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -713,6 +1289,28 @@ mod tests {
             empty,
             "existing v1 artifacts remain readable"
         );
+
+        let legacy_file = temp_root("legacy-v1-file");
+        std::fs::write(&legacy_file, &legacy_v1).unwrap();
+        let mut verified = VerifiedGitRepoBackupFile::open(&legacy_file).unwrap();
+        assert_eq!(verified.ref_count(), 0);
+        assert_eq!(verified.pack_len(), 0);
+        let legacy_restore_root = temp_root("legacy-v1-restore");
+        let legacy_store = DurableGitStore::rooted(&legacy_restore_root);
+        let restored = restore_repo_from_file(&legacy_store, &loc(), &mut verified).unwrap();
+        restored.fsck().unwrap();
+        std::fs::remove_file(&legacy_file).ok();
+        std::fs::remove_dir_all(&legacy_restore_root).ok();
+
+        let corrupt_file = temp_root("corrupt-v2-file");
+        let mut corrupt_v2 = empty.serialize();
+        *corrupt_v2.last_mut().unwrap() ^= 1;
+        std::fs::write(&corrupt_file, corrupt_v2).unwrap();
+        assert!(matches!(
+            VerifiedGitRepoBackupFile::open(&corrupt_file),
+            Err(GitBackupError::BadArtifact(message)) if message.contains("checksum")
+        ));
+        std::fs::remove_file(&corrupt_file).ok();
     }
 
     #[test]
@@ -723,7 +1321,9 @@ mod tests {
         seed(&repo);
         let normal = GitRepoBackup::create(&repo).unwrap();
         assert_eq!(
-            GitRepoBackup::create_bounded(&repo, normal.pack_len()).unwrap().pack_len(),
+            GitRepoBackup::create_bounded(&repo, normal.pack_len())
+                .unwrap()
+                .pack_len(),
             normal.pack_len(),
             "the exact pack limit succeeds"
         );
@@ -731,6 +1331,30 @@ mod tests {
             GitRepoBackup::create_bounded(&repo, normal.pack_len() - 1),
             Err(GitBackupError::BadArtifact(message)) if message.contains("construction limit")
         ));
+
+        let exact_artifact = root.join("exact.gitbackup");
+        let exact =
+            GitRepoBackup::create_to_file_bounded(&repo, &exact_artifact, normal.pack_len())
+                .unwrap();
+        assert_eq!(exact.pack_len(), normal.pack_len() as u64);
+        assert_eq!(
+            GitRepoBackup::read_from_file(&exact_artifact).unwrap(),
+            normal,
+            "the streamed v2 artifact remains readable by the existing in-memory API"
+        );
+
+        let preserved_artifact = root.join("preserved.gitbackup");
+        let prior = b"previous valid publication remains untouched";
+        std::fs::write(&preserved_artifact, prior).unwrap();
+        assert!(matches!(
+            GitRepoBackup::create_to_file_bounded(
+                &repo,
+                &preserved_artifact,
+                normal.pack_len() - 1,
+            ),
+            Err(GitBackupError::BadArtifact(message)) if message.contains("construction limit")
+        ));
+        assert_eq!(std::fs::read(&preserved_artifact).unwrap(), prior);
 
         let mut declared_pack = MAGIC_V1.to_vec();
         declared_pack.extend_from_slice(&0u32.to_be_bytes());
@@ -760,20 +1384,19 @@ mod tests {
         let src_store = DurableGitStore::rooted(&src_root);
         let src_repo = src_store.create_repo(&loc()).unwrap();
         let want = seed(&src_repo);
-        let backup = GitRepoBackup::create(&src_repo).unwrap();
         // Persist + reload the artifact from disk so the restore truly reads bytes alone.
         let artifact = temp_root("artifact");
         std::fs::create_dir_all(&artifact).unwrap();
         let artifact_file = artifact.join("core.gitbackup");
-        backup.write_to_file(&artifact_file).unwrap();
+        GitRepoBackup::create_to_file(&src_repo, &artifact_file).unwrap();
 
         // A genuinely CLEAN target root — the original src_root is NOT visible to it.
         let dst_root = temp_root("dst");
         let dst_store = DurableGitStore::rooted(&dst_root);
         assert!(!dst_store.repo_exists(&loc()), "target starts clean/empty");
 
-        let reloaded = GitRepoBackup::read_from_file(&artifact_file).unwrap();
-        let restored = restore_repo(&dst_store, &loc(), &reloaded).unwrap();
+        let mut reloaded = VerifiedGitRepoBackupFile::open(&artifact_file).unwrap();
+        let restored = restore_repo_from_file(&dst_store, &loc(), &mut reloaded).unwrap();
 
         // Every ref reads back identical.
         assert_eq!(restored.list_refs_bounded(MAX_BACKUP_REFS).unwrap(), want);
@@ -781,18 +1404,67 @@ mod tests {
         for (_, tip) in &want {
             let src_bytes = src_repo.read_object_bounded(tip, 64 * 1024 * 1024).unwrap();
             let dst_bytes = restored.read_object_bounded(tip, 64 * 1024 * 1024).unwrap();
-            assert_eq!(src_bytes, dst_bytes, "object {} bytes identical", tip.as_str());
+            assert_eq!(
+                src_bytes,
+                dst_bytes,
+                "object {} bytes identical",
+                tip.as_str()
+            );
         }
-        restored.fsck().expect("in-process fsck clean on the restored repo");
+        restored
+            .fsck()
+            .expect("in-process fsck clean on the restored repo");
 
         // Restoring AGAIN over the now-present repo is refused (clean-target guard).
         assert!(matches!(
-            restore_repo(&dst_store, &loc(), &reloaded),
+            restore_repo_from_file(&dst_store, &loc(), &mut reloaded),
             Err(GitBackupError::TargetNotClean(_))
         ));
 
         std::fs::remove_dir_all(&src_root).ok();
         std::fs::remove_dir_all(&dst_root).ok();
         std::fs::remove_dir_all(&artifact).ok();
+    }
+
+    #[test]
+    fn pack_mutation_after_verified_open_is_refused_before_publish() {
+        let src_root = temp_root("mutated-pack-src");
+        let src_store = DurableGitStore::rooted(&src_root);
+        let src_repo = src_store.create_repo(&loc()).unwrap();
+        seed(&src_repo);
+        let artifact = temp_root("mutated-pack-artifact");
+        let mut verified = GitRepoBackup::create_to_file(&src_repo, &artifact).unwrap();
+        assert!(verified.pack_len > 0);
+
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&artifact)
+            .unwrap();
+        let mutation_offset = verified.pack_offset + verified.pack_len - 1;
+        writer
+            .seek(std::io::SeekFrom::Start(mutation_offset))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        writer.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xff;
+        writer
+            .seek(std::io::SeekFrom::Start(mutation_offset))
+            .unwrap();
+        writer.write_all(&byte).unwrap();
+        writer.sync_all().unwrap();
+
+        let dst_root = temp_root("mutated-pack-dst");
+        let dst_store = DurableGitStore::rooted(&dst_root);
+        let error = restore_repo_from_file(&dst_store, &loc(), &mut verified).unwrap_err();
+        assert!(matches!(
+            error,
+            GitBackupError::BadArtifact(message) if message.contains("changed after open")
+        ));
+        assert!(!dst_store.repo_exists(&loc()));
+
+        std::fs::remove_dir_all(&src_root).ok();
+        std::fs::remove_dir_all(&dst_root).ok();
+        std::fs::remove_file(&artifact).ok();
     }
 }
