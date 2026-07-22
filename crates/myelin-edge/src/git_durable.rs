@@ -147,8 +147,8 @@ pub struct DurableGitBackend {
     /// `/{tenant}/{region}/{repo}.git` — so the clone URL rendered into every repo-home ViewModel must
     /// be `{base}/{tenant}/{region}/{repo}.git`, never the old hardcoded `ssh://git@myelin/{tenant}/…`
     /// (wrong scheme, missing region, wrong slug). The edge does not inherently know its own external
-    /// origin, so the base is read from `MYELIN_PUBLIC_BASE_URL` at construction (e.g.
-    /// `https://git.example.com`); UNSET → the empty string, which yields an HONEST relative
+    /// origin, so the composition root injects its validated `MYELIN_PUBLIC_BASE_URL` (e.g.
+    /// `https://git.example.com`); an empty value yields an HONEST relative
     /// `/{tenant}/{region}/{repo}.git` (a real path on this host) rather than a fabricated hostname.
     clone_base: String,
     /// The on-disk root holding `<tenant>/<region>/<repo>.git` bare repos — retained so the wire-serving
@@ -285,6 +285,7 @@ impl DurableGitBackend {
     /// test passes the in-memory `OutboxStore::new()` double + a seeded deterministic minter.
     pub fn rooted(
         root: impl Into<PathBuf>,
+        public_clone_base: impl Into<String>,
         provider: SubstrateProvider,
         kms: Arc<KmsEngine>,
         runtime: tokio::runtime::Handle,
@@ -299,8 +300,8 @@ impl DurableGitBackend {
             threads: DurablePrThreadStore::rooted(root.clone()),
             outbox,
             minter,
-            // F3: the public HTTP base for clone URLs — env-driven, honest empty default (relative path).
-            clone_base: public_clone_base(),
+            // F3: only the composition root's already validated public URL reaches clone responses.
+            clone_base: public_clone_base.into().trim_end_matches('/').to_string(),
             root,
             git_shutdown: Arc::new(AtomicBool::new(false)),
             git_wire_credentials:
@@ -336,7 +337,7 @@ impl DurableGitBackend {
             threads: DurablePrThreadStore::rooted(root.clone()),
             outbox: OutboxStore::new(),
             minter: Arc::new(MonotonicMinter::new()),
-            clone_base: public_clone_base(),
+            clone_base: String::new(),
             root,
             git_shutdown: Arc::new(AtomicBool::new(false)),
             git_wire_credentials: crate::git_wire_exec::test_git_wire_credential_issuer_factory(),
@@ -2667,18 +2668,6 @@ impl QuarantineMigration for ObjectPromotion<'_> {
 
 fn region_of<'a>(ctx: &'a HandlerCtx<'_>) -> &'a str {
     ctx.scope.region().0.as_str()
-}
-
-/// **F3 (R4.1 dogfood) — the public base URL prefix for HTTP git-wire clone URLs.** Read once from
-/// `MYELIN_PUBLIC_BASE_URL` at backend construction. UNSET (or empty) → the empty string, which makes
-/// [`DurableGitBackend::clone_url`] emit an HONEST relative `/{tenant}/{region}/{repo}.git` (a real
-/// path on whatever origin the edge is served from) rather than a fabricated hostname. A configured
-/// value has any trailing `/` trimmed so the `{base}/{tenant}/…` join never doubles the slash.
-fn public_clone_base() -> String {
-    std::env::var("MYELIN_PUBLIC_BASE_URL")
-        .unwrap_or_default()
-        .trim_end_matches('/')
-        .to_string()
 }
 
 /// Wall-clock unix seconds for the durable `updated_at` stamp (the list's "updated" column +
