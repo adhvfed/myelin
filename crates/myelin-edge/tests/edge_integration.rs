@@ -48,12 +48,23 @@ const REGION: &str = "eu-west";
 const OTHER_TENANT: &str = "globex";
 const SCHEME: &str = "agent"; // a TTL-constrained token (no DPoP) — simplest real proof.
 static SLOW_GIT_STARTED: AtomicUsize = AtomicUsize::new(0);
+static SLOW_JSON_STARTED: AtomicUsize = AtomicUsize::new(0);
 
 struct SlowGitWireHandler;
 
 impl Handler for SlowGitWireHandler {
     fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         SLOW_GIT_STARTED.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(500));
+        Ok(EdgeResponse::json(200, &serde_json::json!({ "status": "ok" })))
+    }
+}
+
+struct SlowJsonHandler;
+
+impl Handler for SlowJsonHandler {
+    fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        SLOW_JSON_STARTED.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(500));
         Ok(EdgeResponse::json(200, &serde_json::json!({ "status": "ok" })))
     }
@@ -160,6 +171,12 @@ fn build_gateway() -> (Arc<Gateway>, CellTokenAuthority, RevocationStore) {
                 "/v1/invalid-response",
                 "edge.whoami",
                 Arc::new(InvalidResponseHandler),
+            )
+            .route(
+                Method::Get,
+                "/v1/slow-json",
+                "edge.whoami",
+                Arc::new(SlowJsonHandler),
             )
             .route(
                 Method::Get,
@@ -725,6 +742,41 @@ async fn blocking_git_wire_dispatch_does_not_stall_liveness() {
     assert!(
         started.elapsed() < Duration::from_millis(250),
         "liveness must not wait for the 500 ms blocking Git operation"
+    );
+    let (slow_status, _) = slow.await.unwrap();
+    assert_eq!(slow_status, 200);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_json_dispatch_does_not_stall_liveness() {
+    SLOW_JSON_STARTED.store(0, Ordering::SeqCst);
+    let (gateway, cell, _revocations) = build_gateway();
+    let token = mint(&cell, TENANT, "jti-slow-json", now() + 3600);
+    let headers = bearer(&token);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_edge(listener, gateway).await;
+    });
+
+    let slow_headers = headers.clone();
+    let slow = tokio::spawn(async move {
+        http(addr, "GET", "/v1/slow-json", &hdr(&slow_headers), vec![]).await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while SLOW_JSON_STARTED.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the blocking JSON handler must start");
+
+    let started = std::time::Instant::now();
+    let (status, body) = http(addr, "GET", "/livez", &[], vec![]).await;
+    assert_eq!((status, body.as_str()), (200, "{\"status\":\"ok\"}"));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "liveness must remain responsive while a JSON handler blocks"
     );
     let (slow_status, _) = slow.await.unwrap();
     assert_eq!(slow_status, 200);
