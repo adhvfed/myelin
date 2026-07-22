@@ -461,6 +461,10 @@ pub const COMMIT_META_MAX_PARENTS: usize = 64;
 pub const COMMIT_META_MAX_SUMMARY_BYTES: usize = 8 * 1024;
 /// Maximum author name/email bytes represented in interactive metadata.
 pub const COMMIT_META_MAX_IDENTITY_BYTES: usize = 1_024;
+/// Deepest offset accepted by the interactive commit-log walker.
+pub const COMMIT_LOG_MAX_OFFSET: usize = 100_000;
+/// Largest commit page materialized by one interactive history read.
+pub const COMMIT_LOG_MAX_PAGE: usize = 500;
 /// Maximum files materialized for one interactive commit diff.
 pub const COMMIT_DIFF_MAX_FILES: usize = 1_000;
 /// Maximum rendered lines materialized for one file in an interactive commit diff.
@@ -1561,6 +1565,11 @@ impl DurableGitRepo {
         offset: usize,
         limit: usize,
     ) -> Result<(Vec<CommitMeta>, bool), DurableError> {
+        if offset > COMMIT_LOG_MAX_OFFSET || limit > COMMIT_LOG_MAX_PAGE {
+            return Err(DurableError::Git(
+                "commit log pagination limit exceeded".into(),
+            ));
+        }
         let repo = self.open_git()?;
         let Some(tip) = self.tip_commit(&repo, ref_name)? else {
             return Ok((Vec::new(), false));
@@ -1599,6 +1608,11 @@ impl DurableGitRepo {
         head_oid: &str,
         limit: usize,
     ) -> Result<(Vec<CommitMeta>, bool), DurableError> {
+        if limit > COMMIT_LOG_MAX_PAGE {
+            return Err(DurableError::Git(
+                "commit log pagination limit exceeded".into(),
+            ));
+        }
         let repo = self.open_git()?;
         let head = match git2::Oid::from_str(head_oid) {
             Ok(o) => o,
@@ -2769,6 +2783,14 @@ mod tests {
         assert!(more0 && p0.len() == 1 && p0[0].oid == c2.0);
         let (p1, more1) = repo.commit_log("refs/heads/main", 1, 1).unwrap();
         assert!(!more1 && p1.len() == 1 && p1[0].oid == c1.0);
+        assert!(matches!(
+            repo.commit_log("refs/heads/main", COMMIT_LOG_MAX_OFFSET + 1, 1),
+            Err(DurableError::Git(message)) if message == "commit log pagination limit exceeded"
+        ));
+        assert!(matches!(
+            repo.commit_log("refs/heads/main", 0, COMMIT_LOG_MAX_PAGE + 1),
+            Err(DurableError::Git(message)) if message == "commit log pagination limit exceeded"
+        ));
 
         // Diff of c2 vs its parent: file.txt MODIFIED with an added "line two".
         let detail = repo.commit_detail(&c2.0).expect("detail").expect("present");
