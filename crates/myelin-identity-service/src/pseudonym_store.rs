@@ -493,21 +493,33 @@ impl PseudonymStore {
     /// verified scope. The PUBLIC pseudonym survives a crypto-shred (only the real-identity LINK is
     /// erased), so this read keeps working post-erasure.
     pub fn mapping_of(&self, scope: &TenantScope, subject: &PrincipalId) -> Option<PseudonymRow> {
+        self.try_mapping_of(scope, subject).ok().flatten()
+    }
+
+    /// Fallible mapping read for service paths that must distinguish absence from storage failure
+    /// or durable-row corruption.
+    pub fn try_mapping_of(
+        &self,
+        scope: &TenantScope,
+        subject: &PrincipalId,
+    ) -> Result<Option<PseudonymRow>, PseudonymError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             PseudonymBackend::Memory(inner_arc) => {
                 let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
-                inner
+                Ok(inner
                     .by_subject
                     .get(&Self::part_key(scope))
-                    .and_then(|p| p.get(&subject.0).cloned())
+                    .and_then(|p| p.get(&subject.0).cloned()))
             }
-            PseudonymBackend::Pg(pg) => pg
-                .block(pg.backing.get_by_principal(&scope.tenant().0, &subject.0))
-                .ok()
-                .flatten()
-                .and_then(|drow| Self::durable_to_row(scope, &drow).ok()),
+            PseudonymBackend::Pg(pg) => {
+                let row = pg
+                    .block(pg.backing.get_by_principal(&scope.tenant().0, &subject.0))
+                    .map_err(|error| PseudonymError::Storage(error.to_string()))?;
+                row.map(|durable| Self::durable_to_row(scope, &durable))
+                    .transpose()
+            }
         }
     }
 
