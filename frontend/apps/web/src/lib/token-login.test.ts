@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_TOKEN_SCHEME,
+  MAX_TOKEN_LOGIN_BYTES,
   TOKEN_LOGIN_DISABLED,
   TOKEN_LOGIN_ERROR,
   TOKEN_LOGIN_SUCCESS,
@@ -77,6 +78,24 @@ describe("runTokenLogin (R4.0 — the operator-token login decision)", () => {
     expect(issue).not.toHaveBeenCalled();
   });
 
+  it("refuses oversized tokens and malformed schemes before contacting the edge", async () => {
+    const malformed: Array<[string, string]> = [
+      ["x".repeat(MAX_TOKEN_LOGIN_BYTES + 1), "agent"],
+      ["token", "agent\r\nx-forged"],
+      ["token", "A".repeat(33)],
+    ];
+    for (const [token, scheme] of malformed) {
+      const verify = vi.fn(async () => whoami());
+      const isEnabled = vi.fn(async () => true);
+      const issue = vi.fn();
+      const out = await runTokenLogin(token, scheme, { isEnabled, verify, issue });
+      expect(out.redirectTo).toBe(TOKEN_LOGIN_ERROR);
+      expect(isEnabled).not.toHaveBeenCalled();
+      expect(verify).not.toHaveBeenCalled();
+      expect(issue).not.toHaveBeenCalled();
+    }
+  });
+
   it("on a whoami missing a principal id (unexpected shape): honest error, no session", async () => {
     const issue = vi.fn();
     const verify = vi.fn(async () => whoami({ principal_id: "" }));
@@ -87,6 +106,24 @@ describe("runTokenLogin (R4.0 — the operator-token login decision)", () => {
     });
     expect(out.redirectTo).toBe(TOKEN_LOGIN_ERROR);
     expect(issue).not.toHaveBeenCalled();
+  });
+
+  it("refuses malformed or unbounded trust-rooted identity fields", async () => {
+    for (const malformed of [
+      { principal_id: `u_${"x".repeat(512)}` },
+      { tenant: "" },
+      { tenant: "x".repeat(129) },
+      { region: "eu\nwest" },
+    ]) {
+      const issue = vi.fn();
+      const out = await runTokenLogin("tok", undefined, {
+        isEnabled: async () => true,
+        verify: async () => whoami(malformed),
+        issue,
+      });
+      expect(out.redirectTo).toBe(TOKEN_LOGIN_ERROR);
+      expect(issue).not.toHaveBeenCalled();
+    }
   });
 
   it("refuses an elapsed or unrepresentable capability expiry", async () => {

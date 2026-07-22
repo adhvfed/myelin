@@ -54,6 +54,21 @@ export const TOKEN_LOGIN_DISABLED = "/login";
 export const TOKEN_LOGIN_SUCCESS = "/git/repos";
 /** The edge's default capability-token scheme; the paste form defaults here but may override. */
 export const DEFAULT_TOKEN_SCHEME = "agent";
+export const MAX_TOKEN_LOGIN_BYTES = 32 * 1024;
+
+function boundedIdentityField(value: unknown, maxBytes: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= maxBytes &&
+    new TextEncoder().encode(value).byteLength <= maxBytes &&
+    !hasControlCharacter(value);
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint <= 0x1f || codePoint === 0x7f) return true;
+  }
+  return false;
+}
 
 /** Derive an honest identity-menu label from the principal id — whoami carries no human display name
  *  for a capability token, so the PII-free principal id IS the honest label (never a fabricated name). */
@@ -81,7 +96,14 @@ export async function runTokenLogin(
   const token = (rawToken ?? "").trim();
   const scheme = (rawScheme ?? "").trim() || DEFAULT_TOKEN_SCHEME;
 
-  if (!token) return { redirectTo: TOKEN_LOGIN_ERROR };
+  if (
+    !token ||
+    token.length > MAX_TOKEN_LOGIN_BYTES ||
+    !/^[\x21-\x7e]+$/.test(token) ||
+    !/^[a-z][a-z0-9_]{0,31}$/.test(scheme)
+  ) {
+    return { redirectTo: TOKEN_LOGIN_ERROR };
+  }
 
   try {
     if ((await deps.isEnabled()) !== true) {
@@ -103,8 +125,9 @@ export async function runTokenLogin(
 
   if (
     !who ||
-    typeof who.principal_id !== "string" ||
-    !who.principal_id ||
+    !boundedIdentityField(who.principal_id, 512) ||
+    !boundedIdentityField(who.tenant, 128) ||
+    !boundedIdentityField(who.region, 128) ||
     !Number.isSafeInteger(who.expires_at) ||
     who.expires_at > Math.floor(Number.MAX_SAFE_INTEGER / 1_000) ||
     who.expires_at <= Math.floor(Date.now() / 1_000)
