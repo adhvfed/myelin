@@ -442,6 +442,12 @@ pub const REFLOG_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 pub const BROWSE_MAX_TREE_ENTRIES: usize = 1_000;
 /// Maximum changed files computed for one interactive pull-request diff.
 pub const PR_DIFF_MAX_FILES: usize = 1_000;
+/// Maximum commit parents represented in interactive metadata (matching the web read contract).
+pub const COMMIT_META_MAX_PARENTS: usize = 64;
+/// Maximum first-line commit summary bytes represented in interactive metadata.
+pub const COMMIT_META_MAX_SUMMARY_BYTES: usize = 8 * 1024;
+/// Maximum author name/email bytes represented in interactive metadata.
+pub const COMMIT_META_MAX_IDENTITY_BYTES: usize = 1_024;
 /// Maximum files materialized for one interactive commit diff.
 pub const COMMIT_DIFF_MAX_FILES: usize = 1_000;
 /// Maximum rendered lines materialized for one file in an interactive commit diff.
@@ -484,17 +490,41 @@ fn is_safe_tree_path(clean: &str) -> bool {
 }
 
 /// Project a libgit2 commit into the PII-free [`CommitMeta`] read shape.
+fn utf8_prefix(value: &str, maximum_bytes: usize) -> String {
+    if value.len() <= maximum_bytes {
+        return value.to_string();
+    }
+    let mut end = maximum_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
 fn commit_meta(c: &git2::Commit<'_>) -> CommitMeta {
     let author = c.author();
     // `Commit::summary` takes `&mut self`; derive the first message line (a `&self` accessor) instead.
     let message = c.message().unwrap_or("");
     CommitMeta {
         oid: c.id().to_string(),
-        summary: message.lines().next().unwrap_or("").to_string(),
-        author_name: author.name().unwrap_or("").to_string(),
-        author_email: author.email().unwrap_or("").to_string(),
+        summary: utf8_prefix(
+            message.lines().next().unwrap_or(""),
+            COMMIT_META_MAX_SUMMARY_BYTES,
+        ),
+        author_name: utf8_prefix(
+            author.name().unwrap_or(""),
+            COMMIT_META_MAX_IDENTITY_BYTES,
+        ),
+        author_email: utf8_prefix(
+            author.email().unwrap_or(""),
+            COMMIT_META_MAX_IDENTITY_BYTES,
+        ),
         time: c.time().seconds(),
-        parents: c.parent_ids().map(|p| p.to_string()).collect(),
+        parents: c
+            .parent_ids()
+            .take(COMMIT_META_MAX_PARENTS)
+            .map(|p| p.to_string())
+            .collect(),
     }
 }
 
@@ -1413,16 +1443,24 @@ impl DurableGitRepo {
     }
 
     /// **Per-entry latest commit via ONE bounded history walk (R3.4 gate decision).** Walks the ref's
-    /// history newest-first up to `cap` commits, resolving the newest commit that touched each immediate
-    /// child of `dir_path`. Entries not resolved within the cap are simply absent from the map (the
-    /// caller renders those rows name-only — graceful degrade, never an N-walk-per-entry blow-up). The
-    /// diff is pathspec-scoped to `dir_path` so a deep repo only pays for that subtree.
-    pub fn latest_commits_in_dir(
+    /// history newest-first up to `cap` commits, resolving only the supplied current directory
+    /// entries. Exact literal pathspecs keep deleted historical siblings out of the diff and result
+    /// map. Entries not resolved within the cap are absent (the caller renders name-only).
+    pub fn latest_commits_for_entries(
         &self,
         ref_name: &str,
         dir_path: &str,
+        entries: &[TreeEntryInfo],
         cap: usize,
     ) -> Result<std::collections::BTreeMap<String, CommitMeta>, DurableError> {
+        if entries.len() > BROWSE_MAX_TREE_ENTRIES {
+            return Err(DurableError::Git(
+                "browse response limit exceeded: tree entry count".into(),
+            ));
+        }
+        if entries.is_empty() || cap == 0 {
+            return Ok(Default::default());
+        }
         let repo = self.open_git()?;
         let Some(tip_commit) = self.resolve_commit(&repo, ref_name)? else {
             return Ok(Default::default());
@@ -1436,6 +1474,8 @@ impl DurableGitRepo {
                 format!("{c}/")
             }
         };
+        let requested: std::collections::BTreeSet<&str> =
+            entries.iter().map(|entry| entry.name.as_str()).collect();
         let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
         walk.set_sorting(git2::Sort::TIME).map_err(|e| git_err("revwalk sort", e))?;
         walk.push(tip).map_err(|e| git_err("revwalk push", e))?;
@@ -1459,8 +1499,14 @@ impl DurableGitRepo {
                 None
             };
             let mut opts = git2::DiffOptions::new();
-            if !prefix.is_empty() {
-                opts.pathspec(prefix.trim_end_matches('/'));
+            opts.disable_pathspec_match(true);
+            for entry in entries {
+                let path = format!("{prefix}{}", entry.name);
+                opts.pathspec(if entry.is_dir {
+                    format!("{path}/")
+                } else {
+                    path
+                });
             }
             let diff = repo
                 .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))
@@ -1477,12 +1523,15 @@ impl DurableGitRepo {
                     };
                     // The immediate child of dir_path (a file directly here, or the dir it lives in).
                     let child = rel.split('/').next().unwrap_or_default();
-                    if child.is_empty() {
+                    if child.is_empty() || !requested.contains(child) {
                         continue;
                     }
                     // First (newest) commit to touch this child wins; later (older) commits don't override.
                     out.entry(child.to_string()).or_insert_with(|| meta.clone());
                 }
+            }
+            if out.len() == requested.len() {
+                break;
             }
         }
         Ok(out)
@@ -3612,15 +3661,116 @@ mod tests {
     fn latest_commits_in_dir_bounded_walk_resolves_entries() {
         let root = temp_root("latest-walk");
         let repo = seed_nested_repo(&root);
-        let map = repo.latest_commits_in_dir("main", "", 500).unwrap();
+        let entries = match repo.tree_at_path("main", "").unwrap() {
+            TreePathLookup::Dir(entries) => entries,
+            _ => panic!("expected root directory"),
+        };
+        let map = repo
+            .latest_commits_for_entries("main", "", &entries, 500)
+            .unwrap();
         // Every top-level entry was introduced by the single seed commit → all resolved.
         assert!(map.contains_key("README.md"));
         assert!(map.contains_key("crates"));
         assert!(map.contains_key("assets"));
         assert_eq!(map["README.md"].summary, "feat: nested seed");
         // A cap of ZERO resolves nothing (graceful degrade → name-only rows), never an error.
-        let none = repo.latest_commits_in_dir("main", "", 0).unwrap();
+        let none = repo
+            .latest_commits_for_entries("main", "", &entries, 0)
+            .unwrap();
         assert!(none.is_empty(), "cap 0 → no per-entry commits, degrade to name-only");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn latest_commit_lookup_ignores_deleted_historical_siblings() {
+        let root = temp_root("latest-current-entries");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let blob = repo.write_blob(b"same\n").expect("blob");
+        let names: Vec<String> = std::iter::once("keep.txt".to_string())
+            .chain((0..=BROWSE_MAX_TREE_ENTRIES).map(|index| format!("removed-{index}.txt")))
+            .collect();
+        let wide_entries: Vec<(&str, &Oid)> = names
+            .iter()
+            .map(|name| (name.as_str(), &blob))
+            .collect();
+        let wide_tree = repo.write_tree(&wide_entries).expect("wide tree");
+        let parent = repo
+            .write_commit(
+                &wide_tree,
+                &[],
+                "wide parent",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
+            .expect("parent commit");
+        let narrow_tree = repo.write_tree(&[("keep.txt", &blob)]).expect("narrow tree");
+        let head = repo
+            .write_commit(
+                &narrow_tree,
+                &[&parent],
+                "delete historical siblings",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
+            .expect("head commit");
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&head),
+            "create",
+            "psn@acme.noreply",
+        )
+        .expect("create ref");
+
+        let entries = match repo.tree_at_path("main", "").unwrap() {
+            TreePathLookup::Dir(entries) => entries,
+            _ => panic!("expected root directory"),
+        };
+        assert_eq!(entries.len(), 1, "the current directory is safely narrow");
+        let map = repo
+            .latest_commits_for_entries("main", "", &entries, 500)
+            .expect("latest commit lookup");
+        assert_eq!(map.len(), 1, "deleted siblings never enter the result map");
+        assert!(map.contains_key("keep.txt"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn commit_metadata_truncates_oversized_summary_at_utf8_boundary() {
+        let root = temp_root("commit-meta-summary");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let blob = repo.write_blob(b"x\n").expect("blob");
+        let tree = repo.write_tree(&[("x.txt", &blob)]).expect("tree");
+        let message = format!("{}é\nbody", "x".repeat(COMMIT_META_MAX_SUMMARY_BYTES - 1));
+        let commit = repo
+            .write_commit(
+                &tree,
+                &[],
+                &message,
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
+            .expect("commit");
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&commit),
+            "create",
+            "psn@acme.noreply",
+        )
+        .expect("create ref");
+
+        let meta = repo
+            .commit_log("refs/heads/main", 0, 1)
+            .unwrap()
+            .0
+            .remove(0);
+        assert_eq!(meta.summary.len(), COMMIT_META_MAX_SUMMARY_BYTES - 1);
+        assert!(meta.summary.is_char_boundary(meta.summary.len()));
+
         std::fs::remove_dir_all(&root).ok();
     }
 }

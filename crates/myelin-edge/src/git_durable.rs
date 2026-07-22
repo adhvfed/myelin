@@ -1076,8 +1076,12 @@ impl DurableGitBackend {
         }
         let readme = read_text_blob_bounded(&repo, &branch_ref, "README.md", README_MAX_BYTES)?;
         let latest = repo.commit_log(&branch_ref, 0, 1)?.0.into_iter().next();
-        let per_entry = repo
-            .latest_commits_in_dir(&branch_ref, "", LATEST_COMMIT_WALK_CAP)?;
+        let per_entry = repo.latest_commits_for_entries(
+            &branch_ref,
+            "",
+            &entries,
+            LATEST_COMMIT_WALK_CAP,
+        )?;
         let entries_json = tree_entries_json(&entries, "", &per_entry);
         Ok(json!({
             "state": "populated",
@@ -1116,8 +1120,12 @@ impl DurableGitBackend {
             ))),
             TreePathLookup::Dir(entries) => {
                 let base = path.trim_matches('/');
-                let per_entry = repo
-                    .latest_commits_in_dir(gitref, base, LATEST_COMMIT_WALK_CAP)?;
+                let per_entry = repo.latest_commits_for_entries(
+                    gitref,
+                    base,
+                    &entries,
+                    LATEST_COMMIT_WALK_CAP,
+                )?;
                 let entries_json = tree_entries_json(&entries, base, &per_entry);
                 // A subtree README renders too (same read-path); binary/absent → no readme.
                 let readme_path = if base.is_empty() {
