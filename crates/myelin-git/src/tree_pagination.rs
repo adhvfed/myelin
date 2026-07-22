@@ -1223,6 +1223,30 @@ mod tests {
             )
             .expect("immutable metadata");
         assert_eq!(immutable["file.txt"].summary, "first snapshot");
+        assert_eq!(
+            fixture
+                .repo
+                .commit_meta_at_oid(&page.snapshot_oid)
+                .expect("snapshot metadata")
+                .expect("snapshot commit")
+                .summary,
+            "first snapshot"
+        );
+        assert!(fixture
+            .repo
+            .commit_meta_at_oid(&Oid::new("malformed"))
+            .expect("malformed oid is a miss")
+            .is_none());
+        assert!(fixture
+            .repo
+            .commit_meta_at_oid(&Oid::new("0".repeat(40)))
+            .expect("absent oid is a miss")
+            .is_none());
+        assert!(fixture
+            .repo
+            .commit_meta_at_oid(&Oid::new(first_tree.to_string()))
+            .expect("tree oid is not a commit")
+            .is_none());
         let mutable = fixture
             .repo
             .latest_commits_for_entries("main", "", &page.entries, 500)
