@@ -453,6 +453,12 @@ pub const REFLOG_MAX_TOTAL_ENTRIES: usize = 100_000;
 pub const REFLOG_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum entries materialized from one tree directory for an interactive browse response.
 pub const BROWSE_MAX_TREE_ENTRIES: usize = 1_000;
+/// Maximum encoded bytes loaded for one tree object during interactive browsing.
+pub const BROWSE_MAX_TREE_OBJECT_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum UTF-8 bytes copied from one tree entry name into an interactive response.
+pub const BROWSE_MAX_TREE_ENTRY_NAME_BYTES: usize = 4 * 1024;
+/// Maximum aggregate tree-entry name bytes copied into one interactive response.
+pub const BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum changed files computed for one interactive pull-request diff.
 pub const PR_DIFF_MAX_FILES: usize = 1_000;
 /// Maximum commit parents represented in interactive metadata (matching the web read contract).
@@ -1137,31 +1143,47 @@ impl DurableGitRepo {
     /// List a ref's TOP-LEVEL tree entries `(name, is_dir)` (empty if the ref does not exist). The repo
     /// home ViewModel's file tree (durable — read from the real on-disk tree, never a seeded list).
     pub fn tree_entries_at_ref(&self, ref_name: &str) -> Result<Vec<(String, bool)>, DurableError> {
-        self.tree_entries_at_ref_bounded(ref_name, BROWSE_MAX_TREE_ENTRIES)
+        self.tree_entries_at_ref_bounded(
+            ref_name,
+            BROWSE_MAX_TREE_ENTRIES,
+            BROWSE_MAX_TREE_OBJECT_BYTES,
+            BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
+            BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES,
+        )
     }
 
     fn tree_entries_at_ref_bounded(
         &self,
         ref_name: &str,
-        maximum: usize,
+        maximum_entries: usize,
+        maximum_tree_bytes: usize,
+        maximum_name_bytes: usize,
+        maximum_total_name_bytes: usize,
     ) -> Result<Vec<(String, bool)>, DurableError> {
         let repo = self.open_git()?;
         let Some(tip) = self.tip_commit(&repo, ref_name)? else {
             return Ok(Vec::new());
         };
         let commit = repo.find_commit(tip).map_err(|e| git_err("find commit", e))?;
-        let tree = commit.tree().map_err(|e| git_err("commit tree", e))?;
-        if tree.len() > maximum {
+        let tree = Self::find_tree_bounded(&repo, commit.tree_id(), maximum_tree_bytes)?;
+        if tree.len() > maximum_entries {
             return Err(DurableError::Git(format!(
-                "browse response limit exceeded: tree contains more than {maximum} entries"
+                "browse response limit exceeded: tree contains more than {maximum_entries} entries"
             )));
         }
         let mut out = Vec::new();
+        let mut total_name_bytes = 0usize;
         for entry in tree.iter() {
             let is_dir = matches!(entry.kind(), Some(git2::ObjectType::Tree));
             let name = entry.name().map_err(|_| {
                 DurableError::Git("tree entry name is not valid UTF-8".into())
             })?;
+            Self::account_tree_entry_name(
+                name,
+                &mut total_name_bytes,
+                maximum_name_bytes,
+                maximum_total_name_bytes,
+            )?;
             out.push((name.to_string(), is_dir));
         }
         out.sort();
@@ -1181,20 +1203,30 @@ impl DurableGitRepo {
         ref_name: &str,
         path: &str,
     ) -> Result<TreePathLookup, DurableError> {
-        self.tree_at_path_bounded(ref_name, path, BROWSE_MAX_TREE_ENTRIES)
+        self.tree_at_path_bounded(
+            ref_name,
+            path,
+            BROWSE_MAX_TREE_ENTRIES,
+            BROWSE_MAX_TREE_OBJECT_BYTES,
+            BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
+            BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES,
+        )
     }
 
     fn tree_at_path_bounded(
         &self,
         ref_name: &str,
         path: &str,
-        maximum: usize,
+        maximum_entries: usize,
+        maximum_tree_bytes: usize,
+        maximum_name_bytes: usize,
+        maximum_total_name_bytes: usize,
     ) -> Result<TreePathLookup, DurableError> {
         let repo = self.open_git()?;
         let Some(commit) = self.resolve_commit(&repo, ref_name)? else {
             return Ok(TreePathLookup::Dir(Vec::new()));
         };
-        let root = commit.tree().map_err(|e| git_err("commit tree", e))?;
+        let root = Self::find_tree_bounded(&repo, commit.tree_id(), maximum_tree_bytes)?;
         let clean = path.trim_matches('/');
         if !is_safe_tree_path(clean) {
             return Ok(TreePathLookup::Missing); // a `..`/absolute path cannot name an in-tree entry.
@@ -1211,35 +1243,40 @@ impl DurableGitRepo {
             };
             match entry.kind() {
                 Some(git2::ObjectType::Tree) => {
-                    let obj = entry.to_object(&repo).map_err(|e| git_err("entry object", e))?;
-                    obj.as_tree()
-                        .cloned()
-                        .ok_or_else(|| DurableError::Git("tree object not a tree".into()))?
+                    Self::find_tree_bounded(&repo, entry.id(), maximum_tree_bytes)?
                 }
                 // A file requested under `tree/` → tell the caller to redirect to the blob route.
                 Some(git2::ObjectType::Blob) => return Ok(TreePathLookup::IsFile),
                 _ => return Ok(TreePathLookup::Missing),
             }
         };
-        if tree.len() > maximum {
+        if tree.len() > maximum_entries {
             return Err(DurableError::Git(format!(
-                "browse response limit exceeded: tree contains more than {maximum} entries"
+                "browse response limit exceeded: tree contains more than {maximum_entries} entries"
             )));
         }
         let mut out = Vec::new();
+        let mut total_name_bytes = 0usize;
+        let odb = repo.odb().map_err(|e| git_err("open object database", e))?;
         for entry in tree.iter() {
             let is_dir = matches!(entry.kind(), Some(git2::ObjectType::Tree));
             let size = if is_dir {
                 None
             } else {
-                let object = entry
-                    .to_object(&repo)
-                    .map_err(|e| git_err("tree entry object", e))?;
-                object.as_blob().map(|blob| blob.size() as u64)
+                let (object_size, object_kind) = odb
+                    .read_header(entry.id())
+                    .map_err(|e| git_err("read tree entry header", e))?;
+                (object_kind == git2::ObjectType::Blob).then_some(object_size as u64)
             };
             let name = entry.name().map_err(|_| {
                 DurableError::Git("tree entry name is not valid UTF-8".into())
             })?;
+            Self::account_tree_entry_name(
+                name,
+                &mut total_name_bytes,
+                maximum_name_bytes,
+                maximum_total_name_bytes,
+            )?;
             out.push(TreeEntryInfo {
                 name: name.to_string(),
                 is_dir,
@@ -1248,6 +1285,48 @@ impl DurableGitRepo {
         }
         out.sort_by(|a, b| (!a.is_dir, &a.name).cmp(&(!b.is_dir, &b.name)));
         Ok(TreePathLookup::Dir(out))
+    }
+
+    fn find_tree_bounded<'r>(
+        repo: &'r git2::Repository,
+        oid: git2::Oid,
+        maximum_bytes: usize,
+    ) -> Result<git2::Tree<'r>, DurableError> {
+        let odb = repo.odb().map_err(|e| git_err("open object database", e))?;
+        let (object_size, object_kind) = odb
+            .read_header(oid)
+            .map_err(|e| git_err("read tree header", e))?;
+        if object_kind != git2::ObjectType::Tree {
+            return Err(DurableError::Git("tree object has the wrong kind".into()));
+        }
+        if object_size > maximum_bytes {
+            return Err(DurableError::Git(format!(
+                "browse response limit exceeded: tree object is larger than {maximum_bytes} bytes"
+            )));
+        }
+        repo.find_tree(oid).map_err(|e| git_err("find tree", e))
+    }
+
+    fn account_tree_entry_name(
+        name: &str,
+        total_name_bytes: &mut usize,
+        maximum_name_bytes: usize,
+        maximum_total_name_bytes: usize,
+    ) -> Result<(), DurableError> {
+        if name.len() > maximum_name_bytes {
+            return Err(DurableError::Git(format!(
+                "browse response limit exceeded: tree entry name is longer than {maximum_name_bytes} bytes"
+            )));
+        }
+        *total_name_bytes = total_name_bytes.checked_add(name.len()).ok_or_else(|| {
+            DurableError::Git("browse response limit exceeded: tree entry name bytes overflowed".into())
+        })?;
+        if *total_name_bytes > maximum_total_name_bytes {
+            return Err(DurableError::Git(format!(
+                "browse response limit exceeded: tree entry names exceed {maximum_total_name_bytes} bytes"
+            )));
+        }
+        Ok(())
     }
 
     /// Read a blob from one exact immutable commit object id. Unlike the browse-oriented
@@ -3667,13 +3746,78 @@ mod tests {
             Err(DurableError::Git(message)) if message.starts_with("browse response limit exceeded:")
         ));
         assert!(matches!(
-            repo.tree_at_path_bounded("main", "", 2),
+            repo.tree_at_path_bounded(
+                "main",
+                "",
+                2,
+                BROWSE_MAX_TREE_OBJECT_BYTES,
+                BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
+                BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES,
+            ),
             Err(DurableError::Git(message)) if message.starts_with("browse response limit exceeded:")
         ));
         assert!(matches!(
-            repo.tree_entries_at_ref_bounded("refs/heads/main", 2),
+            repo.tree_entries_at_ref_bounded(
+                "refs/heads/main",
+                2,
+                BROWSE_MAX_TREE_OBJECT_BYTES,
+                BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
+                BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES,
+            ),
             Err(DurableError::Git(message)) if message.starts_with("browse response limit exceeded:")
         ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn interactive_browse_bounds_tree_object_and_copied_name_bytes() {
+        let root = temp_root("browse-tree-bytes");
+        let repo = seed_nested_repo(&root);
+        let TreePathLookup::Dir(entries) = repo.tree_at_path("main", "").unwrap() else {
+            panic!("root is a directory")
+        };
+        let exact_name_bytes: usize = entries.iter().map(|entry| entry.name.len()).sum();
+
+        assert!(repo
+            .tree_at_path_bounded(
+                "main",
+                "",
+                BROWSE_MAX_TREE_ENTRIES,
+                BROWSE_MAX_TREE_OBJECT_BYTES,
+                BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
+                exact_name_bytes,
+            )
+            .is_ok());
+        assert!(repo
+            .tree_at_path_bounded(
+                "main",
+                "",
+                BROWSE_MAX_TREE_ENTRIES,
+                BROWSE_MAX_TREE_OBJECT_BYTES,
+                BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
+                exact_name_bytes - 1,
+            )
+            .is_err());
+        assert!(repo
+            .tree_at_path_bounded(
+                "main",
+                "",
+                BROWSE_MAX_TREE_ENTRIES,
+                BROWSE_MAX_TREE_OBJECT_BYTES,
+                1,
+                BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES,
+            )
+            .is_err());
+        assert!(repo
+            .tree_at_path_bounded(
+                "main",
+                "",
+                BROWSE_MAX_TREE_ENTRIES,
+                1,
+                BROWSE_MAX_TREE_ENTRY_NAME_BYTES,
+                BROWSE_MAX_TREE_ENTRY_NAMES_TOTAL_BYTES,
+            )
+            .is_err());
         std::fs::remove_dir_all(&root).ok();
     }
 
