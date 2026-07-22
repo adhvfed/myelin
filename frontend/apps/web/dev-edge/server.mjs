@@ -27,6 +27,7 @@ import {
   prDiffJson,
   fileLinesJson,
   prCommitsEnvelope,
+  validPrOperationId,
   devPost,
   repoPrsEnvelope,
   myPrsEnvelope,
@@ -326,6 +327,14 @@ const server = createServer((req, res) => {
     (pm = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/(.+)$/))
   ) {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (pm[3] === "merge" && !validPrOperationId(req.headers["idempotency-key"])) {
+      return send(res, 400, {
+        error: {
+          message: "production PR writes require a valid `Idempotency-Key` header",
+          code: "bad_request",
+        },
+      });
+    }
     let raw = "";
     req.on("data", (c) => (raw += c));
     req.on("end", () => {

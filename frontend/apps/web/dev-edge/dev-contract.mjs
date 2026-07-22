@@ -611,6 +611,14 @@ export function prCommitsEnvelope(repo, n, limit = 50) {
   ];
   return { items, page: { next_cursor: null, limit, offset: 0 } };
 }
+
+/** Mirror `PrOperationId::parse`: production trims one non-empty, bounded ASCII-graphic key. */
+export function validPrOperationId(value) {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  return trimmed.length > 0 && trimmed.length <= 128 && /^[\x21-\x7e]+$/.test(trimmed);
+}
+
 /** POST handlers (stateful). Return the same `{ applied: … }` envelope the edge does. */
 export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.noreply") {
   if (repo !== "myelin" || !SEED_PRS[n]) return { status: 404 };
