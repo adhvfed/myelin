@@ -343,9 +343,11 @@ pub struct SubjectThreads {
 }
 
 impl SubjectThreads {
-    fn next_id(&mut self, prefix: &str) -> String {
-        self.seq += 1;
-        format!("{prefix}-{}", self.seq)
+    fn next_id(&mut self, prefix: &str) -> Result<String, DurableError> {
+        self.seq = self.seq.checked_add(1).ok_or_else(|| {
+            DurableError::Git("PR thread/comment/review id sequence exhausted at u64::MAX".into())
+        })?;
+        Ok(format!("{prefix}-{}", self.seq))
     }
 
     /// A find for a batch by id.
@@ -514,8 +516,8 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         now: i64,
     ) -> Result<ThreadRecord, DurableError> {
         let mut doc = self.load(repo, object_key)?;
-        let tid = doc.next_id("t");
-        let cid = doc.next_id("c");
+        let tid = doc.next_id("t")?;
+        let cid = doc.next_id("c")?;
         let thread = ThreadRecord {
             id: tid,
             anchor,
@@ -547,7 +549,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         now: i64,
     ) -> Result<CommentRecord, DurableError> {
         let mut doc = self.load(repo, object_key)?;
-        let cid = doc.next_id("c");
+        let cid = doc.next_id("c")?;
         let thread = doc
             .threads
             .iter_mut()
@@ -598,7 +600,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         reviewer: ThreadPrincipal,
     ) -> Result<ReviewBatch, DurableError> {
         let mut doc = self.load(repo, object_key)?;
-        let rid = doc.next_id("r");
+        let rid = doc.next_id("r")?;
         let batch = ReviewBatch {
             id: rid,
             advisory: reviewer.kind.is_agent(),
@@ -646,8 +648,8 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             }
             Some(_) => {}
         }
-        let tid = doc.next_id("t");
-        let cid = doc.next_id("c");
+        let tid = doc.next_id("t")?;
+        let cid = doc.next_id("c")?;
         let comment = CommentRecord {
             id: cid,
             author,
@@ -1134,5 +1136,18 @@ mod tests {
         assert_eq!(key_stem("issue:PROJ-1"), "issue_PROJ-1");
         assert_eq!(key_stem("repo:team/app"), "repo_team_app");
         assert!(!key_stem("pr:../../etc").contains('/'));
+    }
+
+    #[test]
+    fn id_sequence_exhaustion_is_loud() {
+        let mut doc = SubjectThreads {
+            seq: u64::MAX,
+            ..Default::default()
+        };
+        let err = doc
+            .next_id("c")
+            .expect_err("the sequence must not wrap and reuse an existing id");
+        assert!(err.to_string().contains("sequence exhausted"));
+        assert_eq!(doc.seq, u64::MAX, "a refused allocation leaves state unchanged");
     }
 }
