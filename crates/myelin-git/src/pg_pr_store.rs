@@ -1299,7 +1299,7 @@ impl PgPrStore {
                 expected_old: PushOid::new(intent.expected_old_oid.clone()),
                 new_oid: head.clone(),
                 forced: false,
-                commit_oids: vec![head],
+                commit_oids: vec![head.clone()],
             }],
             quarantine: Vec::new(),
             pusher: Pusher {
@@ -1319,7 +1319,7 @@ impl PgPrStore {
                         "merge ref adapter did not verify the committed head".into(),
                     ));
                 }
-                let update_seq = moved.first().map(|(_, _, seq)| *seq).unwrap_or(0);
+                let update_seq = accepted_merge_update_seq(&moved, &base, &head)?;
                 self.finalize_merge(scope, repo, number, intent, command_hash, update_seq, ctx)
             }
             PushOutcome::Rejected(_reason) => {
@@ -1760,6 +1760,23 @@ impl PgPrStore {
                 Ok(result.into_attempt())
             })).await
         }).map_err(pg_error)
+    }
+}
+
+fn accepted_merge_update_seq(
+    moved: &[(RefName, PushOid, u64)],
+    expected_ref: &RefName,
+    expected_oid: &PushOid,
+) -> Result<u64, DurableError> {
+    match moved {
+        [(ref_name, oid, update_seq)]
+            if ref_name == expected_ref && oid == expected_oid && *update_seq > 0 =>
+        {
+            Ok(*update_seq)
+        }
+        _ => Err(DurableError::Git(
+            "merge ref adapter returned an invalid committed-move witness".into(),
+        )),
     }
 }
 
@@ -2360,6 +2377,28 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_merge_requires_one_exact_nonzero_move_witness() {
+        let base = RefName::new("refs/heads/main");
+        let head = PushOid::new("0123456789012345678901234567890123456789");
+
+        assert_eq!(
+            accepted_merge_update_seq(&[(base.clone(), head.clone(), 7)], &base, &head)
+                .unwrap(),
+            7
+        );
+        assert!(accepted_merge_update_seq(&[], &base, &head).is_err());
+        assert!(
+            accepted_merge_update_seq(&[(base.clone(), head.clone(), 0)], &base, &head).is_err()
+        );
+        assert!(accepted_merge_update_seq(
+            &[(RefName::new("refs/heads/other"), head, 8)],
+            &base,
+            &PushOid::new("0123456789012345678901234567890123456789"),
+        )
+        .is_err());
+    }
 
     #[test]
     fn schema_is_partition_first_forced_rls_and_has_concurrency_anchors() {
