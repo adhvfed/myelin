@@ -75,8 +75,8 @@ pub use ci_drive_manifest::{
     MAX_CI_DRIVE_MANIFEST_BYTES,
 };
 pub use ci_launch_authority::{
-    CiJobRuntimeAuthority, CiJobRuntimeAuthorityProvider, CiJobRuntimeAuthorityRequest,
-    LinuxSmallV1LaunchAuthority, LINUX_SMALL_V1_POLICY_REVISION,
+    CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority,
+    ManifestBoundCiJobTokenAuthority, LINUX_SMALL_V1_POLICY_REVISION,
 };
 pub use ci_manifest_pipeline::{
     decode_resolved_ci_manifest, drive_resolved_ci_manifest_pipeline, register_ci_manifest_pipeline,
@@ -855,9 +855,12 @@ pub fn ci_run_store_factory(pool: sqlx::PgPool) -> CiRunStore {
 /// runner lane uses: while the startup refusal keeps `MYELIN_CI_RUNNER=1` fail-closed, the factory is
 /// constructed but no minted starter is driven (constructing it wraps the pool + blob client only — no
 /// query runs), so no queued run is started yet. Production construction does bind the real fixed,
-/// default-deny `linux-small-v1` policy; its external durable budget/token provider is explicitly
-/// unavailable and fabricates no handles. Even if accidentally driven, a fresh V2 launch therefore
-/// fails before attempts or manifest state. The activation flip must replace that one provider,
+/// default-deny `linux-small-v1` policy; its operational budget-reservation provider is explicitly
+/// unavailable and fabricates no reservation handle. This is a Tier-P safety/metering floor, not a
+/// Commercial wallet or billing integration. The token-authority reference is already
+/// content-bound to the complete immutable request, but is not a bearer or mint. Even if accidentally
+/// driven, a fresh V2 launch therefore fails before attempts or manifest state. The activation flip
+/// must replace the operational reservation provider,
 /// attach [`PgCiRunStarterPoller`] to coordinated lifecycle shutdown with the deployed definition
 /// pin, compose the exact manifest-to-sandbox runner/token authority and terminal settlement path,
 /// and close the remaining worker budget/remint floors.
@@ -874,7 +877,7 @@ pub fn ci_run_starter_factory(
         region,
         blobs,
         std::sync::Arc::new(ci_launch_authority::LinuxSmallV1LaunchAuthority::new(
-            std::sync::Arc::new(ci_launch_authority::UnavailableCiJobRuntimeAuthority),
+            std::sync::Arc::new(ci_launch_authority::UnavailableCiJobBudgetReservation),
         )),
     )
 }
