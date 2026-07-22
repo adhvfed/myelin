@@ -52,11 +52,21 @@ use crate::receive_pack::{
 /// record from becoming an unbounded point read/list row, and refuse mutations before they persist a
 /// document beyond the same ceiling.
 pub(crate) const PR_RECORD_MAX_BYTES: usize = 2 * 1024 * 1024;
+const BRANCH_PROTECTION_MAX_BYTES: usize = 256 * 1024;
 
 pub(crate) fn ensure_pr_record_size(size: usize) -> Result<(), DurableError> {
     if size > PR_RECORD_MAX_BYTES {
         return Err(DurableError::Git(
             "pull request record limit exceeded: serialized bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_branch_protection_size(size: usize) -> Result<(), DurableError> {
+    if size > BRANCH_PROTECTION_MAX_BYTES {
+        return Err(DurableError::Git(
+            "branch protection limit exceeded: serialized bytes".into(),
         ));
     }
     Ok(())
@@ -597,6 +607,7 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         let dir = self.meta_dir(repo)?;
         let bytes = serde_json::to_vec_pretty(config)
             .map_err(|e| DurableError::Io(format!("serialize branch-protection: {e}")))?;
+        ensure_branch_protection_size(bytes.len())?;
         self.write_atomic(&dir, &self.protection_path(repo)?, &bytes)
     }
 
@@ -606,6 +617,15 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         repo: &RepoLoc,
     ) -> Result<Option<BranchProtectionConfig>, DurableError> {
         let path = self.protection_path(repo)?;
+        match std::fs::metadata(&path) {
+            Ok(metadata) => ensure_branch_protection_size(
+                usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+            )?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(DurableError::Io(format!("stat {}: {error}", path.display())))
+            }
+        }
         match std::fs::read(&path) {
             Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
                 DurableError::Io(format!("parse {}: {e}", path.display()))
@@ -1018,6 +1038,39 @@ mod tests {
         store.put_protection(&loc(), &cfg).unwrap();
         let store2 = DurablePrStore::rooted(&root);
         assert_eq!(store2.get_protection(&loc()).unwrap(), Some(cfg));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn oversized_branch_protection_is_rejected_before_read_or_write() {
+        let root = temp_root("protection-size-bound");
+        let gitstore = DurableGitStore::rooted(&root);
+        gitstore.create_repo(&loc()).unwrap();
+        let store = DurablePrStore::rooted(&root);
+        let config = BranchProtectionConfig {
+            rulesets: vec![BranchProtectionRuleset {
+                ref_pattern: "refs/heads/main".into(),
+                required_contexts: vec!["x".repeat(BRANCH_PROTECTION_MAX_BYTES)],
+                required_approvals: 1,
+                require_codeowner_review: false,
+                require_conversation_resolution: false,
+                allow_force_push: false,
+            }],
+        };
+        assert!(matches!(
+            store.put_protection(&loc(), &config),
+            Err(DurableError::Git(message))
+                if message == "branch protection limit exceeded: serialized bytes"
+        ));
+
+        let path = store.protection_path(&loc()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b'x'; BRANCH_PROTECTION_MAX_BYTES + 1]).unwrap();
+        assert!(matches!(
+            store.get_protection(&loc()),
+            Err(DurableError::Git(message))
+                if message == "branch protection limit exceeded: serialized bytes"
+        ));
         std::fs::remove_dir_all(&root).ok();
     }
 
