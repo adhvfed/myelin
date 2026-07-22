@@ -563,8 +563,12 @@ impl DurableGitBackend {
 
     fn pr_list(&self, loc: &RepoLoc, principal: &Principal) -> Result<Vec<PrRecord>, DurableError> {
         match &self.pg_prs {
-            Some(store) => store.list(&Self::verified_pr_scope(principal, loc)?, &loc.repo),
-            None => self.prs.list(loc),
+            Some(store) => store.list_bounded(
+                &Self::verified_pr_scope(principal, loc)?,
+                &loc.repo,
+                PR_LIST_MAX_RECORDS,
+            ),
+            None => self.prs.list_bounded(loc, PR_LIST_MAX_RECORDS),
         }
     }
 
@@ -3012,6 +3016,10 @@ const LATEST_COMMIT_WALK_CAP: usize = 500;
 /// without limit; normal response pagination happens after this leak-free authorization prefilter.
 const REPO_SCAN_MAX_CANDIDATES: usize = 10_000;
 
+/// Counts and bucket badges require the full already-authorized PR set. Cap that set at the storage
+/// query itself so exact list semantics cannot turn into an unbounded filesystem/SQL materialization.
+const PR_LIST_MAX_RECORDS: usize = 10_000;
+
 /// The inline-text cap for a blob view (R3.4). The ODB header is checked first: a larger object gets
 /// a metadata-only download fallback and is never inflated merely to build the interactive page.
 const BLOB_INLINE_CAP: usize = 512 * 1024;
@@ -3219,6 +3227,9 @@ fn map_durable_err(e: DurableError) -> EdgeError {
         }
         DurableError::Git(m) if m.starts_with("commit diff computation limit exceeded:") => {
             EdgeError::PayloadTooLarge("commit diff exceeds the interactive content limit".into())
+        }
+        DurableError::Git(m) if m.starts_with("pull request list limit exceeded:") => {
+            EdgeError::PayloadTooLarge("pull request list exceeds the interactive record limit".into())
         }
         // A traversal-rejected slug / malformed body (e.g. R3.1 open-PR with no `title`) surfaces as a
         // clean 400 (never a silent wrong path, never a 500 for a client input error).
@@ -5522,6 +5533,10 @@ mod pr_list_tests {
             (
                 "commit diff computation limit exceeded: private repository detail",
                 "commit diff exceeds the interactive content limit",
+            ),
+            (
+                "pull request list limit exceeded: private repository detail",
+                "pull request list exceeds the interactive record limit",
             ),
         ] {
             let mapped = map_durable_err(DurableError::Git(private.into()));

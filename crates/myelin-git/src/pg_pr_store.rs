@@ -497,6 +497,17 @@ impl PgPrStore {
     }
 
     pub fn list(&self, scope: &TenantScope, repo: &str) -> Result<Vec<PrRecord>, DurableError> {
+        self.list_bounded(scope, repo, usize::MAX)
+    }
+
+    /// Fetch at most one row beyond the caller's ceiling, so interactive list/count projections can
+    /// detect a pathological repository without materializing its entire PR relation in process.
+    pub fn list_bounded(
+        &self,
+        scope: &TenantScope,
+        repo: &str,
+        maximum_records: usize,
+    ) -> Result<Vec<PrRecord>, DurableError> {
         let target = self.scoped_target(scope, repo)?;
         let provider = self.provider.clone();
         let kms = self.kms.clone();
@@ -506,6 +517,7 @@ impl PgPrStore {
         let transaction_tenant = tenant_id.0.clone();
         let crypto_region = region.clone();
         let expected_tenant = tenant_id.0.clone();
+        let fetch_limit = i64::try_from(maximum_records.saturating_add(1)).unwrap_or(i64::MAX);
         let rows = self
             .block_on(async move {
                 provider
@@ -513,12 +525,14 @@ impl PgPrStore {
                         Box::pin(async move {
                             let list_sql = format!(
                                 "SELECT {PR_RECORD_COLUMNS} FROM git_pr \
-                                 WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 ORDER BY number"
+                                 WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 \
+                                 ORDER BY number LIMIT $4"
                             );
                             sqlx::query(&list_sql)
                                 .bind(&tenant_id.0)
                                 .bind(&region.0)
                                 .bind(&loc.repo)
+                                .bind(fetch_limit)
                                 .fetch_all(&mut *conn)
                                 .await
                                 .map_err(|_| pg_query("list PRs"))
@@ -527,6 +541,11 @@ impl PgPrStore {
                     .await
             })
             .map_err(pg_error)?;
+        if rows.len() > maximum_records {
+            return Err(DurableError::Git(
+                "pull request list limit exceeded: record count".into(),
+            ));
+        }
         rows.into_iter()
             .map(|row| decode_record(&kms, &crypto_region, &expected_tenant, row))
             .collect()
