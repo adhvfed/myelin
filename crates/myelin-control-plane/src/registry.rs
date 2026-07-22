@@ -249,7 +249,7 @@ pub(crate) fn durable_to_placement(r: &DurablePlacementRow) -> Option<TenantPlac
 /// routing — the correct-but-latent shape MR-009b kills. Mirrors the W3b.4 fail-loud boot posture
 /// and the `KmsEngine` durable-mutation panic (no error variant exists on this legacy-sync surface;
 /// converting the infallible signatures to `Result` is the named W5-residual ripple wave).
-fn placement_db_panic(op: &str, why: &dyn core::fmt::Display) -> ! {
+pub(crate) fn placement_db_panic(op: &str, why: &dyn core::fmt::Display) -> ! {
     panic!(
         "control-plane placement registry: durable {op} FAILED (fail-static loud — the placement \
          registry is the routing system-of-record; the write/read did NOT complete and there is no \
@@ -259,7 +259,7 @@ fn placement_db_panic(op: &str, why: &dyn core::fmt::Display) -> ! {
 
 /// Fail-static LOUD on a corrupt durable row (an unknown status/tier text): the closed enums fail
 /// CLOSED — a row that cannot round-trip is never silently skipped or coerced.
-fn corrupt_row_panic(table: &str, key: &str) -> ! {
+pub(crate) fn corrupt_row_panic(table: &str, key: &str) -> ! {
     panic!(
         "control-plane placement registry: durable `{table}` row `{key}` carries an unknown \
          status/tier text — fail closed (the closed enums admit no silent coercion; the row is \
