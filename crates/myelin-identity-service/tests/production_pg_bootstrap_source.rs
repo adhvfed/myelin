@@ -3,14 +3,16 @@ mod support;
 
 #[test]
 fn production_identity_uses_split_role_bootstrap() {
+    let source = include_str!("../src/main.rs");
     support::assert_split_role_source(
-        include_str!("../src/main.rs"),
+        source,
         "identity_service_migrations()",
-        "serve(identity_app_spec",
+        "serve_until_shutdown(\n        identity_app_spec",
     );
     support::assert_missing_migration_credential_fails_before_serve(
         env!("CARGO_BIN_EXE_identity"),
         "identity",
         "identity service failed",
     );
+    assert!(source.contains("SignalKind::terminate()"));
 }
