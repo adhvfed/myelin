@@ -20,4 +20,7 @@ fn production_mcp_requires_both_git_pr_indexes_before_runtime_handoff() {
     assert!(migrations < head_index);
     assert!(head_index < operation_index);
     assert!(operation_index < handoff);
+    assert!(source.contains("signal = shutdown_signal()"));
+    assert!(source.contains("SignalKind::terminate()"));
+    assert!(source.contains("server.teardown();"));
 }

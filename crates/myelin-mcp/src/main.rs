@@ -899,8 +899,8 @@ async fn run_stdio_signal_aware(server: McpServer) -> Result<(), String> {
     let mut stdout = io::stdout().lock();
     let result = loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                break signal.map_err(|error| format!("shutdown signal failed: {error}"));
+            signal = shutdown_signal() => {
+                break signal;
             }
             item = rx.recv() => match item {
                 Some(Input::Frame(frame)) => {
@@ -947,6 +947,33 @@ async fn run_stdio_signal_aware(server: McpServer) -> Result<(), String> {
     };
     server.teardown();
     result
+}
+
+/// Wait for terminal or process-manager shutdown. Either signal exits through `server.teardown()`
+/// above so session-scoped run-token authority is revoked before the stdio process returns.
+async fn shutdown_signal() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|error| format!("failed to install SIGTERM handler: {error}"))?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.map_err(|error| format!("failed while waiting for SIGINT: {error}"))
+            }
+            signal = terminate.recv() => {
+                signal
+                    .map(|_| ())
+                    .ok_or_else(|| "SIGTERM stream closed unexpectedly".to_string())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| format!("failed while waiting for shutdown signal: {error}"))
+    }
 }
 
 fn drain_through_newline_bounded(reader: &mut impl BufRead) -> io::Result<()> {
