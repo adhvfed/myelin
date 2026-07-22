@@ -217,7 +217,7 @@ fn gitcore_seam_clones_via_canonical_wire_then_diffs_and_blames_via_gix() {
 
     // read_blob in-process returns the exact bytes.
     let bytes = core
-        .read_blob(&repo, &myelin_git::core::Oid::new(&blob2))
+        .read_blob_bounded(&repo, &myelin_git::core::Oid::new(&blob2), 1024)
         .expect("in-process read_blob");
     assert_eq!(bytes, b"alpha\nBETA-changed\ngamma\ndelta\n");
 
