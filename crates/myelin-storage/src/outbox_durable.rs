@@ -180,6 +180,19 @@ impl myelin_events::DurableOutboxBacking for PgOutboxBacking {
         })
     }
 
+    fn try_retained_rows_bounded(
+        &self,
+        maximum_rows: usize,
+        maximum_envelope_bytes: usize,
+    ) -> Result<Vec<OutboxRow>> {
+        self.block(async {
+            self.relay()
+                .retained_rows_bounded(maximum_rows, maximum_envelope_bytes)
+                .await
+                .map_err(|e| OutboxError(e.to_string()))
+        })
+    }
+
     fn dead_letters(&self) -> Vec<OutboxRow> {
         let rows = self.block(async { self.relay().dead_rows().await });
         require_outbox_read("dead-letter rows", rows)

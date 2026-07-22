@@ -17,13 +17,16 @@ use myelin_events::{
 use myelin_git::core::RepoLoc;
 use myelin_git::durable::{DurableGitRepo, DurableGitStore};
 use myelin_git::reconcile::{
-    reconcile_refs, refs_from_outbox_scoped, repo_slugs_from_outbox_scoped,
+    reconcile_refs, refs_from_outbox_scoped_bounded, repo_slugs_from_outbox_scoped_bounded,
 };
 use myelin_git::receive_pack::{
     CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher, RefName,
     RefStore,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+
+const SNAPSHOT_MAX_ROWS: usize = 100;
+const SNAPSHOT_MAX_BYTES: usize = 1024 * 1024;
 
 fn temp_root(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -138,7 +141,14 @@ fn malformed_scoped_retained_witnesses_fail_discovery_and_replay_loudly() {
             "new_oid":"aaaa", "pusher_pseudonym":"git-event:pusher"
         }),
     ));
-    assert!(repo_slugs_from_outbox_scoped(&discovery, "acme", "fr-par").is_err());
+    assert!(repo_slugs_from_outbox_scoped_bounded(
+        &discovery,
+        "acme",
+        "fr-par",
+        SNAPSHOT_MAX_ROWS,
+        SNAPSHOT_MAX_BYTES,
+    )
+    .is_err());
 
     let replay = OutboxStore::new();
     replay.restore_committed_row_for_test(retained_ref_witness(
@@ -149,7 +159,14 @@ fn malformed_scoped_retained_witnesses_fail_discovery_and_replay_loudly() {
         }),
     ));
     assert!(
-        refs_from_outbox_scoped(&replay, "acme", "fr-par", "core")
+        refs_from_outbox_scoped_bounded(
+            &replay,
+            "acme",
+            "fr-par",
+            "core",
+            SNAPSHOT_MAX_ROWS,
+            SNAPSHOT_MAX_BYTES,
+        )
             .unwrap()
             .is_empty(),
         "a fully valid different-repository witness is the only skippable payload"
@@ -161,7 +178,15 @@ fn malformed_scoped_retained_witnesses_fail_discovery_and_replay_loudly() {
             "update_seq":1, "pusher_pseudonym":"git-event:pusher"
         }),
     ));
-    assert!(refs_from_outbox_scoped(&replay, "acme", "fr-par", "core").is_err());
+    assert!(refs_from_outbox_scoped_bounded(
+        &replay,
+        "acme",
+        "fr-par",
+        "core",
+        SNAPSHOT_MAX_ROWS,
+        SNAPSHOT_MAX_BYTES,
+    )
+    .is_err());
 }
 
 /// **THE CRASH-WINDOW PROOF.** A push is crashed AFTER the outbox committed but BEFORE the on-disk ref
@@ -243,7 +268,33 @@ fn reconciler_recovers_the_apply_after_outbox_commit_window_idempotently_fsck_cl
     // events through the reconciler.
     let store2 = DurableGitStore::rooted(&root);
     let repo2 = store2.open_repo(&loc).expect("open after restart");
-    let records = refs_from_outbox_scoped(&outbox, "acme", "fr-par", "core").unwrap();
+    assert!(refs_from_outbox_scoped_bounded(
+        &outbox,
+        "acme",
+        "fr-par",
+        "core",
+        1,
+        SNAPSHOT_MAX_BYTES,
+    )
+    .is_err());
+    assert!(refs_from_outbox_scoped_bounded(
+        &outbox,
+        "acme",
+        "fr-par",
+        "core",
+        SNAPSHOT_MAX_ROWS,
+        0,
+    )
+    .is_err());
+    let records = refs_from_outbox_scoped_bounded(
+        &outbox,
+        "acme",
+        "fr-par",
+        "core",
+        SNAPSHOT_MAX_ROWS,
+        SNAPSHOT_MAX_BYTES,
+    )
+    .unwrap();
     assert_eq!(records.len(), 1, "same-slug foreign tenant row excluded");
     let report = reconcile_refs(&repo2, &records).expect("reconcile");
     assert_eq!(

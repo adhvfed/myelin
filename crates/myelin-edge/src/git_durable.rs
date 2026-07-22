@@ -436,8 +436,14 @@ impl DurableGitBackend {
     ) -> Result<myelin_git::reconcile::ReconcileReport, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?;
-        let records =
-            myelin_git::reconcile::refs_from_outbox_scoped(&self.outbox, tenant, region, slug)?;
+        let records = myelin_git::reconcile::refs_from_outbox_scoped_bounded(
+            &self.outbox,
+            tenant,
+            region,
+            slug,
+            BOOT_RECOVERY_MAX_RETAINED_OUTBOX_ROWS,
+            BOOT_RECOVERY_MAX_RETAINED_OUTBOX_BYTES,
+        )?;
         myelin_git::reconcile::reconcile_refs(&repo, &records)
     }
 
@@ -466,8 +472,13 @@ impl DurableGitBackend {
             )?,
             None => Vec::new(),
         };
-        let mut repos =
-            myelin_git::reconcile::repo_slugs_from_outbox_scoped(&self.outbox, tenant, region)?;
+        let mut repos = myelin_git::reconcile::repo_slugs_from_outbox_scoped_bounded(
+            &self.outbox,
+            tenant,
+            region,
+            BOOT_RECOVERY_MAX_RETAINED_OUTBOX_ROWS,
+            BOOT_RECOVERY_MAX_RETAINED_OUTBOX_BYTES,
+        )?;
         repos.extend(pending.iter().map(|item| item.repo_slug.clone()));
 
         let mut report = GitBootRecoveryReport::default();
@@ -3040,6 +3051,8 @@ const PR_LIST_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// become an unbounded startup allocation.
 const BOOT_RECOVERY_MAX_PENDING_MERGES: usize = 10_000;
 const BOOT_RECOVERY_MAX_PENDING_MERGE_BYTES: usize = 64 * 1024 * 1024;
+const BOOT_RECOVERY_MAX_RETAINED_OUTBOX_ROWS: usize = 100_000;
+const BOOT_RECOVERY_MAX_RETAINED_OUTBOX_BYTES: usize = 256 * 1024 * 1024;
 
 /// The inline-text cap for a blob view (R3.4). The ODB header is checked first: a larger object gets
 /// a metadata-only download fallback and is never inflated merely to build the interactive page.

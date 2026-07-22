@@ -23,7 +23,8 @@
 //! which RESET on a ref's delete+recreate and broke the fence — the generation is now a monotonic
 //! config-backed counter keyed by ref name.) The committed events come from the already-frozen
 //! [`myelin_events::OutboxStore`] (in production the durable `outbox` table);
-//! [`refs_from_outbox_scoped`] extracts rows for one exact tenant/region/repository authority tuple.
+//! [`refs_from_outbox_scoped_bounded`] extracts rows for one exact tenant/region/repository authority
+//! tuple under explicit retained-snapshot limits.
 
 use crate::core::Oid;
 use crate::durable::{DurableError, DurableGitRepo};
@@ -108,14 +109,16 @@ impl GitRefUpdatedRecord {
 /// tuple. Repository slugs are tenant-local, so filtering only the payload slug can replay another
 /// tenant's same-named event into this repository. Authority is therefore checked on the envelope
 /// before the payload is decoded.
-pub fn refs_from_outbox_scoped(
+pub fn refs_from_outbox_scoped_bounded(
     outbox: &OutboxStore,
     tenant: &str,
     region: &str,
     repo: &str,
+    maximum_retained_rows: usize,
+    maximum_envelope_bytes: usize,
 ) -> Result<Vec<GitRefUpdatedRecord>, DurableError> {
     outbox
-        .try_retained_rows()
+        .try_retained_rows_bounded(maximum_retained_rows, maximum_envelope_bytes)
         .map_err(|_| DurableError::Io("durable outbox witness snapshot failed".into()))?
         .into_iter()
         .filter(|row| row.envelope.type_.0 == GIT_REF_UPDATED)
@@ -128,13 +131,15 @@ pub fn refs_from_outbox_scoped(
 /// Repository slugs that have committed ref witnesses in one exact tenant/region partition. This is
 /// the durable boot-recovery discovery set; callers union it with repositories named by pending PR
 /// merge intents and never infer recovery authority from filesystem directory names.
-pub fn repo_slugs_from_outbox_scoped(
+pub fn repo_slugs_from_outbox_scoped_bounded(
     outbox: &OutboxStore,
     tenant: &str,
     region: &str,
+    maximum_retained_rows: usize,
+    maximum_envelope_bytes: usize,
 ) -> Result<BTreeSet<String>, DurableError> {
     outbox
-        .try_retained_rows()
+        .try_retained_rows_bounded(maximum_retained_rows, maximum_envelope_bytes)
         .map_err(|_| DurableError::Io("durable outbox witness snapshot failed".into()))?
         .into_iter()
         .filter(|row| row.envelope.type_.0 == GIT_REF_UPDATED)
