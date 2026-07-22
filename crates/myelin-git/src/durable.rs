@@ -1179,6 +1179,21 @@ impl DurableGitRepo {
         Self::read_blob_from_commit(&repo, &commit, path, maximum_bytes)
     }
 
+    /// Resolve only the blob object id for a path. The tree entry is authoritative, so callers that
+    /// need a CAS base do not have to inflate or copy the blob contents first.
+    pub fn blob_oid_at_path(
+        &self,
+        ref_name: &str,
+        path: &str,
+    ) -> Result<Option<Oid>, DurableError> {
+        match self.read_blob_at_path_bounded(ref_name, path, 0)? {
+            BlobPathLookup::Found { oid, .. } | BlobPathLookup::TooLarge { oid, .. } => {
+                Ok(Some(oid))
+            }
+            BlobPathLookup::IsDir | BlobPathLookup::Missing => Ok(None),
+        }
+    }
+
     fn read_blob_from_commit(
         repo: &git2::Repository,
         commit: &git2::Commit<'_>,
@@ -3364,7 +3379,7 @@ mod tests {
         let repo = seed_nested_repo(&root);
 
         // A nested TEXT blob: not binary, real size, real oid.
-        let BlobPathLookup::Found { bytes, is_binary, size, .. } =
+        let BlobPathLookup::Found { bytes, oid, is_binary, size } =
             repo.read_blob_at_path("main", "crates/inner/deep.rs").unwrap()
         else {
             panic!("deep.rs is a blob");
@@ -3372,6 +3387,10 @@ mod tests {
         assert!(!is_binary, "a text file is not binary");
         assert_eq!(size as usize, bytes.len());
         assert!(String::from_utf8_lossy(&bytes).contains("deep"));
+        assert_eq!(
+            repo.blob_oid_at_path("main", "crates/inner/deep.rs").unwrap(),
+            Some(oid)
+        );
         assert!(matches!(
             repo.read_blob_at_path_bounded("main", "crates/inner/deep.rs", 1).unwrap(),
             BlobPathLookup::TooLarge { size, maximum: 1, oid } if size > 1 && oid.as_str().len() == 40

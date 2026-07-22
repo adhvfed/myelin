@@ -1330,10 +1330,11 @@ impl DurableGitBackend {
         let repo = Arc::new(self.store.open_repo(&loc)?);
         let full = format!("refs/heads/{gitref}");
 
-        // GF-6: the current blob oid (or "" for a new file) is the CAS base.
+        // GF-6: the current blob oid (or "" for a new file) is the CAS base. The oid comes directly
+        // from the tree entry; never inflate a potentially huge existing file merely to compare it.
         let current_base = repo
-            .read_file_at_ref(&full, path)?
-            .map(|(_, oid)| oid.0)
+            .blob_oid_at_path(&full, path)?
+            .map(|oid| oid.0)
             .unwrap_or_default();
 
         // The pure GF-6 CAS (reused) — a stale base refuses honestly (no silent overwrite).
