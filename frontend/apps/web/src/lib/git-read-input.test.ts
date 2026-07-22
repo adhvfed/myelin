@@ -11,6 +11,8 @@ import {
   parseGitRepoInput,
   parseGitRepoPrsInput,
   parseGitRefsInput,
+  parseGitTreeInput,
+  gitTreeSearchParams,
   gitRefsSearchParams,
 } from "./git-read-input";
 
@@ -21,6 +23,13 @@ describe("Git read RPC inputs", () => {
     expect(parseGitRepoInput("team/core")).toEqual({ repo: "team/core" });
     expect(parseGitBrowseInput({ repo: "core", ref: "feature/x", path: "src/x" }, false))
       .toEqual({ repo: "core", ref: "feature/x", path: "src/x" });
+    expect(parseGitTreeInput({
+      repo: "core", ref: "refs/heads/main", path: "", limit: 100,
+      cursor: "gt1_a-b_c", q: "readme & docs",
+    })).toEqual({
+      repo: "core", ref: "refs/heads/main", path: "", limit: 100,
+      cursor: "gt1_a-b_c", q: "readme & docs",
+    });
     expect(parseGitCommitsInput({ repo: "core", ref: "main", cursor: "opaque" }))
       .toEqual({ repo: "core", ref: "main", cursor: "opaque" });
     expect(parseGitCommitInput({ repo: "core", oid: OID })).toEqual({ repo: "core", oid: OID });
@@ -50,6 +59,13 @@ describe("Git read RPC inputs", () => {
     );
   });
 
+  it("encodes tree pagination and search only through URLSearchParams", () => {
+    expect(gitTreeSearchParams({
+      repo: "core", ref: "refs/heads/main", path: "", limit: 100,
+      cursor: "gt1_a-b_c", q: "readme & docs",
+    }).toString()).toBe("limit=100&cursor=gt1_a-b_c&q=readme+%26+docs");
+  });
+
   it.each([
     "refs/heads/feature@two",
     "refs/heads/topic/a.b",
@@ -64,6 +80,13 @@ describe("Git read RPC inputs", () => {
     () => parseGitBrowseInput({ repo: "core", ref: "main", path: "", surprise: true }, true),
     () => parseGitBrowseInput({ repo: "core", ref: "main\nnext", path: "x" }, false),
     () => parseGitBrowseInput({ repo: "core", ref: "main", path: "" }, false),
+    () => parseGitBrowseInput({ repo: "core", ref: "main", path: "", limit: 1 }, true),
+    () => parseGitTreeInput({ repo: "core", ref: "main", path: "", limit: 0 }),
+    () => parseGitTreeInput({ repo: "core", ref: "main", path: "", limit: 101 }),
+    () => parseGitTreeInput({ repo: "core", ref: "main", path: "", cursor: "opaque" }),
+    () => parseGitTreeInput({ repo: "core", ref: "main", path: "", cursor: "gt1_bad\n" }),
+    () => parseGitTreeInput({ repo: "core", ref: "main", path: "", q: "x".repeat(257) }),
+    () => parseGitTreeInput({ repo: "core", ref: "main", path: "", surprise: true }),
     () => parseGitCommitsInput({ repo: "core", ref: "main", cursor: "x\nsmuggled" }),
     () => parseGitCommitInput({ repo: "core", oid: OID.toUpperCase() }),
     () => parseGitPrInput({ repo: "core", n: 0 }),

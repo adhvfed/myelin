@@ -9,12 +9,14 @@ import type {
   ReposPage,
   TreeVM,
 } from "./api";
+import { isFullGitRef } from "./git-read-input";
 
 const MAX_TEXT_BYTES = 512 * 1024;
 const MAX_PATH_BYTES = 4 * 1024;
 const MAX_REPO_ENTRIES = 1_000;
 const MAX_REF_BYTES = 4 * 1024;
 const MAX_REF_CURSOR_BYTES = 8 * 1024;
+const MAX_TREE_CURSOR_BYTES = 8 * 1024;
 const MAX_LEGACY_REFS = 1_000;
 const utf8 = new TextEncoder();
 type WireRecord = Record<string, unknown>;
@@ -42,6 +44,18 @@ function uint(value: unknown): value is number {
 
 function gitOid(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+}
+
+function treeCursor(value: unknown): value is string {
+  return displayText(value, MAX_TREE_CURSOR_BYTES) && /^gt1_[A-Za-z0-9_-]+$/.test(value);
+}
+
+function treePage(value: unknown): { next_cursor: string | null; limit: number } | null {
+  const page = record(value);
+  if (!page || (page.next_cursor !== null && !treeCursor(page.next_cursor)) ||
+      !Number.isSafeInteger(page.limit) || (page.limit as number) < 1 ||
+      (page.limit as number) > 100) return null;
+  return { next_cursor: page.next_cursor as string | null, limit: page.limit as number };
 }
 
 function repoSlug(value: unknown): value is string {
@@ -102,6 +116,9 @@ export function parseRepoHome(value: unknown): RepoHomeVM | null {
     default_branch: home.default_branch,
     ...(home.clone_url === undefined ? {} : { clone_url: home.clone_url }),
   };
+  const modernPagination = home.snapshot_oid !== undefined || home.entries_page !== undefined;
+  if (state === "populated" && modernPagination &&
+      (home.snapshot_oid === undefined || home.entries_page === undefined)) return null;
   if (home.counts !== undefined) {
     const counts = record(home.counts);
     if (!counts || !uint(counts.branches) || !uint(counts.tags)) return null;
@@ -118,6 +135,25 @@ export function parseRepoHome(value: unknown): RepoHomeVM | null {
     const entries = home.entries.map(repoEntry);
     if (!entries.every((entry): entry is RepoEntry => entry !== null)) return null;
     result.entries = entries;
+  }
+  if (home.snapshot_oid !== undefined) {
+    if (!gitOid(home.snapshot_oid)) return null;
+    result.snapshot_oid = home.snapshot_oid;
+  }
+  if (home.entries_page !== undefined) {
+    const entriesPage = record(home.entries_page);
+    const page = treePage(entriesPage);
+    if (!entriesPage || !page || !isFullGitRef(entriesPage.ref) ||
+        !gitOid(entriesPage.snapshot_oid) ||
+        (result.entries !== undefined && result.entries.length > page.limit) ||
+        (result.snapshot_oid !== undefined && result.snapshot_oid !== entriesPage.snapshot_oid)) {
+      return null;
+    }
+    result.entries_page = {
+      ref: entriesPage.ref,
+      snapshot_oid: entriesPage.snapshot_oid,
+      ...page,
+    };
   }
   if (home.latest_commit !== undefined) {
     const latest = commitBrief(home.latest_commit);
@@ -231,9 +267,23 @@ export function parseTree(value: unknown): TreeVM | null {
       (tree.readme !== undefined && tree.readme !== null && !bounded(tree.readme, MAX_TEXT_BYTES))) {
     return null;
   }
+  if (tree.redirect_to_blob === true) {
+    return {
+      ...(tree.ref === undefined ? {} : { ref: tree.ref as string }),
+      ...(tree.path === undefined ? {} : { path: tree.path as string }),
+      redirect_to_blob: true,
+    };
+  }
+  const modern = tree.page !== undefined || tree.snapshot_oid !== undefined;
+  const page = modern ? treePage(tree.page) : null;
+  if (modern && (!page || !gitOid(tree.snapshot_oid) || !displayText(tree.ref, 1_024) ||
+      !tree.ref || (tree.path !== "" && !repoPath(tree.path)) || !Array.isArray(tree.entries))) {
+    return null;
+  }
   let parsedEntries: RepoEntry[] | undefined;
   if (tree.entries !== undefined) {
-    if (!Array.isArray(tree.entries) || tree.entries.length > MAX_REPO_ENTRIES) return null;
+    const maximum = modern ? page!.limit : MAX_REPO_ENTRIES;
+    if (!Array.isArray(tree.entries) || tree.entries.length > maximum) return null;
     const candidate = tree.entries.map(repoEntry);
     if (!candidate.every((entry): entry is RepoEntry => entry !== null)) return null;
     parsedEntries = candidate;
@@ -244,6 +294,7 @@ export function parseTree(value: unknown): TreeVM | null {
     ...(parsedEntries === undefined ? {} : { entries: parsedEntries }),
     ...(typeof tree.readme === "string" ? { readme: tree.readme } : {}),
     ...(tree.redirect_to_blob === undefined ? {} : { redirect_to_blob: tree.redirect_to_blob }),
+    ...(modern ? { snapshot_oid: tree.snapshot_oid as string, page: page! } : {}),
   };
 }
 
