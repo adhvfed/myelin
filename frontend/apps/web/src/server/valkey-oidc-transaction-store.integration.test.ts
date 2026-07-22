@@ -4,6 +4,7 @@ import Redis from "ioredis";
 import { describe, expect, it } from "vitest";
 
 import {
+  MAX_STORED_OIDC_TRANSACTION_BYTES,
   OIDC_TRANSACTION_KEY_PREFIX,
   ValkeyOidcTransactionStore,
 } from "./oidc-transaction-store";
@@ -35,6 +36,23 @@ describe.runIf(Boolean(redisUrl))("ValkeyOidcTransactionStore integration", () =
       admin.disconnect(false);
       first.close();
       second.close();
+    }
+  });
+
+  it("atomically deletes an oversized stored transaction before decryption", async () => {
+    const store = new ValkeyOidcTransactionStore(redisUrl!, encryptionKey);
+    const admin = new Redis(redisUrl!);
+    const state = randomBytes(32).toString("base64url");
+    const key = `${OIDC_TRANSACTION_KEY_PREFIX}${state}`;
+
+    try {
+      await admin.set(key, "x".repeat(MAX_STORED_OIDC_TRANSACTION_BYTES + 1));
+      expect(await store.consume(state)).toBeNull();
+      expect(await admin.exists(key)).toBe(0);
+    } finally {
+      await admin.del(key);
+      admin.disconnect(false);
+      store.close();
     }
   });
 });
