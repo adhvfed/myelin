@@ -7,7 +7,9 @@
 // Toast); semantic-tokens-only; a11y per the design manual (landmarks, skip link, aria-current).
 import {
   For,
+  Match,
   Show,
+  Switch,
   createContext,
   createEffect,
   createSignal,
@@ -21,6 +23,7 @@ import { A, useAction, useLocation, useNavigate } from "@solidjs/router";
 import { Icon, Menu, Dialog, useToast, type IconName, type MenuItemSpec } from "@myelin/design-system";
 import { logout, type Viewer } from "../lib/auth";
 import { createInbox } from "../lib/notifications";
+import { inboxReasonLabel } from "../lib/inbox-response";
 import { CommandPalette, type Command } from "./CommandPalette";
 
 /** The shell context a nested route uses to fill the shell-owned context-pane region (§1b). A route
@@ -138,10 +141,11 @@ export function AppShell(props: AppShellProps) {
   const paneThunk = (): (() => JSX.Element) | null => ctxPaneThunk();
   const hasPane = () => paneThunk() != null;
   const paneLabel = () => ctxPaneLabel();
-  // The inbox binds to REAL notification state (empty today — the honest floor), never a hardcoded
-  // count or demo rows.
+  // The inbox binds to the authenticated durable read surface, never a hardcoded count or demo row.
   const inbox = createInbox();
   const inboxLabel = () => {
+    if (inbox.availability() === "loading") return "Inbox, notifications loading";
+    if (inbox.availability() === "unavailable") return "Inbox, notifications unavailable";
     const n = inbox.unreadCount();
     if (n === 0) return "Inbox, no unread notifications";
     return `Inbox, ${n} unread notification${n === 1 ? "" : "s"}`;
@@ -303,9 +307,8 @@ export function AppShell(props: AppShellProps) {
             </button>
           </Show>
 
-          {/* Inbox affordance — glyph + a visible unread COUNT badge (never color-only; WCAG 1.4.1).
-              Badge + aria-label are driven by REAL notification state: ZERO unread → NO badge, and
-              the accessible name says "no unread notifications" (dissolves firstrun #3 fake inbox). */}
+          {/* Inbox affordance — the count is shown only after a successful durable read. Loading or
+              unavailable data can never masquerade as a real zero. */}
           <button
             type="button"
             class="inbox-button"
@@ -323,7 +326,7 @@ export function AppShell(props: AppShellProps) {
             }}
           >
             <Icon name="inbox" />
-            <Show when={inbox.unreadCount() > 0}>
+            <Show when={inbox.availability() === "ready" && inbox.unreadCount() > 0}>
               <span
                 data-testid="inbox-badge"
                 aria-hidden="true"
@@ -484,11 +487,32 @@ export function AppShell(props: AppShellProps) {
         description="Things that need you land here."
         size="sm"
       >
-        {/* Bound to REAL notification state. Empty today (the honest floor — the durable inbox
-            endpoint + its SSE delivery are a later wiring); NEVER fabricated rows. */}
-        <Show
-          when={inbox.items().length > 0}
-          fallback={
+        <Switch>
+          <Match when={inbox.availability() === "loading"}>
+            <div
+              role="status"
+              data-testid="inbox-loading"
+              style={{ display: "flex", "flex-direction": "column", "align-items": "center", gap: "var(--space-2)", padding: "var(--space-5) var(--space-3)", "text-align": "center", color: "var(--text-muted)" }}
+            >
+              <Icon name="inbox" />
+              <strong style={{ color: "var(--text-primary)" }}>Loading your inbox…</strong>
+            </div>
+          </Match>
+          <Match when={inbox.availability() === "unavailable"}>
+            <div
+              role="alert"
+              data-testid="inbox-unavailable"
+              style={{ display: "flex", "flex-direction": "column", "align-items": "center", gap: "var(--space-2)", padding: "var(--space-5) var(--space-3)", "text-align": "center", color: "var(--text-muted)" }}
+            >
+              <Icon name="inbox" />
+              <strong style={{ color: "var(--text-primary)" }}>Inbox unavailable</strong>
+              <span style={{ "font-size": "var(--fs-body-sm)" }}>
+                We couldn't confirm your notifications. Nothing has been marked as read.
+              </span>
+              <button type="button" class="button-secondary" onClick={inbox.retry}>Try again</button>
+            </div>
+          </Match>
+          <Match when={inbox.items().length === 0}>
             <div
               role="status"
               data-testid="inbox-empty"
@@ -500,28 +524,35 @@ export function AppShell(props: AppShellProps) {
                 When a pull request needs your review or someone mentions you, it'll show up here.
               </span>
             </div>
-          }
-        >
-          <ul style={{ "list-style": "none", margin: "0", padding: "0", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
-            <For each={inbox.items()}>
-              {(item) => (
-                <li style={{ display: "flex", gap: "var(--space-2)", "align-items": "center" }}>
-                  <Icon name="inbox" />
-                  <Show
-                    when={item.href}
-                    fallback={<span>{item.title}</span>}
-                  >
-                    {(href) => (
-                      <A href={href()} onClick={() => setInboxOpen(false)} style={{ color: "var(--text-primary)" }}>
-                        {item.title}
-                      </A>
-                    )}
-                  </Show>
-                </li>
-              )}
-            </For>
-          </ul>
-        </Show>
+          </Match>
+          <Match when={true}>
+            <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
+              <ul style={{ "list-style": "none", margin: "0", padding: "0", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+                <For each={inbox.items()}>
+                  {(item) => (
+                    <li style={{ display: "flex", gap: "var(--space-2)", "align-items": "flex-start", padding: "var(--space-2) 0" }}>
+                      <Icon name="inbox" />
+                      <span style={{ display: "flex", "flex-direction": "column", gap: "var(--space-1)", "min-width": "0" }}>
+                        <strong style={{ color: "var(--text-primary)" }}>
+                          {inboxReasonLabel(item.reason)}
+                          <Show when={item.coalesce_count > 1}> · {item.coalesce_count} events</Show>
+                        </strong>
+                        <code style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)", "overflow-wrap": "anywhere" }}>
+                          {item.subject}
+                        </code>
+                      </span>
+                    </li>
+                  )}
+                </For>
+              </ul>
+              <Show when={inbox.hasMore()}>
+                <p role="status" style={{ margin: "0", color: "var(--text-muted)", "font-size": "var(--fs-body-sm)" }}>
+                  More notifications are available. Pagination is not yet available in this panel.
+                </p>
+              </Show>
+            </div>
+          </Match>
+        </Switch>
       </Dialog>
     </>
   );

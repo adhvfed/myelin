@@ -63,6 +63,8 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "issues.authorization_status",
     "issues.view",
     "issues.close",
+    // -- the durable notification inbox (register_notif) --
+    "notif.inbox.list",
     // -- the git JSON product API (register_git_durable over Git's catalogue) --
     "git.repos.list",
     "git.repo.create",
@@ -171,6 +173,7 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("issues.authorization_status", "issue.view", OP_AGENT_PAT),
     requirement!("issues.view", "issue.view", OP_AGENT_PAT),
     requirement!("issues.close", "issue.transition", OP_AGENT_PAT),
+    requirement!("notif.inbox.list", "notification.read", OP_AGENT_PAT),
     requirement!("git.repos.list", "repo.pull", OP_AGENT_PAT),
     requirement!("git.repo.create", "repo.create", OP_PAT),
     requirement!("git.pr.view", "repo.pull", OP_AGENT_PAT),
