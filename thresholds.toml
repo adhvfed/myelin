@@ -32,7 +32,7 @@
 version = 1
 # The date this file's current row set was last asserted against its drills (ISO-8601). Bump
 # (with a [[claimed_not_proven]] or a drill-dated note) on every threshold change.
-as_of = "2026-06-25"
+as_of = "2026-07-22"
 
 # ---------------------------------------------------------------------------------------------
 # [revocation] — N, the deprovision / revocation SLA (the disabled-user blast-radius bound).

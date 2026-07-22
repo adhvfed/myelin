@@ -133,6 +133,13 @@ async fn production_worker_boots_reconciles_and_restarts_idempotently() {
         worker_config.clone(),
     );
     wait_until_visible(&store, &creator, &staged.id).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while first.metrics().snapshot().newly_activated == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first sweep publishes its activation metric");
     assert_eq!(first.metrics().snapshot().newly_activated, 1);
     first.shutdown().await.expect("first worker drains");
 

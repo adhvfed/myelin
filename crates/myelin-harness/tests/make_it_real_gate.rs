@@ -59,7 +59,10 @@ fn changed_output_bytes_is_a_tamper_not_a_silent_pass() {
     assert_eq!(target.attestation.as_ref().unwrap().hash, original);
 
     let verdict = manifest.validate(TODAY, DEFAULT_MAX_AGE_DAYS);
-    assert!(!verdict.is_green(), "a changed-output row must RED the gate");
+    assert!(
+        !verdict.is_green(),
+        "a changed-output row must RED the gate"
+    );
     assert!(
         verdict.problems.iter().any(|p| matches!(
             p,
@@ -114,7 +117,10 @@ fn stale_dated_row_is_red() {
     // Attest everything on an old date, then validate as of TODAY.
     let manifest = fully_attested("2025-01-01");
     let verdict = manifest.validate(TODAY, DEFAULT_MAX_AGE_DAYS);
-    assert!(!verdict.is_green(), "a far-past attestation must RED the gate");
+    assert!(
+        !verdict.is_green(),
+        "a far-past attestation must RED the gate"
+    );
     assert!(
         verdict
             .problems
@@ -191,4 +197,72 @@ fn claimed_not_proven_row_reds_the_gate() {
         .problems
         .iter()
         .any(|p| matches!(p, GateProblem::NotProven { .. })));
+}
+
+#[test]
+fn malformed_manifest_metadata_dates_duplicates_and_extra_rows_are_red() {
+    let mut manifest = fully_attested(TODAY);
+    manifest.band = "other band".to_string();
+    manifest.generated_on = "2026-02-30".to_string();
+    manifest.rows[0].date = "not-a-date".to_string();
+    manifest.rows.push(manifest.rows[1].clone());
+    let mut extra = manifest.rows[2].clone();
+    extra.id = "MR-999".to_string();
+    manifest.rows.push(extra);
+
+    let verdict = manifest.validate(TODAY, DEFAULT_MAX_AGE_DAYS);
+    assert!(!verdict.is_green());
+    for id in [
+        "manifest.band",
+        "manifest.generated_on",
+        "MR-004",
+        "MR-009",
+        "MR-999",
+    ] {
+        assert!(
+            verdict.problems.iter().any(
+                |problem| matches!(problem, GateProblem::Malformed { id: found, .. } if found == id)
+            ),
+            "missing malformed problem for {id}: {:?}",
+            verdict.problems
+        );
+    }
+}
+
+#[test]
+fn hash_valid_attestation_for_a_different_command_is_red() {
+    let mut manifest = fully_attested(TODAY);
+    let row = &mut manifest.rows[0];
+    let wrong = vec![
+        "test".to_string(),
+        "-p".to_string(),
+        "wrong-package".to_string(),
+    ];
+    row.attestation = Some(RowAttestation::compute(
+        &row.id, &wrong, &row.date, b"green",
+    ));
+
+    let verdict = manifest.validate(TODAY, DEFAULT_MAX_AGE_DAYS);
+    assert!(verdict.problems.iter().any(
+        |problem| matches!(problem, GateProblem::Tampered { id, detail }
+            if id == "MR-004" && detail.contains("does not equal frozen proof command"))
+    ));
+}
+
+#[test]
+fn checked_in_markdown_is_derived_byte_for_byte_from_the_json_manifest() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root");
+    let json = std::fs::read_to_string(root.join("testing/scorecards/make-it-real.json"))
+        .expect("checked-in make-it-real JSON");
+    let markdown = std::fs::read_to_string(root.join("testing/scorecards/make-it-real.md"))
+        .expect("checked-in make-it-real Markdown");
+    let manifest = AttestedScorecard::from_json(&json).expect("valid checked-in manifest");
+    assert_eq!(
+        markdown,
+        manifest.render_markdown(),
+        "the Markdown mirror must only be regenerated from the JSON source"
+    );
 }

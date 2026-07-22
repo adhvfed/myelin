@@ -125,7 +125,9 @@ async fn edge_sets_the_tenant_scope_in_a_real_transaction() {
     });
     let gateway = Arc::new(
         Gateway::builder(authn, human, Arc::new(AllowAll))
-            .route(Method::Get, "/v1/scope-probe", "edge.scope.probe", probe)
+            // Reuse a catalogue-backed identity read: even test-only routes must pass the signed
+            // capability boundary, which deliberately rejects invented action strings.
+            .route(Method::Get, "/v1/scope-probe", "edge.whoami", probe)
             .build(),
     );
 
