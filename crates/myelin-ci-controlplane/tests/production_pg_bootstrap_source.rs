@@ -6,6 +6,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let library_source = include_str!("../src/lib.rs");
     let launch_authority_source = include_str!("../src/ci_launch_authority.rs");
     let claim_issuer_source = include_str!("../src/ci_claim_token_issuer.rs");
+    let identity_adapter_source = include_str!("../src/ci_identity_adapter.rs");
+    let runner_identity_source = include_str!("../src/ci_runner_composition.rs");
     let region_store_source = include_str!("../src/job_queue_region.rs");
     let runner_bind_source = include_str!("../src/runner_bind.rs");
 
@@ -45,6 +47,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let starter_lane = source
         .find("ci_run_starter_factory(")
         .expect("the per-tenant ci_run starter lane must be composed at the root");
+    let runner_identity = source
+        .find("ci_runner_identity_authorities(")
+        .expect("the real CI Identity authorities must be composed at the root");
     let runner_gate = source
         .find("verify_startup_activation(runner_setting)")
         .expect("production runner activation must be refused explicitly");
@@ -70,6 +75,35 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(starter_factory_source.contains("TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING"));
     assert!(!starter_factory_source.contains("DEFAULT_TENANT_IN_FLIGHT_CAP"));
     assert!(!starter_factory_source.contains("UnavailableCiJobBudgetReservation"));
+    for production_dependency in [
+        "DurableCellRootBacking::new",
+        "RevocationStore::with_pg",
+        "DurableRevocationBacking::new",
+        "PasetoCapabilitySigner::new",
+        "PasetoCapabilityVerifier::new",
+        "RunTokenMinter::with_signer_and_tuples",
+        "LockedManifestCiJobTokenIssuer::new",
+        "IdentityCiJobLaunchAuthorizer::new",
+    ] {
+        assert!(
+            runner_identity_source.contains(production_dependency),
+            "production Identity composition must retain {production_dependency}"
+        );
+    }
+    for forbidden_dependency in [
+        "CellTokenAuthority::generate",
+        "RevocationStore::new",
+        "StructuralTokenSigner",
+        "StructuralTokenVerifier",
+    ] {
+        assert!(
+            !runner_identity_source.contains(forbidden_dependency),
+            "production Identity composition must not admit {forbidden_dependency}"
+        );
+    }
+    assert!(runner_identity_source.contains("provider.config().region.clone()"));
+    assert!(claim_issuer_source.contains("request.region != self.region"));
+    assert!(identity_adapter_source.contains("context.region != self.region.0"));
     assert!(
         launch_authority_source.contains("ManifestBoundCiJobTokenAuthority::handle_for(request)")
     );
@@ -118,6 +152,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(shape_check < first_store);
     assert!(first_store < reaper);
     assert!(reaper < starter_lane);
+    assert!(starter_lane < runner_identity);
+    assert!(runner_identity < service);
     assert!(starter_lane < service);
 }
 
@@ -161,8 +197,8 @@ fn runner_activation_is_refused_before_any_database_attempt() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
-    assert!(stderr.contains("real durable CostLedger reserve/settle authority"));
-    assert!(stderr.contains("live per-run-token verification"));
+    assert!(stderr.contains("exact-tenant worker"));
+    assert!(stderr.contains("scoped reservation lifecycle"));
     assert!(stderr.contains("production runner activation is refused"));
     assert!(!stderr.contains("database bootstrap refused to start"));
     assert!(!stderr.contains("DATABASE_URL"));

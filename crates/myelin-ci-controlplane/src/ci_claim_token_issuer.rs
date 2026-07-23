@@ -42,13 +42,19 @@ pub trait CiJobCredentialMinter: Send + Sync {
 #[derive(Clone)]
 pub struct LockedManifestCiJobTokenIssuer {
     pool: PgPool,
+    region: String,
     credential_minter: Arc<dyn CiJobCredentialMinter>,
 }
 
 impl LockedManifestCiJobTokenIssuer {
-    pub fn new(pool: PgPool, credential_minter: Arc<dyn CiJobCredentialMinter>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        region: impl Into<String>,
+        credential_minter: Arc<dyn CiJobCredentialMinter>,
+    ) -> Self {
         Self {
             pool,
+            region: region.into(),
             credential_minter,
         }
     }
@@ -62,6 +68,11 @@ impl CiJobTokenIssuer for LockedManifestCiJobTokenIssuer {
     {
         Box::pin(async move {
             request.validate()?;
+            if request.region != self.region {
+                return Err(refused(
+                    "scheduler claim region differs from the runner cell",
+                ));
+            }
             let tenant = request.tenant_id.clone();
             let region = request.region.clone();
             let manifest_store = CiDriveManifestStore::new(
