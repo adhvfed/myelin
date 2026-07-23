@@ -431,3 +431,66 @@ fn immutable_pricing_projects_exact_raw_cpu_and_split_memory_costs() {
         Err(CiJobPricingError::InvalidOutput)
     );
 }
+
+#[test]
+fn tier_p_reservation_structurally_requires_its_exact_operational_settlement_policy() {
+    let usage = ResourceUsage {
+        cpu_seconds: 17,
+        mem_byte_seconds: 3 * 1_073_741_824 + 1,
+    };
+    let mut priced = PricedCiJobUsage {
+        pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
+        memory_gb_seconds: 4,
+        cpu_wholesale: MinorUnits(17),
+        cpu_markup: MinorUnits::ZERO,
+        memory_wholesale: MinorUnits(4),
+        memory_markup: MinorUnits::ZERO,
+    };
+    let handle = "ci-reserve:v1:run:batch:job:item";
+    assert_eq!(
+        validate_reservation_pricing_policy(handle, usage, &priced),
+        Ok(())
+    );
+
+    priced.pricing_revision = "commercial:2026-07-21".into();
+    assert_eq!(
+        validate_reservation_pricing_policy(handle, usage, &priced),
+        Err(CiJobPricingError::InvalidOutput)
+    );
+    priced.pricing_revision = TIER_P_OPERATIONAL_PRICING_REVISION.into();
+    priced.memory_gb_seconds = 3;
+    assert_eq!(
+        validate_reservation_pricing_policy(handle, usage, &priced),
+        Err(CiJobPricingError::InvalidOutput)
+    );
+    priced.memory_gb_seconds = 4;
+    priced.cpu_wholesale = MinorUnits(16);
+    assert_eq!(
+        validate_reservation_pricing_policy(handle, usage, &priced),
+        Err(CiJobPricingError::InvalidOutput)
+    );
+    priced.cpu_wholesale = MinorUnits(17);
+    priced.cpu_markup = MinorUnits(1);
+    assert_eq!(
+        validate_reservation_pricing_policy(handle, usage, &priced),
+        Err(CiJobPricingError::InvalidOutput)
+    );
+    priced.cpu_markup = MinorUnits::ZERO;
+    priced.memory_wholesale = MinorUnits(3);
+    assert_eq!(
+        validate_reservation_pricing_policy(handle, usage, &priced),
+        Err(CiJobPricingError::InvalidOutput)
+    );
+    priced.memory_wholesale = MinorUnits(4);
+    priced.memory_markup = MinorUnits(1);
+    assert_eq!(
+        validate_reservation_pricing_policy(handle, usage, &priced),
+        Err(CiJobPricingError::InvalidOutput)
+    );
+
+    assert_eq!(
+        validate_reservation_pricing_policy("commercial-reserve:v1:job", usage, &priced),
+        Ok(()),
+        "non-Tier-P reservation authorities retain their own revisioned policy"
+    );
+}

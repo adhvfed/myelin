@@ -206,6 +206,21 @@ pub trait CiLaunchAuthorityMaterializer: Send + Sync {
     ) -> Pin<
         Box<dyn Future<Output = Result<CiLaunchAuthorityV1, CiLaunchAuthorityError>> + Send + 'a>,
     >;
+
+    /// Materialize on the starter's tenant-scoped transaction. The default preserves truly external
+    /// authority providers; an in-database reservation adapter overrides this so reservation and
+    /// manifest/workflow/job state co-commit.
+    fn materialize_in_tx<'a>(
+        &'a self,
+        _conn: &'a mut sqlx::PgConnection,
+        record: &'a CiRunRecord,
+        prepared: &'a PreparedRunPlanV2,
+        definition: &'a CiWorkflowDefinitionPin,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<CiLaunchAuthorityV1, CiLaunchAuthorityError>> + Send + 'a>,
+    > {
+        self.materialize(record, prepared, definition)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -544,11 +559,11 @@ impl PgCiPipelineStarter {
                     )
                 })?;
                 validate_definition_pin(&mut transaction, &self.definition, false).await?;
-                // The exact queued row is locked before consulting policy. Implementations must be
-                // retry-safe by run identity because external reservations cannot join this SQL tx.
+                // The exact queued row is locked before consulting policy. Same-database reservation
+                // adapters co-commit here; truly external adapters must remain retry-safe by run identity.
                 let authority = self
                     .launch_authority
-                    .materialize(&record, prepared, &self.definition)
+                    .materialize_in_tx(&mut transaction, &record, prepared, &self.definition)
                     .await
                     .map_err(PgCiStarterError::LaunchAuthority)?;
                 let expected_jobs = expected_ci_jobs_v2(&record, prepared)?;

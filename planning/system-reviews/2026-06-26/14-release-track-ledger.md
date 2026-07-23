@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — claim-time Identity + exact final launch fence proven; operational reservation/composition remain; production start disabled** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — concrete operational reservation + claim/launch fences proven; production composition/crash path remain; production start disabled** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -939,11 +939,37 @@ continued detached. The concrete in-process mint is now awaited to completion in
 remote signer is introduced, its transport must provide a genuinely cancellable deadline before it
 can replace this boundary; a cosmetic timeout is not an accepted gate.
 
-**Honest remaining activation floors:** implement and crash-prove the concrete Tier-P operational
-reservation source; compose this Identity minter, exact launch authorizer, exact-tenant region
-poller/worker, and terminal reserve/settle bookends in the production runner; then inject crashes
-across mint→CAS and CAS→spawn in that composed path. No Commercial wallet, billing, or Stripe work
-is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
+**Concrete Tier-P operational reservation source (2026-07-23).** The PostgreSQL provider now admits
+one complete ordered manifest batch into Storage's existing `cost_reservation` ledger under a
+tenant/region transaction advisory lock and an explicit per-tenant outstanding-job ceiling. Every
+handle binds the complete ordered batch plus every immutable per-job launch-authority field; exact
+acknowledgement-loss retries return the same ordered handles even after lifecycle advancement, while
+subset, superset, reorder, disjoint replacement, changed authority, duplicate jobs, exhausted
+capacity, and partial durable state refuse. Same-database reservation runs on the starter's scoped
+transaction, so reservation, manifest, attempts, job ledger, workflow start, and queued→running share
+one commit. An injected post-reservation manifest failure leaves zero rows and a clean retry commits
+the complete three-job start.
+
+Tier P records operational capacity units—not customer prices—and terminal settlement now gates that
+policy mechanically. A `ci-reserve:v1:` handle accepts only revision `tier-p-operational:v1`, CPU
+wholesale equal to measured CPU-seconds, memory quantity and wholesale equal to rounded-up measured
+GiB-seconds, and zero markup in both dimensions. Any field mismatch rolls the complete claim,
+reservation, cost projection, accounting receipt, and workflow-signal transaction back. Live
+PostgreSQL proofs cover concurrent exact retries, competing fresh batches at the ceiling, mid-batch
+failure rollback/recovery, starter-level crash rollback/recovery, FORCE-RLS visibility, and terminal
+pricing refusal/success; DB-free mutants cover every settlement-policy field. The focused
+all-feature proofs, full control-plane suite, workspace all-target check, warnings-denied clippy,
+architecture lint, erosion gate, and contract-coverage gate are green. Independent adversarial
+review reported CONFIRMED-SOUND with no remaining HIGH/MEDIUM provider or terminal-policy finding.
+
+**Honest remaining activation floors:** the production starter factory still composes the explicit
+unavailable provider; wire the proven provider with a server-owned ceiling, then compose the Identity
+minter, exact launch authorizer, exact-tenant region poller/worker, and terminal bookends. Resolve
+single ownership of terminal settlement before activation: the sandbox hook currently precedes the
+atomic reporter, so a durable settle there would create a crash split while a no-op would violate the
+hook contract. Then inject crashes across mint→CAS and CAS→spawn plus cancellation, retry, recovery,
+and settlement races in the complete composition. No Commercial wallet, billing, or Stripe work is
+admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
 
 ## R5–R6
 

@@ -461,6 +461,11 @@ pub struct PricedCiJobUsage {
     pub memory_markup: MinorUnits,
 }
 
+/// Frozen Tier-P settlement policy paired with `ci-reserve:v1:` reservation authority.
+pub const TIER_P_OPERATIONAL_PRICING_REVISION: &str = "tier-p-operational:v1";
+pub(crate) const TIER_P_OPERATIONAL_RESERVATION_PREFIX: &str = "ci-reserve:v1:";
+const PRICING_GIB_BYTES: u64 = 1_073_741_824;
+
 /// A fail-closed pricing refusal. Values and authority handles are deliberately absent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiJobPricingError {
@@ -479,10 +484,37 @@ impl core::fmt::Display for CiJobPricingError {
 
 impl std::error::Error for CiJobPricingError {}
 
-/// Commercial-owned immutable pricing lookup. Implementations must resolve the revision current at
-/// completion; the resulting revision and split amounts are persisted so replay never reprices.
+/// Immutable completion-accounting lookup. Tier P uses an explicitly revisioned operational-unit
+/// adapter with zero markup; Tier B may later compose a Commercial-owned price lookup. Either way,
+/// the resulting revision and split amounts are persisted so replay never reprices, and the adapter
+/// must use the same unit policy as the reservation that admitted the job.
 pub trait CiJobAccountingPricer: Send + Sync {
     fn price(&self, usage: ResourceUsage) -> Result<PricedCiJobUsage, CiJobPricingError>;
+}
+
+/// Bind a versioned reservation authority to its exact settlement unit policy. Generic and future
+/// Commercial handles remain governed by their own revisioned adapters, but a Tier-P operational
+/// handle cannot be settled by an arbitrary monetary pricer merely because it implements the trait.
+pub(crate) fn validate_reservation_pricing_policy(
+    reserve_handle: &str,
+    usage: ResourceUsage,
+    priced: &PricedCiJobUsage,
+) -> Result<(), CiJobPricingError> {
+    if !reserve_handle.starts_with(TIER_P_OPERATIONAL_RESERVATION_PREFIX) {
+        return Ok(());
+    }
+    let memory_gb_seconds = usage.mem_byte_seconds.div_ceil(PRICING_GIB_BYTES);
+    let exact_operational_policy = priced.pricing_revision == TIER_P_OPERATIONAL_PRICING_REVISION
+        && priced.memory_gb_seconds == memory_gb_seconds
+        && priced.cpu_wholesale == MinorUnits(usage.cpu_seconds)
+        && priced.cpu_markup == MinorUnits::ZERO
+        && priced.memory_wholesale == MinorUnits(memory_gb_seconds)
+        && priced.memory_markup == MinorUnits::ZERO;
+    if exact_operational_policy {
+        Ok(())
+    } else {
+        Err(CiJobPricingError::InvalidOutput)
+    }
 }
 
 /// All durable authorities required by the production terminal reporter. Constructing an accounted
@@ -634,6 +666,8 @@ async fn co_commit_terminal_accounting(
     let priced = accounting
         .pricer
         .price(input.report.usage)
+        .map_err(CompletionTxError::Pricing)?;
+    validate_reservation_pricing_policy(input.reserve_handle, input.report.usage, &priced)
         .map_err(CompletionTxError::Pricing)?;
     let rows = priced_cost_rows(
         input.tenant,

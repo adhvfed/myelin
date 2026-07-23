@@ -10,7 +10,7 @@ use myelin_ci_controlplane::{
     CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiPipelineReporter,
     CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert,
     CiRunStoreError, CiRunTerminalState, DurableCiJobAccounting, DurableCiJobLaunchTemplate,
-    DurableCiRunFinalizer, GrantedCiJobV1, PricedCiJobUsage,
+    DurableCiRunFinalizer, GrantedCiJobV1, PricedCiJobUsage, TIER_P_OPERATIONAL_PRICING_REVISION,
 };
 use myelin_ci_sandbox::{
     CompletionClaim, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
@@ -30,6 +30,9 @@ use myelin_storage::{
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool, Row};
+
+const OPERATIONAL_RESERVE_HANDLE: &str =
+    "ci-reserve:v1:22222222-2222-8222-8222-222222222222:batch:33333333-3333-8333-8333-333333333333:item";
 
 fn app_url() -> String {
     std::env::var("DATABASE_URL")
@@ -65,17 +68,14 @@ struct TestPricer {
 
 impl CiJobAccountingPricer for TestPricer {
     fn price(&self, usage: ResourceUsage) -> Result<PricedCiJobUsage, CiJobPricingError> {
+        let memory_gb_seconds = usage.mem_byte_seconds.div_ceil(1_073_741_824);
         Ok(PricedCiJobUsage {
-            pricing_revision: if self.valid {
-                "pricing:2026-07-21".into()
-            } else {
-                String::new()
-            },
-            memory_gb_seconds: usage.mem_byte_seconds.div_ceil(1_073_741_824),
-            cpu_wholesale: MinorUnits(30),
-            cpu_markup: MinorUnits(5),
-            memory_wholesale: MinorUnits(10),
-            memory_markup: MinorUnits(2),
+            pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
+            memory_gb_seconds,
+            cpu_wholesale: MinorUnits(usage.cpu_seconds),
+            cpu_markup: MinorUnits::ZERO,
+            memory_wholesale: MinorUnits(memory_gb_seconds + u64::from(!self.valid)),
+            memory_markup: MinorUnits::ZERO,
         })
     }
 }
@@ -141,7 +141,7 @@ fn manifest(
                     concurrency_group: None,
                     fair_key: tenant.into(),
                 },
-                reserve_handle: "reserve:accounting-live".into(),
+                reserve_handle: OPERATIONAL_RESERVE_HANDLE.into(),
                 token_authority_handle: "token-authority:live".into(),
                 continue_on_error: false,
             },
@@ -203,7 +203,7 @@ fn sandbox_spec(idem: &str) -> JobSpec {
         TrustTier::Trusted,
         RunTokenCredential::new("test-bearer", "test-jti", 300).unwrap(),
         MeterTarget {
-            reserve_id: "reserve:accounting-live".into(),
+            reserve_id: OPERATIONAL_RESERVE_HANDLE.into(),
         },
         IdemToken(idem.into()),
     )
@@ -366,11 +366,12 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     .unwrap();
     sqlx::query(
         "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
-         VALUES ($1, $2, 'reserve:accounting-live', 100, 'inflight'),
+         VALUES ($1, $2, $3, 100, 'inflight'),
                 ($1, $2, 'reserve:skipped-live', 40, 'reserved')",
     )
     .bind(&tenant.0)
     .bind(&region.0)
+    .bind(OPERATIONAL_RESERVE_HANDLE)
     .execute(&pool)
     .await
     .unwrap();
@@ -458,7 +459,7 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         jobs: vec![
             CiRunFinalizationJob {
                 job_id: job.into(),
-                reserve_handle: "reserve:accounting-live".into(),
+                reserve_handle: OPERATIONAL_RESERVE_HANDLE.into(),
                 flow_timed_out: false,
                 dispatched: true,
             },
@@ -496,12 +497,12 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         (0, 0, 0, "leased".into()),
         "a post-claim pricing refusal rolls the entire transaction back"
     );
-    let reservation_state: String = sqlx::query_scalar(
-        "SELECT state FROM cost_reservation WHERE run_id = 'reserve:accounting-live'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let reservation_state: String =
+        sqlx::query_scalar("SELECT state FROM cost_reservation WHERE run_id = $1")
+            .bind(OPERATIONAL_RESERVE_HANDLE)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(reservation_state, "inflight");
 
     assert_eq!(
@@ -528,19 +529,19 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     );
     assert_eq!(
         accounting.get::<String, _>("pricing_revision"),
-        "pricing:2026-07-21"
+        TIER_P_OPERATIONAL_PRICING_REVISION
     );
-    assert_eq!(accounting.get::<i64, _>("billed_minor_units"), 47);
-    assert_eq!(accounting.get::<i64, _>("refunded_minor_units"), 53);
+    assert_eq!(accounting.get::<i64, _>("billed_minor_units"), 9);
+    assert_eq!(accounting.get::<i64, _>("refunded_minor_units"), 91);
     assert!(accounting
         .get::<String, _>("completion_receipt")
         .starts_with("v3:"));
-    let storage_events: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM cost_event WHERE run_id = 'reserve:accounting-live'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let storage_events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cost_event WHERE run_id = $1")
+            .bind(OPERATIONAL_RESERVE_HANDLE)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(storage_events, 2);
 
     let durable_finalizer = DurableCiRunFinalizer::new(

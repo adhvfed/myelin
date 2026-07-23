@@ -10,11 +10,12 @@ use myelin_ci_controlplane::{
     ci_artifact_ref, ci_job_id_v2, ci_region_run_discovery_test_support, ci_run_ref,
     CiExecutionProfileV1, CiExecutionRequestV1, CiJobLaunchGrantV1, CiLaunchAuthorityError,
     CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1, CiManifestLaneV1, CiManifestLimitsV1,
-    CiManifestSchedulingV1, CiWorkflowDefinitionPin, PgCiPipelineStarter, PgCiRunStarterFactory,
-    PgCiRunStarterPoller, PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
-    ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
-    CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
-    CREATE_CI_RUN_DDL,
+    CiManifestSchedulingV1, CiWorkflowDefinitionPin, LinuxSmallV1LaunchAuthority,
+    PgCiPipelineStarter, PgCiRunStarterFactory, PgCiRunStarterPoller,
+    PgTierPCiJobBudgetReservation, PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2,
+    StartQueuedOutcome, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, CI_JOB_RUN_LEDGER_INDEX,
+    CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_DDL,
+    CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_RUN_DDL,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::MonotonicMinter;
@@ -24,8 +25,8 @@ use myelin_flow::{
 };
 use myelin_refs::ArtifactRef;
 use myelin_storage::{
-    provider::foundation_migrations, BlobError, BlobMeta, BlobStore, ContentHash, FsBlobStore,
-    HotTables, PgMigrator,
+    provider::foundation_migrations, reserve_settle_durable_migrations, BlobError, BlobMeta,
+    BlobStore, ContentHash, FsBlobStore, HotTables, PgMigrator,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
@@ -248,6 +249,26 @@ fn starter_without_authority_with(
         definition,
     )
     .expect("valid fail-closed production starter")
+}
+
+fn starter_with_operational_reservations(
+    pool: &PgPool,
+    tenant: &str,
+    blobs: Arc<dyn BlobStore + Send + Sync>,
+) -> PgCiPipelineStarter {
+    let reservations = PgTierPCiJobBudgetReservation::new(pool.clone(), "fr-par", 4)
+        .expect("valid Tier-P operational reservation source");
+    PgCiPipelineStarter::new_with_authority(
+        pool.clone(),
+        tokio::runtime::Handle::current(),
+        Arc::new(MonotonicMinter::new()),
+        TenantId(tenant.into()),
+        Region("fr-par".into()),
+        blobs,
+        CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+        Arc::new(LinuxSmallV1LaunchAuthority::new(Arc::new(reservations))),
+    )
+    .expect("valid starter with concrete Tier-P launch authority")
 }
 
 // The production composition-root seam (`ci_run_starter_factory`) over the app-role pool + cell region
@@ -637,6 +658,9 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     PgMigrator::apply(&admin, &foundation_migrations())
         .await
         .expect("foundation migrations");
+    PgMigrator::apply(&admin, &reserve_settle_durable_migrations())
+        .await
+        .expect("durable reservation migrations");
     PgMigrator::apply_validated(
         &admin,
         &flow_migrations(),
@@ -776,6 +800,88 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
             .await
             .is_empty()
     );
+
+    // The real Tier-P authority is dispatched through `materialize_in_tx`: reservations are written
+    // before the manifest, but a later manifest failure rolls both back with the starter transaction.
+    // Calling the authority's standalone path here would commit three orphan reservations and fail
+    // this proof.
+    let reservation_tenant = "tenant_atomic_reservation";
+    let reservation_run = "10000000-0000-0000-0000-0000000000a7";
+    let reservation_wf = "20000000-0000-0000-0000-0000000000a7";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        reservation_tenant,
+        reservation_run,
+        reservation_wf,
+    )
+    .await;
+    admin
+        .execute(
+            "CREATE FUNCTION fail_atomic_reservation_manifest() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+               IF NEW.tenant_id = 'tenant_atomic_reservation' \
+               THEN RAISE EXCEPTION 'injected post-reservation manifest failure'; END IF; \
+               RETURN NEW; END $$",
+        )
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "CREATE TRIGGER fail_atomic_reservation_manifest \
+             BEFORE INSERT ON ci_drive_manifest FOR EACH ROW \
+             EXECUTE FUNCTION fail_atomic_reservation_manifest()",
+        )
+        .await
+        .unwrap();
+    let atomic_starter =
+        starter_with_operational_reservations(&app, reservation_tenant, blobs.clone());
+    let atomic_error = atomic_starter
+        .run_once()
+        .await
+        .expect_err("post-reservation manifest failure must abort the complete start");
+    assert!(atomic_error
+        .to_string()
+        .contains("injected post-reservation manifest failure"));
+    assert_atomic_started(&admin, reservation_tenant, reservation_run, false, false).await;
+    let atomic_side_effects: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+           (SELECT count(*) FROM cost_reservation WHERE tenant_id=$1),
+           (SELECT count(*) FROM ci_drive_manifest WHERE tenant_id=$1),
+           (SELECT count(*) FROM check_attempt WHERE tenant_id=$1)",
+    )
+    .bind(reservation_tenant)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        atomic_side_effects,
+        (0, 0, 0),
+        "reservation, manifest, and check-attempt state share one commit"
+    );
+    admin
+        .execute("DROP TRIGGER fail_atomic_reservation_manifest ON ci_drive_manifest")
+        .await
+        .unwrap();
+    admin
+        .execute("DROP FUNCTION fail_atomic_reservation_manifest()")
+        .await
+        .unwrap();
+    assert!(matches!(
+        atomic_starter
+            .run_once()
+            .await
+            .expect("retry after the injected crash starts normally"),
+        StartQueuedOutcome::Started { .. }
+    ));
+    let committed_reservations: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cost_reservation WHERE tenant_id=$1 AND state='reserved'",
+    )
+    .bind(reservation_tenant)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(committed_reservations, 3);
 
     // Two concurrent starters see one row. SKIP LOCKED lets one win and the other return idle;
     // there is exactly one workflow and the state transition cannot split from it.
