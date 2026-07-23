@@ -64,8 +64,12 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     // while the refusal stands: it is gated on the runner-host request, not spawned unconditionally.
     assert!(source.contains("if runner_host_requested {"));
     assert!(source.contains("let runner_host_requested = matches!(&runner_setting"));
-    assert!(library_source.contains("LinuxSmallV1LaunchAuthority::new"));
-    assert!(library_source.contains("UnavailableCiJobBudgetReservation"));
+    let starter_factory_source = &library_source[starter_lane_source_start(library_source)..];
+    assert!(starter_factory_source.contains("LinuxSmallV1LaunchAuthority::new"));
+    assert!(starter_factory_source.contains("PgTierPCiJobBudgetReservation::new"));
+    assert!(starter_factory_source.contains("TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING"));
+    assert!(!starter_factory_source.contains("DEFAULT_TENANT_IN_FLIGHT_CAP"));
+    assert!(!starter_factory_source.contains("UnavailableCiJobBudgetReservation"));
     assert!(
         launch_authority_source.contains("ManifestBoundCiJobTokenAuthority::handle_for(request)")
     );
@@ -115,6 +119,12 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(first_store < reaper);
     assert!(reaper < starter_lane);
     assert!(starter_lane < service);
+}
+
+fn starter_lane_source_start(source: &str) -> usize {
+    source
+        .find("pub fn ci_run_starter_factory(")
+        .expect("production starter factory must stay named")
 }
 
 #[test]
