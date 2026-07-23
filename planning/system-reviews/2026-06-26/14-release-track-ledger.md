@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — operational reservation, claim/launch fences, exact-tenant runtime/fan-out, and dormant full runner-host composition proven; lifecycle/crash activation remains; production start disabled** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — operational reservation, claim/launch fences, exact-tenant runtime/fan-out, dormant full runner-host composition, and producer-authored PR head ordering proven; run supersession/lifecycle/crash activation remains; production start disabled** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1172,6 +1172,31 @@ CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding. Both CI crates' comple
 all-target/all-feature suites (including live PostgreSQL and `runsc`), workspace check,
 warnings-denied clippy, migration upgrade, production-source guard, architecture lint, erosion
 budgets, contract coverage, and diff check are green.
+
+**Producer-authored PR head ordering (2026-07-23).** Durable newest-head authority now comes from
+Git's row-locked `git_pr.version`, read and emitted in the same PostgreSQL transaction as each PR
+head-trigger event; timestamps, ULIDs, and consumer receipt order have no role. `git.pr.opened` and
+`git.pr.synchronized` advance to schema v2 in Git's registered token lineage and require a positive
+`head_generation`. CI installs the forward-only v1→v2 chain before handling: a legacy opened event
+is deterministically rewritten to generation 1 (including an unknown conflicting v1 key), while a
+legacy synchronized event without a generation is rejected rather than assigned invented ordering.
+A current v2 omission, zero, negative, string, or fractional generation is permanent poison before
+Git reads, capacity reservation, or run persistence.
+
+Forward-only `ci_0001d` adds nullable `ci_run.pr_head_generation` without rewriting any applied
+migration. New dispatchers require and replay-verify a positive value on every pull-request run and
+forbid it on every other trigger; the database enforces the same boundary. `NULL` exists only for
+rows written by the immediately preceding dispatcher during a mixed-version rollout: launch remains
+available, but the run-supersession transaction must treat it as legacy-oldest, must never let it
+cancel a positive generation, and must not invent an order between two legacy rows. The producer
+wire adapter was extracted from the oversized PR store, bringing that module below the 3,000-line
+soft ceiling and removing its shrink-only exception. Mechanical payoff: accepted current PR
+head-trigger events lacking positive producer authority = 0; v1 opened variants yielding anything
+other than generation 1 = 0; module-budget exceptions = 2→1. Live Git outbox, dispatch co-commit,
+run-store/RLS, and absent→present migration proofs pass. Independent adversarial review twice
+reported CONFIRMED-SOUND with no HIGH or MEDIUM finding, including after the extraction. This is the
+ordering prerequisite only; serialized run cancellation, Flow finalization, and reservation
+settlement remain the next coherent R4.2 row.
 
 **Honest remaining activation floors:** attach the retained starter, bounded fan-out, and sandbox
 runner to coordinated lifecycle shutdown, and wire accounted supersession into the durable dispatch

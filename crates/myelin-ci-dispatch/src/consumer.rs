@@ -89,7 +89,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use myelin_events::{
     Actor, EmitContextBase, EventEnvelope, EventHandler, EventId, HandleOutcome, IdMinter,
-    OutboxStore, SubjectPattern,
+    OutboxStore, SubjectPattern, UpcasterRegistry,
 };
 use myelin_storage::BlobStore;
 use myelin_tenancy::TenantId;
@@ -299,6 +299,9 @@ pub struct ReserveFacts {
     /// Canonical PR supersession identity derived from validated event provenance. `None` for
     /// non-PR triggers.
     pub concurrency_group: Option<String>,
+    /// Producer-authored, transactionally serialized positive PR row generation. This is the
+    /// durable newest-head ordering authority; `None` is only for non-PR triggers.
+    pub pr_head_generation: Option<i64>,
 }
 
 /// A fully-armed run ready to persist: the atomic [`StartHandoff`] bundle + the extra `ci_run` facts
@@ -470,6 +473,7 @@ pub fn ci_run_insert_from_armed(armed: &ArmedRun) -> myelin_ci_controlplane::CiR
         definition_snapshot: rw.definition_snapshot.0.clone(),
         trigger_kind: rw.trigger_kind.clone(),
         concurrency_group: armed.reserve.concurrency_group.clone(),
+        pr_head_generation: armed.reserve.pr_head_generation,
         trust_tier: rw.trust_tier.clone(),
         state: rw.state.clone(),
         correlation_id: armed.reserve.correlation_id.clone(),
@@ -628,6 +632,7 @@ struct TriggerFacts {
     new_oid: String,
     is_fork: bool,
     concurrency_group: Option<String>,
+    pr_head_generation: Option<i64>,
 }
 
 /// Parse the triggering-event provenance from the envelope payload (arch 02 §1). `git.ref.updated`
@@ -648,7 +653,8 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
 
     // Subject, aggregate, and payload are mutually distrustful provenance inputs. All three must
     // identify the same push/PR before any Git or CAS read is attempted.
-    let (oid_field, concurrency_group) = if ev.type_.0 == myelin_git::events::GIT_REF_UPDATED {
+    let (oid_field, concurrency_group, pr_head_generation) =
+        if ev.type_.0 == myelin_git::events::GIT_REF_UPDATED {
         let ref_name = p.get("ref").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
             .ok_or_else(|| SkipReason::MalformedPayload("missing `ref`".into()))?;
         validate_git_ref_name(ref_name)?;
@@ -657,7 +663,7 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
             &format!("myelin://{}/git/ref/{repo}:{ref_name}", ev.tenant.0),
             &format!("{repo}:{ref_name}"),
         )?;
-        ("new_oid", None)
+        ("new_oid", None, None)
     } else {
         let number = p.get("number").and_then(|v| v.as_u64()).filter(|number| *number > 0)
             .ok_or_else(|| SkipReason::InvalidProvenance("PR `number` must be a positive integer".into()))?;
@@ -672,7 +678,21 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
                 "PR concurrency identity exceeds 512 bytes".into(),
             ));
         }
-        ("head_oid", Some(group))
+        if ev.schema_ver < myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2 {
+            return Err(SkipReason::InvalidProvenance(
+                "PR head-trigger event did not pass the required schema upcaster".into(),
+            ));
+        }
+        let generation = p
+            .get("head_generation")
+            .and_then(|value| value.as_i64())
+            .filter(|generation| *generation > 0)
+            .ok_or_else(|| {
+                SkipReason::InvalidProvenance(
+                    "PR `head_generation` must be a positive signed 64-bit integer".into(),
+                )
+            })?;
+        ("head_oid", Some(group), Some(generation))
     };
 
     // Only an immutable full SHA-1 oid is admitted. Refs, HEAD, revspecs, and abbreviations are
@@ -695,6 +715,7 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
         new_oid,
         is_fork,
         concurrency_group,
+        pr_head_generation,
     })
 }
 
@@ -938,6 +959,7 @@ pub fn plan_dispatch(
         repo_ref: facts.repo,
         commit_oid: facts.new_oid,
         concurrency_group: facts.concurrency_group,
+        pr_head_generation: facts.pr_head_generation,
     };
     let emit_ctx = EmitContextBase {
         tenant: tenant.clone(),
@@ -1060,8 +1082,44 @@ pub fn build_trigger_consumer(
     )?;
     Ok(myelin_substrate::ConsumerReg::new(
         myelin_events::Consumer::new(handler, subscription, dedup)
+            .with_upcaster(pr_trigger_upcasters().into_hook())
             .with_dead_letter_sink(myelin_events::DeadLetterSink::durable(dead_letters)),
     ))
+}
+
+fn pr_trigger_upcasters() -> UpcasterRegistry {
+    let mut registry = UpcasterRegistry::new();
+    registry
+        .register(
+            myelin_events::EventType(myelin_git::events::GIT_PR_OPENED.into()),
+            1,
+            myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2,
+            |mut event| {
+                if let Some(payload) = event.payload.as_object_mut() {
+                    // V1 never defined this field. Opening the row creates git_pr.version=1, so the
+                    // only deterministic upcast is to overwrite any unknown legacy key with 1.
+                    payload.insert("head_generation".into(), serde_json::json!(1));
+                }
+                event.schema_ver = myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2;
+                event
+            },
+        )
+        .expect("git.pr.opened has one static adjacent schema hop");
+    registry
+        .register(
+            myelin_events::EventType(myelin_git::events::GIT_PR_SYNCHRONIZED.into()),
+            1,
+            myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2,
+            |mut event| {
+                // A legacy synchronized event has no deterministic generation. Preserve a field if
+                // its producer supplied one, but never invent ordering authority when it is absent;
+                // the v2 handler will reject that event loudly.
+                event.schema_ver = myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2;
+                event
+            },
+        )
+        .expect("git.pr.synchronized has one static adjacent schema hop");
+    registry
 }
 
 impl EventHandler for CiTriggerHandler {
@@ -1316,7 +1374,9 @@ mod tests {
         Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, DedupLedger, EventId, EventType,
         Timestamp, Visibility,
     };
-    use myelin_git::events::{GIT_PR_OPENED, GIT_PR_SYNCHRONIZED, GIT_REF_UPDATED};
+    use myelin_git::events::{
+        GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_OPENED, GIT_PR_SYNCHRONIZED, GIT_REF_UPDATED,
+    };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use myelin_storage::{ContentHash, FsBlobStore};
     use myelin_tenancy::{Region, TenantId};
@@ -1365,9 +1425,15 @@ mod tests {
     fn pr_envelope(event_type: &str, fork_fields: serde_json::Value) -> EventEnvelope {
         let mut ev = push_envelope("web", TEST_OID);
         ev.type_ = EventType(event_type.into());
+        ev.schema_ver = myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2;
         ev.subject = ArtifactRef("myelin://acme/git/pr/web:42".into());
         ev.aggregate = AggregateKey("git/pr/web:42".into());
-        ev.payload = serde_json::json!({ "repo": "web", "number": 42, "head_oid": TEST_OID });
+        ev.payload = serde_json::json!({
+            "repo": "web",
+            "number": 42,
+            "head_oid": TEST_OID,
+            "head_generation": 1,
+        });
         ev.payload.as_object_mut().unwrap().extend(fork_fields.as_object().unwrap().clone());
         ev
     }
@@ -1454,6 +1520,7 @@ mod tests {
         )
         .expect("CI trigger subscription");
         Consumer::new(handler, subscription, ledger)
+            .with_upcaster(pr_trigger_upcasters().into_hook())
     }
 
     fn message(envelope: EventEnvelope) -> Message {
@@ -1819,6 +1886,76 @@ mod tests {
     }
 
     #[test]
+    fn pr_head_generation_is_versioned_upcasted_and_never_invented_for_legacy_sync() {
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("1"),
+            serde_json::json!(1.5),
+        ] {
+            let mut event =
+                pr_envelope(GIT_PR_SYNCHRONIZED, serde_json::json!({ "is_fork": false }));
+            event.payload["head_generation"] = invalid;
+            assert_invalid_provenance_is_poison_before_effects(event);
+        }
+
+        let event = pr_envelope(GIT_PR_SYNCHRONIZED, serde_json::json!({ "is_fork": false }));
+        let facts = trigger_facts(&event).expect("canonical producer generation is admitted");
+        assert_eq!(facts.pr_head_generation, Some(1));
+
+        let mut current_missing =
+            pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
+        current_missing
+            .payload
+            .as_object_mut()
+            .unwrap()
+            .remove("head_generation");
+        assert!(matches!(
+            trigger_facts(&current_missing),
+            Err(SkipReason::InvalidProvenance(_))
+        ));
+
+        let mut legacy_opened = current_missing.clone();
+        legacy_opened.schema_ver = 1;
+        let upcasted = pr_trigger_upcasters()
+            .upcast(legacy_opened)
+            .expect("legacy opened has deterministic initial generation");
+        assert_eq!(upcasted.schema_ver, GIT_PR_HEAD_TRIGGER_SCHEMA_V2);
+        assert_eq!(
+            trigger_facts(&upcasted).unwrap().pr_head_generation,
+            Some(1)
+        );
+
+        let mut conflicting_legacy_opened =
+            pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
+        conflicting_legacy_opened.schema_ver = 1;
+        conflicting_legacy_opened.payload["head_generation"] = serde_json::json!(999);
+        let upcasted = pr_trigger_upcasters()
+            .upcast(conflicting_legacy_opened)
+            .expect("unknown v1 key cannot override the deterministic opened generation");
+        assert_eq!(
+            trigger_facts(&upcasted).unwrap().pr_head_generation,
+            Some(1)
+        );
+
+        let mut legacy_sync =
+            pr_envelope(GIT_PR_SYNCHRONIZED, serde_json::json!({ "is_fork": false }));
+        legacy_sync.schema_ver = 1;
+        legacy_sync
+            .payload
+            .as_object_mut()
+            .unwrap()
+            .remove("head_generation");
+        let upcasted = pr_trigger_upcasters()
+            .upcast(legacy_sync)
+            .expect("the adjacent hop preserves the legacy event for typed validation");
+        assert!(matches!(
+            trigger_facts(&upcasted),
+            Err(SkipReason::InvalidProvenance(_))
+        ));
+    }
+
+    #[test]
     fn revspecs_refs_head_abbreviations_and_non_hex_oids_are_permanent_before_git_read() {
         for invalid in ["HEAD", "main", "refs/heads/main", "deadbeef", "ATTACKER_SENTINEL"] {
             let mut event = push_envelope("web", TEST_OID);
@@ -2033,9 +2170,14 @@ mod tests {
         assert_eq!(armed.handoff.run_write.trust_tier, "untrusted_fork");
         assert_eq!(armed.handoff.run_write.trigger_kind, "pull_request");
         assert_eq!(armed.reserve.concurrency_group.as_deref(), Some("pr:web:42"));
+        assert_eq!(armed.reserve.pr_head_generation, Some(1));
         assert_eq!(
             ci_run_insert_from_armed(&armed).concurrency_group.as_deref(),
             Some("pr:web:42")
+        );
+        assert_eq!(
+            ci_run_insert_from_armed(&armed).pr_head_generation,
+            Some(1)
         );
         for c in &armed.handoff.queued_checks {
             assert_eq!(c.payload["trust_tier"], "untrusted_fork", "X-1: 0 divergence");

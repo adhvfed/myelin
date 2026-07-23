@@ -5,6 +5,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let source = include_str!("../src/main.rs");
     let library_source = include_str!("../src/lib.rs");
     let dispatch_consumer_source = include_str!("../../myelin-ci-dispatch/src/consumer.rs");
+    let git_events_source = include_str!("../../myelin-git/src/events.rs");
+    let git_pr_event_source = include_str!("../../myelin-git/src/pg_pr_event.rs");
+    let git_pr_store_source = include_str!("../../myelin-git/src/pg_pr_store.rs");
     let launch_authority_source = include_str!("../src/ci_launch_authority.rs");
     let run_store_source = include_str!("../src/ci_run_store.rs");
     let migrations_source = include_str!("../src/migrations.rs");
@@ -192,13 +195,29 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     );
     assert!(launch_authority_source.contains("labels: LINUX_SMALL_V1_RUNNER_LABELS"));
     assert!(dispatch_consumer_source.contains("let group = format!(\"pr:{repo}:{number}\")"));
-    assert!(dispatch_consumer_source.contains("(\"head_oid\", Some(group))"));
+    assert!(dispatch_consumer_source.contains(".get(\"head_generation\")"));
+    assert!(dispatch_consumer_source.contains("(\"head_oid\", Some(group), Some(generation))"));
+    assert!(dispatch_consumer_source
+        .contains(".with_upcaster(pr_trigger_upcasters().into_hook())"));
+    assert!(dispatch_consumer_source
+        .contains("ev.schema_ver < myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2"));
     assert!(dispatch_consumer_source
         .contains("concurrency_group: armed.reserve.concurrency_group.clone()"));
+    assert!(dispatch_consumer_source
+        .contains("pr_head_generation: armed.reserve.pr_head_generation"));
+    assert!(git_events_source.contains("git_event_token_list() -> SubsystemTokenList"));
+    assert!(git_events_source.contains("GIT_PR_HEAD_TRIGGER_SCHEMA_V2"));
+    assert!(git_pr_store_source.contains("co_commit_event("));
+    assert!(git_pr_event_source.contains("payload[\"head_generation\"] = generation.into()"));
+    assert!(git_pr_event_source.contains("ctx.schema_ver = GIT_PR_HEAD_TRIGGER_SCHEMA_V2"));
+    assert!(git_pr_event_source.contains("SELECT version FROM git_pr"));
     assert!(run_store_source.contains("valid_pr_concurrency_group(group)"));
+    assert!(run_store_source.contains("row.pr_head_generation"));
     assert!(launch_authority_source.contains("launch_concurrency_group(record)?"));
+    assert!(launch_authority_source.contains("record.pr_head_generation"));
     assert!(launch_authority_source.contains("concurrency_group: concurrency_group.clone()"));
     assert!(migrations_source.contains("ci_0001c_ci_run_concurrency_group"));
+    assert!(migrations_source.contains("ci_0001d_ci_run_pr_head_generation"));
     assert!(source.contains("myelin_ci_controlplane::LINUX_SMALL_V1_RUNNER_LABELS"));
     assert!(!launch_authority_source.contains("CiJobTokenAuthorityProvider"));
     assert!(runner_bind_source.contains("token_issuer: LockedManifestCiJobTokenIssuer"));

@@ -91,6 +91,9 @@ pub struct CiRunInsert {
     /// Canonical PR supersession identity (`pr:{repo}:{number}`). Required for every newly written
     /// pull-request run and forbidden for other trigger kinds.
     pub concurrency_group: Option<String>,
+    /// Producer-authored positive `git_pr.version` for this PR head. Required with
+    /// `concurrency_group` for every newly written pull-request run and forbidden otherwise.
+    pub pr_head_generation: Option<i64>,
     /// `ci_run.trust_tier` — the stamped CHECK token (`trusted`/`untrusted_fork`/`self_hosted`),
     /// NOT NULL; the SAME value stamped on every `ci.check.updated.trust_tier` (X-1).
     pub trust_tier: String,
@@ -149,6 +152,9 @@ pub struct CiRunRecord {
     /// Canonical PR supersession identity. Historical rows may be `NULL`; production launch
     /// authority refuses such legacy PR rows rather than inventing a group.
     pub concurrency_group: Option<String>,
+    /// Producer-authored positive PR row generation. Historical `NULL` rows written by the
+    /// immediately preceding dispatcher are legacy-oldest and may never supersede a generation.
+    pub pr_head_generation: Option<i64>,
     /// `ci_run.trust_tier`.
     pub trust_tier: String,
     /// `ci_run.state`.
@@ -167,10 +173,10 @@ pub const INSERT_CI_RUN_QUERY: &str = "\
 INSERT INTO ci_run (
   tenant_id, region, run_id, project_id, pipeline_id, wf_run_id,
   repo_ref, commit_oid, cause_event_id, cause_depth, caused_by, definition_snapshot,
-  trigger_kind, concurrency_group, triggered_by, trust_tier, state, correlation_id
+  trigger_kind, concurrency_group, pr_head_generation, triggered_by, trust_tier, state, correlation_id
 ) VALUES (
   $1, $2, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
-  $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+  $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
 )
 ON CONFLICT (tenant_id, run_id) DO NOTHING
 RETURNING run_id";
@@ -197,10 +203,11 @@ SELECT
   definition_snapshot = $12                        AS definition_snapshot_matches,
   trigger_kind = $13                               AS trigger_kind_matches,
   concurrency_group IS NOT DISTINCT FROM $14::text AS concurrency_group_matches,
-  trust_tier = $15                                 AS trust_tier_matches,
-  correlation_id = $16                             AS correlation_id_matches,
-  (triggered_by IS NOT DISTINCT FROM $17::text
-    OR triggered_by = $18::text)                   AS triggered_by_matches
+  pr_head_generation IS NOT DISTINCT FROM $15::bigint AS pr_head_generation_matches,
+  trust_tier = $16                                 AS trust_tier_matches,
+  correlation_id = $17                             AS correlation_id_matches,
+  (triggered_by IS NOT DISTINCT FROM $18::text
+    OR triggered_by = $19::text)                   AS triggered_by_matches
 FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
 FOR KEY SHARE";
@@ -224,6 +231,7 @@ SELECT
   definition_snapshot     AS definition_snapshot,
   trigger_kind            AS trigger_kind,
   concurrency_group       AS concurrency_group,
+  pr_head_generation      AS pr_head_generation,
   trust_tier              AS trust_tier,
   state                   AS state,
   correlation_id          AS correlation_id
@@ -248,6 +256,7 @@ SELECT
   definition_snapshot     AS definition_snapshot,
   trigger_kind            AS trigger_kind,
   concurrency_group       AS concurrency_group,
+  pr_head_generation      AS pr_head_generation,
   trust_tier              AS trust_tier,
   state                   AS state,
   correlation_id          AS correlation_id
@@ -383,6 +392,9 @@ pub enum CiRunStoreError {
     /// New pull-request runs require one canonical `pr:{repo}:{number}` identity; other triggers
     /// must not carry one.
     InvalidConcurrencyGroup,
+    /// New pull-request runs require the positive producer-authored PR row generation; other
+    /// triggers must not carry one.
+    InvalidPrHeadGeneration,
     /// The primary key already exists, but its immutable run identity differs from this replay.
     /// Field names only: submitted and stored values are deliberately never exposed in the error.
     ReplayCollision {
@@ -429,6 +441,10 @@ impl core::fmt::Display for CiRunStoreError {
             CiRunStoreError::InvalidConcurrencyGroup => write!(
                 f,
                 "durable ci_run insert requires a canonical PR concurrency group only for pull-request triggers"
+            ),
+            CiRunStoreError::InvalidPrHeadGeneration => write!(
+                f,
+                "durable ci_run insert requires a positive producer-authored head generation only for pull-request triggers"
             ),
             CiRunStoreError::ReplayCollision { differing_fields } => write!(
                 f,
@@ -792,6 +808,7 @@ fn ci_run_record_from_row(row: sqlx::postgres::PgRow) -> CiRunRecord {
         definition_snapshot: row.get("definition_snapshot"),
         trigger_kind: row.get("trigger_kind"),
         concurrency_group: row.get("concurrency_group"),
+        pr_head_generation: row.get("pr_head_generation"),
         trust_tier: row.get("trust_tier"),
         state: row.get("state"),
         correlation_id: row.get("correlation_id"),
@@ -1021,10 +1038,11 @@ async fn insert_on_conn(
         .bind(&row.definition_snapshot) // $12 definition_snapshot
         .bind(&row.trigger_kind) // $13 trigger_kind
         .bind(&row.concurrency_group) // $14 canonical PR group (nullable for non-PR)
-        .bind(&row.triggered_by) // $15 triggered_by (nullable pseudonym)
-        .bind(&row.trust_tier) // $16 trust_tier
-        .bind(&row.state) // $17 state
-        .bind(&row.correlation_id) // $18 correlation_id
+        .bind(row.pr_head_generation) // $15 producer-authored PR generation
+        .bind(&row.triggered_by) // $16 triggered_by (nullable pseudonym)
+        .bind(&row.trust_tier) // $17 trust_tier
+        .bind(&row.state) // $18 state
+        .bind(&row.correlation_id) // $19 correlation_id
         .fetch_optional(&mut *conn)
         .await
         .map_err(|e| CiRunStoreError::Db(e.to_string()))?;
@@ -1049,6 +1067,7 @@ async fn insert_on_conn(
         .bind(&row.definition_snapshot)
         .bind(&row.trigger_kind)
         .bind(&row.concurrency_group)
+        .bind(row.pr_head_generation)
         .bind(&row.trust_tier)
         .bind(&row.correlation_id)
         .bind(&row.triggered_by)
@@ -1084,6 +1103,10 @@ async fn insert_on_conn(
             "concurrency_group",
             stored.get::<bool, _>("concurrency_group_matches"),
         ),
+        (
+            "pr_head_generation",
+            stored.get::<bool, _>("pr_head_generation_matches"),
+        ),
         ("trust_tier", stored.get::<bool, _>("trust_tier_matches")),
         (
             "correlation_id",
@@ -1110,15 +1133,24 @@ fn validate_initial_state(row: &CiRunInsert) -> Result<(), CiRunStoreError> {
     if row.state != "queued" {
         return Err(CiRunStoreError::InvalidInitialState);
     }
-    match (row.trigger_kind.as_str(), row.concurrency_group.as_deref()) {
-        ("pull_request", Some(group)) if valid_pr_concurrency_group(group) => {}
-        ("pull_request", _) => {
+    match (
+        row.trigger_kind.as_str(),
+        row.concurrency_group.as_deref(),
+        row.pr_head_generation,
+    ) {
+        ("pull_request", Some(group), Some(generation))
+            if valid_pr_concurrency_group(group) && generation > 0 => {}
+        ("pull_request", group, _) if !group.is_some_and(valid_pr_concurrency_group) => {
             return Err(CiRunStoreError::InvalidConcurrencyGroup);
         }
-        (_, None) => {}
-        (_, Some(_)) => {
+        ("pull_request", _, _) => {
+            return Err(CiRunStoreError::InvalidPrHeadGeneration);
+        }
+        (_, None, None) => {}
+        (_, Some(_), _) => {
             return Err(CiRunStoreError::InvalidConcurrencyGroup);
         }
+        (_, None, Some(_)) => return Err(CiRunStoreError::InvalidPrHeadGeneration),
     }
     u32::try_from(row.cause_depth)
         .map(|_| ())
@@ -1184,6 +1216,7 @@ mod tests {
             definition_snapshot: "blake3:abcd".into(),
             trigger_kind: "push".into(),
             concurrency_group: None,
+            pr_head_generation: None,
             trust_tier: "trusted".into(),
             state: "queued".into(),
             correlation_id: "corr-1".into(),
@@ -1213,7 +1246,7 @@ mod tests {
         }
     }
 
-    /// The INSERT binds all 18 columns + is idempotent on the `(tenant_id, run_id)` PK (the DB-free
+    /// The INSERT binds all 19 columns + is idempotent on the `(tenant_id, run_id)` PK (the DB-free
     /// shape assertions; the live round-trip + co-commit atomicity are the integration proofs).
     #[test]
     fn insert_query_is_idempotent_on_the_pk_and_binds_every_column() {
@@ -1221,13 +1254,13 @@ mod tests {
             INSERT_CI_RUN_QUERY.contains("ON CONFLICT (tenant_id, run_id) DO NOTHING"),
             "idempotent on the run-of-record PK"
         );
-        // 18 bind placeholders ($1..$18) for the 18 writer-set columns.
-        for n in 1..=18 {
+        // 19 bind placeholders ($1..$19) for the 19 writer-set columns.
+        for n in 1..=19 {
             assert!(INSERT_CI_RUN_QUERY.contains(&format!("${n}")), "binds ${n}");
         }
         assert!(
-            !INSERT_CI_RUN_QUERY.contains("$19"),
-            "no over-bind past $18"
+            !INSERT_CI_RUN_QUERY.contains("$20"),
+            "no over-bind past $19"
         );
         // The uuid columns are cast from text (the CT-004b proven posture).
         assert!(INSERT_CI_RUN_QUERY.contains("$3::uuid"));
@@ -1260,6 +1293,7 @@ mod tests {
             "definition_snapshot",
             "trigger_kind",
             "concurrency_group",
+            "pr_head_generation",
             "trust_tier",
             "correlation_id",
             "triggered_by",
@@ -1314,6 +1348,7 @@ mod tests {
         );
 
         row.concurrency_group = Some("pr:team/core:42".into());
+        row.pr_head_generation = Some(7);
         assert!(validate_initial_state(&row).is_ok());
 
         for invalid in [
@@ -1339,6 +1374,25 @@ mod tests {
             Err(CiRunStoreError::InvalidConcurrencyGroup),
             "non-PR rows cannot smuggle PR scheduler authority"
         );
+
+        row.concurrency_group = None;
+        row.pr_head_generation = Some(7);
+        assert_eq!(
+            validate_initial_state(&row),
+            Err(CiRunStoreError::InvalidPrHeadGeneration),
+            "non-PR rows cannot smuggle PR ordering authority"
+        );
+
+        row.trigger_kind = "pull_request".into();
+        row.concurrency_group = Some("pr:team/core:42".into());
+        for invalid in [None, Some(0), Some(-1)] {
+            row.pr_head_generation = invalid;
+            assert_eq!(
+                validate_initial_state(&row),
+                Err(CiRunStoreError::InvalidPrHeadGeneration),
+                "PR generation {invalid:?} is refused"
+            );
+        }
     }
 
     #[test]

@@ -281,6 +281,7 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
             definition_snapshot: format!("blake3:{}", "a".repeat(64)),
             trigger_kind: "push".into(),
             concurrency_group: None,
+            pr_head_generation: None,
             trust_tier: "trusted".into(),
             state: "queued".into(),
             correlation_id: "accounting-live".into(),

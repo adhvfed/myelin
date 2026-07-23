@@ -15,7 +15,8 @@ use myelin_ci_controlplane::{
     CiManifestWorkspaceV1, DurableCiJobLaunchTemplate, GrantedCiJobV1,
     LockedManifestCiJobTokenIssuer, ManifestBoundCiJobTokenAuthority,
     ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
-    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
+    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CI_PIPELINE_WF_TYPE,
     CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
 };
@@ -366,6 +367,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         "{CREATE_CI_RUN_DDL};
          {ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL};
          {ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL};
+         {ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL};
          SELECT myelin_make_tenant_scoped('ci_run');
          {CREATE_CI_DRIVE_MANIFEST_DDL};
          SELECT myelin_make_tenant_scoped('ci_drive_manifest');

@@ -13,7 +13,8 @@ use myelin_ci_controlplane::{
     CiManifestLimitsV1, CiManifestSchedulingV1, CiWorkflowDefinitionPin, PgCiPipelineStarter,
     PgCiRunStarterFactory, PgCiRunStarterPoller, PreparedRunPlanV2, ResolvedJobV2,
     ResolvedRunPlanV2, StartQueuedOutcome, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
-    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
+    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
+    CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
     CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
     CREATE_CI_RUN_DDL,
 };
@@ -676,6 +677,10 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .execute(ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL)
         .await
         .expect("ci_run concurrency identity migration");
+    admin
+        .execute(ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL)
+        .await
+        .expect("ci_run PR ordering authority migration");
     sqlx::raw_sql(CREATE_CI_DRIVE_MANIFEST_DDL)
         .execute(&admin)
         .await

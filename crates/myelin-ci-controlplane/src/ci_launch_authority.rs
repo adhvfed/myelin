@@ -612,15 +612,26 @@ fn launch_concurrency_group(
     match (
         record.trigger_kind.as_str(),
         record.concurrency_group.as_deref(),
+        record.pr_head_generation,
     ) {
-        ("pull_request", Some(group)) if crate::ci_run_store::valid_pr_concurrency_group(group) => {
+        ("pull_request", Some(group), Some(generation))
+            if crate::ci_run_store::valid_pr_concurrency_group(group) && generation > 0 =>
+        {
             Ok(Some(group.to_owned()))
         }
-        ("pull_request", _) => Err(refused(
-            "pull-request run lacks canonical concurrency identity",
+        ("pull_request", Some(group), None)
+            if crate::ci_run_store::valid_pr_concurrency_group(group) =>
+        {
+            // Rows written by the immediately preceding dispatcher during a rolling deploy do not
+            // have this additive column. They remain runnable but are permanently legacy-oldest;
+            // the run-supersession transaction must never let NULL cancel a positive generation.
+            Ok(Some(group.to_owned()))
+        }
+        ("pull_request", _, _) => Err(refused(
+            "pull-request run lacks canonical concurrency identity or producer generation",
         )),
-        (_, None) => Ok(None),
-        (_, Some(_)) => Err(refused(
+        (_, None, None) => Ok(None),
+        (_, _, _) => Err(refused(
             "non-pull-request run carries PR concurrency identity",
         )),
     }
@@ -872,6 +883,7 @@ mod tests {
             ),
             trigger_kind: "push".into(),
             concurrency_group: None,
+            pr_head_generation: None,
             trust_tier: "trusted".into(),
             state: "queued".into(),
             correlation_id: "50000000-0000-0000-0000-000000000001".into(),
@@ -962,6 +974,7 @@ mod tests {
         let (mut record, prepared) = fixture();
         record.trigger_kind = "pull_request".into();
         record.concurrency_group = Some("pr:team/core:42".into());
+        record.pr_head_generation = Some(7);
         let budget = Arc::new(RecordingBudget::default());
         let policy = policy(budget.clone());
         let pin = CiWorkflowDefinitionPin::new(1, "ci-body-v1").unwrap();
@@ -973,12 +986,21 @@ mod tests {
             .all(|job| { job.scheduling.concurrency_group.as_deref() == Some("pr:team/core:42") }));
         assert_eq!(budget.batches.lock().unwrap().len(), 1);
 
+        record.pr_head_generation = None;
+        assert_eq!(
+            launch_concurrency_group(&record).unwrap().as_deref(),
+            Some("pr:team/core:42"),
+            "an old-dispatcher row remains launchable during the rolling migration"
+        );
+
         record.concurrency_group = None;
         let error = policy
             .materialize(&record, &prepared, &pin)
             .await
             .expect_err("a legacy PR row without its event-derived identity fails closed");
-        assert!(error.0.contains("lacks canonical concurrency identity"));
+        assert!(error
+            .0
+            .contains("lacks canonical concurrency identity or producer generation"));
         assert_eq!(
             budget.batches.lock().unwrap().len(),
             1,

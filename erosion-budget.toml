@@ -8,7 +8,3 @@ hard_limit = 5000
 [[over_limit]]
 path = "crates/myelin-edge/src/git_durable.rs"
 production_lines = 4283
-
-[[over_limit]]
-path = "crates/myelin-git/src/pg_pr_store.rs"
-production_lines = 3034

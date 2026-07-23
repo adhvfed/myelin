@@ -16,10 +16,11 @@
 //!   re-defined (the envelope lives in `myelin-events`).
 //!
 //! ## What this prompt (GIT-P2 / P-124) ships — and what it deliberately does NOT
-//! **Ships:** the complete v1 `git.*` event-token registration (arch §1) as named `&'static str`
-//! constants + the [`GIT_EVENT_TOKENS`] table, each PROVEN grammatical against the Bus §6.2/§6.1
-//! grammar by [`myelin_events::validate_event_type`] (0 ungrammatical tokens — the gate). Git
-//! REGISTERS its list; the Bus owns the grammar.
+//! **Ships:** the complete `git.*` event-token registration (arch §1) as named `&'static str`
+//! constants + the [`GIT_EVENT_TOKENS`] table and [`git_event_token_list`] schema lineages, each
+//! PROVEN grammatical against the Bus §6.2/§6.1 grammar by
+//! [`myelin_events::validate_event_type`] (0 ungrammatical tokens — the gate). Git REGISTERS its
+//! list; the Bus owns the grammar.
 //!
 //! **Does NOT ship (floors named — VISION §3 name-your-floors):** these tokens are **registered**
 //! here but **actually EMITTED only from the outbox** in later prompts — there is no emit body here:
@@ -38,7 +39,9 @@
 //! (the names anchor, X-5). The emit paths attach to these constants in the later prompts above;
 //! when they do, they assert against THESE names — one token language, no drift (EI-01 §7).
 
-use myelin_events::validate_event_type;
+use myelin_events::{
+    validate_event_type, RegisteredToken, SubsystemTokenList,
+};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
 
 /// Stable tenant-bound actor pseudonym for Git event envelopes. Production emitters must never put
@@ -146,6 +149,10 @@ pub const GIT_PR_REOPENED: &str = "git.pr.reopened";
 pub const GIT_PR_MERGED: &str = "git.pr.merged";
 /// A pull request head moved (re-anchor + re-gate). Aggregate `git/pr/<n>`.
 pub const GIT_PR_SYNCHRONIZED: &str = "git.pr.synchronized";
+
+/// Current wire lineage for PR head-trigger events. Version 2 adds the required, producer-authored
+/// `head_generation`; CI upcasts durable v1 events before handling them.
+pub const GIT_PR_HEAD_TRIGGER_SCHEMA_V2: u32 = 2;
 
 // --- review (aggregate: git/pr/<n>) ----------------------------------------
 
@@ -259,7 +266,7 @@ pub const GIT_BLOB_SNAPSHOT: &str = "git.blob.snapshot";
 /// The `*.snapshot` reindex event for a comment (contract 2.6).
 pub const GIT_COMMENT_SNAPSHOT: &str = "git.comment.snapshot";
 
-/// The complete v1 `git.*` event-token list this subsystem registers (arch 03 §1). The Bus taxonomy
+/// The complete `git.*` event-token name list this subsystem registers (arch 03 §1). The Bus taxonomy
 /// (contract 2.9) admits exactly these under the §6.1 grammar; each is PROVEN grammatical by
 /// [`tests::every_git_token_parses_the_bus_grammar`]. **Git registers; it does not author the
 /// grammar** — the validator is [`myelin_events::validate_event_type`] (one grammar, no drift).
@@ -340,6 +347,26 @@ pub const GIT_EVENT_TOKENS: &[&str] = &[
     GIT_BLOB_SNAPSHOT,
     GIT_COMMENT_SNAPSHOT,
 ];
+
+/// Git's complete token registration with the current per-name schema lineage. Most Git events
+/// remain at v1; the two PR head-trigger names are v2 because their ordering authority is now part
+/// of the required consumer contract.
+pub fn git_event_token_list() -> SubsystemTokenList {
+    SubsystemTokenList::new(
+        "git",
+        GIT_EVENT_TOKENS
+            .iter()
+            .map(|name| {
+                let token = RegisteredToken::references_only(*name);
+                if matches!(*name, GIT_PR_OPENED | GIT_PR_SYNCHRONIZED) {
+                    token.at_schema_ver(GIT_PR_HEAD_TRIGGER_SCHEMA_V2)
+                } else {
+                    token
+                }
+            })
+            .collect(),
+    )
+}
 
 /// Register the complete `git.*` list against the Bus grammar (contract 2.9). Returns `Ok(())` iff
 /// **every** registered token parses the §6.1 grammar via the one Bus validator
