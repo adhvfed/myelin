@@ -962,14 +962,34 @@ all-feature proofs, full control-plane suite, workspace all-target check, warnin
 architecture lint, erosion gate, and contract-coverage gate are green. Independent adversarial
 review reported CONFIRMED-SOUND with no remaining HIGH/MEDIUM provider or terminal-policy finding.
 
+**Single terminal settlement ownership (2026-07-23).** Successful completion now has one explicit
+typed owner: generic Agent/Git execution settles through its sandbox hook, while durable CI defers
+settlement to the reporter transaction that also consumes the claim, records the immutable receipt
+and cost projection, and signals the workflow. `RunnerHooks` keeps its raw lifecycle closures
+private, requires the owner at construction, and exposes only owner-aware completion and
+pre-spawn-release methods; alternate backends therefore cannot call the raw settlement closure.
+`TerminalReporter` implementations must declare their owner, and `RunnerAgent` refuses either
+double-owned or unowned composition before queue claim, reservation, or launch. The production
+runner loop treats that mismatch as a static configuration refusal and stops the lane.
+
+Both Firecracker and gVisor prove that reporter-owned success does not invoke hook settlement, while
+final-attribution refusal still releases the unused reservation at zero because no terminal report
+will exist. A runner-level rollback/reclaim/retry proof leaves the failed claim retryable and records
+exactly one reporter settlement with zero hook settlements. The durable PostgreSQL reporter
+advertises reporter ownership and its existing injected-failure proof rolls claim, reservation,
+projection, receipt, and signal back together before a clean retry. The exact-tenant router also
+rejects any factory output whose actual owner contradicts its durable-accounting contract, including
+a test-support bypass. Full sandbox, control-plane, Agent, and Edge all-target/all-feature suites,
+workspace all-target check, warnings-denied clippy, architecture lint, erosion gate, and
+contract-coverage gate are green. Independent adversarial review reported CONFIRMED-SOUND with no
+HIGH, MEDIUM, or remaining code LOW findings after its fixture-honesty findings were corrected.
+
 **Honest remaining activation floors:** the production starter factory still composes the explicit
 unavailable provider; wire the proven provider with a server-owned ceiling, then compose the Identity
-minter, exact launch authorizer, exact-tenant region poller/worker, and terminal bookends. Resolve
-single ownership of terminal settlement before activation: the sandbox hook currently precedes the
-atomic reporter, so a durable settle there would create a crash split while a no-op would violate the
-hook contract. Then inject crashes across mint→CAS and CAS→spawn plus cancellation, retry, recovery,
-and settlement races in the complete composition. No Commercial wallet, billing, or Stripe work is
-admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
+minter, exact launch authorizer, exact-tenant region poller/worker, reporter-owned runner hooks, and
+terminal bookends. Then inject crashes across mint→CAS and CAS→spawn plus cancellation, retry,
+recovery, and settlement races in the complete composition. No Commercial wallet, billing, or
+Stripe work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
 
 ## R5–R6
 

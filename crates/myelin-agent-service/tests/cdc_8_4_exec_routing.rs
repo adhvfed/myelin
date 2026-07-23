@@ -87,7 +87,7 @@ struct RunnerSeam {
 impl SandboxBackend for RunnerSeam {
     type Error = HookError;
     fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
-        (hooks.isolation_floor)(spec)?;
+        hooks.enforce_isolation_floor(spec)?;
         self.order.lock().unwrap().push("isolation_floor");
         let target = if self.reserve_exhausted {
             MeterTarget {
@@ -96,16 +96,19 @@ impl SandboxBackend for RunnerSeam {
         } else {
             spec.meter_to.clone()
         };
-        let res = (hooks.reserve)(&target)?;
+        let res = hooks.reserve(&target)?;
         self.order.lock().unwrap().push("reserve");
-        (hooks.attribute)(spec)?;
+        if let Err(error) = hooks.attribute(spec) {
+            hooks.release_unused(&res)?;
+            return Err(error);
+        }
         self.order.lock().unwrap().push("attribute");
         // ... the hardened guest runs the (compute) command here; the seam carries the result back ...
         let result = SandboxResult::stub_ok(ResourceUsage {
             cpu_seconds: 2,
             mem_byte_seconds: 4,
         });
-        (hooks.settle)(&res, result.usage)?;
+        hooks.settle_completed(&res, result.usage)?;
         self.order.lock().unwrap().push("settle");
         Ok(SandboxLaunch {
             handle: SandboxHandle {
@@ -121,18 +124,19 @@ impl SandboxBackend for RunnerSeam {
 }
 
 fn working_hooks() -> RunnerHooks {
-    RunnerHooks {
-        reserve: Box::new(|m| {
+    RunnerHooks::new(
+        myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+        Box::new(|m| {
             if m.reserve_id == "__exhausted__" {
                 Err(HookError("wallet exhausted — refuse to start".into()))
             } else {
                 Ok(ReserveHandle(m.reserve_id.clone()))
             }
         }),
-        settle: Box::new(|_h, _u| Ok(())),
-        attribute: Box::new(|_t| Ok(())),
-        isolation_floor: Box::new(|_s| Ok(())),
-    }
+        Box::new(|_h, _u| Ok(())),
+        Box::new(|_t| Ok(())),
+        Box::new(|_s| Ok(())),
+    )
 }
 
 /// A real GREEN AG-D4 gate (AG-P17 → P-229) — the structural fail-closed prerequisite the exec hands

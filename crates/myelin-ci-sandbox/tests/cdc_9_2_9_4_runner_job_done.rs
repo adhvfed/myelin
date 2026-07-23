@@ -72,12 +72,13 @@ fn ci_spec(idem: &str) -> JobSpec {
     .unwrap()
 }
 fn hooks() -> RunnerHooks {
-    RunnerHooks {
-        reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-        settle: Box::new(|_h, _u| Ok(())),
-        attribute: Box::new(|_t| Ok(())),
-        isolation_floor: Box::new(|_s| Ok(())),
-    }
+    RunnerHooks::new(
+        myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+        Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+        Box::new(|_h, _u| Ok(())),
+        Box::new(|_t| Ok(())),
+        Box::new(|_s| Ok(())),
+    )
 }
 
 /// A no-op backend that drives the four-guarantee seam (the runner DRIVES the sandbox; it does not
@@ -86,14 +87,17 @@ struct NoopBackend;
 impl SandboxBackend for NoopBackend {
     type Error = myelin_ci_sandbox::HookError;
     fn launch(&self, spec: &JobSpec, h: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
-        (h.isolation_floor)(spec)?;
-        (h.attribute)(spec)?;
-        let r = (h.reserve)(&spec.meter_to)?;
+        h.enforce_isolation_floor(spec)?;
+        let r = h.reserve(&spec.meter_to)?;
+        if let Err(error) = h.attribute(spec) {
+            h.release_unused(&r)?;
+            return Err(error);
+        }
         let result = SandboxResult::stub_ok(ResourceUsage {
             cpu_seconds: 1,
             mem_byte_seconds: 1,
         });
-        (h.settle)(&r, result.usage)?;
+        h.settle_completed(&r, result.usage)?;
         Ok(SandboxLaunch {
             handle: SandboxHandle {
                 guest_id: "g".into(),

@@ -549,19 +549,13 @@ impl GvisorBackend {
     where
         F: FnOnce(&JobSpec, &OciConfig) -> Result<ContainerRun, String>,
     {
-        (hooks.isolation_floor)(spec)?;
+        hooks.enforce_isolation_floor(spec)?;
         let profile = HardeningProfile::derive(spec);
         profile.assert_enforced().map_err(GvisorError::Hardening)?;
-        let reserve = (hooks.reserve)(&spec.meter_to)?;
+        let reserve = hooks.reserve(&spec.meter_to)?;
         let cfg = OciConfig::from_spec(spec, &profile);
-        if let Err(attribute_error) = (hooks.attribute)(spec) {
-            (hooks.settle)(
-                &reserve,
-                ResourceUsage {
-                    cpu_seconds: 0,
-                    mem_byte_seconds: 0,
-                },
-            )?;
+        if let Err(attribute_error) = hooks.attribute(spec) {
+            hooks.release_unused(&reserve)?;
             return Err(attribute_error.into());
         }
         // Run the container + capture the REAL result (the ONE legitimate `runsc`-spawn site — the
@@ -580,7 +574,7 @@ impl GvisorBackend {
             .insert(guest_id.clone(), RunscProc { child, bundle_dir });
 
         // Settle against the result's REAL measured usage (CT-002b) — never interrupt in-flight.
-        (hooks.settle)(&reserve, result.usage)?;
+        hooks.settle_completed(&reserve, result.usage)?;
 
         Ok(SandboxLaunch {
             handle: SandboxHandle { guest_id },
@@ -1792,7 +1786,7 @@ impl GvisorBackend {
         .map_err(|e| WireError::Runtime(e.to_string()))?;
 
         // Derive the isolation/config posture before the final mutable launch boundary.
-        (hooks.isolation_floor)(&job)?;
+        hooks.enforce_isolation_floor(&job)?;
         let profile = HardeningProfile::derive(&job);
         profile.assert_enforced().map_err(WireError::Hardening)?;
 
@@ -1818,15 +1812,9 @@ impl GvisorBackend {
             .with_extra_env(spec.env.clone())
             .with_extra_mounts(mounts)
             .with_root_path(root_abs);
-        let reserve = (hooks.reserve)(&job.meter_to)?;
-        if let Err(attribute_error) = (hooks.attribute)(&job) {
-            (hooks.settle)(
-                &reserve,
-                ResourceUsage {
-                    cpu_seconds: 0,
-                    mem_byte_seconds: 0,
-                },
-            )?;
+        let reserve = hooks.reserve(&job.meter_to)?;
+        if let Err(attribute_error) = hooks.attribute(&job) {
+            hooks.release_unused(&reserve)?;
             return Err(attribute_error.into());
         }
 
@@ -1858,7 +1846,7 @@ impl GvisorBackend {
             .insert(guest_id.clone(), RunscProc { child, bundle_dir });
 
         // Settle against the REAL measured usage (never interrupt in-flight).
-        (hooks.settle)(&reserve, result.usage)?;
+        hooks.settle_completed(&reserve, result.usage)?;
 
         Ok(SandboxLaunch {
             handle: SandboxHandle { guest_id },
@@ -1960,7 +1948,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::{ReserveHandle, RunTokenCredential};
+    use crate::{CompletionSettlementOwner, ReserveHandle, RunTokenCredential};
 
     fn spec(allow: Vec<String>) -> JobSpec {
         JobSpec::new(
@@ -1992,12 +1980,13 @@ mod tests {
     }
 
     fn ok_hooks() -> RunnerHooks {
-        RunnerHooks {
-            reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Ok(())),
-        }
+        RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        )
     }
 
     fn outcome(stdout: &[u8], stderr: &[u8]) -> RunscOutcome {
@@ -2292,14 +2281,40 @@ mod tests {
     #[test]
     fn gvisor_refuses_to_start_on_exhaustion() {
         let backend = GvisorBackend::new();
-        let hooks = RunnerHooks {
-            reserve: Box::new(|_m| Err(crate::HookError("exhausted".into()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Ok(())),
-        };
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|_m| Err(crate::HookError("exhausted".into()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
         let r = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg| Ok(fake_run()));
         assert!(matches!(r, Err(GvisorError::Hook(_))));
+    }
+
+    #[test]
+    fn successful_reporter_owned_gvisor_launch_defers_settlement_to_terminal_reporter() {
+        let backend = GvisorBackend::new();
+        let hook_settled = Arc::new(AtomicBool::new(false));
+        let hook_settled_at = hook_settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            Box::new(move |_h, _u| {
+                hook_settled_at.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+
+        backend
+            .launch_with(&spec(vec![]), &hooks, |_spec, _cfg| Ok(fake_run()))
+            .expect("the sandbox returns measured usage for the reporter transaction");
+        assert!(
+            !hook_settled.load(Ordering::SeqCst),
+            "reporter-owned completion must not settle through the hook"
+        );
     }
 
     #[test]
@@ -2307,15 +2322,16 @@ mod tests {
         let backend = GvisorBackend::new();
         let settled = Arc::new(Mutex::new(None));
         let settled_at = settled.clone();
-        let hooks = RunnerHooks {
-            reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            settle: Box::new(move |_h, usage| {
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            Box::new(move |_h, usage| {
                 *settled_at.lock().unwrap() = Some(usage);
                 Ok(())
             }),
-            attribute: Box::new(|_t| Err(crate::HookError("claim canceled".into()))),
-            isolation_floor: Box::new(|_s| Ok(())),
-        };
+            Box::new(|_t| Err(crate::HookError("claim canceled".into()))),
+            Box::new(|_s| Ok(())),
+        );
         let spawned = Arc::new(AtomicBool::new(false));
         let spawned_at = spawned.clone();
         let result = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _cfg| {

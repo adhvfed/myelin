@@ -85,7 +85,9 @@
 //! report run against LIVE Postgres ONLY in `tests/integration_runner_lease.rs` (the `integration`
 //! feature). `cargo build --workspace` + the default `cargo test` stay DB-free AND VM-free.
 
-use crate::{JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxLaunch};
+use crate::{
+    CompletionSettlementOwner, JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxLaunch,
+};
 use myelin_flow::{
     DurableExecutor, ExecutorError, RunId, SignalOutcome, SignalSpec, JOB_DONE_SIGNAL,
 };
@@ -515,6 +517,10 @@ pub struct CompletionClaim {
 /// second signal mechanism. The runner delivers `signal_name = JOB_DONE_SIGNAL`, `idem_key =
 /// idem_token`; the engine's `INSERT … ON CONFLICT DO NOTHING` makes a double-delivery wake once.
 pub trait TerminalReporter {
+    /// The component that commits successful usage settlement. The runner requires this to match
+    /// its hooks before claiming work, preventing both a double-settle and an unowned settlement.
+    fn completion_settlement_owner(&self) -> CompletionSettlementOwner;
+
     /// Report `job.done`, carrying the CLAIMED job's durable identity — `tenant` + `job_id` (the leased
     /// `job_queue` row's authority) alongside `run` + `idem_token` (the workflow-minted dispatch token
     /// the `idem_key` echoes). A verifying reporter (the CI pipeline reporter) checks
@@ -551,6 +557,10 @@ impl<E: DurableExecutor> EngineTerminalReporter<E> {
 }
 
 impl<E: DurableExecutor> TerminalReporter for EngineTerminalReporter<E> {
+    fn completion_settlement_owner(&self) -> CompletionSettlementOwner {
+        CompletionSettlementOwner::Hook
+    }
+
     fn report_done(
         &self,
         claim: &CompletionClaim,
@@ -626,6 +636,12 @@ pub enum RunnerError {
     },
     /// The terminal report failed (a `job.done` to a phantom run — surfaced, never dropped).
     ReportFailed(ExecutorError),
+    /// Hook and reporter composition disagree about who commits successful settlement. Refused
+    /// before a queue claim, guest launch, or reservation mutation.
+    SettlementOwnerMismatch {
+        hooks: CompletionSettlementOwner,
+        reporter: CompletionSettlementOwner,
+    },
 }
 
 impl std::fmt::Display for RunnerError {
@@ -639,6 +655,10 @@ impl std::fmt::Display for RunnerError {
                  re-queued it; this runner must not report terminal)"
             ),
             RunnerError::ReportFailed(e) => write!(f, "terminal job.done report failed: {e}"),
+            RunnerError::SettlementOwnerMismatch { hooks, reporter } => write!(
+                f,
+                "terminal settlement owner mismatch: hooks={hooks:?}, reporter={reporter:?}"
+            ),
         }
     }
 }
@@ -751,6 +771,14 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
     /// (RESHAPE-001 / CT-001): the runner derives it from the [`SandboxResult`](crate::SandboxResult)
     /// the seam now carries back.
     pub fn run_one(&self, now: i64) -> Result<RunOutcome, RunnerError> {
+        let hook_owner = self.hooks.completion_settlement_owner();
+        let reporter_owner = self.reporter.completion_settlement_owner();
+        if hook_owner != reporter_owner {
+            return Err(RunnerError::SettlementOwnerMismatch {
+                hooks: hook_owner,
+                reporter: reporter_owner,
+            });
+        }
         // ── Step 1: CLAIM (the FOR UPDATE SKIP LOCKED handshake). Region + label + trust eligible,
         // lease-free (unleased or expired). A live lease another runner holds is skipped.
         let job = self
@@ -900,7 +928,7 @@ mod tests {
     use myelin_events::MonotonicMinter;
     use myelin_flow::{job_idem_token, FlowExecutor, StartSpec};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn tenant() -> TenantId {
         TenantId("acme".into())
@@ -943,12 +971,13 @@ mod tests {
     }
 
     fn test_hooks() -> RunnerHooks {
-        RunnerHooks {
-            reserve: Box::new(|m| Ok(ReserveHandle(format!("reserved:{}", m.reserve_id)))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Ok(())),
-        }
+        RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|m| Ok(ReserveHandle(format!("reserved:{}", m.reserve_id)))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        )
     }
 
     /// A recording sandbox backend — proves the runner DRIVES the seam (launch + kill), counts
@@ -993,10 +1022,13 @@ mod tests {
                 return Err(HookError("backend refused".into()));
             }
             // Drive the four-guarantee seam exactly as a real backend must (X-6).
-            (hooks.isolation_floor)(spec)?;
-            (hooks.attribute)(spec)?;
-            let res = (hooks.reserve)(&spec.meter_to)?;
-            (hooks.settle)(&res, self.result.usage)?;
+            hooks.enforce_isolation_floor(spec)?;
+            let res = hooks.reserve(&spec.meter_to)?;
+            if let Err(error) = hooks.attribute(spec) {
+                hooks.release_unused(&res)?;
+                return Err(error);
+            }
+            hooks.settle_completed(&res, self.result.usage)?;
             self.launches.fetch_add(1, Ordering::SeqCst);
             Ok(SandboxLaunch {
                 handle: SandboxHandle {
@@ -1009,6 +1041,61 @@ mod tests {
             self.kills.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    struct RecordingTerminalReporter {
+        owner: CompletionSettlementOwner,
+        reports: AtomicUsize,
+        settlements: Arc<Mutex<Vec<ResourceUsage>>>,
+        fail: bool,
+    }
+
+    impl RecordingTerminalReporter {
+        fn reporter_owned(settlements: Arc<Mutex<Vec<ResourceUsage>>>, fail: bool) -> Self {
+            Self {
+                owner: CompletionSettlementOwner::TerminalReporter,
+                reports: AtomicUsize::new(0),
+                settlements,
+                fail,
+            }
+        }
+    }
+
+    impl TerminalReporter for RecordingTerminalReporter {
+        fn completion_settlement_owner(&self) -> CompletionSettlementOwner {
+            self.owner
+        }
+
+        fn report_done(
+            &self,
+            _claim: &CompletionClaim,
+            report: &TerminalReport,
+        ) -> Result<SignalOutcome, ExecutorError> {
+            self.reports.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(ExecutorError::Storage(
+                    "injected terminal transaction rollback".into(),
+                ));
+            }
+            self.settlements.lock().unwrap().push(report.usage);
+            Ok(SignalOutcome::Buffered)
+        }
+    }
+
+    fn hooks_with_owner(
+        owner: CompletionSettlementOwner,
+        hook_settlements: Arc<Mutex<Vec<ResourceUsage>>>,
+    ) -> RunnerHooks {
+        RunnerHooks::new(
+            owner,
+            Box::new(|m| Ok(ReserveHandle(format!("reserved:{}", m.reserve_id)))),
+            Box::new(move |_handle, usage| {
+                hook_settlements.lock().unwrap().push(usage);
+                Ok(())
+            }),
+            Box::new(|_spec| Ok(())),
+            Box::new(|_spec| Ok(())),
+        )
     }
 
     /// Build a FlowExecutor with one registered `ci.pipeline` definition + a started run, returning
@@ -1215,6 +1302,177 @@ mod tests {
         );
         // the engine buffered EXACTLY ONE job.done for the run.
         assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 1);
+    }
+
+    /// The owner handshake is checked before the queue mutation. A hook-owned backend paired with a
+    /// reporter-owned terminal transaction can neither double-settle nor claim work and strand it.
+    #[test]
+    fn settlement_owner_mismatch_refuses_before_claim_or_launch() {
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-1",
+            "job-1",
+            vec!["linux".into()],
+            ci_spec("idem-1"),
+        ));
+        let backend = RecordingBackend::default();
+        let firehose = CountingFirehose::new();
+        let reporter_settlements = Arc::new(Mutex::new(Vec::new()));
+        let reporter =
+            RecordingTerminalReporter::reporter_owned(reporter_settlements.clone(), false);
+        let hook_settlements = Arc::new(Mutex::new(Vec::new()));
+        let agent = RunnerAgent::new(
+            "worker-1",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q.clone(),
+            &backend,
+            &firehose,
+            &reporter,
+            hooks_with_owner(CompletionSettlementOwner::Hook, hook_settlements.clone()),
+        );
+
+        assert!(matches!(
+            agent.run_one(1000),
+            Err(RunnerError::SettlementOwnerMismatch {
+                hooks: CompletionSettlementOwner::Hook,
+                reporter: CompletionSettlementOwner::TerminalReporter,
+            })
+        ));
+        let queued = q.get(&tenant(), "job-1").expect("job remains queued");
+        assert_eq!(
+            queued.lease_owner, None,
+            "the mismatch cannot claim the job"
+        );
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 0);
+        assert_eq!(reporter.reports.load(Ordering::SeqCst), 0);
+        assert!(hook_settlements.lock().unwrap().is_empty());
+        assert!(reporter_settlements.lock().unwrap().is_empty());
+
+        let hook_reporter = RecordingTerminalReporter {
+            owner: CompletionSettlementOwner::Hook,
+            reports: AtomicUsize::new(0),
+            settlements: reporter_settlements.clone(),
+            fail: false,
+        };
+        let unowned = RunnerAgent::new(
+            "worker-1",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q.clone(),
+            &backend,
+            &firehose,
+            &hook_reporter,
+            hooks_with_owner(
+                CompletionSettlementOwner::TerminalReporter,
+                hook_settlements.clone(),
+            ),
+        );
+        assert!(matches!(
+            unowned.run_one(1000),
+            Err(RunnerError::SettlementOwnerMismatch {
+                hooks: CompletionSettlementOwner::TerminalReporter,
+                reporter: CompletionSettlementOwner::Hook,
+            })
+        ));
+        assert_eq!(
+            q.get(&tenant(), "job-1")
+                .expect("job remains queued")
+                .lease_owner,
+            None,
+            "the inverse mismatch also cannot claim the job"
+        );
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 0);
+        assert_eq!(hook_reporter.reports.load(Ordering::SeqCst), 0);
+        assert!(hook_settlements.lock().unwrap().is_empty());
+        assert!(reporter_settlements.lock().unwrap().is_empty());
+    }
+
+    /// Reporter-owned completion skips the hook and commits the measured usage once at the terminal
+    /// boundary. A rolled-back report leaves the claim retryable; the retry still settles exactly
+    /// once through the reporter and never through the hook.
+    #[test]
+    fn reporter_owned_completion_is_single_owner_across_rollback_and_retry() {
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-1",
+            "job-1",
+            vec!["linux".into()],
+            ci_spec("idem-1"),
+        ));
+        let backend = RecordingBackend::default();
+        let firehose = CountingFirehose::new();
+        let hook_settlements = Arc::new(Mutex::new(Vec::new()));
+        let reporter_settlements = Arc::new(Mutex::new(Vec::new()));
+        let failing_reporter =
+            RecordingTerminalReporter::reporter_owned(reporter_settlements.clone(), true);
+        let first = RunnerAgent::new(
+            "worker-1",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q.clone(),
+            &backend,
+            &firehose,
+            &failing_reporter,
+            hooks_with_owner(
+                CompletionSettlementOwner::TerminalReporter,
+                hook_settlements.clone(),
+            ),
+        );
+
+        assert!(matches!(
+            first.run_one(1000),
+            Err(RunnerError::ReportFailed(ExecutorError::Storage(_)))
+        ));
+        let claimed = q
+            .get(&tenant(), "job-1")
+            .expect("rolled-back terminal report leaves the claim for retry");
+        assert_eq!(claimed.lease_owner.as_deref(), Some("worker-1"));
+        assert!(hook_settlements.lock().unwrap().is_empty());
+        assert!(reporter_settlements.lock().unwrap().is_empty());
+
+        let successful_reporter =
+            RecordingTerminalReporter::reporter_owned(reporter_settlements.clone(), false);
+        let retry = RunnerAgent::new(
+            "worker-2",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q.clone(),
+            &backend,
+            &firehose,
+            &successful_reporter,
+            hooks_with_owner(
+                CompletionSettlementOwner::TerminalReporter,
+                hook_settlements.clone(),
+            ),
+        );
+        let outcome = retry
+            .run_one(1031)
+            .expect("the expired claim is reclaimed and terminal accounting retries");
+        assert_eq!(outcome.job_id, "job-1");
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 2);
+        assert!(hook_settlements.lock().unwrap().is_empty());
+        assert_eq!(
+            *reporter_settlements.lock().unwrap(),
+            vec![ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 1,
+            }],
+            "only the successful terminal transaction settles measured usage"
+        );
+        assert!(q.get(&tenant(), "job-1").is_none());
     }
 
     /// **GATE — a runner that delivers `job.done` TWICE wakes the parked workflow EXACTLY ONCE
