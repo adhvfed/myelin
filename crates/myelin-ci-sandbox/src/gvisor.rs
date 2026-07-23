@@ -34,11 +34,12 @@
 //! exclusion of this one file (registered in `lint-gate` + `tests/workspace_clean.rs`).
 
 use crate::hardening::HardeningProfile;
+use crate::launch_gate::SandboxCommand;
 use crate::redaction::RedactionPlan;
 use crate::{
-    drain_capped, EgressPolicy, HookError, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
-    ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend, SandboxHandle,
-    SandboxLaunch, SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
+    drain_capped, EgressPolicy, HookError, IdemToken, ImageRef, JobKind, JobSpec, LaunchPermit,
+    MeterTarget, ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend,
+    SandboxHandle, SandboxLaunch, SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
@@ -450,6 +451,15 @@ impl MemoryCgroup {
         Ok(())
     }
 
+    /// Open the kernel whole-cgroup kill switch for inheritance by the trusted launch watchdog.
+    /// The untrusted guest cannot access this host fd: it is consumed by the host-side runsc process
+    /// tree, outside the OCI container fd table.
+    fn kill_file(&self) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(self.dir.join("cgroup.kill"))
+    }
+
     /// Tear the cgroup down on EVERY path (success / timeout-kill / error): `cgroup.kill` every
     /// remaining member (cgroup v2), wait briefly for the kernel to reap them, then `rmdir`. No
     /// leaked cgroups. Idempotent — safe to call more than once (Drop also calls it).
@@ -547,17 +557,20 @@ impl GvisorBackend {
         run: F,
     ) -> Result<SandboxLaunch, GvisorError>
     where
-        F: FnOnce(&JobSpec, &OciConfig) -> Result<ContainerRun, String>,
+        F: FnOnce(&JobSpec, &OciConfig, LaunchPermit) -> Result<ContainerRun, String>,
     {
         hooks.enforce_isolation_floor(spec)?;
         let profile = HardeningProfile::derive(spec);
         profile.assert_enforced().map_err(GvisorError::Hardening)?;
         let reserve = hooks.reserve(spec)?;
         let cfg = OciConfig::from_spec(spec, &profile);
-        if let Err(attribute_error) = hooks.attribute(spec) {
-            hooks.release_unused(spec, &reserve)?;
-            return Err(attribute_error.into());
-        }
+        let launch_permit = match hooks.acquire_launch_permit(spec) {
+            Ok(permit) => permit,
+            Err(attribute_error) => {
+                hooks.release_unused(spec, &reserve)?;
+                return Err(attribute_error.into());
+            }
+        };
         // Run the container + capture the REAL result (the ONE legitimate `runsc`-spawn site — the
         // sandbox seam's mechanism; the `no-host-exec` named exclusion). `run` cleans up its own
         // bundle/container on error.
@@ -565,7 +578,7 @@ impl GvisorBackend {
             child,
             bundle_dir,
             result,
-        } = run(spec, &cfg).map_err(GvisorError::Runtime)?;
+        } = run(spec, &cfg, launch_permit).map_err(GvisorError::Runtime)?;
 
         let guest_id = format!("runsc-{}", spec.idem_token.0);
         self.live
@@ -634,7 +647,11 @@ impl SandboxBackend for GvisorBackend {
 ///    at most `spec.limits.timeout_secs`; on expiry the WHOLE CONTAINER is killed (`runsc kill <cid>
 ///    KILL` + the child) ⇒ `timed_out=true`, `exit_code=None`.
 /// 3. Best-effort `runsc delete -force <cid>` + remove the bundle dir on EVERY path (no leaks).
-fn run_production_container(spec: &JobSpec, cfg: &OciConfig) -> Result<ContainerRun, String> {
+fn run_production_container(
+    spec: &JobSpec,
+    cfg: &OciConfig,
+    launch_permit: LaunchPermit,
+) -> Result<ContainerRun, String> {
     let bin = runsc_bin();
     let rootfs = resolved_gvisor_rootfs();
     // Honest fail-closed: a runtime/start precondition failure surfaces as an error (never a
@@ -660,6 +677,7 @@ fn run_production_container(spec: &JobSpec, cfg: &OciConfig) -> Result<Container
             stdout_mode: StdoutMode::CappedHead,
             cancellation: &NEVER_CANCELLED,
         },
+        Some(launch_permit),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -783,6 +801,7 @@ fn run_and_capture(
     timeout: Duration,
     mem_bytes: u64,
     options: RunCaptureOptions<'_>,
+    launch_permit: Option<LaunchPermit>,
 ) -> Result<RunscOutcome, String> {
     let RunCaptureOptions {
         stdin,
@@ -794,39 +813,54 @@ fn run_and_capture(
     // memory UNBOUNDED — a host-DoS escape). The cgroup is torn down on every path (its `Drop`).
     let cgroup = MemoryCgroup::create(mem_bytes)?;
 
-    let mut cmd = Command::new(bin);
-    cmd.arg("--rootless")
-        .arg("--network=none")
-        .arg("run")
-        .arg("-bundle")
-        .arg(bundle)
-        .arg(container_id)
-        // CT-006a: the git-wire path pipes the stateless-rpc request body in; CI/agent jobs get no
-        // stdin (`null`). The bytes are already bounded by [`WIRE_STDIN_BOUND`] before we get here.
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Place the runsc child (and the sentry/gofer tree it forks) into the memory cgroup at birth.
-    cgroup
-        .place_child(&mut cmd)
-        .map_err(|e| format!("bind runsc into the memory cgroup: {e}"))?;
-    let mut child = cmd.spawn().map_err(|e| format!("spawn runsc: {e}"))?;
+    let watchdog_timeout = launch_permit.as_ref().map(|_| timeout);
+    let mut sandbox_command = SandboxCommand::new(bin, launch_permit, watchdog_timeout)
+        .map_err(|error| format!("prepare runsc launch gate: {error}"))?;
+    let fenced = sandbox_command.is_fenced();
+    {
+        let cmd = sandbox_command.command_mut();
+        cmd.arg("--rootless")
+            .arg("--network=none")
+            .arg("run")
+            .arg("-bundle")
+            .arg(bundle)
+            .arg(container_id)
+            // CT-006a: the git-wire path pipes the stateless-rpc request body in; CI/agent jobs get no
+            // stdin (`null`). The bytes are already bounded by [`WIRE_STDIN_BOUND`] before we get here.
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if !fenced {
+            cmd.stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
+        }
+        // Place the runsc child (and the sentry/gofer tree it forks) into the memory cgroup at birth.
+        cgroup
+            .place_child(cmd)
+            .map_err(|e| format!("bind runsc into the memory cgroup: {e}"))?;
+    }
+    if fenced {
+        let kill_file = cgroup
+            .kill_file()
+            .map_err(|error| format!("open runsc cgroup kill switch: {error}"))?;
+        sandbox_command.kill_cgroup_on_liveness_loss(kill_file);
+    }
+    let mut child = sandbox_command
+        .spawn()
+        .map_err(|error| format!("spawn runsc: {error}"))?;
 
     // CT-006a: feed the bounded request body to the container's stdin on a DEDICATED thread (so a
     // large body + a slow in-guest reader cannot deadlock against our stdout/stderr drains), then drop
     // the handle to deliver EOF (the stateless-rpc request terminator). None ⇒ stdin was `null`.
     let stdin_pipe = if stdin.is_some() {
-        child.stdin.take()
+        child.stdin().take()
     } else {
         None
     };
     if stdin.is_some() && stdin_pipe.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill_and_wait();
         return Err("runsc stdin pipe unavailable".to_string());
     }
     let stdin_th = stdin.zip(stdin_pipe).map(|(bytes, mut si)| {
@@ -841,9 +875,8 @@ fn run_and_capture(
     let start = Instant::now();
 
     // Drain both pipes on threads so a chatty container cannot fill a pipe buffer and deadlock.
-    let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
-        let _ = child.kill();
-        let _ = child.wait();
+    let (Some(mut out), Some(mut err)) = (child.stdout().take(), child.stderr().take()) else {
+        child.kill_and_wait();
         if let Some(t) = stdin_th {
             let _ = t.join();
         }
@@ -864,10 +897,11 @@ fn run_and_capture(
     // stderr is ALWAYS the 256 KiB head bound — it is error text folded into a message, never payload.
     let th_err = std::thread::spawn(move || drain_capped(&mut err, SANDBOX_CAPTURE_BOUND).0);
 
-    let mut timed_out = false;
+    let timed_out;
     let mut last_cpu: Option<u64> = None;
     let exit = loop {
         if let Some(status) = child.try_wait().map_err(|e| format!("wait runsc: {e}"))? {
+            timed_out = child.watchdog_deadline_expired();
             break status.code();
         }
         if let Some(c) = read_proc_cpu_seconds(pid) {
@@ -883,8 +917,7 @@ fn run_and_capture(
                 .arg(container_id)
                 .arg("KILL")
                 .output();
-            let _ = child.kill();
-            let _ = child.wait();
+            child.kill_and_wait();
             timed_out = !cancelled;
             break None;
         }
@@ -1899,6 +1932,7 @@ fn run_git_wire_container(
             stdout_mode: StdoutMode::StreamToFile { bound: wire_cap },
             cancellation,
         },
+        None,
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -2162,7 +2196,12 @@ mod tests {
         // The SAME SandboxBackend trait + the SAME hardening — the named-second backend.
         let backend = GvisorBackend::new();
         let launch = backend
-            .launch_with(&spec(vec![]), &ok_hooks(), |_spec, _cfg| Ok(fake_run()))
+            .launch_with(&spec(vec![]), &ok_hooks(), |_spec, _cfg, permit| {
+                permit
+                    .commit_and_release()
+                    .map_err(|error| error.to_string())?;
+                Ok(fake_run())
+            })
             .unwrap();
         assert_eq!(launch.handle.guest_id, "runsc-idem-runsc-1");
         // The reshaped seam carries the command result back (CT-001 stub).
@@ -2254,6 +2293,83 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn launch_watchdog_cgroup_kills_a_descendant_outside_the_runtime_process_group() {
+        let cgroup = MemoryCgroup::create(64 << 20)
+            .expect("the all-feature gVisor cgroup watchdog gate requires a real delegated cgroup");
+        let armed = std::env::temp_dir().join(format!(
+            "myelin-gvisor-cgroup-watchdog-armed-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let escaped = std::env::temp_dir().join(format!(
+            "myelin-gvisor-cgroup-watchdog-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let permit = LaunchPermit::retained(|| Ok(crate::LaunchOwnership::immediate()));
+        let mut command =
+            SandboxCommand::new("/bin/sh", Some(permit), Some(Duration::from_secs(2))).unwrap();
+        command
+            .command_mut()
+            .arg("-c")
+            .arg(
+                "setsid /bin/sh -c 'printf \"%s\" \"$$\" > \"$1\"; \
+                 sleep 0.35; printf escaped > \"$2\"; sleep 5' \
+                 myelin-detached \"$1\" \"$2\" & sleep 5",
+            )
+            .arg("myelin-cgroup-watchdog")
+            .arg(&armed)
+            .arg(&escaped)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cgroup
+            .place_child(command.command_mut())
+            .expect("place launch guard in the real gVisor cgroup");
+        command.kill_cgroup_on_liveness_loss(
+            cgroup
+                .kill_file()
+                .expect("open the real whole-cgroup kill switch"),
+        );
+        let mut child = command.spawn().expect("release detached-descendant probe");
+        let runtime_group = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !armed.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "detached cgroup descendant did not publish readiness"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let detached_pid: i32 = std::fs::read_to_string(&armed)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: detached_pid came from the live test-owned setsid child.
+        let detached_group = unsafe { libc::getpgid(detached_pid) };
+        assert!(detached_group > 0);
+        assert_ne!(
+            detached_group, runtime_group,
+            "the readiness process must genuinely be outside the runtime process group"
+        );
+        let membership = std::fs::read_to_string(format!("/proc/{detached_pid}/cgroup")).unwrap();
+        let cgroup_name = cgroup.dir.file_name().unwrap().to_string_lossy();
+        assert!(
+            membership.contains(cgroup_name.as_ref()),
+            "the detached descendant must remain in the exact gVisor memory cgroup"
+        );
+        child.kill_and_wait();
+        std::thread::sleep(Duration::from_millis(450));
+        assert!(
+            !escaped.exists(),
+            "a sentry/gofer-shaped descendant outside the runtime process group survived cgroup.kill"
+        );
+        let _ = std::fs::remove_file(armed);
+        let _ = std::fs::remove_file(escaped);
+    }
+
     #[test]
     fn gvisor_drill_config_expresses_the_mandatory_posture() {
         let json = gvisor_drill_config_json(&spec(vec![]), GVISOR_CORPUS_SCRIPT).unwrap();
@@ -2288,7 +2404,7 @@ mod tests {
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         );
-        let r = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg| Ok(fake_run()));
+        let r = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit| Ok(fake_run()));
         assert!(matches!(r, Err(GvisorError::Hook(_))));
     }
 
@@ -2309,7 +2425,12 @@ mod tests {
         );
 
         backend
-            .launch_with(&spec(vec![]), &hooks, |_spec, _cfg| Ok(fake_run()))
+            .launch_with(&spec(vec![]), &hooks, |_spec, _cfg, permit| {
+                permit
+                    .commit_and_release()
+                    .map_err(|error| error.to_string())?;
+                Ok(fake_run())
+            })
             .expect("the sandbox returns measured usage for the reporter transaction");
         assert!(
             !hook_settled.load(Ordering::SeqCst),
@@ -2334,7 +2455,7 @@ mod tests {
         );
         let spawned = Arc::new(AtomicBool::new(false));
         let spawned_at = spawned.clone();
-        let result = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _cfg| {
+        let result = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _cfg, _permit| {
             spawned_at.store(true, Ordering::SeqCst);
             Ok(fake_run())
         });

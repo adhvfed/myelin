@@ -89,13 +89,13 @@ pub fn ci_runner_hooks(
     let begin = lifecycle.clone();
     let verify = lifecycle.clone();
     let release = lifecycle;
-    RunnerHooks::new(
+    RunnerHooks::new_with_launch_fence(
         CompletionSettlementOwner::TerminalReporter,
         Box::new(move |spec| begin.begin(spec)),
         Box::new(move |spec, handle, usage| release.release_unused(spec, handle, usage)),
         Box::new(move |spec| {
             verify.verify_for_launch(spec)?;
-            launch_authorizer.authorize(spec)
+            launch_authorizer.authorize_retained(spec)
         }),
         Box::new(|spec| {
             HardeningProfile::derive(spec)

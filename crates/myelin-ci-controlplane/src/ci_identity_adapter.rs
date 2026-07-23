@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use myelin_ci_sandbox::{
-    AttributeHook, CiJobAuthorizationContext, HookError, JobKind, JobSpec,
-    RunTokenAuthorizationContext, RunTokenCredential,
+    AttributeHook, CiJobAuthorizationContext, HookError, JobKind, JobSpec, LaunchFenceHook,
+    LaunchOwnership, LaunchPermit, RunTokenAuthorizationContext, RunTokenCredential,
+    ValidatedLaunchOwnership,
 };
 use myelin_events::Timestamp;
 use myelin_identity::{
@@ -161,7 +162,7 @@ fn deterministic_token_expiry(claim: &CiJobTokenRequest) -> Result<i64, CiJobTok
 }
 
 trait CiJobLaunchClaimGate: Send + Sync {
-    fn authorize(&self, context: &CiJobAuthorizationContext) -> Result<bool, String>;
+    fn permit(&self, context: &CiJobAuthorizationContext) -> Result<LaunchPermit, String>;
 }
 
 #[derive(Clone)]
@@ -171,7 +172,7 @@ struct PgCiJobLaunchClaimGate {
 }
 
 impl CiJobLaunchClaimGate for PgCiJobLaunchClaimGate {
-    fn authorize(&self, context: &CiJobAuthorizationContext) -> Result<bool, String> {
+    fn permit(&self, context: &CiJobAuthorizationContext) -> Result<LaunchPermit, String> {
         let claim = CiJobLaunchClaim {
             tenant_id: context.tenant_id.clone(),
             region: context.region.clone(),
@@ -183,7 +184,29 @@ impl CiJobLaunchClaimGate for PgCiJobLaunchClaimGate {
             claim_started_at_epoch_secs: context.claim_started_at_epoch_secs,
             claim_expires_at_epoch_secs: context.claim_expires_at_epoch_secs,
         };
-        bridge(&self.rt, self.store.authorize_launch(&claim)).map_err(|error| error.to_string())
+        let store = self.store.clone();
+        let rt = self.rt.clone();
+        Ok(LaunchPermit::retained(move || {
+            let launch = bridge(&rt, store.authorize_launch_retained(&claim))
+                .map_err(|error| HookError(error.to_string()))?
+                .ok_or_else(|| {
+                    HookError(
+                        "durable scheduler claim was canceled, reaped, expired, or already launched"
+                            .into(),
+                    )
+                })?;
+            let release_rt = rt.clone();
+            Ok(LaunchOwnership::retained(move || {
+                let mut launch = launch;
+                bridge(&release_rt, launch.validate())
+                    .map_err(|error| HookError(error.to_string()))?;
+                let release_rt = release_rt.clone();
+                Ok(ValidatedLaunchOwnership::retained(move || {
+                    bridge(&release_rt, launch.release())
+                        .map_err(|error| HookError(error.to_string()))
+                }))
+            }))
+        }))
     }
 }
 
@@ -234,8 +257,19 @@ impl IdentityCiJobLaunchAuthorizer {
         Box::new(move |spec| self.authorize(spec))
     }
 
+    /// Turn this verifier into a retained production launch fence.
+    pub fn launch_fence_hook(self: Arc<Self>) -> LaunchFenceHook {
+        Box::new(move |spec| self.authorize_retained(spec))
+    }
+
     /// Reauthorize all signed and durable facts immediately before sandbox launch.
     pub fn authorize(&self, spec: &JobSpec) -> Result<(), HookError> {
+        self.authorize_retained(spec)?.commit_and_release()
+    }
+
+    /// Reauthorize signed facts and return a lazy durable permit. The exact CAS runs only after the
+    /// sandbox launch guard is spawned and armed.
+    pub fn authorize_retained(&self, spec: &JobSpec) -> Result<LaunchPermit, HookError> {
         if spec.kind != JobKind::Ci {
             return Err(HookError(
                 "CI Identity launch authorizer received a non-CI job".into(),
@@ -290,21 +324,9 @@ impl IdentityCiJobLaunchAuthorizer {
                 "signed CI credential outlives its durable scheduler claim".into(),
             ));
         }
-        match self.claim_gate.authorize(context) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(HookError(
-                    "durable scheduler claim was canceled, reaped, expired, or already launched"
-                        .into(),
-                ));
-            }
-            Err(error) => {
-                return Err(HookError(format!(
-                    "durable scheduler launch fence failed: {error}"
-                )));
-            }
-        }
-        Ok(())
+        self.claim_gate
+            .permit(context)
+            .map_err(|error| HookError(format!("durable scheduler launch fence failed: {error}")))
     }
 }
 
@@ -374,16 +396,18 @@ mod tests {
     struct AllowClaimGate;
 
     impl CiJobLaunchClaimGate for AllowClaimGate {
-        fn authorize(&self, _context: &CiJobAuthorizationContext) -> Result<bool, String> {
-            Ok(true)
+        fn permit(&self, _context: &CiJobAuthorizationContext) -> Result<LaunchPermit, String> {
+            Ok(LaunchPermit::immediate())
         }
     }
 
     struct RefuseClaimGate;
 
     impl CiJobLaunchClaimGate for RefuseClaimGate {
-        fn authorize(&self, _context: &CiJobAuthorizationContext) -> Result<bool, String> {
-            Ok(false)
+        fn permit(&self, _context: &CiJobAuthorizationContext) -> Result<LaunchPermit, String> {
+            Ok(LaunchPermit::retained(|| {
+                Err(HookError("durable scheduler claim was refused".into()))
+            }))
         }
     }
 

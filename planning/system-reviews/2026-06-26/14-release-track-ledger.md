@@ -1275,10 +1275,63 @@ authority transaction; new workflow drives after shutdown = 0 beyond the one alr
 detached host tasks/threads at deadline = 0; runner intake continuing after terminal-report failure
 = 0; production runner-host lifecycle owners = 3→1.
 
-**Honest remaining activation floors:** inject crashes across mint→CAS and CAS→spawn, then prove
-cancellation, retry, recovery, and reservation settlement through the complete running root before
-activation. No Commercial wallet, billing, or Stripe work is admitted before the Tier-B go decision.
-`MYELIN_CI_RUNNER=1` remains startup-refused.
+**Fenced durable sandbox launch and crash recovery (2026-07-23).** Production Firecracker and
+gVisor launches now spawn a trusted wrapper that is mechanically blocked before runtime exec. Only
+after the exact `leased` → `running` CAS commits does the parent validate its retained PostgreSQL
+session-lock ownership, write the gate byte while that ownership is still held, and release the
+lock. No transaction, row lock, or pooled connection remains owned during guest execution. The
+successful CAS installs a server-owned execution lease equal to the maximum admitted runtime plus
+600 seconds; callers cannot select that recovery window. The reaper still recovers expired
+pre-launch leases immediately, but an expired running generation is requeued only after it acquires
+the exact generation's advisory lock. A paused live post-CAS continuation therefore cannot race a
+replacement, while process or connection death releases ownership and makes the row recoverable.
+Dirty pooled sessions carrying any advisory lock are refused before CAS because PostgreSQL session
+locks are re-entrant.
+
+A native watchdog forks before wrapper exec, closes every inherited descriptor except its exact
+liveness, readiness, timer, and optional cgroup-kill capabilities, and moves into a process group
+separate from the runtime. Runner death or liveness loss kills the complete runtime process group;
+gVisor also inherits an exact `cgroup.kill` descriptor so sentry/gofer-shaped descendants that call
+`setsid` cannot survive. Its independent `CLOCK_BOOTTIME` timer enforces the admitted runtime
+deadline even when the runner thread or process is stopped. It accounts host-suspend time and acts
+on resume; it does not claim to run while the whole host is suspended.
+
+The live PostgreSQL production proof now injects both required crash windows. A credential minted
+without a launch CAS expires, reaps, remints under a new scheduler generation, and the stale
+generation cannot reserve or launch. A committed CAS retains visible `running` state without a
+long transaction, blocks reaping while its session owner lives, reaps after simulated
+process/connection death, refuses the stale generation, and executes the immutable command through
+the real production gVisor backend under the fresh generation. The recovery creates exactly one
+reservation and leaves terminal settlement with the reporter. Process-level regressions SIGKILL
+and SIGSTOP a disposable runner and prove no delayed runtime effect; a real delegated-cgroup test
+proves an out-of-process-group descendant's exact cgroup membership and absence after the ordinary
+sandbox kill path.
+
+Independent review first returned HOLD because the initial design retained a database transaction
+through guest execution, then because the watchdog shared the runtime process group and the
+cgroup-descendant proof was not load-bearing. After the transaction was replaced with the
+commit-to-gate session fence, the watchdog moved to its own group, and the test asserted a real
+detached descendant and exact cgroup membership, final review reported **CONFIRMED-SOUND for the
+scoped process-crash and runner-pause boundary**. The complete Controlplane and Sandbox
+all-target/all-feature suites (including live PostgreSQL, real Firecracker, real gVisor, and escape
+drills), complete lint suite, workspace all-target/all-feature check, warnings-denied clippy,
+architecture lint, erosion budgets, contract coverage, production-source guard, and diff check are
+green. Mechanical payoff: runtimes execing before a committed exact launch CAS = 0; replacement
+generations admitted while a live post-CAS owner is paused = 0; runtime process groups surviving
+runner death or watchdog deadline = 0; gVisor descendants surviving outside the runtime process
+group = 0; caller-selected execution-lease duration = 0.
+
+Two bounded residuals remain explicit. If PostgreSQL applies COMMIT but its acknowledgement is lost,
+execution remains refused and no duplicate is admitted, but recovery can wait for the fixed 6h10m
+lease; this is a MED availability/recovery-latency residual, not a fencing-correctness failure. A
+whole-host suspension spanning both watchdog deadline and remote lease expiry leaves resume
+scheduling unordered; because the guest has no network or durable writable surface and its stale
+terminal CAS is refused, the impact is brief stale contained compute, classified LOW and outside
+this process-crash row.
+
+**Honest remaining activation floors:** prove cancellation, retry, recovery, and reservation
+settlement through the complete running root before activation. No Commercial wallet, billing, or
+Stripe work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
 
 ## R5–R6
 

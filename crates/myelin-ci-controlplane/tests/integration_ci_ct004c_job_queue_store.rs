@@ -612,6 +612,56 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         claim_started_at_epoch_secs: race_lease.claim_started_at_epoch_secs,
         claim_expires_at_epoch_secs: race_lease.claim_expires_at_epoch_secs,
     };
+
+    // A pooled PostgreSQL session lock is re-entrant. Deliberately return a dirty session to a
+    // one-connection pool and prove the launch fence closes/refuses it before the durable CAS,
+    // rather than accepting stale ownership and decrementing only one lock level at release.
+    let dirty_schema = schema.clone();
+    let dirty_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _meta| {
+            let dirty_schema = dirty_schema.clone();
+            Box::pin(async move {
+                conn.execute(format!("SET search_path TO {dirty_schema}, public").as_str())
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&admin_url())
+        .await
+        .expect("connect one-session stale-lock probe");
+    {
+        let mut dirty_connection = dirty_pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(9_223_372_036_i64)
+            .execute(&mut *dirty_connection)
+            .await
+            .expect("seed a stale pooled advisory lock");
+    }
+    let dirty_store = ci_job_queue_store(dirty_pool.clone());
+    let stale_lock_error = dirty_store
+        .authorize_launch(&exact)
+        .await
+        .expect_err("a dirty pooled session must be refused");
+    assert!(
+        stale_lock_error
+            .to_string()
+            .contains("retained an advisory lock"),
+        "the refusal must identify stale session ownership"
+    );
+    let state_after_dirty_session: String =
+        sqlx::query_scalar("SELECT state FROM job_queue WHERE job_id = $1")
+            .bind(uid("launch-race-old"))
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(
+        state_after_dirty_session, "leased",
+        "dirty session refusal must happen before the launch CAS"
+    );
+    drop(dirty_store);
+    dirty_pool.close().await;
+
     let launch_store = store.clone();
     let cancel_store = store.clone();
     let exact_for_launch = exact.clone();

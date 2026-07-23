@@ -64,6 +64,7 @@ pub mod events;
 pub mod firecracker;
 pub mod gvisor;
 pub mod hardening;
+mod launch_gate;
 pub mod notif_rules;
 pub mod redaction;
 pub mod replay;
@@ -74,6 +75,9 @@ pub mod snapshot_pool;
 pub use events::{
     ci_event_tokens, is_durable, register_ci_tokens, CI_DURABLE_TOKENS, CI_FIREHOSE_TOKENS,
 };
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use launch_gate::launch_gate_parent_death_probe;
 pub use replay::CiReindexSource;
 
 pub use notif_rules::{
@@ -973,9 +977,9 @@ pub struct RunnerHooks {
     /// Guarantee #1b: settle the reserve on completion (contract 11.7, `settle_budget`); the
     /// unused reserve is released, never interrupting in-flight.
     settle: SettleHook,
-    /// Guarantee #2: reauthorize the per-run attenuated token and any durable launch generation
-    /// after reserve, immediately before spawn.
-    attribute: AttributeHook,
+    /// Guarantee #2: reauthorize the per-run attenuated token and retain any durable launch fence
+    /// until a sandbox child exists but remains mechanically unable to execute.
+    attribute: AttributionHook,
     /// Guarantee #4: the isolation-floor hook the escape drill (CI-P5) drives — apply + verify the
     /// mandatory hardening profile (arch 02 §5.3) before any untrusted code runs.
     isolation_floor: IsolationFloorHook,
@@ -1003,8 +1007,116 @@ pub type SettleHook =
 /// Guarantee #2 hook type (contract 4.7 mint_run_token): final-boundary attribution over the
 /// credential and the server-resolved expected launch facts carried by the complete spec.
 pub type AttributeHook = Box<dyn Fn(&JobSpec) -> Result<(), HookError> + Send + Sync>;
+/// Production launch-fence hook. The returned permit retains the durable generation fence until
+/// the backend has spawned a gated child. Dropping it before commit rolls the fence back.
+pub type LaunchFenceHook = Box<dyn Fn(&JobSpec) -> Result<LaunchPermit, HookError> + Send + Sync>;
 /// Guarantee #4 hook type (arch 02 §5.3): apply + verify the mandatory hardening profile.
 pub type IsolationFloorHook = Box<dyn Fn(&JobSpec) -> Result<(), HookError> + Send + Sync>;
+
+enum AttributionHook {
+    Immediate(AttributeHook),
+    Fenced(LaunchFenceHook),
+}
+
+/// Opaque durable launch-generation fence committed at the gated child-spawn boundary.
+pub struct LaunchPermit {
+    commit: Option<Box<dyn FnOnce() -> Result<LaunchOwnership, HookError> + Send>>,
+}
+
+impl LaunchPermit {
+    /// A permit for non-durable/test hooks that completed attribution immediately.
+    pub fn immediate() -> Self {
+        Self {
+            commit: Some(Box::new(|| Ok(LaunchOwnership::immediate()))),
+        }
+    }
+
+    /// Wrap a lazy durable fence. The closure runs only after the launch guard is armed and returns
+    /// session ownership that prevents a paused post-commit continuation from being reaped.
+    pub fn retained(
+        commit: impl FnOnce() -> Result<LaunchOwnership, HookError> + Send + 'static,
+    ) -> Self {
+        Self {
+            commit: Some(Box::new(commit)),
+        }
+    }
+
+    /// Commit the launch generation while the spawned child is mechanically blocked from execing
+    /// the sandbox runtime. The launch gate releases the child only after this returns successfully.
+    pub fn commit(mut self) -> Result<LaunchOwnership, HookError> {
+        self.commit
+            .take()
+            .expect("launch permit commit is single-use")()
+    }
+
+    /// Compatibility path for immediate/non-spawning checks.
+    pub fn commit_and_release(self) -> Result<(), HookError> {
+        self.commit()?.validate()?.release()
+    }
+}
+
+/// Ownership retained after durable launch commit, validated before the gate, and held across the
+/// exact gate write. Production uses a PostgreSQL session advisory lock: a paused runner keeps the
+/// row unreapable, while process/connection death releases the lock fail-closed.
+#[must_use = "launch ownership must be released only at the sandbox exec boundary"]
+pub struct LaunchOwnership {
+    validate: Option<Box<dyn FnOnce() -> Result<ValidatedLaunchOwnership, HookError> + Send>>,
+}
+
+impl LaunchOwnership {
+    /// No-op ownership for immediate/test attribution hooks.
+    pub fn immediate() -> Self {
+        Self {
+            validate: Some(Box::new(|| Ok(ValidatedLaunchOwnership::immediate()))),
+        }
+    }
+
+    /// Wrap production session-lock validation. A successful validation returns the still-held
+    /// ownership that the launch gate releases only after it has delivered the exec byte.
+    pub fn retained(
+        validate: impl FnOnce() -> Result<ValidatedLaunchOwnership, HookError> + Send + 'static,
+    ) -> Self {
+        Self {
+            validate: Some(Box::new(validate)),
+        }
+    }
+
+    /// Validate that ownership is still live while retaining it across the child-gate write.
+    pub fn validate(mut self) -> Result<ValidatedLaunchOwnership, HookError> {
+        self.validate
+            .take()
+            .expect("launch ownership validation is single-use")()
+    }
+}
+
+/// A validated durable launch ownership retained across the exact child-gate write.
+#[must_use = "validated launch ownership must be released after the sandbox gate opens"]
+pub struct ValidatedLaunchOwnership {
+    release: Option<Box<dyn FnOnce() -> Result<(), HookError> + Send>>,
+}
+
+impl ValidatedLaunchOwnership {
+    /// No-op ownership for immediate/test attribution hooks.
+    pub fn immediate() -> Self {
+        Self {
+            release: Some(Box::new(|| Ok(()))),
+        }
+    }
+
+    /// Wrap the production session-lock release.
+    pub fn retained(release: impl FnOnce() -> Result<(), HookError> + Send + 'static) -> Self {
+        Self {
+            release: Some(Box::new(release)),
+        }
+    }
+
+    /// Release ownership after the already-gated child has received its exec byte.
+    pub fn release(mut self) -> Result<(), HookError> {
+        self.release
+            .take()
+            .expect("validated launch ownership release is single-use")()
+    }
+}
 
 impl RunnerHooks {
     /// Build the lifecycle hook bundle with one explicit successful-completion settlement owner.
@@ -1022,7 +1134,25 @@ impl RunnerHooks {
             completion_settlement_owner,
             reserve,
             settle,
-            attribute,
+            attribute: AttributionHook::Immediate(attribute),
+            isolation_floor,
+        }
+    }
+
+    /// Build a lifecycle bundle whose final authorization is committed at the gated child-spawn
+    /// boundary.
+    pub fn new_with_launch_fence(
+        completion_settlement_owner: CompletionSettlementOwner,
+        reserve: ReserveHook,
+        settle: SettleHook,
+        attribute: LaunchFenceHook,
+        isolation_floor: IsolationFloorHook,
+    ) -> Self {
+        Self {
+            completion_settlement_owner,
+            reserve,
+            settle,
+            attribute: AttributionHook::Fenced(attribute),
             isolation_floor,
         }
     }
@@ -1044,7 +1174,18 @@ impl RunnerHooks {
 
     /// Perform the final launch-attribution check.
     pub fn attribute(&self, spec: &JobSpec) -> Result<(), HookError> {
-        (self.attribute)(spec)
+        self.acquire_launch_permit(spec)?.commit_and_release()
+    }
+
+    /// Authorize and retain the exact launch generation for a sandbox backend.
+    pub fn acquire_launch_permit(&self, spec: &JobSpec) -> Result<LaunchPermit, HookError> {
+        match &self.attribute {
+            AttributionHook::Immediate(attribute) => {
+                attribute(spec)?;
+                Ok(LaunchPermit::immediate())
+            }
+            AttributionHook::Fenced(attribute) => attribute(spec),
+        }
     }
 
     /// Prepend a final attribution guard while preserving the configured settlement owner and all
@@ -1053,11 +1194,18 @@ impl RunnerHooks {
         mut self,
         guard: impl Fn(&JobSpec) -> Result<(), HookError> + Send + Sync + 'static,
     ) -> Self {
-        let attribute = self.attribute;
-        self.attribute = Box::new(move |spec| {
-            guard(spec)?;
-            attribute(spec)
-        });
+        self.attribute = match self.attribute {
+            AttributionHook::Immediate(attribute) => {
+                AttributionHook::Immediate(Box::new(move |spec| {
+                    guard(spec)?;
+                    attribute(spec)
+                }))
+            }
+            AttributionHook::Fenced(attribute) => AttributionHook::Fenced(Box::new(move |spec| {
+                guard(spec)?;
+                attribute(spec)
+            })),
+        };
         self
     }
 

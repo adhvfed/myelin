@@ -38,9 +38,10 @@
 use crate::hardening::{
     enforce_egress, EgressEnforceError, EgressEnforcer, EnforcedEgress, HardeningProfile,
 };
+use crate::launch_gate::SandboxCommand;
 use crate::redaction::RedactionPlan;
 use crate::{
-    drain_capped, JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxHandle,
+    drain_capped, JobSpec, LaunchPermit, ResourceUsage, RunnerHooks, SandboxBackend, SandboxHandle,
     SandboxLaunch, SandboxResult, SANDBOX_CAPTURE_BOUND,
 };
 use std::io::Read;
@@ -453,7 +454,7 @@ impl FirecrackerBackend {
         run: F,
     ) -> Result<SandboxLaunch, FcError>
     where
-        F: FnOnce(&JobSpec, &HardeningProfile) -> Result<GuestRun, String>,
+        F: FnOnce(&JobSpec, &HardeningProfile, LaunchPermit) -> Result<GuestRun, String>,
     {
         // #4 isolation floor FIRST — the hardening profile must hold before any code runs.
         hooks.enforce_isolation_floor(spec)?;
@@ -473,10 +474,13 @@ impl FirecrackerBackend {
         let reserve = hooks.reserve(spec)?;
         // #2 attribution is the final mutable authorization boundary before spawn. If it refuses,
         // release the unused reserve immediately; no untrusted code has run.
-        if let Err(attribute_error) = hooks.attribute(spec) {
-            hooks.release_unused(spec, &reserve)?;
-            return Err(attribute_error.into());
-        }
+        let launch_permit = match hooks.acquire_launch_permit(spec) {
+            Ok(permit) => permit,
+            Err(attribute_error) => {
+                hooks.release_unused(spec, &reserve)?;
+                return Err(attribute_error.into());
+            }
+        };
 
         // Boot the microVM + run spec.command + capture the REAL result (the ONE legitimate VMM
         // spawn — the sandbox seam's mechanism; the `no-host-exec` named exclusion). `run` cleans up
@@ -485,7 +489,7 @@ impl FirecrackerBackend {
             child,
             cfg_path,
             result,
-        } = run(spec, &profile).map_err(FcError::Vmm)?;
+        } = run(spec, &profile, launch_permit).map_err(FcError::Vmm)?;
 
         let guest_id = format!("fc-{}", spec.idem_token.0);
         self.live
@@ -520,7 +524,11 @@ impl FirecrackerBackend {
 /// 3. Boot with a wall-clock timeout = `spec.limits.timeout_secs` ([`spawn_and_capture`]); on expiry
 ///    the whole guest is killed (`timed_out=true`, `exit_code=None`).
 /// 4. Parse the serial console for the nonce-framed exit + base64 streams ([`build_result_from_console`]).
-fn run_production_guest(spec: &JobSpec, profile: &HardeningProfile) -> Result<GuestRun, String> {
+fn run_production_guest(
+    spec: &JobSpec,
+    profile: &HardeningProfile,
+    launch_permit: LaunchPermit,
+) -> Result<GuestRun, String> {
     let nonce = boot_nonce()?;
     let script = build_command_runner_script(spec, &nonce);
     let script_drive = stage_padded_script(&script)?;
@@ -536,7 +544,7 @@ fn run_production_guest(spec: &JobSpec, profile: &HardeningProfile) -> Result<Gu
     };
 
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
-    let (child, outcome) = match spawn_and_capture(&cfg_path, Some(timeout)) {
+    let (child, outcome) = match spawn_and_capture(&cfg_path, Some(timeout), Some(launch_permit)) {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(&script_drive);
@@ -816,14 +824,27 @@ fn read_proc_cpu_seconds(pid: u32) -> Option<u64> {
 fn spawn_and_capture(
     cfg_path: &Path,
     timeout: Option<Duration>,
+    launch_permit: Option<LaunchPermit>,
 ) -> Result<(SpawnedVmm, CaptureOutcome), String> {
-    let mut child = Command::new(firecracker_bin())
-        .arg("--no-api")
+    let watchdog_timeout = if launch_permit.is_some() {
+        timeout
+    } else {
+        None
+    };
+    let mut sandbox_command =
+        SandboxCommand::new(firecracker_bin(), launch_permit, watchdog_timeout)
+            .map_err(|error| format!("prepare firecracker launch gate: {error}"))?;
+    let fenced = sandbox_command.is_fenced();
+    let cmd = sandbox_command.command_mut();
+    cmd.arg("--no-api")
         .arg("--config-file")
         .arg(cfg_path)
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if !fenced {
+        cmd.stdin(Stdio::null());
+    }
+    let mut child = sandbox_command
         .spawn()
         .map_err(|e| format!("spawn firecracker: {e}"))?;
 
@@ -831,11 +852,10 @@ fn spawn_and_capture(
     let start = Instant::now();
 
     // Drain both pipes on threads so a chatty guest console cannot fill a pipe buffer and deadlock.
-    let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
+    let (Some(mut out), Some(mut err)) = (child.stdout().take(), child.stderr().take()) else {
         // `piped()` should always install both handles, but do not panic or orphan a VMM if the
         // process implementation violates that contract.
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill_and_wait();
         return Err("firecracker console pipe unavailable".to_string());
     };
     // CT-002c: cap each drained stream at CONSOLE_CAPTURE_BOUND (head capture) and DISCARD the rest to
@@ -844,13 +864,14 @@ fn spawn_and_capture(
     let th_out = std::thread::spawn(move || drain_capped(&mut out, CONSOLE_CAPTURE_BOUND).0);
     let th_err = std::thread::spawn(move || drain_capped(&mut err, CONSOLE_CAPTURE_BOUND).0);
 
-    let mut timed_out = false;
+    let timed_out;
     let mut last_cpu: Option<u64> = None;
     let exit = loop {
         if let Some(status) = child
             .try_wait()
             .map_err(|e| format!("wait firecracker: {e}"))?
         {
+            timed_out = child.watchdog_deadline_expired();
             break status.code();
         }
         if let Some(c) = read_proc_cpu_seconds(pid) {
@@ -859,8 +880,7 @@ fn spawn_and_capture(
         if let Some(t) = timeout {
             if start.elapsed() >= t {
                 // Wall-clock ceiling hit: whole-guest-kill the VMM and reap it.
-                let _ = child.kill();
-                let _ = child.wait();
+                child.kill_and_wait();
                 timed_out = true;
                 break None;
             }
@@ -894,7 +914,7 @@ fn spawn_and_capture(
 /// `tests/hardened_boot_selftest.rs` + `tests/escape_drill_test.rs`. Delegates to [`spawn_and_capture`]
 /// (the single VMM-spawn mechanism) so the boot path does not fork.
 pub fn boot_and_capture(cfg_path: &Path) -> Result<(i32, String), String> {
-    let (_child, outcome) = spawn_and_capture(cfg_path, None)?;
+    let (_child, outcome) = spawn_and_capture(cfg_path, None, None)?;
     Ok((outcome.exit.unwrap_or(-1), outcome.console))
 }
 
@@ -1272,9 +1292,16 @@ mod tests {
         let killed = Arc::new(AtomicBool::new(false));
         let killed2 = killed.clone();
         let launch = backend
-            .launch_with(&spec(vec![]), &ok_hooks(), move |_spec, _profile| {
-                Ok(fake_run(killed2))
-            })
+            .launch_with(
+                &spec(vec![]),
+                &ok_hooks(),
+                move |_spec, _profile, permit| {
+                    permit
+                        .commit_and_release()
+                        .map_err(|error| error.to_string())?;
+                    Ok(fake_run(killed2))
+                },
+            )
             .unwrap();
         assert_eq!(launch.handle.guest_id, "fc-idem-fc-1");
         // The reshaped seam carries the (injected) command result: clean exit, usage flows to settle.
@@ -1303,7 +1330,7 @@ mod tests {
         );
         let spawned = Arc::new(AtomicBool::new(false));
         let spawned2 = spawned.clone();
-        let r = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _profile| {
+        let r = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _profile, _permit| {
             spawned2.store(true, Ordering::SeqCst);
             Ok(fake_run(Arc::new(AtomicBool::new(false))))
         });
@@ -1331,7 +1358,10 @@ mod tests {
         );
 
         backend
-            .launch_with(&spec(vec![]), &hooks, |_spec, _profile| {
+            .launch_with(&spec(vec![]), &hooks, |_spec, _profile, permit| {
+                permit
+                    .commit_and_release()
+                    .map_err(|error| error.to_string())?;
                 Ok(fake_run(Arc::new(AtomicBool::new(false))))
             })
             .expect("the sandbox returns measured usage for the reporter transaction");
@@ -1358,7 +1388,7 @@ mod tests {
         );
         let spawned = Arc::new(AtomicBool::new(false));
         let spawned_at = spawned.clone();
-        let result = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _profile| {
+        let result = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _profile, _permit| {
             spawned_at.store(true, Ordering::SeqCst);
             Ok(fake_run(Arc::new(AtomicBool::new(false))))
         });
@@ -1385,7 +1415,7 @@ mod tests {
         );
         let spawned = Arc::new(AtomicBool::new(false));
         let spawned2 = spawned.clone();
-        let r = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _profile| {
+        let r = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _profile, _permit| {
             spawned2.store(true, Ordering::SeqCst);
             Ok(fake_run(Arc::new(AtomicBool::new(false))))
         });
@@ -1416,7 +1446,10 @@ mod tests {
             .launch_with(
                 &spec(vec!["93.184.216.34".into()]),
                 &ok_hooks(),
-                move |_s, profile| {
+                move |_s, profile, permit| {
+                    permit
+                        .commit_and_release()
+                        .map_err(|error| error.to_string())?;
                     *gp2.lock().unwrap() = Some(profile.clone());
                     Ok(fake_run(killed.clone()))
                 },
@@ -1457,7 +1490,7 @@ mod tests {
         let r = backend.launch_with(
             &spec(vec!["93.184.216.34".into()]),
             &ok_hooks(),
-            move |_s, _p| {
+            move |_s, _p, _permit| {
                 ran2.store(true, Ordering::SeqCst);
                 Ok(fake_run(Arc::new(AtomicBool::new(false))))
             },
@@ -1486,7 +1519,7 @@ mod tests {
         let r = backend.launch_with(
             &spec(vec!["registry.example.com".into()]),
             &ok_hooks(),
-            move |_s, _p| {
+            move |_s, _p, _permit| {
                 ran2.store(true, Ordering::SeqCst);
                 Ok(fake_run(Arc::new(AtomicBool::new(false))))
             },

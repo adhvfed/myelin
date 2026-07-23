@@ -152,22 +152,53 @@ RETURNING job_id";
 /// returns to `queued`); the run's `SCHEDULE_AND_RUN_JOB` activity re-dispatch is ONE row (the
 /// `jq_idem` unique on `(tenant_id, idem_token)` rejects a duplicate enqueue). Bind: `$1 region`.
 pub const REAP_QUERY: &str = "\
-UPDATE job_queue
+WITH candidates AS MATERIALIZED (
+  SELECT tenant_id, region, job_id, state, lease_epoch, claim_nonce
+  FROM job_queue
+  WHERE region = $1
+    AND state IN ('leased', 'running')
+    AND lease_expires < now()
+  FOR UPDATE SKIP LOCKED
+),
+expired AS (
+  SELECT tenant_id, job_id
+  FROM candidates
+  WHERE state = 'leased'
+     OR (
+       state = 'running'
+       AND pg_try_advisory_xact_lock(
+         hashtextextended(
+           jsonb_build_array(
+             tenant_id::text,
+             region::text,
+             job_id::text,
+             lease_epoch::text,
+             claim_nonce::text
+           )::text,
+           0
+         )
+       )
+     )
+)
+UPDATE job_queue j
 SET state = 'queued', lease_owner = NULL, lease_expires = NULL, claim_nonce = NULL
-WHERE region = $1
-  AND state IN ('leased', 'running')
-  AND lease_expires < now()
-RETURNING tenant_id, job_id";
+FROM expired e
+WHERE j.tenant_id = e.tenant_id AND j.job_id = e.job_id
+RETURNING j.tenant_id, j.job_id";
 
 /// **Final exact-generation launch fence.** Atomically move one still-live scheduler generation
 /// from `leased` to `running` immediately before sandbox spawn. Cancellation and this CAS serialize
 /// on the same row: cancellation winning first makes this match zero rows; this winning first makes
 /// the row ineligible for cancel-superseded. Every persisted generation fact is compared, including
-/// the original (heartbeat-independent) claim timestamps. Bind: `$1 tenant`, `$2 region`, `$3 job`,
-/// `$4 workflow run`, `$5 owner`, `$6 epoch`, `$7 nonce`, `$8 claim start`, `$9 claim expiry`.
+/// the original (heartbeat-independent) claim timestamps. The successful CAS installs a fresh
+/// execution lease covering the admitted runtime while a session advisory lock protects the much
+/// smaller commit→gated-release interval. Bind: `$1 tenant`, `$2 region`, `$3 job`, `$4 workflow
+/// run`, `$5 owner`, `$6 epoch`, `$7 nonce`, `$8 claim start`, `$9 claim expiry`, `$10 execution
+/// lease seconds`.
 pub const AUTHORIZE_JOB_LAUNCH_QUERY: &str = "\
 UPDATE job_queue
-SET state = 'running'
+SET state = 'running',
+    lease_expires = statement_timestamp() + ($10 || ' seconds')::interval
 WHERE tenant_id = $1
   AND region = $2
   AND job_id = $3::uuid
@@ -1166,7 +1197,11 @@ mod tests {
         assert!(
             REAP_QUERY.contains("SET state = 'queued'")
                 && REAP_QUERY.contains("lease_expires < now()")
-                && REAP_QUERY.trim_start().starts_with("UPDATE"),
+                && REAP_QUERY.contains("FOR UPDATE SKIP LOCKED")
+                && REAP_QUERY.contains("pg_try_advisory_xact_lock")
+                && REAP_QUERY
+                    .trim_start()
+                    .starts_with("WITH candidates AS MATERIALIZED"),
             "the reaper UPDATEs an expired lease in place (no INSERT)"
         );
         // Cancel-superseded terminalises the prior heads, keeping the new one.

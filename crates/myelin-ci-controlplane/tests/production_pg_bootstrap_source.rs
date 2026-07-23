@@ -22,6 +22,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let region_store_source = include_str!("../src/job_queue_region.rs");
     let runner_bind_source = include_str!("../src/runner_bind.rs");
     let runner_host_source = include_str!("../src/ci_runner_host.rs");
+    let launch_gate_source = include_str!("../../myelin-ci-sandbox/src/launch_gate.rs");
+    let gvisor_source = include_str!("../../myelin-ci-sandbox/src/gvisor.rs");
 
     assert!(source.contains("MyelinConfig::from_env(Mode::RequireEnv)"));
     assert!(source.contains("CiSchedulerDbConfig::from_env(&platform_config)"));
@@ -211,13 +213,46 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         "completion_receipt.is_none()",
         "job.reserve_handle != scope.reserve_handle",
         "HardeningProfile::derive",
-        "launch_authorizer.authorize(spec)",
+        "launch_authorizer.authorize_retained(spec)",
     ] {
         assert!(
             runner_identity_source.contains(production_lifecycle_dependency),
             "production runner lifecycle must retain {production_lifecycle_dependency}"
         );
     }
+    assert!(job_queue_store_source.contains(".bind(CI_RUNNER_LEASE_TTL_SECS)"));
+    assert!(
+        job_queue_store_source.contains("pg_backend_pid() AND locktype = 'advisory'"),
+        "the final launch fence must reject a pooled session with stale advisory ownership"
+    );
+    let validate_ownership = launch_gate_source
+        .find("ownership.validate()")
+        .expect("launch ownership must be validated before gate release");
+    let open_gate = launch_gate_source
+        .find("gate.write_all(b\"launch\\n\")")
+        .expect("the durable gate must have one explicit release byte");
+    let release_ownership = launch_gate_source
+        .find("ownership.release()")
+        .expect("launch ownership must be released after the gate handoff");
+    assert!(
+        validate_ownership < open_gate && open_gate < release_ownership,
+        "launch ownership must remain held across the exact child-gate write"
+    );
+    for watchdog_floor in [
+        "CLOCK_BOOTTIME",
+        "timerfd_create",
+        "native_watchdog",
+        "close_unneeded_fds",
+        "kill_from_watchdog",
+        "The watchdog must survive a parent-driven kill of the runtime group",
+    ] {
+        assert!(
+            launch_gate_source.contains(watchdog_floor),
+            "the independent launch watchdog must retain {watchdog_floor}"
+        );
+    }
+    assert!(gvisor_source.contains("kill_cgroup_on_liveness_loss(kill_file)"));
+    assert!(gvisor_source.contains("launch_permit.as_ref().map(|_| timeout)"));
     for production_supersession_dependency in [
         "pr_head_generation",
         "cancel_stale_queued_on_conn",
