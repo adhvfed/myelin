@@ -920,7 +920,7 @@ pub use identity_durable::{
 };
 pub use provider::{
     all_durable_migrations, durable_migration_groups, foundation_migrations, BootstrapError,
-    PgBootstrap, ProviderError, SubstrateProvider, DEFAULT_MAX_CONNECTIONS,
+    IndexReadinessSpec, PgBootstrap, ProviderError, SubstrateProvider, DEFAULT_MAX_CONNECTIONS,
 };
 pub use pseudonym_durable::{
     pseudonym_durable_migrations, DurableErasureLedgerBacking, DurableErasureLedgerRow,

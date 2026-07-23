@@ -42,8 +42,8 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
         .find("&myelin_flow::migrations::migrations()")
         .expect("CI's Flow prerequisite must run through PgBootstrap");
     let ci_index = source
-        .find("verify_index_ready(myelin_ci_controlplane::CI_RUN_SURFACE_REPO_CREATED_INDEX)")
-        .expect("CI run-list keyset index must be ready before serving");
+        .find("verify_index_ready_exact(myelin_ci_controlplane::CI_RUN_SURFACE_INDEX_READINESS)")
+        .expect("CI run-list keyset index identity must be exact before serving");
     let handoff = source
         .find("bootstrap.into_runtime()")
         .expect("bootstrap must be consumed by the runtime handoff");

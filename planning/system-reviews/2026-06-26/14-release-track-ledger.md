@@ -1491,10 +1491,20 @@ hidden details returned after parent movement = 0; runtime starts with the run-l
 This increment does **not** serve log bytes or live tail, does not add the CI web route, does not wire
 CLI/MCP, does not claim the founder acceptance pass, and does not open CT-007.
 
-**Named CT-005 follow-on (LOW):** the generic bootstrap readiness probe currently binds a
-schema-local index name plus PostgreSQL ready/valid bits, not the exact owning table/key/predicate
-identity. Harden that reusable probe before declaring the complete CT-005 surface done; CT-005a does
-not silently promote this low operational-hardening caveat to a finished gate.
+**CT-005a bootstrap identity follow-on (2026-07-24; prior LOW closed).** The reusable split-credential
+bootstrap now has an exact index-readiness probe over the schema-local relation, owning table,
+ordinary table/index relation kinds, access method, PostgreSQL-rendered ordered keys (including
+direction and non-default null order), partial predicate, and PostgreSQL's
+valid/ready/live/not-`indcheckxmin` planner-usability state. Edge binds the CI run-list gate to `ci_run`,
+`(tenant_id,region,repo_ref,created_at DESC,run_id DESC)`, and `repo_ref IS NOT NULL`; a same-name
+relation with a wrong schema, relation kind, access method, table, key/order/null order, predicate,
+or planner-usability state refuses runtime handoff. The live split-credential proof admits the exact shape
+and rejects that physical near-miss matrix; the full live CI bootstrap applies the real migration
+then verifies the same canonical spec Edge consumes. The live CI store proof independently pins the
+migration's actual catalogue identity. The earlier name-only readiness caveat no longer blocks
+completion of CT-005.
+
+L3 bootstrap-hardening footprint: **10 files, +477 / -14 lines** for the reusable exact probe and live matrix.
 
 L3 row footprint: **23 files, +2,257 / -48 lines** for the bounded production read surface and its proofs.
 

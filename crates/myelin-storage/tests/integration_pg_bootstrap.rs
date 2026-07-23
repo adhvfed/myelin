@@ -3,7 +3,7 @@
 
 use myelin_config::MyelinConfig;
 use myelin_storage::migration::{HotTables, Migration, Migrations};
-use myelin_storage::{PgBootstrap, PgError};
+use myelin_storage::{IndexReadinessSpec, PgBootstrap, PgError};
 use sqlx::postgres::PgPoolOptions;
 
 fn unique_suffix() -> String {
@@ -20,6 +20,15 @@ fn unique_suffix() -> String {
 fn with_search_path(url: &str, schema: &str) -> String {
     let separator = if url.contains('?') { '&' } else { '?' };
     format!("{url}{separator}options=-csearch_path%3D{schema}")
+}
+
+fn ordinary_btree<'a>(
+    index: &'a str,
+    table: &'a str,
+    keys: &'a [&'a str],
+    predicate: Option<&'a str>,
+) -> IndexReadinessSpec<'a> {
+    IndexReadinessSpec::new(index, table, "r", "i", "btree", keys, predicate)
 }
 
 async fn exercise_bootstrap(
@@ -83,6 +92,242 @@ async fn exercise_bootstrap(
         )
         .await
         .map_err(|e| format!("migrate isolated RLS table: {e}"))?;
+
+    let index = format!("bootstrap_exact_{suffix}");
+    let index_ddl: &'static str = Box::leak(
+        format!(
+            "CREATE INDEX CONCURRENTLY {index} ON {table} \
+             (tenant_id, region, value DESC) WHERE value <> ''"
+        )
+        .into_boxed_str(),
+    );
+    let index_migration_id: &'static str =
+        Box::leak(format!("9001_pg_bootstrap_index_{suffix}").into_boxed_str());
+    bootstrap
+        .migrate(
+            &Migrations::of([Migration::plain(index_migration_id, index_ddl)]),
+            &HotTables::none(),
+        )
+        .await
+        .map_err(|e| format!("migrate isolated exact index: {e}"))?;
+    let keys = ["tenant_id", "region", "value DESC"];
+    bootstrap
+        .verify_index_ready_exact(ordinary_btree(
+            &index,
+            &table,
+            &keys,
+            Some("(value <> ''::text)"),
+        ))
+        .await
+        .map_err(|e| format!("verify exact index identity: {e}"))?;
+    for wrong in [
+        ordinary_btree(&index, "wrong_table", &keys, Some("(value <> ''::text)")),
+        ordinary_btree(
+            &index,
+            &table,
+            &["tenant_id", "region", "value"],
+            Some("(value <> ''::text)"),
+        ),
+        ordinary_btree(&index, &table, &keys, None),
+    ] {
+        if bootstrap.verify_index_ready_exact(wrong).await.is_ok() {
+            return Err(format!(
+                "exact readiness admitted wrong index identity: {wrong:?}"
+            ));
+        }
+    }
+
+    let other_schema = format!("{schema}_other");
+    let other_table = format!("bootstrap_other_{suffix}");
+    let other_index = format!("bootstrap_other_index_{suffix}");
+    let order_index = format!("bootstrap_order_{suffix}");
+    let nulls_index = format!("bootstrap_nulls_{suffix}");
+    let predicate_index = format!("bootstrap_predicate_{suffix}");
+    let hash_index = format!("bootstrap_hash_{suffix}");
+    let materialized = format!("bootstrap_materialized_{suffix}");
+    let materialized_index = format!("bootstrap_materialized_index_{suffix}");
+    let partitioned = format!("bootstrap_partitioned_{suffix}");
+    let partitioned_index = format!("bootstrap_partitioned_index_{suffix}");
+    sqlx::raw_sql(&format!(
+        "CREATE SCHEMA {other_schema} AUTHORIZATION myelin_admin;
+         CREATE TABLE {other_schema}.{other_table} (
+             tenant_id text NOT NULL,
+             region text NOT NULL,
+             value text NOT NULL
+         );
+         CREATE INDEX {other_index} ON {other_schema}.{other_table}
+             (tenant_id, region, value DESC) WHERE value <> '';
+         CREATE INDEX {order_index} ON {schema}.{table}
+             (region, tenant_id, value DESC) WHERE value <> '';
+         CREATE INDEX {nulls_index} ON {schema}.{table}
+             (tenant_id, region, value DESC NULLS LAST) WHERE value <> '';
+         CREATE INDEX {predicate_index} ON {schema}.{table}
+             (tenant_id, region, value DESC) WHERE value <> 'different';
+         CREATE INDEX {hash_index} ON {schema}.{table} USING hash (value);
+         CREATE MATERIALIZED VIEW {schema}.{materialized} AS
+             SELECT tenant_id, region, value FROM {schema}.{table};
+         CREATE INDEX {materialized_index} ON {schema}.{materialized}
+             (tenant_id, region, value DESC) WHERE value <> '';
+         CREATE TABLE {schema}.{partitioned} (
+             tenant_id text NOT NULL,
+             region text NOT NULL,
+             value text NOT NULL
+         ) PARTITION BY LIST (tenant_id);
+         CREATE INDEX {partitioned_index} ON {schema}.{partitioned}
+             (tenant_id, region, value DESC) WHERE value <> '';"
+    ))
+    .execute(admin_pool)
+    .await
+    .map_err(|e| format!("create exact-readiness negative fixtures: {e}"))?;
+
+    for (label, wrong) in [
+        (
+            "wrong schema",
+            ordinary_btree(
+                &other_index,
+                &other_table,
+                &keys,
+                Some("(value <> ''::text)"),
+            ),
+        ),
+        (
+            "wrong key order",
+            ordinary_btree(&order_index, &table, &keys, Some("(value <> ''::text)")),
+        ),
+        (
+            "wrong null order",
+            ordinary_btree(&nulls_index, &table, &keys, Some("(value <> ''::text)")),
+        ),
+        (
+            "different predicate",
+            ordinary_btree(&predicate_index, &table, &keys, Some("(value <> ''::text)")),
+        ),
+        (
+            "wrong access method",
+            ordinary_btree(&hash_index, &table, &["value"], None),
+        ),
+        (
+            "materialized-view table kind",
+            ordinary_btree(
+                &materialized_index,
+                &materialized,
+                &keys,
+                Some("(value <> ''::text)"),
+            ),
+        ),
+        (
+            "partitioned table/index kind",
+            ordinary_btree(
+                &partitioned_index,
+                &partitioned,
+                &keys,
+                Some("(value <> ''::text)"),
+            ),
+        ),
+    ] {
+        if bootstrap.verify_index_ready_exact(wrong).await.is_ok() {
+            return Err(format!(
+                "exact readiness admitted the physical {label} fixture: {wrong:?}"
+            ));
+        }
+    }
+
+    sqlx::query(
+        "UPDATE pg_index
+            SET indisvalid = false
+          WHERE indexrelid = to_regclass($1)",
+    )
+    .bind(format!("{schema}.{index}"))
+    .execute(admin_pool)
+    .await
+    .map_err(|e| format!("mark exact-readiness fixture invalid: {e}"))?;
+    if bootstrap
+        .verify_index_ready_exact(ordinary_btree(
+            &index,
+            &table,
+            &keys,
+            Some("(value <> ''::text)"),
+        ))
+        .await
+        .is_ok()
+    {
+        return Err("exact readiness admitted an invalid index".into());
+    }
+    sqlx::query(
+        "UPDATE pg_index
+            SET indisvalid = true, indisready = false
+          WHERE indexrelid = to_regclass($1)",
+    )
+    .bind(format!("{schema}.{index}"))
+    .execute(admin_pool)
+    .await
+    .map_err(|e| format!("mark exact-readiness fixture unready: {e}"))?;
+    if bootstrap
+        .verify_index_ready_exact(ordinary_btree(
+            &index,
+            &table,
+            &keys,
+            Some("(value <> ''::text)"),
+        ))
+        .await
+        .is_ok()
+    {
+        return Err("exact readiness admitted an unready index".into());
+    }
+    sqlx::query(
+        "UPDATE pg_index
+            SET indisvalid = true, indisready = true, indislive = false
+          WHERE indexrelid = to_regclass($1)",
+    )
+    .bind(format!("{schema}.{index}"))
+    .execute(admin_pool)
+    .await
+    .map_err(|e| format!("mark exact-readiness fixture non-live: {e}"))?;
+    if bootstrap
+        .verify_index_ready_exact(ordinary_btree(
+            &index,
+            &table,
+            &keys,
+            Some("(value <> ''::text)"),
+        ))
+        .await
+        .is_ok()
+    {
+        return Err("exact readiness admitted a non-live index".into());
+    }
+    sqlx::query(
+        "UPDATE pg_index
+            SET indislive = true, indcheckxmin = true
+          WHERE indexrelid = to_regclass($1)",
+    )
+    .bind(format!("{schema}.{index}"))
+    .execute(admin_pool)
+    .await
+    .map_err(|e| format!("mark exact-readiness fixture xmin-blocked: {e}"))?;
+    if bootstrap
+        .verify_index_ready_exact(ordinary_btree(
+            &index,
+            &table,
+            &keys,
+            Some("(value <> ''::text)"),
+        ))
+        .await
+        .is_ok()
+    {
+        return Err("exact readiness admitted an xmin-blocked index".into());
+    }
+    sqlx::query(
+        "UPDATE pg_index
+            SET indisvalid = true,
+                indisready = true,
+                indislive = true,
+                indcheckxmin = false
+          WHERE indexrelid = to_regclass($1)",
+    )
+    .bind(format!("{schema}.{index}"))
+    .execute(admin_pool)
+    .await
+    .map_err(|e| format!("restore exact-readiness fixture state: {e}"))?;
 
     let provider = bootstrap
         .into_runtime()
