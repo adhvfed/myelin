@@ -101,7 +101,8 @@ pub use ci_runtime_composition::ci_production_runtime_factory_test_support;
 pub use ci_launch_authority::{
     CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority,
     ManifestBoundCiJobTokenAuthority, PgTierPCiJobBudgetReservation, TierPOperationalCiJobPricer,
-    LINUX_SMALL_V1_POLICY_REVISION, TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
+    LINUX_SMALL_V1_POLICY_REVISION, LINUX_SMALL_V1_RUNNER_LABELS,
+    TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
 };
 pub use ci_manifest_pipeline::{
     decode_resolved_ci_manifest, drive_resolved_ci_manifest_pipeline, register_ci_manifest_pipeline,
