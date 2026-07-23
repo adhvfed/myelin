@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a now serves repository-authorized durable run list/detail reads. Still required: live-log API/SSE, web, CLI/MCP, the live founder push→CI→surfaced-check pass, then CT-007.** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges. Still required: honest cross-service live-log SSE, web, CLI/MCP, the live founder push→CI→surfaced-check pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1458,7 +1458,7 @@ completed. Independent adversarial re-review of immutable attempt issuance, rese
 bounded admission-lane composition, canonical detail refs, and the cutover order reports
 **CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding**.
 
-**Honest remaining R4.2 floors:** complete CT-005's live-log API/SSE, web, and CLI/MCP surfaces; start
+**Honest remaining R4.2 floors:** complete CT-005's cross-service live-log SSE, web, and CLI/MCP surfaces; start
 the three CI services and production Edge against the founder cell; push a real Myelin commit; and
 observe the exact head's required check settle green through the verifier and browser. Only after the
 complete surface and founder pass may CT-007 remove GitHub Actions. No completed increment claims that
@@ -1507,6 +1507,46 @@ completion of CT-005.
 L3 bootstrap-hardening footprint: **10 files, +477 / -14 lines** for the reusable exact probe and live matrix.
 
 L3 row footprint: **23 files, +2,257 / -48 lines** for the bounded production read surface and its proofs.
+
+**CT-005b bounded archived-log increment (2026-07-24; not live tail or complete CT-005).** Production
+Edge now mounts authenticated
+`GET /v1/ci/runs/{run}/jobs/{job}/log?start=<byte>&limit=<bytes>`. The action requires the existing
+`run.view` capability and accepts operator/human/agent/PAT purposes but never a CI-job token. Edge
+resolves the canonical run under the verified tenant/region, inherits the parent Git repository's
+exact Pull decision, and returns the same 404 for denied parents and absent runs/jobs. CI then binds
+that exact authorized `repo_ref`, run, and job in a tenant-scoped repeatable-read snapshot and selects
+only sealed `log_segment` rows overlapping the requested byte range. Query grammar is canonical and
+duplicate/unknown-field rejecting; response ranges default to 64 KiB and are capped at 256 KiB, while
+segment-reference count and individual blob reads have separate hard ceilings.
+
+Edge parses each canonical content address, reads it from the provider-injected production BlobStore
+under the verified tenant keyspace, applies the store's metadata pre-bound plus re-hash-on-read
+integrity check, verifies row byte length exactly, and requires contiguous non-overlapping coverage
+before returning any bytes. The wire payload is base64 so a caller may split arbitrary UTF-8 or binary
+output without lossy transcoding. Missing/malformed/corrupt/oversized blobs, invalid offsets,
+gaps/overlaps, and over-fragmentation return one generic unavailable response without content-address
+leakage. The live PostgreSQL store proof pins run/repo/job conjunction, overlapping segment selection,
+wrong-parent rejection, and FORCE-RLS isolation. The authenticated production-handler proof reads a
+range across two real CAS objects, proves denied-parent and absent-job 404 equivalence, and proves a
+missing CAS object fails closed without exposing its ref. Unit and mounted-action gates cover strict
+range grammar, exact byte assembly, gap refusal, viewer authority, and CI-job-token denial.
+
+Mechanical payoff: archived bytes served without parent Pull authorization = 0; unverified or
+over-bound blob bytes served = 0; incomplete/overlapping archive ranges silently truncated = 0;
+content addresses entering public failures = 0. This increment does **not** claim SSE/live tail,
+because the existing `LiveTail` Firehose is process-local and is not a cross-service resume authority
+for separately deployed runners and Edge. That named transport floor, CI web, CLI/MCP, the founder
+acceptance pass, and CT-007 remain open.
+
+Independent adversarial review found one MED availability defect in the first reader bound: invalid
+UTF-8 may expand threefold in the production frame-to-line adapter, so a legitimate sealed segment can
+approach 1 MiB rather than the guessed 512 KiB. The producer now exports the one derived ceiling and
+Edge consumes it; a worst-case invalid-byte frame proves the actual adapter→seal→CAS→bounded-read path.
+The review also caused the hidden-parent proof to receive a real hidden child and removed new
+source-string assertions that could pass on comments. Independent re-review reports all HIGH/MED and
+junk-test findings closed.
+
+L3 CT-005b footprint: **10 files, +882 / -33 lines** for archived reads, shared producer bound, proofs, and ledgers.
 
 ## R5–R6
 

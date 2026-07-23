@@ -49,9 +49,10 @@ use myelin_identity_service::{
 };
 use myelin_notif::pg_inbox::PgInboxStore;
 use myelin_storage::{
-    all_durable_migrations, seal_key_from_env, DurableCellRootBacking, DurableKmsBacking,
-    DurablePrincipalBacking, DurableReplayBacking, DurableRevocationBacking, DurableTupleBacking,
-    HotTables, KmsEngine, PgBootstrap, PgOutboxBacking, SubstrateProvider, TenantScope,
+    all_durable_migrations, seal_key_from_env, BlobStore, DurableCellRootBacking,
+    DurableKmsBacking, DurablePrincipalBacking, DurableReplayBacking, DurableRevocationBacking,
+    DurableTupleBacking, HotTables, KmsEngine, PgBootstrap, PgOutboxBacking, SubstrateProvider,
+    TenantScope,
 };
 use myelin_tenancy::{Region, TenantId};
 use std::{
@@ -1064,6 +1065,7 @@ async fn serve(
         )
         .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
     builder = register_git_durable(builder, git_backend.clone());
+    let ci_blobs: Arc<dyn BlobStore + Send + Sync> = Arc::from(provider.blob_store(handle.clone()));
     builder = register_ci(
         builder,
         myelin_ci_controlplane::CiRunStore::with_pg_surface_cursor_key(
@@ -1071,6 +1073,7 @@ async fn serve(
             ci_surface_cursor_key,
         ),
         git_backend.clone(),
+        ci_blobs,
         handle.clone(),
     );
     builder = register_git_wire(builder, git_backend);

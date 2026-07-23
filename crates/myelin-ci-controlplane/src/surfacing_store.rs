@@ -18,6 +18,9 @@ pub const CI_RUN_PAGE_DEFAULT: u32 = 50;
 pub const CI_RUN_PAGE_MAX: u32 = 100;
 pub const CI_RUN_VISIBLE_REPO_MAX: usize = 4_096;
 pub const CI_RUN_CURSOR_PREFIX: &str = "cr1_";
+pub const CI_LOG_RANGE_DEFAULT: u32 = 64 * 1024;
+pub const CI_LOG_RANGE_MAX: u32 = 256 * 1024;
+pub const CI_LOG_SEGMENT_REF_MAX: usize = 256;
 
 const CURSOR_TIMESTAMP_BYTES: usize = 27;
 const CURSOR_UUID_BYTES: usize = 16;
@@ -111,6 +114,49 @@ SELECT
 FROM log_anchor
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
 ORDER BY job_id ASC, byte_start ASC, step_id ASC";
+
+pub const SELECT_CI_LOG_ARCHIVE_HEAD_QUERY: &str = "\
+SELECT COALESCE(MAX(segment.byte_end), 0) AS total_end
+FROM ci_run run
+JOIN ci_job job
+  ON job.tenant_id = run.tenant_id
+ AND job.region = run.region
+ AND job.run_id = run.run_id
+LEFT JOIN log_segment segment
+  ON segment.tenant_id = job.tenant_id
+ AND segment.region = job.region
+ AND segment.run_id = job.run_id
+ AND segment.job_id = job.job_id
+ AND segment.blob_ref IS NOT NULL
+WHERE run.tenant_id = $1
+  AND run.region = $2
+  AND run.run_id = $3::uuid
+  AND run.repo_ref = $4
+  AND job.job_id = $5::uuid
+GROUP BY run.run_id, job.job_id";
+
+pub const SELECT_CI_LOG_ARCHIVE_SEGMENTS_QUERY: &str = "\
+SELECT segment.blob_ref, segment.byte_start, segment.byte_end
+FROM ci_run run
+JOIN ci_job job
+  ON job.tenant_id = run.tenant_id
+ AND job.region = run.region
+ AND job.run_id = run.run_id
+JOIN log_segment segment
+  ON segment.tenant_id = job.tenant_id
+ AND segment.region = job.region
+ AND segment.run_id = job.run_id
+ AND segment.job_id = job.job_id
+WHERE run.tenant_id = $1
+  AND run.region = $2
+  AND run.run_id = $3::uuid
+  AND run.repo_ref = $4
+  AND job.job_id = $5::uuid
+  AND segment.blob_ref IS NOT NULL
+  AND segment.byte_end > $6
+  AND segment.byte_start < $7
+ORDER BY segment.byte_start ASC, segment.segment_seq ASC
+LIMIT $8";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiRunStateFilter {
@@ -226,6 +272,48 @@ pub struct CiRunSurface {
     pub run: CiRunSummary,
     pub jobs: Vec<CiJobSurface>,
     pub steps: Vec<CiStepSurface>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CiLogRangeRequest {
+    pub start: i64,
+    pub limit: u32,
+}
+
+impl CiLogRangeRequest {
+    pub fn new(start: i64, limit: u32) -> Result<Self, CiRunSurfaceError> {
+        if start < 0 {
+            return Err(CiRunSurfaceError::BadInput(
+                "CI log start must be non-negative".into(),
+            ));
+        }
+        if !(1..=CI_LOG_RANGE_MAX).contains(&limit) {
+            return Err(CiRunSurfaceError::BadInput(format!(
+                "CI log range limit must be between 1 and {CI_LOG_RANGE_MAX}"
+            )));
+        }
+        start
+            .checked_add(i64::from(limit))
+            .ok_or_else(|| CiRunSurfaceError::BadInput("CI log range overflows".into()))?;
+        Ok(Self { start, limit })
+    }
+
+    pub fn end(self) -> i64 {
+        self.start + i64::from(self.limit)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiLogSegmentRef {
+    pub blob_ref: String,
+    pub byte_start: i64,
+    pub byte_end: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiLogArchive {
+    pub total_end: i64,
+    pub segments: Vec<CiLogSegmentRef>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -405,6 +493,97 @@ impl CiRunStore {
             run: run_from_row(run),
             jobs: jobs.into_iter().map(job_from_row).collect(),
             steps: steps.into_iter().map(step_from_row).collect(),
+        }))
+    }
+
+    pub async fn get_surface_log_archive(
+        &self,
+        tenant_id: &str,
+        region: &str,
+        run_id: &str,
+        job_id: &str,
+        expected_repo_ref: &str,
+        request: CiLogRangeRequest,
+    ) -> Result<Option<CiLogArchive>, CiRunSurfaceError> {
+        let request = CiLogRangeRequest::new(request.start, request.limit)?;
+        let run_id = canonical_uuid("run id", run_id)?;
+        let job_id = canonical_uuid("job id", job_id)?;
+        if expected_repo_ref.is_empty() || expected_repo_ref.len() > 1_024 {
+            return Err(CiRunSurfaceError::BadInput(
+                "expected repository ref must be non-empty and bounded".into(),
+            ));
+        }
+        let tenant_id_owned = tenant_id.to_string();
+        let region_owned = region.to_string();
+        let repo = expected_repo_ref.to_string();
+        let query_run = run_id.clone();
+        let query_job = job_id.clone();
+        let fetch_limit = i64::try_from(CI_LOG_SEGMENT_REF_MAX + 1)
+            .expect("CI log segment reference bound fits i64");
+        let result = with_tenant_repeatable_read_tx(self.pool(), tenant_id, region, move |conn| {
+            Box::pin(async move {
+                let head = sqlx::query(SELECT_CI_LOG_ARCHIVE_HEAD_QUERY)
+                    .bind(&tenant_id_owned)
+                    .bind(&region_owned)
+                    .bind(&query_run)
+                    .bind(&repo)
+                    .bind(&query_job)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|error| PgError::Query(error.to_string()))?;
+                let Some(head) = head else {
+                    return Ok(None);
+                };
+                let total_end: i64 = head.get("total_end");
+                if total_end < 0 {
+                    return Err(PgError::Query(
+                        "CI log archive has a negative total byte offset".into(),
+                    ));
+                }
+                let range_end = if request.start < total_end {
+                    request.end().min(total_end)
+                } else {
+                    request.start
+                };
+                let segments = if range_end > request.start {
+                    sqlx::query(SELECT_CI_LOG_ARCHIVE_SEGMENTS_QUERY)
+                        .bind(&tenant_id_owned)
+                        .bind(&region_owned)
+                        .bind(&query_run)
+                        .bind(&repo)
+                        .bind(&query_job)
+                        .bind(request.start)
+                        .bind(range_end)
+                        .bind(fetch_limit)
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(|error| PgError::Query(error.to_string()))?
+                } else {
+                    Vec::new()
+                };
+                Ok(Some((total_end, segments)))
+            })
+        })
+        .await?;
+        let Some((total_end, rows)) = result else {
+            return Ok(None);
+        };
+        if rows.len() > CI_LOG_SEGMENT_REF_MAX {
+            return Err(CiRunSurfaceError::Storage(
+                "CI log archive range is too fragmented to serve".into(),
+            ));
+        }
+        let segments = rows
+            .into_iter()
+            .map(|row| CiLogSegmentRef {
+                blob_ref: row.get("blob_ref"),
+                byte_start: row.get("byte_start"),
+                byte_end: row.get("byte_end"),
+            })
+            .collect();
+        Ok(Some(CiLogArchive {
+            total_end,
+            segments,
         }))
     }
 }

@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use myelin_ci_controlplane::surfacing_store::{
-    CiRunPageRequest, CiRunStateFilter, CiRunSurfaceError,
+    CiLogRangeRequest, CiRunPageRequest, CiRunStateFilter, CiRunSurfaceError,
 };
 use myelin_ci_controlplane::{
     ci_controlplane_migrations, CiRunStore, CI_RUN_SURFACE_REPO_CREATED_INDEX,
@@ -78,6 +78,7 @@ async fn setup_schema(admin: &PgPool, schema: &str) {
             migration.id,
             "ci_0001_ci_run"
                 | "ci_0002_ci_job"
+                | "ci_0007_log_segment"
                 | "ci_0008_log_anchor"
                 | "ci_0018d_ci_run_surface_repo_created"
         )
@@ -159,6 +160,21 @@ async fn insert_detail(app: &PgPool) {
             .bind(REGION)
             .bind(JOB)
             .bind(RUN_2)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+            sqlx::query(
+                "INSERT INTO log_segment (
+                   tenant_id, region, run_id, job_id, segment_seq, blob_ref,
+                   byte_start, byte_end, pii_key_ref
+                 ) VALUES
+                   ($1, $2, $3::uuid, $4::uuid, 0, 'blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 0, 20, 'tenant:test'),
+                   ($1, $2, $3::uuid, $4::uuid, 1, 'blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 20, 50, 'tenant:test')",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(RUN_2)
+            .bind(JOB)
             .execute(&mut *conn)
             .await
             .map_err(|error| PgError::Query(error.to_string()))?;
@@ -316,6 +332,53 @@ async fn run_list_and_detail_are_visibility_scoped_keyset_and_rls_safe() {
     assert_eq!(detail.steps.len(), 1);
     assert_eq!(detail.steps[0].step_id, "compile");
     assert_eq!(detail.steps[0].byte_end, Some(48));
+
+    let archive = store
+        .get_surface_log_archive(
+            TENANT,
+            REGION,
+            RUN_2,
+            JOB,
+            BETA,
+            CiLogRangeRequest::new(12, 16).unwrap(),
+        )
+        .await
+        .expect("archive read")
+        .expect("repo-bound job exists");
+    assert_eq!(archive.total_end, 50);
+    assert_eq!(archive.segments.len(), 2);
+    assert_eq!(
+        archive
+            .segments
+            .iter()
+            .map(|segment| (segment.byte_start, segment.byte_end))
+            .collect::<Vec<_>>(),
+        [(0, 20), (20, 50)]
+    );
+    assert!(store
+        .get_surface_log_archive(
+            TENANT,
+            REGION,
+            RUN_2,
+            JOB,
+            ALPHA,
+            CiLogRangeRequest::new(0, 16).unwrap(),
+        )
+        .await
+        .expect("wrong parent is an ordinary miss")
+        .is_none());
+    assert!(store
+        .get_surface_log_archive(
+            OTHER_TENANT,
+            REGION,
+            RUN_2,
+            JOB,
+            BETA,
+            CiLogRangeRequest::new(0, 16).unwrap(),
+        )
+        .await
+        .expect("cross-tenant archive read returns no row")
+        .is_none());
 
     assert!(
         store

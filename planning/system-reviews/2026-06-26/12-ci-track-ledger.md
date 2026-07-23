@@ -13,9 +13,11 @@ reserve commit as the run, queued outbox rows, and trigger dedup; PipelineStarte
 reallocates them. CT-004 remains in progress until a real founder push produces, settles, and surfaces
 its exact-head check. CT-005 is now **IN PROGRESS**: CT-005a mounts production durable run-list and
 run-detail reads at Edge, prefiltered through the parent Git repository's Pull visibility and backed by
-an opaque scope-bound keyset cursor plus a ready-at-boot index. It does not yet serve log bytes/live
-tail, web, CLI, or MCP. CT-007 is still unopened; GitHub Actions must not be removed before the founder
-acceptance pass and the complete CT-005 surface are genuinely usable.
+an opaque scope-bound keyset cursor plus a ready-at-boot index. CT-005b adds byte-exact bounded archived
+log reads over sealed `log_segment` rows and the production content-addressed BlobStore. It deliberately
+does not call the process-local `LiveTail` an SSE transport: cross-service resumable live tail, web,
+CLI, and MCP remain open. CT-007 is still unopened; GitHub Actions must not be removed before the
+founder acceptance pass and the complete CT-005 surface are genuinely usable.
 
 ## Environment (confirmed — this track is testable here)
 Firecracker v1.16.0 + gVisor (`runsc`) on PATH; `/dev/kvm` present. So the production microVM boot + the
@@ -57,6 +59,24 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
 - **W3:** CT-003 (escape verification, 0 escapes through prod) · CT-004 (CI backend harden) · CT-006 (the git wire, unblocked)
 - **W4:** CT-005 (CI API+UI+CLI/MCP)
 - **W5:** CT-007 (cut over — only after the sandbox is genuinely hardened)
+
+## CT-005 execution increments
+
+- **CT-005a — durable run reads:** authenticated repository-authorized run list/detail, opaque
+  scope-bound keyset cursor, repeatable-read detail snapshot, and exact boot index readiness.
+- **CT-005b — bounded archived logs:** authenticated
+  `GET /v1/ci/runs/{run}/jobs/{job}/log?start=<byte>&limit=<bytes>` resolves the exact run parent,
+  inherits Git Pull authorization, selects only overlapping sealed segment refs in one tenant-scoped
+  repeatable-read transaction, then reads each content address through BlobStore's metadata bound and
+  re-hash-on-read integrity gate. The response is base64 so arbitrary byte ranges never corrupt UTF-8.
+  Missing, malformed, corrupt, oversized, gapped, overlapping, or over-fragmented archives fail
+  generically; absent jobs and denied parents remain the same 404. The default range is 64 KiB and the
+  hard response cap is 256 KiB.
+
+**Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
+services. It is not an honest production SSE resume source. SSE remains open until a real
+cross-service bounded resume transport exists; CT-005b claims archived cold-path reads only. Web,
+CLI/MCP, the live founder push→settled check→surfaced log pass, and CT-007 also remain open.
 
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod
