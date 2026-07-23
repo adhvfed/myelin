@@ -543,13 +543,15 @@ fn decode_real(produced: &CiProducerFacts, context: &str) -> CheckStatus {
     panic!("CI did not produce a ci.check.updated for context `{context}`");
 }
 
-/// Re-stamp a decoded fact's `run_attempt` / `state` / `trust_tier` for a supersession scenario (the
-/// fact's other frozen fields — repo, commit, context, summary, refs — are CI's REAL ones).
+/// Re-stamp a decoded terminal fact for a supersession scenario. The workflow producer emits its
+/// terminal fact before the external accounting bookend, so the fixture must model the later settled
+/// projection explicitly; an unsettled success is correctly neutral at the merge gate.
 fn bump_attempt(base: &CheckStatus, attempt: u32, state: GitState, trust: GitTier) -> CheckStatus {
     let mut f = base.clone();
     f.run_attempt = attempt;
     f.state = state;
     f.trust_tier = trust;
+    f.cost_settled = true;
     f.run = myelin_tenancy::ArtifactRef(format!("myelin://acme/ci/run/{attempt}"));
     f
 }
