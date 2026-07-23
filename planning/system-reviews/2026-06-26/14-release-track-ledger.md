@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — readable logs proven; execution-plan boundary built but production start remains disabled** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — claim-time Identity + exact final launch fence proven; operational reservation/composition remain; production start disabled** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -901,15 +901,49 @@ refuses forged handle/owner/time, reaped/null, and reclaimed generations before 
 full control-plane all-target/all-feature suite and warnings-denied clippy are green. An independent
 adversarial re-audit reported CONFIRMED-SOUND with no HIGH/MEDIUM findings.
 
+**Concrete Identity generation + exact final launch fence (2026-07-23, `ef4c91f1`).** The claim-time
+adapter now mints a real PASETO-backed Identity CI credential under S7. A production 6h10m scheduler
+claim gets one deterministic token generation whose absolute deadline is
+`min(claim_started_at + 300s, claim_expires_at)`: concurrent acknowledgement-loss retries return the
+same credential while that window is live, and the same claim refuses rather than reminting after
+the window. The final authorizer cryptographically pins the CI scheme, kind, purpose, tenant,
+region, service principal, job, carrier/signed JTI, required capabilities, signed expiry, and S7
+liveness. Its non-serializable launch context also carries workflow run, lease owner/epoch/nonce,
+and both original claim timestamps.
+
+Authorization is no longer a copied-fact check. After isolation/config derivation and successful
+operational reservation, the last mutable action before sandbox spawn is one exact durable
+`leased` → `running` CAS over every scheduler-generation field. Cancel-superseded and launch now
+serialize on the same row: cancellation winning first refuses launch; launch winning first makes the
+row ineligible for cancellation. A refused final authorization releases the unused reservation with
+zero usage. Heartbeat and dead-runner recovery accept `running`, so a process death after the fence
+does not create an orphan. The live PostgreSQL test races cancellation against the exact launch CAS,
+proves exactly one winner, refuses CAS replay, and reaps an expired running generation. Real PASETO
+tests cover concurrent retry, forgery, scope/capability/expiry divergence, S7 teardown, the full
+production lease lifetime, and a refused durable fence.
+
+The same verification uncovered that the gVisor process-pressure corpus had been mechanically
+dishonest: it printed `CONTAINED` unconditionally, while rootless `runsc` actually admitted all 300
+children because its OCI pids cgroup field was advisory. The runtime config now adds
+`RLIMIT_NPROC` at the same server-owned PIDs ceiling, and the corpus counts admitted processes,
+reports an escape above the ceiling, and isolates/reaps the pressure probe before later resource
+checks. The real production-path rerun admitted 58 under the ceiling of 64 and completed all twelve
+probes with zero escapes and zero did-not-run outcomes. Full control-plane and sandbox
+all-target/all-feature suites, the agent-service suite, edge focused tests, workspace all-target
+check, warnings-denied clippy, architecture lint, L2 erosion gate, and contract-coverage gate are
+green.
+
+**Code-wins deviation:** the first adapter revision wrapped `spawn_blocking` in a timeout, but Tokio
+cannot cancel a blocking task; timing out could release the durable locks while signing/S7 mutation
+continued detached. The concrete in-process mint is now awaited to completion instead. If a future
+remote signer is introduced, its transport must provide a genuinely cancellable deadline before it
+can replace this boundary; a cosmetic timeout is not an accepted gate.
+
 **Honest remaining activation floors:** implement and crash-prove the concrete Tier-P operational
-reservation source. The concrete Identity adapter must mint and cryptographically verify the signed
-credential's scheme, purpose, tenant/region/principal/job scope, capabilities, carrier JTI, and
-absolute expiry bounded by the durable claim; its call must have a claim-bounded timeout and exact
-acknowledgement-loss/concurrent-retry behavior. The runner must reauthorize immediately before
-sandbox launch, with a concurrent-reaper and post-mint/pre-commit crash proof. Then compose the
-exact-tenant region poller/worker and terminal reserve/settle bookends. No Commercial wallet,
-billing, or Stripe work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains
-startup-refused.
+reservation source; compose this Identity minter, exact launch authorizer, exact-tenant region
+poller/worker, and terminal reserve/settle bookends in the production runner; then inject crashes
+across mint→CAS and CAS→spawn in that composed path. No Commercial wallet, billing, or Stripe work
+is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
 
 ## R5–R6
 
