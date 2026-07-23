@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — complete running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, dormant coordinated runner host, producer-authored PR head ordering, and serialized run supersession proven; live dogfood activation/cutover remains; production start disabled** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — complete running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, and opt-in production runner boot proven; live founder push→CI→check and GitHub-Actions cutover remain** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1362,10 +1362,40 @@ Mechanical payoff: accepted completions before launch = 0; partial terminal comm
 accounting fault = 0; stale generation settlements after reaping = 0; duplicate terminal
 signals/accounting/Storage events on exact retry = 0; recovered finalizer workflows left active = 0.
 
-**Honest remaining activation floor:** deliberately enable the dormant coordinated runner and
-complete a live founder Myelin push → CI → check dogfood/cutover pass. No Commercial wallet, billing,
-or Stripe work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains
-startup-refused until that activation row.
+**Opt-in production runner activation (2026-07-23).** The former blanket refusal is removed only for
+the exact `MYELIN_CI_RUNNER=1` value; unset / `0` remains dormant and malformed or non-UTF-8 values
+still fail before database access. Activation now preflights an explicit absolute `MYELIN_RUNSC_BIN`
+and `MYELIN_GVISOR_ROOTFS` before PostgreSQL bootstrap. That preflight identifies the runtime, checks
+the immutable rootfs executables, and executes `/bin/false` as the non-root guest through the same
+rootless runsc OCI staging, no-network posture, and delegated cgroup-v2 placement used by production.
+The dogfood command exports the exact executor paths and starts the coordinated CI host in a
+foreground-owned process.
+
+Signal handling is armed and consumed into one process-wide shutdown latch before preflight or
+bootstrap. The reaper, queued-run starter, exact-tenant Flow recovery poller, and sandbox runner all
+subscribe to that same current state, so a termination received during bootstrap is visible before
+their first intake instruction. The production-process proof seeds a claimable trusted queued row,
+waits only for the early handler-armed marker, sends SIGTERM before the runner-host announcement, and
+requires a clean exit with no runner start and the row still queued and unowned. A separate local boot
+reached the real runner announcement with the production split roles and executor, then drained
+cleanly on SIGINT.
+
+The complete Controlplane all-target/all-feature suite (439 unit tests plus live PostgreSQL, real
+gVisor, scheduler least-privilege, cancellation, recovery, accounting, and production-process
+integrations), the complete Sandbox all-target/all-feature suite (including the real gVisor and
+Firecracker production/escape paths), workspace all-target/all-feature check, warnings-denied clippy,
+architecture lint and fixture matrix, erosion budgets, frontend-aware contract coverage, targeted
+rustfmt, shell syntax, and diff check are green. Independent adversarial review first held MED on a
+boot-time signal that was installed but not consumed before host start; after the shared latch and
+seeded pre-host-signal proof, final review reported **CONFIRMED-SOUND with no remaining HIGH or MEDIUM
+finding**. Mechanical payoff: opt-in boots with an unavailable executor = 0; queued jobs claimed after
+a bootstrap-time termination request = 0; runner-host lanes outside the coordinated shutdown owner =
+0.
+
+**Honest remaining activation floor:** run the exact opt-in coordinated runner through a live founder
+Myelin push → CI → check dogfood/cutover pass. No Commercial wallet, billing, or Stripe work is
+admitted before the Tier-B go decision. The runner is now locally boot-proven, but that is not
+evidence that a real founder push produced and surfaced its check.
 
 ## R5–R6
 

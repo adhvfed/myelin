@@ -57,6 +57,25 @@ bounded checks against PostgreSQL and the writable durable Git root, returning `
 error details when either critical dependency cannot serve. During termination the edge stops
 accepting sockets, drains HTTP connections for up to 20 seconds, then closes any remaining streams.
 
+### Bring the CI runner up
+
+In another foreground-owned terminal, start the CI control plane with its coordinated runner host:
+
+```sh
+./scripts/dogfood.sh ci
+```
+
+This uses the same dogfood cell, seal key, split PostgreSQL credentials, region, and data services as
+the edge, and sets the exact opt-in `MYELIN_CI_RUNNER=1`. The host owns queued-run start, durable Flow
+recovery, real gVisor execution, terminal accounting, and bounded shutdown as one lifecycle. Unset or
+`MYELIN_CI_RUNNER=0` keeps those lanes dormant; any other value is refused before database access.
+Activation also refuses before database access unless `MYELIN_RUNSC_BIN` is an absolute executable
+that identifies itself as gVisor `runsc`, `MYELIN_GVISOR_ROOTFS` is an absolute staged base rootfs
+with the required executables, and the host can execute a bounded non-root `/bin/false` smoke through
+the real rootless runsc, read-only OCI bundle, and delegated cgroup-v2 memory boundary.
+Keep the process in the foreground during dogfood. Stop it with SIGINT/SIGTERM and require a clean
+drain before restarting or upgrading it.
+
 ## 3. Mint an operator token (`edge bootstrap`)
 
 ```sh

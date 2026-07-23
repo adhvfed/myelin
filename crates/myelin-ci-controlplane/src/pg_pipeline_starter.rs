@@ -6,16 +6,15 @@
 //! PostgreSQL transaction.
 //!
 //! The service main composes this starter through [`PgCiRunStarterFactory`] (built at the composition
-//! root by [`crate::ci_run_starter_factory`]), behind the SAME `MYELIN_CI_RUNNER` activation seam the
-//! runner lane uses. That composition is REAL but DORMANT: while the startup refusal keeps
-//! `MYELIN_CI_RUNNER=1` fail-closed, the factory is constructed but no minted starter is driven, so no
-//! queued run is started yet. A fresh start accepts only a canonical V2 plan and requires an explicit
+//! root by [`crate::ci_run_starter_factory`]), behind the SAME explicit `MYELIN_CI_RUNNER=1`
+//! activation seam the runner lane uses. Unset / `0` keeps the complete runner host dormant. A fresh
+//! start accepts only a canonical V2 plan and requires an explicit
 //! policy-aware [`CiLaunchAuthorityMaterializer`]; the production default refuses every fresh launch.
 //! The starter co-commits the immutable runtime grants, check attempts, canonical job ledger, workflow,
 //! and lifecycle transition, while an exact retry validates and reuses the frozen manifest without
 //! consulting mutable current policy. A fresh start also co-emits one manifest-bound in-progress
 //! check fact per authored context through the durable outbox. The region-wide poller is composed
-//! separately and remains dormant until the production activation blockers are closed.
+//! separately and is driven only by that same opt-in host.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;

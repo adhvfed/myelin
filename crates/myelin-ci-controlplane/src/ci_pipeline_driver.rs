@@ -1081,13 +1081,11 @@ impl TerminalReporter for CiPipelineReporter {
                                     },
                                 )
                                 .await?;
+                                close_cancelled_run_if_accounted(conn, accounting, &run_owned.0)
+                                    .await?;
                             }
                             #[cfg(any(test, feature = "test-support"))]
                             ReporterAccounting::TestBypass => {}
-                        }
-                        if let ReporterAccounting::Durable(accounting) = &accounting {
-                            close_cancelled_run_if_accounted(conn, accounting, &run_owned.0)
-                                .await?;
                         }
                         Ok((outcome, signal))
                     })
