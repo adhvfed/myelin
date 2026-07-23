@@ -8,7 +8,9 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::{SecondsFormat, Utc};
 use myelin_events::{Actor, MonotonicMinter};
 use myelin_flow::{PgFlowExecutor, PgFlowWorker, PgWorkerScope};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
@@ -271,6 +273,42 @@ impl CiProductionWorkflowPoller {
         now_unix_secs: i64,
         now_rfc3339: &str,
     ) -> Result<CiWorkflowFanoutBatch, CiRuntimeCompositionError> {
+        self.run_once_inner(
+            max_scopes,
+            max_drives_per_scope,
+            now_unix_secs,
+            now_rfc3339,
+            None,
+        )
+        .await
+    }
+
+    async fn run_once_or_shutdown(
+        &mut self,
+        max_scopes: usize,
+        max_drives_per_scope: usize,
+        now_unix_secs: i64,
+        now_rfc3339: &str,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<CiWorkflowFanoutBatch, CiRuntimeCompositionError> {
+        self.run_once_inner(
+            max_scopes,
+            max_drives_per_scope,
+            now_unix_secs,
+            now_rfc3339,
+            Some(shutdown),
+        )
+        .await
+    }
+
+    async fn run_once_inner(
+        &mut self,
+        max_scopes: usize,
+        max_drives_per_scope: usize,
+        now_unix_secs: i64,
+        now_rfc3339: &str,
+        shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<CiWorkflowFanoutBatch, CiRuntimeCompositionError> {
         if !(1..=MAX_CI_WORKFLOW_SCOPES_PER_PASS).contains(&max_scopes)
             || !(1..=MAX_CI_WORKFLOW_DRIVES_PER_SCOPE).contains(&max_drives_per_scope)
         {
@@ -301,6 +339,10 @@ impl CiProductionWorkflowPoller {
         let mut driven = 0usize;
         let mut saturated = discovered == max_scopes;
         for route in page.routes {
+            if shutdown.is_some_and(|receiver| *receiver.borrow()) {
+                saturated = true;
+                break;
+            }
             let partition = route.partition;
             if !seen.insert((route.tenant.0.clone(), partition)) {
                 continue;
@@ -309,10 +351,24 @@ impl CiProductionWorkflowPoller {
             let worker = self
                 .runtime
                 .worker_for(route.tenant, partition, worker_id)?;
-            let batch = worker
-                .run_until_idle(max_drives_per_scope, now_unix_secs, now_rfc3339)
-                .await
-                .map_err(|_| CiRuntimeCompositionError)?;
+            let batch = match shutdown {
+                Some(receiver) => {
+                    worker
+                        .run_until_idle_or_shutdown(
+                            max_drives_per_scope,
+                            now_unix_secs,
+                            now_rfc3339,
+                            receiver,
+                        )
+                        .await
+                }
+                None => {
+                    worker
+                        .run_until_idle(max_drives_per_scope, now_unix_secs, now_rfc3339)
+                        .await
+                }
+            }
+            .map_err(|_| CiRuntimeCompositionError)?;
             scopes += 1;
             driven = driven.saturating_add(batch.driven);
             saturated |= batch.saturated;
@@ -323,6 +379,46 @@ impl CiProductionWorkflowPoller {
             driven,
             saturated,
         })
+    }
+
+    /// Run bounded recovery passes until explicit shutdown or sender closure. Wall-clock values are
+    /// sampled once per pass and supplied to Flow's deterministic lease/timestamp boundary.
+    pub async fn run_until_shutdown(
+        mut self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        poll_interval: Duration,
+        max_scopes: usize,
+        max_drives_per_scope: usize,
+    ) -> Result<(), CiRuntimeCompositionError> {
+        if poll_interval.is_zero()
+            || !(1..=MAX_CI_WORKFLOW_SCOPES_PER_PASS).contains(&max_scopes)
+            || !(1..=MAX_CI_WORKFLOW_DRIVES_PER_SCOPE).contains(&max_drives_per_scope)
+        {
+            return Err(CiRuntimeCompositionError);
+        }
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            let now = Utc::now();
+            let now_rfc3339 = now.to_rfc3339_opts(SecondsFormat::Secs, true);
+            self.run_once_or_shutdown(
+                max_scopes,
+                max_drives_per_scope,
+                now.timestamp(),
+                &now_rfc3339,
+                &shutdown,
+            )
+            .await?;
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                _ = tokio::time::sleep(poll_interval) => {}
+            }
+        }
     }
 }
 

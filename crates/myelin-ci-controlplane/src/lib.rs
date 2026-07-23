@@ -73,6 +73,7 @@ pub mod ci_pipeline;
 pub mod ci_result_signal;
 pub mod ci_runtime_composition;
 pub mod ci_runner_composition;
+pub mod ci_runner_host;
 pub use ci_claim_token_issuer::{CiJobCredentialMinter, LockedManifestCiJobTokenIssuer};
 pub use ci_drive_manifest::{
     ci_check_context_v1, CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1,
@@ -576,6 +577,11 @@ pub use ci_run_supersession::{CiRunSupersessionError, PgCiRunSupersession};
 pub use ci_run_starter_poller::{
     CiRunStarterBatch, CiRunStarterPollerError, PgCiRunStarterPoller, MAX_CI_RUN_START_BATCH,
 };
+pub use ci_runner_host::{
+    wait_for_ci_runner_host_drain_timeout, wait_for_ci_runner_host_failure, CiRunnerHost,
+    CiRunnerHostConfig, CiRunnerHostFailure, CiRunnerHostHandle, CI_RUNNER_HOST_DRAIN_TIMEOUT,
+    CI_RUNNER_HOST_POLL_INTERVAL,
+};
 pub use ci_scheduler_db::{
     CiSchedulerDbConfig, CiSchedulerDbError, CiSchedulerDbProvider, CI_SCHEDULER_DATABASE_URL_ENV,
 };
@@ -586,8 +592,8 @@ pub use ci_scheduler_db::{
 #[cfg(any(test, feature = "test-support"))]
 pub use runner_bind::durable_spec_resolver_test_support;
 pub use runner_bind::{
-    durable_spec_resolver, spec_store_unavailable_resolver, CiRunnerLoop, DurableLeaseAdapter,
-    JobSpecResolver, CI_RUNNER_LEASE_TTL_SECS,
+    durable_spec_resolver, spec_store_unavailable_resolver, CiRunnerLoop, CiRunnerLoopExit,
+    DurableLeaseAdapter, JobSpecResolver, CI_RUNNER_LEASE_TTL_SECS,
 };
 
 // CT-004d.2 CULMINATION (chunks 2/3/5): the CI pipeline driver — `DurableJobRunner` (chunk 5) dispatches

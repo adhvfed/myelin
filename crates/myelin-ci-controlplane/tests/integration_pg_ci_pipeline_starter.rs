@@ -155,6 +155,42 @@ fn plan() -> ResolvedRunPlanV2 {
 #[derive(Clone, Debug)]
 struct TestLaunchAuthority;
 
+fn test_launch_authority(
+    record: &myelin_ci_controlplane::ci_run_store::CiRunRecord,
+    prepared: &PreparedRunPlanV2,
+) -> CiLaunchAuthorityV1 {
+    CiLaunchAuthorityV1 {
+        policy_revision: "test-policy-v1".into(),
+        jobs: prepared
+            .plan()
+            .jobs
+            .iter()
+            .map(|job| CiJobLaunchGrantV1 {
+                concrete_name: job.name.clone(),
+                env: BTreeMap::new(),
+                secret_handles: BTreeMap::new(),
+                egress_allow: Vec::new(),
+                limits: CiManifestLimitsV1 {
+                    cpu_millis: 1_000,
+                    mem_bytes: 1_073_741_824,
+                    disk_bytes: 2_147_483_648,
+                    pids_max: 128,
+                    timeout_secs: 600,
+                },
+                scheduling: CiManifestSchedulingV1 {
+                    lane: CiManifestLaneV1::Batch,
+                    labels: vec!["linux".into()],
+                    concurrency_group: None,
+                    fair_key: format!("project:{}", record.project_id),
+                },
+                reserve_handle: format!("reserve:{}:{}", record.run_id, job.name),
+                token_authority_handle: format!("mint:{}:{}", record.run_id, job.name),
+            })
+            .collect(),
+        merge_waiter: None,
+    }
+}
+
 impl CiLaunchAuthorityMaterializer for TestLaunchAuthority {
     fn materialize<'a>(
         &'a self,
@@ -170,36 +206,34 @@ impl CiLaunchAuthorityMaterializer for TestLaunchAuthority {
     > {
         Box::pin(async move {
             AUTHORITY_CALLS.fetch_add(1, Ordering::SeqCst);
-            Ok(CiLaunchAuthorityV1 {
-                policy_revision: "test-policy-v1".into(),
-                jobs: prepared
-                    .plan()
-                    .jobs
-                    .iter()
-                    .map(|job| CiJobLaunchGrantV1 {
-                        concrete_name: job.name.clone(),
-                        env: BTreeMap::new(),
-                        secret_handles: BTreeMap::new(),
-                        egress_allow: Vec::new(),
-                        limits: CiManifestLimitsV1 {
-                            cpu_millis: 1_000,
-                            mem_bytes: 1_073_741_824,
-                            disk_bytes: 2_147_483_648,
-                            pids_max: 128,
-                            timeout_secs: 600,
-                        },
-                        scheduling: CiManifestSchedulingV1 {
-                            lane: CiManifestLaneV1::Batch,
-                            labels: vec!["linux".into()],
-                            concurrency_group: None,
-                            fair_key: format!("project:{}", record.project_id),
-                        },
-                        reserve_handle: format!("reserve:{}:{}", record.run_id, job.name),
-                        token_authority_handle: format!("mint:{}:{}", record.run_id, job.name),
-                    })
-                    .collect(),
-                merge_waiter: None,
-            })
+            Ok(test_launch_authority(record, prepared))
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PausingLaunchAuthority {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl CiLaunchAuthorityMaterializer for PausingLaunchAuthority {
+    fn materialize<'a>(
+        &'a self,
+        record: &'a myelin_ci_controlplane::ci_run_store::CiRunRecord,
+        prepared: &'a PreparedRunPlanV2,
+        _definition: &'a CiWorkflowDefinitionPin,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<CiLaunchAuthorityV1, CiLaunchAuthorityError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(test_launch_authority(record, prepared))
         })
     }
 }
@@ -1147,6 +1181,81 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
             .register_definition(CI_PIPELINE_WF_TYPE, 1, BODY_HASH)
             .expect("register immutable workflow definition");
     });
+
+    // A shutdown arriving during one real starter transaction lets that in-flight start commit, then
+    // prevents the next queued run in the same nominal 64-item pass from acquiring authority.
+    let shutdown_run_a = "10000000-0000-0000-0000-0000000000c1";
+    let shutdown_wf_a = "20000000-0000-0000-0000-0000000000c1";
+    let shutdown_run_b = "10000000-0000-0000-0000-0000000000c2";
+    let shutdown_wf_b = "20000000-0000-0000-0000-0000000000c2";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_shutdown_a",
+        shutdown_run_a,
+        shutdown_wf_a,
+    )
+    .await;
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_shutdown_b",
+        shutdown_run_b,
+        shutdown_wf_b,
+    )
+    .await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let shutdown_poller = PgCiRunStarterPoller::new(
+        ci_region_run_discovery_test_support(admin.clone()),
+        PgCiRunStarterFactory::new_with_authority(
+            app.clone(),
+            tokio::runtime::Handle::current(),
+            Arc::new(MonotonicMinter::new()),
+            Region("fr-par".into()),
+            blobs.clone(),
+            Arc::new(PausingLaunchAuthority {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        ),
+        CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_task = tokio::spawn(async move {
+        shutdown_poller
+            .run_until_shutdown(shutdown_rx, Duration::from_millis(1), 64)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the first real starter entered launch authority");
+    shutdown_tx.send(true).unwrap();
+    release.notify_one();
+    shutdown_task
+        .await
+        .unwrap()
+        .expect("starter lane drains one in-flight transaction");
+    let shutdown_states: Vec<String> = sqlx::query_scalar(
+        "SELECT state FROM ci_run
+         WHERE run_id IN ($1::uuid, $2::uuid)
+         ORDER BY run_id",
+    )
+    .bind(shutdown_run_a)
+    .bind(shutdown_run_b)
+    .fetch_all(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        shutdown_states,
+        vec!["running".to_string(), "queued".to_string()],
+        "shutdown must stop before the second concrete starter unit"
+    );
+    sqlx::query("DELETE FROM ci_run WHERE run_id = $1::uuid")
+        .bind(shutdown_run_b)
+        .execute(&admin)
+        .await
+        .expect("remove only the deliberately unstarted shutdown fixture");
 
     // The region-wide poller routes only the discovered authoritative tenant into the exact-cell
     // starter. Two pollers may discover the same row, but the starter's exact queued-row lock admits

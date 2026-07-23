@@ -1240,9 +1240,43 @@ after committed cancellation = 0; undispatched reservations left open after supe
 cancelled runs with complete receipts but `cost_settled=false` = 0; production supersession owners =
 2→1.
 
-**Honest remaining activation floors:** attach the retained starter, bounded fan-out, and sandbox
-runner to coordinated lifecycle shutdown. Inject crashes across mint→CAS and CAS→spawn plus
-cancellation, retry, recovery, and settlement races through that complete running root before
+**Coordinated dormant runner-host lifecycle (2026-07-23).** One `CiRunnerHost` now owns the concrete
+queued-run starter, exact-tenant Flow recovery poller, and sandbox runner loop. Start is ordered and
+fallible, one watch signal stops every lane, and shutdown retains and joins both Tokio tasks and the
+runner OS thread. Intake checks the signal before every queued-run start, every exact workflow scope,
+and every durable Flow drive rather than only between large batches. An already-running sandbox is
+allowed to drain, but no subsequent job is claimed. Settlement-owner mismatch and terminal-report
+failure are host failures: they stop peer intake and surface to the service instead of backing off
+and claiming more work.
+
+The drain deadline is the maximum admitted job timeout plus 60 seconds. Expiry publishes a typed
+`DrainTimedOut` failure while the supervisor keeps ownership of every join. Production has two
+observers: the ordinary lifecycle observer stops the service on the first host failure, while an
+independent deadline observer survives service teardown and terminates the process if a stuck runner
+crosses the deadline. Clean completion closes the deadline watch and joins that observer. The reaper
+remains separately owned but consumes the same service shutdown signal.
+
+The live PostgreSQL proof pauses the first run inside the real launch-authority transaction, signals
+shutdown, releases the transaction, and observes `[running, queued]` with a batch limit of 64. Seven
+host tests prove single-signal joining, peer-stop on lane failure, settlement-owner refusal,
+terminal-report fail-stop, in-flight drain, no-lane invalid-config refusal, and retained join
+ownership across a simulated service-receiver drop and drain timeout. The production-source guard
+proves the two-observer topology while preserving pre-database activation refusal. Independent
+adversarial review first returned HOLD because shutdown was checked only between batches, timeout
+detached join ownership, and terminal-report failure continued intake. After those fixes, re-review
+found one remaining HIGH: service teardown could drop the only failure receiver and then hang
+awaiting the retained joins. The independent deadline observer and same-topology regression closed
+it; final review reported **CONFIRMED-SOUND with no remaining HIGH or MEDIUM lifecycle finding**.
+The complete Flow, Controlplane, and Dispatch all-target/all-feature suites (including live
+PostgreSQL and `runsc`), workspace all-target/all-feature check, warnings-denied clippy,
+architecture lint, erosion budgets, contract coverage, production-source guard, and diff check are
+green. Mechanical payoff: newly started runs after shutdown = 0 beyond the one already inside its
+authority transaction; new workflow drives after shutdown = 0 beyond the one already in flight;
+detached host tasks/threads at deadline = 0; runner intake continuing after terminal-report failure
+= 0; production runner-host lifecycle owners = 3→1.
+
+**Honest remaining activation floors:** inject crashes across mint→CAS and CAS→spawn, then prove
+cancellation, retry, recovery, and reservation settlement through the complete running root before
 activation. No Commercial wallet, billing, or Stripe work is admitted before the Tier-B go decision.
 `MYELIN_CI_RUNNER=1` remains startup-refused.
 
