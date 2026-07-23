@@ -371,17 +371,58 @@ async fn run_list_and_detail_are_visibility_scoped_keyset_and_rls_safe() {
         "the returned detail is atomically bound to the exact authorized parent repository"
     );
 
-    let index_ready: bool = sqlx::query_scalar(
-        "SELECT i.indisready AND i.indisvalid
+    let index_shape: (bool, String, Vec<String>, Option<String>) = sqlx::query_as(
+        "SELECT i.indisready
+                    AND i.indisvalid
+                    AND i.indislive
+                    AND NOT i.indcheckxmin,
+                table_class.relname,
+                ARRAY(
+                    SELECT pg_get_indexdef(i.indexrelid, key_number, false)
+                           || CASE
+                                  WHEN (i.indoption[key_number - 1] & 1) = 1
+                                  THEN ' DESC'
+                                  ELSE ''
+                              END
+                           || CASE
+                                  WHEN (i.indoption[key_number - 1] & 1) = 1
+                                       AND (i.indoption[key_number - 1] & 2) = 0
+                                  THEN ' NULLS LAST'
+                                  WHEN (i.indoption[key_number - 1] & 1) = 0
+                                       AND (i.indoption[key_number - 1] & 2) = 2
+                                  THEN ' NULLS FIRST'
+                                  ELSE ''
+                              END
+                      FROM generate_series(1, i.indnkeyatts::integer) AS key_number
+                     ORDER BY key_number
+                ),
+                pg_get_expr(i.indpred, i.indrelid, false)
            FROM pg_index i
-           JOIN pg_class c ON c.oid = i.indexrelid
-          WHERE c.relname = $1",
+           JOIN pg_class index_class ON index_class.oid = i.indexrelid
+           JOIN pg_namespace index_namespace ON index_namespace.oid = index_class.relnamespace
+           JOIN pg_class table_class ON table_class.oid = i.indrelid
+          WHERE index_namespace.nspname = current_schema() AND index_class.relname = $1",
     )
     .bind(CI_RUN_SURFACE_REPO_CREATED_INDEX)
     .fetch_one(&admin)
     .await
     .expect("inspect run-list index");
-    assert!(index_ready);
+    assert_eq!(
+        index_shape,
+        (
+            true,
+            "ci_run".into(),
+            vec![
+                "tenant_id".into(),
+                "region".into(),
+                "repo_ref".into(),
+                "created_at DESC".into(),
+                "run_id DESC".into(),
+            ],
+            Some("(repo_ref IS NOT NULL)".into()),
+        ),
+        "the serving index is ready and has the exact table/key/predicate identity"
+    );
 
     app.close().await;
     admin

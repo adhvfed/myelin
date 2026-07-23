@@ -492,6 +492,58 @@ pub struct PgBootstrap {
     max_connections: u32,
 }
 
+/// Exact PostgreSQL catalogue identity required for a concurrently-created serving index.
+///
+/// `key_columns` and `predicate` use PostgreSQL's canonical `pg_get_indexdef(..., column, false)`
+/// and `pg_get_expr(..., false)` renderings. This keeps the readiness check structural: a relation
+/// with the expected name is insufficient unless it indexes the expected table, ordered keys, and
+/// partial predicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexReadinessSpec<'a> {
+    pub index_name: &'a str,
+    pub table_name: &'a str,
+    pub table_relkind: &'a str,
+    pub index_relkind: &'a str,
+    pub access_method: &'a str,
+    pub key_columns: &'a [&'a str],
+    pub predicate: Option<&'a str>,
+}
+
+impl<'a> IndexReadinessSpec<'a> {
+    pub const fn new(
+        index_name: &'a str,
+        table_name: &'a str,
+        table_relkind: &'a str,
+        index_relkind: &'a str,
+        access_method: &'a str,
+        key_columns: &'a [&'a str],
+        predicate: Option<&'a str>,
+    ) -> Self {
+        Self {
+            index_name,
+            table_name,
+            table_relkind,
+            index_relkind,
+            access_method,
+            key_columns,
+            predicate,
+        }
+    }
+}
+
+type IndexReadinessRow = (
+    bool,
+    bool,
+    bool,
+    bool,
+    String,
+    String,
+    String,
+    String,
+    Vec<String>,
+    Option<String>,
+);
+
 impl PgBootstrap {
     /// Build a validated bootstrap from environment-provided split credentials.
     pub async fn from_env(mode: Mode) -> Result<PgBootstrap, ProviderError> {
@@ -572,6 +624,99 @@ impl PgBootstrap {
         .await
         .map_err(|_| BootstrapError::ValidationProbe)?;
         if ready == Some(true) {
+            Ok(())
+        } else {
+            Err(BootstrapError::ValidationProbe.into())
+        }
+    }
+
+    /// Verify both usability and the exact table/key/predicate identity of a serving index.
+    ///
+    /// This is the fail-closed form for an index whose shape is part of a production query's
+    /// boundedness contract. It rejects a valid, ready index if a stale or operator-created relation
+    /// reused the expected name with different semantics.
+    pub async fn verify_index_ready_exact(
+        &self,
+        expected: IndexReadinessSpec<'_>,
+    ) -> Result<(), ProviderError> {
+        // @tenant-cross-scope: verifies a migration-owned PostgreSQL index catalogue entry.
+        let actual: Option<IndexReadinessRow> = sqlx::query_as(
+            "SELECT i.indisvalid,
+                        i.indisready,
+                        i.indislive,
+                        i.indcheckxmin,
+                        table_class.relname,
+                        table_class.relkind::text,
+                        index_class.relkind::text,
+                        access_method.amname,
+                        ARRAY(
+                            SELECT pg_get_indexdef(i.indexrelid, key_number, false)
+                                   || CASE
+                                          WHEN (i.indoption[key_number - 1] & 1) = 1
+                                          THEN ' DESC'
+                                          ELSE ''
+                                      END
+                                   || CASE
+                                          WHEN (i.indoption[key_number - 1] & 1) = 1
+                                               AND (i.indoption[key_number - 1] & 2) = 0
+                                          THEN ' NULLS LAST'
+                                          WHEN (i.indoption[key_number - 1] & 1) = 0
+                                               AND (i.indoption[key_number - 1] & 2) = 2
+                                          THEN ' NULLS FIRST'
+                                          ELSE ''
+                                      END
+                              FROM generate_series(1, i.indnkeyatts::integer) AS key_number
+                             ORDER BY key_number
+                        ),
+                        pg_get_expr(i.indpred, i.indrelid, false)
+                   FROM pg_index i
+                   JOIN pg_class index_class ON index_class.oid = i.indexrelid
+                   JOIN pg_namespace index_namespace
+                     ON index_namespace.oid = index_class.relnamespace
+                   JOIN pg_class table_class ON table_class.oid = i.indrelid
+                   JOIN pg_namespace table_namespace
+                     ON table_namespace.oid = table_class.relnamespace
+                   JOIN pg_am access_method ON access_method.oid = index_class.relam
+                  WHERE index_namespace.nspname = current_schema()
+                    AND table_namespace.nspname = current_schema()
+                    AND index_class.relname = $1",
+        )
+        .bind(expected.index_name)
+        .fetch_optional(&self.migration_pool)
+        .await
+        .map_err(|_| BootstrapError::ValidationProbe)?;
+
+        let Some((
+            valid,
+            ready,
+            live,
+            check_xmin,
+            table_name,
+            table_relkind,
+            index_relkind,
+            access_method,
+            key_columns,
+            predicate,
+        )) = actual
+        else {
+            return Err(BootstrapError::ValidationProbe.into());
+        };
+        let expected_keys: Vec<String> = expected
+            .key_columns
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect();
+        if valid
+            && ready
+            && live
+            && !check_xmin
+            && table_name == expected.table_name
+            && table_relkind == expected.table_relkind
+            && index_relkind == expected.index_relkind
+            && access_method == expected.access_method
+            && key_columns == expected_keys
+            && predicate.as_deref() == expected.predicate
+        {
             Ok(())
         } else {
             Err(BootstrapError::ValidationProbe.into())

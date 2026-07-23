@@ -653,7 +653,7 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         std::process::exit(1);
     }
     if let Err(e) = bootstrap
-        .verify_index_ready(myelin_ci_controlplane::CI_RUN_SURFACE_REPO_CREATED_INDEX)
+        .verify_index_ready_exact(myelin_ci_controlplane::CI_RUN_SURFACE_INDEX_READINESS)
         .await
     {
         eprintln!("edge: CI run-list keyset index is not ready: {e}");

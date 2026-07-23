@@ -81,6 +81,10 @@ async fn exercise(
         )
         .await
         .map_err(|e| format!("migrate complete Controlplane schema: {e}"))?;
+    bootstrap
+        .verify_index_ready_exact(myelin_ci_controlplane::CI_RUN_SURFACE_INDEX_READINESS)
+        .await
+        .map_err(|e| format!("verify exact CI run-list index identity: {e}"))?;
 
     let provider = bootstrap
         .into_runtime()

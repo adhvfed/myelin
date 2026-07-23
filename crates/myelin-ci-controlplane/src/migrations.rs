@@ -127,6 +127,23 @@ pub const CI_RUN_QUEUED_REGION_INDEX: &str = "ci_run_queued_region";
 pub const CI_WORKFLOW_ACTIVE_REGION_INDEX: &str = "ci_workflow_active_region";
 /// Tenant/repository keyset used by the authenticated CT-005 run-list surface.
 pub const CI_RUN_SURFACE_REPO_CREATED_INDEX: &str = "ci_run_surface_repo_created";
+/// Exact production readiness identity for the authenticated CT-005 run-list index.
+pub const CI_RUN_SURFACE_INDEX_READINESS: myelin_storage::IndexReadinessSpec<'static> =
+    myelin_storage::IndexReadinessSpec::new(
+        CI_RUN_SURFACE_REPO_CREATED_INDEX,
+        CI_RUN_TABLE,
+        "r",
+        "i",
+        "btree",
+        &[
+            "tenant_id",
+            "region",
+            "repo_ref",
+            "created_at DESC",
+            "run_id DESC",
+        ],
+        Some("(repo_ref IS NOT NULL)"),
+    );
 /// Forward-only migration id for [`CI_JOB_RUN_LEDGER_INDEX`]. Kept separate from the already-applied
 /// `ci_0002_ci_job` table/RLS migration so its checksum is never rewritten.
 pub const CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID: &str = "ci_0002a_ci_job_run_ledger";
