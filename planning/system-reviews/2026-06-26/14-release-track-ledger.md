@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — operational reservation, claim/launch fences, exact-tenant runtime/fan-out, dormant full runner-host composition, producer-authored PR head ordering, and serialized run supersession proven; coordinated lifecycle/crash activation remains; production start disabled** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — complete running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, dormant coordinated runner host, producer-authored PR head ordering, and serialized run supersession proven; live dogfood activation/cutover remains; production start disabled** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1329,9 +1329,43 @@ scheduling unordered; because the guest has no network or durable writable surfa
 terminal CAS is refused, the impact is brief stale contained compute, classified LOW and outside
 this process-crash row.
 
-**Honest remaining activation floors:** prove cancellation, retry, recovery, and reservation
-settlement through the complete running root before activation. No Commercial wallet, billing, or
-Stripe work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
+**Complete running-root retry, recovery, and settlement (2026-07-23).** Terminal completion now
+requires the exact scheduler generation to be `running`; possession of a valid leased generation is
+not evidence that work executed. The live PostgreSQL proof begins with the production region claim,
+locked Identity token mint, operational reservation begin, and exact launch CAS. It first proves a
+leased completion has zero queue, signal, accounting, projection, or Storage effects. After launch,
+an injected `ci_job_accounting` trigger faults only after Flow signalling, queue consumption,
+Storage settlement, and the CI cost projection have all run in the same transaction. Every write
+rolls back: the queue remains running, the reservation remains inflight, and no signal, completion
+receipt, CI accounting/projection, or Storage cost event survives.
+
+The failed running generation is then expired and recovered through the advisory-lock-aware
+production reaper. Its stale completion is refused with zero effects. A second production scheduler
+generation resolves through the manifest-bound Identity issuer, crosses the fenced launch
+authorizer, executes immutable `/bin/false` in real gVisor through `RunnerAgent`, and reports through
+the exact-tenant production reporter. The measured failure usage settles once; an exact
+acknowledgement-loss replay is idempotent, while divergent usage is refused. The finalizer-to-Flow
+crash window is replayed by the production poller and must leave the workflow exactly `completed`,
+not merely outside its active states.
+
+Historical culmination tests were made mechanically honest too. Their real gVisor launch now
+defers the production exact-generation CAS until the child launch guard is armed. The claim-bound
+test explicitly refuses the correct claim while leased, then attacks nonce, epoch, owner, verdict,
+and typed-reference predicates only after the row is running. Independent review found and held on
+the first ordering because the leased-state predicate masked three attacks; after reordering them
+behind launch, final review reported **CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding**.
+The complete Controlplane all-target/all-feature suite (438 unit tests plus live PostgreSQL, real
+gVisor, scheduler least-privilege, cancellation, recovery, and accounting integrations), workspace
+all-target/all-feature check, warnings-denied clippy, architecture lint and its fixture matrix,
+erosion budgets, contract coverage, production activation guard, rustfmt, and diff check are green.
+Mechanical payoff: accepted completions before launch = 0; partial terminal commits after a late
+accounting fault = 0; stale generation settlements after reaping = 0; duplicate terminal
+signals/accounting/Storage events on exact retry = 0; recovered finalizer workflows left active = 0.
+
+**Honest remaining activation floor:** deliberately enable the dormant coordinated runner and
+complete a live founder Myelin push → CI → check dogfood/cutover pass. No Commercial wallet, billing,
+or Stripe work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains
+startup-refused until that activation row.
 
 ## R5–R6
 

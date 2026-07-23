@@ -949,6 +949,8 @@ mod tests {
         assert!(CONSUME_CLAIM_QUERY.contains("$7") && !CONSUME_CLAIM_QUERY.contains("$8"));
         assert!(CONSUME_CLAIM_QUERY.contains("claim_nonce = $5::uuid"));
         assert!(CONSUME_CLAIM_QUERY.contains("stage = $7"));
+        assert!(CONSUME_CLAIM_QUERY.contains("state = 'running'"));
+        assert!(!CONSUME_CLAIM_QUERY.contains("state IN ('leased','running')"));
         // Final launch is a one-shot exact-generation CAS, including original claim times.
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("$10"));
         assert!(!AUTHORIZE_JOB_LAUNCH_QUERY.contains("$11"));
