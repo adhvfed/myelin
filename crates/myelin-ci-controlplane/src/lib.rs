@@ -91,8 +91,9 @@ pub use ci_runner_composition::{
 };
 pub use ci_runtime_composition::{
     ci_manifest_pipeline_definition, ci_production_runtime_factory, CiProductionRuntimeFactory,
-    CiRuntimeCompositionError, CI_FLOW_OUTBOX_SCHEMA_VERSION, CI_FLOW_WORKER_LEASE_TTL_SECS,
-    CI_MANIFEST_PIPELINE_VERSION,
+    CiProductionWorkflowPoller, CiRuntimeCompositionError, CiWorkflowFanoutBatch,
+    CI_FLOW_OUTBOX_SCHEMA_VERSION, CI_FLOW_WORKER_LEASE_TTL_SECS, CI_MANIFEST_PIPELINE_VERSION,
+    MAX_CI_WORKFLOW_DRIVES_PER_SCOPE, MAX_CI_WORKFLOW_SCOPES_PER_PASS,
 };
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -560,7 +561,10 @@ pub use ci_run_store::{
     LOCK_CI_RUN_FOR_FINALIZE_QUERY, LOCK_CI_RUN_FOR_TOKEN_MINT_QUERY,
     SELECT_CI_RUN_ACCOUNTING_QUERY, SELECT_CI_RUN_QUERY, VERIFY_CI_RUN_REPLAY_QUERY,
 };
-pub use ci_run_region::{CiRegionRunDiscovery, DISCOVER_QUEUED_CI_RUN_TENANT_QUERY};
+pub use ci_run_region::{
+    CiActiveRunCursor, CiActiveRunPage, CiActiveRunRoute, CiRegionRunDiscovery,
+    DISCOVER_ACTIVE_CI_RUNS_QUERY, DISCOVER_QUEUED_CI_RUN_TENANT_QUERY, MAX_ACTIVE_CI_RUN_PAGE,
+};
 pub use ci_run_starter_poller::{
     CiRunStarterBatch, CiRunStarterPollerError, PgCiRunStarterPoller, MAX_CI_RUN_START_BATCH,
 };
@@ -632,8 +636,10 @@ pub use migrations::{
     CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
     CI_RUN_QUEUED_REGION_INDEX, CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID, CI_RUN_TABLE,
     CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
+    CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID,
     CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID, CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID,
-    CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL, CREATE_CHECK_ATTEMPT_DDL,
+    CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID, CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL,
+    CREATE_CHECK_ATTEMPT_DDL,
     CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_ACCOUNTING_DDL,
     CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL,
     CREATE_CI_REGION_SCHEDULER_RLS_DDL, CREATE_CI_RUN_DDL, CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL,
@@ -876,9 +882,10 @@ pub fn ci_run_store_factory(pool: sqlx::PgPool) -> CiRunStore {
 /// migrations have run) + the cell region + the blob CAS, so the runner-lane autonomy wire has a real,
 /// production-callable [`PgCiRunStarterFactory`] that mints an exact-cell [`PgCiPipelineStarter`] for a
 /// discovered run's authoritative tenant. A thin composition seam (over [`PgCiRunStarterFactory::new`])
-/// so the wiring point is named in ONE place. The `ci_run` / `ci_job` / `workflow_run` / `wf_definition`
-/// tables a minted starter reads are created by the migrations both the durable aggregate and the full
-/// [`ci_controlplane_migrations`] apply at boot.
+/// so the wiring point is named in ONE place. The durable aggregate and full
+/// [`ci_controlplane_migrations`] create the `ci_run` / `ci_job` tables; Flow's exact shared
+/// migrations create `workflow_run` / `wf_definition`, and production applies those before the CI
+/// recovery follow-ons.
 ///
 /// **DORMANT + activation-gated.** `main` composes this behind the SAME `MYELIN_CI_RUNNER` seam the
 /// runner lane uses: while the startup refusal keeps `MYELIN_CI_RUNNER=1` fail-closed, the factory is
@@ -1037,8 +1044,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            34,
-            "all 17 tables, ci_run causal provenance, 5 concurrent indexes, the ledger validator, 3 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, and the ci_run discovery grant are present"
+            36,
+            "all 17 tables, ci_run causal provenance, 6 concurrent indexes, the ledger validator, 3 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, and both ci_run discovery grants are present"
         );
         assert!(
             spec.consumers.is_empty(),

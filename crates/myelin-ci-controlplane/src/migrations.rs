@@ -122,6 +122,8 @@ pub const CI_JOB_RUN_LEDGER_INDEX: &str = "ci_job_run_ledger";
 /// Region starter discovery index over queued CI runs, with tenant ownership covered for an
 /// index-only lookup.
 pub const CI_RUN_QUEUED_REGION_INDEX: &str = "ci_run_queued_region";
+/// Region recovery index over nonterminal CI workflow runs, covering the persisted partition.
+pub const CI_WORKFLOW_ACTIVE_REGION_INDEX: &str = "ci_workflow_active_region";
 /// Forward-only migration id for [`CI_JOB_RUN_LEDGER_INDEX`]. Kept separate from the already-applied
 /// `ci_0002_ci_job` table/RLS migration so its checksum is never rewritten.
 pub const CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID: &str = "ci_0002a_ci_job_run_ledger";
@@ -163,6 +165,11 @@ pub const CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID: &str = "ci_0016c_scheduler
 pub const CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID: &str = "ci_0018_ci_run_queued_region";
 /// Additive, column-minimal queued-run discovery grant for the constrained region scheduler.
 pub const CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID: &str = "ci_0018a_scheduler_ci_run_discovery";
+/// Additive active-workflow recovery index.
+pub const CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID: &str = "ci_0018b_ci_workflow_active_region";
+/// Additive, column-minimal workflow route used only for exact-tenant worker routing.
+pub const CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID: &str =
+    "ci_0018c_scheduler_ci_workflow_discovery";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -813,6 +820,32 @@ pub const CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL: &str = "CREATE INDEX CONCURRENT
 ci_run_queued_region ON ci_run (region, created_at, run_id) INCLUDE (tenant_id) \
 WHERE state = 'queued'";
 
+/// Non-blocking partial index for restart-safe active workflow discovery in one residency cell.
+pub const CREATE_CI_WORKFLOW_ACTIVE_REGION_INDEX_DDL: &str =
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+ci_workflow_active_region ON workflow_run (region, created_at, tenant_id, run_id) \
+INCLUDE (partition) \
+WHERE wf_type = 'ci.pipeline' AND state IN ('running', 'waiting')";
+
+/// Exact column grant plus the same server-mapped, empty-tenant RLS boundary as CI-run discovery.
+pub const GRANT_SCHEDULER_CI_WORKFLOW_DISCOVERY_DDL: &str = "\
+CREATE POLICY myelin_ci_scheduler_workflow_discovery_access ON workflow_run
+  AS PERMISSIVE FOR SELECT TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+CREATE POLICY myelin_ci_scheduler_workflow_discovery_guard ON workflow_run
+  AS RESTRICTIVE FOR SELECT TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+GRANT SELECT (tenant_id, region, run_id, wf_type, state, partition, created_at)
+  ON workflow_run TO myelin_ci_region_scheduler";
+
 /// The stable migration ids of the WRITER-CRITICAL CI durable tables both CI service mains must have
 /// present regardless of boot order (CT-004m): `ci_run` (ci-dispatch's reserve/start co-commit + the
 /// control-plane run state), `check_attempt` (the control-plane monotonic counter), and
@@ -853,11 +886,11 @@ pub fn make_tenant_scoped_ddl(table: &str) -> String {
 }
 
 /// **The complete CI Control-Plane forward-only migration set** (contract 1.5 / 11.1; arch 01 §3).
-/// One table/RLS [`Migration`] per table, in FK-dependency order, plus five separately versioned
+/// One table/RLS [`Migration`] per table, in FK-dependency order, plus six separately versioned
 /// `CREATE INDEX CONCURRENTLY` migrations and one post-index validation migration: the run-ledger
 /// index and validator immediately after `ci_job`, the three job scheduler indexes immediately after
-/// `job_queue`, and the queued-run discovery index as an additive follow-on. Keeping each concurrent
-/// index as one top-level command makes the same set executable by live PostgreSQL.
+/// `job_queue`, and the queued/running run-discovery indexes as additive follow-ons. Keeping each
+/// concurrent index as one top-level command makes the same set executable by live PostgreSQL.
 ///
 /// Compatibility: the prior `ci_0004_job_queue` bundled these concurrent indexes into one
 /// multi-statement command. PostgreSQL rejected that command atomically before [`PgMigrator`]
@@ -963,6 +996,16 @@ pub fn ci_controlplane_migrations() -> Migrations {
         CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID,
         GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL,
         CI_RUN_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID,
+        CREATE_CI_WORKFLOW_ACTIVE_REGION_INDEX_DDL,
+        "workflow_run",
+    ));
+    migrations.push(Migration::plain_on(
+        CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID,
+        GRANT_SCHEDULER_CI_WORKFLOW_DISCOVERY_DDL,
+        "workflow_run",
     ));
     Migrations::of(migrations)
 }
@@ -1149,8 +1192,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            34,
-            "17 table/RLS + 1 ci_run causal ALTER + 5 concurrent-index + 1 index-validation + 3 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 1 scheduler ci_run discovery grant"
+            36,
+            "17 table/RLS + 1 ci_run causal ALTER + 6 concurrent-index + 1 index-validation + 3 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 2 scheduler ci_run discovery grants"
         );
         for m in &migrations.0 {
             assert!(
@@ -1192,6 +1235,8 @@ mod tests {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CLAIM_TIME_DDL);
             } else if m.id == CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL);
+            } else if m.id == CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID {
+                assert_eq!(m.ddl, GRANT_SCHEDULER_CI_WORKFLOW_DISCOVERY_DDL);
             } else if m.id == CI_REGION_SCHEDULER_RLS_MIGRATION_ID {
                 assert_eq!(m.ddl, CREATE_CI_REGION_SCHEDULER_RLS_DDL);
             } else {
@@ -1224,8 +1269,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            34,
-            "the runner applied all 17 table/RLS, 1 ci_run causal ALTER, 5 concurrent-index, 1 index-validation, 3 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, and 1 scheduler ci_run discovery grant"
+            36,
+            "the runner applied all 17 table/RLS, 1 ci_run causal ALTER, 6 concurrent-index, 1 index-validation, 3 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, and 2 scheduler ci_run discovery grants"
         );
         assert_eq!(
             runner.applied()[0],
@@ -1237,12 +1282,26 @@ mod tests {
     #[test]
     fn region_scheduler_boundary_is_additive_restrictive_and_least_privilege() {
         let migrations = ci_controlplane_migrations();
-        // The ci_run discovery grant is the final additive migration. The already-shipped claim
-        // grants remain byte-identical.
-        let discovery = migrations
+        // The workflow-route grant is the final additive migration. The already-shipped queued
+        // discovery and claim grants remain byte-identical.
+        let workflow_discovery = migrations
             .0
             .last()
-            .expect("the scheduler ci_run discovery grant is the final additive migration");
+            .expect("the workflow-route grant is the final additive migration");
+        assert_eq!(
+            workflow_discovery.id,
+            CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID
+        );
+        assert_eq!(workflow_discovery.table, Some("workflow_run"));
+        assert_eq!(
+            workflow_discovery.ddl,
+            GRANT_SCHEDULER_CI_WORKFLOW_DISCOVERY_DDL
+        );
+        let discovery = migrations
+            .0
+            .iter()
+            .find(|migration| migration.id == CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID)
+            .expect("the scheduler ci_run discovery grant remains present");
         assert_eq!(discovery.id, CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID);
         assert_eq!(discovery.table, Some(CI_RUN_TABLE));
         assert_eq!(discovery.ddl, GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL);
@@ -1263,6 +1322,24 @@ mod tests {
                 discovery_index.ddl.contains(required),
                 "queued-run discovery index pins `{required}`"
             );
+        }
+        let running_index = migrations
+            .0
+            .iter()
+            .find(|m| m.id == CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID)
+            .expect("active-workflow recovery index remains present");
+        assert_eq!(running_index.table, Some("workflow_run"));
+        assert_eq!(
+            running_index.ddl,
+            CREATE_CI_WORKFLOW_ACTIVE_REGION_INDEX_DDL
+        );
+        for required in [
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ci_workflow_active_region",
+            "ON workflow_run (region, created_at, tenant_id, run_id)",
+            "INCLUDE (partition)",
+            "WHERE wf_type = 'ci.pipeline' AND state IN ('running', 'waiting')",
+        ] {
+            assert!(running_index.ddl.contains(required));
         }
         let epoch_grant = migrations
             .0
@@ -1338,6 +1415,18 @@ mod tests {
                 discovery_ddl.contains(required),
                 "ci_run discovery boundary pins `{required}`"
             );
+        }
+        for required in [
+            "CREATE POLICY myelin_ci_scheduler_workflow_discovery_access ON workflow_run",
+            "AS PERMISSIVE FOR SELECT TO myelin_ci_region_scheduler",
+            "CREATE POLICY myelin_ci_scheduler_workflow_discovery_guard ON workflow_run",
+            "AS RESTRICTIVE FOR SELECT TO myelin_ci_region_scheduler",
+            "current_setting('myelin.tenant_id', true) = ''",
+            "region = public.myelin_ci_scheduler_region()",
+            "GRANT SELECT (tenant_id, region, run_id, wf_type, state, partition, created_at)",
+            "ON workflow_run TO myelin_ci_region_scheduler",
+        ] {
+            assert!(workflow_discovery.ddl.contains(required));
         }
         for forbidden in [
             "GRANT INSERT",

@@ -170,6 +170,20 @@ async fn main() {
         eprintln!("ci-controlplane: cannot apply the durable migration aggregate (identity/pseudonym/placement/kms/cost/erasure): {e}");
         std::process::exit(1);
     }
+    // The CI runner owns durable `ci.pipeline` executions in Flow. Apply Flow's exact shared
+    // migration set before the CI follow-ons that add the active-run recovery index and constrained
+    // scheduler discovery policy. This is idempotent with a separately booted Flow service and
+    // removes any boot-order dependency on that service.
+    if let Err(e) = bootstrap
+        .migrate(
+            &myelin_flow::migrations::migrations(),
+            &HotTables::declare(["workflow_run"]),
+        )
+        .await
+    {
+        eprintln!("ci-controlplane: cannot apply the durable Flow prerequisite migrations: {e}");
+        std::process::exit(1);
+    }
     // Apply the COMPLETE Controlplane-owned schema through the privileged pool. The AppSpec still
     // declares this exact set for lifecycle/model checks, but production cannot defer real SQL until
     // after cost stores or the reaper have already been constructed.
@@ -321,6 +335,15 @@ async fn main() {
             starter_factory,
             runner_runtime.definition().clone(),
         );
+        let _workflow_poller = match runner_runtime
+            .workflow_poller(scheduler_provider.region_run_discovery(), "ci-flow")
+        {
+            Ok(poller) => poller,
+            Err(error) => {
+                eprintln!("ci-controlplane: workflow fan-out composition refused: {error}");
+                std::process::exit(1);
+            }
+        };
         let _runner_reporter = match runner_runtime.reporter_router() {
             Ok(reporter) => reporter,
             Err(error) => {

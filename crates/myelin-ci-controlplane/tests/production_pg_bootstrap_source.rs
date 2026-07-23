@@ -25,6 +25,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let durable = source
         .find("bootstrap\n        .migrate(&all_durable_migrations()")
         .expect("durable aggregate must run through PgBootstrap");
+    let flow = source
+        .find("&myelin_flow::migrations::migrations()")
+        .expect("the Flow prerequisite must run through PgBootstrap");
     let controlplane = source
         .find("&myelin_ci_controlplane::ci_controlplane_migrations()")
         .expect("complete Controlplane migrations must run through PgBootstrap");
@@ -55,6 +58,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let starter_poller = source
         .find("PgCiRunStarterPoller::new(")
         .expect("the region discovery to exact-tenant starter poller must be composed at the root");
+    let workflow_poller = source
+        .find(".workflow_poller(scheduler_provider.region_run_discovery()")
+        .expect("active-run recovery must be composed at the dormant production root");
     let reporter_router = source
         .find("runner_runtime.reporter_router()")
         .expect("the accounted exact-tenant reporter router must be composed at the root");
@@ -131,6 +137,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         "DurableCiJobAccounting::new",
         "TierPOperationalCiJobPricer",
         "CiPipelineReporter::new_accounted",
+        "active_run_page",
+        "route.partition",
+        "run_until_idle",
     ] {
         assert!(
             runtime_composition_source.contains(production_runtime_dependency),
@@ -205,7 +214,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
 
     assert!(runner_gate < bootstrap);
     assert!(foundation < durable);
-    assert!(durable < controlplane);
+    assert!(durable < flow);
+    assert!(flow < controlplane);
     assert!(controlplane < hot_tables);
     assert!(hot_tables < handoff);
     assert!(handoff < scheduler_handoff);
@@ -215,7 +225,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(reaper < starter_lane);
     assert!(starter_lane < runtime_factory);
     assert!(runtime_factory < starter_poller);
-    assert!(starter_poller < reporter_router);
+    assert!(starter_poller < workflow_poller);
+    assert!(workflow_poller < reporter_router);
     assert!(reporter_router < runner_identity);
     assert!(runner_identity < runner_hooks);
     assert!(runner_hooks < runner_cancellations);

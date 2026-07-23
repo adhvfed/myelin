@@ -6,12 +6,13 @@ use std::sync::Arc;
 use myelin_ci_controlplane::{
     ci_artifact_ref, ci_controlplane_hot_tables, ci_controlplane_migrations, ci_job_queue_store,
     ci_job_spec_store, ci_manifest_pipeline_definition, ci_production_runtime_factory_test_support,
-    ci_run_ref, ci_run_store_factory, CiDriveManifestStore, CiDriveManifestV1,
-    CiJobAccountingPricer, CiJobAccountingStore, CiJobPricingError, CiManifestLaneV1,
-    CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1,
-    CiPipelineReporter, CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite,
-    CiRunFinalizer, CiRunInsert, CiRunStoreError, CiRunTerminalState, DurableCiJobAccounting,
-    DurableCiRunFinalizer, GrantedCiJobV1, PricedCiJobUsage, TIER_P_OPERATIONAL_PRICING_REVISION,
+    ci_region_run_discovery_test_support, ci_run_ref, ci_run_store_factory, CiDriveManifestStore,
+    CiDriveManifestV1, CiJobAccountingPricer, CiJobAccountingStore, CiJobPricingError,
+    CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1,
+    CiManifestWorkspaceV1, CiPipelineReporter, CiRunFinalization, CiRunFinalizationJob,
+    CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert, CiRunStoreError, CiRunTerminalState,
+    DurableCiJobAccounting, DurableCiRunFinalizer, GrantedCiJobV1, PricedCiJobUsage,
+    TIER_P_OPERATIONAL_PRICING_REVISION,
 };
 use myelin_ci_sandbox::{
     CompletionClaim, CompletionSettlementOwner, ResourceUsage, TerminalReport, TerminalReporter,
@@ -20,7 +21,7 @@ use myelin_config::MyelinConfig;
 use myelin_events::{IdMinter, MonotonicMinter};
 use myelin_flow::{
     migrations::migrations as flow_migrations, partition_for_run_id, DurableExecutor, MinorUnits,
-    PgFlowExecutor, PgRunOnceOutcome, RunId, SignalOutcome, StartSpec, CI_PIPELINE_WF_TYPE,
+    PgFlowExecutor, RunId, SignalOutcome, StartSpec, CI_PIPELINE_WF_TYPE,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::{
@@ -346,10 +347,16 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         tokio::runtime::Handle::current(),
     )
     .unwrap();
-    let production_worker = production_runtime
+    let _definition_registration = production_runtime
         .worker_for(
             tenant.clone(),
             partition_for_run_id(wf_run),
+            "ci-flow-definition-proof",
+        )
+        .unwrap();
+    let mut production_poller = production_runtime
+        .workflow_poller(
+            ci_region_run_discovery_test_support(pool.clone()),
             "ci-flow-accounting-proof",
         )
         .unwrap();
@@ -396,13 +403,12 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
             .unwrap();
     });
     let (first_secs, first_stamp) = drive_clock(&pool).await;
-    assert!(matches!(
-        production_worker
-            .run_once(first_secs, &first_stamp)
-            .await
-            .unwrap(),
-        PgRunOnceOutcome::Driven { .. }
-    ));
+    let first_drive = production_poller
+        .run_once(8, 8, first_secs, &first_stamp)
+        .await
+        .unwrap();
+    assert_eq!(first_drive.scopes, 1);
+    assert_eq!(first_drive.driven, 1);
     let (idem, queued_state): (String, String) = sqlx::query_as(
         "SELECT idem_token, state FROM job_queue
          WHERE tenant_id = $1 AND job_id = $2::uuid",
@@ -588,14 +594,42 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     .unwrap();
     assert_eq!(skipped_after_rollback, (0, "reserved".into()));
 
+    // Model a process death after the external finalizer transaction commits but before Flow can
+    // commit the drive. Recovery must route from workflow_run, not the now-terminal ci_run.
+    let precommitted = durable_finalizer.finalize(&finalization).unwrap();
+    assert_eq!(precommitted.write, CiRunFinalizationWrite::Finalized);
+    let split_brain_window: (String, String) = sqlx::query_as(
+        "SELECT ci.state, wf.state
+           FROM ci_run ci
+           JOIN workflow_run wf
+             ON wf.tenant_id = ci.tenant_id
+            AND wf.region = ci.region
+            AND wf.run_id = ci.wf_run_id::text
+          WHERE ci.run_id = $1::uuid",
+    )
+    .bind(ci_run)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(split_brain_window, ("failed".into(), "running".into()));
+
     let (second_secs, second_stamp) = drive_clock(&pool).await;
-    assert!(matches!(
-        production_worker
-            .run_once(second_secs, &second_stamp)
+    let second_drive = production_poller
+        .run_once(8, 8, second_secs, &second_stamp)
+        .await
+        .unwrap();
+    assert_eq!(second_drive.scopes, 1);
+    assert_eq!(second_drive.driven, 1);
+    let workflow_terminal: String =
+        sqlx::query_scalar("SELECT state FROM workflow_run WHERE run_id = $1")
+            .bind(wf_run)
+            .fetch_one(&pool)
             .await
-            .unwrap(),
-        PgRunOnceOutcome::Driven { .. }
-    ));
+            .unwrap();
+    assert!(
+        !matches!(workflow_terminal.as_str(), "running" | "waiting"),
+        "the replayed Flow drive closes the finalizer-to-Flow-commit crash window"
+    );
     let run_terminal: (String, bool, bool) = sqlx::query_as(
         "SELECT state, cost_settled, finished_at IS NOT NULL
          FROM ci_run WHERE run_id = $1::uuid",
