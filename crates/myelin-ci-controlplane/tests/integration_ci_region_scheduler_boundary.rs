@@ -73,6 +73,20 @@ async fn cleanup(admin: &PgPool, tenants: &[&str]) {
         .expect("clean scheduler-boundary run fixtures");
 }
 
+async fn cleanup_stale_fixtures(admin: &PgPool) {
+    for table in ["job_queue", "fair_deficit", "ci_run"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table}
+              WHERE tenant_id LIKE 'scheduler-a-%'
+                 OR tenant_id LIKE 'scheduler-b-%'
+                 OR tenant_id LIKE 'scheduler-de-%'"
+        ))
+        .execute(admin)
+        .await
+        .unwrap_or_else(|error| panic!("clean stale scheduler fixtures from {table}: {error}"));
+    }
+}
+
 async fn insert_queued_run(
     admin: &PgPool,
     tenant: &str,
@@ -134,6 +148,7 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         tenant_b.as_str(),
         tenant_other_region.as_str(),
     ];
+    cleanup_stale_fixtures(&admin).await;
     cleanup(&admin, &tenants).await;
 
     let app = connect_pool_with_reset(&app_url, FR_PAR, 4)

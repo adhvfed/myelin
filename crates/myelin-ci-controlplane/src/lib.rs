@@ -71,6 +71,7 @@ pub mod ci_manifest_pipeline;
 pub mod ci_manifest_job_runner;
 pub mod ci_pipeline;
 pub mod ci_result_signal;
+pub mod ci_runtime_composition;
 pub mod ci_runner_composition;
 pub use ci_claim_token_issuer::{CiJobCredentialMinter, LockedManifestCiJobTokenIssuer};
 pub use ci_drive_manifest::{
@@ -88,6 +89,14 @@ pub use ci_runner_composition::{
     ci_runner_cancellation_coordinator, ci_runner_hooks, ci_runner_identity_authorities,
     CiRunnerCancellationCoordinator, CiRunnerIdentityAuthorities, CiRunnerIdentityCompositionError,
 };
+pub use ci_runtime_composition::{
+    ci_manifest_pipeline_definition, ci_production_runtime_factory, CiProductionRuntimeFactory,
+    CiRuntimeCompositionError, CI_FLOW_OUTBOX_SCHEMA_VERSION, CI_FLOW_WORKER_LEASE_TTL_SECS,
+    CI_MANIFEST_PIPELINE_VERSION,
+};
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use ci_runtime_composition::ci_production_runtime_factory_test_support;
 pub use ci_launch_authority::{
     CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority,
     ManifestBoundCiJobTokenAuthority, PgTierPCiJobBudgetReservation, TierPOperationalCiJobPricer,
