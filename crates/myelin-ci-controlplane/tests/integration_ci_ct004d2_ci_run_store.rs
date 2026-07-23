@@ -19,7 +19,7 @@
 
 use myelin_ci_controlplane::{
     ci_run_store_factory, CiRunInsert, CiRunStoreError, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
-    CREATE_CI_RUN_DDL, ERASED_PSEUDONYM,
+    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, CREATE_CI_RUN_DDL, ERASED_PSEUDONYM,
 };
 use myelin_events::{HandlerTx, CONSUMER_DEDUP_MIGRATION};
 use sqlx::{Executor, PgPool};
@@ -67,6 +67,7 @@ fn row(tenant: &str, run_id: &str) -> CiRunInsert {
         wf_run_id: "44444444-4444-4444-4444-444444444444".into(),
         definition_snapshot: "blake3:snap-abcd".into(),
         trigger_kind: "push".into(),
+        concurrency_group: None,
         trust_tier: "trusted".into(),
         state: "queued".into(),
         correlation_id: "corr-1".into(),
@@ -106,6 +107,10 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         .execute(ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL)
         .await
         .expect("add ci_run causal provenance");
+    admin
+        .execute(ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL)
+        .await
+        .expect("add ci_run concurrency identity");
     admin
         .execute(CONSUMER_DEDUP_MIGRATION)
         .await
@@ -158,6 +163,7 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
     assert_eq!(got.cause_event_id.as_deref(), Some("ev-push-1"));
     assert_eq!(got.definition_snapshot, "blake3:snap-abcd");
     assert_eq!(got.trigger_kind, "push");
+    assert!(got.concurrency_group.is_none());
     assert_eq!(got.trust_tier, "trusted");
     assert_eq!(got.state, "queued");
     assert_eq!(got.correlation_id, "corr-1");
@@ -175,6 +181,43 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
     assert_eq!(
         n, 1,
         "exactly one durable ci_run row after the idempotent re-insert"
+    );
+
+    let mut pr = row("tenantA", &run_id(3));
+    pr.trigger_kind = "pull_request".into();
+    pr.concurrency_group = Some("pr:team/web:42".into());
+    assert!(store.insert_ci_run(&pr).await.unwrap());
+    let stored_pr = store
+        .get_ci_run("tenantA", "fr-par", &pr.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored_pr.concurrency_group.as_deref(),
+        Some("pr:team/web:42"),
+        "event-derived PR concurrency identity round-trips durably"
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE ci_run SET concurrency_group = 'pr:web:42' \
+             WHERE tenant_id = 'tenantA' AND run_id = $1::uuid"
+        )
+        .bind(run_a)
+        .execute(&admin)
+        .await
+        .is_err(),
+        "the database refuses PR scheduler authority on a non-PR run"
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE ci_run SET concurrency_group = 'pr:web:0' \
+             WHERE tenant_id = 'tenantA' AND run_id = $1::uuid"
+        )
+        .bind(&pr.run_id)
+        .execute(&admin)
+        .await
+        .is_err(),
+        "the database refuses malformed PR scheduler authority"
     );
 
     let canonical_run = run_id(1);
@@ -247,13 +290,18 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         "cause_event_id",
         "definition_snapshot",
         "trigger_kind",
+        "concurrency_group",
         "trust_tier",
         "correlation_id",
         "triggered_by",
     ];
     for (index, field) in immutable_fields.into_iter().enumerate() {
         let collision_run = run_id(10 + index as u64);
-        let original = row("tenantA", &collision_run);
+        let mut original = row("tenantA", &collision_run);
+        if field == "concurrency_group" {
+            original.trigger_kind = "pull_request".into();
+            original.concurrency_group = Some("pr:web:42".into());
+        }
         assert!(
             store.insert_ci_run(&original).await.unwrap(),
             "seed {field}"
@@ -269,6 +317,7 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
             "cause_event_id" => replay.cause_event_id = None,
             "definition_snapshot" => replay.definition_snapshot = "blake3:other".into(),
             "trigger_kind" => replay.trigger_kind = "manual".into(),
+            "concurrency_group" => replay.concurrency_group = Some("pr:web:43".into()),
             "trust_tier" => replay.trust_tier = "self_hosted".into(),
             "correlation_id" => replay.correlation_id = "corr-other".into(),
             "triggered_by" => replay.triggered_by = None,

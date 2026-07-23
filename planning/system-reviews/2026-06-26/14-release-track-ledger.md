@@ -1150,6 +1150,29 @@ MEDIUM finding. The full control-plane all-target/all-feature suite and the pre-
 activation-refusal/source guards, workspace all-target/all-feature check, warnings-denied clippy,
 architecture lint, erosion budgets, contract coverage, and diff check are green.
 
+**Canonical PR supersession authority (2026-07-23).** The validated PR event's repository and
+positive number now derive one bounded canonical `pr:{repo}:{number}` identity. A forward-only
+`ci_0001c` migration persists it as immutable `ci_run` authority without rewriting the shipped
+create; both CI mains apply the same migration. New pull-request rows require the identity,
+non-pull-request rows forbid it, exact redelivery verifies it, and legacy PR rows with no identity
+remain readable but fail closed before operational capacity reservation. The production
+`LinuxSmallV1LaunchAuthority` copies the persisted identity onto every immutable manifest job; push
+jobs continue to carry none.
+
+The live production-consumer proof co-commits a namespaced PR identity with the run and dedup mark.
+The app-role PostgreSQL proof covers round-trip, exact replay, divergent collision, database
+constraints, and RLS; the rolling-upgrade proof observes the column absent before applying the new
+full set and present afterward. An initial per-job co-persist/cancel prototype was removed before
+commit after adversarial review showed that job-local atomicity could not establish newest-head
+ordering or finalize undispatched reservations and Flow. Supersession therefore remains explicitly
+at the durable run-start boundary rather than being conventionally inferred during job dispatch.
+Independent review first found the upgrade fixture accidentally included `ci_0001c` in its old
+schema; after making the absent→present transition load-bearing, re-review reported
+CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding. Both CI crates' complete
+all-target/all-feature suites (including live PostgreSQL and `runsc`), workspace check,
+warnings-denied clippy, migration upgrade, production-source guard, architecture lint, erosion
+budgets, contract coverage, and diff check are green.
+
 **Honest remaining activation floors:** attach the retained starter, bounded fan-out, and sandbox
 runner to coordinated lifecycle shutdown, and wire accounted supersession into the durable dispatch
 path. Inject crashes across mint→CAS and CAS→spawn plus cancellation, retry, recovery, and settlement

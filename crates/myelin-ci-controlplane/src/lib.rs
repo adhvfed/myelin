@@ -626,6 +626,7 @@ pub use migrations::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, ci_durable_hot_tables,
     ci_durable_migrations, make_tenant_scoped_ddl, ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL,
     ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
+    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
     ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ARTIFACT_TABLE, CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE,
     CI_COST_EVENT_TABLE, CI_DRIVE_MANIFEST_TABLE, CI_DURABLE_WRITER_IDS,
@@ -635,7 +636,8 @@ pub use migrations::{
     CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID, CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID,
     CI_JOB_SPEC_STAGE_MIGRATION_ID, CI_JOB_SPEC_TABLE, CI_JOB_TABLE,
     CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
-    CI_RUN_QUEUED_REGION_INDEX, CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID, CI_RUN_TABLE,
+    CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID, CI_RUN_QUEUED_REGION_INDEX,
+    CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID, CI_RUN_TABLE,
     CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
     CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID,
     CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID, CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID,
@@ -1045,8 +1047,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            36,
-            "all 17 tables, ci_run causal provenance, 6 concurrent indexes, the ledger validator, 3 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, and both ci_run discovery grants are present"
+            37,
+            "all 17 tables, both ci_run forward ALTERs, 6 concurrent indexes, the ledger validator, 3 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, and both ci_run discovery grants are present"
         );
         assert!(
             spec.consumers.is_empty(),

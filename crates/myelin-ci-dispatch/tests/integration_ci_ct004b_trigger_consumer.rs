@@ -148,9 +148,40 @@ command = [\"test\"]
 needs = [\"build\"]
 ";
 
+const VALID_PR_CI_TOML: &str = "\
+on = \"pull_request\"
+
+[[jobs]]
+name = \"build\"
+image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"
+command = [\"build\"]
+";
+
 struct FixtureGitReader {
     repo: String,
     oid: String,
+}
+
+struct PrFixtureGitReader {
+    repo: String,
+    oid: String,
+}
+
+impl GitConfigReader for PrFixtureGitReader {
+    fn read_repo_file(
+        &self,
+        _tenant: &str,
+        _region: &str,
+        repo: &str,
+        oid: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, GitReadError> {
+        if repo == self.repo && oid == self.oid && path == ".myelin/ci.toml" {
+            Ok(Some(VALID_PR_CI_TOML.as_bytes().to_vec()))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl GitConfigReader for FixtureGitReader {
@@ -283,6 +314,20 @@ fn push_envelope(ev: &str, repo: &str, new_oid: &str) -> EventEnvelope {
             "forced": false,
         }),
     }
+}
+
+fn pr_envelope(ev: &str, repo: &str, number: u64, head_oid: &str) -> EventEnvelope {
+    let mut envelope = push_envelope(ev, repo, head_oid);
+    envelope.type_ = EventType(myelin_git::events::GIT_PR_OPENED.into());
+    envelope.subject = ArtifactRef(format!("myelin://acme/git/pr/{repo}:{number}"));
+    envelope.aggregate = AggregateKey(format!("git/pr/{repo}:{number}"));
+    envelope.payload = serde_json::json!({
+        "repo": repo,
+        "number": number,
+        "head_oid": head_oid,
+        "is_fork": false,
+    });
+    envelope
 }
 
 async fn count(pool: &PgPool, sql: &str, run_id: &str) -> i64 {
@@ -587,6 +632,78 @@ async fn chunk4_production_cocommit_row_with_mark_events_absorb() {
 
     p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str()).await.ok();
     println!("[chunk4/1] PASS production co-commit: the ci_run ROW co-commits with the dedup mark (1 row), events absorb through the real outbox (3), redelivery deduped exactly once.");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_pr_cocommit_persists_canonical_concurrency_identity() {
+    let schema = schema_name(uniq());
+    let repo = "team/web";
+    let number = 42;
+    let oid = "aa11bb22cc33000000000000000000000000dd44";
+    let p = setup_schema(&schema, OUTBOX_MIGRATION).await;
+    let rt = tokio::runtime::Handle::current();
+    let reader: Arc<dyn GitConfigReader> = Arc::new(PrFixtureGitReader {
+        repo: repo.into(),
+        oid: oid.into(),
+    });
+    let blobs: Arc<dyn BlobStore + Send + Sync> = Arc::new(FsBlobStore::new());
+    let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(p.clone(), rt.clone())));
+    let store = Arc::new(CoCommitReserveStore::new(
+        ci_run_store_factory(p.clone()),
+        outbox,
+        Arc::new(UlidMinter::new()),
+        rt.clone(),
+    ));
+    let handler = CiTriggerHandler::new(reader, blobs, store);
+    let cname = handler.consumer_name().to_string();
+    let ledger = DedupLedger::durable(Arc::new(DurableDedupBacking::new(
+        p.clone(),
+        rt.clone(),
+    )));
+    let sub = Subscription::bind(
+        ConsumerName(cname),
+        &["myelin://acme/git/"],
+        PrefetchBound::DEFAULT,
+    )
+    .unwrap();
+    let consumer = Consumer::new(handler, sub, ledger);
+    let ev = pr_envelope("ev-chunk4-pr", repo, number, oid);
+    let run_id = match plan_dispatch(
+        &ev,
+        &PrFixtureGitReader {
+            repo: repo.into(),
+            oid: oid.into(),
+        },
+        &FsBlobStore::new(),
+    ) {
+        DispatchOutcome::Arm(armed) => armed.handoff.run_write.run_id,
+        other => panic!("validated PR must arm, got {other:?}"),
+    };
+    let msg = Message {
+        subject: ev.subject.0.clone(),
+        envelope: ev,
+    };
+
+    assert_eq!(
+        tokio::task::block_in_place(|| consumer.deliver(&msg)),
+        Delivered::Acked
+    );
+    let row = sqlx::query(
+        "SELECT trigger_kind, concurrency_group FROM ci_run WHERE run_id = $1::uuid",
+    )
+    .bind(run_id)
+    .fetch_one(&p)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("trigger_kind"), "pull_request");
+    assert_eq!(
+        row.get::<Option<String>, _>("concurrency_group").as_deref(),
+        Some("pr:team/web:42")
+    );
+
+    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .ok();
 }
 
 // =================================================================================================

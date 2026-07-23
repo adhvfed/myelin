@@ -48,7 +48,8 @@ use crate::surfacing::{ci_artifact_ref, ci_run_ref};
 const SELECT_QUEUED_RUN: &str = "\
 SELECT tenant_id, run_id::text AS run_id, region, project_id::text AS project_id,
        pipeline_id::text AS pipeline_id, wf_run_id::text AS wf_run_id, repo_ref, commit_oid,
-       cause_event_id, cause_depth, caused_by, definition_snapshot, trigger_kind, triggered_by, trust_tier, state,
+       cause_event_id, cause_depth, caused_by, definition_snapshot, trigger_kind, concurrency_group,
+       triggered_by, trust_tier, state,
        cost_settled, correlation_id,
        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at,
        finished_at::text AS finished_at
@@ -60,7 +61,8 @@ LIMIT 1";
 const LOCK_EXACT_QUEUED_RUN: &str = "\
 SELECT tenant_id, run_id::text AS run_id, region, project_id::text AS project_id,
        pipeline_id::text AS pipeline_id, wf_run_id::text AS wf_run_id, repo_ref, commit_oid,
-       cause_event_id, cause_depth, caused_by, definition_snapshot, trigger_kind, triggered_by, trust_tier, state,
+       cause_event_id, cause_depth, caused_by, definition_snapshot, trigger_kind, concurrency_group,
+       triggered_by, trust_tier, state,
        cost_settled, correlation_id,
        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at,
        finished_at::text AS finished_at
@@ -984,6 +986,7 @@ fn decode_candidate(row: &sqlx::postgres::PgRow) -> Result<StarterCandidate, PgC
             caused_by: field!("caused_by"),
             definition_snapshot: field!("definition_snapshot"),
             trigger_kind: field!("trigger_kind"),
+            concurrency_group: field!("concurrency_group"),
             trust_tier: field!("trust_tier"),
             state: field!("state"),
             correlation_id: field!("correlation_id"),
@@ -1903,6 +1906,7 @@ mod tests {
                 hash.to_multihash_string()
             ),
             trigger_kind: "push".into(),
+            concurrency_group: None,
             trust_tier: "trusted".into(),
             state: "queued".into(),
             correlation_id: run_id.into(),
@@ -1976,6 +1980,7 @@ mod tests {
                 hash.to_multihash_string()
             ),
             trigger_kind: "push".into(),
+            concurrency_group: None,
             trust_tier: "trusted".into(),
             state: "queued".into(),
             correlation_id: "10000000-0000-0000-0000-000000000001".into(),

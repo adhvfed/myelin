@@ -300,6 +300,7 @@ mod tests {
             caused_by: None,
             definition_snapshot: "snapshot".into(),
             trigger_kind: "push".into(),
+            concurrency_group: None,
             trust_tier: "trusted".into(),
             state: "running".into(),
             correlation_id: "correlation".into(),

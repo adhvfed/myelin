@@ -4,7 +4,10 @@
 fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let source = include_str!("../src/main.rs");
     let library_source = include_str!("../src/lib.rs");
+    let dispatch_consumer_source = include_str!("../../myelin-ci-dispatch/src/consumer.rs");
     let launch_authority_source = include_str!("../src/ci_launch_authority.rs");
+    let run_store_source = include_str!("../src/ci_run_store.rs");
+    let migrations_source = include_str!("../src/migrations.rs");
     let claim_issuer_source = include_str!("../src/ci_claim_token_issuer.rs");
     let identity_adapter_source = include_str!("../src/ci_identity_adapter.rs");
     let runtime_composition_source = include_str!("../src/ci_runtime_composition.rs");
@@ -188,6 +191,14 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         launch_authority_source.contains("ManifestBoundCiJobTokenAuthority::handle_for(request)")
     );
     assert!(launch_authority_source.contains("labels: LINUX_SMALL_V1_RUNNER_LABELS"));
+    assert!(dispatch_consumer_source.contains("let group = format!(\"pr:{repo}:{number}\")"));
+    assert!(dispatch_consumer_source.contains("(\"head_oid\", Some(group))"));
+    assert!(dispatch_consumer_source
+        .contains("concurrency_group: armed.reserve.concurrency_group.clone()"));
+    assert!(run_store_source.contains("valid_pr_concurrency_group(group)"));
+    assert!(launch_authority_source.contains("launch_concurrency_group(record)?"));
+    assert!(launch_authority_source.contains("concurrency_group: concurrency_group.clone()"));
+    assert!(migrations_source.contains("ci_0001c_ci_run_concurrency_group"));
     assert!(source.contains("myelin_ci_controlplane::LINUX_SMALL_V1_RUNNER_LABELS"));
     assert!(!launch_authority_source.contains("CiJobTokenAuthorityProvider"));
     assert!(runner_bind_source.contains("token_issuer: LockedManifestCiJobTokenIssuer"));
