@@ -66,10 +66,11 @@ use sqlx::postgres::PgPool;
 use sqlx::types::Uuid;
 use sqlx::Row;
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::scheduler::CANCEL_SUPERSEDED_QUERY;
 use crate::scheduler::{
-    EnqueueOutcome, Lane, AUTHORIZE_JOB_LAUNCH_QUERY, CANCEL_SUPERSEDED_QUERY, COMPLETE_JOB_QUERY,
-    CONSUME_CLAIM_QUERY, HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY,
-    READ_COMPLETION_DISPOSITION_QUERY,
+    EnqueueOutcome, Lane, AUTHORIZE_JOB_LAUNCH_QUERY, COMPLETE_JOB_QUERY, CONSUME_CLAIM_QUERY,
+    HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY, READ_COMPLETION_DISPOSITION_QUERY,
 };
 
 // =================================================================================================
@@ -379,6 +380,7 @@ impl CiJobQueueStore {
     /// the in-flight run for that group.** Tenant-scoped ([`with_tenant_tx`]). Moves the prior
     /// `queued`/`leased` rows of `group` to `terminal`, keeping `keep_job_id` (the new head), so only
     /// the latest PR head is tested. Returns the cancelled job ids.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn cancel_superseded(
         &self,
         tenant_id: &str,

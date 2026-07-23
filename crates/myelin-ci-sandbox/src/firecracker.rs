@@ -470,11 +470,11 @@ impl FirecrackerBackend {
         // network-device profile carries the enforced-egress record just recorded above.
         profile.assert_enforced().map_err(FcError::Hardening)?;
         // #1a cost gate — reserve before the final claim CAS; refusal starts nothing.
-        let reserve = hooks.reserve(&spec.meter_to)?;
+        let reserve = hooks.reserve(spec)?;
         // #2 attribution is the final mutable authorization boundary before spawn. If it refuses,
         // release the unused reserve immediately; no untrusted code has run.
         if let Err(attribute_error) = hooks.attribute(spec) {
-            hooks.release_unused(&reserve)?;
+            hooks.release_unused(spec, &reserve)?;
             return Err(attribute_error.into());
         }
 
@@ -495,7 +495,7 @@ impl FirecrackerBackend {
 
         // #1b settle — release the unused reserve on completion (never interrupt in-flight), now
         // settling against the result's REAL measured usage (CT-002a).
-        hooks.settle_completed(&reserve, result.usage)?;
+        hooks.settle_completed(spec, &reserve, result.usage)?;
 
         Ok(SandboxLaunch {
             handle: SandboxHandle { guest_id },
@@ -1180,8 +1180,8 @@ mod tests {
     fn ok_hooks() -> RunnerHooks {
         RunnerHooks::new(
             CompletionSettlementOwner::Hook,
-            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         )
@@ -1296,8 +1296,8 @@ mod tests {
         let backend = FirecrackerBackend::new();
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::Hook,
-            Box::new(|_m| Err(crate::HookError("wallet exhausted".into()))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|_spec| Err(crate::HookError("wallet exhausted".into()))),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         );
@@ -1321,8 +1321,8 @@ mod tests {
         let hook_settled_at = hook_settled.clone();
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::TerminalReporter,
-            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            Box::new(move |_h, _u| {
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, _u| {
                 hook_settled_at.store(true, Ordering::SeqCst);
                 Ok(())
             }),
@@ -1348,8 +1348,8 @@ mod tests {
         let settled_at = settled.clone();
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::TerminalReporter,
-            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            Box::new(move |_h, usage| {
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, usage| {
                 *settled_at.lock().unwrap() = Some(usage);
                 Ok(())
             }),
@@ -1378,8 +1378,8 @@ mod tests {
         let backend = FirecrackerBackend::new();
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::Hook,
-            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Err(crate::HookError("hardening not met".into()))),
         );

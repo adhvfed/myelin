@@ -8,6 +8,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let claim_issuer_source = include_str!("../src/ci_claim_token_issuer.rs");
     let identity_adapter_source = include_str!("../src/ci_identity_adapter.rs");
     let runner_identity_source = include_str!("../src/ci_runner_composition.rs");
+    let job_queue_store_source = include_str!("../src/job_queue_store.rs");
     let region_store_source = include_str!("../src/job_queue_region.rs");
     let runner_bind_source = include_str!("../src/runner_bind.rs");
 
@@ -50,6 +51,12 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let runner_identity = source
         .find("ci_runner_identity_authorities(")
         .expect("the real CI Identity authorities must be composed at the root");
+    let runner_hooks = source
+        .find("ci_runner_hooks(")
+        .expect("the scoped durable CI runner hooks must be composed at the root");
+    let runner_cancellations = source
+        .find("ci_runner_cancellation_coordinator(")
+        .expect("accounted cancel-superseded capability must be composed at the root");
     let runner_gate = source
         .find("verify_startup_activation(runner_setting)")
         .expect("production runner activation must be refused explicitly");
@@ -60,7 +67,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         .find("run_controlplane_until_shutdown(Config::default()")
         .expect("signal-driven service lifecycle must remain wired");
 
-    assert!(!source.contains("runner_hooks"));
+    assert!(!source.contains("CiRunnerLoop::new"));
+    assert!(!source.contains("spawn_until_shutdown"));
     assert!(!source.contains("CiPipelineDriver"));
     assert!(!source.contains("unresolved_stage_spec_builder"));
     assert!(!source.contains("TenantId(\"ci-controlplane\""));
@@ -104,6 +112,32 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(runner_identity_source.contains("provider.config().region.clone()"));
     assert!(claim_issuer_source.contains("request.region != self.region"));
     assert!(identity_adapter_source.contains("context.region != self.region.0"));
+    assert!(job_queue_store_source.contains(
+        "#[cfg(any(test, feature = \"test-support\"))]\n    pub async fn cancel_superseded("
+    ));
+    for production_lifecycle_dependency in [
+        "CompletionSettlementOwner::TerminalReporter",
+        "DurableCostLedger::with_runtime",
+        "load_by_wf_run_on_conn",
+        "get_launch_template_on_conn",
+        "durable.spec != scope.template",
+        "lock_exact_live_claim",
+        "claim_nonce = $10::uuid",
+        "begin_in_tx",
+        "settle_in_tx",
+        "ReleaseDisposition::CanceledBeforeLaunch",
+        "completion_receipt.is_none()",
+        "cancel_superseded_and_settle",
+        "sqlx::query(crate::CANCEL_SUPERSEDED_QUERY)",
+        "job.reserve_handle != scope.reserve_handle",
+        "HardeningProfile::derive",
+        "launch_authorizer.authorize(spec)",
+    ] {
+        assert!(
+            runner_identity_source.contains(production_lifecycle_dependency),
+            "production runner lifecycle must retain {production_lifecycle_dependency}"
+        );
+    }
     assert!(
         launch_authority_source.contains("ManifestBoundCiJobTokenAuthority::handle_for(request)")
     );
@@ -153,7 +187,10 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(first_store < reaper);
     assert!(reaper < starter_lane);
     assert!(starter_lane < runner_identity);
-    assert!(runner_identity < service);
+    assert!(runner_identity < runner_hooks);
+    assert!(runner_hooks < runner_cancellations);
+    assert!(runner_cancellations < service);
+    assert!(runner_hooks < service);
     assert!(starter_lane < service);
 }
 
@@ -197,8 +234,8 @@ fn runner_activation_is_refused_before_any_database_attempt() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
-    assert!(stderr.contains("exact-tenant worker"));
-    assert!(stderr.contains("scoped reservation lifecycle"));
+    assert!(stderr.contains("exact-tenant workflow worker/reporter"));
+    assert!(stderr.contains("complete launch/recovery proof"));
     assert!(stderr.contains("production runner activation is refused"));
     assert!(!stderr.contains("database bootstrap refused to start"));
     assert!(!stderr.contains("DATABASE_URL"));

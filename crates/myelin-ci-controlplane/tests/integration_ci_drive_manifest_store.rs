@@ -8,23 +8,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use myelin_ci_controlplane::{
-    ci_job_authorization_context, ci_runner_identity_authorities, CiDriveManifestStore,
-    CiDriveManifestV1, CiJobCredentialMinter, CiJobRuntimeAuthorityRequest, CiJobTokenIssueError,
-    CiJobTokenIssuer, CiJobTokenRequest, CiManifestLaneV1, CiManifestLimitsV1,
-    CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, GrantedCiJobV1,
+    ci_job_authorization_context, ci_runner_cancellation_coordinator, ci_runner_hooks,
+    ci_runner_identity_authorities, CiDriveManifestStore, CiDriveManifestV1, CiJobCredentialMinter,
+    CiJobRuntimeAuthorityRequest, CiJobTokenIssueError, CiJobTokenIssuer, CiJobTokenRequest,
+    CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1,
+    CiManifestWorkspaceV1, DurableCiJobLaunchTemplate, GrantedCiJobV1,
     LockedManifestCiJobTokenIssuer, ManifestBoundCiJobTokenAuthority,
-    ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CI_PIPELINE_WF_TYPE,
-    CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
+    ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CI_PIPELINE_WF_TYPE, CREATE_CI_DRIVE_MANIFEST_DDL,
+    CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
 };
 use myelin_ci_sandbox::{
-    EgressPolicy, IdemToken, ImageRef, JobKind, JobSpecTemplate, MeterTarget, ResourceLimits,
-    RunTokenCredential, TrustTier, WorkspaceSpec,
+    EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpecTemplate, MeterTarget,
+    ResourceLimits, ResourceUsage, RunTokenCredential, SecretRef, TrustTier, WorkspaceSpec,
 };
 use myelin_config::MyelinConfig;
 use myelin_storage::{
-    cell_root_durable_migrations, identity_durable_migrations, PgMigrator, SealKey,
-    SubstrateProvider,
+    cell_root_durable_migrations, identity_durable_migrations, reserve_settle_durable_migrations,
+    PgMigrator, SealKey, SubstrateProvider,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
@@ -77,6 +79,17 @@ fn digest(byte: char) -> String {
 }
 
 const PROJECT_ID: &str = "44444444-4444-8444-8444-444444444444";
+const PRIMARY_JOB_ID: &str = "33333333-3333-8333-8333-333333333333";
+const REFUSED_JOB_ID: &str = "66666666-6666-8666-8666-666666666666";
+const CRASH_JOB_ID: &str = "aaaaaaaa-aaaa-8aaa-aaaa-aaaaaaaaaaaa";
+
+fn reserve_handle(job_id: &str, digest_byte: char) -> String {
+    format!(
+        "ci-reserve:v1:22222222-2222-8222-8222-222222222222:{}:{job_id}:{}",
+        digest_byte.to_string().repeat(64),
+        digest_byte.to_string().repeat(64)
+    )
+}
 
 fn authority() -> CiJobRuntimeAuthorityRequest {
     CiJobRuntimeAuthorityRequest {
@@ -85,7 +98,7 @@ fn authority() -> CiJobRuntimeAuthorityRequest {
         ci_run_id: "22222222-2222-8222-8222-222222222222".into(),
         wf_run_id: "11111111-1111-8111-8111-111111111111".into(),
         project_id: PROJECT_ID.into(),
-        job_id: "33333333-3333-8333-8333-333333333333".into(),
+        job_id: PRIMARY_JOB_ID.into(),
         stage: "build".into(),
         concrete_name: "build".into(),
         trigger_kind: "push".into(),
@@ -128,37 +141,101 @@ fn manifest() -> CiDriveManifestV1 {
         run_ref: "myelin://manifest-live/ci/run/22222222-2222-8222-8222-222222222222".into(),
         started_at: "2026-07-21T12:34:56.000000Z".into(),
         trust_tier: CiManifestTrustTierV1::Trusted,
-        check_attempts: BTreeMap::from([("build".into(), 9)]),
+        check_attempts: BTreeMap::from([
+            ("build".into(), 9),
+            ("lint".into(), 10),
+            ("test".into(), 11),
+        ]),
         merge_waiter: None,
-        jobs: vec![GrantedCiJobV1 {
-            job_id: "33333333-3333-8333-8333-333333333333".into(),
-            stage: "build".into(),
-            name: "build".into(),
-            check_context: "build".into(),
-            needs: Vec::new(),
-            matrix_key: BTreeMap::new(),
-            image: format!("registry.example/build@sha256:{}", "d".repeat(64)),
-            command: vec!["/bin/true".into()],
-            env: BTreeMap::new(),
-            secret_handles: BTreeMap::new(),
-            egress_allow: Vec::new(),
-            limits: authority.limits.clone(),
-            workspace: CiManifestWorkspaceV1 {
-                repo_ref,
-                commit_oid: "deadbeef".into(),
-                read_only_root: true,
-                tmpfs_scratch: true,
+        jobs: vec![
+            GrantedCiJobV1 {
+                job_id: PRIMARY_JOB_ID.into(),
+                stage: "build".into(),
+                name: "build".into(),
+                check_context: "build".into(),
+                needs: Vec::new(),
+                matrix_key: BTreeMap::new(),
+                image: format!("registry.example/build@sha256:{}", "d".repeat(64)),
+                command: vec!["/bin/true".into()],
+                env: BTreeMap::new(),
+                secret_handles: BTreeMap::new(),
+                egress_allow: Vec::new(),
+                limits: authority.limits.clone(),
+                workspace: CiManifestWorkspaceV1 {
+                    repo_ref: repo_ref.clone(),
+                    commit_oid: "deadbeef".into(),
+                    read_only_root: true,
+                    tmpfs_scratch: true,
+                },
+                scheduling: CiManifestSchedulingV1 {
+                    lane: CiManifestLaneV1::Batch,
+                    labels: vec!["linux".into()],
+                    concurrency_group: Some("pr:web:42".into()),
+                    fair_key: "project:core".into(),
+                },
+                reserve_handle: reserve_handle(PRIMARY_JOB_ID, '1'),
+                token_authority_handle: ManifestBoundCiJobTokenAuthority::handle_for(&authority),
+                continue_on_error: false,
             },
-            scheduling: CiManifestSchedulingV1 {
-                lane: CiManifestLaneV1::Batch,
-                labels: vec!["linux".into()],
-                concurrency_group: None,
-                fair_key: "project:core".into(),
+            GrantedCiJobV1 {
+                job_id: REFUSED_JOB_ID.into(),
+                stage: "lint".into(),
+                name: "lint".into(),
+                check_context: "lint".into(),
+                needs: Vec::new(),
+                matrix_key: BTreeMap::new(),
+                image: format!("registry.example/build@sha256:{}", "e".repeat(64)),
+                command: vec!["/bin/false".into()],
+                env: BTreeMap::new(),
+                secret_handles: BTreeMap::new(),
+                egress_allow: Vec::new(),
+                limits: authority.limits.clone(),
+                workspace: CiManifestWorkspaceV1 {
+                    repo_ref: repo_ref.clone(),
+                    commit_oid: "deadbeef".into(),
+                    read_only_root: true,
+                    tmpfs_scratch: true,
+                },
+                scheduling: CiManifestSchedulingV1 {
+                    lane: CiManifestLaneV1::Batch,
+                    labels: vec!["linux".into()],
+                    concurrency_group: None,
+                    fair_key: "project:core".into(),
+                },
+                reserve_handle: reserve_handle(REFUSED_JOB_ID, '2'),
+                token_authority_handle: format!("ci-token-authority:v1:{}", "2".repeat(64)),
+                continue_on_error: false,
             },
-            reserve_handle: "reserve:live-run".into(),
-            token_authority_handle: ManifestBoundCiJobTokenAuthority::handle_for(&authority),
-            continue_on_error: false,
-        }],
+            GrantedCiJobV1 {
+                job_id: CRASH_JOB_ID.into(),
+                stage: "test".into(),
+                name: "test".into(),
+                check_context: "test".into(),
+                needs: Vec::new(),
+                matrix_key: BTreeMap::new(),
+                image: format!("registry.example/build@sha256:{}", "f".repeat(64)),
+                command: vec!["/bin/true".into()],
+                env: BTreeMap::new(),
+                secret_handles: BTreeMap::new(),
+                egress_allow: Vec::new(),
+                limits: authority.limits,
+                workspace: CiManifestWorkspaceV1 {
+                    repo_ref,
+                    commit_oid: "deadbeef".into(),
+                    read_only_root: true,
+                    tmpfs_scratch: true,
+                },
+                scheduling: CiManifestSchedulingV1 {
+                    lane: CiManifestLaneV1::Batch,
+                    labels: vec!["linux".into()],
+                    concurrency_group: Some("pr:web:42".into()),
+                    fair_key: "project:core".into(),
+                },
+                reserve_handle: reserve_handle(CRASH_JOB_ID, '3'),
+                token_authority_handle: format!("ci-token-authority:v1:{}", "3".repeat(64)),
+                continue_on_error: false,
+            },
+        ],
     }
 }
 
@@ -205,6 +282,57 @@ fn claim(manifest: &CiDriveManifestV1) -> CiJobTokenRequest {
     }
 }
 
+fn launch_template(
+    manifest: &CiDriveManifestV1,
+    job_index: usize,
+    idem_token: &str,
+) -> DurableCiJobLaunchTemplate {
+    let job = &manifest.jobs[job_index];
+    DurableCiJobLaunchTemplate {
+        spec: JobSpecTemplate::new(
+            JobKind::Ci,
+            ImageRef::pinned(job.image.clone()).unwrap(),
+            job.command.clone(),
+            job.env
+                .iter()
+                .map(|(name, value)| EnvVar {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            job.secret_handles
+                .iter()
+                .map(|(name, handle)| SecretRef {
+                    name: name.clone(),
+                    handle: handle.clone(),
+                })
+                .collect(),
+            EgressPolicy {
+                allow: job.egress_allow.clone(),
+            },
+            ResourceLimits {
+                cpu_millis: job.limits.cpu_millis,
+                mem_bytes: job.limits.mem_bytes,
+                disk_bytes: job.limits.disk_bytes,
+                pids_max: job.limits.pids_max,
+                timeout_secs: job.limits.timeout_secs,
+            },
+            WorkspaceSpec {
+                repo_ref: Some(job.workspace.repo_ref.clone()),
+                commit: Some(job.workspace.commit_oid.clone()),
+            },
+            TrustTier::Trusted,
+            MeterTarget {
+                reserve_id: job.reserve_handle.clone(),
+            },
+            IdemToken(idem_token.into()),
+        )
+        .unwrap(),
+        ci_run_id: manifest.ci_run_id.clone(),
+        token_authority_handle: job.token_authority_handle.clone(),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     let bare_admin = sqlx::postgres::PgPoolOptions::new()
@@ -231,6 +359,9 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     PgMigrator::apply(&admin, &cell_root_durable_migrations())
         .await
         .expect("apply the durable cell-root schema");
+    PgMigrator::apply(&admin, &reserve_settle_durable_migrations())
+        .await
+        .expect("apply the durable reservation schema");
     sqlx::raw_sql(&format!(
         "{CREATE_CI_RUN_DDL};
          {ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL};
@@ -241,7 +372,10 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
          {ALTER_JOB_QUEUE_ADD_COMPLETION_DDL};
          {ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL};
          {ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL};
-         SELECT myelin_make_tenant_scoped('job_queue');"
+         SELECT myelin_make_tenant_scoped('job_queue');
+         {CREATE_CI_JOB_SPEC_DDL};
+         {ALTER_CI_JOB_SPEC_ADD_STAGE_DDL};
+         SELECT myelin_make_tenant_scoped('ci_job_spec');"
     ))
     .execute(&admin)
     .await
@@ -276,6 +410,20 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .execute(&mut *parent)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
+         VALUES ($1, $2, $3, 1200, 'reserved'),
+                ($1, $2, $4, 1200, 'reserved'),
+                ($1, $2, $5, 1200, 'reserved')",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[0].reserve_handle)
+    .bind(&expected.jobs[1].reserve_handle)
+    .bind(&expected.jobs[2].reserve_handle)
+    .execute(&mut *parent)
+    .await
+    .unwrap();
     let mut exact_claim = claim(&expected);
     let persisted_claim_times: (i64, i64) = sqlx::query_as(
         "INSERT INTO job_queue (
@@ -304,6 +452,93 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .unwrap();
     exact_claim.claim_started_at_epoch_secs = persisted_claim_times.0;
     exact_claim.claim_expires_at_epoch_secs = persisted_claim_times.1;
+    let mut refused_claim = exact_claim.clone();
+    refused_claim.job_id = expected.jobs[1].job_id.clone();
+    refused_claim.token_authority_handle = expected.jobs[1].token_authority_handle.clone();
+    refused_claim.idem_token = "manifest-live/refused".into();
+    refused_claim.lease_owner = "runner-refused".into();
+    refused_claim.claim_nonce = "77777777-7777-8777-8777-777777777777".into();
+    let refused_claim_times: (i64, i64) = sqlx::query_as(
+        "INSERT INTO job_queue (
+           tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group,
+           fair_key, idem_token,
+           lease_owner, lease_expires, state, lease_epoch, claim_nonce, stage,
+           claim_started_at, claim_expires_at
+         ) VALUES (
+           $1, $2, $3::uuid, $4::uuid, 'batch', ARRAY['linux'], 'trusted', 'pr:web:42', $5, $6,
+           $7, statement_timestamp() + interval '300 seconds', 'leased', $8, $9::uuid, 'lint',
+           statement_timestamp(), statement_timestamp() + interval '300 seconds'
+         )
+         RETURNING EXTRACT(EPOCH FROM claim_started_at)::bigint,
+                   EXTRACT(EPOCH FROM claim_expires_at)::bigint",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&refused_claim.job_id)
+    .bind(&expected.wf_run_id)
+    .bind(format!("project:{PROJECT_ID}"))
+    .bind(&refused_claim.idem_token)
+    .bind(&refused_claim.lease_owner)
+    .bind(refused_claim.lease_epoch)
+    .bind(&refused_claim.claim_nonce)
+    .fetch_one(&mut *parent)
+    .await
+    .unwrap();
+    refused_claim.claim_started_at_epoch_secs = refused_claim_times.0;
+    refused_claim.claim_expires_at_epoch_secs = refused_claim_times.1;
+    let mut crash_claim = exact_claim.clone();
+    crash_claim.job_id = expected.jobs[2].job_id.clone();
+    crash_claim.token_authority_handle = expected.jobs[2].token_authority_handle.clone();
+    crash_claim.idem_token = "manifest-live/crash".into();
+    crash_claim.lease_owner = "runner-crash".into();
+    crash_claim.claim_nonce = "bbbbbbbb-bbbb-8bbb-bbbb-bbbbbbbbbbbb".into();
+    let crash_claim_times: (i64, i64) = sqlx::query_as(
+        "INSERT INTO job_queue (
+           tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group,
+           fair_key, idem_token,
+           lease_owner, lease_expires, state, lease_epoch, claim_nonce, stage,
+           claim_started_at, claim_expires_at
+         ) VALUES (
+           $1, $2, $3::uuid, $4::uuid, 'batch', ARRAY['linux'], 'trusted', 'pr:web:42', $5, $6,
+           $7, statement_timestamp() + interval '300 seconds', 'leased', $8, $9::uuid, 'test',
+           statement_timestamp(), statement_timestamp() + interval '300 seconds'
+         )
+         RETURNING EXTRACT(EPOCH FROM claim_started_at)::bigint,
+                   EXTRACT(EPOCH FROM claim_expires_at)::bigint",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&crash_claim.job_id)
+    .bind(&expected.wf_run_id)
+    .bind(format!("project:{PROJECT_ID}"))
+    .bind(&crash_claim.idem_token)
+    .bind(&crash_claim.lease_owner)
+    .bind(crash_claim.lease_epoch)
+    .bind(&crash_claim.claim_nonce)
+    .fetch_one(&mut *parent)
+    .await
+    .unwrap();
+    crash_claim.claim_started_at_epoch_secs = crash_claim_times.0;
+    crash_claim.claim_expires_at_epoch_secs = crash_claim_times.1;
+    for (job_index, claim) in [(0, &exact_claim), (1, &refused_claim), (2, &crash_claim)] {
+        sqlx::query(
+            "INSERT INTO ci_job_spec
+               (tenant_id, region, job_id, run_id, idem_token, spec, stage)
+             VALUES ($1, $2, $3::uuid, $4::uuid, $5, $6, $7)",
+        )
+        .bind(&expected.tenant_id)
+        .bind(&expected.region)
+        .bind(&claim.job_id)
+        .bind(&expected.wf_run_id)
+        .bind(&claim.idem_token)
+        .bind(
+            serde_json::to_value(launch_template(&expected, job_index, &claim.idem_token)).unwrap(),
+        )
+        .bind(&expected.jobs[job_index].stage)
+        .execute(&mut *parent)
+        .await
+        .unwrap();
+    }
     parent.commit().await.unwrap();
 
     let store = CiDriveManifestStore::new(
@@ -413,7 +648,10 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
             pids_max: expected.jobs[0].limits.pids_max,
             timeout_secs: expected.jobs[0].limits.timeout_secs,
         },
-        WorkspaceSpec::default(),
+        WorkspaceSpec {
+            repo_ref: Some(expected.jobs[0].workspace.repo_ref.clone()),
+            commit: Some(expected.jobs[0].workspace.commit_oid.clone()),
+        },
         TrustTier::Trusted,
         MeterTarget {
             reserve_id: expected.jobs[0].reserve_handle.clone(),
@@ -421,11 +659,64 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         IdemToken(exact_claim.idem_token.clone()),
     )
     .unwrap()
-    .resolve_with_authorization(signed, Some(ci_job_authorization_context(&exact_claim)));
-    second_identity
-        .launch_authorizer()
-        .authorize(&spec)
-        .expect("a reconstructed production verifier authorizes the exact durable claim");
+    .resolve_with_authorization(
+        signed.clone(),
+        Some(ci_job_authorization_context(&exact_claim)),
+    );
+    let runner_hooks = ci_runner_hooks(
+        provider.clone(),
+        second_identity.launch_authorizer(),
+        tokio::runtime::Handle::current(),
+    );
+    let cancellation_coordinator =
+        ci_runner_cancellation_coordinator(provider.clone(), tokio::runtime::Handle::current());
+    let mut mutated_spec = spec.clone();
+    mutated_spec.command = vec!["/bin/echo".into(), "mutated".into()];
+    assert!(
+        runner_hooks.reserve(&mutated_spec).is_err(),
+        "same-job executable mutation is refused before reservation begin"
+    );
+    assert!(
+        runner_hooks.attribute(&mutated_spec).is_err(),
+        "same-job executable mutation is refused before the durable launch CAS"
+    );
+    let reservation = runner_hooks
+        .reserve(&spec)
+        .expect("the exact manifest-scoped reservation begins before final launch");
+    assert_eq!(reservation.0, expected.jobs[0].reserve_handle);
+    assert_eq!(
+        runner_hooks
+            .reserve(&spec)
+            .expect("an acknowledgement-loss begin retry is idempotent"),
+        reservation
+    );
+    let begun_state: String = sqlx::query_scalar(
+        "SELECT state FROM cost_reservation
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[0].reserve_handle)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(begun_state, "inflight");
+    runner_hooks
+        .attribute(&spec)
+        .expect("the final hook verifies Identity and wins the exact durable launch CAS");
+    runner_hooks
+        .settle_completed(
+            &spec,
+            &reservation,
+            ResourceUsage {
+                cpu_seconds: 7,
+                mem_byte_seconds: 11,
+            },
+        )
+        .expect("successful settlement is explicitly deferred to the terminal reporter");
+    runner_hooks
+        .release_unused(&spec, &reservation)
+        .expect("a CAS-acknowledgement-loss retry must retain a running job's reservation");
     let launched_state: String = sqlx::query_scalar(
         "SELECT state FROM job_queue WHERE tenant_id = $1 AND job_id = $2::uuid",
     )
@@ -435,6 +726,236 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .await
     .unwrap();
     assert_eq!(launched_state, "running");
+    let still_inflight: String = sqlx::query_scalar(
+        "SELECT state FROM cost_reservation
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[0].reserve_handle)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        still_inflight, "inflight",
+        "the sandbox hook cannot double-own successful terminal settlement"
+    );
+
+    // A final-attribution refusal while the exact claim is still retryable retains its deterministic
+    // reservation. The signed credential belongs to the first job, so changing only the
+    // non-serializable expected context makes Identity refuse before any launch CAS. Once a
+    // cancel-superseded transition has made the same generation terminal, zero-release becomes safe.
+    let refused_spec = JobSpecTemplate::new(
+        JobKind::Ci,
+        ImageRef::pinned(expected.jobs[1].image.clone()).unwrap(),
+        expected.jobs[1].command.clone(),
+        Vec::new(),
+        Vec::new(),
+        EgressPolicy::deny_all(),
+        ResourceLimits {
+            cpu_millis: expected.jobs[1].limits.cpu_millis,
+            mem_bytes: expected.jobs[1].limits.mem_bytes,
+            disk_bytes: expected.jobs[1].limits.disk_bytes,
+            pids_max: expected.jobs[1].limits.pids_max,
+            timeout_secs: expected.jobs[1].limits.timeout_secs,
+        },
+        WorkspaceSpec {
+            repo_ref: Some(expected.jobs[1].workspace.repo_ref.clone()),
+            commit: Some(expected.jobs[1].workspace.commit_oid.clone()),
+        },
+        TrustTier::Trusted,
+        MeterTarget {
+            reserve_id: expected.jobs[1].reserve_handle.clone(),
+        },
+        IdemToken(refused_claim.idem_token.clone()),
+    )
+    .unwrap()
+    .resolve_with_authorization(
+        signed.clone(),
+        Some(ci_job_authorization_context(&refused_claim)),
+    );
+    let crash_spec = launch_template(&expected, 2, &crash_claim.idem_token)
+        .spec
+        .resolve_with_authorization(signed, Some(ci_job_authorization_context(&crash_claim)));
+    let mut cross_tenant_claim = refused_claim.clone();
+    cross_tenant_claim.tenant_id = "manifest-other".into();
+    let mut cross_tenant_spec = refused_spec.clone();
+    cross_tenant_spec.run_token_authorization =
+        Some(ci_job_authorization_context(&cross_tenant_claim));
+    assert!(
+        runner_hooks.reserve(&cross_tenant_spec).is_err(),
+        "caller-supplied cross-tenant scope never begins another tenant's reservation"
+    );
+    let mut stale_generation_claim = refused_claim.clone();
+    stale_generation_claim.lease_epoch += 1;
+    stale_generation_claim.claim_nonce = "88888888-8888-8888-8888-888888888888".into();
+    let mut stale_generation_spec = refused_spec.clone();
+    stale_generation_spec.run_token_authorization =
+        Some(ci_job_authorization_context(&stale_generation_claim));
+    assert!(
+        runner_hooks.reserve(&stale_generation_spec).is_err(),
+        "a copied context for a nonexistent claim generation cannot begin the reservation"
+    );
+    let state_after_cross_tenant_refusal: String = sqlx::query_scalar(
+        "SELECT state FROM cost_reservation
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[1].reserve_handle)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(state_after_cross_tenant_refusal, "reserved");
+    let (runner_hooks, refused_spec, refused_reservation) = std::thread::spawn(move || {
+        let refused_reservation = runner_hooks
+            .reserve(&refused_spec)
+            .expect("the second exact manifest reservation begins off-runtime");
+        assert_eq!(
+            runner_hooks
+                .reserve(&refused_spec)
+                .expect("off-runtime begin retry is idempotent"),
+            refused_reservation
+        );
+        assert!(runner_hooks.attribute(&refused_spec).is_err());
+        runner_hooks
+            .release_unused(&refused_spec, &refused_reservation)
+            .expect("a retryable attribution refusal retains the deterministic reservation");
+        (runner_hooks, refused_spec, refused_reservation)
+    })
+    .join()
+    .expect("the dedicated production runner thread completes without a bridge panic");
+    let retryable_state: String = sqlx::query_scalar(
+        "SELECT state FROM cost_reservation
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[1].reserve_handle)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(retryable_state, "inflight");
+    let retryable_event_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cost_event
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[1].reserve_handle)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(retryable_event_count, 0);
+    let mut replacement_claim = refused_claim.clone();
+    replacement_claim.lease_owner = "runner-replacement".into();
+    replacement_claim.lease_epoch += 1;
+    replacement_claim.claim_nonce = "99999999-9999-8999-8999-999999999999".into();
+    let replacement_times: (i64, i64) = sqlx::query_as(
+        "UPDATE job_queue
+         SET state = 'leased', lease_owner = $4, lease_epoch = $5, claim_nonce = $6::uuid,
+             claim_started_at = statement_timestamp(),
+             claim_expires_at = statement_timestamp() + interval '300 seconds',
+             lease_expires = statement_timestamp() + interval '300 seconds'
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+         RETURNING EXTRACT(EPOCH FROM claim_started_at)::bigint,
+                   EXTRACT(EPOCH FROM claim_expires_at)::bigint",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[1].job_id)
+    .bind(&replacement_claim.lease_owner)
+    .bind(replacement_claim.lease_epoch)
+    .bind(&replacement_claim.claim_nonce)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    replacement_claim.claim_started_at_epoch_secs = replacement_times.0;
+    replacement_claim.claim_expires_at_epoch_secs = replacement_times.1;
+    runner_hooks
+        .release_unused(&refused_spec, &refused_reservation)
+        .expect("a stale generation cannot release its replacement's reservation");
+    let state_after_stale_release: String = sqlx::query_scalar(
+        "SELECT state FROM cost_reservation
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[1].reserve_handle)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(state_after_stale_release, "inflight");
+    let crash_reservation = runner_hooks
+        .reserve(&crash_spec)
+        .expect("the third exact reservation begin commits before simulated acknowledgement loss");
+    assert_eq!(crash_reservation.0, expected.jobs[2].reserve_handle);
+    drop(crash_reservation);
+    let mut canceled = cancellation_coordinator
+        .cancel_superseded(
+            &TenantId(expected.tenant_id.clone()),
+            "pr:web:42",
+            PRIMARY_JOB_ID,
+        )
+        .expect("cancel and zero-settle both superseded reservations atomically");
+    canceled.sort();
+    let mut expected_canceled = vec![
+        expected.jobs[1].job_id.clone(),
+        expected.jobs[2].job_id.clone(),
+    ];
+    expected_canceled.sort();
+    assert_eq!(canceled, expected_canceled);
+    assert!(cancellation_coordinator
+        .cancel_superseded(
+            &TenantId(expected.tenant_id.clone()),
+            "pr:web:42",
+            PRIMARY_JOB_ID,
+        )
+        .expect("cancel acknowledgement-loss retry is idempotent")
+        .is_empty());
+    let released_state: String = sqlx::query_scalar(
+        "SELECT state FROM cost_reservation
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[1].reserve_handle)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(released_state, "settled");
+    let released_units: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT unit, wholesale, markup FROM cost_event
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3 ORDER BY ord",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[1].reserve_handle)
+    .fetch_all(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        released_units,
+        vec![
+            ("cpu_seconds".into(), 0, 0),
+            ("mem_gb_seconds".into(), 0, 0),
+        ]
+    );
+    let crash_released: (String, i64) = sqlx::query_as(
+        "SELECT r.state, count(e.ord)
+         FROM cost_reservation r
+         LEFT JOIN cost_event e
+           ON e.tenant_id = r.tenant_id AND e.region = r.region AND e.run_id = r.run_id
+         WHERE r.tenant_id = $1 AND r.region = $2 AND r.run_id = $3
+         GROUP BY r.state",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[2].reserve_handle)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(crash_released, ("settled".into(), 2));
 
     let mut forged = exact_claim.clone();
     forged.token_authority_handle = format!("ci-token-authority:v1:{}", "0".repeat(64));

@@ -32,8 +32,8 @@
 //! endpoint and both PostgreSQL roles are explicit through `Mode::RequireEnv`. The per-table
 //! behaviour (the scheduler claim, the check emitter, the log index, the metering) is the
 //! CI-P12..CI-P24 surface. This shell runs no job: requesting the incomplete production runner
-//! fails before database bootstrap until its exact-tenant worker, scoped reservation lifecycle, and
-//! complete crash/recovery path are wired around the now-real durable token authorities.
+//! fails before database bootstrap until its exact-tenant workflow worker/reporter and complete
+//! crash/recovery path are wired around the now-real durable token and reservation authorities.
 
 use myelin_ci_controlplane::run_controlplane_until_shutdown;
 use myelin_config::{Mode, MyelinConfig};
@@ -65,8 +65,8 @@ impl fmt::Display for StartupRefusal {
         match self {
             Self::IncompleteProductionRunner => write!(
                 f,
-                "MYELIN_CI_RUNNER=1 requires the exact-tenant worker, scoped reservation lifecycle, \
-                 and complete launch/recovery composition; production runner activation is refused"
+                "MYELIN_CI_RUNNER=1 requires the exact-tenant workflow worker/reporter and complete \
+                 launch/recovery proof; production runner activation is refused"
             ),
             Self::InvalidRunnerSetting(value) => write!(
                 f,
@@ -264,9 +264,9 @@ async fn main() {
     // leased/running work. Initial checks and the manifest-native DAG body are implemented and
     // live-PG proven but deliberately unwired.
     // NAMED FLOORS the activation change must close explicitly: attach the existing region-wide
-    // `PgCiRunStarterPoller` to coordinated shutdown with the deployed workflow-definition pin, bind
-    // the exact manifest job identity to the sandbox/token/reserve stores, settle the durable CI run,
-    // and attach Flow's production budget/remint hooks.
+    // `PgCiRunStarterPoller` to coordinated shutdown with the deployed workflow-definition pin,
+    // compose exact-tenant `PgFlowWorker`/accounted reporter routing and durable CI-run
+    // finalization, then close the complete launch/recovery crash matrix.
     if runner_host_requested {
         // ROLLING-UPGRADE FLOOR (CT-004d.2): refuse activation while any non-terminal NULL-stage
         // dispatch is still live — completion refuses such a job without consuming its claim, so the
@@ -326,7 +326,7 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        let _runner_identity = match myelin_ci_controlplane::ci_runner_identity_authorities(
+        let runner_identity = match myelin_ci_controlplane::ci_runner_identity_authorities(
             provider.clone(),
             runner_cell_id,
             &runner_seal_key,
@@ -340,6 +340,15 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+        let _runner_hooks = myelin_ci_controlplane::ci_runner_hooks(
+            provider.clone(),
+            runner_identity.launch_authorizer(),
+            tokio::runtime::Handle::current(),
+        );
+        let _runner_cancellations = myelin_ci_controlplane::ci_runner_cancellation_coordinator(
+            provider.clone(),
+            tokio::runtime::Handle::current(),
+        );
     }
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).

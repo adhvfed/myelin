@@ -552,10 +552,10 @@ impl GvisorBackend {
         hooks.enforce_isolation_floor(spec)?;
         let profile = HardeningProfile::derive(spec);
         profile.assert_enforced().map_err(GvisorError::Hardening)?;
-        let reserve = hooks.reserve(&spec.meter_to)?;
+        let reserve = hooks.reserve(spec)?;
         let cfg = OciConfig::from_spec(spec, &profile);
         if let Err(attribute_error) = hooks.attribute(spec) {
-            hooks.release_unused(&reserve)?;
+            hooks.release_unused(spec, &reserve)?;
             return Err(attribute_error.into());
         }
         // Run the container + capture the REAL result (the ONE legitimate `runsc`-spawn site — the
@@ -574,7 +574,7 @@ impl GvisorBackend {
             .insert(guest_id.clone(), RunscProc { child, bundle_dir });
 
         // Settle against the result's REAL measured usage (CT-002b) — never interrupt in-flight.
-        hooks.settle_completed(&reserve, result.usage)?;
+        hooks.settle_completed(spec, &reserve, result.usage)?;
 
         Ok(SandboxLaunch {
             handle: SandboxHandle { guest_id },
@@ -1812,9 +1812,9 @@ impl GvisorBackend {
             .with_extra_env(spec.env.clone())
             .with_extra_mounts(mounts)
             .with_root_path(root_abs);
-        let reserve = hooks.reserve(&job.meter_to)?;
+        let reserve = hooks.reserve(&job)?;
         if let Err(attribute_error) = hooks.attribute(&job) {
-            hooks.release_unused(&reserve)?;
+            hooks.release_unused(&job, &reserve)?;
             return Err(attribute_error.into());
         }
 
@@ -1846,7 +1846,7 @@ impl GvisorBackend {
             .insert(guest_id.clone(), RunscProc { child, bundle_dir });
 
         // Settle against the REAL measured usage (never interrupt in-flight).
-        hooks.settle_completed(&reserve, result.usage)?;
+        hooks.settle_completed(&job, &reserve, result.usage)?;
 
         Ok(SandboxLaunch {
             handle: SandboxHandle { guest_id },
@@ -1982,8 +1982,8 @@ mod tests {
     fn ok_hooks() -> RunnerHooks {
         RunnerHooks::new(
             CompletionSettlementOwner::Hook,
-            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         )
@@ -2283,8 +2283,8 @@ mod tests {
         let backend = GvisorBackend::new();
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::Hook,
-            Box::new(|_m| Err(crate::HookError("exhausted".into()))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|_spec| Err(crate::HookError("exhausted".into()))),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         );
@@ -2299,8 +2299,8 @@ mod tests {
         let hook_settled_at = hook_settled.clone();
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::TerminalReporter,
-            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            Box::new(move |_h, _u| {
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, _u| {
                 hook_settled_at.store(true, Ordering::SeqCst);
                 Ok(())
             }),
@@ -2324,8 +2324,8 @@ mod tests {
         let settled_at = settled.clone();
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::TerminalReporter,
-            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            Box::new(move |_h, usage| {
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, usage| {
                 *settled_at.lock().unwrap() = Some(usage);
                 Ok(())
             }),

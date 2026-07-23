@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — concrete operational reservation + claim/launch fences proven; production composition/crash path remain; production start disabled** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — operational reservation + scoped runner hooks + claim/launch fences proven; exact-tenant worker/reporter and full crash path remain; production start disabled** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -915,12 +915,15 @@ Authorization is no longer a copied-fact check. After isolation/config derivatio
 operational reservation, the last mutable action before sandbox spawn is one exact durable
 `leased` → `running` CAS over every scheduler-generation field. Cancel-superseded and launch now
 serialize on the same row: cancellation winning first refuses launch; launch winning first makes the
-row ineligible for cancellation. A refused final authorization releases the unused reservation with
-zero usage. Heartbeat and dead-runner recovery accept `running`, so a process death after the fence
-does not create an orphan. The live PostgreSQL test races cancellation against the exact launch CAS,
-proves exactly one winner, refuses CAS replay, and reaps an expired running generation. Real PASETO
-tests cover concurrent retry, forgery, scope/capability/expiry divergence, S7 teardown, the full
-production lease lifetime, and a refused durable fence.
+row ineligible for cancellation. A refused final authorization invokes the pre-spawn release
+bookend, but the composed production hook zero-settles only an exact generation already proven
+terminal without a completion receipt; a retryable, replacement, running, or reporter-completed
+generation retains the deterministic reservation for its real owner. Heartbeat and dead-runner
+recovery accept `running`, so a process death after the fence does not create an orphan. The live
+PostgreSQL test races cancellation against the exact launch CAS, proves exactly one winner, refuses
+CAS replay, and reaps an expired running generation. Real PASETO tests cover concurrent retry,
+forgery, scope/capability/expiry divergence, S7 teardown, the full production lease lifetime, and a
+refused durable fence.
 
 The same verification uncovered that the gVisor process-pressure corpus had been mechanically
 dishonest: it printed `CONTAINED` unconditionally, while rootless `runsc` actually admitted all 300
@@ -973,16 +976,18 @@ double-owned or unowned composition before queue claim, reservation, or launch. 
 runner loop treats that mismatch as a static configuration refusal and stops the lane.
 
 Both Firecracker and gVisor prove that reporter-owned success does not invoke hook settlement, while
-final-attribution refusal still releases the unused reservation at zero because no terminal report
-will exist. A runner-level rollback/reclaim/retry proof leaves the failed claim retryable and records
-exactly one reporter settlement with zero hook settlements. The durable PostgreSQL reporter
-advertises reporter ownership and its existing injected-failure proof rolls claim, reservation,
-projection, receipt, and signal back together before a clean retry. The exact-tenant router also
-rejects any factory output whose actual owner contradicts its durable-accounting contract, including
-a test-support bypass. Full sandbox, control-plane, Agent, and Edge all-target/all-feature suites,
-workspace all-target check, warnings-denied clippy, architecture lint, erosion gate, and
-contract-coverage gate are green. Independent adversarial review reported CONFIRMED-SOUND with no
-HIGH, MEDIUM, or remaining code LOW findings after its fixture-honesty findings were corrected.
+final-attribution refusal still invokes the pre-spawn bookend. The production implementation
+distinguishes safe canceled-generation zero release from retry/replacement/running ownership instead
+of treating every refusal as terminal. A runner-level rollback/reclaim/retry proof leaves the failed
+claim retryable and records exactly one reporter settlement with zero hook settlements. The durable
+PostgreSQL reporter advertises reporter ownership and its existing injected-failure proof rolls
+claim, reservation, projection, receipt, and signal back together before a clean retry. The
+exact-tenant router also rejects any factory output whose actual owner contradicts its
+durable-accounting contract, including a test-support bypass. Full sandbox, control-plane, Agent,
+and Edge all-target/all-feature suites, workspace all-target check, warnings-denied clippy,
+architecture lint, erosion gate, and contract-coverage gate are green. Independent adversarial
+review reported CONFIRMED-SOUND with no HIGH, MEDIUM, or remaining code LOW findings after its
+fixture-honesty findings were corrected.
 
 **Production Tier-P reservation binding (2026-07-23).** The dormant production starter factory now
 constructs the proven PostgreSQL Tier-P reservation provider from the app-role pool and exact cell
@@ -1021,11 +1026,48 @@ database access. Independent adversarial review initially found the whitespace s
 after the canonical-ID guard and both-sided regression coverage, re-review reported
 CONFIRMED-SOUND with no HIGH, MEDIUM, or LOW findings.
 
-**Honest remaining activation floors:** compose the exact-tenant region poller/worker,
-reporter-owned runner hooks, scoped reservation begin/release, and terminal bookends in one
-production runner. Then inject crashes across mint→CAS and CAS→spawn plus cancellation, retry,
-recovery, and settlement races in the complete composition. No Commercial wallet, billing, or
-Stripe work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
+**Production scoped runner lifecycle composition (2026-07-23).** `RunnerHooks` now carries the
+complete resolved `JobSpec` through reserve, pre-spawn release, and successful-completion ownership
+instead of reducing the money boundary to a caller-controlled meter string. The dormant production
+hook factory binds one provider region, the immutable drive manifest, the durable launch template,
+the exact live scheduler generation, Storage's Tier-P ledger, the real Identity final-launch
+authorizer, and the enforced hardening profile. Reservation begin locks and verifies tenant, region,
+workflow/job UUIDs, idempotency token, stage, trust tier, owner, epoch, nonce, original claim times,
+database-clock liveness, manifest reservation, and every executable template field before moving the
+exact reservation `reserved` → `inflight`. The final attribute hook repeats the complete
+manifest/template and live-generation verification immediately before Identity verification and the
+one-shot `leased` → `running` CAS.
+
+The first adversarial review found two real HIGH defects in the initial composition: a stale worker
+could zero-settle the deterministic reservation after a replacement worker launched, and a
+same-job command/image mutation could retain a valid token and pass the launch CAS. Both are now
+mechanically closed. Pre-spawn release row-locks the current queue disposition and zero-settles only
+the exact generation already terminal with no completion receipt; live retry, replacement, running
+or reporter-completed generations retain the reservation. The executable check compares the whole
+`JobSpecTemplate` to the durable `ci_job_spec` record and independently to the immutable manifest
+(image, command, environment, secret references, egress, resource limits, workspace, trust tier,
+meter, CI-run and token authority), while queue identity separately pins idempotency/stage/trust.
+A re-review then found a cancellation orphan if begin committed before handle acknowledgement or
+cancellation committed immediately after a retry-preserving release check. Production
+cancel-superseded is therefore a separate accounted coordinator: queue terminalization and exact
+Tier-P zero settlement co-commit in one tenant transaction, and the old unaccounted queue-store verb
+is structurally test-support-only. The live PostgreSQL proof covers exact begin retry, nonexistent
+generation refusal, same-job command mutation refusal before both begin and CAS, cross-tenant
+refusal, off-runtime execution, retryable Identity refusal with no settlement, stale
+replacement-generation release refusal, launch-CAS acknowledgement-loss retention, cancellation
+after retry retention, cancellation after begin-commit/handle-acknowledgement loss, atomic zero
+settlement of both, cancellation acknowledgement retry, and reporter-owned success remaining
+in-flight. The complete row is green under workspace all-target/all-feature check, warnings-denied
+clippy, the full control-plane all-target/all-feature suite (including live PostgreSQL), architecture
+lint, erosion budgets, contract coverage, and the production-source activation guard. Independent
+adversarial re-review reported CONFIRMED-SOUND after the two HIGH and one MEDIUM findings were
+closed, with no remaining finding. Production activation remains refused.
+
+**Honest remaining activation floors:** compose the exact-tenant region poller, workflow worker,
+accounted reporter router, durable CI-run finalizer, and the now-scoped hooks into one production
+runner. Then inject crashes across mint→CAS and CAS→spawn plus cancellation, retry, recovery, and
+settlement races in the complete composition. No Commercial wallet, billing, or Stripe work is
+admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
 
 ## R5–R6
 

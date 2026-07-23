@@ -990,11 +990,16 @@ pub enum CompletionSettlementOwner {
     TerminalReporter,
 }
 
-/// Guarantee #1a hook type (contract 11.7 reserve_budget): reserve at dispatch, `Err` == exhausted.
-pub type ReserveHook = Box<dyn Fn(&MeterTarget) -> Result<ReserveHandle, HookError> + Send + Sync>;
-/// Guarantee #1b hook type (contract 11.7 settle_budget): settle on completion.
+/// Guarantee #1a hook type (contract 11.7 reserve_budget): begin the exact reservation carried by
+/// the fully resolved job, `Err` == unavailable/exhausted. The complete [`JobSpec`] is required so a
+/// durable implementation can bind the reservation to the same tenant, region, workflow, job, and
+/// claim generation as final attribution; a bare caller-controlled meter string is insufficient.
+pub type ReserveHook = Box<dyn Fn(&JobSpec) -> Result<ReserveHandle, HookError> + Send + Sync>;
+/// Guarantee #1b hook type (contract 11.7 settle_budget): settle/release the exact scoped job
+/// reservation. The complete [`JobSpec`] remains present at both successful completion and
+/// pre-spawn refusal, so the hook never has to recover tenant scope from an opaque handle.
 pub type SettleHook =
-    Box<dyn Fn(&ReserveHandle, ResourceUsage) -> Result<(), HookError> + Send + Sync>;
+    Box<dyn Fn(&JobSpec, &ReserveHandle, ResourceUsage) -> Result<(), HookError> + Send + Sync>;
 /// Guarantee #2 hook type (contract 4.7 mint_run_token): final-boundary attribution over the
 /// credential and the server-resolved expected launch facts carried by the complete spec.
 pub type AttributeHook = Box<dyn Fn(&JobSpec) -> Result<(), HookError> + Send + Sync>;
@@ -1033,8 +1038,8 @@ impl RunnerHooks {
     }
 
     /// Reserve operational capacity before final attribution and guest launch.
-    pub fn reserve(&self, target: &MeterTarget) -> Result<ReserveHandle, HookError> {
-        (self.reserve)(target)
+    pub fn reserve(&self, spec: &JobSpec) -> Result<ReserveHandle, HookError> {
+        (self.reserve)(spec)
     }
 
     /// Perform the final launch-attribution check.
@@ -1058,8 +1063,9 @@ impl RunnerHooks {
 
     /// Release a reservation after final attribution refuses before spawn. There will be no terminal
     /// report in this path, so the real hook always owns the zero-usage release.
-    pub fn release_unused(&self, reserve: &ReserveHandle) -> Result<(), HookError> {
+    pub fn release_unused(&self, spec: &JobSpec, reserve: &ReserveHandle) -> Result<(), HookError> {
         (self.settle)(
+            spec,
             reserve,
             ResourceUsage {
                 cpu_seconds: 0,
@@ -1071,11 +1077,12 @@ impl RunnerHooks {
     /// Settle completed usage exactly once, or explicitly defer it to the terminal reporter.
     pub fn settle_completed(
         &self,
+        spec: &JobSpec,
         reserve: &ReserveHandle,
         usage: ResourceUsage,
     ) -> Result<(), HookError> {
         match self.completion_settlement_owner {
-            CompletionSettlementOwner::Hook => (self.settle)(reserve, usage),
+            CompletionSettlementOwner::Hook => (self.settle)(spec, reserve, usage),
             CompletionSettlementOwner::TerminalReporter => Ok(()),
         }
     }
@@ -1501,9 +1508,9 @@ mod tests {
         ) -> Result<SandboxLaunch, Self::Error> {
             // Drive the four-guarantee seam exactly as a real backend must:
             hooks.enforce_isolation_floor(spec)?; // #4 isolation floor
-            let res = hooks.reserve(&spec.meter_to)?; // #1a cost gate (reserve)
+            let res = hooks.reserve(spec)?; // #1a cost gate (reserve)
             if let Err(attribute_error) = hooks.attribute(spec) {
-                hooks.release_unused(&res)?;
+                hooks.release_unused(spec, &res)?;
                 return Err(attribute_error);
             }
             // ... the guest would run here (a real backend launches the hardened VM) ...
@@ -1513,7 +1520,7 @@ mod tests {
                 cpu_seconds: 1,
                 mem_byte_seconds: 1,
             });
-            hooks.settle_completed(&res, result.usage)?; // #1b settle or explicit reporter deferral
+            hooks.settle_completed(spec, &res, result.usage)?; // #1b settle or explicit reporter deferral
             Ok(SandboxLaunch {
                 handle: SandboxHandle {
                     guest_id: "noop-guest".into(),
@@ -1529,8 +1536,13 @@ mod tests {
     fn test_hooks() -> RunnerHooks {
         RunnerHooks::new(
             CompletionSettlementOwner::Hook,
-            Box::new(|m| Ok(ReserveHandle(format!("reserved:{}", m.reserve_id)))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|spec| {
+                Ok(ReserveHandle(format!(
+                    "reserved:{}",
+                    spec.meter_to.reserve_id
+                )))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         )
@@ -1556,8 +1568,8 @@ mod tests {
         let seen_at_boundary = seen.clone();
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::Hook,
-            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(move |spec| {
                 let credential = &spec.run_token;
                 *seen_at_boundary.lock().unwrap() = Some((
@@ -1604,8 +1616,8 @@ mod tests {
         let backend = NoopBackend;
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::Hook,
-            Box::new(|_m| Err(HookError("wallet exhausted".into()))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|_spec| Err(HookError("wallet exhausted".into()))),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         );
@@ -1620,8 +1632,8 @@ mod tests {
         let backend = NoopBackend;
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::Hook,
-            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Err(HookError("hardening profile not met".into()))),
         );
