@@ -277,10 +277,10 @@ async fn main() {
     // run when the tenant has no prior live reservations; the scheduler separately limits
     // leased/running work. Initial checks and the manifest-native DAG body are implemented and
     // live-PG proven but deliberately unwired.
-    // NAMED FLOORS the activation change must close explicitly: attach the already-composed starter,
-    // workflow-recovery, and sandbox runner drivers to coordinated shutdown, then close the complete
-    // launch/recovery crash matrix.
-    let _runner_host = if runner_host_requested {
+    // The retained host below now owns coordinated start, failure propagation, and bounded shutdown
+    // for the starter, workflow recovery, and sandbox runner. The remaining activation floor is the
+    // complete launch/recovery crash matrix; the pre-bootstrap refusal above stays in force.
+    let runner_host = if runner_host_requested {
         // ROLLING-UPGRADE FLOOR (CT-004d.2): refuse activation while any non-terminal NULL-stage
         // dispatch is still live — completion refuses such a job without consuming its claim, so the
         // lane must not start until the backlog is repaired. A CHECKED invariant (a healthy never-activated
@@ -417,22 +417,76 @@ async fn main() {
             provider.db_pool().clone(),
             provider.config().s3.clone(),
         );
-        Some((starter_poller, workflow_poller, runner))
+        match myelin_ci_controlplane::CiRunnerHost::new(starter_poller, workflow_poller, runner)
+            .start(myelin_ci_controlplane::CiRunnerHostConfig::production())
+        {
+            Ok(host) => Some(host),
+            Err(error) => {
+                eprintln!("ci-controlplane: runner-host lifecycle refused: {error}");
+                std::process::exit(1);
+            }
+        }
     } else {
         None
     };
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
     let signal_shutdown = shutdown_tx.clone();
+    let runner_host_shutdown = runner_host
+        .as_ref()
+        .map(myelin_ci_controlplane::CiRunnerHostHandle::shutdown_sender);
+    let runner_host_failures = runner_host
+        .as_ref()
+        .map(myelin_ci_controlplane::CiRunnerHostHandle::failure_receiver);
+    // This second observer deliberately outlives the service-shutdown future. The supervisor keeps
+    // owning every join after the deadline; if a lane never returns, only the process boundary can
+    // end it without detaching work inside a still-serving process.
+    let runner_host_deadline_task = runner_host.as_ref().map(|host| {
+        let failures = host.failure_receiver();
+        tokio::spawn(async move {
+            if myelin_ci_controlplane::wait_for_ci_runner_host_drain_timeout(failures).await {
+                eprintln!("ci-controlplane: runner host exceeded its process-fatal drain deadline");
+                std::process::exit(1);
+            }
+        })
+    });
     let service_result = run_controlplane_until_shutdown(Config::default(), outbox, async move {
-        shutdown_signal().await;
+        if let Some(failures) = runner_host_failures {
+            tokio::select! {
+                _ = shutdown_signal() => {}
+                failure = myelin_ci_controlplane::wait_for_ci_runner_host_failure(failures) => {
+                    eprintln!("ci-controlplane: runner host failed: {failure}");
+                }
+            }
+        } else {
+            shutdown_signal().await;
+        }
         let _ = signal_shutdown.send(true);
+        if let Some(host_shutdown) = runner_host_shutdown {
+            let _ = host_shutdown.send(true);
+        }
     })
     .await;
     let _ = shutdown_tx.send(true);
     let reaper_result = tokio::time::timeout(std::time::Duration::from_secs(10), reaper_task).await;
+    let runner_host_result = match runner_host {
+        Some(host) => host.shutdown().await,
+        None => Ok(()),
+    };
+    let runner_host_deadline_result = match runner_host_deadline_task {
+        Some(task) => task.await,
+        None => Ok(()),
+    };
     if !matches!(reaper_result, Ok(Ok(()))) {
         eprintln!("ci-controlplane: reaper did not stop cleanly during shutdown");
+        std::process::exit(1);
+    }
+    if let Err(error) = runner_host_result {
+        eprintln!("ci-controlplane: runner host did not stop cleanly: {error}");
+        std::process::exit(1);
+    }
+    if runner_host_deadline_result.is_err() {
+        eprintln!("ci-controlplane: runner-host deadline watchdog failed");
         std::process::exit(1);
     }
     match service_result {

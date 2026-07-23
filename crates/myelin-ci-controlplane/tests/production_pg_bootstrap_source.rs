@@ -21,6 +21,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let job_queue_store_source = include_str!("../src/job_queue_store.rs");
     let region_store_source = include_str!("../src/job_queue_region.rs");
     let runner_bind_source = include_str!("../src/runner_bind.rs");
+    let runner_host_source = include_str!("../src/ci_runner_host.rs");
 
     assert!(source.contains("MyelinConfig::from_env(Mode::RequireEnv)"));
     assert!(source.contains("CiSchedulerDbConfig::from_env(&platform_config)"));
@@ -85,6 +86,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let runner_loop = source
         .find("CiRunnerLoop::new(")
         .expect("the real sandbox runner loop must be composed at the dormant root");
+    let runner_host = source
+        .find("CiRunnerHost::new(")
+        .expect("the coordinated runner host must own every dormant driver");
     let runner_gate = source
         .find("verify_startup_activation(runner_setting)")
         .expect("production runner activation must be refused explicitly");
@@ -98,7 +102,26 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(!source.contains("spawn_until_shutdown"));
     assert!(!source.contains("runner.spawn("));
     assert!(!source.contains("runner.spawn_until_shutdown("));
-    assert!(source.contains("Some((starter_poller, workflow_poller, runner))"));
+    assert!(source.contains("CiRunnerHostConfig::production()"));
+    assert!(source.contains("host.shutdown().await"));
+    assert!(source.contains("wait_for_ci_runner_host_failure(failures)"));
+    assert!(source.contains("wait_for_ci_runner_host_drain_timeout(failures)"));
+    assert!(source.contains("runner_host_deadline_task"));
+    assert!(
+        runner_host_source.matches(".run_until_shutdown(").count() >= 2,
+        "the host must drive both async production lanes through their shutdown-aware entrypoints"
+    );
+    for lifecycle_contract in [
+        "runner.try_spawn_until_shutdown(shutdown)",
+        "tokio::time::sleep(config.drain_timeout)",
+        "drain.await",
+        "shutdown_tx.send(true)",
+    ] {
+        assert!(
+            runner_host_source.contains(lifecycle_contract),
+            "runner host must retain lifecycle contract {lifecycle_contract}"
+        );
+    }
     assert!(!source.contains("ci_runner_cancellation_coordinator("));
     assert!(!source.contains("CiPipelineDriver"));
     assert!(!source.contains("unresolved_stage_spec_builder"));
@@ -293,6 +316,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(runner_identity < runner_resolver);
     assert!(runner_resolver < runner_hooks);
     assert!(runner_hooks < runner_loop);
+    assert!(runner_loop < runner_host);
+    assert!(runner_host < service);
     assert!(runner_hooks < service);
     assert!(starter_lane < service);
 }

@@ -92,12 +92,34 @@ impl PgCiRunStarterPoller {
         &self,
         max_starts: usize,
     ) -> Result<CiRunStarterBatch, CiRunStarterPollerError> {
+        self.run_until_idle_inner(max_starts, None).await
+    }
+
+    async fn run_until_idle_or_shutdown(
+        &self,
+        max_starts: usize,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<CiRunStarterBatch, CiRunStarterPollerError> {
+        self.run_until_idle_inner(max_starts, Some(shutdown)).await
+    }
+
+    async fn run_until_idle_inner(
+        &self,
+        max_starts: usize,
+        shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<CiRunStarterBatch, CiRunStarterPollerError> {
         if !(1..=MAX_CI_RUN_START_BATCH).contains(&max_starts) {
             return Err(CiRunStarterPollerError::InvalidConfig);
         }
         let mut started = 0;
         let mut processed = 0;
         while processed < max_starts {
+            if shutdown.is_some_and(|receiver| *receiver.borrow()) {
+                return Ok(CiRunStarterBatch {
+                    started,
+                    saturated: true,
+                });
+            }
             match self.run_once().await? {
                 StartQueuedOutcome::Idle => {
                     return Ok(CiRunStarterBatch {
@@ -134,7 +156,8 @@ impl PgCiRunStarterPoller {
             if *shutdown.borrow() {
                 return Ok(());
             }
-            self.run_until_idle(max_starts).await?;
+            self.run_until_idle_or_shutdown(max_starts, &shutdown)
+                .await?;
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {

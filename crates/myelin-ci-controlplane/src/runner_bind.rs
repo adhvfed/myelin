@@ -284,6 +284,20 @@ pub struct CiRunnerLoop {
     s3: myelin_config::S3Config,
 }
 
+/// Terminal reason returned by the owned runner thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiRunnerLoopExit {
+    /// The lifecycle signal arrived before another claim. An in-flight sandbox, if any, completed
+    /// under its durable job timeout before this result was returned.
+    Shutdown,
+    /// Reporter and hook settlement ownership disagreed. Retrying cannot repair this static
+    /// composition error, so the complete runner host must stop fail-closed.
+    SettlementOwnerMismatch,
+    /// A launched job could not co-commit its terminal report/accounting. The durable claim remains
+    /// recoverable, but accepting more work would accumulate completed, unsettled jobs.
+    TerminalReportFailed,
+}
+
 impl CiRunnerLoop {
     /// Construct the runner loop. `worker_id`/`labels`/`allowed_tiers`/`region`/`lease_ttl_secs` are
     /// the claim predicates + lease TTL; `store` is the durable `job_queue` store; `rt` bridges the
@@ -341,7 +355,7 @@ impl CiRunnerLoop {
     /// whole in-line `runsc` job and the adapter bridges its DB calls onto `rt`; running off-runtime
     /// keeps `block_on` correct and never starves a tokio worker. This legacy forever-loop entry is
     /// retained for deterministic callers; production uses [`Self::spawn_until_shutdown`].
-    pub fn spawn(self) -> std::thread::JoinHandle<()> {
+    pub fn spawn(self) -> std::thread::JoinHandle<CiRunnerLoopExit> {
         std::thread::Builder::new()
             .name("ci-runner".into())
             .spawn(move || self.run())
@@ -355,11 +369,20 @@ impl CiRunnerLoop {
     pub fn spawn_until_shutdown(
         self,
         shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> std::thread::JoinHandle<CiRunnerLoopExit> {
+        self.try_spawn_until_shutdown(shutdown)
+            .expect("spawn the shutdown-aware ci-runner thread")
+    }
+
+    /// Fallible production spawn used by the coordinated runner host. Thread-resource exhaustion is
+    /// a typed startup refusal rather than a panic after other host lanes have started.
+    pub(crate) fn try_spawn_until_shutdown(
+        self,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> std::io::Result<std::thread::JoinHandle<CiRunnerLoopExit>> {
         std::thread::Builder::new()
             .name("ci-runner".into())
             .spawn(move || self.run_until_shutdown(shutdown))
-            .expect("spawn the shutdown-aware ci-runner thread")
     }
 
     /// **Run the claim → launch → `job.done` cycle forever (until the process stops).** Constructs the
@@ -367,18 +390,21 @@ impl CiRunnerLoop {
     /// `idle_backoff`; `LeaseLost` is a clean immediate retry (another worker owns it now); a
     /// `LaunchFailed`/`ReportFailed` is logged LOUD and sleeps `error_backoff` (the dispatch activity
     /// retries the job, §OQ-F). Never reimplements any sandbox logic.
-    pub fn run(self) {
+    pub fn run(self) -> CiRunnerLoopExit {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        self.run_until_shutdown(shutdown_rx);
+        self.run_until_shutdown(shutdown_rx)
     }
 
     /// Run claim → launch → `job.done` cycles until explicit shutdown or sender closure. Shutdown is
     /// checked before constructing live adapters and before every claim. It never kills a job midway:
     /// an already-running sandbox remains bounded by its job timeout and drains before this loop
     /// returns.
-    pub fn run_until_shutdown(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    pub fn run_until_shutdown(
+        self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> CiRunnerLoopExit {
         if runner_shutdown_requested(&mut shutdown) {
-            return;
+            return CiRunnerLoopExit::Shutdown;
         }
         let CiRunnerLoop {
             worker_id,
@@ -430,7 +456,7 @@ impl CiRunnerLoop {
         );
         loop {
             if runner_shutdown_requested(&mut shutdown) {
-                return;
+                return CiRunnerLoopExit::Shutdown;
             }
             match agent.run_one(now_secs()) {
                 Ok(o) => {
@@ -441,7 +467,7 @@ impl CiRunnerLoop {
                 }
                 Err(RunnerError::NoWork) => {
                     if runner_sleep_until_shutdown(&mut shutdown, idle_backoff) {
-                        return;
+                        return CiRunnerLoopExit::Shutdown;
                     }
                 }
                 Err(RunnerError::LeaseLost { job_id }) => {
@@ -459,20 +485,21 @@ impl CiRunnerLoop {
                          the dispatch retries): {e}"
                     );
                     if runner_sleep_until_shutdown(&mut shutdown, error_backoff) {
-                        return;
+                        return CiRunnerLoopExit::Shutdown;
                     }
                 }
                 Err(e @ RunnerError::ReportFailed(_)) => {
-                    eprintln!("ci-runner[{worker_id}]: terminal report FAILED (surfaced): {e}");
-                    if runner_sleep_until_shutdown(&mut shutdown, error_backoff) {
-                        return;
-                    }
+                    eprintln!(
+                        "ci-runner[{worker_id}]: terminal report FAILED; stopping host intake so the \
+                         durable claim can be recovered: {e}"
+                    );
+                    return CiRunnerLoopExit::TerminalReportFailed;
                 }
                 Err(e @ RunnerError::SettlementOwnerMismatch { .. }) => {
                     // Static composition failure: retrying cannot make an unowned/double settlement
                     // safe. Stop this runner lane fail-closed before it claims any work.
                     eprintln!("ci-runner[{worker_id}]: CONFIGURATION REFUSED: {e}");
-                    return;
+                    return CiRunnerLoopExit::SettlementOwnerMismatch;
                 }
             }
         }

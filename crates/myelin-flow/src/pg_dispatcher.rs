@@ -785,6 +785,34 @@ impl PgFlowWorker {
         now_unix_secs: i64,
         now_rfc3339: &str,
     ) -> Result<PgDriveBatch, PgWorkerError> {
+        self.run_until_idle_inner(max_runs, now_unix_secs, now_rfc3339, None)
+            .await
+    }
+
+    /// Drive until idle, the explicit bound, or a coordinated shutdown signal is reached.
+    pub async fn run_until_idle_or_shutdown(
+        &self,
+        max_runs: usize,
+        now_unix_secs: i64,
+        now_rfc3339: &str,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<PgDriveBatch, PgWorkerError> {
+        self.run_until_idle_inner(
+            max_runs,
+            now_unix_secs,
+            now_rfc3339,
+            Some(shutdown),
+        )
+        .await
+    }
+
+    async fn run_until_idle_inner(
+        &self,
+        max_runs: usize,
+        now_unix_secs: i64,
+        now_rfc3339: &str,
+        shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<PgDriveBatch, PgWorkerError> {
         if !(1..=MAX_BATCH).contains(&max_runs) {
             return Err(PgWorkerError::InvalidConfig(format!(
                 "max_runs must be between 1 and {MAX_BATCH}"
@@ -792,6 +820,12 @@ impl PgFlowWorker {
         }
         let mut driven = 0;
         while driven < max_runs {
+            if shutdown.is_some_and(|receiver| *receiver.borrow()) {
+                return Ok(PgDriveBatch {
+                    driven,
+                    saturated: true,
+                });
+            }
             match self.run_once(now_unix_secs, now_rfc3339).await? {
                 PgRunOnceOutcome::Idle => {
                     return Ok(PgDriveBatch {
@@ -829,7 +863,8 @@ impl PgFlowWorker {
                 .store
                 .fire_due_timer(self.scope.partition, secs)
                 .await?;
-            self.run_until_idle(max_batch, secs, &stamp).await?;
+            self.run_until_idle_or_shutdown(max_batch, secs, &stamp, &shutdown)
+                .await?;
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() { return Ok(()); }
