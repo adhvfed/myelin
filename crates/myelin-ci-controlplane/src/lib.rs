@@ -86,7 +86,7 @@ pub use ci_identity_adapter::{
 pub use ci_launch_authority::{
     CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority,
     ManifestBoundCiJobTokenAuthority, PgTierPCiJobBudgetReservation, TierPOperationalCiJobPricer,
-    LINUX_SMALL_V1_POLICY_REVISION,
+    LINUX_SMALL_V1_POLICY_REVISION, TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
 };
 pub use ci_manifest_pipeline::{
     decode_resolved_ci_manifest, drive_resolved_ci_manifest_pipeline, register_ci_manifest_pipeline,
@@ -866,33 +866,40 @@ pub fn ci_run_store_factory(pool: sqlx::PgPool) -> CiRunStore {
 ///
 /// **DORMANT + activation-gated.** `main` composes this behind the SAME `MYELIN_CI_RUNNER` seam the
 /// runner lane uses: while the startup refusal keeps `MYELIN_CI_RUNNER=1` fail-closed, the factory is
-/// constructed but no minted starter is driven (constructing it wraps the pool + blob client only — no
-/// query runs), so no queued run is started yet. Production construction does bind the real fixed,
-/// default-deny `linux-small-v1` policy; its operational budget-reservation provider is explicitly
-/// unavailable and fabricates no reservation handle. This is a Tier-P safety/metering floor, not a
-/// Commercial wallet or billing integration. The token-authority reference is already
+/// not reached and no minted starter is driven. When that refusal is eventually removed, constructing
+/// it wraps the pool + blob client only — no query runs — so construction alone cannot start a queued
+/// run. Production construction binds the real fixed,
+/// default-deny `linux-small-v1` policy and the PostgreSQL Tier-P operational reservation source.
+/// Its outstanding-reservation ceiling is deliberately distinct from the scheduler's measured
+/// leased/running cap: it admits one largest valid run for an otherwise-idle tenant while bounding
+/// queued durable authority. This is a Tier-P safety/metering seam, not a Commercial wallet or
+/// billing integration. The token-authority reference is already
 /// content-bound to the complete immutable request, but is not a bearer or mint. Even if accidentally
-/// driven, a fresh V2 launch therefore fails before attempts or manifest state. The activation flip
-/// must replace the operational reservation provider,
-/// attach [`PgCiRunStarterPoller`] to coordinated lifecycle shutdown with the deployed definition
-/// pin, compose the exact manifest-to-sandbox runner/token authority and terminal settlement path,
-/// and close the remaining worker budget/remint floors.
+/// driven, startup remains separately refused before this composition is reachable. The activation
+/// flip must attach [`PgCiRunStarterPoller`] to coordinated lifecycle shutdown with the deployed
+/// definition pin, compose the exact manifest-to-sandbox runner/token authority and terminal
+/// settlement path, and close the remaining crash/recovery floors.
 pub fn ci_run_starter_factory(
     pool: sqlx::PgPool,
     region: myelin_tenancy::Region,
     blobs: std::sync::Arc<dyn myelin_storage::BlobStore + Send + Sync>,
     rt: tokio::runtime::Handle,
-) -> PgCiRunStarterFactory {
-    PgCiRunStarterFactory::new_with_authority(
+) -> Result<PgCiRunStarterFactory, CiLaunchAuthorityError> {
+    let reservations = ci_launch_authority::PgTierPCiJobBudgetReservation::new(
+        pool.clone(),
+        region.0.clone(),
+        ci_launch_authority::TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
+    )?;
+    Ok(PgCiRunStarterFactory::new_with_authority(
         pool,
         rt,
         std::sync::Arc::new(myelin_events::MonotonicMinter::new()),
         region,
         blobs,
         std::sync::Arc::new(ci_launch_authority::LinuxSmallV1LaunchAuthority::new(
-            std::sync::Arc::new(ci_launch_authority::UnavailableCiJobBudgetReservation),
+            std::sync::Arc::new(reservations),
         )),
-    )
+    ))
 }
 
 #[cfg(test)]

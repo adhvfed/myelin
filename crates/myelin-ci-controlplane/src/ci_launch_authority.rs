@@ -28,6 +28,12 @@ use myelin_storage::{with_tenant_tx, PgError};
 use sqlx::{PgPool, Row};
 
 pub const LINUX_SMALL_V1_POLICY_REVISION: &str = "linux-small-v1:1";
+/// Production-for-one ceiling on durable Tier-P reservations for one tenant and region.
+///
+/// Reservations cover every queued DAG job, so this is deliberately distinct from the measured
+/// scheduler cap, which covers only leased/running jobs. An idle tenant can reserve one largest
+/// valid run; additional runs fail closed until enough earlier reservations settle.
+pub const TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING: u32 = 1_024;
 const CI_OPERATIONAL_RESERVATION_V1_DOMAIN: &[u8] = b"myelin.ci.operational-reservation.v1\0";
 const CI_OPERATIONAL_BATCH_V1_DOMAIN: &[u8] = b"myelin.ci.operational-reservation-batch.v1\0";
 const GIB_BYTES: u64 = 1_073_741_824;
@@ -76,28 +82,6 @@ pub trait CiJobBudgetReservationProvider: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CiLaunchAuthorityError>> + Send + 'a>>
     {
         self.reserve_batch(requests)
-    }
-}
-
-/// Explicit fail-closed reservation placeholder used by the dormant production composition. Keeping this
-/// one layer below the real policy adapter means the composed starter exercises the fixed policy
-/// mapping while the Tier-P operational quota/cost reservation source remains the exact visible
-/// blocker. This is a safety/metering floor, not billing, Stripe, or a Commercial wallet, and it
-/// never fabricates a reservation handle.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct UnavailableCiJobBudgetReservation;
-
-impl CiJobBudgetReservationProvider for UnavailableCiJobBudgetReservation {
-    fn reserve_batch<'a>(
-        &'a self,
-        _requests: Vec<CiJobRuntimeAuthorityRequest>,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CiLaunchAuthorityError>> + Send + 'a>>
-    {
-        Box::pin(async {
-            Err(refused(
-                "durable CI budget reservation authority is not composed",
-            ))
-        })
     }
 }
 
@@ -803,6 +787,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn production_operational_ceiling_admits_one_largest_valid_run_when_idle() {
+        assert_eq!(
+            TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING as usize,
+            crate::run_plan::MAX_RUN_PLAN_JOBS
+        );
+    }
+
     fn fixture() -> (CiRunRecord, PreparedRunPlanV2) {
         let tenant = TenantId("acme".into());
         let plan = ResolvedRunPlanV2 {
@@ -1098,18 +1090,5 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.0.contains("wrong reservation cardinality"));
-    }
-
-    #[tokio::test]
-    async fn dormant_budget_provider_never_fabricates_reservation_handles() {
-        let (record, prepared) = fixture();
-        let policy = policy(Arc::new(UnavailableCiJobBudgetReservation));
-        let pin = CiWorkflowDefinitionPin::new(1, "ci-body-v1").unwrap();
-
-        let error = policy
-            .materialize(&record, &prepared, &pin)
-            .await
-            .unwrap_err();
-        assert!(error.0.contains("not composed"));
     }
 }

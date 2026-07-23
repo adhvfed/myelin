@@ -8,14 +8,13 @@ use std::time::Duration;
 
 use myelin_ci_controlplane::{
     ci_artifact_ref, ci_job_id_v2, ci_region_run_discovery_test_support, ci_run_ref,
-    CiExecutionProfileV1, CiExecutionRequestV1, CiJobLaunchGrantV1, CiLaunchAuthorityError,
-    CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1, CiManifestLaneV1, CiManifestLimitsV1,
-    CiManifestSchedulingV1, CiWorkflowDefinitionPin, LinuxSmallV1LaunchAuthority,
-    PgCiPipelineStarter, PgCiRunStarterFactory, PgCiRunStarterPoller,
-    PgTierPCiJobBudgetReservation, PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2,
-    StartQueuedOutcome, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, CI_JOB_RUN_LEDGER_INDEX,
-    CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_DDL,
-    CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_RUN_DDL,
+    ci_run_starter_factory, CiExecutionProfileV1, CiExecutionRequestV1, CiJobLaunchGrantV1,
+    CiLaunchAuthorityError, CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1, CiManifestLaneV1,
+    CiManifestLimitsV1, CiManifestSchedulingV1, CiWorkflowDefinitionPin, PgCiPipelineStarter,
+    PgCiRunStarterFactory, PgCiRunStarterPoller, PreparedRunPlanV2, ResolvedJobV2,
+    ResolvedRunPlanV2, StartQueuedOutcome, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
+    CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL,
+    CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_RUN_DDL,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::MonotonicMinter;
@@ -256,19 +255,18 @@ fn starter_with_operational_reservations(
     tenant: &str,
     blobs: Arc<dyn BlobStore + Send + Sync>,
 ) -> PgCiPipelineStarter {
-    let reservations = PgTierPCiJobBudgetReservation::new(pool.clone(), "fr-par", 4)
-        .expect("valid Tier-P operational reservation source");
-    PgCiPipelineStarter::new_with_authority(
+    ci_run_starter_factory(
         pool.clone(),
-        tokio::runtime::Handle::current(),
-        Arc::new(MonotonicMinter::new()),
-        TenantId(tenant.into()),
         Region("fr-par".into()),
         blobs,
-        CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
-        Arc::new(LinuxSmallV1LaunchAuthority::new(Arc::new(reservations))),
+        tokio::runtime::Handle::current(),
     )
-    .expect("valid starter with concrete Tier-P launch authority")
+    .expect("valid production Tier-P starter factory")
+    .starter_for(
+        TenantId(tenant.into()),
+        CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+    )
+    .expect("valid exact-cell production starter")
 }
 
 // The production composition-root seam (`ci_run_starter_factory`) over the app-role pool + cell region

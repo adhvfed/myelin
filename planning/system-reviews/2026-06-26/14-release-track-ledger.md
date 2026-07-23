@@ -984,10 +984,28 @@ workspace all-target check, warnings-denied clippy, architecture lint, erosion g
 contract-coverage gate are green. Independent adversarial review reported CONFIRMED-SOUND with no
 HIGH, MEDIUM, or remaining code LOW findings after its fixture-honesty findings were corrected.
 
-**Honest remaining activation floors:** the production starter factory still composes the explicit
-unavailable provider; wire the proven provider with a server-owned ceiling, then compose the Identity
-minter, exact launch authorizer, exact-tenant region poller/worker, reporter-owned runner hooks, and
-terminal bookends. Then inject crashes across mint→CAS and CAS→spawn plus cancellation, retry,
+**Production Tier-P reservation binding (2026-07-23).** The dormant production starter factory now
+constructs the proven PostgreSQL Tier-P reservation provider from the app-role pool and exact cell
+region, and propagates construction refusal instead of retaining the placeholder provider. Its
+server-owned outstanding-reservation ceiling is 1,024: deliberately distinct from the measured
+64-job scheduler cap, because reservations include queued DAG jobs while that cap includes only
+leased/running jobs. A mechanical invariant ties 1,024 to the largest valid run plan, so an otherwise
+idle tenant can reserve one maximum-size run; further runs fail closed until earlier reservations
+settle, while scheduler excess continues to queue at its independent 64-job concurrency boundary.
+
+The live PostgreSQL starter proof now enters through the exact public production factory. An injected
+failure after all three reservations but before the manifest leaves reservation, manifest, and
+check-attempt counts at zero; an ordinary retry commits all three. A production-source gate pins the
+PostgreSQL provider and dedicated ceiling, rejects both the obsolete unavailable provider and the
+scheduler cap at that seam, and keeps runner activation refused before configuration, database
+bootstrap, or factory construction. The dead placeholder implementation and its self-contained
+fixture test were removed. Full row gates are green. Independent adversarial re-review reported
+CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding after catching and closing an initial
+scheduler-cap semantic mismatch.
+
+**Honest remaining activation floors:** compose the Identity minter, exact launch authorizer,
+exact-tenant region poller/worker, reporter-owned runner hooks, and terminal bookends in one
+production runner. Then inject crashes across mint→CAS and CAS→spawn plus cancellation, retry,
 recovery, and settlement races in the complete composition. No Commercial wallet, billing, or
 Stripe work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
 
