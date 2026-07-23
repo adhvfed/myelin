@@ -85,7 +85,8 @@ pub use ci_identity_adapter::{
 };
 pub use ci_launch_authority::{
     CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority,
-    ManifestBoundCiJobTokenAuthority, LINUX_SMALL_V1_POLICY_REVISION,
+    ManifestBoundCiJobTokenAuthority, PgTierPCiJobBudgetReservation, TierPOperationalCiJobPricer,
+    LINUX_SMALL_V1_POLICY_REVISION,
 };
 pub use ci_manifest_pipeline::{
     decode_resolved_ci_manifest, drive_resolved_ci_manifest_pipeline, register_ci_manifest_pipeline,
@@ -573,6 +574,7 @@ pub use ci_pipeline_driver::{fixed_command_spec_builder, CiPipelineDriver, Start
 pub use ci_pipeline_driver::{
     unresolved_stage_spec_builder, CiJobAccountingPricer, CiJobPricingError, CiPipelineReporter,
     ClaimRefusal, DurableCiJobAccounting, DurableJobRunner, PricedCiJobUsage, StageSpecBuilder,
+    TIER_P_OPERATIONAL_PRICING_REVISION,
 };
 pub use ci_pipeline_reporter_router::{
     CiPipelineReporterFactory, CiPipelineReporterFactoryError, CiPipelineReporterRouter,
