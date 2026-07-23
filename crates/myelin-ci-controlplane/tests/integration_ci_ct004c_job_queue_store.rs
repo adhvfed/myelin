@@ -37,10 +37,10 @@
 
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_region_queue_store_test_support, make_tenant_scoped_ddl,
-    CiJobQueueStore, DurableEnqueue, EnqueueOutcome, Lane, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
-    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
-    INSERT_JOB_QUEUE_QUERY,
+    CiJobLaunchClaim, CiJobQueueStore, DurableEnqueue, EnqueueOutcome, Lane,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL, INSERT_JOB_QUEUE_QUERY,
 };
 use myelin_ci_sandbox::TrustTier;
 use sqlx::types::Uuid;
@@ -562,6 +562,151 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         .get("state");
     assert_eq!(h2_state, "queued", "the latest head h2 stays schedulable");
 
+    // ── 6b. FINAL LAUNCH CAS vs CANCEL: exactly one row transition wins. ──
+    let race_old = job(
+        "tenantA",
+        region,
+        "launch-race-old",
+        Lane::Interactive,
+        &["launch-race"],
+        TrustTier::Trusted,
+        Some("pr:web:launch-race"),
+        "idem-launch-race-old",
+    );
+    store
+        .enqueue(&race_old)
+        .await
+        .expect("enqueue launch race old");
+    let race_lease = region_store
+        .claim(
+            region,
+            &["launch-race".into()],
+            &trusted_only,
+            "launch-race-runner",
+            60,
+        )
+        .await
+        .expect("claim launch race old")
+        .expect("launch race old is eligible");
+    store
+        .enqueue(&job(
+            "tenantA",
+            region,
+            "launch-race-new",
+            Lane::Interactive,
+            &["launch-race"],
+            TrustTier::Trusted,
+            Some("pr:web:launch-race"),
+            "idem-launch-race-new",
+        ))
+        .await
+        .expect("enqueue launch race new");
+    let exact = CiJobLaunchClaim {
+        tenant_id: race_lease.tenant_id.clone(),
+        region: region.into(),
+        wf_run_id: race_lease.run_id.to_string(),
+        job_id: race_lease.job_id.to_string(),
+        lease_owner: race_lease.lease_owner.clone(),
+        lease_epoch: race_lease.lease_epoch,
+        claim_nonce: race_lease.claim_nonce.clone(),
+        claim_started_at_epoch_secs: race_lease.claim_started_at_epoch_secs,
+        claim_expires_at_epoch_secs: race_lease.claim_expires_at_epoch_secs,
+    };
+    let launch_store = store.clone();
+    let cancel_store = store.clone();
+    let exact_for_launch = exact.clone();
+    let (launch, cancel) = tokio::join!(
+        async move { launch_store.authorize_launch(&exact_for_launch).await },
+        async move {
+            cancel_store
+                .cancel_superseded(
+                    "tenantA",
+                    region,
+                    "pr:web:launch-race",
+                    &uid("launch-race-new").to_string(),
+                )
+                .await
+        },
+    );
+    let launch_won = launch.expect("launch CAS completes");
+    let cancelled = cancel.expect("cancel completes");
+    let cancel_won = cancelled.contains(&uid("launch-race-old"));
+    assert_ne!(
+        launch_won, cancel_won,
+        "launch CAS and cancel serialize: exactly one transition wins"
+    );
+    let race_state: String = sqlx::query("SELECT state FROM job_queue WHERE job_id = $1")
+        .bind(uid("launch-race-old"))
+        .fetch_one(&admin)
+        .await
+        .unwrap()
+        .get("state");
+    assert_eq!(race_state, if launch_won { "running" } else { "terminal" });
+    assert!(
+        !store
+            .authorize_launch(&exact)
+            .await
+            .expect("replayed launch CAS"),
+        "the exact launch generation is one-shot"
+    );
+
+    // A runner that dies after the launch fence is still recoverable when its execution lease
+    // expires; `running` is not an orphan state.
+    let reap_job = job(
+        "tenantA",
+        region,
+        "launch-reap",
+        Lane::Interactive,
+        &["launch-reap"],
+        TrustTier::Trusted,
+        None,
+        "idem-launch-reap",
+    );
+    store.enqueue(&reap_job).await.expect("enqueue launch reap");
+    let reap_lease = region_store
+        .claim(
+            region,
+            &["launch-reap".into()],
+            &trusted_only,
+            "launch-reap-runner",
+            60,
+        )
+        .await
+        .expect("claim launch reap")
+        .expect("launch reap is eligible");
+    assert!(store
+        .authorize_launch(&CiJobLaunchClaim {
+            tenant_id: reap_lease.tenant_id.clone(),
+            region: region.into(),
+            wf_run_id: reap_lease.run_id.to_string(),
+            job_id: reap_lease.job_id.to_string(),
+            lease_owner: reap_lease.lease_owner.clone(),
+            lease_epoch: reap_lease.lease_epoch,
+            claim_nonce: reap_lease.claim_nonce.clone(),
+            claim_started_at_epoch_secs: reap_lease.claim_started_at_epoch_secs,
+            claim_expires_at_epoch_secs: reap_lease.claim_expires_at_epoch_secs,
+        })
+        .await
+        .expect("authorize launch reap"));
+    sqlx::query(
+        "UPDATE job_queue SET lease_expires = now() - interval '1 second' WHERE job_id = $1",
+    )
+    .bind(uid("launch-reap"))
+    .execute(&admin)
+    .await
+    .expect("expire running launch lease");
+    region_store
+        .reap(region)
+        .await
+        .expect("reap running launch");
+    let launch_reap_state: String = sqlx::query("SELECT state FROM job_queue WHERE job_id = $1")
+        .bind(uid("launch-reap"))
+        .fetch_one(&admin)
+        .await
+        .unwrap()
+        .get("state");
+    assert_eq!(launch_reap_state, "queued");
+
     // ── 7. KILL-9 / reopen: a leased row survives; an UNCOMMITTED enqueue leaves NO ghost. ──
     // jint is leased. Start an enqueue in a raw tx and DROP it without commit (the crash mid-write).
     {
@@ -668,8 +813,9 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         "[CT-004c.1] PASS job_queue store: claim honours residency+affinity+trust+lane; trusted-only \
          claim NEVER leases untrusted_fork/self_hosted (security seam); concurrent claims take \
          different rows (SKIP LOCKED); reaper re-queues dead leases (0 orphans, 0 dup enqueue) + a \
-         heart-beating lease is NOT reaped; cancel-superseded keeps the latest head; leased row \
-         survives kill-9/reopen with no ghost; tenant-scoped enqueue + isolation proven under the \
-         NOBYPASSRLS app role"
+         heart-beating lease is NOT reaped; cancel and the exact launch-generation CAS serialize \
+         with one winner, CAS replay refuses, and an expired running lease reaps; \
+         cancel-superseded keeps the latest head; leased row survives kill-9/reopen with no ghost; \
+         tenant-scoped enqueue + isolation proven under the NOBYPASSRLS app role"
     );
 }

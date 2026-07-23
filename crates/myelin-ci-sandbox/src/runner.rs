@@ -994,7 +994,7 @@ mod tests {
             }
             // Drive the four-guarantee seam exactly as a real backend must (X-6).
             (hooks.isolation_floor)(spec)?;
-            (hooks.attribute)(&spec.run_token)?;
+            (hooks.attribute)(spec)?;
             let res = (hooks.reserve)(&spec.meter_to)?;
             (hooks.settle)(&res, self.result.usage)?;
             self.launches.fetch_add(1, Ordering::SeqCst);

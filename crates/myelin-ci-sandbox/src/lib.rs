@@ -170,6 +170,10 @@ pub struct JobSpec {
     /// The per-job attenuated token (`Id::mint_run_token`, contract 4.7) — guarantee #2,
     /// attribution; life == run life, auto-revoked on teardown.
     pub run_token: RunTokenCredential,
+    /// Server-resolved facts the final attribution hook must bind the signed credential to. This
+    /// value is deliberately ephemeral: durable templates omit it, and the claim-time resolver
+    /// constructs it only after locking the exact scheduler generation.
+    pub run_token_authorization: Option<RunTokenAuthorizationContext>,
     /// The reserve this job settles against (run-level / agent-run-level) — guarantee #1, the cost
     /// gate (contract 11.7).
     pub meter_to: MeterTarget,
@@ -381,6 +385,34 @@ pub struct RunTokenCredential {
     ttl_secs: u64,
 }
 
+/// Expected, non-secret facts for final-boundary run-token authorization.
+///
+/// This context grants nothing by itself. A launch hook must cryptographically verify the opaque
+/// bearer and compare its signed claims with every field here immediately before sandbox launch.
+/// It deliberately implements neither `Serialize` nor `Deserialize`, so queued work cannot persist
+/// or customer-supply a claimed authorization result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunTokenAuthorizationContext {
+    /// One exact hosted CI job under one live scheduler claim generation.
+    CiJob(CiJobAuthorizationContext),
+}
+
+/// Durable-claim facts a signed CI job credential must match at the launch boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiJobAuthorizationContext {
+    pub tenant_id: String,
+    pub region: String,
+    pub principal_id: String,
+    pub wf_run_id: String,
+    pub job_id: String,
+    pub lease_owner: String,
+    pub lease_epoch: i64,
+    pub claim_nonce: String,
+    pub claim_started_at_epoch_secs: i64,
+    pub claim_expires_at_epoch_secs: i64,
+    pub required_capabilities: Vec<String>,
+}
+
 impl RunTokenCredential {
     const MAX_BEARER_BYTES: usize = 64 * 1024;
 
@@ -564,6 +596,7 @@ impl JobSpec {
             workspace,
             trust_tier,
             run_token,
+            run_token_authorization: None,
             meter_to,
             idem_token,
         })
@@ -625,6 +658,16 @@ impl JobSpecTemplate {
     /// Attach the freshly minted claim-generation token and produce the only type a sandbox can
     /// launch. The template itself has no launch method and contains no credential.
     pub fn resolve(self, run_token: RunTokenCredential) -> JobSpec {
+        self.resolve_with_authorization(run_token, None)
+    }
+
+    /// Attach a freshly minted credential plus its server-resolved final-boundary expectations.
+    /// The durable template remains bearer- and authorization-context-free.
+    pub fn resolve_with_authorization(
+        self,
+        run_token: RunTokenCredential,
+        run_token_authorization: Option<RunTokenAuthorizationContext>,
+    ) -> JobSpec {
         JobSpec {
             kind: self.kind,
             image: self.image,
@@ -636,6 +679,7 @@ impl JobSpecTemplate {
             workspace: self.workspace,
             trust_tier: self.trust_tier,
             run_token,
+            run_token_authorization,
             meter_to: self.meter_to,
             idem_token: self.idem_token,
         }
@@ -906,8 +950,8 @@ pub trait FleetProvider {
 ///    — reserve at dispatch, refuse-on-exhaustion, settle on completion, never interrupt
 ///    in-flight; CI runs and agent runs meter into the SAME wallet (contract 11.7).
 /// 2. **Attribution** ([`attribute`](RunnerHooks::attribute)) — the job runs under a per-run
-///    attenuated token (`mint_run_token`, contract 4.7); life == run life, auto-revoked on
-///    teardown, re-mintable on resume (S-11).
+///    attenuated token (`mint_run_token`, contract 4.7); after reserve, this is the final pre-spawn
+///    authorization boundary. A refusal settles the unused reserve at zero and starts no guest.
 /// 3. **HITL withhold (plan-then-apply)** — encoded structurally, not as a hook: side-effecting
 ///    mutation NEVER goes through this runner; it goes through `EffectApi::apply` (contract 8.2).
 ///    `exec` carries ONLY `compute`/`external` untrusted code. See [`hitl_withhold_note`].
@@ -924,8 +968,8 @@ pub struct RunnerHooks {
     /// Guarantee #1b: settle the reserve on completion (contract 11.7, `settle_budget`); the
     /// unused reserve is released, never interrupting in-flight.
     pub settle: SettleHook,
-    /// Guarantee #2: confirm/attach the per-run attenuated token (contract 4.7); the job runs
-    /// under it, life == run life.
+    /// Guarantee #2: reauthorize the per-run attenuated token and any durable launch generation
+    /// after reserve, immediately before spawn.
     pub attribute: AttributeHook,
     /// Guarantee #4: the isolation-floor hook the escape drill (CI-P5) drives — apply + verify the
     /// mandatory hardening profile (arch 02 §5.3) before any untrusted code runs.
@@ -937,8 +981,9 @@ pub type ReserveHook = Box<dyn Fn(&MeterTarget) -> Result<ReserveHandle, HookErr
 /// Guarantee #1b hook type (contract 11.7 settle_budget): settle on completion.
 pub type SettleHook =
     Box<dyn Fn(&ReserveHandle, ResourceUsage) -> Result<(), HookError> + Send + Sync>;
-/// Guarantee #2 hook type (contract 4.7 mint_run_token): per-run attenuated-token attribution.
-pub type AttributeHook = Box<dyn Fn(&RunTokenCredential) -> Result<(), HookError> + Send + Sync>;
+/// Guarantee #2 hook type (contract 4.7 mint_run_token): final-boundary attribution over the
+/// credential and the server-resolved expected launch facts carried by the complete spec.
+pub type AttributeHook = Box<dyn Fn(&JobSpec) -> Result<(), HookError> + Send + Sync>;
 /// Guarantee #4 hook type (arch 02 §5.3): apply + verify the mandatory hardening profile.
 pub type IsolationFloorHook = Box<dyn Fn(&JobSpec) -> Result<(), HookError> + Send + Sync>;
 
@@ -1358,11 +1403,20 @@ mod tests {
         ) -> Result<SandboxLaunch, Self::Error> {
             // Drive the four-guarantee seam exactly as a real backend must:
             (hooks.isolation_floor)(spec)?; // #4 isolation floor
-            (hooks.attribute)(&spec.run_token)?; // #2 attribution
             let res = (hooks.reserve)(&spec.meter_to)?; // #1a cost gate (reserve)
-                                                        // ... the guest would run here (a real backend launches the hardened VM) ...
-                                                        // CT-001: the seam now carries the command result; the metering settle (guarantee #1)
-                                                        // settles against `result.usage`.
+            if let Err(attribute_error) = (hooks.attribute)(spec) {
+                (hooks.settle)(
+                    &res,
+                    ResourceUsage {
+                        cpu_seconds: 0,
+                        mem_byte_seconds: 0,
+                    },
+                )?;
+                return Err(attribute_error);
+            }
+            // ... the guest would run here (a real backend launches the hardened VM) ...
+            // CT-001: the seam now carries the command result; the metering settle (guarantee #1)
+            // settles against `result.usage`.
             let result = SandboxResult::stub_ok(ResourceUsage {
                 cpu_seconds: 1,
                 mem_byte_seconds: 1,
@@ -1403,28 +1457,50 @@ mod tests {
     }
 
     #[test]
-    fn final_launch_hook_receives_the_ephemeral_bearer_and_ttl() {
+    fn final_launch_hook_receives_the_ephemeral_bearer_ttl_and_expected_facts() {
         let backend = NoopBackend;
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
         let seen_at_boundary = seen.clone();
         let hooks = RunnerHooks {
             reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
             settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(move |credential| {
+            attribute: Box::new(move |spec| {
+                let credential = &spec.run_token;
                 *seen_at_boundary.lock().unwrap() = Some((
                     credential.expose_bearer().to_owned(),
                     credential.jti.clone(),
                     credential.ttl_secs(),
+                    spec.run_token_authorization.clone(),
                 ));
                 Ok(())
             }),
             isolation_floor: Box::new(|_s| Ok(())),
         };
 
-        backend.launch(&ci_spec(), &hooks).unwrap();
+        let mut spec = ci_spec();
+        let expected = RunTokenAuthorizationContext::CiJob(CiJobAuthorizationContext {
+            tenant_id: "acme".into(),
+            region: "eu-west".into(),
+            principal_id: "svc:ci".into(),
+            wf_run_id: "11111111-1111-4111-8111-111111111111".into(),
+            job_id: "job-1".into(),
+            lease_owner: "runner-1".into(),
+            lease_epoch: 1,
+            claim_nonce: "44444444-4444-4444-8444-444444444444".into(),
+            claim_started_at_epoch_secs: 1_785_000_000,
+            claim_expires_at_epoch_secs: 1_785_000_030,
+            required_capabilities: vec!["job.launch".into()],
+        });
+        spec.run_token_authorization = Some(expected.clone());
+        backend.launch(&spec, &hooks).unwrap();
         assert_eq!(
             *seen.lock().unwrap(),
-            Some(("test-bearer:jti-1".into(), "jti-1".into(), 300))
+            Some((
+                "test-bearer:jti-1".into(),
+                "jti-1".into(),
+                300,
+                Some(expected)
+            ))
         );
     }
 

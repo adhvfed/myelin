@@ -2359,6 +2359,7 @@ version = "0.0.0"
 dependencies = [
  "aws-sdk-s3",
  "blake3",
+ "chrono",
  "myelin-agent",
  "myelin-ci-controlplane",
  "myelin-ci-sandbox",
@@ -2369,6 +2370,7 @@ dependencies = [
  "myelin-git",
  "myelin-harness",
  "myelin-identity",
+ "myelin-identity-service",
  "myelin-lints",
  "myelin-notif",
  "myelin-query",

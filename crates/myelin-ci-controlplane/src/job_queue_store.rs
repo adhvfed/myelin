@@ -67,8 +67,9 @@ use sqlx::types::Uuid;
 use sqlx::Row;
 
 use crate::scheduler::{
-    EnqueueOutcome, Lane, CANCEL_SUPERSEDED_QUERY, COMPLETE_JOB_QUERY, CONSUME_CLAIM_QUERY,
-    HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY, READ_COMPLETION_DISPOSITION_QUERY,
+    EnqueueOutcome, Lane, AUTHORIZE_JOB_LAUNCH_QUERY, CANCEL_SUPERSEDED_QUERY, COMPLETE_JOB_QUERY,
+    CONSUME_CLAIM_QUERY, HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY,
+    READ_COMPLETION_DISPOSITION_QUERY,
 };
 
 // =================================================================================================
@@ -193,6 +194,20 @@ pub struct LeasedJob {
     pub claim_started_at_epoch_secs: i64,
     /// Initial claim expiry in Unix epoch seconds. A token authority may issue only within this
     /// bounded claim generation; heartbeat may extend execution but never rewrites mint identity.
+    pub claim_expires_at_epoch_secs: i64,
+}
+
+/// Exact durable scheduler generation presented to the final pre-spawn launch fence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiJobLaunchClaim {
+    pub tenant_id: String,
+    pub region: String,
+    pub wf_run_id: String,
+    pub job_id: String,
+    pub lease_owner: String,
+    pub lease_epoch: i64,
+    pub claim_nonce: String,
+    pub claim_started_at_epoch_secs: i64,
     pub claim_expires_at_epoch_secs: i64,
 }
 
@@ -423,6 +438,45 @@ impl CiJobQueueStore {
         Ok(moved)
     }
 
+    /// Atomically authorize one exact, still-live claim generation for launch. This is a one-shot
+    /// `leased` → `running` CAS, not a read/check: cancellation, reaping, and launch serialize on the
+    /// row, so no cancellation can slip between a successful check and sandbox spawn.
+    pub async fn authorize_launch(
+        &self,
+        claim: &CiJobLaunchClaim,
+    ) -> Result<bool, JobQueueStoreError> {
+        let job_id = parse_id("job_id", &claim.job_id)?;
+        let wf_run_id = parse_id("run_id", &claim.wf_run_id)?;
+        let claim_nonce = parse_id("claim_nonce", &claim.claim_nonce)?;
+        let tenant_id = claim.tenant_id.clone();
+        let region = claim.region.clone();
+        let lease_owner = claim.lease_owner.clone();
+        let lease_epoch = claim.lease_epoch;
+        let claim_started_at = claim.claim_started_at_epoch_secs;
+        let claim_expires_at = claim.claim_expires_at_epoch_secs;
+        let authorized = with_tenant_tx(&self.pool, &claim.tenant_id, &claim.region, move |conn| {
+            Box::pin(async move {
+                let row = sqlx::query(AUTHORIZE_JOB_LAUNCH_QUERY)
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .bind(job_id)
+                    .bind(wf_run_id)
+                    .bind(&lease_owner)
+                    .bind(lease_epoch)
+                    .bind(claim_nonce)
+                    .bind(claim_started_at)
+                    .bind(claim_expires_at)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|error| PgError::Query(error.to_string()))?;
+                Ok(row.is_some())
+            })
+        })
+        .await
+        .map_err(JobQueueStoreError::from_pg)?;
+        Ok(authorized)
+    }
+
     /// Claim CAS for the durable completion reporter. This is intentionally caller-transaction-only:
     /// the claim transition and `PgFlowExecutor::signal_typed_on_conn` must share this exact connection
     /// and commit boundary, so no public helper can accidentally reintroduce a crash gap.
@@ -463,7 +517,7 @@ impl CiJobQueueStore {
     }
 
     /// **Heartbeat — a live runner extends its lease ([`HEARTBEAT_QUERY`]).** Tenant-scoped. Only the
-    /// lease OWNER (while `leased`) can extend, so a heart-beating runner is NOT reaped (only a DEAD
+    /// lease OWNER (while `leased` or `running`) can extend, so a heart-beating runner is NOT reaped (only a DEAD
     /// runner's expired lease is swept). Returns `true` iff the lease was extended.
     pub async fn heartbeat(
         &self,
@@ -505,7 +559,7 @@ impl CiJobQueueStore {
 /// no new `AppSpec` field): every `interval` it calls [`crate::CiRegionQueueStore::reap`] for the cell region,
 /// re-queuing expired leases so a dead runner's job becomes claimable again. This is the SAME
 /// lease-driven periodic shape as `WorkflowEngine::tick` (a lease sweep on a timer). The reaper is
-/// SAFE: it only moves `leased`→`queued` for expired rows; it launches nothing.
+/// SAFE: it only moves expired `leased`/`running` rows back to `queued`; it launches nothing.
 ///
 /// The loop is resilient by design (a reaper that dies on one transient DB blip is worse than one
 /// that retries): a reap error is logged LOUDLY (never a silent drop — the typed error is surfaced to
@@ -655,8 +709,8 @@ pub(crate) fn trust_from_token(token: &str) -> Result<TrustTier, JobQueueStoreEr
 mod tests {
     use super::*;
     use crate::scheduler::{
-        CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, COMPLETE_JOB_QUERY, CONSUME_CLAIM_QUERY,
-        HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
+        AUTHORIZE_JOB_LAUNCH_QUERY, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, COMPLETE_JOB_QUERY,
+        CONSUME_CLAIM_QUERY, HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
     };
 
     /// **The store's SQL constants are well-formed against the real DDL (bind arity + column names).**
@@ -704,6 +758,13 @@ mod tests {
         assert!(CONSUME_CLAIM_QUERY.contains("$7") && !CONSUME_CLAIM_QUERY.contains("$8"));
         assert!(CONSUME_CLAIM_QUERY.contains("claim_nonce = $5::uuid"));
         assert!(CONSUME_CLAIM_QUERY.contains("stage = $7"));
+        // Final launch is a one-shot exact-generation CAS, including original claim times.
+        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("$9"));
+        assert!(!AUTHORIZE_JOB_LAUNCH_QUERY.contains("$10"));
+        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("SET state = 'running'"));
+        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("state = 'leased'"));
+        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("claim_nonce = $7::uuid"));
+        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("claim_expires_at > statement_timestamp()"));
         // REAP: one bind ($1 region), an in-place UPDATE (no INSERT → 0 duplicate enqueues).
         assert!(REAP_QUERY.contains("$1") && !REAP_QUERY.contains("$2"));
         assert!(REAP_QUERY.trim_start().starts_with("UPDATE"));
@@ -713,11 +774,11 @@ mod tests {
         // COMPLETE: two binds, idempotent on state <> 'terminal'.
         assert!(COMPLETE_JOB_QUERY.contains("$2") && !COMPLETE_JOB_QUERY.contains("$3"));
         assert!(COMPLETE_JOB_QUERY.contains("state <> 'terminal'"));
-        // HEARTBEAT: four binds, owner-guarded, leased-only.
+        // HEARTBEAT: four binds, owner-guarded, leased/running only.
         assert!(HEARTBEAT_QUERY.contains("$4") && !HEARTBEAT_QUERY.contains("$5"));
         assert!(
             HEARTBEAT_QUERY.contains("lease_owner = $3")
-                && HEARTBEAT_QUERY.contains("state = 'leased'")
+                && HEARTBEAT_QUERY.contains("state IN ('leased', 'running')")
         );
     }
 

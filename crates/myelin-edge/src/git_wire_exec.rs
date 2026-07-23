@@ -352,11 +352,11 @@ impl GitWireExecutor {
         let hooks = RunnerHooks {
             reserve,
             settle,
-            attribute: Box::new(move |credential| {
+            attribute: Box::new(move |spec| {
                 verifier
-                    .verify(credential)
+                    .verify(&spec.run_token)
                     .map_err(myelin_ci_sandbox::HookError)?;
-                attribute(credential)
+                attribute(spec)
             }),
             isolation_floor,
         };

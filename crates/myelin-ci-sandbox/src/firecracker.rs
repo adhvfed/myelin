@@ -437,7 +437,7 @@ impl FirecrackerBackend {
     }
 
     /// Drive the four-guarantee seam in the mandated order — **isolation floor → hardening assert →
-    /// attribution → reserve → run → settle** — fail-closed at every step, then hand the captured
+    /// reserve → final attribution/claim CAS → run → settle** — fail-closed at every step, then hand the captured
     /// [`SandboxResult`] back behind the redrawn CT-001 seam. The `run` closure does the actual boot:
     /// it builds/writes whatever machine config it needs, spawns the VMM, runs `spec.command`,
     /// captures the real exit/streams/usage, and returns a [`GuestRun`]. The real trait `launch`
@@ -469,10 +469,20 @@ impl FirecrackerBackend {
         // The mandatory profile is now asserted in force — including R0.1's honesty check that a
         // network-device profile carries the enforced-egress record just recorded above.
         profile.assert_enforced().map_err(FcError::Hardening)?;
-        // #2 attribution — the per-run attenuated token (4.7).
-        (hooks.attribute)(&spec.run_token)?;
-        // #1a cost gate — reserve at dispatch; refuse-to-start on exhaustion (BEFORE any boot).
+        // #1a cost gate — reserve before the final claim CAS; refusal starts nothing.
         let reserve = (hooks.reserve)(&spec.meter_to)?;
+        // #2 attribution is the final mutable authorization boundary before spawn. If it refuses,
+        // release the unused reserve immediately; no untrusted code has run.
+        if let Err(attribute_error) = (hooks.attribute)(spec) {
+            (hooks.settle)(
+                &reserve,
+                ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0,
+                },
+            )?;
+            return Err(attribute_error.into());
+        }
 
         // Boot the microVM + run spec.command + capture the REAL result (the ONE legitimate VMM
         // spawn — the sandbox seam's mechanism; the `no-host-exec` named exclusion). `run` cleans up
@@ -1305,6 +1315,37 @@ mod tests {
         assert!(
             !spawned.load(Ordering::SeqCst),
             "the VMM must NOT spawn when the wallet is exhausted"
+        );
+    }
+
+    #[test]
+    fn launch_releases_the_unused_reserve_when_final_attribution_refuses() {
+        let backend = FirecrackerBackend::new();
+        let settled = Arc::new(Mutex::new(None));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks {
+            reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            settle: Box::new(move |_h, usage| {
+                *settled_at.lock().unwrap() = Some(usage);
+                Ok(())
+            }),
+            attribute: Box::new(|_t| Err(crate::HookError("claim canceled".into()))),
+            isolation_floor: Box::new(|_s| Ok(())),
+        };
+        let spawned = Arc::new(AtomicBool::new(false));
+        let spawned_at = spawned.clone();
+        let result = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _profile| {
+            spawned_at.store(true, Ordering::SeqCst);
+            Ok(fake_run(Arc::new(AtomicBool::new(false))))
+        });
+        assert!(matches!(result, Err(FcError::Hook(_))));
+        assert!(!spawned.load(Ordering::SeqCst));
+        assert_eq!(
+            *settled.lock().unwrap(),
+            Some(ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            })
         );
     }
 

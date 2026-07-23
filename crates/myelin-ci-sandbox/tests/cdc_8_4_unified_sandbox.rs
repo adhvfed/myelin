@@ -17,7 +17,7 @@
 //!
 //! - the **PROVIDER** is the CI runner seam — it accepts ANY well-formed `JobSpec` (either `kind`)
 //!   through `SandboxBackend::launch`, drives the four-guarantee `RunnerHooks` in the mandated
-//!   order (isolation floor → attribution → reserve → … → settle), and **only ever launches a
+//!   order (isolation floor → reserve → final attribution → … → settle), and **only ever launches a
 //!   digest-pinned, pids-capped, timeout-bounded spec** (the fail-closed non-negotiables) — there
 //!   is no host-exec bypass (`no-host-exec`, X-6/AG-2);
 //! - the **CONSUMER** is a dispatcher (the agent fabric's `ToolHands::exec`, AG-P8 → P-226; or the
@@ -59,7 +59,7 @@ fn pinned() -> ImageRef {
 /// **PROVIDER side of 8.4 (CI runner seam).** A backend that records the ORDER it drives the four
 /// guarantees so the consumer can assert the mandated sequence. It launches only specs that already
 /// passed the fail-closed `JobSpec::new` invariants (the type guarantees that), and drives:
-/// #4 isolation floor → #2 attribution → #1a reserve → (guest runs) → #1b settle. There is no
+/// #4 isolation floor → #1a reserve → #2 final attribution → (guest runs) → #1b settle. There is no
 /// host-execution path — all execution goes through this `launch` seam (X-6 / AG-2).
 struct RunnerSeam {
     /// Bitset of which guarantees fired, in call order encoded as a sequence.
@@ -75,9 +75,6 @@ impl SandboxBackend for RunnerSeam {
         // #4 isolation floor FIRST — the hardening profile must hold before any code runs.
         (hooks.isolation_floor)(spec)?;
         self.order.lock().unwrap().push("isolation_floor");
-        // #2 attribution — the per-run attenuated token (4.7).
-        (hooks.attribute)(&spec.run_token)?;
-        self.order.lock().unwrap().push("attribute");
         // #1a cost gate — reserve at dispatch; refuse-to-start on exhaustion (never starts).
         let reserve = if self.exhausted {
             (hooks.reserve)(&MeterTarget {
@@ -87,6 +84,9 @@ impl SandboxBackend for RunnerSeam {
             (hooks.reserve)(&spec.meter_to)
         }?;
         self.order.lock().unwrap().push("reserve");
+        // #2 final attribution — immediately before untrusted code would spawn.
+        (hooks.attribute)(spec)?;
+        self.order.lock().unwrap().push("attribute");
         // ... the hardened guest would run the (compute/external) command here; the seam carries
         // the result back (RESHAPE-001 / CT-001 stub) ...
         let result = SandboxResult::stub_ok(ResourceUsage {
@@ -179,7 +179,7 @@ fn provider_launches_consumer_ci_spec_driving_four_guarantees_in_order() {
     provider.kill(&launch.handle).unwrap();
     assert_eq!(
         *order.lock().unwrap(),
-        vec!["isolation_floor", "attribute", "reserve", "settle"],
+        vec!["isolation_floor", "reserve", "attribute", "settle"],
         "the four uniform guarantees must fire in the mandated order (X-6 §5.2)"
     );
 }
@@ -198,7 +198,7 @@ fn provider_launches_the_agent_exec_spec_on_the_same_seam() {
     // The agent exec inherits ALL four guarantees by construction — same seam, same order.
     assert_eq!(
         *order.lock().unwrap(),
-        vec!["isolation_floor", "attribute", "reserve", "settle"]
+        vec!["isolation_floor", "reserve", "attribute", "settle"]
     );
 }
 

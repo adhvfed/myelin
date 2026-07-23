@@ -60,6 +60,8 @@ pub mod ci_claim_token_issuer;
 /// DAG, per-context check attempts, workflow code identity, and server-granted launch templates;
 /// secret values and minted token JTIs are structurally absent.
 pub mod ci_drive_manifest;
+/// Real Identity PASETO/S7 adapter at claim-time mint and final pre-launch authorization.
+pub mod ci_identity_adapter;
 /// Server-owned mapping from the authored `linux-small-v1` request to fixed default-deny runtime
 /// terms plus explicit durable budget/token authority handles.
 pub mod ci_launch_authority;
@@ -76,6 +78,10 @@ pub use ci_drive_manifest::{
     CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiMergeWaiterV1,
     GrantedCiJobV1, CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN, CI_DRIVE_MANIFEST_SCHEMA_V1,
     MAX_CI_DRIVE_MANIFEST_BYTES,
+};
+pub use ci_identity_adapter::{
+    ci_job_authorization_context, IdentityCiJobCredentialMinter, IdentityCiJobLaunchAuthorizer,
+    CI_JOB_PRINCIPAL_ID, CI_JOB_REQUIRED_CAPABILITIES,
 };
 pub use ci_launch_authority::{
     CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority,
@@ -494,8 +500,8 @@ pub use surfacing_tools::{
 
 pub use scheduler::{
     lane_token, state_token, ClaimRequest, Claimed, EnqueueOutcome, JobState, Lane, QueuedJob,
-    SchedulerState, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, COMPLETE_JOB_QUERY, HEARTBEAT_QUERY,
-    INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
+    SchedulerState, AUTHORIZE_JOB_LAUNCH_QUERY, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY,
+    COMPLETE_JOB_QUERY, HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
 };
 
 // CT-004c.1 (CI backend reconcile-and-harden — durability plumbing): the REAL durable `job_queue`
@@ -507,8 +513,8 @@ pub use scheduler::{
 // predicate + the sandbox exec path).
 pub use job_queue_region::CiRegionQueueStore;
 pub use job_queue_store::{
-    CiJobQueueStore, DurableEnqueue, JobQueueReaper, JobQueueStoreError, LeasedJob,
-    LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY,
+    CiJobLaunchClaim, CiJobQueueStore, DurableEnqueue, JobQueueReaper, JobQueueStoreError,
+    LeasedJob, LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY,
 };
 
 // CT-004d.1: the durable `JobSpec` store + the dispatch→durable co-persist + the fail-closed

@@ -57,6 +57,7 @@ use myelin_storage::s3blob::S3BlobStore;
 use myelin_tenancy::{Region, TenantId};
 
 use crate::ci_claim_token_issuer::LockedManifestCiJobTokenIssuer;
+use crate::ci_identity_adapter::ci_job_authorization_context;
 use crate::ci_manifest_job_runner::{validate_run_token, CiJobTokenIssuer, CiJobTokenRequest};
 use crate::ci_pipeline_reporter_router::CiPipelineReporterRouter;
 use crate::job_spec_store::MAX_JOB_TIMEOUT_SECS;
@@ -594,9 +595,12 @@ fn durable_spec_resolver_with_issuer(
             claim_expires_at_epoch_secs: leased.claim_expires_at_epoch_secs,
         };
         request.validate().map_err(|e| e.to_string())?;
+        let authorization = ci_job_authorization_context(&request);
         let run_token = bridge(&rt, token_issuer.mint(request)).map_err(|e| e.to_string())?;
         validate_run_token(&run_token, &launch.token_authority_handle).map_err(|e| e.0)?;
-        Ok(launch.spec.resolve(run_token))
+        Ok(launch
+            .spec
+            .resolve_with_authorization(run_token, Some(authorization)))
     })
 }
 

@@ -856,10 +856,10 @@ mod tests {
         ) -> Result<SandboxLaunch, Self::Error> {
             (hooks.isolation_floor)(spec)?;
             self.order.lock().unwrap().push("isolation_floor");
-            (hooks.attribute)(&spec.run_token)?;
-            self.order.lock().unwrap().push("attribute");
             let res = (hooks.reserve)(&spec.meter_to)?;
             self.order.lock().unwrap().push("reserve");
+            (hooks.attribute)(spec)?;
+            self.order.lock().unwrap().push("attribute");
             // ... the hardened guest runs the compute here; the seam carries the result back ...
             let result = SandboxResult::stub_ok(ResourceUsage {
                 cpu_seconds: 1,
@@ -925,7 +925,7 @@ mod tests {
         // All four guarantees fired in the mandated order.
         assert_eq!(
             *order.lock().unwrap(),
-            vec!["isolation_floor", "attribute", "reserve", "settle"]
+            vec!["isolation_floor", "reserve", "attribute", "settle"]
         );
         // Guarantee #4: whole-guest kill on teardown (the guest is never reused).
         assert_eq!(kills.load(Ordering::SeqCst), 1);

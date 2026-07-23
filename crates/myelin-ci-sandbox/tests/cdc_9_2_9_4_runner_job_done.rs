@@ -87,7 +87,7 @@ impl SandboxBackend for NoopBackend {
     type Error = myelin_ci_sandbox::HookError;
     fn launch(&self, spec: &JobSpec, h: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
         (h.isolation_floor)(spec)?;
-        (h.attribute)(&spec.run_token)?;
+        (h.attribute)(spec)?;
         let r = (h.reserve)(&spec.meter_to)?;
         let result = SandboxResult::stub_ok(ResourceUsage {
             cpu_seconds: 1,
