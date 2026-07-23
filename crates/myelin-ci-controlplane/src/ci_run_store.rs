@@ -44,6 +44,7 @@
 //! chunks start the workflow with.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use myelin_ci_sandbox::ResourceUsage;
 use myelin_events::OutboxRow;
@@ -524,6 +525,9 @@ impl From<PgError> for CiRunStoreError {
 #[derive(Clone)]
 pub struct CiRunStore {
     pool: PgPool,
+    surface_cursor_key: Option<Arc<zeroize::Zeroizing<[u8; 32]>>>,
+    #[cfg(any(test, feature = "integration"))]
+    surface_detail_test_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 /// Production bridge from the synchronous workflow activity to [`CiRunStore::finalize_ci_run`].
@@ -653,12 +657,52 @@ impl CiRunStore {
     /// The production composition root constructs this from the MR-022 `SubstrateProvider` pool
     /// ([`crate::ci_run_store`]).
     pub fn with_pg(pool: PgPool) -> CiRunStore {
-        CiRunStore { pool }
+        CiRunStore {
+            pool,
+            surface_cursor_key: None,
+            #[cfg(any(test, feature = "integration"))]
+            surface_detail_test_barrier: None,
+        }
+    }
+
+    /// Bind the durable run store to the cell-secret-derived key that authenticates public CI
+    /// pagination cursors. Ordinary scheduler/control-plane stores do not need this authority;
+    /// production Edge must use this constructor before mounting the run-read surface.
+    pub fn with_pg_surface_cursor_key(
+        pool: PgPool,
+        key: zeroize::Zeroizing<[u8; 32]>,
+    ) -> CiRunStore {
+        CiRunStore {
+            pool,
+            surface_cursor_key: Some(Arc::new(key)),
+            #[cfg(any(test, feature = "integration"))]
+            surface_detail_test_barrier: None,
+        }
     }
 
     /// The pool this store is bound to.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub(crate) fn surface_cursor_key(&self) -> Option<&[u8; 32]> {
+        self.surface_cursor_key.as_deref().map(|key| &**key)
+    }
+
+    /// Integration-only synchronization point after detail identity selection. It lets the live
+    /// race proof commit a parent mutation between the production materializer's SQL statements.
+    #[cfg(any(test, feature = "integration"))]
+    pub fn with_surface_detail_test_barrier(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> CiRunStore {
+        self.surface_detail_test_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(any(test, feature = "integration"))]
+    pub(crate) fn surface_detail_test_barrier(&self) -> Option<Arc<tokio::sync::Barrier>> {
+        self.surface_detail_test_barrier.clone()
     }
 
     /// **Co-commit the `ci_run` ROW on the consumer's co-commit connection (the run-of-record ⇄ dedup

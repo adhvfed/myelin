@@ -32,6 +32,7 @@ serde.workspace = true
 # structure — VISION §4 / storage.md §11), `hex` renders the multihash digest into the
 # self-describing content-address + the per-tenant fs key path.
 blake3.workspace = true
+zeroize = "1"
 hex.workspace = true
 # SHA-256 verification for git-imported objects (P-ST-22 / 11.2 git pack tier). The BlobStore
 # admits a `sha256:` multihash tag (P-ST-03); the git pack tier supplies the read-side verify

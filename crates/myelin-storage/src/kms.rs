@@ -366,6 +366,15 @@ impl SealKey {
         Ok(SealKey(RawKey(bytes)))
     }
 
+    /// Derive a domain-separated service key without exporting the operator-held seal root.
+    ///
+    /// The context is part of BLAKE3's KDF domain and must be a globally unique, versioned
+    /// application string. The returned subkey may authenticate service-local opaque carriers; it
+    /// must never be used to reconstruct or replace the seal key.
+    pub fn derive_service_key(&self, context: &str) -> zeroize::Zeroizing<[u8; KEY_LEN]> {
+        zeroize::Zeroizing::new(blake3::derive_key(context, &self.0 .0))
+    }
+
     /// The AEAD cipher keyed by this seal key (the SAME vetted AES-256-GCM the rest of the engine
     /// uses — EI-01 §7, never a hand-rolled cipher).
     fn cipher(&self) -> Aes256Gcm {
@@ -806,7 +815,8 @@ impl KmsCore {
         region: &Region,
         class: KeyClass,
     ) -> Result<PiiKeyRef, KmsError> {
-        self.ensure_dek_tracked(tenant, region, class).map(|(k, _)| k)
+        self.ensure_dek_tracked(tenant, region, class)
+            .map(|(k, _)| k)
     }
 
     /// [`Self::ensure_dek`] + whether the DEK was FRESHLY minted. The durable backend keys its
@@ -1739,7 +1749,8 @@ mod tests {
             "the sealed root is ciphertext, never the plaintext root"
         );
         // Unseal under the CORRECT key recovers the exact root (so every KEK it wrapped still unwraps).
-        let recovered = CellRoot::unseal(&seal, &sealed).expect("unseal under the correct seal key");
+        let recovered =
+            CellRoot::unseal(&seal, &sealed).expect("unseal under the correct seal key");
         assert_eq!(
             recovered.root.0, root.root.0,
             "unseal recovers the exact 256-bit root"
@@ -1802,6 +1813,23 @@ mod tests {
         let seal = SealKey::from_bytes([5u8; KEY_LEN]);
         assert_eq!(format!("{seal:?}"), "SealKey(<redacted seal key>)");
         assert!(!format!("{seal:?}").contains('5'));
+    }
+
+    #[test]
+    fn seal_key_service_derivation_is_stable_and_domain_separated() {
+        let seal = SealKey::from_bytes([5u8; KEY_LEN]);
+        let cursor = seal.derive_service_key("myelin test cursor v1");
+        assert_eq!(
+            *cursor,
+            *seal.derive_service_key("myelin test cursor v1"),
+            "all instances sharing the cell seal root derive the same service key"
+        );
+        assert_ne!(
+            *cursor,
+            *seal.derive_service_key("myelin test other purpose v1"),
+            "one derived service key cannot be replayed into another domain"
+        );
+        assert_ne!(*cursor, [5u8; KEY_LEN], "the seal root is never exported");
     }
 
     #[test]

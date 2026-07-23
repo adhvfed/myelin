@@ -71,8 +71,11 @@
 pub mod authz;
 pub mod bootstrap;
 pub mod catalogue;
+pub mod ci_http;
 pub mod error;
 pub mod gateway;
+#[path = "git_durable/ci_surface.rs"]
+mod git_ci_surface;
 pub mod git_durable;
 pub mod git_edge;
 pub mod git_effect;
@@ -105,6 +108,7 @@ pub use catalogue::{
     page_envelope, Handler, HandlerCtx, Method, Page, API_VERSION, DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
 };
+pub use ci_http::register_ci;
 pub use error::{map_authz_error, EdgeError};
 pub use gateway::{
     sse_scope_for_resource, sse_scope_for_tenant, AuthProvider, AuthPublicConfig, Gateway,

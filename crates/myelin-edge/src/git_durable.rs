@@ -1870,7 +1870,7 @@ impl DurableGitBackend {
     /// requested reviewer) is applied by the handler over this leak-free set. Per-repository reads
     /// and the request-wide record/serialized-byte aggregate are independently capped; below those
     /// ceilings the returned bucket remains exact.
-    fn visible_pr_repo_slugs(
+    pub(crate) fn visible_pr_repo_slugs(
         &self,
         tenant: &str,
         region: &str,

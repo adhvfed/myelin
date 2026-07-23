@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — complete running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and the durable CI→Git check projection proven; live founder push→CI→surfaced check and GitHub-Actions cutover remain** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a now serves repository-authorized durable run list/detail reads. Still required: live-log API/SSE, web, CLI/MCP, the live founder push→CI→surfaced-check pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1458,10 +1458,45 @@ completed. Independent adversarial re-review of immutable attempt issuance, rese
 bounded admission-lane composition, canonical detail refs, and the cutover order reports
 **CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding**.
 
-**Honest remaining R4.2 acceptance:** start the three CI services and the production Edge against the
-founder cell, push a real Myelin commit, observe the exact head's required check settle green through
-the verifier and browser, then remove GitHub Actions only after that pass. This increment does not
-claim that founder act, does not start the four-week R4 exit clock, and does not spend GitHub Actions.
+**Honest remaining R4.2 floors:** complete CT-005's live-log API/SSE, web, and CLI/MCP surfaces; start
+the three CI services and production Edge against the founder cell; push a real Myelin commit; and
+observe the exact head's required check settle green through the verifier and browser. Only after the
+complete surface and founder pass may CT-007 remove GitHub Actions. No completed increment claims that
+founder act, starts the four-week R4 exit clock, or spends GitHub Actions.
+
+**CT-005a production read-API increment (2026-07-24; not the complete CT-005 surface).** Production
+Edge now mounts authenticated `GET /v1/ci/runs` and `GET /v1/ci/runs/{run}` routes over CI's durable
+`ci_run` / `ci_job` / `log_anchor` authority. The verified principal supplies tenant/region; run
+visibility is inherited from the parent Git repository's exact Pull decision rather than a second CI
+ACL. Lists intersect the bounded visible-repository set before querying and use an opaque,
+tenant/region/filter/visibility-bound `(created_at,run_id)` keyset cursor authenticated by a
+domain-separated, cell-seal-root-derived keyed MAC held in zeroizing memory; timestamps are
+semantically validated before PostgreSQL. Detail authorization resolves only the canonical parent
+repo, then materializes run/jobs/steps in one tenant-scoped repeatable-read snapshot bound to that
+exact authorized `repo_ref`, and returns the same 404 for absent and denied runs. Edge applies the
+complete CI schema before dropping migration authority and refuses runtime handoff unless the new
+forward-only `ci_run_surface_repo_created` index is valid and ready.
+
+The live PostgreSQL proof covers hidden-repository exclusion before pagination, an insert between
+pages, visibility/filter cursor staleness, DAG/job/step-anchor detail, a parent mutation committed
+between detail statements while the authorized repeatable-read snapshot stays stable, FORCE-RLS
+tenant isolation, and index readiness. The cursor unit gate separately rejects retained-tag mutation,
+recomputation under a non-cell key, and shape-valid impossible timestamps before database access. A
+second live proof invokes the production handlers and action policy, proves that parent visibility is
+conjoined before pagination, and proves denied and absent details have the identical 404 envelope.
+Separate gates pin Git Pull inheritance, strict query grammar, production route/action registration,
+split-credential migration ordering, and the shrink-only module budget. Mechanical payoff: offset
+cursors accepted = 0; hidden-parent runs entering a list page = 0; stale/tampered cursors accepted = 0;
+hidden details returned after parent movement = 0; runtime starts with the run-list index unready = 0.
+This increment does **not** serve log bytes or live tail, does not add the CI web route, does not wire
+CLI/MCP, does not claim the founder acceptance pass, and does not open CT-007.
+
+**Named CT-005 follow-on (LOW):** the generic bootstrap readiness probe currently binds a
+schema-local index name plus PostgreSQL ready/valid bits, not the exact owning table/key/predicate
+identity. Harden that reusable probe before declaring the complete CT-005 surface done; CT-005a does
+not silently promote this low operational-hardening caveat to a finished gate.
+
+L3 row footprint: **23 files, +2,257 / -48 lines** for the bounded production read surface and its proofs.
 
 ## R5–R6
 

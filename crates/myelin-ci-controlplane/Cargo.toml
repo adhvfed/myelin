@@ -97,6 +97,8 @@ myelin-agent = { path = "../myelin-agent" }
 serde_json = { workspace = true }
 serde = { workspace = true }
 blake3 = { workspace = true }
+base64 = "0.22"
+zeroize = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # ------------------------------------------------------------------------------------------

@@ -818,8 +818,8 @@ pub use gd4::{
 pub use git_shred::{GitCryptoShredReach, GitResidual, GitShredReceipt, GitShreddable};
 pub use gitpack::{
     git_object_address, GitObjectKind, GitPackError, GitPackTier, PackManifest, PlacementError,
-    RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup,
-    GIT_PACKFILE_MAX_STORED_BYTES, GIT_PACK_OBJECT_MAX_STORED_BYTES,
+    RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup, GIT_PACKFILE_MAX_STORED_BYTES,
+    GIT_PACK_OBJECT_MAX_STORED_BYTES,
 };
 pub use holder::{register_holder, BlobStoreHolder, OltpHolderRegistration, OltpStoreHolder};
 pub use holder_fanout::{
@@ -945,7 +945,8 @@ pub use restore_verify_durable::{
     RESTORE_ERASURE_LEDGER_MIGRATION,
 };
 pub use tenant_tx::{
-    connect_pool_with_reset, with_tenant_tx, with_tenant_tx_error, TxScope, TypedTxScope,
+    connect_pool_with_reset, with_tenant_repeatable_read_tx, with_tenant_tx, with_tenant_tx_error,
+    TxScope, TypedTxScope,
 };
 // `events_serve` STAYS behind `integration` (it consumes the real NATS broker `myelin_events::nats`,
 // gated by `myelin-events/integration`) — see the module declaration above.
