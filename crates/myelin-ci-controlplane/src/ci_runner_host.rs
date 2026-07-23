@@ -155,14 +155,30 @@ impl CiRunnerHost {
         self,
         config: CiRunnerHostConfig,
     ) -> Result<CiRunnerHostHandle, CiRunnerHostFailure> {
+        let (shutdown, _receiver) = watch::channel(false);
+        self.start_with_shutdown(config, shutdown)
+    }
+
+    /// Start every lane behind a lifecycle signal that was armed before host construction.
+    ///
+    /// Production passes the process-wide shutdown sender installed before bootstrap. A signal
+    /// received while migrations or composition are still running is therefore already visible to
+    /// every lane at its first instruction; no queued work can be admitted in the gap between
+    /// bootstrap and host supervision.
+    pub fn start_with_shutdown(
+        self,
+        config: CiRunnerHostConfig,
+        shutdown: watch::Sender<bool>,
+    ) -> Result<CiRunnerHostHandle, CiRunnerHostFailure> {
         let config = config.validate()?;
         let Self {
             starter,
             workflow,
             runner,
         } = self;
-        start_lanes(
+        start_lanes_with_shutdown(
             config,
+            shutdown,
             move |shutdown| async move {
                 starter
                     .run_until_shutdown(
@@ -251,6 +267,7 @@ pub async fn wait_for_ci_runner_host_drain_timeout(
     }
 }
 
+#[cfg(test)]
 fn start_lanes<S, SF, W, WF, R>(
     config: CiRunnerHostConfig,
     starter: S,
@@ -266,8 +283,28 @@ where
         + Send
         + 'static,
 {
+    let (shutdown, _receiver) = watch::channel(false);
+    start_lanes_with_shutdown(config, shutdown, starter, workflow, runner)
+}
+
+fn start_lanes_with_shutdown<S, SF, W, WF, R>(
+    config: CiRunnerHostConfig,
+    shutdown: watch::Sender<bool>,
+    starter: S,
+    workflow: W,
+    runner: R,
+) -> Result<CiRunnerHostHandle, CiRunnerHostFailure>
+where
+    S: FnOnce(watch::Receiver<bool>) -> SF + Send + 'static,
+    SF: Future<Output = Result<(), CiRunnerHostFailure>> + Send + 'static,
+    W: FnOnce(watch::Receiver<bool>) -> WF + Send + 'static,
+    WF: Future<Output = Result<(), CiRunnerHostFailure>> + Send + 'static,
+    R: FnOnce(watch::Receiver<bool>) -> std::io::Result<std::thread::JoinHandle<CiRunnerLoopExit>>
+        + Send
+        + 'static,
+{
     let config = config.validate()?;
-    let (shutdown, receiver) = watch::channel(false);
+    let receiver = shutdown.subscribe();
     let runner_thread =
         runner(receiver.clone()).map_err(|_| CiRunnerHostFailure::RunnerThreadSpawn)?;
     let starter_task = tokio::spawn(starter(receiver.clone()));
@@ -514,6 +551,45 @@ mod tests {
 
         handle.shutdown().await.unwrap();
         assert_eq!(exits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_latched_before_host_start_admits_no_lane_work() {
+        let intake = Arc::new(AtomicUsize::new(0));
+        let starter_intake = intake.clone();
+        let workflow_intake = intake.clone();
+        let runner_intake = intake.clone();
+        let (shutdown, _receiver) = watch::channel(true);
+        let handle = start_lanes_with_shutdown(
+            CiRunnerHostConfig::for_test(Duration::from_secs(1)),
+            shutdown,
+            move |shutdown| async move {
+                if !*shutdown.borrow() {
+                    starter_intake.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            },
+            move |shutdown| async move {
+                if !*shutdown.borrow() {
+                    workflow_intake.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            },
+            move |mut shutdown| {
+                std::thread::Builder::new()
+                    .name("ci-runner-host-test".into())
+                    .spawn(move || {
+                        if !*shutdown.borrow_and_update() {
+                            runner_intake.fetch_add(1, Ordering::SeqCst);
+                        }
+                        CiRunnerLoopExit::Shutdown
+                    })
+            },
+        )
+        .unwrap();
+
+        handle.shutdown().await.unwrap();
+        assert_eq!(intake.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

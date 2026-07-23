@@ -28,12 +28,11 @@
 //! `DurableOutboxBacking` verbs bridge to async sqlx via `block_in_place` + `block_on`, which
 //! panics on a current-thread runtime.
 //!
-//! **Floor:** the substrate AppSpec config still uses its validated default, while every production
-//! endpoint and both PostgreSQL roles are explicit through `Mode::RequireEnv`. The per-table
-//! behaviour (the scheduler claim, the check emitter, the log index, the metering) is the
-//! CI-P12..CI-P24 surface. This shell runs no job: requesting the incomplete production runner
-//! fails before database bootstrap until exact-tenant workflow-worker fan-out and the complete
-//! crash/recovery path are wired around the now-real durable token and reservation authorities.
+//! The substrate AppSpec config still uses its validated default, while every production endpoint
+//! and all three PostgreSQL roles are explicit through `Mode::RequireEnv`. The per-table behaviour
+//! (the scheduler claim, check emitter, log index, and metering) is the CI-P12..CI-P24 surface.
+//! Runner execution is an exact opt-in (`MYELIN_CI_RUNNER=1`) and preflights the real gVisor
+//! executor before opening intake; unset / `0` keeps every runner-host lane dormant.
 
 use myelin_ci_controlplane::run_controlplane_until_shutdown;
 use myelin_config::{Mode, MyelinConfig};
@@ -48,9 +47,9 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StartupRefusal {
-    IncompleteProductionRunner,
     InvalidRunnerSetting(String),
     NonUnicodeRunnerSetting(OsString),
+    RunnerHostPreflight(String),
     /// **The rolling-upgrade floor (CT-004d.2 claim-bound completion).** The runner lane refuses to
     /// activate while any non-terminal job's dispatched stage is NULL (a pre-rewire historical dispatch
     /// the reporter must refuse without consuming). A checked invariant, not an assumption — a
@@ -63,11 +62,6 @@ enum StartupRefusal {
 impl fmt::Display for StartupRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IncompleteProductionRunner => write!(
-                f,
-                "MYELIN_CI_RUNNER=1 requires the complete composed launch/recovery crash proof; \
-                 production runner activation is refused"
-            ),
             Self::InvalidRunnerSetting(value) => write!(
                 f,
                 "invalid MYELIN_CI_RUNNER value {value:?}; allowed values are `0`, `1`, or unset"
@@ -77,6 +71,9 @@ impl fmt::Display for StartupRefusal {
                 "invalid MYELIN_CI_RUNNER value {value:?} contains non-UTF-8 bytes; allowed values \
                  are `0`, `1`, or unset"
             ),
+            Self::RunnerHostPreflight(error) => {
+                write!(f, "runner-host executor preflight refused: {error}")
+            }
             Self::NonTerminalNullStageBacklog { count } => write!(
                 f,
                 "runner-lane activation refused: {count} non-terminal job(s) have a NULL dispatched \
@@ -95,7 +92,7 @@ fn verify_startup_activation(
     match runner_setting {
         Err(std::env::VarError::NotPresent) => Ok(()),
         Ok(value) if value == "0" => Ok(()),
-        Ok(value) if value == "1" => Err(StartupRefusal::IncompleteProductionRunner),
+        Ok(value) if value == "1" => Ok(()),
         Ok(value) => Err(StartupRefusal::InvalidRunnerSetting(value)),
         Err(std::env::VarError::NotUnicode(value)) => {
             Err(StartupRefusal::NonUnicodeRunnerSetting(value))
@@ -103,21 +100,60 @@ fn verify_startup_activation(
     }
 }
 
+fn preflight_runner_host() -> Result<(), StartupRefusal> {
+    let required_path = |name: &'static str| match std::env::var(name) {
+        Ok(value) if !value.is_empty() => Ok(std::path::PathBuf::from(value)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Err(StartupRefusal::RunnerHostPreflight(
+            format!("{name} is required when MYELIN_CI_RUNNER=1"),
+        )),
+        Err(std::env::VarError::NotUnicode(_)) => Err(StartupRefusal::RunnerHostPreflight(
+            format!("{name} must be valid Unicode"),
+        )),
+    };
+    let runsc = required_path(myelin_ci_sandbox::gvisor::ENV_RUNSC_BIN)?;
+    let rootfs = required_path(myelin_ci_sandbox::gvisor::ENV_GVISOR_ROOTFS)?;
+    myelin_ci_sandbox::gvisor::preflight_gvisor_runner_host(&runsc, &rootfs)
+        .map_err(StartupRefusal::RunnerHostPreflight)
+}
+
 #[tokio::main]
 async fn main() {
     myelin_events::install_payload_free_panic_hook("ci-controlplane");
-    // The former runner composition reached sandbox execution with accept-all billing/attribution
-    // hooks, placeholder tenancy, and an unresolved stage-spec builder. Keep the flag reserved,
-    // but refuse it before PostgreSQL bootstrap until all launch authorities are real and durable.
+    // Runner execution is explicit opt-in. Unset / `0` keeps the runner host dormant; `1` composes
+    // the proven production claim, Identity, reservation, fenced launch, recovery, and reporter root.
+    // Every other value is refused before PostgreSQL bootstrap.
     let runner_setting = std::env::var("MYELIN_CI_RUNNER");
-    // Whether this boot requested runner-host activation (`MYELIN_CI_RUNNER=1`). Read by borrow BEFORE
-    // the setting is moved into the refusal check, so the ci_run starter lane below composes behind the
-    // SAME activation seam. It is `true` for `1` today, but the refusal exits first — so the starter
-    // composition stays DORMANT until the later activation flip removes that refusal.
+    // Read by borrow before validation consumes the setting so the complete host stays behind the
+    // same single activation decision.
     let runner_host_requested = matches!(&runner_setting, Ok(value) if value == "1");
     if let Err(e) = verify_startup_activation(runner_setting) {
         eprintln!("ci-controlplane: startup refused: {e}");
         std::process::exit(1);
+    }
+    // Install OS signal handlers before database bootstrap or runner-host construction. A deploy
+    // signal that lands after intake starts must always enter the coordinated drain path.
+    let shutdown_signals = match ShutdownSignals::install() {
+        Ok(signals) => signals,
+        Err(error) => {
+            eprintln!("ci-controlplane: failed to install shutdown signal handlers: {error}");
+            std::process::exit(1);
+        }
+    };
+    // Consume signals immediately, not only after bootstrap. Every intake owner subscribes to this
+    // same latch, so a signal received during preflight or migrations is already true at the first
+    // starter/workflow/runner instruction.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let signal_shutdown = shutdown_tx.clone();
+    let signal_task = tokio::spawn(async move {
+        shutdown_signals.wait().await;
+        let _ = signal_shutdown.send(true);
+    });
+    eprintln!("ci-controlplane: shutdown handlers armed; startup termination is intake-gated");
+    if runner_host_requested {
+        if let Err(error) = preflight_runner_host() {
+            eprintln!("ci-controlplane: startup refused: {error}");
+            std::process::exit(1);
+        }
     }
 
     // Production is strict: validate every endpoint plus three distinct PostgreSQL credentials
@@ -254,15 +290,14 @@ async fn main() {
     // delays its first sweep one interval so that boot-migrate has completed. The reaper is SAFE — it
     // only re-queues expired leases (`leased`→`queued`); it launches NO untrusted code (binding the
     // runner + starting the pipeline body on the sandbox executor is CT-004c.2). The claim path is
-    // dormant at the shell (production runner activation is refused above).
+    // dormant unless the explicit runner-host activation below is requested.
     let region_queue_store = scheduler_provider.region_queue_store();
     let reaper = myelin_ci_controlplane::JobQueueReaper::new(
         region_queue_store.clone(),
         provider.config().region.clone(),
         std::time::Duration::from_secs(15),
     );
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let reaper_task = tokio::spawn(reaper.run_until_shutdown(shutdown_rx));
+    let reaper_task = tokio::spawn(reaper.run_until_shutdown(shutdown_tx.subscribe()));
     // CT-004 — compose the per-tenant `ci_run`-poll STARTER lane behind the SAME `MYELIN_CI_RUNNER`
     // activation seam the runner uses. `ci_run_starter_factory` builds the REAL, production-callable
     // `PgCiRunStarterFactory` from the runtime pool + cell region + blob CAS: it mints an exact-cell
@@ -270,21 +305,19 @@ async fn main() {
     // region-wide poller can never stamp one tenant's authority onto another's run. Constructing it wraps
     // the pool + blob client only — NO query runs at boot, and NO fixed service identity is ever bound.
     //
-    // DORMANT until the activation flip: `runner_host_requested` is `true` only for `MYELIN_CI_RUNNER=1`,
-    // which the refusal above already exited before this line — so this block does not run today. The
+    // Explicit opt-in only: `runner_host_requested` is true exactly for `MYELIN_CI_RUNNER=1`. The
     // starter factory below carries the real fixed linux-small-v1 policy plus the PostgreSQL Tier-P
     // operational reservation source. Its outstanding-reservation bound admits one largest valid
     // run when the tenant has no prior live reservations; the scheduler separately limits
-    // leased/running work. Initial checks and the manifest-native DAG body are implemented and
-    // live-PG proven but deliberately unwired.
+    // leased/running work. Initial checks and the manifest-native DAG body are wired through this
+    // same coordinated host.
     // The retained host below now owns coordinated start, failure propagation, and bounded shutdown
-    // for the starter, workflow recovery, and sandbox runner. The remaining activation floor is the
-    // complete launch/recovery crash matrix; the pre-bootstrap refusal above stays in force.
+    // for the starter, workflow recovery, and sandbox runner.
     let runner_host = if runner_host_requested {
         // ROLLING-UPGRADE FLOOR (CT-004d.2): refuse activation while any non-terminal NULL-stage
         // dispatch is still live — completion refuses such a job without consuming its claim, so the
         // lane must not start until the backlog is repaired. A CHECKED invariant (a healthy never-activated
-        // deploy has zero). Dormant with the refusal above; the activation flip runs it for real.
+        // deploy has zero).
         match region_queue_store
             .count_non_terminal_null_stage_jobs(&provider.config().region)
             .await
@@ -418,8 +451,10 @@ async fn main() {
             provider.config().s3.clone(),
         );
         match myelin_ci_controlplane::CiRunnerHost::new(starter_poller, workflow_poller, runner)
-            .start(myelin_ci_controlplane::CiRunnerHostConfig::production())
-        {
+            .start_with_shutdown(
+                myelin_ci_controlplane::CiRunnerHostConfig::production(),
+                shutdown_tx.clone(),
+            ) {
             Ok(host) => Some(host),
             Err(error) => {
                 eprintln!("ci-controlplane: runner-host lifecycle refused: {error}");
@@ -431,10 +466,6 @@ async fn main() {
     };
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
-    let signal_shutdown = shutdown_tx.clone();
-    let runner_host_shutdown = runner_host
-        .as_ref()
-        .map(myelin_ci_controlplane::CiRunnerHostHandle::shutdown_sender);
     let runner_host_failures = runner_host
         .as_ref()
         .map(myelin_ci_controlplane::CiRunnerHostHandle::failure_receiver);
@@ -450,24 +481,31 @@ async fn main() {
             }
         })
     });
+    let service_shutdown = shutdown_tx.clone();
     let service_result = run_controlplane_until_shutdown(Config::default(), outbox, async move {
+        let shutdown = async move {
+            if *shutdown_rx.borrow_and_update() {
+                return;
+            }
+            let _ = shutdown_rx.changed().await;
+        };
+        tokio::pin!(shutdown);
         if let Some(failures) = runner_host_failures {
             tokio::select! {
-                _ = shutdown_signal() => {}
+                _ = shutdown.as_mut() => {}
                 failure = myelin_ci_controlplane::wait_for_ci_runner_host_failure(failures) => {
                     eprintln!("ci-controlplane: runner host failed: {failure}");
                 }
             }
         } else {
-            shutdown_signal().await;
+            shutdown.as_mut().await;
         }
-        let _ = signal_shutdown.send(true);
-        if let Some(host_shutdown) = runner_host_shutdown {
-            let _ = host_shutdown.send(true);
-        }
+        let _ = service_shutdown.send(true);
     })
     .await;
     let _ = shutdown_tx.send(true);
+    signal_task.abort();
+    let _ = signal_task.await;
     let reaper_result = tokio::time::timeout(std::time::Duration::from_secs(10), reaper_task).await;
     let runner_host_result = match runner_host {
         Some(host) => host.shutdown().await,
@@ -499,23 +537,30 @@ async fn main() {
     }
 }
 
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .unwrap_or_else(|error| {
-                    eprintln!("ci-controlplane: failed to install SIGTERM handler: {error}");
-                    std::process::exit(1);
-                });
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn install() -> std::io::Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    async fn wait(mut self) {
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result {
-                    eprintln!("ci-controlplane: failed while waiting for SIGINT: {error}");
+            signal = self.interrupt.recv() => {
+                if signal.is_none() {
+                    eprintln!("ci-controlplane: SIGINT stream closed unexpectedly");
                     std::process::exit(1);
                 }
             }
-            signal = terminate.recv() => {
+            signal = self.terminate.recv() => {
                 if signal.is_none() {
                     eprintln!("ci-controlplane: SIGTERM stream closed unexpectedly");
                     std::process::exit(1);
@@ -523,8 +568,18 @@ async fn shutdown_signal() {
             }
         }
     }
-    #[cfg(not(unix))]
-    {
+}
+
+#[cfg(not(unix))]
+struct ShutdownSignals;
+
+#[cfg(not(unix))]
+impl ShutdownSignals {
+    fn install() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn wait(self) {
         if let Err(error) = tokio::signal::ctrl_c().await {
             eprintln!("ci-controlplane: failed while waiting for shutdown signal: {error}");
             std::process::exit(1);
@@ -538,11 +593,8 @@ mod tests {
     use std::env::VarError;
 
     #[test]
-    fn production_runner_flag_has_a_typed_fail_closed_verdict() {
-        assert_eq!(
-            verify_startup_activation(Ok("1".to_owned())),
-            Err(StartupRefusal::IncompleteProductionRunner)
-        );
+    fn production_runner_flag_is_explicit_opt_in_and_malformed_values_fail_closed() {
+        assert_eq!(verify_startup_activation(Ok("1".to_owned())), Ok(()));
         assert_eq!(verify_startup_activation(Err(VarError::NotPresent)), Ok(()));
         assert_eq!(verify_startup_activation(Ok("0".to_owned())), Ok(()));
         assert_eq!(
@@ -551,21 +603,18 @@ mod tests {
         );
     }
 
-    /// The `MYELIN_CI_RUNNER=1` request that gates the (dormant) ci_run starter-lane composition is the
-    /// SAME setting the refusal fires on: `runner_host_requested` is true ONLY for `1`, and for that
-    /// exact value `verify_startup_activation` still refuses — so the starter composition never runs
-    /// while the refusal stands (it activates only when the flip removes the refusal). Unset / `0` /
-    /// invalid never request runner-host activation.
+    /// The `MYELIN_CI_RUNNER=1` request gates the complete host on the same validated setting.
+    /// Unset / `0` leave it dormant, while invalid values neither request activation nor boot.
     #[test]
-    fn runner_host_request_is_the_refused_setting_so_the_starter_lane_stays_dormant() {
+    fn runner_host_request_activates_only_for_the_exact_valid_setting() {
         let requested = |setting: Result<String, VarError>| {
             let host_requested = matches!(&setting, Ok(value) if value == "1");
             (host_requested, verify_startup_activation(setting))
         };
         assert_eq!(
             requested(Ok("1".to_owned())),
-            (true, Err(StartupRefusal::IncompleteProductionRunner)),
-            "MYELIN_CI_RUNNER=1 both requests the runner host AND is refused — the lane is dormant"
+            (true, Ok(())),
+            "MYELIN_CI_RUNNER=1 explicitly requests the complete runner host"
         );
         assert_eq!(requested(Err(VarError::NotPresent)), (false, Ok(())));
         assert_eq!(requested(Ok("0".to_owned())), (false, Ok(())));

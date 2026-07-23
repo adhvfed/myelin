@@ -904,21 +904,19 @@ pub fn ci_run_store_factory(pool: sqlx::PgPool) -> CiRunStore {
 /// migrations create `workflow_run` / `wf_definition`, and production applies those before the CI
 /// recovery follow-ons.
 ///
-/// **DORMANT + activation-gated.** `main` composes this behind the SAME `MYELIN_CI_RUNNER` seam the
-/// runner lane uses: while the startup refusal keeps `MYELIN_CI_RUNNER=1` fail-closed, the factory is
-/// not reached and no minted starter is driven. When that refusal is eventually removed, constructing
-/// it wraps the pool + blob client only — no query runs — so construction alone cannot start a queued
-/// run. Production construction binds the real fixed,
+/// **Explicitly activation-gated.** `main` composes this behind the same `MYELIN_CI_RUNNER=1` seam as
+/// the runner lane. Unset / `0` leaves the factory unconstructed and no minted starter is driven.
+/// Constructing it wraps the pool + blob client only — no query runs — so construction alone cannot
+/// start a queued run. Production construction binds the real fixed,
 /// default-deny `linux-small-v1` policy and the PostgreSQL Tier-P operational reservation source.
 /// Its outstanding-reservation ceiling is deliberately distinct from the scheduler's measured
 /// leased/running cap: it admits one largest valid run for an otherwise-idle tenant while bounding
 /// queued durable authority. This is a Tier-P safety/metering seam, not a Commercial wallet or
 /// billing integration. The token-authority reference is already
-/// content-bound to the complete immutable request, but is not a bearer or mint. Even if accidentally
-/// driven, startup remains separately refused before this composition is reachable. The activation
-/// flip must attach [`PgCiRunStarterPoller`] to coordinated lifecycle shutdown with the deployed
-/// definition pin, compose the exact manifest-to-sandbox runner/token authority and terminal
-/// settlement path, and close the remaining crash/recovery floors.
+/// content-bound to the complete immutable request, but is not a bearer or mint.
+/// [`PgCiRunStarterPoller`] is attached to coordinated lifecycle shutdown with the deployed
+/// definition pin and the exact manifest-to-sandbox runner/token authority and terminal
+/// settlement path.
 pub fn ci_run_starter_factory(
     pool: sqlx::PgPool,
     region: myelin_tenancy::Region,

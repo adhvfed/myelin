@@ -546,11 +546,9 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// **The production spec-resolver seam (CT-004d floor).** Returns `Err` for every leased row — the
-/// durable spec store (specs keyed by `job_id`, written by the `SCHEDULE_AND_RUN_JOB` dispatch) is
-/// CT-004d. Until then a `main`-wired runner claims nothing it can launch (the row stays leased and is
-/// reaped) — so enabling the runner before CT-004d is a safe no-op, never an unresolved launch. The
-/// CT-004c.2 integration test injects a REAL resolver instead (proving the exec path on a real spec).
+/// Historical fail-closed resolver retained for callers that deliberately have no durable spec
+/// authority. It returns `Err` for every leased row, leaving the claim for the reaper rather than
+/// inventing a launch. Production uses [`durable_spec_resolver`].
 pub fn spec_store_unavailable_resolver() -> JobSpecResolver {
     Arc::new(|leased: &LeasedJob| {
         Err(format!(

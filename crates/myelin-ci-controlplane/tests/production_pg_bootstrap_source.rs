@@ -1,5 +1,20 @@
 //! Deployment guards for the CI Controlplane split-credential bootstrap sequence.
 
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+
+use sqlx::PgPool;
+
+fn executable_on_path(name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .find(|path| path.is_file())
+}
+
 #[test]
 fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let source = include_str!("../src/main.rs");
@@ -24,6 +39,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let runner_host_source = include_str!("../src/ci_runner_host.rs");
     let launch_gate_source = include_str!("../../myelin-ci-sandbox/src/launch_gate.rs");
     let gvisor_source = include_str!("../../myelin-ci-sandbox/src/gvisor.rs");
+    let dogfood_source = include_str!("../../../scripts/dogfood.sh");
 
     assert!(source.contains("MyelinConfig::from_env(Mode::RequireEnv)"));
     assert!(source.contains("CiSchedulerDbConfig::from_env(&platform_config)"));
@@ -93,7 +109,16 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         .expect("the coordinated runner host must own every dormant driver");
     let runner_gate = source
         .find("verify_startup_activation(runner_setting)")
-        .expect("production runner activation must be refused explicitly");
+        .expect("production runner activation must validate its explicit setting");
+    let signal_install = source
+        .find("let shutdown_signals = match ShutdownSignals::install()")
+        .expect("OS signal handlers must be installed before runner-host intake");
+    let signal_latch = source
+        .find("let signal_task = tokio::spawn(async move")
+        .expect("OS signals must be consumed into the intake latch during bootstrap");
+    let executor_preflight = source
+        .find("if let Err(error) = preflight_runner_host()")
+        .expect("runner activation must preflight its exact executor before database bootstrap");
     let bootstrap = source
         .find("PgBootstrap::connect(platform_config, DEFAULT_MAX_CONNECTIONS)")
         .expect("database bootstrap must remain wired");
@@ -129,8 +154,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(!source.contains("unresolved_stage_spec_builder"));
     assert!(!source.contains("TenantId(\"ci-controlplane\""));
     assert!(!source.contains("synthetic tenant"));
-    // The starter lane composes behind the SAME MYELIN_CI_RUNNER seam the runner uses, and stays DORMANT
-    // while the refusal stands: it is gated on the runner-host request, not spawned unconditionally.
+    // The starter lane composes behind the SAME explicit MYELIN_CI_RUNNER seam the runner uses and is
+    // never spawned unconditionally.
     assert!(source.contains("if runner_host_requested {"));
     assert!(source.contains("let runner_host_requested = matches!(&runner_setting"));
     let starter_factory_source = &library_source[starter_lane_source_start(library_source)..];
@@ -253,6 +278,23 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     }
     assert!(gvisor_source.contains("kill_cgroup_on_liveness_loss(kill_file)"));
     assert!(gvisor_source.contains("launch_permit.as_ref().map(|_| timeout)"));
+    assert!(source.contains("preflight_gvisor_runner_host(&runsc, &rootfs)"));
+    for executor_preflight in [
+        "probe_runsc_version(&runsc)",
+        "MYELIN_GVISOR_ROOTFS must contain executable",
+        "args: vec![\"/bin/false\".into()]",
+        "run_and_capture(",
+        "outcome.exit != Some(1)",
+    ] {
+        assert!(
+            gvisor_source.contains(executor_preflight),
+            "runner-host executor preflight must retain {executor_preflight}"
+        );
+    }
+    assert!(dogfood_source.contains("export MYELIN_GVISOR_ROOTFS="));
+    assert!(dogfood_source.contains("export MYELIN_CI_RUNNER=1"));
+    assert!(dogfood_source
+        .contains("exec cargo run --quiet -p myelin-ci-controlplane --bin ci-controlplane"));
     for production_supersession_dependency in [
         "pr_head_generation",
         "cancel_stale_queued_on_conn",
@@ -327,12 +369,18 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(!source.contains("std::env::var(\"MYELIN_CI_RUNNER\").ok()"));
     assert!(source.contains("ci_job_queue_store(provider.db_pool().clone())"));
     assert!(source.contains("scheduler_provider.region_queue_store()"));
-    assert!(source.contains("reaper.run_until_shutdown(shutdown_rx)"));
-    assert!(source.contains("shutdown_signal().await"));
+    assert!(source.contains("reaper.run_until_shutdown(shutdown_tx.subscribe())"));
+    assert!(source.contains(".start_with_shutdown("));
+    assert!(source.contains("shutdown_tx.clone()"));
+    assert!(source.contains("if *shutdown_rx.borrow_and_update()"));
+    assert!(source.contains("_ = shutdown.as_mut()"));
     assert!(!library_source.contains("pub fn ci_region_queue_store("));
     assert!(!region_store_source.contains("pub fn with_pg"));
 
-    assert!(runner_gate < bootstrap);
+    assert!(runner_gate < signal_install);
+    assert!(signal_install < signal_latch);
+    assert!(signal_latch < executor_preflight);
+    assert!(executor_preflight < bootstrap);
     assert!(foundation < durable);
     assert!(durable < flow);
     assert!(flow < controlplane);
@@ -388,7 +436,7 @@ fn missing_migration_credential_exits_before_reaper_runner_or_service_boot() {
 }
 
 #[test]
-fn runner_activation_is_refused_before_any_database_attempt() {
+fn runner_activation_refuses_a_missing_executor_before_platform_or_database_access() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_ci-controlplane"))
         .env_clear()
         .env("MYELIN_CI_RUNNER", "1")
@@ -397,11 +445,11 @@ fn runner_activation_is_refused_before_any_database_attempt() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
-    assert!(stderr.contains("complete composed launch/recovery crash proof"));
-    assert!(stderr.contains("production runner activation is refused"));
+    assert!(stderr.contains("runner-host executor preflight refused"));
+    assert!(stderr.contains("MYELIN_RUNSC_BIN is required"));
+    assert!(!stderr.contains("platform configuration refused to start"));
     assert!(!stderr.contains("database bootstrap refused to start"));
     assert!(!stderr.contains("DATABASE_URL"));
-    assert!(!stderr.contains("DATABASE_MIGRATION_URL"));
 }
 
 #[test]
@@ -419,4 +467,200 @@ fn invalid_runner_setting_is_refused_before_any_database_attempt() {
     assert!(!stderr.contains("database bootstrap refused to start"));
     assert!(!stderr.contains("DATABASE_URL"));
     assert!(!stderr.contains("DATABASE_MIGRATION_URL"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn boot_time_sigterm_is_latched_before_the_real_runner_host_can_claim() {
+    let required = std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1");
+    let Some(runsc) = std::env::var_os(myelin_ci_sandbox::gvisor::ENV_RUNSC_BIN)
+        .map(std::path::PathBuf::from)
+        .or_else(|| executable_on_path("runsc"))
+    else {
+        if required {
+            panic!("MYELIN_REQUIRE_RUNSC=1 but runsc is unavailable");
+        }
+        eprintln!("SKIP live CI runner activation proof: runsc is unavailable");
+        return;
+    };
+    let runsc = runsc
+        .canonicalize()
+        .expect("resolve the live runsc executable");
+    let rootfs = myelin_ci_sandbox::resolved_gvisor_rootfs();
+    if !rootfs.join("bin/sh").is_file() {
+        if required {
+            panic!(
+                "MYELIN_REQUIRE_RUNSC=1 but the gVisor rootfs is unavailable at {}",
+                rootfs.display()
+            );
+        }
+        eprintln!(
+            "SKIP live CI runner activation proof: gVisor rootfs is unavailable at {}",
+            rootfs.display()
+        );
+        return;
+    }
+    let admin_url = "postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin";
+    let admin = match PgPool::connect(admin_url).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            eprintln!("SKIP live CI runner activation proof: {error}");
+            return;
+        }
+    };
+    let suffix = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let mut job_queue_exists = false;
+    for table in ["ci_run", "job_queue"] {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("public.{table}"))
+            .fetch_one(&admin)
+            .await
+            .expect("inspect public CI activation table");
+        if table == "job_queue" {
+            job_queue_exists = exists;
+        }
+        if exists {
+            let active: i64 =
+                sqlx::query_scalar(&format!("SELECT count(*) FROM public.{table} WHERE state IN ('queued', 'leased', 'running')"))
+                    .fetch_one(&admin)
+                    .await
+                    .expect("count active public CI rows");
+            assert_eq!(
+                active, 0,
+                "the production-root smoke test refuses to execute pre-existing active work"
+            );
+        }
+    }
+    if !job_queue_exists {
+        if required {
+            panic!("MYELIN_REQUIRE_RUNSC=1 but the production job_queue schema is unavailable");
+        }
+        eprintln!(
+            "SKIP live CI runner activation proof: production job_queue schema is unavailable"
+        );
+        return;
+    }
+    let tenant_id = format!("ci-runner-shutdown-{suffix}");
+    let seeded_job_id: String = sqlx::query_scalar(
+        "INSERT INTO public.job_queue \
+           (tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group, \
+            fair_key, idem_token, stage, state) \
+         VALUES ($1, 'fr-par', gen_random_uuid(), gen_random_uuid(), 'interactive', \
+                 ARRAY[]::text[], 'trusted', NULL, $1, $2, 'shutdown-proof', 'queued') \
+         RETURNING job_id::text",
+    )
+    .bind(&tenant_id)
+    .bind(format!("shutdown-proof-{suffix}"))
+    .fetch_one(&admin)
+    .await
+    .expect("seed one uniquely-owned queued job behind the startup signal gate");
+    let cell_id = format!("ci-runner-activation-{suffix}");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ci-controlplane"))
+        .env_clear()
+        .env(
+            "DATABASE_URL",
+            "postgres://myelin_app:myelin_app_pw@localhost:5433/myelin",
+        )
+        .env("DATABASE_MIGRATION_URL", admin_url)
+        .env(
+            "MYELIN_CI_SCHEDULER_DATABASE_URL",
+            "postgres://myelin_ci_scheduler_fr_par:myelin_ci_scheduler_dev_pw@localhost:5433/myelin",
+        )
+        .env("S3_ENDPOINT", "http://localhost:9000")
+        .env("S3_REGION", "fr-par")
+        .env("S3_ACCESS_KEY", "myelin_dev_access")
+        .env("S3_SECRET_KEY", "myelin_dev_secret")
+        .env("S3_BUCKET", "myelin-dev")
+        .env("REDIS_URL", "redis://localhost:6380")
+        .env("NATS_URL", "nats://localhost:4222")
+        .env("MYELIN_REGION", "fr-par")
+        .env("MYELIN_CELL_ID", &cell_id)
+        .env("MYELIN_KMS_SEAL_KEY", "55".repeat(32))
+        .env(
+            "XDG_RUNTIME_DIR",
+            std::env::var("XDG_RUNTIME_DIR")
+                .expect("live rootless runsc proof requires XDG_RUNTIME_DIR"),
+        )
+        .env(myelin_ci_sandbox::gvisor::ENV_RUNSC_BIN, &runsc)
+        .env(myelin_ci_sandbox::gvisor::ENV_GVISOR_ROOTFS, &rootfs)
+        .env("MYELIN_CI_RUNNER", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch the production CI Controlplane binary");
+    let stderr = child.stderr.take().expect("capture child stderr");
+    let captured = Arc::new(Mutex::new(String::new()));
+    let captured_reader = captured.clone();
+    let (armed_tx, armed_rx) = mpsc::sync_channel(1);
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let line = line.expect("read CI Controlplane stderr");
+            captured_reader.lock().unwrap().push_str(&line);
+            captured_reader.lock().unwrap().push('\n');
+            if line.contains("shutdown handlers armed; startup termination is intake-gated") {
+                let _ = armed_tx.try_send(());
+            }
+            if line.contains("started (region `fr-par`") {
+                let _ = started_tx.try_send(());
+            }
+        }
+    });
+
+    let armed = armed_rx.recv_timeout(Duration::from_secs(10));
+    let kill = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .expect("signal the CI Controlplane process");
+    let status = child.wait().expect("wait for the bounded production drain");
+    reader.join().expect("join child stderr reader");
+    let stderr = captured.lock().unwrap().clone();
+
+    let untouched_state: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT state, lease_owner FROM public.job_queue \
+         WHERE tenant_id = $1 AND job_id = $2::uuid",
+    )
+    .bind(&tenant_id)
+    .bind(&seeded_job_id)
+    .fetch_optional(&admin)
+    .await
+    .expect("inspect the shutdown-gated queued job");
+    let job_cleanup =
+        sqlx::query("DELETE FROM public.job_queue WHERE tenant_id = $1 AND job_id = $2::uuid")
+            .bind(&tenant_id)
+            .bind(&seeded_job_id)
+            .execute(&admin)
+            .await;
+    let cleanup = sqlx::query("DELETE FROM public.cell_token_root WHERE cell_id = $1")
+        .bind(&cell_id)
+        .execute(&admin)
+        .await;
+    admin.close().await;
+    cleanup.expect("remove only the activation proof's disposable cell root");
+    job_cleanup.expect("remove only the activation proof's disposable queued job");
+
+    armed.unwrap_or_else(|error| {
+        panic!("shutdown handlers were not armed before timeout: {error}; stderr={stderr}")
+    });
+    assert!(kill.success(), "SIGTERM must reach the live process");
+    assert!(
+        status.success(),
+        "boot-time SIGTERM must cleanly drain the production root: status={status}; stderr={stderr}"
+    );
+    assert!(
+        started_rx.try_recv().is_err(),
+        "runner intake must never announce after bootstrap was termination-gated; stderr={stderr}"
+    );
+    assert_eq!(
+        untouched_state,
+        Some(("queued".to_owned(), None)),
+        "work queued before boot-time SIGTERM must remain unclaimed"
+    );
 }

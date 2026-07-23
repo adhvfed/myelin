@@ -81,6 +81,118 @@ pub fn probe_runsc_version(path: &Path) -> Result<(), RunscProbeError> {
     Ok(())
 }
 
+/// Boot preflight for a production gVisor runner host. This is deliberately stronger than waiting
+/// for the first claimed job: activation must refuse before intake unless the exact runtime,
+/// immutable base rootfs, and delegated memory-cgroup boundary are all usable.
+pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), String> {
+    if !runsc.is_absolute() {
+        return Err("MYELIN_RUNSC_BIN must be an absolute path".into());
+    }
+    let runsc = runsc
+        .canonicalize()
+        .map_err(|error| format!("MYELIN_RUNSC_BIN must name an existing executable: {error}"))?;
+    if !is_executable_file(&runsc) {
+        return Err("MYELIN_RUNSC_BIN must name an executable file".into());
+    }
+    probe_runsc_version(&runsc).map_err(|error| match error {
+        RunscProbeError::CouldNotExecute => {
+            "MYELIN_RUNSC_BIN could not execute its version probe".to_string()
+        }
+        RunscProbeError::NotRunsc => {
+            "MYELIN_RUNSC_BIN did not identify itself as runsc".to_string()
+        }
+    })?;
+
+    if !rootfs.is_absolute() {
+        return Err("MYELIN_GVISOR_ROOTFS must be an absolute path".into());
+    }
+    let rootfs = rootfs.canonicalize().map_err(|error| {
+        format!("MYELIN_GVISOR_ROOTFS must name an existing directory: {error}")
+    })?;
+    if rootfs.parent().is_none() || !rootfs.is_dir() {
+        return Err("MYELIN_GVISOR_ROOTFS must resolve to a non-root directory".into());
+    }
+    for relative in ["bin/sh", "bin/false"] {
+        let executable = rootfs.join(relative);
+        if !is_executable_file(&executable) {
+            return Err(format!(
+                "MYELIN_GVISOR_ROOTFS must contain executable {}",
+                executable.display()
+            ));
+        }
+    }
+
+    let config = OciConfig {
+        args: vec!["/bin/false".into()],
+        root_readonly: true,
+        drop_all_caps: true,
+        no_new_privileges: true,
+        seccomp: true,
+        has_network: false,
+        pids_max: 128,
+        mem_bytes: 256 * 1024 * 1024,
+        disk_bytes: 1024 * 1024 * 1024,
+        extra_mounts: Vec::new(),
+        extra_env: Vec::new(),
+        root_path: None,
+    };
+    let bundle = stage_production_bundle(&config, &rootfs)
+        .map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
+    let container_id = format!(
+        "myelin-preflight-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    );
+    let Some(runsc) = runsc.to_str() else {
+        let _ = std::fs::remove_dir_all(&bundle);
+        return Err("MYELIN_RUNSC_BIN must resolve to a Unicode path".into());
+    };
+    let outcome = run_and_capture(
+        runsc,
+        &bundle,
+        &container_id,
+        Duration::from_secs(5),
+        config.mem_bytes,
+        RunCaptureOptions {
+            stdin: None,
+            stdout_mode: StdoutMode::CappedHead,
+            cancellation: &NEVER_CANCELLED,
+        },
+        None,
+    );
+    delete_container(runsc, &container_id);
+    let _ = std::fs::remove_dir_all(&bundle);
+    let outcome =
+        outcome.map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
+    if outcome.timed_out || outcome.exit != Some(1) {
+        let stderr = String::from_utf8_lossy(&outcome.stderr);
+        let stderr: String = stderr.chars().take(512).collect();
+        return Err(format!(
+            "CI runner sandbox host preflight `/bin/false` returned {:?}: {stderr}",
+            outcome.exit,
+        ));
+    }
+    Ok(())
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// The unprivileged uid/gid the untrusted `spec.command` runs as INSIDE the gVisor sandbox. Untrusted
 /// code must NEVER be uid 0 even within the userspace-kernel boundary (defense in depth + hygiene);
 /// 65534 = nobody/nogroup (numeric ⇒ no `/etc/passwd` lookup). Unlike Firecracker, gVisor's exit
@@ -1983,6 +2095,13 @@ mod tests {
 
     use super::*;
     use crate::{CompletionSettlementOwner, ReserveHandle, RunTokenCredential};
+
+    #[test]
+    fn runner_host_preflight_refuses_a_non_absolute_runtime_before_intake() {
+        let error = preflight_gvisor_runner_host(Path::new("runsc"), Path::new("/unused-rootfs"))
+            .expect_err("a PATH-relative runtime is not stable production authority");
+        assert!(error.contains("MYELIN_RUNSC_BIN must be an absolute path"));
+    }
 
     fn spec(allow: Vec<String>) -> JobSpec {
         JobSpec::new(
