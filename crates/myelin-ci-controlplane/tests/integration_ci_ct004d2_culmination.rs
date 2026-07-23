@@ -34,19 +34,20 @@ use std::sync::{Arc, Mutex};
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support,
     ci_run_store_factory, durable_spec_resolver_test_support, fixed_command_spec_builder,
-    CheckFacts, CiJobTokenIssueError, CiJobTokenIssuer, CiJobTokenRequest, CiPipelineDriver,
-    CiPipelineReporter, CiRunInsert, DurableJobRunner, DurableLeaseAdapter, JobScheduleTerms, Lane,
-    PipelineRun, PipelineStage, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
-    ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
-    ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
+    CheckFacts, CiJobLaunchClaim, CiJobQueueStore, CiJobTokenIssueError, CiJobTokenIssuer,
+    CiJobTokenRequest, CiPipelineDriver, CiPipelineReporter, CiRunInsert, DurableJobRunner,
+    DurableLeaseAdapter, JobScheduleTerms, Lane, PipelineRun, PipelineStage,
+    ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
+    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
     ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL,
     CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
 };
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    resolved_gvisor_rootfs, CompletionClaim, FirehoseSink, ReserveHandle, ResourceUsage,
-    RunTokenCredential, RunnerAgent, RunnerHooks, TerminalReport, TerminalReporter, TrustTier,
+    resolved_gvisor_rootfs, CompletionClaim, FirehoseSink, HookError, LaunchOwnership,
+    LaunchPermit, ReserveHandle, ResourceUsage, RunTokenAuthorizationContext, RunTokenCredential,
+    RunnerAgent, RunnerHooks, TerminalReport, TerminalReporter, TrustTier,
 };
 use myelin_events::{Actor, IdMinter, MonotonicMinter, OutboxStore};
 use myelin_flow::{
@@ -255,12 +256,52 @@ impl CapturingFirehose {
     }
 }
 
-fn ok_hooks() -> RunnerHooks {
-    RunnerHooks::new(
+fn bridge<F: Future>(rt: &tokio::runtime::Handle, future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(|| rt.block_on(future)),
+        Err(_) => rt.block_on(future),
+    }
+}
+
+/// Historical culmination support still uses a test credential issuer, but completion must cross
+/// the same durable `leased` -> `running` CAS as production. The permit defers that CAS until the
+/// real gVisor backend has armed its child launch gate.
+fn durable_launch_hooks(queue_store: CiJobQueueStore, rt: tokio::runtime::Handle) -> RunnerHooks {
+    RunnerHooks::new_with_launch_fence(
         myelin_ci_sandbox::CompletionSettlementOwner::Hook,
         Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
         Box::new(|_spec, _h, _u| Ok(())),
-        Box::new(|_t| Ok(())),
+        Box::new(move |spec| {
+            let RunTokenAuthorizationContext::CiJob(context) = spec
+                .run_token_authorization
+                .clone()
+                .ok_or_else(|| HookError("test launch is missing durable claim facts".into()))?;
+            let claim = CiJobLaunchClaim {
+                tenant_id: context.tenant_id,
+                region: context.region,
+                wf_run_id: context.wf_run_id,
+                job_id: context.job_id,
+                lease_owner: context.lease_owner,
+                lease_epoch: context.lease_epoch,
+                claim_nonce: context.claim_nonce,
+                claim_started_at_epoch_secs: context.claim_started_at_epoch_secs,
+                claim_expires_at_epoch_secs: context.claim_expires_at_epoch_secs,
+            };
+            let queue_store = queue_store.clone();
+            let rt = rt.clone();
+            Ok(LaunchPermit::retained(move || {
+                let authorized =
+                    bridge(&rt, queue_store.authorize_launch(&claim)).map_err(|error| {
+                        HookError(format!("authorize durable test launch: {error}"))
+                    })?;
+                if !authorized {
+                    return Err(HookError(
+                        "durable test launch claim was no longer live".into(),
+                    ));
+                }
+                Ok(LaunchOwnership::immediate())
+            }))
+        }),
         Box::new(|_s| Ok(())),
     )
 }
@@ -579,7 +620,10 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         &backend,
         &firehose,
         &reporter,
-        ok_hooks(),
+        durable_launch_hooks(
+            ci_job_queue_store(admin.clone()),
+            tokio::runtime::Handle::current(),
+        ),
     );
     let outcome = agent
         .run_one(now_secs())
@@ -774,20 +818,78 @@ async fn arm_and_dispatch(
     (run, job_id.to_string(), idem)
 }
 
-/// Simulate a runner claim on the dispatched job: move it `leased` with the given generation.
-async fn claim_job(admin: &PgPool, wf_run: &str, owner: &str, epoch: i64) -> String {
+#[derive(Debug)]
+struct TestClaimFacts {
+    owner: String,
+    epoch: i64,
+    nonce: String,
+    started_at_epoch_secs: i64,
+    expires_at_epoch_secs: i64,
+}
+
+impl TestClaimFacts {
+    fn launch_claim(
+        &self,
+        tenant: &str,
+        region: &str,
+        wf_run: &str,
+        job_id: &str,
+    ) -> CiJobLaunchClaim {
+        CiJobLaunchClaim {
+            tenant_id: tenant.into(),
+            region: region.into(),
+            wf_run_id: wf_run.into(),
+            job_id: job_id.into(),
+            lease_owner: self.owner.clone(),
+            lease_epoch: self.epoch,
+            claim_nonce: self.nonce.clone(),
+            claim_started_at_epoch_secs: self.started_at_epoch_secs,
+            claim_expires_at_epoch_secs: self.expires_at_epoch_secs,
+        }
+    }
+}
+
+/// Simulate a runner claim on the dispatched job with complete durable generation facts.
+async fn claim_job(admin: &PgPool, wf_run: &str, owner: &str, epoch: i64) -> TestClaimFacts {
     let nonce = uid(&format!("{wf_run}:{owner}:{epoch}:claim"));
-    sqlx::query(
-        "UPDATE job_queue SET state='leased', lease_owner=$2, lease_epoch=$3, claim_nonce=$4 WHERE run_id=$1",
+    let (nonce, started_at_epoch_secs, expires_at_epoch_secs): (String, i64, i64) = sqlx::query_as(
+        "UPDATE job_queue
+         SET state = 'leased',
+             lease_owner = $2,
+             lease_epoch = $3,
+             claim_nonce = $4,
+             claim_started_at = date_trunc('second', statement_timestamp()),
+             claim_expires_at = date_trunc('second', statement_timestamp()) + interval '5 minutes',
+             lease_expires = date_trunc('second', statement_timestamp()) + interval '5 minutes'
+         WHERE run_id = $1
+         RETURNING claim_nonce::text,
+                   EXTRACT(EPOCH FROM claim_started_at)::bigint,
+                   EXTRACT(EPOCH FROM claim_expires_at)::bigint",
     )
     .bind(Uuid::parse_str(wf_run).unwrap())
     .bind(owner)
     .bind(epoch)
     .bind(nonce)
-    .execute(admin)
+    .fetch_one(admin)
     .await
     .expect("simulate the runner claim");
-    nonce.to_string()
+    TestClaimFacts {
+        owner: owner.into(),
+        epoch,
+        nonce,
+        started_at_epoch_secs,
+        expires_at_epoch_secs,
+    }
+}
+
+async fn authorize_test_launch(admin: &PgPool, claim: CiJobLaunchClaim) {
+    assert!(
+        ci_job_queue_store(admin.clone())
+            .authorize_launch(&claim)
+            .await
+            .expect("authorize exact test launch"),
+        "the exact live test claim must cross leased -> running"
+    );
 }
 
 fn completion_claim(
@@ -874,7 +976,17 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
     );
 
     // ── the runner claims at generation (worker-real, epoch 1). ──
-    let nonce = claim_job(&admin, &wf_run, "worker-real", 1).await;
+    let claim = claim_job(&admin, &wf_run, "worker-real", 1).await;
+
+    let leased_completion = reporter.report_done(
+        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
+        &pass(),
+    );
+    assert!(
+        matches!(leased_completion, Err(ExecutorError::InvalidInput(_))),
+        "possession of a merely leased claim cannot invent completed execution"
+    );
+    authorize_test_launch(&admin, claim.launch_claim(tenant, region, &wf_run, &job_id)).await;
 
     let wrong_nonce = uid("wrong-completion-claim").to_string();
     let wrong_nonce_result = reporter.report_done(
@@ -887,7 +999,7 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
     );
 
     let contradictory = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &nonce),
+        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
         &TerminalReport {
             passed: true,
             timed_out: true,
@@ -907,7 +1019,7 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         result_refs: vec![ArtifactRef("myelin://acme/ci/run/deep/not-scoped".into())],
     };
     let invalid = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &nonce),
+        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
         &invalid_ref,
     );
     assert!(
@@ -922,14 +1034,14 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
             .unwrap();
     assert_eq!(
         before_success,
-        ("leased".into(), None),
-        "typed-signal failure rolls back claim consumption"
+        ("running".into(), None),
+        "typed-signal failure rolls back running-claim consumption"
     );
 
     // (B) STALE GENERATION: a worker whose lease was reaped and re-claimed elsewhere presents a LOWER
     // epoch — refused (the CAS matches no live claim at that generation).
     let stale = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 0, &nonce),
+        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 0, &claim.nonce),
         &pass(),
     );
     assert!(
@@ -938,7 +1050,7 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
     );
     // a DIFFERENT owner at the correct epoch is refused too.
     let wrong_owner = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-evil", 1, &nonce),
+        &completion_claim(&tid, &run, &job_id, &idem, "worker-evil", 1, &claim.nonce),
         &pass(),
     );
     assert!(
@@ -951,13 +1063,13 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         "no refused delivery signalled"
     );
 
-    // (C) THE OWNING CLAIM consumes the claim + signals the verdict.
+    // (C) THE OWNING RUNNING CLAIM consumes the claim + signals the verdict.
     let ok = reporter
         .report_done(
-            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &nonce),
+            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
             &pass(),
         )
-        .expect("the owning claim consumes + signals");
+        .expect("the owning running claim consumes + signals");
     assert_eq!(ok, SignalOutcome::Buffered);
     let (state, receipt): (String, Option<String>) =
         sqlx::query_as("SELECT state, completion_receipt FROM job_queue WHERE run_id = $1")
@@ -972,7 +1084,7 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
     // re-signal, the engine dedups to Duplicate) — a signal that failed after the CAS retries safely.
     let retry = reporter
         .report_done(
-            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &nonce),
+            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
             &pass(),
         )
         .expect("an identical redelivery is idempotent");
@@ -986,7 +1098,7 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
     // than the recorded one — REFUSED (the receipt binds the verdict; a consumed pass cannot be replayed
     // as a fail).
     let flipped = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &nonce),
+        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
         &TerminalReport {
             passed: false,
             timed_out: false,
@@ -999,7 +1111,7 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         "a flipped-verdict replay with a valid receipt is refused, got {flipped:?}"
     );
     let divergent_refs = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &nonce),
+        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
         &TerminalReport {
             passed: true,
             timed_out: false,
@@ -1012,7 +1124,7 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         "an ordered result-ref divergence changes the receipt and is refused"
     );
     let divergent_usage = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &nonce),
+        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
         &TerminalReport {
             passed: true,
             timed_out: false,
@@ -1037,9 +1149,10 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         .execute(&admin)
         .await
         .expect("null the stage (simulate a pre-rewire historical row)");
-    let nonce2 = claim_job(&admin, &wf_run2, "worker-real", 1).await;
+    let claim2 = claim_job(&admin, &wf_run2, "worker-real", 1).await;
+    authorize_test_launch(&admin, claim2.launch_claim(tenant, region, &wf_run2, &job2)).await;
     let refused = reporter.report_done(
-        &completion_claim(&tid, &run2, &job2, &idem2, "worker-real", 1, &nonce2),
+        &completion_claim(&tid, &run2, &job2, &idem2, "worker-real", 1, &claim2.nonce),
         &pass(),
     );
     assert!(refused.is_err(), "a NULL-stage completion fails closed");
@@ -1054,8 +1167,8 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         .await
         .unwrap();
     assert_eq!(
-        q_state, "leased",
-        "the atomic transaction leaves the claim live for operator-visible recovery"
+        q_state, "running",
+        "the atomic transaction leaves the launched generation live for operator-visible recovery"
     );
 
     drop_schema(&admin, &schema).await;

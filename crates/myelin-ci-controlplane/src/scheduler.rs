@@ -264,12 +264,13 @@ RETURNING job_id";
 /// **The atomic prove-and-consume completion CAS (CT-004d.2 claim-bound completion).** Before any
 /// verdict is signalled, the terminal reporter consumes the CLAIM: it moves the row to `terminal` and
 /// records the deterministic `completion_receipt` ONLY IF the presented claim generation matches the
-/// row's — `lease_owner = $3 AND lease_epoch = $4` AND the row is still a live claim
-/// (`state IN ('leased','running')` and not already consumed). A stale worker (reaped + re-claimed →
-/// higher epoch, or a different owner) matches 0 rows and is refused; a forger with a valid token but
-/// no claim matches 0 rows. Bind: `$1 tenant_id`, `$2 job_id`, `$3 lease_owner`, `$4 lease_epoch`,
-/// `$5 claim_nonce`, `$6 completion_receipt`, `$7 stage`. `RETURNING job_id` iff THIS call consumed
-/// the claim. The receipt is idempotent evidence an exact redelivery reads.
+/// row's — `lease_owner = $3 AND lease_epoch = $4` — and the exact launch CAS already moved that
+/// generation to `running`. A merely leased claimant cannot invent a terminal result for work that
+/// never executed. A stale worker (reaped + re-claimed → higher epoch, or a different owner) matches
+/// 0 rows and is refused; a forger with a valid token but no running claim matches 0 rows. Bind:
+/// `$1 tenant_id`, `$2 job_id`, `$3 lease_owner`, `$4 lease_epoch`, `$5 claim_nonce`,
+/// `$6 completion_receipt`, `$7 stage`. `RETURNING job_id` iff THIS call consumed the claim. The
+/// receipt is idempotent evidence an exact redelivery reads.
 pub const CONSUME_CLAIM_QUERY: &str = "\
 UPDATE job_queue
 SET state = 'terminal', completion_receipt = $6, lease_owner = NULL, lease_expires = NULL
@@ -279,7 +280,7 @@ WHERE tenant_id = $1
   AND lease_epoch = $4
   AND claim_nonce = $5::uuid
   AND stage = $7
-  AND state IN ('leased','running')
+  AND state = 'running'
   AND completion_receipt IS NULL
 RETURNING job_id";
 
