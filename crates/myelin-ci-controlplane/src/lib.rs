@@ -450,7 +450,9 @@ pub use log_pipeline::{
 // CT-004f (CI-P20): the cycle-safe binding of the runner's `FirehoseSink` seam to the real
 // `LogPipeline` — `LogPipelineSink` (per-`(tenant, run, job)` pipeline, boundary-redaction-honest)
 // + the `LogPersist` durable-write seam the sealed index/pointers flush through (sub-step 4 fills it).
-pub use log_sink::{FlushedJobLogs, LogPersist, LogPipelineSink, SINGLE_STEP_ID};
+pub use log_sink::{
+    FlushedJobLogs, LogPersist, LogPipelineSink, PRODUCTION_LOG_SEGMENT_MAX_BYTES, SINGLE_STEP_ID,
+};
 // CT-004f sub-step 4a: the DURABLE LogPersist — the live `log_segment`/`log_anchor` writer (frozen
 // bind-param SQL, one tenant-scoped FORCE-RLS tx per finished job).
 pub use log_sink_durable::DurableLogPersist;

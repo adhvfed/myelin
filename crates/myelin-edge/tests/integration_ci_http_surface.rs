@@ -1,6 +1,7 @@
 //! Live CT-005a proof through the production CI HTTP handlers and action policy.
 #![cfg(feature = "integration")]
 
+use base64::Engine as _;
 use myelin_ci_controlplane::{ci_controlplane_migrations, CiRunStore};
 use myelin_edge::repo_authz::GrantBackedRepos;
 use myelin_edge::{
@@ -12,7 +13,9 @@ use myelin_identity_service::{
     CredentialPurpose, HumanSsoAuthenticator, PasetoCapabilityVerifier, PrincipalStore,
     RevocationStore,
 };
-use myelin_storage::{with_tenant_tx, KmsEngine, PgError, TenantScope};
+use myelin_storage::{
+    with_tenant_tx, BlobStore, ContentHash, FsBlobStore, KmsEngine, PgError, TenantScope,
+};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +27,10 @@ const REGION: &str = "eu-north";
 const VISIBLE_RUN: &str = "81000000-0000-4000-8000-000000000001";
 const HIDDEN_RUN: &str = "81000000-0000-4000-8000-000000000002";
 const ABSENT_RUN: &str = "81000000-0000-4000-8000-000000000003";
+const VISIBLE_JOB: &str = "85000000-0000-4000-8000-000000000001";
+const ABSENT_JOB: &str = "85000000-0000-4000-8000-000000000002";
+const CORRUPT_JOB: &str = "85000000-0000-4000-8000-000000000003";
+const HIDDEN_JOB: &str = "85000000-0000-4000-8000-000000000004";
 const SCHEME: &str = "agent";
 
 static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -128,6 +135,59 @@ async fn insert_run(app: &PgPool, run_id: &str, repo: &str, created_at: &str) {
     .expect("insert tenant-scoped run");
 }
 
+async fn insert_job_and_segments(
+    app: &PgPool,
+    run_id: &str,
+    job_id: &str,
+    segments: &[(String, i64, i64)],
+) {
+    let run_id = run_id.to_string();
+    let job_id = job_id.to_string();
+    let segments = segments.to_vec();
+    with_tenant_tx(app, TENANT, REGION, move |conn| {
+        Box::pin(async move {
+            sqlx::query(
+                "INSERT INTO ci_job (
+                   tenant_id, region, job_id, run_id, stage, name, needs, matrix_key,
+                   spec_ref, state, attempt
+                 ) VALUES (
+                   $1, $2, $3::uuid, $4::uuid, 'build', 'archive', '{}', NULL,
+                   'cas:spec', 'running', 1
+                 )",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(&job_id)
+            .bind(&run_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+            for (sequence, (blob_ref, byte_start, byte_end)) in segments.into_iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO log_segment (
+                       tenant_id, region, run_id, job_id, segment_seq, blob_ref,
+                       byte_start, byte_end, pii_key_ref
+                     ) VALUES ($1, $2, $3::uuid, $4::uuid, $5, $6, $7, $8, 'tenant:test')",
+                )
+                .bind(TENANT)
+                .bind(REGION)
+                .bind(&run_id)
+                .bind(&job_id)
+                .bind(sequence as i32)
+                .bind(blob_ref)
+                .bind(byte_start)
+                .bind(byte_end)
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| PgError::Query(error.to_string()))?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .expect("insert tenant-scoped CI log archive");
+}
+
 fn admin_scope() -> TenantScope {
     TenantScope::from_verified_token(
         &Principal::stub(
@@ -139,7 +199,11 @@ fn admin_scope() -> TenantScope {
     )
 }
 
-fn authenticated_gateway(app: PgPool, git_root: &std::path::Path) -> (Gateway, CellTokenAuthority) {
+fn authenticated_gateway(
+    app: PgPool,
+    git_root: &std::path::Path,
+    blobs: Arc<dyn BlobStore + Send + Sync>,
+) -> (Gateway, CellTokenAuthority) {
     let cell = CellTokenAuthority::from_seed(&[17; 32], &[19; 32]).expect("cell authority");
     let principals = PrincipalStore::new(Arc::new(KmsEngine::new()));
     principals
@@ -182,6 +246,7 @@ fn authenticated_gateway(app: PgPool, git_root: &std::path::Path) -> (Gateway, C
                 .derive_service_key("myelin test edge ci run surface cursor v1"),
         ),
         git,
+        blobs,
         tokio::runtime::Handle::current(),
     );
     (builder.build(), cell)
@@ -207,10 +272,14 @@ fn mint(cell: &CellTokenAuthority) -> String {
 }
 
 fn get(gateway: &Gateway, token: &str, path: &str) -> myelin_edge::EdgeResponse {
+    get_query(gateway, token, path, "")
+}
+
+fn get_query(gateway: &Gateway, token: &str, path: &str, query: &str) -> myelin_edge::EdgeResponse {
     gateway.handle(EdgeRequest::new(
         "GET",
         path,
-        "",
+        query,
         vec![
             ("Authorization".into(), format!("Bearer {token}")),
             ("x-myelin-token-scheme".into(), SCHEME.into()),
@@ -227,12 +296,60 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
     let app = pool(&app_url(), &schema).await;
     insert_run(&app, VISIBLE_RUN, "alpha", "2026-07-24T10:00:00Z").await;
     insert_run(&app, HIDDEN_RUN, "hidden", "2026-07-24T11:00:00Z").await;
+    let blobs = Arc::new(FsBlobStore::new());
+    let tenant = TenantId(TENANT.into());
+    let first = b"alpha\n";
+    let second = b"beta\n";
+    let first_ref = blobs
+        .put(&tenant, first)
+        .expect("store first sealed log segment")
+        .to_multihash_string();
+    let second_ref = blobs
+        .put(&tenant, second)
+        .expect("store second sealed log segment")
+        .to_multihash_string();
+    insert_job_and_segments(
+        &app,
+        VISIBLE_RUN,
+        VISIBLE_JOB,
+        &[
+            (first_ref, 0, first.len() as i64),
+            (
+                second_ref,
+                first.len() as i64,
+                (first.len() + second.len()) as i64,
+            ),
+        ],
+    )
+    .await;
+    insert_job_and_segments(
+        &app,
+        HIDDEN_RUN,
+        HIDDEN_JOB,
+        &[(
+            ContentHash::blake3(b"hidden archive").to_multihash_string(),
+            0,
+            14,
+        )],
+    )
+    .await;
+    insert_job_and_segments(
+        &app,
+        VISIBLE_RUN,
+        CORRUPT_JOB,
+        &[(
+            ContentHash::blake3(b"not present").to_multihash_string(),
+            0,
+            11,
+        )],
+    )
+    .await;
 
     let root = std::env::temp_dir().join(format!("{schema}_git"));
     let repo_dir = root.join(TENANT).join(REGION);
     std::fs::create_dir_all(repo_dir.join("alpha.git")).expect("create visible repo");
     std::fs::create_dir_all(repo_dir.join("hidden.git")).expect("create hidden repo");
-    let (gateway, cell) = authenticated_gateway(app.clone(), &root);
+    let (gateway, cell) = authenticated_gateway(app.clone(), &root, blobs);
     let token = mint(&cell);
 
     let list = get(&gateway, &token, "/v1/ci/runs");
@@ -261,6 +378,60 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
         hidden.json_body(),
         absent.json_body(),
         "denied and absent detail are the same public response"
+    );
+
+    let log = get_query(
+        &gateway,
+        &token,
+        &format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{VISIBLE_JOB}/log"),
+        "start=3&limit=6",
+    );
+    assert_eq!(log.status(), 200);
+    let log_body = log.json_body().expect("log JSON");
+    assert_eq!(log_body["byte_start"], 3);
+    assert_eq!(log_body["byte_end"], 9);
+    assert_eq!(log_body["total_end"], 11);
+    assert_eq!(log_body["next_offset"], 9);
+    assert_eq!(log_body["encoding"], "base64");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(log_body["data"].as_str().expect("base64 log bytes"))
+            .expect("decode log bytes"),
+        b"ha\nbet"
+    );
+
+    let absent_job = get(
+        &gateway,
+        &token,
+        &format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{ABSENT_JOB}/log"),
+    );
+    let hidden_log = get(
+        &gateway,
+        &token,
+        &format!("/v1/ci/runs/{HIDDEN_RUN}/jobs/{HIDDEN_JOB}/log"),
+    );
+    assert_eq!(absent_job.status(), 404);
+    assert_eq!(hidden_log.status(), 404);
+    assert_eq!(
+        absent_job.json_body(),
+        hidden_log.json_body(),
+        "a denied parent and absent child are the same public response"
+    );
+
+    let corrupt = get(
+        &gateway,
+        &token,
+        &format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{CORRUPT_JOB}/log"),
+    );
+    assert_eq!(corrupt.status(), 503);
+    let corrupt_body = corrupt.json_body().expect("generic unavailable JSON");
+    assert_eq!(
+        corrupt_body["error"]["message"],
+        "CI log data is temporarily unavailable"
+    );
+    assert!(
+        !corrupt_body.to_string().contains("blake3:"),
+        "content addresses never enter the public error"
     );
 
     app.close().await;

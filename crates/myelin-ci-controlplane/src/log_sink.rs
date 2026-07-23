@@ -40,13 +40,21 @@ use myelin_tenancy::{Region, TenantId};
 
 use crate::log_pipeline::{
     AnchorStatus, LogAnchorRow, LogAvailablePointer, LogCoord, LogPipeline, LogSegmentRow,
-    SecretRedactor,
+    SealThreshold, SecretRedactor,
 };
 
 /// The single logical step id for a single-command job (RESHAPE-001: one command per job — the
 /// sandbox runs ONE command, so its whole output is one step). A multi-step job would thread a real
 /// per-step id through the seam; every frame lands under this stable step id today.
 pub const SINGLE_STEP_ID: &str = "0";
+
+/// Maximum sealed-segment size the production runner can legitimately produce. An open segment is
+/// strictly below the seal threshold before one more line is appended. A captured frame is bounded
+/// by [`myelin_ci_sandbox::SANDBOX_CAPTURE_BOUND`], but invalid UTF-8 can expand threefold when the
+/// frame-to-line adapter replaces each invalid byte with U+FFFD before appending the whole line.
+/// The archived-log reader shares this producer-derived ceiling rather than guessing independently.
+pub const PRODUCTION_LOG_SEGMENT_MAX_BYTES: usize =
+    SealThreshold::DEFAULT_SEAL_AT_BYTES as usize + 3 * myelin_ci_sandbox::SANDBOX_CAPTURE_BOUND;
 
 /// **The sealed index + drained pointers for one finished `(tenant, run, job)`** — what
 /// [`LogPersist`] durably writes. References-not-payloads: the `segments` name content addresses in
@@ -205,7 +213,7 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
 mod tests {
     use super::*;
     use myelin_ci_sandbox::FirehoseSink;
-    use myelin_storage::FsBlobStore;
+    use myelin_storage::{ContentHash, FsBlobStore};
     use std::sync::Arc;
 
     /// A recording [`LogPersist`] — captures every flushed job so a test can assert the mapping.
@@ -270,6 +278,39 @@ mod tests {
             "every sealed segment names a CAS blob"
         );
         assert!(!job.pointers.is_empty(), "a ci.log.available pointer was emitted");
+    }
+
+    #[test]
+    fn worst_case_non_utf8_capture_remains_readable_under_the_shared_production_ceiling() {
+        let blobs = Arc::new(FsBlobStore::new());
+        let persist = Arc::new(RecordingPersist::default());
+        let sink = LogPipelineSink::new(Region::new("eu-west"), blobs.clone(), persist.clone());
+        let tenant = TenantId::from_token("tnt-invalid-utf8");
+        let almost_full = vec![b'a'; SealThreshold::DEFAULT_SEAL_AT_BYTES as usize - 1];
+        sink.ship_frame("run-invalid", "job-invalid", &tenant, &almost_full);
+        let invalid = vec![0xff; myelin_ci_sandbox::SANDBOX_CAPTURE_BOUND];
+        sink.ship_frame("run-invalid", "job-invalid", &tenant, &invalid);
+        sink.finish("run-invalid", "job-invalid", &tenant, true);
+
+        let flushed = persist.flushed.lock().unwrap();
+        let segment = flushed[0]
+            .1
+            .segments
+            .iter()
+            .max_by_key(|segment| segment.byte_end)
+            .expect("worst-case frame seals a segment");
+        let byte_len = usize::try_from(segment.byte_end - segment.byte_start).unwrap();
+        assert!(
+            byte_len > 2 * SealThreshold::DEFAULT_SEAL_AT_BYTES as usize,
+            "the regression fixture exceeds the old guessed reader ceiling"
+        );
+        assert!(byte_len <= PRODUCTION_LOG_SEGMENT_MAX_BYTES);
+        let hash = ContentHash::parse(segment.blob_ref.as_deref().expect("sealed blob ref"))
+            .expect("canonical content address");
+        let bytes = blobs
+            .get_bounded(&tenant, &hash, PRODUCTION_LOG_SEGMENT_MAX_BYTES)
+            .expect("every legitimately produced segment is readable at the shared ceiling");
+        assert_eq!(bytes.len(), byte_len);
     }
 
     #[test]
