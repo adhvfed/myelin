@@ -6,6 +6,7 @@
 //! partition into that complete scope. Construction performs no tenant query; driving the returned
 //! worker remains behind the control-plane's refused runner activation seam.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use myelin_events::{Actor, MonotonicMinter};
@@ -15,11 +16,12 @@ use myelin_storage::{DurableCostLedger, SubstrateProvider, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 
 use crate::{
-    register_durable_ci_manifest_pipeline, CiCostEventStore, CiDriveManifestStore,
-    CiJobAccountingStore, CiJobQueueStore, CiJobSpecStore, CiManifestInputResolver,
-    CiPipelineReporter, CiPipelineReporterFactory, CiPipelineReporterFactoryError,
-    CiPipelineReporterRouter, CiRunStore, CiWorkflowDefinitionPin, DurableCiJobAccounting,
-    DurableCiRunFinalizer, TierPOperationalCiJobPricer,
+    register_durable_ci_manifest_pipeline, CiActiveRunCursor, CiCostEventStore,
+    CiDriveManifestStore, CiJobAccountingStore, CiJobQueueStore, CiJobSpecStore,
+    CiManifestInputResolver, CiPipelineReporter, CiPipelineReporterFactory,
+    CiPipelineReporterFactoryError, CiPipelineReporterRouter, CiRegionRunDiscovery, CiRunStore,
+    CiWorkflowDefinitionPin, DurableCiJobAccounting, DurableCiRunFinalizer,
+    TierPOperationalCiJobPricer, MAX_ACTIVE_CI_RUN_PAGE,
 };
 
 /// Version of the production manifest-native `ci.pipeline` definition.
@@ -28,6 +30,10 @@ pub const CI_MANIFEST_PIPELINE_VERSION: i32 = 1;
 pub const CI_FLOW_WORKER_LEASE_TTL_SECS: i64 = 60;
 /// Schema version stamped on workflow-body outbox facts.
 pub const CI_FLOW_OUTBOX_SCHEMA_VERSION: u32 = 1;
+/// Maximum exact tenant/partition scopes one recovery pass may construct.
+pub const MAX_CI_WORKFLOW_SCOPES_PER_PASS: usize = MAX_ACTIVE_CI_RUN_PAGE;
+/// Maximum workflow drives one exact scope may perform before yielding.
+pub const MAX_CI_WORKFLOW_DRIVES_PER_SCOPE: usize = 64;
 const CI_MANIFEST_PIPELINE_DEFINITION_V1_DOMAIN: &str = "myelin.ci.manifest-pipeline-definition.v1";
 
 /// The deployed definition pin, mechanically derived from the exact production workflow source.
@@ -73,6 +79,23 @@ pub struct CiProductionRuntimeFactory {
     definition: CiWorkflowDefinitionPin,
 }
 
+/// Result of one bounded active-run recovery/fan-out pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CiWorkflowFanoutBatch {
+    pub discovered: usize,
+    pub scopes: usize,
+    pub driven: usize,
+    pub saturated: bool,
+}
+
+/// Keyset-cycling, bounded router from region-active CI rows to exact Flow workers.
+pub struct CiProductionWorkflowPoller {
+    discovery: CiRegionRunDiscovery,
+    runtime: CiProductionRuntimeFactory,
+    worker_prefix: String,
+    cursor: Option<CiActiveRunCursor>,
+}
+
 /// Compose the dormant production factory from the one validated cell provider.
 pub fn ci_production_runtime_factory(
     provider: SubstrateProvider,
@@ -112,11 +135,28 @@ impl CiProductionRuntimeFactory {
         &self.definition
     }
 
+    /// Bind restart-safe region discovery to this exact-cell worker factory.
+    pub fn workflow_poller(
+        &self,
+        discovery: CiRegionRunDiscovery,
+        worker_prefix: impl Into<String>,
+    ) -> Result<CiProductionWorkflowPoller, CiRuntimeCompositionError> {
+        let worker_prefix = worker_prefix.into();
+        if !valid_scope_token(&worker_prefix) {
+            return Err(CiRuntimeCompositionError);
+        }
+        Ok(CiProductionWorkflowPoller {
+            discovery,
+            runtime: self.clone(),
+            worker_prefix,
+            cursor: None,
+        })
+    }
+
     /// Build and register one exact `(tenant, region, partition)` durable workflow worker.
     ///
-    /// The caller must obtain `tenant` from the constrained region discovery capability and
-    /// `partition` from Flow's stable `partition_for_run_id` mapping. No default or global worker
-    /// exists.
+    /// The caller must obtain `tenant` and the persisted `partition` from the constrained region
+    /// discovery capability. No default or global worker exists.
     pub fn worker_for(
         &self,
         tenant: TenantId,
@@ -220,6 +260,72 @@ impl CiProductionRuntimeFactory {
     }
 }
 
+impl CiProductionWorkflowPoller {
+    /// Drive one keyset page. A short page wraps the next pass to the beginning; a full page advances
+    /// from its last durable `(created_at, tenant_id, run_id)` key, so a large active set cannot pin
+    /// the oldest scope forever.
+    pub async fn run_once(
+        &mut self,
+        max_scopes: usize,
+        max_drives_per_scope: usize,
+        now_unix_secs: i64,
+        now_rfc3339: &str,
+    ) -> Result<CiWorkflowFanoutBatch, CiRuntimeCompositionError> {
+        if !(1..=MAX_CI_WORKFLOW_SCOPES_PER_PASS).contains(&max_scopes)
+            || !(1..=MAX_CI_WORKFLOW_DRIVES_PER_SCOPE).contains(&max_drives_per_scope)
+        {
+            return Err(CiRuntimeCompositionError);
+        }
+        let mut page = self
+            .discovery
+            .active_run_page(&self.runtime.region.0, self.cursor.as_ref(), max_scopes)
+            .await
+            .map_err(|_| CiRuntimeCompositionError)?;
+        if page.routes.is_empty() && self.cursor.is_some() {
+            self.cursor = None;
+            page = self
+                .discovery
+                .active_run_page(&self.runtime.region.0, None, max_scopes)
+                .await
+                .map_err(|_| CiRuntimeCompositionError)?;
+        }
+        let discovered = page.routes.len();
+        self.cursor = if discovered == max_scopes {
+            page.next_cursor.clone()
+        } else {
+            None
+        };
+
+        let mut seen = BTreeSet::new();
+        let mut scopes = 0usize;
+        let mut driven = 0usize;
+        let mut saturated = discovered == max_scopes;
+        for route in page.routes {
+            let partition = route.partition;
+            if !seen.insert((route.tenant.0.clone(), partition)) {
+                continue;
+            }
+            let worker_id = scoped_worker_id(&self.worker_prefix, &route.tenant, partition);
+            let worker = self
+                .runtime
+                .worker_for(route.tenant, partition, worker_id)?;
+            let batch = worker
+                .run_until_idle(max_drives_per_scope, now_unix_secs, now_rfc3339)
+                .await
+                .map_err(|_| CiRuntimeCompositionError)?;
+            scopes += 1;
+            driven = driven.saturating_add(batch.driven);
+            saturated |= batch.saturated;
+        }
+        Ok(CiWorkflowFanoutBatch {
+            discovered,
+            scopes,
+            driven,
+            saturated,
+        })
+    }
+}
+
 /// Test-only parts constructor for isolated-schema live integration proofs.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -252,6 +358,14 @@ fn valid_scope_token(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
+fn scoped_worker_id(prefix: &str, tenant: &TenantId, partition: i16) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key("myelin.ci.flow-worker-id.v1");
+    hasher.update(&(tenant.0.len() as u64).to_be_bytes());
+    hasher.update(tenant.0.as_bytes());
+    let tenant_hash = hasher.finalize().to_hex();
+    format!("{prefix}-{}-{partition}", &tenant_hash[..16])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +387,19 @@ mod tests {
             assert!(!valid_scope_token(invalid), "{invalid:?}");
         }
         assert!(!valid_scope_token(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn worker_ids_are_bounded_stable_and_tenant_distinct() {
+        let one = scoped_worker_id("ci-flow", &TenantId("tenant-a".into()), 7);
+        assert_eq!(
+            one,
+            scoped_worker_id("ci-flow", &TenantId("tenant-a".into()), 7)
+        );
+        assert_ne!(
+            one,
+            scoped_worker_id("ci-flow", &TenantId("tenant-b".into()), 7)
+        );
+        assert!(valid_scope_token(&one));
     }
 }

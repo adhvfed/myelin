@@ -255,6 +255,13 @@ struct SchedulerProbe {
     run_select_state: bool,
     run_select_created_at: bool,
     run_select_run_id: bool,
+    workflow_select_tenant: bool,
+    workflow_select_region: bool,
+    workflow_select_run_id: bool,
+    workflow_select_type: bool,
+    workflow_select_state: bool,
+    workflow_select_partition: bool,
+    workflow_select_created_at: bool,
     mapping_function_execute: bool,
     excess_privilege: bool,
 }
@@ -350,6 +357,13 @@ fn validate_probe_before_mapping(
         && scheduler.run_select_state
         && scheduler.run_select_created_at
         && scheduler.run_select_run_id
+        && scheduler.workflow_select_tenant
+        && scheduler.workflow_select_region
+        && scheduler.workflow_select_run_id
+        && scheduler.workflow_select_type
+        && scheduler.workflow_select_state
+        && scheduler.workflow_select_partition
+        && scheduler.workflow_select_created_at
         && scheduler.mapping_function_execute)
     {
         return Err(CiSchedulerDbError::InsufficientPrivileges);
@@ -454,6 +468,13 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'state', 'SELECT') AS run_select_state,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'created_at', 'SELECT') AS run_select_created_at,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'run_id', 'SELECT') AS run_select_run_id,
+                pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'tenant_id', 'SELECT') AS workflow_select_tenant,
+                pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'region', 'SELECT') AS workflow_select_region,
+                pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'run_id', 'SELECT') AS workflow_select_run_id,
+                pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'wf_type', 'SELECT') AS workflow_select_type,
+                pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'state', 'SELECT') AS workflow_select_state,
+                pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'partition', 'SELECT') AS workflow_select_partition,
+                pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'created_at', 'SELECT') AS workflow_select_created_at,
                 pg_catalog.has_function_privilege(
                   session_user, 'public.myelin_ci_scheduler_region()'::regprocedure, 'EXECUTE'
                 ) AS mapping_function_execute,
@@ -515,6 +536,7 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                          'public.job_queue'::regclass,
                          'public.fair_deficit'::regclass,
                          'public.ci_run'::regclass,
+                         'public.workflow_run'::regclass,
                          'public.myelin_ci_scheduler_region_map'::regclass
                        )
                        AND (
@@ -525,6 +547,25 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                          OR pg_catalog.has_table_privilege(session_user, unrelated.oid, 'TRUNCATE')
                          OR pg_catalog.has_table_privilege(session_user, unrelated.oid, 'REFERENCES')
                          OR pg_catalog.has_table_privilege(session_user, unrelated.oid, 'TRIGGER')
+                       )
+                  )
+                  OR pg_catalog.has_table_privilege(session_user, 'public.workflow_run', 'INSERT')
+                  OR pg_catalog.has_table_privilege(session_user, 'public.workflow_run', 'UPDATE')
+                  OR pg_catalog.has_table_privilege(session_user, 'public.workflow_run', 'DELETE')
+                  OR pg_catalog.has_table_privilege(session_user, 'public.workflow_run', 'TRUNCATE')
+                  OR pg_catalog.has_table_privilege(session_user, 'public.workflow_run', 'REFERENCES')
+                  OR pg_catalog.has_table_privilege(session_user, 'public.workflow_run', 'TRIGGER')
+                  OR EXISTS (
+                    SELECT 1
+                      FROM pg_catalog.pg_attribute AS workflow_column
+                     WHERE workflow_column.attrelid = 'public.workflow_run'::regclass
+                       AND workflow_column.attnum > 0
+                       AND NOT workflow_column.attisdropped
+                       AND workflow_column.attname NOT IN (
+                         'tenant_id', 'region', 'run_id', 'wf_type', 'state', 'partition', 'created_at'
+                       )
+                       AND pg_catalog.has_column_privilege(
+                         session_user, workflow_column.attrelid, workflow_column.attnum, 'SELECT'
                        )
                   )
                   OR pg_catalog.has_table_privilege(session_user,
@@ -619,6 +660,13 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
         run_select_state: row.get("run_select_state"),
         run_select_created_at: row.get("run_select_created_at"),
         run_select_run_id: row.get("run_select_run_id"),
+        workflow_select_tenant: row.get("workflow_select_tenant"),
+        workflow_select_region: row.get("workflow_select_region"),
+        workflow_select_run_id: row.get("workflow_select_run_id"),
+        workflow_select_type: row.get("workflow_select_type"),
+        workflow_select_state: row.get("workflow_select_state"),
+        workflow_select_partition: row.get("workflow_select_partition"),
+        workflow_select_created_at: row.get("workflow_select_created_at"),
         mapping_function_execute: row.get("mapping_function_execute"),
         excess_privilege: row.get("excess_privilege"),
     })

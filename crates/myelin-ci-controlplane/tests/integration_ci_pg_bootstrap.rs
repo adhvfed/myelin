@@ -69,6 +69,13 @@ async fn exercise(
         .map_err(|e| format!("migrate Controlplane durable aggregate: {e}"))?;
     bootstrap
         .migrate(
+            &myelin_flow::migrations::migrations(),
+            &HotTables::declare(["workflow_run"]),
+        )
+        .await
+        .map_err(|e| format!("migrate Controlplane Flow prerequisite: {e}"))?;
+    bootstrap
+        .migrate(
             &myelin_ci_controlplane::ci_controlplane_migrations(),
             &myelin_ci_controlplane::ci_controlplane_hot_tables(),
         )
@@ -89,6 +96,7 @@ async fn exercise(
     for table in [
         "outbox",
         "ci_run",
+        "workflow_run",
         "ci_drive_manifest",
         "ci_job",
         "job_queue",

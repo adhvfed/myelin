@@ -82,6 +82,8 @@ use crate::scheduler::{
 /// tokens the CI schema already keys on.
 #[derive(Debug)]
 pub enum JobQueueStoreError {
+    /// Caller-supplied runtime bounds or scope are invalid; no database operation was attempted.
+    InvalidInput(String),
     /// A durable-store DB error (the statement did NOT succeed) — never a silent partial write.
     Db(String),
     /// A `job_id`/`run_id` presented to the store is not a UUID (the durable column type). CI job/run
@@ -100,6 +102,9 @@ pub enum JobQueueStoreError {
 impl core::fmt::Display for JobQueueStoreError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            JobQueueStoreError::InvalidInput(e) => {
+                write!(f, "durable job_queue input refused: {e}")
+            }
             JobQueueStoreError::Db(e) => write!(f, "durable job_queue store error: {e}"),
             JobQueueStoreError::BadId { field, value } => write!(
                 f,

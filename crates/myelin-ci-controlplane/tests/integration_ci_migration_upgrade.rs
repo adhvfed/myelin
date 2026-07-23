@@ -1,17 +1,18 @@
 //! **The ROLLING-UPGRADE migration proof (CT-004d.2).** The existing migration tests prove a FRESH
 //! bootstrap applies the whole set. This proves the UPGRADE path from the already-shipped completion
 //! WIP: apply the sequence with `ci_0004a`/`ci_0015a`/`ci_0016a`, then apply the full set. Those
-//! shared ids checksum-match and the new additive migrations add nonce authority plus queued-run
-//! discovery. This is the checked invariant behind editing NO applied migration DDL (the base
-//! creates stay byte-frozen).
+//! shared ids checksum-match and the new additive migrations add nonce authority, queued-run
+//! discovery, and active-workflow recovery. This is the checked invariant behind editing NO
+//! applied migration DDL (the base creates stay byte-frozen).
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
     ci_controlplane_hot_tables, ci_controlplane_migrations,
     CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID,
-    CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
+    CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID,
+    CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID, CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID,
 };
-use myelin_storage::PgMigrator;
+use myelin_storage::{migration::HotTables, PgMigrator};
 use myelin_substrate::Migrations;
 use sqlx::{Executor, PgPool};
 
@@ -48,6 +49,8 @@ const NEW_SUB_MIGRATION_IDS: &[&str] = &[
     CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
     CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID,
     CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID,
+    CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID,
+    CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID,
 ];
 
 /// The full set with the new sub-migrations filtered OUT — the sequence a pre-CT-004d.2 deploy applied.
@@ -89,6 +92,17 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
         .await
         .expect("create the upgrade schema");
     let pool = pinned_pool(&schema).await;
+
+    // CI's recovery-route follow-ons intentionally target Flow's authoritative workflow_run table.
+    // Install that prerequisite in the same isolated schema so this proof cannot mutate or inherit
+    // policies/indexes from public.workflow_run.
+    PgMigrator::apply_validated(
+        &pool,
+        &myelin_flow::migrations::migrations(),
+        &HotTables::declare(["workflow_run"]),
+    )
+    .await
+    .expect("the isolated Flow prerequisite applies");
 
     // ── 1. Apply the already-shipped WIP sequence (including immutable a-suffix migrations). ──
     PgMigrator::apply_validated(&pool, &old_sequence(), &ci_controlplane_hot_tables())

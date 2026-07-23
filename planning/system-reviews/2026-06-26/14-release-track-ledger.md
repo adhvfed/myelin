@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — operational reservation, scoped hooks, claim/launch fences, and exact-tenant worker/reporter/finalizer composition proven; bounded fan-out + full crash path remain; production start disabled** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — operational reservation, scoped hooks, claim/launch fences, exact-tenant worker/reporter/finalizer composition, and bounded active-workflow fan-out proven; full runner/crash path remains; production start disabled** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1095,12 +1095,47 @@ all-target/all-feature suite, workspace all-target/all-feature check, warnings-d
 architecture lint, erosion budgets, contract coverage, production-source activation guard, and diff
 check are green.
 
-**Honest remaining activation floors:** turn region discovery into bounded exact-tenant
-tenant/partition worker fan-out, then compose that fan-out, the accounted reporter, the now-scoped
-hooks, and the accounted cancellation coordinator into the real `CiRunnerLoop`. Inject crashes
-across mint→CAS and CAS→spawn plus cancellation, retry, recovery, and settlement races through that
-complete root before activation. No Commercial wallet, billing, or Stripe work is admitted before
-the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
+**Bounded active-workflow recovery fan-out (2026-07-23).** The constrained region scheduler can now
+discover only nonterminal `ci.pipeline` rows from Flow's authoritative `workflow_run` table, returning
+the persisted partition rather than deriving one from the run ID. Discovery is a 64-row maximum
+keyset page ordered by the globally unique `(created_at, tenant_id, run_id)` tuple; it uses no
+transparent offset and exposes only tenant, run identity, persisted partition, and cursor time. A
+new partial concurrent index covers the exact region/type/state/keyset predicate. The scheduler role
+gets SELECT on exactly the seven required `workflow_run` columns behind both a permissive and
+restrictive empty-tenant/server-mapped-region RLS policy; the startup privilege probe treats every
+additional Flow column or mutation capability as excess.
+
+`CiProductionWorkflowPoller` keyset-cycles across at most 64 discovered rows per pass, deduplicates
+the resulting exact `(tenant, partition)` scopes, derives bounded tenant-distinct worker IDs, and
+drives each exact worker at most 64 times before yielding. Production constructs this poller from
+the same dormant exact-tenant runtime factory but starts no task, spawn, or `CiRunnerLoop`. CI boot
+now applies Flow's exact shared migrations before the CI-owned recovery index/policy follow-ons, so a
+fresh cell has no service boot-order dependency; isolated bootstrap and rolling-upgrade proofs carry
+the same real prerequisite instead of accidentally targeting `public.workflow_run`.
+
+The live PostgreSQL recovery proof commits the CI finalizer first to simulate a crash between the
+CI-run terminal transaction and the Flow commit. Even though `ci_run` is already failed, the
+nonterminal Flow row remains discoverable; the production poller recreates the exact persisted
+tenant/partition worker, deterministic replay finishes the Flow commit, and no second terminal
+effect is invented. The scheduler boundary proof also covers wrong-region exclusion, persisted
+partition routing, and two one-row keyset pages. Adversarial review initially found one HIGH and two
+MEDIUM errors in the first draft: terminal `ci_run` state could hide a split-commit Flow run, the
+cursor omitted tenant identity, and routing recomputed a partition using a helper whose contract
+forbids that use. All three were replaced by authoritative Flow state, the tenant-inclusive keyset,
+and the stored partition. Re-review then found the fresh-boot Flow prerequisite; production boot and
+both isolated migration proofs now apply the exact shared Flow set first. Its apparent excess-grant
+failure was a stale schema left by the earlier failed upgrade fixture, not product DDL; removing that
+test-owned schema restored the unchanged fail-closed privilege probe. Final independent re-review:
+CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding. The full control-plane
+all-target/all-feature suite, including every live PostgreSQL proof, workspace all-target/all-feature
+check, warnings-denied clippy, production migration checksum audit, architecture lint, erosion
+budgets, contract coverage, production-source activation guard, and diff check are green.
+
+**Honest remaining activation floors:** compose the bounded fan-out, accounted reporter, scoped
+hooks, and accounted cancellation coordinator into the real `CiRunnerLoop`. Inject crashes across
+mint→CAS and CAS→spawn plus cancellation, retry, recovery, and settlement races through that complete
+root before activation. No Commercial wallet, billing, or Stripe work is admitted before the Tier-B
+go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
 
 ## R5–R6
 

@@ -56,6 +56,11 @@ fn assert_permission_denied(result: Result<PgQueryResult, sqlx::Error>, operatio
 }
 
 async fn cleanup(admin: &PgPool, tenants: &[&str]) {
+    sqlx::query("DELETE FROM workflow_run WHERE tenant_id = ANY($1)")
+        .bind(tenants)
+        .execute(admin)
+        .await
+        .expect("clean scheduler-boundary workflow fixtures");
     sqlx::query("DELETE FROM job_queue WHERE tenant_id = ANY($1)")
         .bind(tenants)
         .execute(admin)
@@ -74,7 +79,7 @@ async fn cleanup(admin: &PgPool, tenants: &[&str]) {
 }
 
 async fn cleanup_stale_fixtures(admin: &PgPool) {
-    for table in ["job_queue", "fair_deficit", "ci_run"] {
+    for table in ["workflow_run", "job_queue", "fair_deficit", "ci_run"] {
         sqlx::query(&format!(
             "DELETE FROM {table}
               WHERE tenant_id LIKE 'scheduler-a-%'
@@ -178,6 +183,68 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         "1999-01-01T00:00:00Z",
     )
     .await;
+    insert_queued_run(&admin, &tenant_a, FR_PAR, 204, "1900-01-01T00:00:00Z").await;
+    insert_queued_run(&admin, &tenant_b, FR_PAR, 206, "1900-01-01T00:00:01Z").await;
+    insert_queued_run(
+        &admin,
+        &tenant_other_region,
+        DE_FRA,
+        205,
+        "1899-01-01T00:00:00Z",
+    )
+    .await;
+    sqlx::query(
+        "UPDATE ci_run SET state = 'running'
+          WHERE run_id IN (
+            '20000000-0000-0000-0000-000000000204'::uuid,
+            '20000000-0000-0000-0000-000000000205'::uuid,
+            '20000000-0000-0000-0000-000000000206'::uuid
+          )",
+    )
+    .execute(&admin)
+    .await
+    .expect("mark active workflow discovery fixtures running");
+    for (tenant, region, run_id, partition, created_at) in [
+        (
+            tenant_a.as_str(),
+            FR_PAR,
+            "30000000-0000-0000-0000-000000000204",
+            7_i16,
+            "1900-01-01T00:00:00Z",
+        ),
+        (
+            tenant_b.as_str(),
+            FR_PAR,
+            "30000000-0000-0000-0000-000000000206",
+            8_i16,
+            "1900-01-01T00:00:01Z",
+        ),
+        (
+            tenant_other_region.as_str(),
+            DE_FRA,
+            "30000000-0000-0000-0000-000000000205",
+            9_i16,
+            "1899-01-01T00:00:00Z",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO workflow_run (
+               tenant_id, region, run_id, wf_type, wf_version, input, state, correlation_id,
+               depth, partition, created_at
+             ) VALUES (
+               $1, $2, $3, 'ci.pipeline', 1, '[]'::jsonb, 'running', $3, 0, $4,
+               $5::timestamptz
+             )",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(run_id)
+        .bind(partition)
+        .bind(created_at)
+        .execute(&admin)
+        .await
+        .expect("insert active workflow discovery fixture");
+    }
 
     let scheduler_config = CiSchedulerDbConfig::from_parts(
         scheduler_url.clone(),
@@ -209,6 +276,43 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
             .is_none(),
         "changing the client region GUC cannot expose a run outside the server-owned mapping"
     );
+    let active_routes = run_discovery
+        .active_run_page(FR_PAR, None, 64)
+        .await
+        .expect("discover active same-region workflow routes");
+    assert!(
+        active_routes.routes.iter().any(|route| {
+            route.tenant.0 == tenant_a
+                && route.wf_run_id == "30000000-0000-0000-0000-000000000204"
+                && route.partition == 7
+        }),
+        "active recovery returns the exact tenant and workflow UUID"
+    );
+    assert!(
+        active_routes
+            .routes
+            .iter()
+            .all(|route| route.tenant.0 != tenant_other_region),
+        "active recovery cannot cross the server-mapped region"
+    );
+    assert!(run_discovery
+        .active_run_page(DE_FRA, None, 64)
+        .await
+        .expect("wrong-region active discovery is safely empty")
+        .routes
+        .is_empty());
+    let first_active = run_discovery
+        .active_run_page(FR_PAR, None, 1)
+        .await
+        .expect("first active keyset page");
+    assert_eq!(first_active.routes.len(), 1);
+    assert_eq!(first_active.routes[0].tenant.0, tenant_a);
+    let second_active = run_discovery
+        .active_run_page(FR_PAR, first_active.next_cursor.as_ref(), 1)
+        .await
+        .expect("second active keyset page");
+    assert_eq!(second_active.routes.len(), 1);
+    assert_eq!(second_active.routes[0].tenant.0, tenant_b);
 
     let baseline_null_stage = region_store
         .count_non_terminal_null_stage_jobs(FR_PAR)
