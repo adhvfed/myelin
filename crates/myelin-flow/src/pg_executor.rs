@@ -177,6 +177,15 @@ async fn persist_prepared_start(
     )))
 }
 
+/// Result of an in-transaction cancellation attempt after locking the exact workflow row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelOnConnOutcome {
+    /// This transaction changed an active workflow to `terminated`.
+    Terminated,
+    /// The workflow was already terminal and was left byte-for-byte unchanged.
+    TerminalNoOp,
+}
+
 /// Durable, tenant- and residency-scoped implementation of [`DurableExecutor`].
 #[derive(Clone)]
 pub struct PgFlowExecutor {
@@ -438,6 +447,56 @@ impl PgFlowExecutor {
         self.deliver_signal_on_conn(conn, run, signal_name, idem_key, payload, payload_key_ref)
             .await
             .map_err(|error| Self::map_signal_store_error(error, error_run_id))
+    }
+
+    /// Terminate a workflow on the caller's already-open, exactly scoped transaction.
+    ///
+    /// Run-level owners use this to co-commit product lifecycle cancellation with Flow termination
+    /// and any adjacent accounting state. The row lock serializes with drive commits and signal
+    /// delivery; a terminal workflow is an exact no-op, while an unknown workflow is refused.
+    pub async fn cancel_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        run: &RunId,
+        reason: &str,
+    ) -> Result<CancelOnConnOutcome, ExecutorError> {
+        bounded("run_id", &run.0, 256)?;
+        bounded("cancel reason", reason, 128)?;
+        self.verify_connection_scope(conn).await?;
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM workflow_run \
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3 FOR UPDATE",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(&run.0)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|error| store_error("lock workflow for cancellation", error))?
+        .ok_or_else(|| ExecutorError::UnknownRun(run.0.clone()))?;
+        if run_state::is_terminal(&state) {
+            return Ok(CancelOnConnOutcome::TerminalNoOp);
+        }
+        let updated = sqlx::query(
+            "UPDATE workflow_run SET state = 'terminated', cancel_reason = $4, \
+             lease_owner = NULL, lease_expires = NULL, updated_at = now() \
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3 \
+               AND state NOT IN ('completed','failed','terminated','nondeterministic')",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(&run.0)
+        .bind(reason)
+        .execute(&mut *conn)
+        .await
+        .map_err(|error| store_error("cancel workflow", error))?;
+        if updated.rows_affected() == 1 {
+            Ok(CancelOnConnOutcome::Terminated)
+        } else {
+            Err(ExecutorError::Storage(
+                "workflow cancellation lost its locked lifecycle authority".into(),
+            ))
+        }
     }
 
     fn prepare_typed_signal(&self, spec: TypedSignalSpec) -> Result<PreparedSignal, ExecutorError> {

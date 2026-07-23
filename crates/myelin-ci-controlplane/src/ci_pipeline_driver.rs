@@ -44,6 +44,7 @@
 //! DAG-aware execution semantics before composing `PgFlowWorker`; V2 launch authority remains
 //! refused until its resource, egress, workspace, token, metering, and check capabilities exist.
 
+use std::collections::BTreeMap;
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,6 +73,7 @@ use myelin_storage::{
 use myelin_tenancy::Region;
 use myelin_tenancy::TenantId;
 use sqlx::types::Uuid;
+use sqlx::Row;
 
 use myelin_flow::{
     ActivityError, ExecutorError, JobRunner, JobSpec as FlowJobSpec, PgFlowExecutor, RunId,
@@ -550,7 +552,7 @@ impl DurableCiJobAccounting {
     }
 }
 
-fn priced_cost_rows(
+pub(crate) fn priced_cost_rows(
     tenant: &TenantId,
     ci_run_id: &str,
     job_id: &str,
@@ -610,6 +612,7 @@ enum CompletionTxError {
     Money(DurableSettleError),
     Projection(CiCostStoreError),
     Accounting(CiJobAccountingError),
+    CancelledClosure,
     Signal(ExecutorError),
     Refused,
 }
@@ -723,6 +726,101 @@ async fn co_commit_terminal_accounting(
         )
         .await
         .map_err(CompletionTxError::Accounting)?;
+    Ok(())
+}
+
+async fn close_cancelled_run_if_accounted(
+    conn: &mut sqlx::PgConnection,
+    accounting: &DurableCiJobAccounting,
+    wf_run_id: &str,
+) -> Result<(), CompletionTxError> {
+    let (manifest, _) = accounting
+        .manifest_store
+        .load_by_wf_run_on_conn(conn, wf_run_id)
+        .await
+        .map_err(|_| CompletionTxError::CancelledClosure)?
+        .ok_or(CompletionTxError::CancelledClosure)?;
+    let run = sqlx::query(
+        "SELECT state, cost_settled, finished_at IS NOT NULL AS finished \
+         FROM ci_run \
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid \
+           AND wf_run_id = $4::uuid FOR UPDATE",
+    )
+    .bind(accounting.scope.tenant().as_str())
+    .bind(accounting.scope.region().as_str())
+    .bind(&manifest.ci_run_id)
+    .bind(&manifest.wf_run_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|_| CompletionTxError::CancelledClosure)?
+    .ok_or(CompletionTxError::CancelledClosure)?;
+    let state: String = run.get("state");
+    let settled: bool = run.get("cost_settled");
+    let finished: bool = run.get("finished");
+    if state != "cancelled" {
+        return Ok(());
+    }
+    if !finished {
+        return Err(CompletionTxError::CancelledClosure);
+    }
+
+    let rows = sqlx::query(
+        "SELECT job_id::text AS job_id, reserve_handle \
+         FROM ci_job_accounting \
+         WHERE tenant_id = $1 AND region = $2 AND ci_run_id = $3::uuid \
+           AND wf_run_id = $4::uuid ORDER BY job_id FOR SHARE",
+    )
+    .bind(accounting.scope.tenant().as_str())
+    .bind(accounting.scope.region().as_str())
+    .bind(&manifest.ci_run_id)
+    .bind(&manifest.wf_run_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|_| CompletionTxError::CancelledClosure)?;
+    let expected: BTreeMap<&str, &str> = manifest
+        .jobs
+        .iter()
+        .map(|job| (job.job_id.as_str(), job.reserve_handle.as_str()))
+        .collect();
+    if rows.len() < expected.len() {
+        return Ok(());
+    }
+    if rows.len() != expected.len()
+        || rows.iter().any(|row| {
+            let job_id: String = row.get("job_id");
+            let reserve_handle: String = row.get("reserve_handle");
+            expected.get(job_id.as_str()).copied() != Some(reserve_handle.as_str())
+        })
+    {
+        return Err(CompletionTxError::CancelledClosure);
+    }
+    if settled {
+        return Ok(());
+    }
+    let updated = sqlx::query(
+        "UPDATE ci_run SET cost_settled = true \
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid \
+           AND wf_run_id = $4::uuid AND state = 'cancelled' \
+           AND cost_settled = false AND finished_at IS NOT NULL",
+    )
+    .bind(accounting.scope.tenant().as_str())
+    .bind(accounting.scope.region().as_str())
+    .bind(&manifest.ci_run_id)
+    .bind(&manifest.wf_run_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|_| CompletionTxError::CancelledClosure)?;
+    if updated.rows_affected() != 1 {
+        return Err(CompletionTxError::CancelledClosure);
+    }
+    crate::ci_run_supersession::emit_settled_cancelled_checks_on_conn(
+        conn,
+        accounting.scope.tenant(),
+        accounting.scope.region(),
+        &manifest,
+    )
+    .await
+    .map_err(|_| CompletionTxError::CancelledClosure)?;
     Ok(())
 }
 
@@ -933,6 +1031,24 @@ impl TerminalReporter for CiPipelineReporter {
                             lease_epoch,
                             claim_nonce: &nonce_owned,
                         });
+                        // Lock Flow before the scheduler/accounting rows. Run supersession uses the
+                        // same order, so a canceller cannot hold a queue row while waiting for Flow
+                        // as this reporter holds Flow while waiting for that queue row.
+                        let signal = TypedSignalSpec {
+                            run: run_owned.clone(),
+                            signal_name: JOB_DONE_SIGNAL.to_string(),
+                            idem_key: idem_owned.clone(),
+                            payload: SignalPayload::CiJobDone {
+                                stage: stage.clone(),
+                                passed: report_owned.passed,
+                                result_refs: report_owned.result_refs.clone(),
+                            },
+                            payload_key_ref: None,
+                        };
+                        let outcome = pg_executor
+                            .signal_typed_on_conn(conn, signal.clone())
+                            .await
+                            .map_err(CompletionTxError::Signal)?;
                         let claim = CiJobQueueStore::consume_claim_on_conn(
                             conn,
                             ClaimConsumeSpec {
@@ -969,21 +1085,10 @@ impl TerminalReporter for CiPipelineReporter {
                             #[cfg(any(test, feature = "test-support"))]
                             ReporterAccounting::TestBypass => {}
                         }
-                        let signal = TypedSignalSpec {
-                            run: run_owned.clone(),
-                            signal_name: JOB_DONE_SIGNAL.to_string(),
-                            idem_key: idem_owned.clone(),
-                            payload: SignalPayload::CiJobDone {
-                                stage,
-                                passed: report_owned.passed,
-                                result_refs: report_owned.result_refs.clone(),
-                            },
-                            payload_key_ref: None,
-                        };
-                        let outcome = pg_executor
-                            .signal_typed_on_conn(conn, signal.clone())
-                            .await
-                            .map_err(CompletionTxError::Signal)?;
+                        if let ReporterAccounting::Durable(accounting) = &accounting {
+                            close_cancelled_run_if_accounted(conn, accounting, &run_owned.0)
+                                .await?;
+                        }
                         Ok((outcome, signal))
                     })
                 },
@@ -1026,6 +1131,11 @@ impl TerminalReporter for CiPipelineReporter {
                 return Err(ExecutorError::Storage(format!(
                     "terminal CI accounting receipt refused: {error}"
                 )))
+            }
+            Err(CompletionTxError::CancelledClosure) => {
+                return Err(ExecutorError::Storage(
+                    "cancelled CI run accounting closure was refused".into(),
+                ))
             }
             Err(CompletionTxError::Signal(error)) => return Err(error),
             Err(CompletionTxError::Scope(error)) => {

@@ -105,11 +105,12 @@ pub fn ci_runner_hooks(
     )
 }
 
-/// Production cancel-superseded coordinator for CI jobs with Tier-P reservations.
+/// Test-support job-local cancellation coordinator for Tier-P reservation crash probes.
 ///
-/// Cancellation and zero settlement share one tenant transaction. This is the durable owner for the
-/// two crash windows where a runner cannot safely release by itself: reservation-begin commit before
-/// handle acknowledgement, and cancellation immediately after a retry-preserving release check.
+/// Production supersession is run-level and producer-generation ordered in
+/// [`crate::PgCiRunSupersession`]. This narrower helper remains available only to tests that exercise
+/// the two reservation crash windows in isolation.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone)]
 pub struct CiRunnerCancellationCoordinator {
     pool: sqlx::PgPool,
@@ -118,7 +119,8 @@ pub struct CiRunnerCancellationCoordinator {
     rt: tokio::runtime::Handle,
 }
 
-/// Compose the only production cancel-superseded capability for the CI runner lane.
+/// Compose the test-support job-local cancellation capability.
+#[cfg(any(test, feature = "test-support"))]
 pub fn ci_runner_cancellation_coordinator(
     provider: SubstrateProvider,
     rt: tokio::runtime::Handle,
@@ -131,6 +133,7 @@ pub fn ci_runner_cancellation_coordinator(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl CiRunnerCancellationCoordinator {
     /// Atomically terminalize all superseded queued/leased jobs and settle their exact reservations
     /// at zero. A transaction failure preserves both the schedulable job and held reservation.
@@ -446,6 +449,7 @@ async fn scoped_launch_verification(
     .await
 }
 
+#[cfg(any(test, feature = "test-support"))]
 async fn cancel_superseded_and_settle(
     pool: sqlx::PgPool,
     region: Region,

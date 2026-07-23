@@ -310,6 +310,10 @@ async fn main() {
                 tokio::runtime::Handle::current(),
             )),
             tokio::runtime::Handle::current(),
+            myelin_storage::DurableCostLedger::with_runtime(
+                provider.clone(),
+                tokio::runtime::Handle::current(),
+            ),
         ) {
             Ok(factory) => factory,
             Err(error) => {
@@ -395,10 +399,6 @@ async fn main() {
             runner_identity.launch_authorizer(),
             tokio::runtime::Handle::current(),
         );
-        let runner_cancellations = myelin_ci_controlplane::ci_runner_cancellation_coordinator(
-            provider.clone(),
-            tokio::runtime::Handle::current(),
-        );
         let runner = myelin_ci_controlplane::CiRunnerLoop::new(
             format!("ci-runner-{}", std::process::id()),
             myelin_ci_controlplane::LINUX_SMALL_V1_RUNNER_LABELS
@@ -417,12 +417,7 @@ async fn main() {
             provider.db_pool().clone(),
             provider.config().s3.clone(),
         );
-        Some((
-            starter_poller,
-            workflow_poller,
-            runner_cancellations,
-            runner,
-        ))
+        Some((starter_poller, workflow_poller, runner))
     } else {
         None
     };

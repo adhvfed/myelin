@@ -24,6 +24,7 @@ use myelin_ci_controlplane::{
 };
 use myelin_events::{HandlerTx, CONSUMER_DEDUP_MIGRATION};
 use sqlx::{Executor, PgPool};
+use std::time::Duration;
 
 fn app_url() -> String {
     std::env::var("DATABASE_URL")
@@ -209,6 +210,33 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         stored_pr.pr_head_generation,
         Some(7),
         "producer-authored PR ordering authority round-trips durably"
+    );
+
+    // Producer insertion takes the same exact group lock as starter classification/cancellation.
+    // Hold that lock independently and prove the real store cannot publish a newer generation
+    // behind a starter transaction that is still deciding the group's durable high-water mark.
+    let mut held_group = admin.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind("myelin.ci.pr-run-supersession.v1:tenantA:fr-par:pr:team/web:43")
+        .execute(&mut *held_group)
+        .await
+        .unwrap();
+    let mut later_pr = row("tenantA", &run_id(4));
+    later_pr.trigger_kind = "pull_request".into();
+    later_pr.concurrency_group = Some("pr:team/web:43".into());
+    later_pr.pr_head_generation = Some(8);
+    let lock_store = store.clone();
+    let mut blocked_insert = tokio::spawn(async move { lock_store.insert_ci_run(&later_pr).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut blocked_insert)
+            .await
+            .is_err(),
+        "producer insertion must wait for the shared PR-group transaction lock"
+    );
+    held_group.commit().await.unwrap();
+    assert!(
+        blocked_insert.await.unwrap().unwrap(),
+        "producer insertion proceeds after the starter-equivalent lock commits"
     );
     assert!(
         sqlx::query(

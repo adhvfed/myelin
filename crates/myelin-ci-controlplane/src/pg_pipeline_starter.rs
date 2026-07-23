@@ -30,7 +30,7 @@ use myelin_flow::{partition_for_run_id, PgFlowExecutor, RunId, StartSpec, CI_PIP
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
 use myelin_storage::pgrelay::PgRelay;
-use myelin_storage::{BlobStore, ContentHash};
+use myelin_storage::{BlobStore, ContentHash, DurableCostLedger};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{PgPool, Row};
 
@@ -40,6 +40,7 @@ use crate::ci_drive_manifest::{
     CiLaunchAuthorityV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, GrantedCiJobV1,
 };
 use crate::ci_run_store::CiRunRecord;
+use crate::ci_run_supersession::{HeadDecision, PgCiRunSupersession};
 use crate::run_plan::{
     load_launch_run_plan_v2, PreparedRunPlanV2, RunPlanError, RUN_PLAN_SCHEMA_V2,
 };
@@ -374,6 +375,8 @@ struct StarterCandidate {
 pub enum StartQueuedOutcome {
     /// No queued row exists in this exact configured cell.
     Idle,
+    /// The queued row was atomically terminalized because a higher producer generation exists.
+    Superseded { run_id: String },
     /// The row and workflow were atomically advanced.
     Started { run_id: String, wf_run_id: String },
 }
@@ -388,6 +391,8 @@ pub enum PgCiStarterError {
     Plan(RunPlanError),
     LaunchAuthority(CiLaunchAuthorityError),
     Manifest(CiDriveManifestError),
+    Supersession(crate::CiRunSupersessionError),
+    SupersessionUnavailable,
     WorkflowIdentityMismatch { expected: String, actual: String },
 }
 
@@ -401,6 +406,10 @@ impl std::fmt::Display for PgCiStarterError {
             Self::Plan(error) => write!(f, "queued CI run plan refused: {error}"),
             Self::LaunchAuthority(error) => write!(f, "{error}"),
             Self::Manifest(error) => write!(f, "CI drive manifest refused: {error}"),
+            Self::Supersession(error) => write!(f, "CI run supersession refused: {error}"),
+            Self::SupersessionUnavailable => f.write_str(
+                "pull-request CI start refused: no durable run-supersession authority is configured",
+            ),
             Self::WorkflowIdentityMismatch { expected, actual } => write!(
                 f,
                 "durable workflow idempotency collision: queued run requires `{expected}` but key resolved to `{actual}`"
@@ -422,6 +431,7 @@ pub struct PgCiPipelineStarter {
     blobs: Arc<dyn BlobStore + Send + Sync>,
     definition: CiWorkflowDefinitionPin,
     launch_authority: Arc<dyn CiLaunchAuthorityMaterializer>,
+    supersession: Option<PgCiRunSupersession>,
 }
 
 impl PgCiPipelineStarter {
@@ -446,9 +456,8 @@ impl PgCiPipelineStarter {
         )
     }
 
-    /// Construct a starter with an explicit policy-aware authority adapter. Production composition
-    /// intentionally uses [`Self::new`] until such an adapter is wired; tests and future composition
-    /// must opt in here rather than receiving a synthetic default grant.
+    /// Construct a starter with an explicit policy-aware authority adapter but no PR supersession
+    /// authority. This is useful for non-PR tests; any pull-request row fails closed.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_authority(
         pool: PgPool,
@@ -459,6 +468,56 @@ impl PgCiPipelineStarter {
         blobs: Arc<dyn BlobStore + Send + Sync>,
         definition: CiWorkflowDefinitionPin,
         launch_authority: Arc<dyn CiLaunchAuthorityMaterializer>,
+    ) -> Result<Self, PgCiStarterError> {
+        Self::new_with_components(
+            pool,
+            rt,
+            minter,
+            tenant,
+            region,
+            blobs,
+            definition,
+            launch_authority,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_authority_and_supersession(
+        pool: PgPool,
+        rt: tokio::runtime::Handle,
+        minter: Arc<dyn IdMinter>,
+        tenant: TenantId,
+        region: Region,
+        blobs: Arc<dyn BlobStore + Send + Sync>,
+        definition: CiWorkflowDefinitionPin,
+        launch_authority: Arc<dyn CiLaunchAuthorityMaterializer>,
+        supersession: PgCiRunSupersession,
+    ) -> Result<Self, PgCiStarterError> {
+        Self::new_with_components(
+            pool,
+            rt,
+            minter,
+            tenant,
+            region,
+            blobs,
+            definition,
+            launch_authority,
+            Some(supersession),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_components(
+        pool: PgPool,
+        rt: tokio::runtime::Handle,
+        minter: Arc<dyn IdMinter>,
+        tenant: TenantId,
+        region: Region,
+        blobs: Arc<dyn BlobStore + Send + Sync>,
+        definition: CiWorkflowDefinitionPin,
+        launch_authority: Arc<dyn CiLaunchAuthorityMaterializer>,
+        supersession: Option<PgCiRunSupersession>,
     ) -> Result<Self, PgCiStarterError> {
         validate_scope("tenant", &tenant.0)?;
         validate_scope("region", &region.0)?;
@@ -472,6 +531,7 @@ impl PgCiPipelineStarter {
             blobs,
             definition,
             launch_authority,
+            supersession,
         })
     }
 
@@ -483,6 +543,9 @@ impl PgCiPipelineStarter {
             return Ok(StartQueuedOutcome::Idle);
         };
         validate_candidate(&self.tenant, &self.region, &candidate)?;
+        if let Some(outcome) = self.cancel_if_already_superseded(&candidate).await? {
+            return Ok(outcome);
+        }
         let manifest_store =
             CiDriveManifestStore::new(self.pool.clone(), self.tenant.clone(), self.region.clone())
                 .map_err(PgCiStarterError::Manifest)?;
@@ -507,6 +570,12 @@ impl PgCiPipelineStarter {
             .await
             .map_err(|error| PgCiStarterError::Database(format!("begin: {error}")))?;
         scope_transaction(&mut transaction, &self.tenant, &self.region).await?;
+        if let Some((group, _)) = pr_supersession_identity(&candidate.record) {
+            self.supersession()?
+                .lock_group_on_conn(&mut transaction, group)
+                .await
+                .map_err(PgCiStarterError::Supersession)?;
+        }
         let tenant_id = &self.tenant.0;
         let row = sqlx::query(LOCK_EXACT_QUEUED_RUN)
             .bind(tenant_id)
@@ -528,6 +597,29 @@ impl PgCiPipelineStarter {
             ));
         }
         validate_candidate(&self.tenant, &self.region, &locked)?;
+        if let Some((group, generation)) = pr_supersession_identity(&locked.record) {
+            let supersession = self.supersession()?;
+            if supersession
+                .classify_on_conn(&mut transaction, &locked.record.run_id, group, generation)
+                .await
+                .map_err(PgCiStarterError::Supersession)?
+                == HeadDecision::Superseded
+            {
+                let run_id = locked.record.run_id.clone();
+                supersession
+                    .cancel_stale_queued_on_conn(
+                        &mut transaction,
+                        &locked.record.run_id,
+                        &locked.record.wf_run_id,
+                    )
+                    .await
+                    .map_err(PgCiStarterError::Supersession)?;
+                transaction.commit().await.map_err(|error| {
+                    PgCiStarterError::Database(format!("commit stale run cancellation: {error}"))
+                })?;
+                return Ok(StartQueuedOutcome::Superseded { run_id });
+            }
+        }
         let started_at = locked.created_at.clone();
         let record = locked.record;
         let replay = lock_existing_exact_workflow(&mut transaction, &record).await?;
@@ -651,6 +743,12 @@ impl PgCiPipelineStarter {
                 "queued-to-running compare-and-set affected no row".into(),
             ));
         }
+        if let Some((group, generation)) = pr_supersession_identity(&record) {
+            self.supersession()?
+                .cancel_older_on_conn(&mut transaction, &record.run_id, group, generation)
+                .await
+                .map_err(PgCiStarterError::Supersession)?;
+        }
         transaction
             .commit()
             .await
@@ -682,6 +780,94 @@ impl PgCiPipelineStarter {
         })?;
         row.as_ref().map(decode_candidate).transpose()
     }
+
+    async fn cancel_if_already_superseded(
+        &self,
+        candidate: &StarterCandidate,
+    ) -> Result<Option<StartQueuedOutcome>, PgCiStarterError> {
+        let Some((group, generation)) = pr_supersession_identity(&candidate.record) else {
+            return Ok(None);
+        };
+        let supersession = self.supersession()?;
+        let mut transaction =
+            self.pool.begin().await.map_err(|error| {
+                PgCiStarterError::Database(format!("begin head guard: {error}"))
+            })?;
+        scope_transaction(&mut transaction, &self.tenant, &self.region).await?;
+        supersession
+            .lock_group_on_conn(&mut transaction, group)
+            .await
+            .map_err(PgCiStarterError::Supersession)?;
+        let tenant_id = &self.tenant.0;
+        let row = sqlx::query(LOCK_EXACT_QUEUED_RUN)
+            .bind(tenant_id)
+            .bind(&self.region.0)
+            .bind(&candidate.record.run_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| {
+                PgCiStarterError::Database(format!("lock head-guard candidate: {error}"))
+            })?;
+        let Some(row) = row else {
+            transaction.rollback().await.map_err(|error| {
+                PgCiStarterError::Database(format!("rollback lost head-guard candidate: {error}"))
+            })?;
+            return Ok(Some(StartQueuedOutcome::Idle));
+        };
+        let locked = decode_candidate(&row)?;
+        if &locked != candidate {
+            return Err(PgCiStarterError::CorruptRun(
+                "authoritative ci_run changed before head-generation guard".into(),
+            ));
+        }
+        let decision = supersession
+            .classify_on_conn(
+                &mut transaction,
+                &candidate.record.run_id,
+                group,
+                generation,
+            )
+            .await
+            .map_err(PgCiStarterError::Supersession)?;
+        if decision == HeadDecision::Superseded {
+            supersession
+                .cancel_stale_queued_on_conn(
+                    &mut transaction,
+                    &candidate.record.run_id,
+                    &candidate.record.wf_run_id,
+                )
+                .await
+                .map_err(PgCiStarterError::Supersession)?;
+            transaction.commit().await.map_err(|error| {
+                PgCiStarterError::Database(format!("commit head-guard cancellation: {error}"))
+            })?;
+            return Ok(Some(StartQueuedOutcome::Superseded {
+                run_id: candidate.record.run_id.clone(),
+            }));
+        }
+        transaction.commit().await.map_err(|error| {
+            PgCiStarterError::Database(format!("commit current-head guard: {error}"))
+        })?;
+        Ok(None)
+    }
+
+    fn supersession(&self) -> Result<&PgCiRunSupersession, PgCiStarterError> {
+        self.supersession
+            .as_ref()
+            .ok_or(PgCiStarterError::SupersessionUnavailable)
+    }
+}
+
+fn pr_supersession_identity(record: &CiRunRecord) -> Option<(&str, Option<i64>)> {
+    (record.trigger_kind == "pull_request").then(|| {
+        (
+            record
+                .concurrency_group
+                .as_deref()
+                .expect("validated pull-request run has a concurrency group"),
+            record.pr_head_generation,
+        )
+    })
 }
 
 async fn emit_initial_checks(
@@ -817,11 +1003,13 @@ pub struct PgCiRunStarterFactory {
     region: Region,
     blobs: Arc<dyn BlobStore + Send + Sync>,
     launch_authority: Arc<dyn CiLaunchAuthorityMaterializer>,
+    supersession_ledger: Option<DurableCostLedger>,
 }
 
 impl PgCiRunStarterFactory {
-    /// Test-support constructor with the explicit fail-closed authority. Production callers must use
-    /// [`Self::new_with_authority`], so an executable composition cannot silently inherit a placeholder.
+    /// Test-support constructor with the explicit fail-closed authority. Production composition uses
+    /// [`Self::new_with_authority_and_supersession`], so a PR lane cannot silently omit newest-head
+    /// ordering and cancellation.
     /// The `region` is the residency boundary every minted starter polls (and never crosses); `blobs`
     /// is the plan CAS the resolved run plan is loaded from; `minter` mints durable workflow ids.
     #[cfg(any(test, feature = "test-support"))]
@@ -850,6 +1038,38 @@ impl PgCiRunStarterFactory {
         blobs: Arc<dyn BlobStore + Send + Sync>,
         launch_authority: Arc<dyn CiLaunchAuthorityMaterializer>,
     ) -> PgCiRunStarterFactory {
+        Self::new_with_components(pool, rt, minter, region, blobs, launch_authority, None)
+    }
+
+    pub fn new_with_authority_and_supersession(
+        pool: PgPool,
+        rt: tokio::runtime::Handle,
+        minter: Arc<dyn IdMinter>,
+        region: Region,
+        blobs: Arc<dyn BlobStore + Send + Sync>,
+        launch_authority: Arc<dyn CiLaunchAuthorityMaterializer>,
+        supersession_ledger: DurableCostLedger,
+    ) -> PgCiRunStarterFactory {
+        Self::new_with_components(
+            pool,
+            rt,
+            minter,
+            region,
+            blobs,
+            launch_authority,
+            Some(supersession_ledger),
+        )
+    }
+
+    fn new_with_components(
+        pool: PgPool,
+        rt: tokio::runtime::Handle,
+        minter: Arc<dyn IdMinter>,
+        region: Region,
+        blobs: Arc<dyn BlobStore + Send + Sync>,
+        launch_authority: Arc<dyn CiLaunchAuthorityMaterializer>,
+        supersession_ledger: Option<DurableCostLedger>,
+    ) -> PgCiRunStarterFactory {
         PgCiRunStarterFactory {
             pool,
             rt,
@@ -857,6 +1077,7 @@ impl PgCiRunStarterFactory {
             region,
             blobs,
             launch_authority,
+            supersession_ledger,
         }
     }
 
@@ -875,16 +1096,38 @@ impl PgCiRunStarterFactory {
         tenant: TenantId,
         definition: CiWorkflowDefinitionPin,
     ) -> Result<PgCiPipelineStarter, PgCiStarterError> {
-        PgCiPipelineStarter::new_with_authority(
-            self.pool.clone(),
-            self.rt.clone(),
-            self.minter.clone(),
-            tenant,
-            self.region.clone(),
-            self.blobs.clone(),
-            definition,
-            self.launch_authority.clone(),
-        )
+        if let Some(ledger) = &self.supersession_ledger {
+            let supersession = PgCiRunSupersession::new(
+                self.pool.clone(),
+                ledger.clone(),
+                tenant.clone(),
+                self.region.clone(),
+                self.rt.clone(),
+            )
+            .map_err(PgCiStarterError::Supersession)?;
+            PgCiPipelineStarter::new_with_authority_and_supersession(
+                self.pool.clone(),
+                self.rt.clone(),
+                self.minter.clone(),
+                tenant,
+                self.region.clone(),
+                self.blobs.clone(),
+                definition,
+                self.launch_authority.clone(),
+                supersession,
+            )
+        } else {
+            PgCiPipelineStarter::new_with_authority(
+                self.pool.clone(),
+                self.rt.clone(),
+                self.minter.clone(),
+                tenant,
+                self.region.clone(),
+                self.blobs.clone(),
+                definition,
+                self.launch_authority.clone(),
+            )
+        }
     }
 }
 
@@ -958,6 +1201,26 @@ fn validate_candidate(
         return Err(PgCiStarterError::CorruptRun(
             "queued ci_run has contradictory settled/finished/creation lifecycle facts".into(),
         ));
+    }
+    match (
+        candidate.record.trigger_kind.as_str(),
+        candidate.record.concurrency_group.as_deref(),
+        candidate.record.pr_head_generation,
+    ) {
+        ("pull_request", Some(group), generation)
+            if crate::ci_run_store::valid_pr_concurrency_group(group)
+                && generation.is_none_or(|value| value > 0) => {}
+        ("pull_request", _, _) => {
+            return Err(PgCiStarterError::CorruptRun(
+                "pull-request run lacks canonical supersession authority".into(),
+            ))
+        }
+        (_, None, None) => {}
+        _ => {
+            return Err(PgCiStarterError::CorruptRun(
+                "non-PR run carries PR supersession authority".into(),
+            ))
+        }
     }
     Ok(())
 }

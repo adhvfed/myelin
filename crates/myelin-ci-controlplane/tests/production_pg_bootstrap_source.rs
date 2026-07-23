@@ -14,7 +14,10 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let claim_issuer_source = include_str!("../src/ci_claim_token_issuer.rs");
     let identity_adapter_source = include_str!("../src/ci_identity_adapter.rs");
     let runtime_composition_source = include_str!("../src/ci_runtime_composition.rs");
+    let manifest_runner_source = include_str!("../src/ci_manifest_job_runner.rs");
+    let job_spec_store_source = include_str!("../src/job_spec_store.rs");
     let runner_identity_source = include_str!("../src/ci_runner_composition.rs");
+    let supersession_source = include_str!("../src/ci_run_supersession.rs");
     let job_queue_store_source = include_str!("../src/job_queue_store.rs");
     let region_store_source = include_str!("../src/job_queue_region.rs");
     let runner_bind_source = include_str!("../src/runner_bind.rs");
@@ -76,9 +79,6 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let runner_hooks = source
         .find("ci_runner_hooks(")
         .expect("the scoped durable CI runner hooks must be composed at the root");
-    let runner_cancellations = source
-        .find("ci_runner_cancellation_coordinator(")
-        .expect("accounted cancel-superseded capability must be composed at the root");
     let runner_resolver = source
         .find("durable_spec_resolver(")
         .expect("the claim-bound durable spec resolver must be composed at the root");
@@ -98,9 +98,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(!source.contains("spawn_until_shutdown"));
     assert!(!source.contains("runner.spawn("));
     assert!(!source.contains("runner.spawn_until_shutdown("));
-    assert!(source.contains(
-        "Some((\n            starter_poller,\n            workflow_poller,\n            runner_cancellations,\n            runner,"
-    ));
+    assert!(source.contains("Some((starter_poller, workflow_poller, runner))"));
+    assert!(!source.contains("ci_runner_cancellation_coordinator("));
     assert!(!source.contains("CiPipelineDriver"));
     assert!(!source.contains("unresolved_stage_spec_builder"));
     assert!(!source.contains("TenantId(\"ci-controlplane\""));
@@ -113,8 +112,16 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(starter_factory_source.contains("LinuxSmallV1LaunchAuthority::new"));
     assert!(starter_factory_source.contains("PgTierPCiJobBudgetReservation::new"));
     assert!(starter_factory_source.contains("TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING"));
+    assert!(starter_factory_source.contains("new_with_authority_and_supersession"));
+    assert!(starter_factory_source.contains("supersession_ledger"));
     assert!(!starter_factory_source.contains("DEFAULT_TENANT_IN_FLIGHT_CAP"));
     assert!(!starter_factory_source.contains("UnavailableCiJobBudgetReservation"));
+    assert!(run_store_source.contains("pg_advisory_xact_lock"));
+    assert!(run_store_source.contains("lock_pr_concurrency_group_on_conn(conn"));
+    assert!(supersession_source.contains("lock_pr_concurrency_group_on_conn("));
+    assert!(manifest_runner_source.contains("co_persist_active_flow_dispatch"));
+    assert!(job_spec_store_source.contains("SELECT state FROM workflow_run"));
+    assert!(job_spec_store_source.contains("state.as_deref() != Some(\"running\")"));
     for production_dependency in [
         "DurableCellRootBacking::new",
         "RevocationStore::with_pg",
@@ -179,8 +186,6 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         "settle_in_tx",
         "ReleaseDisposition::CanceledBeforeLaunch",
         "completion_receipt.is_none()",
-        "cancel_superseded_and_settle",
-        "sqlx::query(crate::CANCEL_SUPERSEDED_QUERY)",
         "job.reserve_handle != scope.reserve_handle",
         "HardeningProfile::derive",
         "launch_authorizer.authorize(spec)",
@@ -190,6 +195,21 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
             "production runner lifecycle must retain {production_lifecycle_dependency}"
         );
     }
+    for production_supersession_dependency in [
+        "pr_head_generation",
+        "cancel_stale_queued_on_conn",
+        "cancel_running_on_conn",
+        "cancel_on_conn",
+        "settle_in_tx",
+        "CI_RUN_CANCELLED",
+        "CheckState::Cancelled",
+        "emit_settled_cancelled_checks_on_conn",
+    ] {
+        assert!(
+            supersession_source.contains(production_supersession_dependency),
+            "production run supersession must retain {production_supersession_dependency}"
+        );
+    }
     assert!(
         launch_authority_source.contains("ManifestBoundCiJobTokenAuthority::handle_for(request)")
     );
@@ -197,14 +217,14 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(dispatch_consumer_source.contains("let group = format!(\"pr:{repo}:{number}\")"));
     assert!(dispatch_consumer_source.contains(".get(\"head_generation\")"));
     assert!(dispatch_consumer_source.contains("(\"head_oid\", Some(group), Some(generation))"));
-    assert!(dispatch_consumer_source
-        .contains(".with_upcaster(pr_trigger_upcasters().into_hook())"));
+    assert!(dispatch_consumer_source.contains(".with_upcaster(pr_trigger_upcasters().into_hook())"));
     assert!(dispatch_consumer_source
         .contains("ev.schema_ver < myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2"));
     assert!(dispatch_consumer_source
         .contains("concurrency_group: armed.reserve.concurrency_group.clone()"));
-    assert!(dispatch_consumer_source
-        .contains("pr_head_generation: armed.reserve.pr_head_generation"));
+    assert!(
+        dispatch_consumer_source.contains("pr_head_generation: armed.reserve.pr_head_generation")
+    );
     assert!(git_events_source.contains("git_event_token_list() -> SubsystemTokenList"));
     assert!(git_events_source.contains("GIT_PR_HEAD_TRIGGER_SCHEMA_V2"));
     assert!(git_pr_store_source.contains("co_commit_event("));
@@ -272,9 +292,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(reporter_router < runner_identity);
     assert!(runner_identity < runner_resolver);
     assert!(runner_resolver < runner_hooks);
-    assert!(runner_hooks < runner_cancellations);
-    assert!(runner_cancellations < runner_loop);
-    assert!(runner_cancellations < service);
+    assert!(runner_hooks < runner_loop);
     assert!(runner_hooks < service);
     assert!(starter_lane < service);
 }

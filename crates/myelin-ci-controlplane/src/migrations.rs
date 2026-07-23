@@ -142,7 +142,7 @@ pub const CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID: &str =
 /// already-applied `ci_0015_ci_job_spec` table (the `ci_0002a` convention), applied immediately after
 /// it so its checksum is never rewritten and the `ci_0015` create stays byte-frozen.
 pub const CI_JOB_SPEC_STAGE_MIGRATION_ID: &str = "ci_0015a_ci_job_spec_stage";
-/// Forward-only disposition column for dependency-skipped job accounting receipts.
+/// Forward-only disposition column for manifest jobs terminalized without execution.
 pub const CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID: &str = "ci_0017a_ci_job_accounting_skipped";
 /// Forward-only migration id for [`ALTER_JOB_QUEUE_ADD_COMPLETION_DDL`]. A sub-migration of the
 /// already-applied `ci_0004_job_queue` table, applied immediately after it (the `ci_0002a` convention)

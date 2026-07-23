@@ -85,9 +85,14 @@ pub use ci_identity_adapter::{
     ci_job_authorization_context, IdentityCiJobCredentialMinter, IdentityCiJobLaunchAuthorizer,
     CI_JOB_PRINCIPAL_ID, CI_JOB_REQUIRED_CAPABILITIES,
 };
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 pub use ci_runner_composition::{
-    ci_runner_cancellation_coordinator, ci_runner_hooks, ci_runner_identity_authorities,
-    CiRunnerCancellationCoordinator, CiRunnerIdentityAuthorities, CiRunnerIdentityCompositionError,
+    ci_runner_cancellation_coordinator, CiRunnerCancellationCoordinator,
+};
+pub use ci_runner_composition::{
+    ci_runner_hooks, ci_runner_identity_authorities, CiRunnerIdentityAuthorities,
+    CiRunnerIdentityCompositionError,
 };
 pub use ci_runtime_composition::{
     ci_manifest_pipeline_definition, ci_production_runtime_factory, CiProductionRuntimeFactory,
@@ -126,6 +131,7 @@ pub use ci_manifest_job_runner::{
 /// now-real policy, Identity, and scoped reservation authorities, then closing the complete
 /// crash/recovery matrix.
 pub mod ci_run_region;
+pub mod ci_run_supersession;
 pub mod ci_run_starter_poller;
 pub mod ci_run_store;
 pub mod ci_scheduler_db;
@@ -566,6 +572,7 @@ pub use ci_run_region::{
     CiActiveRunCursor, CiActiveRunPage, CiActiveRunRoute, CiRegionRunDiscovery,
     DISCOVER_ACTIVE_CI_RUNS_QUERY, DISCOVER_QUEUED_CI_RUN_TENANT_QUERY, MAX_ACTIVE_CI_RUN_PAGE,
 };
+pub use ci_run_supersession::{CiRunSupersessionError, PgCiRunSupersession};
 pub use ci_run_starter_poller::{
     CiRunStarterBatch, CiRunStarterPollerError, PgCiRunStarterPoller, MAX_CI_RUN_START_BATCH,
 };
@@ -911,13 +918,14 @@ pub fn ci_run_starter_factory(
     region: myelin_tenancy::Region,
     blobs: std::sync::Arc<dyn myelin_storage::BlobStore + Send + Sync>,
     rt: tokio::runtime::Handle,
+    supersession_ledger: myelin_storage::DurableCostLedger,
 ) -> Result<PgCiRunStarterFactory, CiLaunchAuthorityError> {
     let reservations = ci_launch_authority::PgTierPCiJobBudgetReservation::new(
         pool.clone(),
         region.0.clone(),
         ci_launch_authority::TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
     )?;
-    Ok(PgCiRunStarterFactory::new_with_authority(
+    Ok(PgCiRunStarterFactory::new_with_authority_and_supersession(
         pool,
         rt,
         std::sync::Arc::new(myelin_events::MonotonicMinter::new()),
@@ -926,6 +934,7 @@ pub fn ci_run_starter_factory(
         std::sync::Arc::new(ci_launch_authority::LinuxSmallV1LaunchAuthority::new(
             std::sync::Arc::new(reservations),
         )),
+        supersession_ledger,
     ))
 }
 

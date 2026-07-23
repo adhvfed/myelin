@@ -346,17 +346,97 @@ impl CiCostEventStore {
                     .map_err(|_| CiCostStoreError::Db("verify existing cost event"))?;
                 for (column, incoming, recorded) in [
                     ("amount", amount, existing.get::<i64, _>("amount")),
-                    ("wholesale", wholesale, existing.get::<i64, _>("wholesale_minor_units")),
-                    ("markup", markup, existing.get::<i64, _>("markup_minor_units")),
+                    (
+                        "wholesale",
+                        wholesale,
+                        existing.get::<i64, _>("wholesale_minor_units"),
+                    ),
+                    (
+                        "markup",
+                        markup,
+                        existing.get::<i64, _>("markup_minor_units"),
+                    ),
                 ] {
                     if incoming != recorded {
-                        return Err(CiCostStoreError::AmountDivergence { column, recorded, incoming });
+                        return Err(CiCostStoreError::AmountDivergence {
+                            column,
+                            recorded,
+                            incoming,
+                        });
                     }
                 }
             }
             affected += done.rows_affected();
         }
         Ok(affected)
+    }
+
+    /// Verify one job's complete immutable CI projection without inserting or repairing rows.
+    ///
+    /// Supersession uses this when accepting accounting written by a reporter that won an earlier
+    /// race. Missing, extra, or value-divergent projection rows are corruption, not an invitation to
+    /// reconstruct monetary truth during cancellation.
+    pub(crate) async fn verify_exact_job_in_tx(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        scope: &TenantScope,
+        expected: &[CostEventRow],
+    ) -> Result<(), CiCostStoreError> {
+        let verified = VerifiedCostScope::new(scope, &self.region)?;
+        verified.verify_rows(expected)?;
+        let Some(first) = expected.first() else {
+            return Err(CiCostStoreError::CorruptRow(
+                "empty expected job projection".into(),
+            ));
+        };
+        if expected
+            .iter()
+            .any(|row| row.run_id != first.run_id || row.job_id != first.job_id)
+        {
+            return Err(CiCostStoreError::CorruptRow(
+                "mixed job projection authority".into(),
+            ));
+        }
+        let run_id = parse_id("run_id", &first.run_id)?;
+        let job_id = parse_id("job_id", &first.job_id)?;
+        let rows = sqlx::query(
+            "SELECT meter, amount, wholesale_minor_units, markup_minor_units, kind \
+             FROM ci_cost_event \
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND job_id = $4 \
+             ORDER BY meter",
+        )
+        .bind(verified.tenant_id.as_str())
+        .bind(&verified.region.0)
+        .bind(run_id)
+        .bind(job_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|_| CiCostStoreError::Db("verify exact job cost projection"))?;
+        if rows.len() != expected.len() {
+            return Err(CiCostStoreError::CorruptRow(
+                "job projection cardinality divergence".into(),
+            ));
+        }
+        let mut expected = expected.to_vec();
+        expected.sort_by_key(|row| row.meter.token());
+        for (row, expected) in rows.iter().zip(expected.iter()) {
+            let meter: String = row.get("meter");
+            let kind: String = row.get("kind");
+            let amount: i64 = row.get("amount");
+            let wholesale: i64 = row.get("wholesale_minor_units");
+            let markup: i64 = row.get("markup_minor_units");
+            if meter != expected.meter.token()
+                || kind != expected.kind.token()
+                || u64::try_from(amount).ok() != Some(expected.amount)
+                || u64::try_from(wholesale).ok() != Some(expected.wholesale.0)
+                || u64::try_from(markup).ok() != Some(expected.markup.0)
+            {
+                return Err(CiCostStoreError::CorruptRow(
+                    "job projection value divergence".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// **Settle-and-commit convenience.** Opens a transaction, records the projection rows via

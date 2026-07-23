@@ -41,7 +41,8 @@ pub struct CiJobAccountingRecord {
     pub reserve_handle: String,
     pub passed: bool,
     pub timed_out: bool,
-    /// True only for a manifest job that was never dispatched because a dependency failed.
+    /// True for a manifest job settled without execution because a dependency failed or the whole
+    /// run was cancelled before this job crossed the final launch fence.
     pub skipped: bool,
     pub usage: ResourceUsage,
     pub pricing_revision: String,

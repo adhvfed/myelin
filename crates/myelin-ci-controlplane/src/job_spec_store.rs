@@ -323,6 +323,32 @@ impl CiJobSpecStore {
         launch: &DurableCiJobLaunchTemplate,
         stage: &str,
     ) -> Result<DispatchOutcome, CiJobSpecStoreError> {
+        self.co_persist_dispatch_inner(enq, launch, stage, false)
+            .await
+    }
+
+    /// Co-persist a manifest dispatch only while its exact Flow run is durably active.
+    ///
+    /// The workflow row is locked before the queue row in this same transaction. Run
+    /// supersession takes the same Flow→queue order, so either dispatch commits first and
+    /// cancellation observes the row, or cancellation terminates Flow first and this write refuses.
+    pub async fn co_persist_active_flow_dispatch(
+        &self,
+        enq: &DurableEnqueue,
+        launch: &DurableCiJobLaunchTemplate,
+        stage: &str,
+    ) -> Result<DispatchOutcome, CiJobSpecStoreError> {
+        self.co_persist_dispatch_inner(enq, launch, stage, true)
+            .await
+    }
+
+    async fn co_persist_dispatch_inner(
+        &self,
+        enq: &DurableEnqueue,
+        launch: &DurableCiJobLaunchTemplate,
+        stage: &str,
+        require_active_flow: bool,
+    ) -> Result<DispatchOutcome, CiJobSpecStoreError> {
         // ── the two fail-closed dispatch invariants (SECURITY trust-tier + the lease-TTL floor). ──
         validate_dispatch(enq.trust_tier, launch)?;
 
@@ -340,6 +366,7 @@ impl CiJobSpecStore {
         let region = enq.region.clone();
         let fair_key = enq.fair_key.clone();
         let idem = enq.idem_token.clone();
+        let workflow_run_id = enq.run_id.clone();
         if enq.stage != stage {
             return Err(CiJobSpecStoreError::Db(
                 "durable dispatch stage differs between queue authority and spec identity".into(),
@@ -349,6 +376,23 @@ impl CiJobSpecStore {
         let (enqueued, spec_inserted) =
             with_tenant_tx(&self.pool, &enq.tenant_id, &enq.region, move |conn| {
                 Box::pin(async move {
+                    if require_active_flow {
+                        let state = sqlx::query_scalar::<_, String>(
+                            "SELECT state FROM workflow_run \
+                             WHERE tenant_id = $1 AND region = $2 AND run_id = $3 FOR UPDATE",
+                        )
+                        .bind(&tenant_id)
+                        .bind(&region)
+                        .bind(&workflow_run_id)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| PgError::Query(e.to_string()))?;
+                        if state.as_deref() != Some("running") {
+                            return Err(PgError::Query(
+                                "manifest dispatch refused: owning Flow run is not active".into(),
+                            ));
+                        }
+                    }
                     // (1) the job_queue row (the eligibility gate) — idempotent on jq_idem.
                     let jq_row = sqlx::query(INSERT_JOB_QUEUE_QUERY)
                         .bind(&tenant_id) // $1 tenant_id (the RLS/tenant predicate)

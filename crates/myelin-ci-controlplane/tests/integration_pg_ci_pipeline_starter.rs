@@ -7,27 +7,38 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use myelin_ci_controlplane::{
-    ci_artifact_ref, ci_job_id_v2, ci_region_run_discovery_test_support, ci_run_ref,
-    ci_run_starter_factory, CiExecutionProfileV1, CiExecutionRequestV1, CiJobLaunchGrantV1,
-    CiLaunchAuthorityError, CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1, CiManifestLaneV1,
-    CiManifestLimitsV1, CiManifestSchedulingV1, CiWorkflowDefinitionPin, PgCiPipelineStarter,
-    PgCiRunStarterFactory, PgCiRunStarterPoller, PreparedRunPlanV2, ResolvedJobV2,
-    ResolvedRunPlanV2, StartQueuedOutcome, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
+    ci_artifact_ref, ci_job_id_v2, ci_production_runtime_factory_test_support,
+    ci_region_run_discovery_test_support, ci_run_ref, ci_run_starter_factory, CiDriveManifestStore,
+    CiExecutionProfileV1, CiExecutionRequestV1, CiJobLaunchClaim, CiJobLaunchGrantV1,
+    CiJobQueueStore, CiJobSpecStore, CiLaunchAuthorityError, CiLaunchAuthorityMaterializer,
+    CiLaunchAuthorityV1, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
+    CiWorkflowDefinitionPin, DurableCiJobLaunchTemplate, DurableEnqueue, GrantedCiJobV1, Lane,
+    PgCiPipelineStarter, PgCiRunStarterFactory, PgCiRunStarterPoller, PreparedRunPlanV2,
+    ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome, ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL,
+    ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
     ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
-    CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
-    CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
-    CREATE_CI_RUN_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
+    CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_ACCOUNTING_DDL,
+    CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL,
+    CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
+};
+use myelin_ci_sandbox::{
+    CompletionClaim, EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpecTemplate,
+    MeterTarget, ResourceLimits, ResourceUsage, SecretRef, TerminalReport, TerminalReporter,
+    TrustTier, WorkspaceSpec,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::MonotonicMinter;
 use myelin_flow::{
-    migrations::migrations as flow_migrations, DurableExecutor, PgFlowExecutor, RunId, StartSpec,
-    CI_PIPELINE_WF_TYPE,
+    migrations::migrations as flow_migrations, DurableExecutor, PgFlowExecutor, RunId,
+    SignalOutcome, StartSpec, CI_PIPELINE_WF_TYPE,
 };
 use myelin_refs::ArtifactRef;
 use myelin_storage::{
     provider::foundation_migrations, reserve_settle_durable_migrations, BlobError, BlobMeta,
-    BlobStore, ContentHash, FsBlobStore, HotTables, PgMigrator,
+    BlobStore, ContentHash, DurableCostLedger, FsBlobStore, HotTables, PgMigrator,
+    SubstrateProvider,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
@@ -256,12 +267,14 @@ fn starter_with_operational_reservations(
     pool: &PgPool,
     tenant: &str,
     blobs: Arc<dyn BlobStore + Send + Sync>,
+    ledger: DurableCostLedger,
 ) -> PgCiPipelineStarter {
     ci_run_starter_factory(
         pool.clone(),
         Region("fr-par".into()),
         blobs,
         tokio::runtime::Handle::current(),
+        ledger,
     )
     .expect("valid production Tier-P starter factory")
     .starter_for(
@@ -325,6 +338,261 @@ async fn insert_run(
     .execute(admin)
     .await
     .expect("insert queued ci_run");
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_pr_run(
+    admin: &PgPool,
+    blobs: &FsBlobStore,
+    tenant: &str,
+    run_id: &str,
+    wf_run_id: &str,
+    group: &str,
+    generation: Option<i64>,
+    persist_plan: bool,
+) {
+    let snapshot = if persist_plan {
+        let bytes = plan().canonical_bytes().expect("canonical plan");
+        let hash = blobs
+            .put(&TenantId(tenant.into()), &bytes)
+            .expect("put immutable PR plan");
+        format!(
+            "myelin://{tenant}/ci/snapshot/{}",
+            hash.to_multihash_string()
+        )
+    } else {
+        format!("myelin://{tenant}/ci/snapshot/blake3:{}", "f".repeat(64))
+    };
+    sqlx::query(
+        "INSERT INTO ci_run (tenant_id, region, run_id, project_id, pipeline_id, wf_run_id, \
+         repo_ref, commit_oid, cause_event_id, cause_depth, caused_by, definition_snapshot, \
+         trigger_kind, concurrency_group, pr_head_generation, trust_tier, state, correlation_id) \
+         VALUES ($1, 'fr-par', $2::uuid, '22222222-2222-2222-2222-222222222222'::uuid, \
+         '33333333-3333-3333-3333-333333333333'::uuid, $3::uuid, \
+         'myelin://' || $1 || '/git/repo/core', 'deadbeef', 'trigger-' || $2, 1, \
+         'session:test', $4, 'pull_request', $5, $6, 'trusted', 'queued', 'corr-' || $2)",
+    )
+    .bind(tenant)
+    .bind(run_id)
+    .bind(wf_run_id)
+    .bind(snapshot)
+    .bind(group)
+    .bind(generation)
+    .execute(admin)
+    .await
+    .expect("insert queued PR ci_run");
+}
+
+struct SeededLaunch {
+    claim: CiJobLaunchClaim,
+    idem_token: String,
+    reserve_handle: String,
+}
+
+fn manifest_dispatch_for_test(
+    tenant: &str,
+    ci_run_id: &str,
+    wf_run_id: &str,
+    job: &GrantedCiJobV1,
+    suffix: &str,
+) -> (DurableEnqueue, DurableCiJobLaunchTemplate) {
+    let idem_token = format!("{wf_run_id}:fenced:{suffix}");
+    let template = DurableCiJobLaunchTemplate {
+        spec: JobSpecTemplate {
+            kind: JobKind::Ci,
+            image: ImageRef::pinned(job.image.clone()).unwrap(),
+            command: job.command.clone(),
+            env: job
+                .env
+                .iter()
+                .map(|(name, value)| EnvVar {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            secret_refs: job
+                .secret_handles
+                .iter()
+                .map(|(name, handle)| SecretRef {
+                    name: name.clone(),
+                    handle: handle.clone(),
+                })
+                .collect(),
+            egress: EgressPolicy {
+                allow: job.egress_allow.clone(),
+            },
+            limits: ResourceLimits {
+                cpu_millis: job.limits.cpu_millis,
+                mem_bytes: job.limits.mem_bytes,
+                disk_bytes: job.limits.disk_bytes,
+                pids_max: job.limits.pids_max,
+                timeout_secs: job.limits.timeout_secs,
+            },
+            workspace: WorkspaceSpec {
+                repo_ref: Some(job.workspace.repo_ref.clone()),
+                commit: Some(job.workspace.commit_oid.clone()),
+            },
+            trust_tier: TrustTier::Trusted,
+            meter_to: MeterTarget {
+                reserve_id: job.reserve_handle.clone(),
+            },
+            idem_token: IdemToken(idem_token.clone()),
+        },
+        ci_run_id: ci_run_id.into(),
+        token_authority_handle: job.token_authority_handle.clone(),
+    };
+    (
+        DurableEnqueue {
+            tenant_id: tenant.into(),
+            region: "fr-par".into(),
+            job_id: job.job_id.clone(),
+            run_id: wf_run_id.into(),
+            lane: match job.scheduling.lane {
+                CiManifestLaneV1::Interactive => Lane::Interactive,
+                CiManifestLaneV1::Batch => Lane::Batch,
+                CiManifestLaneV1::Deploy => Lane::Deploy,
+            },
+            labels: job.scheduling.labels.clone(),
+            trust_tier: TrustTier::Trusted,
+            concurrency_group: job.scheduling.concurrency_group.clone(),
+            fair_key: job.scheduling.fair_key.clone(),
+            idem_token,
+            stage: job.name.clone(),
+        },
+        template,
+    )
+}
+
+async fn seed_claimed_manifest_job(
+    admin: &PgPool,
+    tenant: &str,
+    ci_run_id: &str,
+    wf_run_id: &str,
+    queue_state: &str,
+) -> SeededLaunch {
+    assert!(matches!(queue_state, "leased" | "running"));
+    let tenant_id = TenantId(tenant.into());
+    let region = Region("fr-par".into());
+    let store =
+        CiDriveManifestStore::new(admin.clone(), tenant_id.clone(), region.clone()).unwrap();
+    let (manifest, _) = store
+        .load_by_identity(wf_run_id, ci_run_id)
+        .await
+        .unwrap()
+        .expect("started run has immutable manifest");
+    let job = manifest.jobs.first().expect("test plan has jobs");
+    let idem_token = format!("{wf_run_id}:race:{}", job.stage);
+    let template = DurableCiJobLaunchTemplate {
+        spec: JobSpecTemplate {
+            kind: JobKind::Ci,
+            image: ImageRef::pinned(job.image.clone()).unwrap(),
+            command: job.command.clone(),
+            env: job
+                .env
+                .iter()
+                .map(|(name, value)| EnvVar {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            secret_refs: job
+                .secret_handles
+                .iter()
+                .map(|(name, handle)| SecretRef {
+                    name: name.clone(),
+                    handle: handle.clone(),
+                })
+                .collect(),
+            egress: EgressPolicy {
+                allow: job.egress_allow.clone(),
+            },
+            limits: ResourceLimits {
+                cpu_millis: job.limits.cpu_millis,
+                mem_bytes: job.limits.mem_bytes,
+                disk_bytes: job.limits.disk_bytes,
+                pids_max: job.limits.pids_max,
+                timeout_secs: job.limits.timeout_secs,
+            },
+            workspace: WorkspaceSpec {
+                repo_ref: Some(job.workspace.repo_ref.clone()),
+                commit: Some(job.workspace.commit_oid.clone()),
+            },
+            trust_tier: TrustTier::Trusted,
+            meter_to: MeterTarget {
+                reserve_id: job.reserve_handle.clone(),
+            },
+            idem_token: IdemToken(idem_token.clone()),
+        },
+        ci_run_id: ci_run_id.into(),
+        token_authority_handle: job.token_authority_handle.clone(),
+    };
+    sqlx::query(
+        "INSERT INTO job_queue \
+           (tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group, \
+            fair_key, idem_token, stage, state, lease_owner, lease_expires, lease_epoch, \
+            claim_nonce, claim_started_at, claim_expires_at) \
+         VALUES ($1, 'fr-par', $2::uuid, $3::uuid, 'interactive', ARRAY['linux'], 'trusted', \
+                 $4, $1, $5, $6, $7, 'runner-race', statement_timestamp() + interval '10 minutes', \
+                 1, $2::uuid, statement_timestamp(), statement_timestamp() + interval '5 minutes')",
+    )
+    .bind(tenant)
+    .bind(&job.job_id)
+    .bind(wf_run_id)
+    .bind(&job.scheduling.concurrency_group)
+    .bind(&idem_token)
+    .bind(&job.stage)
+    .bind(queue_state)
+    .execute(admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ci_job_spec \
+           (tenant_id, region, job_id, run_id, idem_token, spec, stage) \
+         VALUES ($1, 'fr-par', $2::uuid, $3::uuid, $4, $5, $6)",
+    )
+    .bind(tenant)
+    .bind(&job.job_id)
+    .bind(wf_run_id)
+    .bind(&idem_token)
+    .bind(serde_json::to_value(template).unwrap())
+    .bind(&job.stage)
+    .execute(admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE cost_reservation SET state='inflight' \
+         WHERE tenant_id=$1 AND region='fr-par' AND run_id=$2",
+    )
+    .bind(tenant)
+    .bind(&job.reserve_handle)
+    .execute(admin)
+    .await
+    .unwrap();
+    let (started, expires): (i64, i64) = sqlx::query_as(
+        "SELECT extract(epoch FROM claim_started_at)::bigint, \
+                extract(epoch FROM claim_expires_at)::bigint \
+         FROM job_queue WHERE tenant_id=$1 AND job_id=$2::uuid",
+    )
+    .bind(tenant)
+    .bind(&job.job_id)
+    .fetch_one(admin)
+    .await
+    .unwrap();
+    SeededLaunch {
+        claim: CiJobLaunchClaim {
+            tenant_id: tenant.into(),
+            region: "fr-par".into(),
+            wf_run_id: wf_run_id.into(),
+            job_id: job.job_id.clone(),
+            lease_owner: "runner-race".into(),
+            lease_epoch: 1,
+            claim_nonce: job.job_id.clone(),
+            claim_started_at_epoch_secs: started,
+            claim_expires_at_epoch_secs: expires,
+        },
+        idem_token,
+        reserve_handle: job.reserve_handle.clone(),
+    }
 }
 
 async fn assert_atomic_started(
@@ -460,6 +728,100 @@ async fn assert_initial_checks(admin: &PgPool, tenant: &str, run_id: &str, attem
         assert!(envelope["event_id"]
             .as_str()
             .is_some_and(|id| id.starts_with("ci-check-start-")));
+    }
+}
+
+async fn cancelled_check_envelopes(
+    admin: &PgPool,
+    tenant: &str,
+    run_id: &str,
+) -> Vec<serde_json::Value> {
+    let run_ref = ci_run_ref(tenant, run_id).0;
+    sqlx::query_scalar(
+        "SELECT envelope FROM outbox \
+         WHERE envelope->>'type_' = 'ci.check.updated' \
+           AND envelope->>'tenant' = $1 \
+           AND envelope->'payload'->>'run' = $2 \
+           AND envelope->'payload'->>'state' = 'cancelled' \
+         ORDER BY (envelope->'payload'->>'cost_settled')::boolean, \
+                  envelope->'payload'->'context'->>'name'",
+    )
+    .bind(tenant)
+    .bind(run_ref)
+    .fetch_all(admin)
+    .await
+    .expect("read cancelled check outbox facts")
+}
+
+async fn assert_cancelled_facts(
+    admin: &PgPool,
+    tenant: &str,
+    run_id: &str,
+    expected_cost_postures: &[bool],
+) {
+    let run_ref = ci_run_ref(tenant, run_id).0;
+    let terminal: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT envelope FROM outbox \
+         WHERE envelope->>'type_' = 'ci.run.cancelled' \
+           AND envelope->>'tenant' = $1 \
+           AND envelope->'payload'->>'run' = $2",
+    )
+    .bind(tenant)
+    .bind(&run_ref)
+    .fetch_all(admin)
+    .await
+    .expect("read cancelled run fact");
+    assert_eq!(terminal.len(), 1, "one terminal run-cancellation fact");
+    assert_eq!(
+        terminal[0]["payload"]["reason"],
+        "superseded-by-newer-pr-head"
+    );
+    assert_eq!(terminal[0]["causation_id"], format!("trigger-{run_id}"));
+    assert_eq!(terminal[0]["correlation_id"], format!("corr-{run_id}"));
+    let checks = cancelled_check_envelopes(admin, tenant, run_id).await;
+    let expected_attempts: BTreeMap<String, i64> = initial_check_envelopes(admin, tenant, run_id)
+        .await
+        .into_iter()
+        .map(|envelope| {
+            (
+                envelope["payload"]["context"]["name"]
+                    .as_str()
+                    .expect("initial context name")
+                    .to_owned(),
+                envelope["payload"]["run_attempt"]
+                    .as_i64()
+                    .expect("initial run attempt"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        checks.len(),
+        expected_cost_postures.len() * 3,
+        "one cancellation fact per context and requested cost posture"
+    );
+    for expected_cost_settled in expected_cost_postures {
+        let posture: Vec<&serde_json::Value> = checks
+            .iter()
+            .filter(|envelope| {
+                envelope["payload"]["cost_settled"].as_bool() == Some(*expected_cost_settled)
+            })
+            .collect();
+        assert_eq!(posture.len(), 3);
+        for (envelope, context) in posture.iter().zip(["build", "package", "test"]) {
+            let payload = &envelope["payload"];
+            assert_eq!(payload["context"]["name"], context);
+            assert_eq!(payload["state"], "cancelled");
+            assert_eq!(
+                payload["run_attempt"].as_i64(),
+                expected_attempts.get(context).copied()
+            );
+            assert!(payload["completed_at"].is_string());
+            assert_eq!(payload["summary"]["template_key"], "ci.check.cancelled");
+            assert_eq!(envelope["causation_id"], format!("trigger-{run_id}"));
+            assert!(envelope["event_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("ci-supersession-")));
+        }
     }
 }
 
@@ -687,6 +1049,44 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .expect("ci_drive_manifest DDL");
     admin.execute(CREATE_CI_JOB_DDL).await.expect("ci_job DDL");
     admin
+        .execute(CREATE_JOB_QUEUE_DDL)
+        .await
+        .expect("job_queue DDL");
+    admin
+        .execute("CREATE UNIQUE INDEX jq_idem ON job_queue (tenant_id, idem_token)")
+        .await
+        .expect("job_queue dispatch idempotency index");
+    for ddl in [
+        ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
+        ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
+        ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+    ] {
+        admin
+            .execute(ddl)
+            .await
+            .expect("job_queue launch-authority migration");
+    }
+    admin
+        .execute(CREATE_CI_JOB_SPEC_DDL)
+        .await
+        .expect("ci_job_spec DDL");
+    admin
+        .execute(ALTER_CI_JOB_SPEC_ADD_STAGE_DDL)
+        .await
+        .expect("ci_job_spec stage migration");
+    admin
+        .execute(CREATE_CI_COST_EVENT_DDL)
+        .await
+        .expect("ci_cost_event DDL");
+    sqlx::raw_sql(CREATE_CI_JOB_ACCOUNTING_DDL)
+        .execute(&admin)
+        .await
+        .expect("ci_job_accounting DDL");
+    admin
+        .execute(ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL)
+        .await
+        .expect("ci_job_accounting skipped migration");
+    admin
         .execute(CREATE_CHECK_ATTEMPT_DDL)
         .await
         .expect("check_attempt DDL");
@@ -710,6 +1110,17 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .execute("SELECT myelin_make_tenant_scoped('check_attempt')")
         .await
         .expect("force RLS on check_attempt");
+    for table in [
+        "job_queue",
+        "ci_job_spec",
+        "ci_cost_event",
+        "ci_job_accounting",
+    ] {
+        admin
+            .execute(format!("SELECT myelin_make_tenant_scoped('{table}')").as_str())
+            .await
+            .expect("force RLS on supersession table");
+    }
     admin
         .execute(format!("GRANT USAGE ON SCHEMA {schema} TO myelin_app").as_str())
         .await
@@ -724,6 +1135,11 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .expect("manifest remains insert-only after broad test setup grant");
     let app = pool_on(&app_url(), &schema).await;
     let blobs = Arc::new(FsBlobStore::new());
+    let mut ledger_config = MyelinConfig::dev();
+    ledger_config.database_url = admin_url();
+    ledger_config.region = "fr-par".into();
+    let supersession_ledger =
+        DurableCostLedger::new(SubstrateProvider::connect(ledger_config, 1).await.unwrap());
 
     let register = flow_executor(&admin, "tenant_a");
     tokio::task::block_in_place(|| {
@@ -842,8 +1258,12 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         )
         .await
         .unwrap();
-    let atomic_starter =
-        starter_with_operational_reservations(&app, reservation_tenant, blobs.clone());
+    let atomic_starter = starter_with_operational_reservations(
+        &app,
+        reservation_tenant,
+        blobs.clone(),
+        supersession_ledger.clone(),
+    );
     let atomic_error = atomic_starter
         .run_once()
         .await
@@ -890,6 +1310,1093 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await
     .unwrap();
     assert_eq!(committed_reservations, 3);
+
+    // Producer generations, not arrival time, own PR supersession. Starting generation 2
+    // co-commits its own workflow/reservations with cancellation of the already-running generation
+    // 1 run. Because no old job crossed launch, all three reservations settle at zero and the
+    // cancelled run is immediately cost-closed.
+    let pr_tenant = "tenant_pr_supersession";
+    let pr_group = "pr:core:42";
+    let old_run = "10000000-0000-0000-0000-000000000141";
+    let old_wf = "20000000-0000-0000-0000-000000000141";
+    let new_run = "10000000-0000-0000-0000-000000000142";
+    let new_wf = "20000000-0000-0000-0000-000000000142";
+    let pr_factory = ci_run_starter_factory(
+        app.clone(),
+        Region("fr-par".into()),
+        blobs.clone(),
+        tokio::runtime::Handle::current(),
+        supersession_ledger.clone(),
+    )
+    .unwrap();
+    let pr_starter = pr_factory
+        .starter_for(
+            TenantId(pr_tenant.into()),
+            CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+        )
+        .unwrap();
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        old_run,
+        old_wf,
+        pr_group,
+        Some(1),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { run_id, .. } if run_id == old_run
+    ));
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        new_run,
+        new_wf,
+        pr_group,
+        Some(2),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { run_id, .. } if run_id == new_run
+    ));
+    let old_lifecycle: (String, bool, String, Option<String>) = sqlx::query_as(
+        "SELECT r.state, r.cost_settled, w.state, w.cancel_reason \
+         FROM ci_run r JOIN workflow_run w \
+           ON w.tenant_id=r.tenant_id AND w.region=r.region AND w.run_id=r.wf_run_id::text \
+         WHERE r.tenant_id=$1 AND r.run_id=$2::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(old_run)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        old_lifecycle,
+        (
+            "cancelled".into(),
+            true,
+            "terminated".into(),
+            Some("superseded-by-newer-pr-head".into())
+        )
+    );
+    let old_accounting: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM ci_job_accounting \
+             WHERE tenant_id=$1 AND ci_run_id=$2::uuid AND skipped), \
+           (SELECT count(*) FROM ci_cost_event \
+             WHERE tenant_id=$1 AND run_id=$2::uuid), \
+           (SELECT count(*) FROM cost_reservation \
+             WHERE tenant_id=$1 AND run_id LIKE ('ci-reserve:v1:' || $2 || ':%') \
+               AND state='settled'), \
+           (SELECT count(*) FROM workflow_run \
+             WHERE tenant_id=$1 AND run_id=$3 AND state IN ('running','waiting'))",
+    )
+    .bind(pr_tenant)
+    .bind(old_run)
+    .bind(new_wf)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(old_accounting, (3, 6, 3, 1));
+    assert_cancelled_facts(&admin, pr_tenant, old_run, &[true]).await;
+
+    // A delayed generation-1 event is consumed without consulting its missing CAS plan. The
+    // already-running generation 2 remains untouched, proving arrival order and timestamps do not
+    // become accidental authority.
+    let delayed_run = "10000000-0000-0000-0000-000000000140";
+    let delayed_wf = "20000000-0000-0000-0000-000000000140";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        delayed_run,
+        delayed_wf,
+        pr_group,
+        Some(1),
+        false,
+    )
+    .await;
+    assert_eq!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Superseded {
+            run_id: delayed_run.into()
+        }
+    );
+    let delayed_shape: (String, bool, i64, i64) = sqlx::query_as(
+        "SELECT state, cost_settled, \
+           (SELECT count(*) FROM workflow_run WHERE run_id=$2), \
+           (SELECT count(*) FROM ci_drive_manifest WHERE ci_run_id=$1::uuid) \
+         FROM ci_run WHERE tenant_id=$3 AND run_id=$1::uuid",
+    )
+    .bind(delayed_run)
+    .bind(delayed_wf)
+    .bind(pr_tenant)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(delayed_shape, ("cancelled".into(), true, 0, 0));
+    assert_cancelled_facts(&admin, pr_tenant, delayed_run, &[]).await;
+    let current_state: String =
+        sqlx::query_scalar("SELECT state FROM ci_run WHERE tenant_id=$1 AND run_id=$2::uuid")
+            .bind(pr_tenant)
+            .bind(new_run)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(current_state, "running");
+
+    // Terminal rows remain the durable generation high-water mark. A late lower positive row and
+    // a rolling-upgrade NULL row are stale even after the newest generation has left the active
+    // set; completion never erases producer ordering authority.
+    let terminal_watermark_group = "pr:core:48";
+    let terminal_watermark_run = "10000000-0000-0000-0000-000000000201";
+    let terminal_watermark_wf = "20000000-0000-0000-0000-000000000201";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        terminal_watermark_run,
+        terminal_watermark_wf,
+        terminal_watermark_group,
+        Some(9),
+        false,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE ci_run SET state='succeeded', cost_settled=true, \
+           finished_at=clock_timestamp() \
+         WHERE tenant_id=$1 AND run_id=$2::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(terminal_watermark_run)
+    .execute(&admin)
+    .await
+    .unwrap();
+    for (run, wf, generation) in [
+        (
+            "10000000-0000-0000-0000-000000000202",
+            "20000000-0000-0000-0000-000000000202",
+            Some(8),
+        ),
+        (
+            "10000000-0000-0000-0000-000000000203",
+            "20000000-0000-0000-0000-000000000203",
+            None,
+        ),
+    ] {
+        insert_pr_run(
+            &admin,
+            blobs.as_ref(),
+            pr_tenant,
+            run,
+            wf,
+            terminal_watermark_group,
+            generation,
+            false,
+        )
+        .await;
+        assert_eq!(
+            pr_starter.run_once().await.unwrap(),
+            StartQueuedOutcome::Superseded { run_id: run.into() },
+            "retained terminal generation is permanent high-water authority"
+        );
+    }
+
+    // Rolling-upgrade NULL generations are legacy-oldest only relative to a positive generation.
+    // Two legacy rows do not invent an order and therefore both start; a positive successor then
+    // cancels both.
+    let legacy_group = "pr:core:43";
+    let legacy_a = "10000000-0000-0000-0000-000000000151";
+    let legacy_a_wf = "20000000-0000-0000-0000-000000000151";
+    let legacy_b = "10000000-0000-0000-0000-000000000152";
+    let legacy_b_wf = "20000000-0000-0000-0000-000000000152";
+    for (run, wf) in [(legacy_a, legacy_a_wf), (legacy_b, legacy_b_wf)] {
+        insert_pr_run(
+            &admin,
+            blobs.as_ref(),
+            pr_tenant,
+            run,
+            wf,
+            legacy_group,
+            None,
+            true,
+        )
+        .await;
+        assert!(matches!(
+            pr_starter.run_once().await.unwrap(),
+            StartQueuedOutcome::Started { run_id, .. } if run_id == run
+        ));
+    }
+    let legacy_running: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ci_run WHERE tenant_id=$1 AND concurrency_group=$2 \
+           AND state='running' AND pr_head_generation IS NULL",
+    )
+    .bind(pr_tenant)
+    .bind(legacy_group)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(legacy_running, 2);
+    let positive_run = "10000000-0000-0000-0000-000000000153";
+    let positive_wf = "20000000-0000-0000-0000-000000000153";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        positive_run,
+        positive_wf,
+        legacy_group,
+        Some(2),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { run_id, .. } if run_id == positive_run
+    ));
+    let legacy_cancelled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ci_run WHERE tenant_id=$1 AND concurrency_group=$2 \
+           AND state='cancelled' AND cost_settled",
+    )
+    .bind(pr_tenant)
+    .bind(legacy_group)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(legacy_cancelled, 2);
+
+    // Cancellation winning the final-launch race terminalizes the exact leased generation and
+    // zero-settles even an already-inflight reservation. The later launch CAS is refused.
+    let cancel_wins_group = "pr:core:44";
+    let cancel_wins_old = "10000000-0000-0000-0000-000000000161";
+    let cancel_wins_old_wf = "20000000-0000-0000-0000-000000000161";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        cancel_wins_old,
+        cancel_wins_old_wf,
+        cancel_wins_group,
+        Some(1),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+    let cancelled_claim = seed_claimed_manifest_job(
+        &admin,
+        pr_tenant,
+        cancel_wins_old,
+        cancel_wins_old_wf,
+        "leased",
+    )
+    .await;
+    let cancel_wins_new = "10000000-0000-0000-0000-000000000162";
+    let cancel_wins_new_wf = "20000000-0000-0000-0000-000000000162";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        cancel_wins_new,
+        cancel_wins_new_wf,
+        cancel_wins_group,
+        Some(2),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+    assert!(
+        !CiJobQueueStore::with_pg(app.clone())
+            .authorize_launch(&cancelled_claim.claim)
+            .await
+            .unwrap(),
+        "cancellation and final launch serialize on the same queue row"
+    );
+    let cancelled_race_shape: (String, bool, String, i64) = sqlx::query_as(
+        "SELECT r.state, r.cost_settled, q.state, \
+           (SELECT count(*) FROM ci_job_accounting a \
+             WHERE a.tenant_id=r.tenant_id AND a.ci_run_id=r.run_id) \
+         FROM ci_run r JOIN job_queue q \
+           ON q.tenant_id=r.tenant_id AND q.run_id=r.wf_run_id \
+         WHERE r.tenant_id=$1 AND r.run_id=$2::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(cancel_wins_old)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        cancelled_race_shape,
+        ("cancelled".into(), true, "terminal".into(), 3)
+    );
+    assert_cancelled_facts(&admin, pr_tenant, cancel_wins_old, &[true]).await;
+
+    // Production manifest dispatch and supersession share the exact Flow→queue fence. A dispatch
+    // that commits first is observed and terminalized; after cancellation commits, a stale body
+    // cannot insert another manifest row behind the queue snapshot.
+    let late_dispatch_group = "pr:core:49";
+    let late_dispatch_old = "10000000-0000-0000-0000-000000000211";
+    let late_dispatch_old_wf = "20000000-0000-0000-0000-000000000211";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        late_dispatch_old,
+        late_dispatch_old_wf,
+        late_dispatch_group,
+        Some(1),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+    let manifest_store = CiDriveManifestStore::new(
+        admin.clone(),
+        TenantId(pr_tenant.into()),
+        Region("fr-par".into()),
+    )
+    .unwrap();
+    let (late_manifest, _) = manifest_store
+        .load_by_identity(late_dispatch_old_wf, late_dispatch_old)
+        .await
+        .unwrap()
+        .unwrap();
+    let dispatched_job = late_manifest.jobs.first().unwrap();
+    let stale_job = late_manifest.jobs.get(1).unwrap();
+    let dispatch_store = CiJobSpecStore::with_pg(app.clone());
+    let (dispatch_enqueue, dispatch_template) = manifest_dispatch_for_test(
+        pr_tenant,
+        late_dispatch_old,
+        late_dispatch_old_wf,
+        dispatched_job,
+        "wins",
+    );
+    dispatch_store
+        .co_persist_active_flow_dispatch(
+            &dispatch_enqueue,
+            &dispatch_template,
+            &dispatched_job.name,
+        )
+        .await
+        .expect("active Flow permits the production manifest dispatch");
+    let late_dispatch_new = "10000000-0000-0000-0000-000000000212";
+    let late_dispatch_new_wf = "20000000-0000-0000-0000-000000000212";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        late_dispatch_new,
+        late_dispatch_new_wf,
+        late_dispatch_group,
+        Some(2),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { run_id, .. } if run_id == late_dispatch_new
+    ));
+    let late_dispatch_shape: (String, String, bool, i64) = sqlx::query_as(
+        "SELECT r.state, q.state, r.cost_settled, \
+           (SELECT count(*) FROM ci_job_accounting a \
+             WHERE a.tenant_id=r.tenant_id AND a.ci_run_id=r.run_id AND a.skipped) \
+         FROM ci_run r JOIN job_queue q \
+           ON q.tenant_id=r.tenant_id AND q.run_id=r.wf_run_id \
+         WHERE r.tenant_id=$1 AND r.run_id=$2::uuid AND q.job_id=$3::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(late_dispatch_old)
+    .bind(&dispatched_job.job_id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        late_dispatch_shape,
+        ("cancelled".into(), "terminal".into(), true, 3)
+    );
+    let (stale_enqueue, stale_template) = manifest_dispatch_for_test(
+        pr_tenant,
+        late_dispatch_old,
+        late_dispatch_old_wf,
+        stale_job,
+        "loses",
+    );
+    assert!(dispatch_store
+        .co_persist_active_flow_dispatch(&stale_enqueue, &stale_template, &stale_job.name)
+        .await
+        .expect_err("terminated Flow must fence stale production dispatch")
+        .to_string()
+        .contains("owning Flow run is not active"));
+    let stale_rows: (i64, i64) = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM job_queue WHERE tenant_id=$1 AND job_id=$2::uuid), \
+           (SELECT count(*) FROM ci_job_spec WHERE tenant_id=$1 AND job_id=$2::uuid)",
+    )
+    .bind(pr_tenant)
+    .bind(&stale_job.job_id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        stale_rows,
+        (0, 0),
+        "stale body writes neither queue nor executable spec"
+    );
+
+    // Recreate the dangerous finalizer-winning interleaving: hold the old ci_run row, let
+    // supersession terminate/lock Flow and reach the product CAS, then publish a terminal product
+    // result first. The canceller must roll back its Flow termination and the replacement start,
+    // never accept a terminal product row paired with a newly terminated workflow.
+    let finalizer_group = "pr:core:50";
+    let finalizer_old = "10000000-0000-0000-0000-000000000221";
+    let finalizer_old_wf = "20000000-0000-0000-0000-000000000221";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        finalizer_old,
+        finalizer_old_wf,
+        finalizer_group,
+        Some(1),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+    let mut finalizer_tx = admin.begin().await.unwrap();
+    sqlx::query(
+        "SELECT state FROM ci_run \
+         WHERE tenant_id=$1 AND run_id=$2::uuid FOR UPDATE",
+    )
+    .bind(pr_tenant)
+    .bind(finalizer_old)
+    .fetch_one(&mut *finalizer_tx)
+    .await
+    .unwrap();
+    let finalizer_new = "10000000-0000-0000-0000-000000000222";
+    let finalizer_new_wf = "20000000-0000-0000-0000-000000000222";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        finalizer_new,
+        finalizer_new_wf,
+        finalizer_group,
+        Some(2),
+        true,
+    )
+    .await;
+    let racing_starter = pr_starter.clone();
+    let racing_supersession = tokio::spawn(async move { racing_starter.run_once().await });
+    let mut flow_locked = false;
+    for _ in 0..100 {
+        let probe = sqlx::query(
+            "SELECT state FROM workflow_run \
+             WHERE tenant_id=$1 AND region='fr-par' AND run_id=$2 FOR UPDATE NOWAIT",
+        )
+        .bind(pr_tenant)
+        .bind(finalizer_old_wf)
+        .fetch_one(&admin)
+        .await;
+        if probe
+            .as_ref()
+            .err()
+            .and_then(sqlx::Error::as_database_error)
+            .and_then(|error| error.code())
+            .as_deref()
+            == Some("55P03")
+        {
+            flow_locked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        flow_locked,
+        "supersession must own the Flow row before reaching the blocked ci_run CAS"
+    );
+    sqlx::query(
+        "UPDATE ci_run SET state='succeeded', cost_settled=true, \
+           finished_at=clock_timestamp() \
+         WHERE tenant_id=$1 AND run_id=$2::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(finalizer_old)
+    .execute(&mut *finalizer_tx)
+    .await
+    .unwrap();
+    finalizer_tx.commit().await.unwrap();
+    assert!(racing_supersession
+        .await
+        .unwrap()
+        .expect_err("Flow/product terminal disagreement must abort supersession")
+        .to_string()
+        .contains("Flow and CI run terminal transitions disagreed"));
+    let finalizer_race_shape: (String, String, String, i64, i64) = sqlx::query_as(
+        "SELECT old.state, w.state, new.state, \
+           (SELECT count(*) FROM workflow_run WHERE run_id=$4), \
+           (SELECT count(*) FROM cost_reservation \
+             WHERE run_id LIKE ('ci-reserve:v1:' || $3::text || ':%')) \
+         FROM ci_run old \
+         JOIN workflow_run w ON w.tenant_id=old.tenant_id AND w.run_id=old.wf_run_id::text \
+         JOIN ci_run new ON new.tenant_id=old.tenant_id \
+         WHERE old.tenant_id=$1 AND old.run_id=$2::uuid AND new.run_id=$3::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(finalizer_old)
+    .bind(finalizer_new)
+    .bind(finalizer_new_wf)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        finalizer_race_shape,
+        ("succeeded".into(), "running".into(), "queued".into(), 0, 0)
+    );
+    sqlx::query(
+        "UPDATE ci_run SET state='cancelled', cost_settled=true, finished_at=clock_timestamp() \
+         WHERE tenant_id=$1 AND run_id=$2::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(finalizer_new)
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let runtime = ci_production_runtime_factory_test_support(
+        app.clone(),
+        Region("fr-par".into()),
+        supersession_ledger.clone(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let reporter = runtime.reporter_router().unwrap();
+
+    // A job that completed before the newer head is immutable settled history, not cancellation
+    // work. Supersession verifies its queue receipt, pricing mode, and settled Storage reservation,
+    // then zero-settles only the two undispatched jobs.
+    let completed_group = "pr:core:46";
+    let completed_old = "10000000-0000-0000-0000-000000000181";
+    let completed_old_wf = "20000000-0000-0000-0000-000000000181";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        completed_old,
+        completed_old_wf,
+        completed_group,
+        Some(1),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+    let completed_claim = seed_claimed_manifest_job(
+        &admin,
+        pr_tenant,
+        completed_old,
+        completed_old_wf,
+        "running",
+    )
+    .await;
+    let completed = CompletionClaim {
+        tenant: TenantId(pr_tenant.into()),
+        run: RunId(completed_old_wf.into()),
+        job_id: completed_claim.claim.job_id.clone(),
+        idem_token: completed_claim.idem_token.clone(),
+        lease_owner: completed_claim.claim.lease_owner.clone(),
+        lease_epoch: completed_claim.claim.lease_epoch,
+        claim_nonce: completed_claim.claim.claim_nonce.clone(),
+    };
+    let completed_report = TerminalReport {
+        passed: true,
+        timed_out: false,
+        usage: ResourceUsage {
+            cpu_seconds: 3,
+            mem_byte_seconds: 536_870_912,
+        },
+        result_refs: vec![ArtifactRef(format!(
+            "myelin://{pr_tenant}/ci/artifact/completed-result"
+        ))],
+    };
+    assert_ne!(
+        reporter.report_done(&completed, &completed_report).unwrap(),
+        SignalOutcome::TerminalNoOp
+    );
+    let completed_new = "10000000-0000-0000-0000-000000000182";
+    let completed_new_wf = "20000000-0000-0000-0000-000000000182";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        completed_new,
+        completed_new_wf,
+        completed_group,
+        Some(2),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+    let completed_shape: (String, bool, String, i64, i64, i64) = sqlx::query_as(
+        "SELECT r.state, r.cost_settled, q.state, \
+           (SELECT count(*) FROM ci_job_accounting a \
+             WHERE a.tenant_id=r.tenant_id AND a.ci_run_id=r.run_id), \
+           (SELECT count(*) FROM ci_cost_event c \
+             WHERE c.tenant_id=r.tenant_id AND c.run_id=r.run_id), \
+           (SELECT count(*) FROM cost_reservation c \
+             WHERE c.tenant_id=r.tenant_id \
+               AND c.run_id LIKE ('ci-reserve:v1:' || r.run_id::text || ':%') \
+               AND c.state='settled') \
+         FROM ci_run r JOIN job_queue q \
+           ON q.tenant_id=r.tenant_id AND q.run_id=r.wf_run_id \
+         WHERE r.tenant_id=$1 AND r.run_id=$2::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(completed_old)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        completed_shape,
+        ("cancelled".into(), true, "terminal".into(), 3, 6, 3)
+    );
+    assert_cancelled_facts(&admin, pr_tenant, completed_old, &[true]).await;
+
+    // Matching IDs, receipt text, and pricing token are insufficient accounting authority. Forge a
+    // mutually matching queue/accounting receipt and an exact Storage settlement, but diverge the
+    // CI usage projection. Supersession must verify all monetary truth and abort the replacement.
+    let corrupt_group = "pr:core:47";
+    let corrupt_old = "10000000-0000-0000-0000-000000000191";
+    let corrupt_old_wf = "20000000-0000-0000-0000-000000000191";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        corrupt_old,
+        corrupt_old_wf,
+        corrupt_group,
+        Some(1),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+    let corrupt_claim =
+        seed_claimed_manifest_job(&admin, pr_tenant, corrupt_old, corrupt_old_wf, "running").await;
+    sqlx::query(
+        "UPDATE job_queue SET state='terminal', \
+           completion_receipt='v3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' \
+         WHERE tenant_id=$1 AND job_id=$2::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(&corrupt_claim.claim.job_id)
+    .execute(&admin)
+    .await
+    .unwrap();
+    let corrupt_reserved: i64 = sqlx::query_scalar(
+        "SELECT reserved FROM cost_reservation \
+         WHERE tenant_id=$1 AND region='fr-par' AND run_id=$2",
+    )
+    .bind(pr_tenant)
+    .bind(&corrupt_claim.reserve_handle)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE cost_reservation SET state='settled' \
+         WHERE tenant_id=$1 AND region='fr-par' AND run_id=$2",
+    )
+    .bind(pr_tenant)
+    .bind(&corrupt_claim.reserve_handle)
+    .execute(&admin)
+    .await
+    .unwrap();
+    for (ord, unit) in [(0_i32, "cpu_seconds"), (1_i32, "mem_gb_seconds")] {
+        sqlx::query(
+            "INSERT INTO cost_event \
+               (tenant_id, region, run_id, ord, unit, wholesale, markup) \
+             VALUES ($1, 'fr-par', $2, $3, $4, 0, 0)",
+        )
+        .bind(pr_tenant)
+        .bind(&corrupt_claim.reserve_handle)
+        .bind(ord)
+        .bind(unit)
+        .execute(&admin)
+        .await
+        .unwrap();
+    }
+    for (cost_id, meter, amount) in [
+        ("30000000-0000-0000-0000-000000000191", "cpu_seconds", 1_i64),
+        (
+            "30000000-0000-0000-0000-000000000192",
+            "mem_gb_seconds",
+            0_i64,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO ci_cost_event \
+               (tenant_id, region, cost_id, run_id, job_id, meter, amount, \
+                wholesale_minor_units, markup_minor_units, kind) \
+             VALUES ($1, 'fr-par', $2::uuid, $3::uuid, $4::uuid, $5, $6, 0, 0, 'ci')",
+        )
+        .bind(pr_tenant)
+        .bind(cost_id)
+        .bind(corrupt_old)
+        .bind(&corrupt_claim.claim.job_id)
+        .bind(meter)
+        .bind(amount)
+        .execute(&admin)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO ci_job_accounting \
+           (tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle, passed, timed_out, \
+            skipped, cpu_seconds, mem_byte_seconds, pricing_revision, billed_minor_units, \
+            refunded_minor_units, completion_receipt) \
+         VALUES ($1, 'fr-par', $2::uuid, $3::uuid, $4::uuid, $5, true, false, false, \
+                 0, 0, 'tier-p-operational:v1', 0, $6, \
+                 'v3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')",
+    )
+    .bind(pr_tenant)
+    .bind(&corrupt_claim.claim.job_id)
+    .bind(corrupt_old_wf)
+    .bind(corrupt_old)
+    .bind(&corrupt_claim.reserve_handle)
+    .bind(corrupt_reserved)
+    .execute(&admin)
+    .await
+    .unwrap();
+    let corrupt_new = "10000000-0000-0000-0000-000000000192";
+    let corrupt_new_wf = "20000000-0000-0000-0000-000000000192";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        corrupt_new,
+        corrupt_new_wf,
+        corrupt_group,
+        Some(2),
+        true,
+    )
+    .await;
+    assert!(pr_starter
+        .run_once()
+        .await
+        .expect_err("divergent monetary projection must abort supersession")
+        .to_string()
+        .contains("accounting was refused"));
+    let corrupt_rollback: (String, String, i64, i64, i64) = sqlx::query_as(
+        "SELECT old.state, new.state, \
+           (SELECT count(*) FROM ci_drive_manifest WHERE ci_run_id=$3::uuid), \
+           (SELECT count(*) FROM workflow_run WHERE run_id=$4), \
+           (SELECT count(*) FROM cost_reservation \
+             WHERE run_id LIKE ('ci-reserve:v1:' || $3::text || ':%')) \
+         FROM ci_run old JOIN ci_run new ON new.tenant_id=old.tenant_id \
+         WHERE old.tenant_id=$1 AND old.run_id=$2::uuid AND new.run_id=$3::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(corrupt_old)
+    .bind(corrupt_new)
+    .bind(corrupt_new_wf)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        corrupt_rollback,
+        ("running".into(), "queued".into(), 0, 0, 0)
+    );
+    sqlx::query(
+        "UPDATE ci_run SET state='cancelled', cost_settled=true, finished_at=clock_timestamp() \
+         WHERE tenant_id=$1 AND run_id=$2::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(corrupt_new)
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    // A no-queue skipped receipt is accepted only when its deterministic supersession receipt and
+    // full-refund monetary facts agree. Even exact zero-unit ledgers/projections cannot bless an
+    // invented completion receipt.
+    let skipped_forge_group = "pr:core:51";
+    let skipped_forge_old = "10000000-0000-0000-0000-000000000231";
+    let skipped_forge_old_wf = "20000000-0000-0000-0000-000000000231";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        skipped_forge_old,
+        skipped_forge_old_wf,
+        skipped_forge_group,
+        Some(1),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+    let (skipped_manifest, _) = manifest_store
+        .load_by_identity(skipped_forge_old_wf, skipped_forge_old)
+        .await
+        .unwrap()
+        .unwrap();
+    let skipped_job = skipped_manifest.jobs.first().unwrap();
+    let skipped_reserved: i64 = sqlx::query_scalar(
+        "SELECT reserved FROM cost_reservation \
+         WHERE tenant_id=$1 AND region='fr-par' AND run_id=$2",
+    )
+    .bind(pr_tenant)
+    .bind(&skipped_job.reserve_handle)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE cost_reservation SET state='settled' \
+         WHERE tenant_id=$1 AND region='fr-par' AND run_id=$2",
+    )
+    .bind(pr_tenant)
+    .bind(&skipped_job.reserve_handle)
+    .execute(&admin)
+    .await
+    .unwrap();
+    for (ord, unit) in [(0_i32, "cpu_seconds"), (1_i32, "mem_gb_seconds")] {
+        sqlx::query(
+            "INSERT INTO cost_event \
+               (tenant_id, region, run_id, ord, unit, wholesale, markup) \
+             VALUES ($1, 'fr-par', $2, $3, $4, 0, 0)",
+        )
+        .bind(pr_tenant)
+        .bind(&skipped_job.reserve_handle)
+        .bind(ord)
+        .bind(unit)
+        .execute(&admin)
+        .await
+        .unwrap();
+    }
+    for (cost_id, meter) in [
+        ("30000000-0000-0000-0000-000000000231", "cpu_seconds"),
+        ("30000000-0000-0000-0000-000000000232", "mem_gb_seconds"),
+    ] {
+        sqlx::query(
+            "INSERT INTO ci_cost_event \
+               (tenant_id, region, cost_id, run_id, job_id, meter, amount, \
+                wholesale_minor_units, markup_minor_units, kind) \
+             VALUES ($1, 'fr-par', $2::uuid, $3::uuid, $4::uuid, $5, 0, 0, 0, 'ci')",
+        )
+        .bind(pr_tenant)
+        .bind(cost_id)
+        .bind(skipped_forge_old)
+        .bind(&skipped_job.job_id)
+        .bind(meter)
+        .execute(&admin)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO ci_job_accounting \
+           (tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle, passed, timed_out, \
+            skipped, cpu_seconds, mem_byte_seconds, pricing_revision, billed_minor_units, \
+            refunded_minor_units, completion_receipt) \
+         VALUES ($1, 'fr-par', $2::uuid, $3::uuid, $4::uuid, $5, false, false, true, \
+                 0, 0, 'tier-p-operational:v1', 0, $6, \
+                 'v3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee')",
+    )
+    .bind(pr_tenant)
+    .bind(&skipped_job.job_id)
+    .bind(skipped_forge_old_wf)
+    .bind(skipped_forge_old)
+    .bind(&skipped_job.reserve_handle)
+    .bind(skipped_reserved)
+    .execute(&admin)
+    .await
+    .unwrap();
+    let skipped_forge_new = "10000000-0000-0000-0000-000000000232";
+    let skipped_forge_new_wf = "20000000-0000-0000-0000-000000000232";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        skipped_forge_new,
+        skipped_forge_new_wf,
+        skipped_forge_group,
+        Some(2),
+        true,
+    )
+    .await;
+    assert!(pr_starter
+        .run_once()
+        .await
+        .expect_err("invented skipped receipt must abort supersession")
+        .to_string()
+        .contains("accounting receipt disagrees with queue lifecycle"));
+    let skipped_forge_rollback: (String, String, i64) = sqlx::query_as(
+        "SELECT old.state, new.state, \
+           (SELECT count(*) FROM workflow_run WHERE run_id=$3) \
+         FROM ci_run old JOIN ci_run new ON new.tenant_id=old.tenant_id \
+         WHERE old.tenant_id=$1 AND old.run_id=$2::uuid AND new.run_id=$4::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(skipped_forge_old)
+    .bind(skipped_forge_new_wf)
+    .bind(skipped_forge_new)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        skipped_forge_rollback,
+        ("running".into(), "queued".into(), 0)
+    );
+    sqlx::query(
+        "UPDATE ci_run SET state='cancelled', cost_settled=true, finished_at=clock_timestamp() \
+         WHERE tenant_id=$1 AND run_id=$2::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(skipped_forge_new)
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    // If final launch wins first, supersession never zero-settles that running generation. It
+    // terminates Flow and closes every other job, leaving cost_settled=false until the real terminal
+    // report accounts actual usage. The late report is an acknowledged terminal no-op at Flow while
+    // atomically closing the cancelled ci_run; exact replay changes nothing.
+    let launch_wins_group = "pr:core:45";
+    let launch_wins_old = "10000000-0000-0000-0000-000000000171";
+    let launch_wins_old_wf = "20000000-0000-0000-0000-000000000171";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        launch_wins_old,
+        launch_wins_old_wf,
+        launch_wins_group,
+        Some(1),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+    let launched_claim = seed_claimed_manifest_job(
+        &admin,
+        pr_tenant,
+        launch_wins_old,
+        launch_wins_old_wf,
+        "running",
+    )
+    .await;
+    let launch_wins_new = "10000000-0000-0000-0000-000000000172";
+    let launch_wins_new_wf = "20000000-0000-0000-0000-000000000172";
+    insert_pr_run(
+        &admin,
+        blobs.as_ref(),
+        pr_tenant,
+        launch_wins_new,
+        launch_wins_new_wf,
+        launch_wins_group,
+        Some(2),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        pr_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+    let before_late_report: (String, bool, String, i64, i64) = sqlx::query_as(
+        "SELECT r.state, r.cost_settled, q.state, \
+           (SELECT count(*) FROM ci_job_accounting a \
+             WHERE a.tenant_id=r.tenant_id AND a.ci_run_id=r.run_id), \
+           (SELECT count(*) FROM cost_reservation c \
+             WHERE c.tenant_id=r.tenant_id \
+               AND c.run_id LIKE ('ci-reserve:v1:' || r.run_id::text || ':%') \
+               AND c.state='inflight') \
+         FROM ci_run r JOIN job_queue q \
+           ON q.tenant_id=r.tenant_id AND q.run_id=r.wf_run_id \
+         WHERE r.tenant_id=$1 AND r.run_id=$2::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(launch_wins_old)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        before_late_report,
+        ("cancelled".into(), false, "running".into(), 2, 1)
+    );
+    assert_cancelled_facts(&admin, pr_tenant, launch_wins_old, &[false]).await;
+    let completion = CompletionClaim {
+        tenant: TenantId(pr_tenant.into()),
+        run: RunId(launch_wins_old_wf.into()),
+        job_id: launched_claim.claim.job_id.clone(),
+        idem_token: launched_claim.idem_token.clone(),
+        lease_owner: launched_claim.claim.lease_owner.clone(),
+        lease_epoch: launched_claim.claim.lease_epoch,
+        claim_nonce: launched_claim.claim.claim_nonce.clone(),
+    };
+    let report = TerminalReport {
+        passed: true,
+        timed_out: false,
+        usage: ResourceUsage {
+            cpu_seconds: 7,
+            mem_byte_seconds: 1_073_741_824,
+        },
+        result_refs: vec![ArtifactRef(format!(
+            "myelin://{pr_tenant}/ci/artifact/late-result"
+        ))],
+    };
+    assert_eq!(
+        reporter.report_done(&completion, &report).unwrap(),
+        SignalOutcome::TerminalNoOp
+    );
+    assert_eq!(
+        reporter.report_done(&completion, &report).unwrap(),
+        SignalOutcome::TerminalNoOp,
+        "acknowledgement-loss replay is exact"
+    );
+    let after_late_report: (bool, String, i64, i64, i64) = sqlx::query_as(
+        "SELECT r.cost_settled, q.state, \
+           (SELECT count(*) FROM ci_job_accounting a \
+             WHERE a.tenant_id=r.tenant_id AND a.ci_run_id=r.run_id), \
+           (SELECT count(*) FROM ci_cost_event c \
+             WHERE c.tenant_id=r.tenant_id AND c.run_id=r.run_id), \
+           (SELECT count(*) FROM wf_signal s \
+             WHERE s.tenant_id=r.tenant_id AND s.run_id=r.wf_run_id::text) \
+         FROM ci_run r JOIN job_queue q \
+           ON q.tenant_id=r.tenant_id AND q.run_id=r.wf_run_id \
+         WHERE r.tenant_id=$1 AND r.run_id=$2::uuid",
+    )
+    .bind(pr_tenant)
+    .bind(launch_wins_old)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(after_late_report, (true, "terminal".into(), 3, 6, 0));
+    assert_cancelled_facts(&admin, pr_tenant, launch_wins_old, &[false, true]).await;
 
     // Two concurrent starters see one row. SKIP LOCKED lets one win and the other return idle;
     // there is exactly one workflow and the state transition cannot split from it.

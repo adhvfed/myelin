@@ -175,7 +175,8 @@ impl JobRunner for CiManifestDurableJobRunner {
         let (enqueue, spec) = manifest_dispatch_parts(&self.manifest, job, flow)?;
         bridge(
             &self.rt,
-            self.store.co_persist_dispatch(&enqueue, &spec, &job.name),
+            self.store
+                .co_persist_active_flow_dispatch(&enqueue, &spec, &job.name),
         )
         .map_err(|error| ActivityError(format!("durable manifest dispatch refused: {error}")))?;
         Ok(())
