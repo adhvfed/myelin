@@ -80,8 +80,8 @@ fn ci_producer_payload_decodes_into_git_frozen_checkstatus() {
         "the tier stamped by CI, read by Git (never recomputed)"
     );
     assert_eq!(
-        fact.details_ref.0, "myelin://acme/ci/run/run-42#summary",
-        "a success anchors on the run summary"
+        fact.details_ref.0, "myelin://acme/ci/run/run-42",
+        "a success anchors on the canonical run root"
     );
     assert_eq!(
         fact.summary.template_key, "ci.check.success",

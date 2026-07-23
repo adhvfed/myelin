@@ -11,8 +11,8 @@ use std::sync::Arc;
 use myelin_config::Mode;
 use myelin_edge::repo_authz::RepoPermission;
 use myelin_edge::{
-    recover_placed_git_at_boot, CheckBackedRepoAuthorizer, DurableGitBackend, GitEffectApi,
-    RepoAuthorizer, TupleRepoBootstrap,
+    recover_placed_git_at_boot, CheckBackedRepoAuthorizer, DurableGitBackend, GitDatabaseProviders,
+    GitEffectApi, RepoAuthorizer, TupleRepoBootstrap,
 };
 use myelin_events::{IdMinter, OutboxStore, Timestamp, UlidMinter};
 use myelin_git::core::RepoLoc;
@@ -468,11 +468,16 @@ async fn serve(core: Core) -> Result<(), String> {
         core.handle.clone(),
     )));
     let minter: Arc<dyn myelin_events::IdMinter> = Arc::new(UlidMinter::new());
+    let git_check_admission_provider = core
+        .provider
+        .auxiliary_runtime_lane(4)
+        .await
+        .map_err(|error| format!("protected-push admission lane refused: {error}"))?;
     let backend = Arc::new(
         DurableGitBackend::rooted(
             git_root,
             String::new(),
-            core.provider.clone(),
+            GitDatabaseProviders::new(core.provider.clone(), git_check_admission_provider),
             core.kms.clone(),
             core.handle.clone(),
             outbox.clone(),

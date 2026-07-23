@@ -97,10 +97,7 @@ impl ConfigFormat {
         // Lowercase + take the trailing extension token (after the last `.` or `/`), so a full path
         // and a bare token both resolve.
         let lower = hint.to_ascii_lowercase();
-        let tail = lower
-            .rsplit(['.', '/'])
-            .next()
-            .unwrap_or(lower.as_str());
+        let tail = lower.rsplit(['.', '/']).next().unwrap_or(lower.as_str());
         match tail {
             "toml" => Ok(ConfigFormat::Toml),
             "json" => Ok(ConfigFormat::Json),
@@ -130,7 +127,10 @@ impl ConfigFormat {
 /// returns a partial/coerced definition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CiConfigError {
-    ConfigTooLarge { actual: usize, maximum: usize },
+    ConfigTooLarge {
+        actual: usize,
+        maximum: usize,
+    },
     /// The `filename_or_format` hint was not a supported format (or was the deferred YAML).
     UnknownFormat {
         /// The hint that could not be resolved to a supported format.
@@ -170,7 +170,10 @@ pub enum CiConfigError {
     },
     /// The definition has no jobs — an empty pipeline is rejected (nothing to run).
     EmptyJobs,
-    TooManyJobs { actual: usize, maximum: usize },
+    TooManyJobs {
+        actual: usize,
+        maximum: usize,
+    },
     /// A job name is empty — a DAG node id must be a non-empty string.
     EmptyJobName,
     /// Two jobs share a name — the DAG node ids must be unique.
@@ -191,16 +194,31 @@ pub enum CiConfigError {
         /// The axis key with no values.
         axis: String,
     },
-    InvalidMachineToken { field: String, value: String },
-    InvalidImage { job: String },
-    InvalidCommand { job: String, detail: String },
-    TooManyMatrixAxes { job: String, actual: usize, maximum: usize },
+    InvalidMachineToken {
+        field: String,
+        value: String,
+    },
+    InvalidImage {
+        job: String,
+    },
+    InvalidCommand {
+        job: String,
+        detail: String,
+    },
+    TooManyMatrixAxes {
+        job: String,
+        actual: usize,
+        maximum: usize,
+    },
 }
 
 impl std::fmt::Display for CiConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CiConfigError::ConfigTooLarge { actual, maximum } => write!(f, "the CI config is {actual} bytes, above the {maximum}-byte limit"),
+            CiConfigError::ConfigTooLarge { actual, maximum } => write!(
+                f,
+                "the CI config is {actual} bytes, above the {maximum}-byte limit"
+            ),
             CiConfigError::UnknownFormat { hint, detail } => {
                 write!(f, "unsupported `.myelin/ci.*` format `{hint}`: {detail}")
             }
@@ -223,14 +241,26 @@ impl std::fmt::Display for CiConfigError {
                  dynamic-generation escape hatch)"
             ),
             CiConfigError::EmptyJobs => {
-                write!(f, "the CI config has no jobs — nothing to run (an empty pipeline is refused)")
+                write!(
+                    f,
+                    "the CI config has no jobs — nothing to run (an empty pipeline is refused)"
+                )
             }
-            CiConfigError::TooManyJobs { actual, maximum } => write!(f, "the CI config declares {actual} jobs, above the {maximum}-job limit"),
+            CiConfigError::TooManyJobs { actual, maximum } => write!(
+                f,
+                "the CI config declares {actual} jobs, above the {maximum}-job limit"
+            ),
             CiConfigError::EmptyJobName => {
-                write!(f, "a job has an empty name — a DAG node id must be a non-empty string")
+                write!(
+                    f,
+                    "a job has an empty name — a DAG node id must be a non-empty string"
+                )
             }
             CiConfigError::DuplicateJob(name) => {
-                write!(f, "duplicate job name `{name}` — DAG node ids must be unique")
+                write!(
+                    f,
+                    "duplicate job name `{name}` — DAG node ids must be unique"
+                )
             }
             CiConfigError::UnknownNeed { job, need } => write!(
                 f,
@@ -241,10 +271,23 @@ impl std::fmt::Display for CiConfigError {
                 "job `{job}`: matrix axis `{axis}` has no values — an empty axis is malformed \
                  (it would silently drop the axis at expansion)"
             ),
-            CiConfigError::InvalidMachineToken { field, value } => write!(f, "{field} `{value}` is not a bounded ASCII machine token"),
-            CiConfigError::InvalidImage { job } => write!(f, "job `{job}` image reference is empty or overlong"),
-            CiConfigError::InvalidCommand { job, detail } => write!(f, "job `{job}` command is invalid: {detail}"),
-            CiConfigError::TooManyMatrixAxes { job, actual, maximum } => write!(f, "job `{job}` declares {actual} matrix axes, above the {maximum}-axis limit"),
+            CiConfigError::InvalidMachineToken { field, value } => {
+                write!(f, "{field} `{value}` is not a bounded ASCII machine token")
+            }
+            CiConfigError::InvalidImage { job } => {
+                write!(f, "job `{job}` image reference is empty or overlong")
+            }
+            CiConfigError::InvalidCommand { job, detail } => {
+                write!(f, "job `{job}` command is invalid: {detail}")
+            }
+            CiConfigError::TooManyMatrixAxes {
+                job,
+                actual,
+                maximum,
+            } => write!(
+                f,
+                "job `{job}` declares {actual} matrix axes, above the {maximum}-axis limit"
+            ),
         }
     }
 }
@@ -399,7 +442,10 @@ impl AuthoredCi {
             return Err(CiConfigError::EmptyJobs);
         }
         if self.jobs.len() > MAX_AUTHORED_JOBS {
-            return Err(CiConfigError::TooManyJobs { actual: self.jobs.len(), maximum: MAX_AUTHORED_JOBS });
+            return Err(CiConfigError::TooManyJobs {
+                actual: self.jobs.len(),
+                maximum: MAX_AUTHORED_JOBS,
+            });
         }
 
         // First pass: build the job set + enforce non-empty + unique names (the DAG node ids).
@@ -408,8 +454,14 @@ impl AuthoredCi {
             if j.name.is_empty() {
                 return Err(CiConfigError::EmptyJobName);
             }
-            if !valid_machine_token(&j.name, myelin_ci_controlplane::run_plan::MAX_JOB_NAME_BYTES) {
-                return Err(CiConfigError::InvalidMachineToken { field: "job name".into(), value: j.name.clone() });
+            if !valid_machine_token(
+                &j.name,
+                myelin_ci_controlplane::run_plan::MAX_JOB_NAME_BYTES,
+            ) {
+                return Err(CiConfigError::InvalidMachineToken {
+                    field: "job name".into(),
+                    value: j.name.clone(),
+                });
             }
             if !names.insert(j.name.as_str()) {
                 return Err(CiConfigError::DuplicateJob(j.name.clone()));
@@ -420,12 +472,20 @@ impl AuthoredCi {
         // map into the domain `JobDef`.
         let mut jobs = Vec::with_capacity(self.jobs.len());
         for j in &self.jobs {
-            if j.image.is_empty() || j.image.len() > myelin_ci_controlplane::run_plan::MAX_IMAGE_BYTES {
-                return Err(CiConfigError::InvalidImage { job: j.name.clone() });
+            if j.image.is_empty()
+                || j.image.len() > myelin_ci_controlplane::run_plan::MAX_IMAGE_BYTES
+            {
+                return Err(CiConfigError::InvalidImage {
+                    job: j.name.clone(),
+                });
             }
             validate_command(&j.name, &j.command)?;
             if j.matrix.len() > myelin_ci_controlplane::run_plan::MAX_MATRIX_AXES {
-                return Err(CiConfigError::TooManyMatrixAxes { job: j.name.clone(), actual: j.matrix.len(), maximum: myelin_ci_controlplane::run_plan::MAX_MATRIX_AXES });
+                return Err(CiConfigError::TooManyMatrixAxes {
+                    job: j.name.clone(),
+                    actual: j.matrix.len(),
+                    maximum: myelin_ci_controlplane::run_plan::MAX_MATRIX_AXES,
+                });
             }
             for need in &j.needs {
                 if !names.contains(need.as_str()) {
@@ -436,8 +496,14 @@ impl AuthoredCi {
                 }
             }
             for (axis, values) in &j.matrix {
-                if !valid_machine_token(axis, myelin_ci_controlplane::run_plan::MAX_MATRIX_KEY_BYTES) {
-                    return Err(CiConfigError::InvalidMachineToken { field: format!("job `{}` matrix axis", j.name), value: axis.clone() });
+                if !valid_machine_token(
+                    axis,
+                    myelin_ci_controlplane::run_plan::MAX_MATRIX_KEY_BYTES,
+                ) {
+                    return Err(CiConfigError::InvalidMachineToken {
+                        field: format!("job `{}` matrix axis", j.name),
+                        value: axis.clone(),
+                    });
                 }
                 if values.is_empty() {
                     return Err(CiConfigError::EmptyMatrixAxis {
@@ -446,8 +512,14 @@ impl AuthoredCi {
                     });
                 }
                 for value in values {
-                    if !valid_machine_token(value, myelin_ci_controlplane::run_plan::MAX_MATRIX_VALUE_BYTES) {
-                        return Err(CiConfigError::InvalidMachineToken { field: format!("job `{}` matrix value for `{axis}`", j.name), value: value.clone() });
+                    if !valid_machine_token(
+                        value,
+                        myelin_ci_controlplane::run_plan::MAX_MATRIX_VALUE_BYTES,
+                    ) {
+                        return Err(CiConfigError::InvalidMachineToken {
+                            field: format!("job `{}` matrix value for `{axis}`", j.name),
+                            value: value.clone(),
+                        });
                     }
                 }
             }
@@ -476,7 +548,11 @@ impl VersionedAuthoredCi {
                 };
                 let profile = match profile_name.as_str() {
                     "linux-small-v1" => myelin_ci_controlplane::CiExecutionProfileV1::LinuxSmallV1,
-                    _ => return Err(VersionedCiConfigError::UnsupportedExecutionProfile { profile: profile_name }),
+                    _ => {
+                        return Err(VersionedCiConfigError::UnsupportedExecutionProfile {
+                            profile: profile_name,
+                        })
+                    }
                 };
                 CiPlanContract::V2(myelin_ci_controlplane::CiExecutionRequestV1 {
                     schema_version: myelin_ci_controlplane::EXECUTION_REQUEST_SCHEMA_V1,
@@ -488,9 +564,12 @@ impl VersionedAuthoredCi {
             }
             _ => return Err(VersionedCiConfigError::PartialExecutionContract),
         };
-        let definition = AuthoredCi { on: self.on, jobs: self.jobs }
-            .into_definition()
-            .map_err(VersionedCiConfigError::Legacy)?;
+        let definition = AuthoredCi {
+            on: self.on,
+            jobs: self.jobs,
+        }
+        .into_definition()
+        .map_err(VersionedCiConfigError::Legacy)?;
         Ok(VersionedCiDefinition {
             contract,
             on: definition.on,
@@ -501,22 +580,45 @@ impl VersionedAuthoredCi {
 
 fn valid_machine_token(value: &str, maximum: usize) -> bool {
     let mut bytes = value.bytes();
-    let Some(first) = bytes.next() else { return false; };
-    value.len() <= maximum && first.is_ascii_alphanumeric()
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    value.len() <= maximum
+        && first.is_ascii_alphanumeric()
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn validate_command(job: &str, command: &[String]) -> Result<(), CiConfigError> {
     use myelin_ci_controlplane::run_plan::{MAX_COMMAND_ARGS, MAX_COMMAND_BYTES};
     if command.is_empty() || command.len() > MAX_COMMAND_ARGS {
-        return Err(CiConfigError::InvalidCommand { job: job.into(), detail: format!("must contain 1..={MAX_COMMAND_ARGS} arguments") });
+        return Err(CiConfigError::InvalidCommand {
+            job: job.into(),
+            detail: format!("must contain 1..={MAX_COMMAND_ARGS} arguments"),
+        });
     }
-    if command[0].is_empty() { return Err(CiConfigError::InvalidCommand { job: job.into(), detail: "argv[0] must not be empty".into() }); }
+    if command[0].is_empty() {
+        return Err(CiConfigError::InvalidCommand {
+            job: job.into(),
+            detail: "argv[0] must not be empty".into(),
+        });
+    }
     let total = command.iter().try_fold(0usize, |total, argument| {
-        (!argument.contains('\0')).then(|| total.checked_add(argument.len())).flatten()
+        (!argument.contains('\0'))
+            .then(|| total.checked_add(argument.len()))
+            .flatten()
     });
-    let Some(total) = total else { return Err(CiConfigError::InvalidCommand { job: job.into(), detail: "arguments must not contain NUL".into() }); };
-    if total > MAX_COMMAND_BYTES { return Err(CiConfigError::InvalidCommand { job: job.into(), detail: format!("{total} bytes exceeds {MAX_COMMAND_BYTES}") }); }
+    let Some(total) = total else {
+        return Err(CiConfigError::InvalidCommand {
+            job: job.into(),
+            detail: "arguments must not contain NUL".into(),
+        });
+    };
+    if total > MAX_COMMAND_BYTES {
+        return Err(CiConfigError::InvalidCommand {
+            job: job.into(),
+            detail: format!("{total} bytes exceeds {MAX_COMMAND_BYTES}"),
+        });
+    }
     Ok(())
 }
 
@@ -580,7 +682,10 @@ fn deserialize_ci_config<T: DeserializeOwned>(
     filename_or_format: &str,
 ) -> Result<T, CiConfigError> {
     if bytes.len() > MAX_CI_CONFIG_BYTES {
-        return Err(CiConfigError::ConfigTooLarge { actual: bytes.len(), maximum: MAX_CI_CONFIG_BYTES });
+        return Err(CiConfigError::ConfigTooLarge {
+            actual: bytes.len(),
+            maximum: MAX_CI_CONFIG_BYTES,
+        });
     }
     let format = ConfigFormat::from_hint(filename_or_format)?;
 
@@ -660,7 +765,10 @@ command = ["generate"]
         assert_eq!(def.jobs.len(), 3, "three authored jobs");
 
         // build — a plain normal job, no needs, no matrix.
-        assert_eq!(def.jobs[0], JobDef::normal("build", PINNED_BUILD, ["build"]));
+        assert_eq!(
+            def.jobs[0],
+            JobDef::normal("build", PINNED_BUILD, ["build"])
+        );
 
         // test — needs build + a 2-axis matrix (axes captured as authored).
         let test = &def.jobs[1];
@@ -694,12 +802,16 @@ command = ["generate"]
         }"#;
         let def = parse_ci_config(json.as_bytes(), ".myelin/ci.json").expect("valid json parses");
         assert_eq!(def.on, OnTrigger::Push);
-        assert_eq!(def.jobs, vec![JobDef::normal("build", PINNED_BUILD, ["build"])]);
+        assert_eq!(
+            def.jobs,
+            vec![JobDef::normal("build", PINNED_BUILD, ["build"])]
+        );
     }
 
     #[test]
     fn exact_v2_toml_and_json_parse_to_the_shared_execution_request() {
-        let toml = format!(r#"schema_version = 2
+        let toml = format!(
+            r#"schema_version = 2
 on = "push"
 
 [execution]
@@ -709,14 +821,23 @@ profile = "linux-small-v1"
 name = "build"
 image = "{PINNED_BUILD}"
 command = ["build"]
-"#);
-        let json = format!(r#"{{"schema_version":2,"execution":{{"profile":"linux-small-v1"}},"on":"push","jobs":[{{"name":"build","image":"{PINNED_BUILD}","command":["build"]}}]}}"#);
-        for (bytes, hint) in [(toml.as_bytes(), ".myelin/ci.toml"), (json.as_bytes(), ".myelin/ci.json")] {
+"#
+        );
+        let json = format!(
+            r#"{{"schema_version":2,"execution":{{"profile":"linux-small-v1"}},"on":"push","jobs":[{{"name":"build","image":"{PINNED_BUILD}","command":["build"]}}]}}"#
+        );
+        for (bytes, hint) in [
+            (toml.as_bytes(), ".myelin/ci.toml"),
+            (json.as_bytes(), ".myelin/ci.json"),
+        ] {
             let def = parse_versioned_ci_config(bytes, hint).expect("valid V2 request");
-            assert_eq!(def.contract, CiPlanContract::V2(myelin_ci_controlplane::CiExecutionRequestV1 {
-                schema_version: myelin_ci_controlplane::EXECUTION_REQUEST_SCHEMA_V1,
-                profile: myelin_ci_controlplane::CiExecutionProfileV1::LinuxSmallV1,
-            }));
+            assert_eq!(
+                def.contract,
+                CiPlanContract::V2(myelin_ci_controlplane::CiExecutionRequestV1 {
+                    schema_version: myelin_ci_controlplane::EXECUTION_REQUEST_SCHEMA_V1,
+                    profile: myelin_ci_controlplane::CiExecutionProfileV1::LinuxSmallV1,
+                })
+            );
             assert!(matches!(
                 parse_ci_config(bytes, hint),
                 Err(CiConfigError::UnknownField { .. })
@@ -738,16 +859,30 @@ command = ["build"]
             "on=\"push\"\njobs=[]\n[execution]\nprofile=\"linux-small-v1\"\n",
             "schema_version=2\non=\"push\"\njobs=[]\n[execution]\n",
         ] {
-            assert_eq!(parse_versioned_ci_config(authored.as_bytes(), "toml"), Err(VersionedCiConfigError::PartialExecutionContract));
+            assert_eq!(
+                parse_versioned_ci_config(authored.as_bytes(), "toml"),
+                Err(VersionedCiConfigError::PartialExecutionContract)
+            );
         }
         assert_eq!(
             parse_versioned_ci_config(b"schema_version=9\non=\"push\"\njobs=[]\n", "toml"),
             Err(VersionedCiConfigError::UnsupportedSchemaVersion { version: 9 })
         );
-        let profile = "schema_version=2\non=\"push\"\njobs=[]\n[execution]\nprofile=\"gpu-large\"\n";
-        assert_eq!(parse_versioned_ci_config(profile.as_bytes(), "toml"), Err(VersionedCiConfigError::UnsupportedExecutionProfile { profile: "gpu-large".into() }));
+        let profile =
+            "schema_version=2\non=\"push\"\njobs=[]\n[execution]\nprofile=\"gpu-large\"\n";
+        assert_eq!(
+            parse_versioned_ci_config(profile.as_bytes(), "toml"),
+            Err(VersionedCiConfigError::UnsupportedExecutionProfile {
+                profile: "gpu-large".into()
+            })
+        );
         let unknown = r#"{"schema_version":2,"execution":{"profile":"linux-small-v1","egress":true},"on":"push","jobs":[]}"#;
-        assert!(matches!(parse_versioned_ci_config(unknown.as_bytes(), "json"), Err(VersionedCiConfigError::Legacy(CiConfigError::UnknownField { .. }))));
+        assert!(matches!(
+            parse_versioned_ci_config(unknown.as_bytes(), "json"),
+            Err(VersionedCiConfigError::Legacy(
+                CiConfigError::UnknownField { .. }
+            ))
+        ));
     }
 
     // -------- 2. Fail-closed cases — each asserts the SPECIFIC CiConfigError --------
@@ -775,8 +910,8 @@ oops = "typo"
 name = "build"
 image = "x@sha256:0"
 "#;
-        let err =
-            parse_ci_config(toml.as_bytes(), ".myelin/ci.toml").expect_err("an unknown key is rejected");
+        let err = parse_ci_config(toml.as_bytes(), ".myelin/ci.toml")
+            .expect_err("an unknown key is rejected");
         assert!(
             matches!(&err, CiConfigError::UnknownField { format: "toml", message } if message.contains("oops")),
             "unknown field → UnknownField naming the key: {err:?}"
@@ -794,7 +929,8 @@ name = "build"
 image = "x@sha256:0"
 retries = 3
 "#;
-        let err = parse_ci_config(toml.as_bytes(), ".myelin/ci.toml").expect_err("nested typo rejected");
+        let err =
+            parse_ci_config(toml.as_bytes(), ".myelin/ci.toml").expect_err("nested typo rejected");
         assert!(matches!(err, CiConfigError::UnknownField { .. }), "{err:?}");
     }
 
@@ -842,7 +978,8 @@ image = "x@sha256:0"
 command = ["a"]
 needs = ["ghost"]
 "#;
-        let err = parse_ci_config(toml.as_bytes(), ".myelin/ci.toml").expect_err("dangling need rejected");
+        let err = parse_ci_config(toml.as_bytes(), ".myelin/ci.toml")
+            .expect_err("dangling need rejected");
         assert!(
             matches!(&err, CiConfigError::UnknownNeed { job, need } if job == "a" && need == "ghost"),
             "{err:?}"
@@ -877,8 +1014,12 @@ on = "push"
 [[jobs]]
 name = "a"
 "#;
-        let err = parse_ci_config(toml.as_bytes(), ".myelin/ci.toml").expect_err("missing image rejected");
-        assert!(matches!(err, CiConfigError::Syntax { .. }), "missing required field → Syntax: {err:?}");
+        let err = parse_ci_config(toml.as_bytes(), ".myelin/ci.toml")
+            .expect_err("missing image rejected");
+        assert!(
+            matches!(err, CiConfigError::Syntax { .. }),
+            "missing required field → Syntax: {err:?}"
+        );
     }
 
     /// An empty job name → [`CiConfigError::EmptyJobName`].
@@ -946,7 +1087,10 @@ os = []
     #[test]
     fn a_yaml_hint_is_refused_as_deferred() {
         let err = parse_ci_config(b"on: push", ".myelin/ci.yaml").expect_err("yaml is deferred");
-        assert!(matches!(err, CiConfigError::UnknownFormat { .. }), "{err:?}");
+        assert!(
+            matches!(err, CiConfigError::UnknownFormat { .. }),
+            "{err:?}"
+        );
     }
 
     // -------- 3. Compose — parse → resolve_snapshot → the expected ResolvedSnapshot --------
@@ -967,7 +1111,10 @@ os = []
             versioned_snap,
             myelin_ci_controlplane::VersionedResolvedRunPlan::V1(snap.clone())
         );
-        assert_eq!(versioned_addr, addr, "legacy bytes and CAS address stay exact");
+        assert_eq!(
+            versioned_addr, addr,
+            "legacy bytes and CAS address stay exact"
+        );
 
         // build (1) + test 2×2 matrix (4) + gen-matrix (1) = 6 resolved instances.
         assert_eq!(snap.jobs.len(), 6, "1 build + 4 test-matrix + 1 generator");
@@ -978,12 +1125,19 @@ os = []
 
         // The matrix expanded deterministically (sorted-axis instance names).
         let names: Vec<&str> = snap.jobs.iter().map(|j| j.name.as_str()).collect();
-        assert_eq!(names.iter().filter(|name| name.starts_with("test--")).count(), 4);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("test--"))
+                .count(),
+            4
+        );
     }
 
     #[test]
     fn v2_matrix_preserves_stage_and_is_reproducible_in_cas() {
-        let toml = format!(r#"schema_version = 2
+        let toml = format!(
+            r#"schema_version = 2
 on = "push"
 
 [execution]
@@ -996,11 +1150,14 @@ command = ["test"]
 
 [jobs.matrix]
 os = ["linux", "macos"]
-"#);
+"#
+        );
         let definition = parse_versioned_ci_config(toml.as_bytes(), "toml").unwrap();
         let store = FsBlobStore::new();
-        let (first, first_hash) = resolve_versioned_snapshot(&definition, &store, &tenant()).unwrap();
-        let (second, second_hash) = resolve_versioned_snapshot(&definition, &store, &tenant()).unwrap();
+        let (first, first_hash) =
+            resolve_versioned_snapshot(&definition, &store, &tenant()).unwrap();
+        let (second, second_hash) =
+            resolve_versioned_snapshot(&definition, &store, &tenant()).unwrap();
         assert_eq!(first, second);
         assert_eq!(first_hash, second_hash);
         let plan = first.as_v2().expect("V2 snapshot");
@@ -1009,8 +1166,14 @@ os = ["linux", "macos"]
         assert!(plan.jobs.iter().all(|job| job.name.starts_with("test--")));
         let bytes = store.get(&tenant(), &first_hash).unwrap();
         assert_eq!(bytes, first.canonical_bytes().unwrap());
-        assert_eq!(myelin_ci_controlplane::decode_resolved_run_plan(&bytes).unwrap(), first);
-        assert_eq!(plan.launch_request_digest_v1().unwrap(), second.as_v2().unwrap().launch_request_digest_v1().unwrap());
+        assert_eq!(
+            myelin_ci_controlplane::decode_resolved_run_plan(&bytes).unwrap(),
+            first
+        );
+        assert_eq!(
+            plan.launch_request_digest_v1().unwrap(),
+            second.as_v2().unwrap().launch_request_digest_v1().unwrap()
+        );
     }
 
     #[test]
@@ -1042,7 +1205,8 @@ image = "alpine:3"
 command = ["build"]
 "#;
         // Parse SUCCEEDS — a floating tag is not a schema defect.
-        let def = parse_ci_config(toml.as_bytes(), ".myelin/ci.toml").expect("a floating tag parses");
+        let def =
+            parse_ci_config(toml.as_bytes(), ".myelin/ci.toml").expect("a floating tag parses");
         assert_eq!(def.jobs[0].image, "alpine:3");
         // The RESOLVER (the semantic owner) refuses it fail-closed.
         let store = FsBlobStore::new();
@@ -1065,26 +1229,48 @@ command = ["build"]
     #[test]
     fn required_command_and_raw_size_bounds_are_fail_closed() {
         let missing = b"on=\"push\"\n[[jobs]]\nname=\"a\"\nimage=\"x@sha256:0\"\n";
-        assert!(matches!(parse_ci_config(missing, "toml"), Err(CiConfigError::Syntax { .. })));
+        assert!(matches!(
+            parse_ci_config(missing, "toml"),
+            Err(CiConfigError::Syntax { .. })
+        ));
         let oversized = vec![b' '; MAX_CI_CONFIG_BYTES + 1];
-        assert_eq!(parse_ci_config(&oversized, "toml"), Err(CiConfigError::ConfigTooLarge {
-            actual: MAX_CI_CONFIG_BYTES + 1, maximum: MAX_CI_CONFIG_BYTES,
-        }));
+        assert_eq!(
+            parse_ci_config(&oversized, "toml"),
+            Err(CiConfigError::ConfigTooLarge {
+                actual: MAX_CI_CONFIG_BYTES + 1,
+                maximum: MAX_CI_CONFIG_BYTES,
+            })
+        );
     }
 
     #[test]
     fn command_and_machine_token_bounds_are_enforced() {
         let too_many = format!(
             "on=\"push\"\n[[jobs]]\nname=\"a\"\nimage=\"x@sha256:0\"\ncommand=[{}]\n",
-            std::iter::repeat_n("\"x\"", myelin_ci_controlplane::run_plan::MAX_COMMAND_ARGS + 1)
-                .collect::<Vec<_>>().join(",")
+            std::iter::repeat_n(
+                "\"x\"",
+                myelin_ci_controlplane::run_plan::MAX_COMMAND_ARGS + 1
+            )
+            .collect::<Vec<_>>()
+            .join(",")
         );
-        assert!(matches!(parse_ci_config(too_many.as_bytes(), "toml"), Err(CiConfigError::InvalidCommand { .. })));
+        assert!(matches!(
+            parse_ci_config(too_many.as_bytes(), "toml"),
+            Err(CiConfigError::InvalidCommand { .. })
+        ));
         let invalid_name = b"on=\"push\"\n[[jobs]]\nname=\"not a token\"\nimage=\"x@sha256:0\"\ncommand=[\"run\"]\n";
-        assert!(matches!(parse_ci_config(invalid_name, "toml"), Err(CiConfigError::InvalidMachineToken { .. })));
-        let jobs = (0..=MAX_AUTHORED_JOBS).map(|index| format!(
-            "[[jobs]]\nname=\"j{index}\"\nimage=\"x@sha256:0\"\ncommand=[\"run\"]\n"
-        )).collect::<String>();
-        assert!(matches!(parse_ci_config(format!("on=\"push\"\n{jobs}").as_bytes(), "toml"), Err(CiConfigError::TooManyJobs { .. })));
+        assert!(matches!(
+            parse_ci_config(invalid_name, "toml"),
+            Err(CiConfigError::InvalidMachineToken { .. })
+        ));
+        let jobs = (0..=MAX_AUTHORED_JOBS)
+            .map(|index| {
+                format!("[[jobs]]\nname=\"j{index}\"\nimage=\"x@sha256:0\"\ncommand=[\"run\"]\n")
+            })
+            .collect::<String>();
+        assert!(matches!(
+            parse_ci_config(format!("on=\"push\"\n{jobs}").as_bytes(), "toml"),
+            Err(CiConfigError::TooManyJobs { .. })
+        ));
     }
 }

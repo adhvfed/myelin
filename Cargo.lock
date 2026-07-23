@@ -2543,6 +2543,7 @@ name = "myelin-events"
 version = "0.0.0"
 dependencies = [
  "async-nats",
+ "blake3",
  "futures",
  "myelin-config",
  "myelin-events",

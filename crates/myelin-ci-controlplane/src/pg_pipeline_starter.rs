@@ -33,7 +33,6 @@ use myelin_storage::{BlobStore, ContentHash, DurableCostLedger};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{PgPool, Row};
 
-use crate::check_emitter::BUMP_CHECK_ATTEMPT_SQL;
 use crate::ci_drive_manifest::{
     ci_check_context_v1, CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1,
     CiLaunchAuthorityV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, GrantedCiJobV1,
@@ -668,7 +667,7 @@ impl PgCiPipelineStarter {
                     .map(|job| job.check_context.clone())
                     .collect::<BTreeSet<_>>();
                 let attempts =
-                    allocate_check_attempts(&mut transaction, &record, &contexts).await?;
+                    load_reserved_check_attempts(&mut transaction, &record, &contexts).await?;
                 let manifest = build_drive_manifest_v1(
                     &record,
                     prepared,
@@ -1521,46 +1520,16 @@ async fn verify_replay_attempts(
     record: &CiRunRecord,
     manifest: &CiDriveManifestV1,
 ) -> Result<(), PgCiStarterError> {
-    let run_id = sqlx::types::Uuid::parse_str(&record.run_id).map_err(|error| {
-        PgCiStarterError::CorruptRun(format!("locked ci_run.run_id is not a UUID: {error}"))
-    })?;
-    for (context, issued) in &manifest.check_attempts {
-        let row: Option<(i32, Option<sqlx::types::Uuid>)> = sqlx::query_as(
-            "SELECT next_attempt, current_run FROM check_attempt \
-             WHERE tenant_id=$1 AND region=$2 AND repo_ref=$3 AND commit_oid=$4 AND context=$5 \
-             FOR SHARE",
-        )
-        .bind(&record.tenant_id)
-        .bind(&record.region)
-        .bind(&manifest.repo_ref)
-        .bind(&manifest.commit_oid)
-        .bind(context)
-        .fetch_optional(&mut **transaction)
-        .await
-        .map_err(|error| {
-            PgCiStarterError::Database(format!("verify replay check attempt: {error}"))
-        })?;
-        let (next, current) = row.ok_or_else(|| {
-            PgCiStarterError::CorruptRun(format!(
-                "manifest check context `{context}` has no allocation ledger"
-            ))
-        })?;
-        let issued = i32::try_from(*issued).map_err(|_| {
-            PgCiStarterError::CorruptRun("manifest check attempt exceeds PostgreSQL i32".into())
-        })?;
-        let minimum_next = issued.checked_add(1).ok_or_else(|| {
-            PgCiStarterError::CorruptRun("manifest check attempt overflows PostgreSQL i32".into())
-        })?;
-        let valid = if current == Some(run_id) {
-            next == minimum_next
-        } else {
-            current.is_some() && next > minimum_next
-        };
-        if !valid {
-            return Err(PgCiStarterError::CorruptRun(format!(
-                "manifest check attempt for `{context}` diverges from the allocation ledger"
-            )));
-        }
+    let contexts = manifest
+        .check_attempts
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let reserved = load_reserved_check_attempts(transaction, record, &contexts).await?;
+    if reserved != manifest.check_attempts {
+        return Err(PgCiStarterError::CorruptRun(
+            "manifest check attempts diverge from the run-scoped allocation ledger".into(),
+        ));
     }
     Ok(())
 }
@@ -1691,7 +1660,7 @@ fn build_drive_manifest_v1(
     Ok(manifest)
 }
 
-async fn allocate_check_attempts(
+async fn load_reserved_check_attempts(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     record: &CiRunRecord,
     contexts: &BTreeSet<String>,
@@ -1706,20 +1675,25 @@ async fn allocate_check_attempts(
     let run_id = sqlx::types::Uuid::parse_str(&record.run_id).map_err(|error| {
         PgCiStarterError::CorruptRun(format!("locked run id is not a UUID: {error}"))
     })?;
+    let rows: Vec<(String, String, String, i32)> = sqlx::query_as(
+        "SELECT context, repo_ref, commit_oid, run_attempt FROM ci_run_check_attempt \
+         WHERE tenant_id=$1 AND region=$2 AND run_id=$3 FOR SHARE",
+    )
+    .bind(&record.tenant_id)
+    .bind(&record.region)
+    .bind(run_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|error| {
+        PgCiStarterError::Database(format!("read reserved check attempts: {error}"))
+    })?;
     let mut attempts = BTreeMap::new();
-    for context in contexts {
-        let attempt: i32 = sqlx::query_scalar(BUMP_CHECK_ATTEMPT_SQL)
-            .bind(&record.tenant_id)
-            .bind(&record.region)
-            .bind(repo_ref)
-            .bind(commit_oid)
-            .bind(context)
-            .bind(run_id)
-            .fetch_one(&mut **transaction)
-            .await
-            .map_err(|error| {
-                PgCiStarterError::Database(format!("allocate check attempt: {error}"))
-            })?;
+    for (context, stored_repo, stored_commit, attempt) in rows {
+        if stored_repo != repo_ref || stored_commit != commit_oid || !contexts.contains(&context) {
+            return Err(PgCiStarterError::CorruptRun(
+                "run-scoped check attempt provenance or context diverged".into(),
+            ));
+        }
         let attempt = u32::try_from(attempt).map_err(|_| {
             PgCiStarterError::CorruptRun("check attempt is not a positive u32".into())
         })?;
@@ -1728,6 +1702,16 @@ async fn allocate_check_attempts(
                 "check attempt allocation returned zero or a duplicate context".into(),
             ));
         }
+    }
+    if attempts.keys().collect::<BTreeSet<_>>() != contexts.iter().collect::<BTreeSet<_>>() {
+        let missing = contexts
+            .iter()
+            .find(|context| !attempts.contains_key(*context))
+            .cloned()
+            .unwrap_or_else(|| "<unknown>".into());
+        return Err(PgCiStarterError::CorruptRun(format!(
+            "manifest check context `{missing}` has no run-scoped allocation ledger"
+        )));
     }
     Ok(attempts)
 }

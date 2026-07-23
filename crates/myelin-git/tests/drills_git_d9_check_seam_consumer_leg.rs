@@ -125,7 +125,7 @@ fn consumer_leg_is_idempotent_on_event_id_zero_dup() {
     let consumer = bind_consumer();
     let env = synthetic_check_updated("build", 1, CheckState::Success, TrustTier::Trusted);
     let msg = Message {
-        subject: CI_CHECK_UPDATED.into(),
+        subject: env.subject.0.clone(),
         envelope: env,
     };
 
@@ -181,7 +181,7 @@ fn consumer_leg_per_aggregate_ordered_supersession_drops_stale() {
             _ => unreachable!(),
         };
         let msg = Message {
-            subject: CI_CHECK_UPDATED.into(),
+            subject: env.subject.0.clone(),
             envelope: env.clone(),
         };
         assert_eq!(consumer.deliver(&msg), Delivered::Acked);
@@ -232,7 +232,7 @@ fn consumer_leg_dead_letters_a_malformed_payload() {
     // Corrupt the opaque payload (not a valid CheckStatus fact).
     env.payload = serde_json::json!({ "garbage": true });
     let msg = Message {
-        subject: CI_CHECK_UPDATED.into(),
+        subject: env.subject.0.clone(),
         envelope: env,
     };
 

@@ -175,9 +175,9 @@ fn cdc_5_9_frozen_shape_surfaces() {
     assert!(supersedes(1, 1));
     assert!(!supersedes(1, 2));
 
-    // The projection-table schema is keyed (tenant, commit_oid, context) with the supersession column.
+    // The projection-table schema includes every authority dimension with the supersession column.
     assert!(CHECK_STATUS_PROJECTION_DDL
-        .contains("PRIMARY KEY (tenant, commit_oid, context_provider, context_name)"));
+        .contains("tenant_id, region, repo_ref, commit_oid, context_provider, context_name"));
     assert!(CHECK_STATUS_PROJECTION_DDL.contains("run_attempt"));
 
     // CheckContext distinguishes ci vs external providers (the KEY half of the frozen shape).

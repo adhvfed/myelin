@@ -71,7 +71,7 @@ fn provider_ci_emits_ci_check_updated_with_the_412_envelope_shape() {
     );
 
     // The aggregate is (repo, commit_oid) — the per-commit ordering partition all contexts share.
-    assert_eq!(draft.aggregate.0, format!("{REPO}#commit-{COMMIT}"));
+    assert_eq!(draft.aggregate, check_aggregate(REPO, COMMIT));
 
     // The CI-owned CheckStatus is carried OPAQUE — every field round-trips untouched (the Bus does
     // NOT interpret it; references-not-payloads, so no inline PII).

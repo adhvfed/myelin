@@ -507,6 +507,7 @@ fn humanise_unmet(u: &UnmetContext) -> String {
             let cue = StatusCue::for_check_state(*state);
             format!("{ctx} {}", cue.label)
         }
+        UnmetReason::CostUnsettled => format!("{ctx} awaiting settlement"),
         UnmetReason::UntrustedForkNeutral => format!("{ctx} awaiting fork trust"),
     }
 }

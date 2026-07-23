@@ -63,9 +63,9 @@ use myelin_git::pr_list_pagination::{
     PrListDirection, PrListKey, PrListPage, PR_LIST_CURSOR_PREFIX,
 };
 use myelin_git::pr_store::{
-    effective_ruleset, evaluate_merge, merge_pr, BranchProtectionConfig, ChecksSummary,
-    DurablePrStore, MergeAttempt, PrCrossListQuery, PrCrossListRecord, PrListBucket, PrListCounts,
-    PrListQuery, PrListSlice, PrListSort, PrListState, PrRecord, ReviewRecord, PR_LIST_OFFSET_MAX,
+    effective_ruleset, merge_pr, BranchProtectionConfig, ChecksSummary, DurablePrStore,
+    MergeAttempt, PrCrossListQuery, PrListBucket, PrListCounts, PrListQuery, PrListSlice,
+    PrListSort, PrListState, PrRecord, ReviewRecord, PR_LIST_OFFSET_MAX,
 };
 use myelin_git::pr_threads::{
     AnchorSide, AnchorState, BatchVerdict, CommentRecord, CommentState, DurablePrThreadStore,
@@ -154,6 +154,9 @@ pub struct DurableGitBackend {
     /// Production PR lifecycle authority. `None` exists only in the test-support constructor so the
     /// long-standing filesystem fixtures remain hermetic.
     pg_prs: Option<PgPrStore>,
+    /// Git-owned durable projection of CI check facts. Production always supplies it; test-support
+    /// constructors leave it absent and continue to use explicit PR-record fixtures.
+    checks: Option<myelin_git::check_status_store::PgCheckStatusProjection>,
     /// **R3.3 / R3.2 — the durable PR review-thread / comment / review-batch store.** Keyed by the
     /// canonical `object_key` (`pr:<slug>:<n>`); rooted at the SAME on-disk root as `store`/`prs`.
     threads: DurablePrThreadStore,
@@ -337,17 +340,19 @@ impl DurableGitBackend {
     pub fn rooted(
         root: impl Into<PathBuf>,
         public_clone_base: impl Into<String>,
-        provider: SubstrateProvider,
+        providers: GitDatabaseProviders,
         kms: Arc<KmsEngine>,
         runtime: tokio::runtime::Handle,
         outbox: OutboxStore,
         minter: Arc<dyn IdMinter>,
     ) -> Result<DurableGitBackend, DurableError> {
         let root = root.into();
+        let (provider, checks) = providers.into_projection(runtime.clone());
         Ok(DurableGitBackend {
             store: DurableGitStore::rooted(root.clone()),
             prs: DurablePrStore::rooted(root.clone()),
             pg_prs: Some(PgPrStore::new(provider, kms, runtime)?),
+            checks: Some(checks),
             threads: DurablePrThreadStore::rooted(root.clone()),
             outbox,
             minter,
@@ -385,6 +390,7 @@ impl DurableGitBackend {
             store: DurableGitStore::rooted(root.clone()),
             prs: DurablePrStore::rooted(root.clone()),
             pg_prs: None,
+            checks: None,
             threads: DurablePrThreadStore::rooted(root.clone()),
             outbox: OutboxStore::new(),
             minter: Arc::new(MonotonicMinter::new()),
@@ -647,9 +653,11 @@ impl DurableGitBackend {
                 PR_LIST_PER_REPO_MAX_RECORDS,
                 PR_LIST_PER_REPO_MAX_BYTES,
             ),
-            None => self
-                .prs
-                .list_bounded(loc, PR_LIST_PER_REPO_MAX_RECORDS, PR_LIST_PER_REPO_MAX_BYTES),
+            None => self.prs.list_bounded(
+                loc,
+                PR_LIST_PER_REPO_MAX_RECORDS,
+                PR_LIST_PER_REPO_MAX_BYTES,
+            ),
         }
     }
 
@@ -663,14 +671,12 @@ impl DurableGitBackend {
             Some(store) => {
                 store.list_page(&Self::verified_pr_scope(principal, loc)?, &loc.repo, query)
             }
-            None => self
-                .prs
-                .list_page_bounded(
-                    loc,
-                    query,
-                    PR_LIST_PER_REPO_MAX_RECORDS,
-                    PR_LIST_PER_REPO_MAX_BYTES,
-                ),
+            None => self.prs.list_page_bounded(
+                loc,
+                query,
+                PR_LIST_PER_REPO_MAX_RECORDS,
+                PR_LIST_PER_REPO_MAX_BYTES,
+            ),
         }
     }
 
@@ -997,11 +1003,7 @@ impl DurableGitBackend {
             .collect();
         let has_more = page.len() > limit;
         page.truncate(limit);
-        let next_slug = if has_more {
-            page.last().cloned()
-        } else {
-            None
-        };
+        let next_slug = if has_more { page.last().cloned() } else { None };
 
         let mut rows = Vec::with_capacity(page.len());
         for slug in page {
@@ -1320,9 +1322,9 @@ impl DurableGitBackend {
             TreePageLookup::IsFile => {
                 Ok(json!({ "redirect_to_blob": true, "ref": gitref, "path": path }))
             }
-            TreePageLookup::Missing => Err(TreePageError::Durable(DurableError::NotFound(format!(
-                "no such path `{path}` at `{gitref}`"
-            )))),
+            TreePageLookup::Missing => Err(TreePageError::Durable(DurableError::NotFound(
+                format!("no such path `{path}` at `{gitref}`"),
+            ))),
             TreePageLookup::Dir(page) => {
                 let base = path.trim_matches('/');
                 let snapshot_oid = page.snapshot_oid.clone();
@@ -1811,43 +1813,6 @@ impl DurableGitBackend {
     // storage authorities. The SQL composer in `list_filter.rs` targets an abstract authorization
     // projection rather than this literal query; the repo `pull` prefilter is the equivalent gate.
 
-    /// Enrich every PR under one repo for the list: read the repo-owned branch-protection config
-    /// ONCE (no N+1 — the effective ruleset per PR is a pure function of that config + the PR's
-    /// base_ref), roll up each PR's checks summary against its effective required set, and mark the
-    /// viewer's requested-reviewer status. On a config-READ error the whole repo's rows fail static
-    /// (`Unavailable`) rather than dropping PRs (a checks-projection hiccup must not hide PRs).
-    fn enrich_pr_records(
-        &self,
-        loc: &RepoLoc,
-        viewer_pseudonym: &str,
-        repo_slug: Option<&str>,
-        records: Vec<PrRecord>,
-    ) -> Vec<EnrichedPr> {
-        // ONE config read for the whole repo (fail static on error — see above).
-        // A read failure degrades every row's summary to Unavailable below.
-        let config = self.prs.get_protection(loc).ok();
-        let config_readable = config.is_some();
-        let config = config.flatten();
-        records
-            .into_iter()
-            .map(|rec| {
-                let summary = if config_readable {
-                    let ruleset = effective_ruleset(config.as_ref(), &rec.base_ref);
-                    rec.checks_summary(&ruleset)
-                } else {
-                    ChecksSummary::unavailable()
-                };
-                let you_requested = rec.is_review_requested_of(viewer_pseudonym);
-                EnrichedPr {
-                    rec,
-                    summary,
-                    you_requested,
-                    repo_slug: repo_slug.map(str::to_string),
-                }
-            })
-            .collect()
-    }
-
     /// **The per-repo PR list (R3.1).** Every PR in the repo (the caller has already cleared the
     /// `Pull` object guard, so all are `view`-able), enriched with the checks rollup + the viewer's
     /// review status. Storage applies state/sort/cursor and computes exact tab/sidebar counts over
@@ -1863,7 +1828,8 @@ impl DurableGitBackend {
         let loc = Self::loc(tenant, region, slug);
         self.store.open_repo(&loc)?; // 404 if the repo is absent (never a phantom empty list).
         let page = self.pr_list_page(&loc, principal, query)?;
-        let rows = self.enrich_pr_records(&loc, &query.viewer_pseudonym, None, page.records);
+        let rows =
+            self.enrich_pr_records(&loc, principal, &query.viewer_pseudonym, None, page.records);
         let endpoint = PrListCursorEndpoint::Repository(query.state);
         let static_scope = pr_list_static_scope(
             tenant,
@@ -1957,45 +1923,9 @@ impl DurableGitBackend {
                 limits.maximum_bytes,
                 "cross-repository serialized bytes",
             )?;
-            out.extend(self.enrich_pr_records(&loc, &viewer, Some(slug), records));
+            out.extend(self.enrich_pr_records(&loc, principal, &viewer, Some(slug), records));
         }
         Ok(out)
-    }
-
-    fn enrich_cross_pr_records(
-        &self,
-        tenant: &str,
-        region: &str,
-        viewer: &str,
-        records: Vec<PrCrossListRecord>,
-    ) -> Vec<EnrichedPr> {
-        let mut configs = std::collections::BTreeMap::new();
-        for item in &records {
-            configs.entry(item.repo_slug.clone()).or_insert_with(|| {
-                self.prs
-                    .get_protection(&Self::loc(tenant, region, &item.repo_slug))
-                    .ok()
-            });
-        }
-        records
-            .into_iter()
-            .map(|item| {
-                let summary = match configs.get(&item.repo_slug) {
-                    Some(Some(config)) => {
-                        let ruleset = effective_ruleset(config.as_ref(), &item.record.base_ref);
-                        item.record.checks_summary(&ruleset)
-                    }
-                    _ => ChecksSummary::unavailable(),
-                };
-                let you_requested = item.record.is_review_requested_of(viewer);
-                EnrichedPr {
-                    rec: item.record,
-                    summary,
-                    you_requested,
-                    repo_slug: Some(item.repo_slug),
-                }
-            })
-            .collect()
     }
 
     fn list_prs_cross_page(
@@ -2036,8 +1966,13 @@ impl DurableGitBackend {
                 &visible,
                 query,
             )?;
-            let rows =
-                self.enrich_cross_pr_records(tenant, region, &query.viewer_pseudonym, page.records);
+            let rows = self.enrich_cross_pr_records(
+                tenant,
+                region,
+                principal,
+                &query.viewer_pseudonym,
+                page.records,
+            );
             let (next_cursor, prev_cursor) = mint_pr_list_cursors(
                 &rows,
                 endpoint,
@@ -2077,11 +2012,10 @@ impl DurableGitBackend {
         });
         match query.sort {
             PrListSort::Created => rows.sort_by(|a, b| {
-                b.rec.number.cmp(&a.rec.number).then(
-                    a.repo_slug
-                        .as_deref()
-                        .cmp(&b.repo_slug.as_deref()),
-                )
+                b.rec
+                    .number
+                    .cmp(&a.rec.number)
+                    .then(a.repo_slug.as_deref().cmp(&b.repo_slug.as_deref()))
             }),
             PrListSort::Updated => rows.sort_by(|a, b| {
                 b.rec
@@ -2099,7 +2033,7 @@ impl DurableGitBackend {
             }
             PrListPage::Keyset(cursor) => {
                 let mut selected: Vec<_> = rows
-            .into_iter()
+                    .into_iter()
                     .enumerate()
                     .filter(|(_, row)| {
                         let before = cross_pr_before_key(row, cursor.key(), query.sort);
@@ -2112,7 +2046,7 @@ impl DurableGitBackend {
                             PrListDirection::Older => !before && !equal,
                         }
                     })
-            .collect();
+                    .collect();
                 if cursor.direction() == PrListDirection::Newer {
                     selected.reverse();
                 }
@@ -2535,6 +2469,7 @@ impl DurableGitBackend {
                 &source_repo,
                 &ref_store,
                 &Self::pseudonym(tenant, principal),
+                self.checks.is_some(),
             );
         }
         merge_pr(
@@ -2883,32 +2818,6 @@ impl DurableGitBackend {
 
     // ── git smart-HTTP PUSH (receive-pack) over the wire — CT-006d ──
 
-    /// **R0.2 / DELTA N1 — Git's OWN recorded check facts for a pushed head commit.** Scans the repo's
-    /// durable PR records for any whose `head_oid` equals the pushed oid and gathers the recorded green
-    /// / fork-unendorsed / endorsed context names (the facts authorized producers stamped — the CI
-    /// check-report op, the maintainer endorsement op). Returns `(green, fork_unendorsed, endorsed)` for
-    /// the merge gate. ACYCLIC: it reads facts Git already holds; the wire push NEVER synchronously
-    /// calls CI (EI-02 §3). The store-backed per-commit `check_status` projection is the GIT-P20
-    /// follow-on; until then a commit's recorded facts live on its PR record(s).
-    fn check_facts_for_head(
-        &self,
-        loc: &RepoLoc,
-        head_oid: &str,
-        principal: &Principal,
-    ) -> (Vec<String>, Vec<String>, Vec<String>) {
-        let mut green = Vec::new();
-        let mut fork_unendorsed = Vec::new();
-        let mut endorsed = Vec::new();
-        if let Ok(prs) = self.pr_list(loc, principal) {
-            for rec in prs.into_iter().filter(|r| r.head_oid == head_oid) {
-                green.extend(rec.green_contexts);
-                fork_unendorsed.extend(rec.fork_unendorsed_contexts);
-                endorsed.extend(rec.endorsed_contexts);
-            }
-        }
-        (green, fork_unendorsed, endorsed)
-    }
-
     /// The receive-pack ref advertisement source: every `(ref_name, oid)` on the durable repo, sorted.
     /// A pure read of OUR tenant-scoped repo (no sandbox needed); the wire handler frames it + the
     /// service header + the restricted capability list. `NotFound` (404) if the repo is absent.
@@ -3130,7 +3039,8 @@ impl DurableGitBackend {
             &loc,
             RepoPermission::ProtectedPush,
         );
-        for u in &updates {
+        let mut protected_updates = Vec::new();
+        for (index, u) in updates.iter().enumerate() {
             let ref_str = u.ref_name.0.as_str();
             let configured = protection
                 .as_ref()
@@ -3141,6 +3051,12 @@ impl DurableGitBackend {
                 continue; // a non-protected ref keeps the existing PushPolicy checks (unchanged).
             }
             let ruleset = effective_ruleset(protection.as_ref(), ref_str);
+            protected_updates.push((index, ruleset.clone()));
+            if self.checks.is_some() {
+                // Production evaluates under the projection consumer's shared admission lock below,
+                // holding it through the ref mutation. Reading here would reopen a check→CAS race.
+                continue;
+            }
             let is_delete = u.new_oid.is_zero();
             let (green, fork_unendorsed, endorsed) =
                 self.check_facts_for_head(&loc, u.new_oid.0.as_str(), principal);
@@ -3177,11 +3093,59 @@ impl DurableGitBackend {
                 is_agent: false,
             },
         };
-        let migration = ObjectPromotion {
-            repo: &repo,
-            objects: &objects,
+        let outcome = if self.checks.is_some() {
+            match self.receive_with_check_admission(
+                &loc,
+                principal,
+                check_projection::ProtectedPushMutation::new(
+                    Arc::clone(&repo),
+                    objects.clone(),
+                    ref_store,
+                    push,
+                ),
+                protected_updates,
+                pusher_has_protected_push,
+            ) {
+                Ok(outcome) => outcome,
+                Err(check_projection::ProtectedPushAdmissionError::Scope(error)) => {
+                    let _ = std::fs::remove_dir_all(&qdir);
+                    return Ok(report_status(
+                        "ok",
+                        &all_ng(
+                            &cmds,
+                            &format!(
+                                "rejected (check admission scope unavailable — fail-closed): {error}"
+                            ),
+                        ),
+                    ));
+                }
+                Err(check_projection::ProtectedPushAdmissionError::Policy(reason)) => {
+                    let _ = std::fs::remove_dir_all(&qdir);
+                    return Ok(report_status(
+                        "ok",
+                        &all_ng(&cmds, &format!("rejected (branch protection): {reason:?}")),
+                    ));
+                }
+                Err(check_projection::ProtectedPushAdmissionError::Projection(error)) => {
+                    let _ = std::fs::remove_dir_all(&qdir);
+                    return Ok(report_status(
+                        "ok",
+                        &all_ng(
+                            &cmds,
+                            &format!(
+                                "rejected (check projection unavailable — fail-closed): {error}"
+                            ),
+                        ),
+                    ));
+                }
+            }
+        } else {
+            let migration = ObjectPromotion {
+                repo: &repo,
+                objects: &objects,
+            };
+            ref_store.receive(&push, &migration, CrashPoint::None)
         };
-        let outcome = ref_store.receive(&push, &migration, CrashPoint::None);
         let _ = std::fs::remove_dir_all(&qdir); // the host quarantine is discarded either way
 
         match outcome.map_err(|e| DurableError::Git(format!("ref-CAS: {e:?}")))? {
@@ -3223,46 +3187,6 @@ impl DurableGitBackend {
             "created_at": rec.created_at,
             "durable": true,
         })
-    }
-
-    /// **The checks + merge-gate projection JSON (`PrChecksVM`).** `gate_admitted` is AUTHORITATIVE —
-    /// the UI reflects it, never recomputes. Reused by the checks endpoint AND the merge-409 re-render
-    /// (so a gate that flipped mid-dialog returns the fresh blocked card, never a stale one). `blocked`
-    /// carries the honest, VERIFIED gate inputs: `changes_requested` (a live request-changes blocks
-    /// unconditionally) and `approvals` (a real threshold; self-approval excluded) — both are what the
-    /// R2 ruleset actually ingests, so the copy never implies a gate input that isn't real.
-    fn pr_checks_json(&self, loc: &RepoLoc, rec: &PrRecord) -> Result<Value, DurableError> {
-        let ruleset = self.prs.effective_ruleset_for(loc, &rec.base_ref)?;
-        let eval = evaluate_merge(&ruleset, rec).map_err(|e| DurableError::Git(e.to_string()))?;
-        let has_blocking_review = rec.reviews.iter().any(|r| {
-            matches!(
-                r.state,
-                ReviewState::Submitted(ReviewVerdict::RequestChanges)
-            )
-        });
-        let counting_approvals = rec
-            .reviews
-            .iter()
-            .filter(|r| {
-                matches!(r.state, ReviewState::Submitted(ReviewVerdict::Approve))
-                    && r.reviewer_pseudonym != rec.author_pseudonym
-            })
-            .count() as u32;
-        Ok(json!({
-            "required_contexts": ruleset.required_contexts,
-            "required_approvals": ruleset.required_approvals,
-            "green_contexts": rec.green_contexts,
-            "endorsed_contexts": rec.endorsed_contexts,
-            // The X-1 fork-trust surface: contexts that passed on an UNTRUSTED FORK run and are
-            // recorded-but-neutral until a maintainer endorses them (the badge the UI renders).
-            "fork_unendorsed_contexts": rec.fork_unendorsed_contexts,
-            "gate_admitted": eval.admitted(),
-            // The VERIFIED review-gate inputs (R2 `evaluate_ruleset`): the UI renders these as
-            // blocked-reason copy WITHOUT inventing a gate input that isn't real.
-            "changes_requested": has_blocking_review,
-            "current_approvals": counting_approvals,
-            "durable": true,
-        }))
     }
 
     /// The commits IN a PR count (R3.3 N1/N2 — the tab badge) via the bounded reachability walk. A cap
@@ -3814,11 +3738,7 @@ fn checked_cross_pr_list_total(
     current
         .checked_add(addition)
         .filter(|total| *total <= maximum)
-        .ok_or_else(|| {
-            DurableError::Git(format!(
-                "pull request list limit exceeded: {dimension}"
-            ))
-        })
+        .ok_or_else(|| DurableError::Git(format!("pull request list limit exceeded: {dimension}")))
 }
 
 fn serialized_pr_records_bytes(records: &[PrRecord]) -> Result<usize, DurableError> {
@@ -3853,10 +3773,7 @@ const README_MAX_BYTES: usize = 512 * 1024;
 /// inflating a file the next hop must reject anyway.
 const RAW_BLOB_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-fn first_root_tree_page(
-    repo: &DurableGitRepo,
-    branch_ref: &str,
-) -> Result<TreePage, DurableError> {
+fn first_root_tree_page(repo: &DurableGitRepo, branch_ref: &str) -> Result<TreePage, DurableError> {
     match repo.tree_page(branch_ref, "", TreePageRequest::default()) {
         Ok(TreePageLookup::Dir(page)) => Ok(page),
         Ok(TreePageLookup::IsFile | TreePageLookup::Missing) => Err(DurableError::NotFound(
@@ -4063,7 +3980,9 @@ fn map_durable_err(e: DurableError) -> EdgeError {
             EdgeError::Conflict("pull request list cursor is stale; restart pagination".into())
         }
         DurableError::Git(m) if m.starts_with("browse response limit exceeded:") => {
-            EdgeError::PayloadTooLarge("repository view exceeds the interactive browse limit".into())
+            EdgeError::PayloadTooLarge(
+                "repository view exceeds the interactive browse limit".into(),
+            )
         }
         DurableError::Git(m) if m.starts_with("tree page limit exceeded:") => {
             EdgeError::PayloadTooLarge(
@@ -4071,13 +3990,17 @@ fn map_durable_err(e: DurableError) -> EdgeError {
             )
         }
         DurableError::Git(m) if m.starts_with("pr diff computation limit exceeded:") => {
-            EdgeError::PayloadTooLarge("pull request diff exceeds the interactive file limit".into())
+            EdgeError::PayloadTooLarge(
+                "pull request diff exceeds the interactive file limit".into(),
+            )
         }
         DurableError::Git(m) if m.starts_with("commit diff computation limit exceeded:") => {
             EdgeError::PayloadTooLarge("commit diff exceeds the interactive content limit".into())
         }
         DurableError::Git(m) if m.starts_with("pull request list limit exceeded:") => {
-            EdgeError::PayloadTooLarge("pull request list exceeds the interactive record limit".into())
+            EdgeError::PayloadTooLarge(
+                "pull request list exceeds the interactive record limit".into(),
+            )
         }
         DurableError::Git(m) if m.starts_with("pull request record limit exceeded:") => {
             EdgeError::PayloadTooLarge("pull request record exceeds the storage limit".into())
@@ -4289,6 +4212,8 @@ fn repo_summary_response(value: &Value) -> Result<EdgeResponse, EdgeError> {
     })
 }
 
+mod check_projection;
 mod http;
+pub use check_projection::GitDatabaseProviders;
 pub use http::register_git_durable;
 use http::{cross_pr_before_key, mint_pr_list_cursors, BlobViewOptions, RawResponseOptions};

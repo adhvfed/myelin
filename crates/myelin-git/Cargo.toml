@@ -96,7 +96,7 @@ serde_json.workspace = true
 # is proven against the dev Postgres stack by `tests/integration_git_d10_check_status_projection.rs`.
 sqlx.workspace = true
 tokio.workspace = true
-myelin-config = { workspace = true, optional = true }
+myelin-config.workspace = true
 
 # BLAKE3 content-addresses the IMMUTABLE git commit object (GIT-P25 / P-ID-25, M3): the commit OID
 # is `blake3:<hex>` over the canonical commit bytes — the SAME multihash convention the GDPR holder
@@ -198,4 +198,4 @@ toml.workspace = true
 # `myelin-storage/integration` pulls in the REAL `ValkeyCache` (the `fork:<pr_id>` cache-confinement
 # integration test, GIT-P22 / P-284, `tests/integration_git_p22_fork_cache_confinement.rs`).
 test-support = []
-integration = ["test-support", "dep:myelin-config", "myelin-storage/integration"]
+integration = ["test-support", "myelin-storage/integration"]

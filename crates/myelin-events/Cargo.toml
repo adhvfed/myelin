@@ -15,6 +15,9 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 serde.workspace = true
 serde_json.workspace = true
+# Fixed-width, versioned check aggregate IDs. A repository ArtifactRef may be longer than one NATS
+# token (or contain `.`), so the production routing key hashes the exact `(repo, commit_oid)` pair.
+blake3.workspace = true
 
 # ------------------------------------------------------------------------------------------
 # REAL durable bus behind the `nats` feature (Stage 1 / infra). The BusTransport trait

@@ -25,10 +25,14 @@ use myelin_git::check_status::{
     CheckContext, CheckState, CheckStatus, GitOid, HumanisedRef, Timestamp, TrustTier,
 };
 use myelin_git::check_status_store::{PgCheckStatusProjection, StoreApplyOutcome};
-use myelin_tenancy::{ArtifactRef, TenantId};
+use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use myelin_storage::{SubstrateProvider, TenantScope};
+use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use std::collections::BTreeMap;
 
 const TENANT: &str = "acme";
+const REGION: &str = "fr-par";
+const REPO: &str = "myelin://acme/git/repo/core";
 const COMMIT: &str = "abc123def";
 
 /// The dev default mirrors the myelin-config dev DATABASE_URL (the admin role so the test owns its
@@ -41,12 +45,18 @@ fn admin_url() -> String {
 
 /// The SYNTHETIC `ci.check.updated` fact (CI's real producer is EB-27/M4). One commit; vary the
 /// context, attempt, state, trust to drive the supersession + the gate.
-fn fact(context: &str, attempt: u32, state: CheckState, trust: TrustTier) -> CheckStatus {
+fn fact_for_repo(
+    repo: &str,
+    context: &str,
+    attempt: u32,
+    state: CheckState,
+    trust: TrustTier,
+) -> CheckStatus {
     let mut args = BTreeMap::new();
     args.insert("context".to_string(), context.to_string());
     CheckStatus {
         tenant: TenantId(TENANT.into()),
-        repo: ArtifactRef(format!("myelin://{TENANT}/git/repo/core")),
+        repo: ArtifactRef(repo.into()),
         commit_oid: GitOid(COMMIT.into()),
         context: CheckContext::ci(context),
         state,
@@ -63,6 +73,10 @@ fn fact(context: &str, attempt: u32, state: CheckState, trust: TrustTier) -> Che
         completed_at: Some(Timestamp("2026-06-22T00:01:00Z".into())),
         cost_settled: true,
     }
+}
+
+fn fact(context: &str, attempt: u32, state: CheckState, trust: TrustTier) -> CheckStatus {
+    fact_for_repo(REPO, context, attempt, state, trust)
 }
 
 /// A stable `event_id` per (context, attempt) so a re-delivery carries the SAME id (the dedup key) —
@@ -94,6 +108,46 @@ async fn connect() -> PgCheckStatusProjection {
         .expect("run the check_status migration")
 }
 
+/// Holding the protected-push admission transaction must not consume the only connection needed by
+/// the nested ref/outbox mutation. With both lanes bounded to one connection, acquiring the ordinary
+/// pool inside the admission callback succeeds only when the composition uses distinct pools.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_push_admission_has_a_reserved_pool_lane_at_max_capacity() {
+    let mut config = myelin_config::MyelinConfig::dev();
+    config.database_url = admin_url();
+    config.region = REGION.into();
+    let ordinary = SubstrateProvider::connect(config.clone(), 1)
+        .await
+        .expect("one-connection ordinary lane");
+    let admission = SubstrateProvider::connect(config, 1)
+        .await
+        .expect("one-connection admission lane");
+    let projection = PgCheckStatusProjection::production(
+        ordinary.clone(),
+        admission,
+        tokio::runtime::Handle::current(),
+    );
+    let principal = Principal::new(
+        TenantId(TENANT.into()),
+        Region(REGION.into()),
+        PrincipalId("git-admission-proof".into()),
+        PrincipalKind::Service,
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    );
+    let scope = TenantScope::from_verified_token(&principal, Region(REGION.into()));
+    let ordinary_pool = ordinary.db_pool().clone();
+    let nested_lane_available = projection
+        .with_admission_snapshot(&scope, REPO, &[], move |_| {
+            ordinary_pool.try_acquire().is_some()
+        })
+        .expect("admission transaction");
+    assert!(
+        nested_lane_available,
+        "the admission lock must not pin the ordinary pool's sole connection"
+    );
+}
+
 /// **GIT-D10 part (a) — out-of-order + dup `ci.check.updated` → exactly 1 current row per key.**
 ///
 /// The scenario the X-1 seam must survive (the bus is at-least-once):
@@ -115,6 +169,7 @@ async fn check_status_supersession_holds_one_current_row_per_key() {
     assert_eq!(
         proj.apply(
             &event_id("build", 1),
+            REGION,
             &fact("build", 1, CheckState::Failure, TrustTier::Trusted)
         )
         .await
@@ -125,6 +180,7 @@ async fn check_status_supersession_holds_one_current_row_per_key() {
     assert_eq!(
         proj.apply(
             &event_id("test", 1),
+            REGION,
             &fact("test", 1, CheckState::Success, TrustTier::Trusted)
         )
         .await
@@ -135,6 +191,7 @@ async fn check_status_supersession_holds_one_current_row_per_key() {
     assert_eq!(
         proj.apply(
             &event_id("build", 2),
+            REGION,
             &fact("build", 2, CheckState::Success, TrustTier::Trusted)
         )
         .await
@@ -147,6 +204,7 @@ async fn check_status_supersession_holds_one_current_row_per_key() {
     assert_eq!(
         proj.apply(
             "gitp20-build-a1-redelivered",
+            REGION,
             &fact("build", 1, CheckState::Failure, TrustTier::Trusted)
         )
         .await
@@ -159,6 +217,7 @@ async fn check_status_supersession_holds_one_current_row_per_key() {
     assert_eq!(
         proj.apply(
             &event_id("build", 2),
+            REGION,
             &fact("build", 2, CheckState::Success, TrustTier::Trusted)
         )
         .await
@@ -169,14 +228,16 @@ async fn check_status_supersession_holds_one_current_row_per_key() {
 
     // THE GREEN ARTIFACT: exactly ONE current row per key. 2 keys (build, test) → exactly 2 rows.
     assert_eq!(
-        proj.row_count_for_commit(TENANT, &commit).await.unwrap(),
+        proj.row_count_for_commit(TENANT, REGION, REPO, &commit)
+            .await
+            .unwrap(),
         2,
         "exactly one current row per (commit_oid, context) — no duplicate/ghost rows"
     );
 
     // The current build row is the highest attempt (2, the re-run success), NOT the stale failure.
     let build_row = proj
-        .current(TENANT, &commit, "ci", "build")
+        .current(TENANT, REGION, REPO, &commit, "ci", "build")
         .await
         .unwrap()
         .expect("the build row is present");
@@ -192,7 +253,7 @@ async fn check_status_supersession_holds_one_current_row_per_key() {
 
     // The test row is its own attempt-1 success (independent key, untouched by the build supersession).
     let test_row = proj
-        .current(TENANT, &commit, "ci", "test")
+        .current(TENANT, REGION, REPO, &commit, "ci", "test")
         .await
         .unwrap()
         .expect("the test row is present");
@@ -215,6 +276,7 @@ async fn supersession_is_order_independent_highest_attempt_wins() {
     assert_eq!(
         proj.apply(
             "scramble-a3",
+            REGION,
             &fact("lint", 3, CheckState::Success, TrustTier::Trusted)
         )
         .await
@@ -224,6 +286,7 @@ async fn supersession_is_order_independent_highest_attempt_wins() {
     assert_eq!(
         proj.apply(
             "scramble-a1",
+            REGION,
             &fact("lint", 1, CheckState::Failure, TrustTier::Trusted)
         )
         .await
@@ -234,6 +297,7 @@ async fn supersession_is_order_independent_highest_attempt_wins() {
     assert_eq!(
         proj.apply(
             "scramble-a2",
+            REGION,
             &fact("lint", 2, CheckState::Error, TrustTier::Trusted)
         )
         .await
@@ -243,9 +307,14 @@ async fn supersession_is_order_independent_highest_attempt_wins() {
     );
 
     // Exactly one row, at attempt 3 (the highest), success (the attempt-3 state).
-    assert_eq!(proj.row_count_for_commit(TENANT, &commit).await.unwrap(), 1);
+    assert_eq!(
+        proj.row_count_for_commit(TENANT, REGION, REPO, &commit)
+            .await
+            .unwrap(),
+        1
+    );
     let row = proj
-        .current(TENANT, &commit, "ci", "lint")
+        .current(TENANT, REGION, REPO, &commit, "ci", "lint")
         .await
         .unwrap()
         .unwrap();
@@ -268,30 +337,93 @@ async fn idempotent_on_event_id_zero_dup() {
     let f = fact("build", 5, CheckState::Success, TrustTier::Trusted);
 
     assert_eq!(
-        proj.apply("evt-once", &f).await.unwrap(),
+        proj.apply("evt-once", REGION, &f).await.unwrap(),
         StoreApplyOutcome::Superseded
     );
     // Re-deliver the SAME event_id twice — both are the effectively-once no-op.
     assert_eq!(
-        proj.apply("evt-once", &f).await.unwrap(),
+        proj.apply("evt-once", REGION, &f).await.unwrap(),
         StoreApplyOutcome::DuplicateEvent
     );
     assert_eq!(
-        proj.apply("evt-once", &f).await.unwrap(),
+        proj.apply("evt-once", REGION, &f).await.unwrap(),
         StoreApplyOutcome::DuplicateEvent
     );
 
     assert_eq!(
-        proj.row_count_for_commit(TENANT, &commit).await.unwrap(),
+        proj.row_count_for_commit(TENANT, REGION, REPO, &commit)
+            .await
+            .unwrap(),
         1,
         "applied exactly once"
     );
     let row = proj
-        .current(TENANT, &commit, "ci", "build")
+        .current(TENANT, REGION, REPO, &commit, "ci", "build")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(row.run_attempt, 5);
+
+    proj.drop_tables().await.unwrap();
+}
+
+/// The repository is part of the projection key. Two repositories may legitimately report the
+/// same commit OID and context; neither fact may overwrite or satisfy the other repository's gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identical_commit_and_context_are_isolated_by_repository() {
+    const OTHER_REPO: &str = "myelin://acme/git/repo/other";
+
+    let proj = connect().await;
+    let commit = GitOid(COMMIT.into());
+    proj.apply(
+        "repo-core-build",
+        REGION,
+        &fact_for_repo(REPO, "build", 1, CheckState::Success, TrustTier::Trusted),
+    )
+    .await
+    .unwrap();
+    proj.apply(
+        "repo-other-build",
+        REGION,
+        &fact_for_repo(
+            OTHER_REPO,
+            "build",
+            7,
+            CheckState::Failure,
+            TrustTier::Trusted,
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        proj.row_count_for_commit(TENANT, REGION, REPO, &commit)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        proj.row_count_for_commit(TENANT, REGION, OTHER_REPO, &commit)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        proj.current(TENANT, REGION, REPO, &commit, "ci", "build")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        CheckState::Success
+    );
+    assert_eq!(
+        proj.current(TENANT, REGION, OTHER_REPO, &commit, "ci", "build")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        CheckState::Failure
+    );
 
     proj.drop_tables().await.unwrap();
 }

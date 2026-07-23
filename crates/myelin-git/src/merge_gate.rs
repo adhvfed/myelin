@@ -234,6 +234,9 @@ pub enum UnmetReason {
         /// The current (non-success) state.
         state: CheckState,
     },
+    /// The context succeeded, but CI has not durably closed its reserve/settle bookend. A success
+    /// is not final and cannot admit a merge until `cost_settled = true`.
+    CostUnsettled,
     /// A current `success` row exists but its trust posture is unacceptable: an `untrusted_fork`
     /// success that has NOT been endorsed (or re-run trusted). **Neutral for gating** — a fork must
     /// never turn its own required gate green by running attacker-controlled CI config (Δ3, the
@@ -307,6 +310,8 @@ fn classify_row(row: &CheckStatusRow, endorsed: bool) -> Option<UnmetReason> {
     // failed the trust posture is an un-endorsed untrusted-fork (the only way a success is unacceptable).
     if !row.state.is_success() {
         Some(UnmetReason::NotGreen { state: row.state })
+    } else if !row.cost_settled {
+        Some(UnmetReason::CostUnsettled)
     } else {
         Some(UnmetReason::UntrustedForkNeutral)
     }

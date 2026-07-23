@@ -26,7 +26,7 @@ use crate::events::{
     event_actor_pseudonym, pseudonymized_event_principal, GIT_PR_MERGED, GIT_PR_OPENED,
     GIT_PR_UPDATED,
 };
-use crate::lifecycle::PrState;
+use crate::lifecycle::{BranchProtectionRuleset, PrState};
 use crate::pg_pr_event::co_commit_event;
 use crate::pr_list_pagination::{PrListDirection, PrListPage};
 use crate::pr_store::{
@@ -36,8 +36,11 @@ use crate::pr_store::{
 };
 use crate::receive_pack::{
     CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushSession,
-    Pusher, RefName, RefStore, RejectReason,
+    Pusher, RefName, RefStore,
 };
+
+mod check_admission;
+use check_admission::overlay_projected_checks;
 
 pub const GIT_PR_TABLE: &str = "git_pr";
 pub const GIT_PR_COUNTER_TABLE: &str = "git_pr_counter";
@@ -161,10 +164,12 @@ fn pr_list_page_sql(query: &PrListQuery) -> String {
 fn pr_cross_bucket_predicate(bucket: PrListBucket) -> &'static str {
     match bucket {
         PrListBucket::Yours => "g.record->>'author_pseudonym' = $4",
-        PrListBucket::NeedsReview => "g.record->>'author_pseudonym' <> $4 \
+        PrListBucket::NeedsReview => {
+            "g.record->>'author_pseudonym' <> $4 \
              AND g.record->>'state' IN ('Open','Draft') \
              AND (g.record->'reviews') @> jsonb_build_array(\
-               jsonb_build_object('reviewer_pseudonym',$4,'state','Requested'))",
+               jsonb_build_object('reviewer_pseudonym',$4,'state','Requested'))"
+        }
     }
 }
 
@@ -207,8 +212,10 @@ fn pr_cross_list_page_sql(query: &PrCrossListQuery) -> String {
     };
     let output_order = match query.sort {
         PrListSort::Created => "p.page_number DESC NULLS LAST, p.page_repo_slug ASC NULLS LAST",
-        PrListSort::Updated => "p.page_updated_at DESC NULLS LAST, p.page_number DESC NULLS LAST, \
-             p.page_repo_slug ASC NULLS LAST",
+        PrListSort::Updated => {
+            "p.page_updated_at DESC NULLS LAST, p.page_number DESC NULLS LAST, \
+             p.page_repo_slug ASC NULLS LAST"
+        }
     };
     let reverse_output_order = match query.sort {
         PrListSort::Created => "p.page_number ASC, p.page_repo_slug DESC",
@@ -588,6 +595,14 @@ pub struct PendingMerge {
     pub intent: MergeIntent,
 }
 
+struct MergeAdmission {
+    intent: MergeIntent,
+    command_hash: String,
+    ctx: EmitContextBase,
+    ruleset: BranchProtectionRuleset,
+    project_checks: bool,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case")]
 enum MergeCommandResult {
@@ -607,33 +622,6 @@ enum MergeCommandResult {
         expected: String,
         actual: String,
     },
-}
-
-impl MergeCommandResult {
-    fn into_attempt(self) -> MergeAttempt {
-        match self {
-            Self::Merged {
-                base_ref,
-                new_oid,
-                update_seq,
-            } => MergeAttempt::Merged {
-                base_ref,
-                new_oid,
-                update_seq,
-            },
-            Self::Blocked { evaluation } => MergeAttempt::Blocked(evaluation),
-            Self::InvalidHead { reason } => MergeAttempt::InvalidHead(reason),
-            Self::RefRefused {
-                base_ref,
-                expected,
-                actual,
-            } => MergeAttempt::RefRefused(RejectReason::NonFastForward {
-                ref_name: RefName::new(base_ref),
-                expected: PushOid::new(expected),
-                actual: PushOid::new(actual),
-            }),
-        }
-    }
 }
 
 enum MergeLedgerState {
@@ -796,8 +784,7 @@ impl PgPrStore {
             return Err(DurableError::NotFound("repository partition".into()));
         }
         let timestamp = now_rfc3339();
-        let event_principal =
-            pseudonymized_event_principal(scope.tenant().as_str(), principal);
+        let event_principal = pseudonymized_event_principal(scope.tenant().as_str(), principal);
         Ok(EmitContextBase {
             tenant: scope.tenant().clone(),
             region: scope.region().clone(),
@@ -1105,9 +1092,9 @@ impl PgPrStore {
                     .await
             })
             .map_err(pg_error)?;
-        let summary = rows
-            .first()
-            .ok_or_else(|| DurableError::Io("cross-repository PR list summary is missing".into()))?;
+        let summary = rows.first().ok_or_else(|| {
+            DurableError::Io("cross-repository PR list summary is missing".into())
+        })?;
         let total: i64 = summary
             .try_get("bucket_count")
             .map_err(|_| DurableError::Io("cross-repository PR list count is malformed".into()))?;
@@ -1121,9 +1108,9 @@ impl PgPrStore {
         })?;
         let mut records = Vec::with_capacity(query.limit);
         for row in rows {
-            let repo_slug: Option<String> = row
-                .try_get("page_repo_slug")
-                .map_err(|_| DurableError::Io("cross-repository PR page row is malformed".into()))?;
+            let repo_slug: Option<String> = row.try_get("page_repo_slug").map_err(|_| {
+                DurableError::Io("cross-repository PR page row is malformed".into())
+            })?;
             if let Some(repo_slug) = repo_slug {
                 records.push(PrCrossListRecord {
                     repo_slug,
@@ -1592,6 +1579,7 @@ impl PgPrStore {
         source_repo: &DurableGitRepo,
         ref_store: &RefStore,
         merger_pseudonym: &str,
+        project_checks: bool,
     ) -> Result<MergeAttempt, DurableError> {
         let loc = self.scoped_loc(scope, repo)?;
         if &loc != target_loc {
@@ -1618,7 +1606,9 @@ impl PgPrStore {
                     target_repo,
                     ref_store,
                 )?
-                .ok_or_else(|| DurableError::Io("pending merge disappeared during recovery".into()));
+                .ok_or_else(|| {
+                    DurableError::Io("pending merge disappeared during recovery".into())
+                });
         }
         let ctx = self.emit_context(scope, principal)?;
         let record = self
@@ -1667,20 +1657,6 @@ impl PgPrStore {
             );
         }
         let ruleset = policy_store.effective_ruleset_for(target_loc, &record.base_ref)?;
-        let evaluation = evaluate_merge(&ruleset, &record)
-            .map_err(|_| DurableError::Git("merge policy input refused".into()))?;
-        if !evaluation.admitted() {
-            return self.record_merge_terminal(
-                scope,
-                repo,
-                number,
-                operation_id,
-                &actor_subject_id,
-                &command_hash,
-                "completed",
-                MergeCommandResult::Blocked { evaluation },
-            );
-        }
 
         let source_ref = qualify_ref(&record.head_ref);
         let source_tip = source_repo.read_ref(&source_ref)?;
@@ -1755,9 +1731,13 @@ impl PgPrStore {
             scope,
             repo,
             number,
-            intent.clone(),
-            &command_hash,
-            ctx.clone(),
+            MergeAdmission {
+                intent: intent.clone(),
+                command_hash: command_hash.clone(),
+                ctx: ctx.clone(),
+                ruleset,
+                project_checks,
+            },
         )? {
             return Ok(attempt);
         }
@@ -1826,38 +1806,19 @@ impl PgPrStore {
         )));
         let base = RefName::new(intent.base_ref.clone());
         let actual = ref_store.try_tip(&base)?;
-        let attempt = if actual.as_ref().map(|oid| oid.0.as_str())
-            == Some(intent.head_oid.as_str())
+        let attempt = if actual.as_ref().map(|oid| oid.0.as_str()) == Some(intent.head_oid.as_str())
         {
             let update_seq = target_repo.ref_generation(&base.0)?;
-            self.finalize_merge(
-                scope,
-                repo,
-                number,
-                &intent,
-                &command_hash,
-                update_seq,
-                ctx,
-            )?
+            self.finalize_merge(scope, repo, number, &intent, &command_hash, update_seq, ctx)?
         } else {
             let expected_matches = actual.as_ref().map(|oid| oid.0.as_str())
                 == Some(intent.expected_old_oid.as_str())
                 || (actual.is_none() && intent.expected_old_oid == PushOid::zero().0);
             if !expected_matches {
-                self.cancel_merge(
-                    scope,
-                    repo,
-                    number,
-                    &intent,
-                    &command_hash,
-                    actual,
-                    ctx,
-                )?
+                self.cancel_merge(scope, repo, number, &intent, &command_hash, actual, ctx)?
             } else {
-                let merger_pseudonym = event_actor_pseudonym(
-                    scope.tenant().as_str(),
-                    &intent.actor_subject_id,
-                );
+                let merger_pseudonym =
+                    event_actor_pseudonym(scope.tenant().as_str(), &intent.actor_subject_id);
                 self.advance_pending_merge(
                     scope,
                     repo,
@@ -2077,7 +2038,7 @@ impl PgPrStore {
                         "pending merge recovery limit exceeded: serialized bytes".into(),
                     )
                 })?)
-                    .map_err(|_| DurableError::Io("pending PR merge intent malformed".into()))?;
+                .map_err(|_| DurableError::Io("pending PR merge intent malformed".into()))?;
                 Ok(PendingMerge {
                     repo_slug,
                     number: u64::try_from(number)
@@ -2226,16 +2187,20 @@ impl PgPrStore {
         scope: &TenantScope,
         repo: &str,
         number: u64,
-        intent: MergeIntent,
-        command_hash: &str,
-        ctx: EmitContextBase,
+        admission: MergeAdmission,
     ) -> Result<Option<MergeAttempt>, DurableError> {
+        let MergeAdmission {
+            intent,
+            command_hash,
+            ctx,
+            ruleset,
+            project_checks,
+        } = admission;
         validate_merge_intent(&intent)?;
         let intent_json = serde_json::to_value(&intent)
             .map_err(|e| DurableError::Git(format!("encode merge intent: {e}")))?;
         let operation_id = PrOperationId::from_stored_digest(&intent.operation_id)?;
         let actor_subject_id = intent.actor_subject_id.clone();
-        let command_hash = command_hash.to_owned();
         let loc = self.scoped_loc(scope, repo)?;
         let number_db = db_number(number)?;
         let provider = self.provider.clone();
@@ -2286,7 +2251,7 @@ impl PgPrStore {
                         if existing.is_some() {
                             return Err(pg_query("a different merge intent is already pending"));
                         }
-                        let record = decode_record(&kms, &crypto_region, &loc.tenant, row)
+                        let mut record = decode_record(&kms, &crypto_region, &loc.tenant, row)
                             .map_err(|_| pg_query("decode merge PR"))?;
                         if record.state == PrState::Merged
                             || record.head_oid != intent.head_oid
@@ -2296,6 +2261,45 @@ impl PgPrStore {
                             return Err(pg_query(
                                 "merge intent diverges from locked PR provenance",
                             ));
+                        }
+                        if project_checks {
+                            let repo_ref = format!("myelin://{}/git/repo/{}", loc.tenant, loc.repo);
+                            crate::check_status_store::lock_check_admission(
+                                conn,
+                                &loc.tenant,
+                                &loc.region,
+                                &repo_ref,
+                                &record.head_oid,
+                            )
+                            .await
+                            .map_err(|_| pg_query("lock merge check admission"))?;
+                            let rows = crate::check_status_store::rows_for_commit_in_tx(
+                                conn,
+                                &loc.tenant,
+                                &loc.region,
+                                &repo_ref,
+                                &record.head_oid,
+                            )
+                            .await
+                            .map_err(|_| pg_query("read merge check projection"))?;
+                            overlay_projected_checks(&mut record, rows);
+                        }
+                        let evaluation = evaluate_merge(&ruleset, &record)
+                            .map_err(|_| pg_query("merge policy input refused"))?;
+                        if !evaluation.admitted() {
+                            let result = MergeCommandResult::Blocked { evaluation };
+                            insert_merge_command(
+                                conn,
+                                &loc,
+                                &operation_id,
+                                &actor_subject_id,
+                                &command_hash,
+                                number_db,
+                                "completed",
+                                Some(&result),
+                            )
+                            .await?;
+                            return Ok(Some(result.into_attempt()));
                         }
                         insert_merge_command(
                             conn,
@@ -2978,9 +2982,8 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{
-        GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_SYNCHRONIZED,
-    };
+    #[cfg(feature = "integration")]
+    use crate::events::{GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_SYNCHRONIZED};
 
     #[test]
     fn accepted_merge_requires_one_exact_nonzero_move_witness() {
@@ -2988,8 +2991,7 @@ mod tests {
         let head = PushOid::new("0123456789012345678901234567890123456789");
 
         assert_eq!(
-            accepted_merge_update_seq(&[(base.clone(), head.clone(), 7)], &base, &head)
-                .unwrap(),
+            accepted_merge_update_seq(&[(base.clone(), head.clone(), 7)], &base, &head).unwrap(),
             7
         );
         assert!(accepted_merge_update_seq(&[], &base, &head).is_err());
@@ -3092,7 +3094,9 @@ mod tests {
         assert!(validate_cross_visible_slugs(&["team/app".into(), "core".into()]).is_ok());
         assert!(validate_cross_visible_slugs(&["core".into(), "core".into()]).is_err());
         assert!(validate_cross_visible_slugs(&["../hidden".into()]).is_err());
-        assert!(validate_cross_visible_slugs(&vec!["core".into(); PR_LIST_OFFSET_MAX + 1]).is_err());
+        assert!(
+            validate_cross_visible_slugs(&vec!["core".into(); PR_LIST_OFFSET_MAX + 1]).is_err()
+        );
         let needs_review = PrCrossListQuery::new(
             PrListBucket::NeedsReview,
             PrListSort::Updated,
@@ -3103,7 +3107,9 @@ mod tests {
         .unwrap();
         let sql = pr_cross_list_page_sql(&needs_review);
         assert_eq!(
-            sql.split(';').filter(|part| !part.trim().is_empty()).count(),
+            sql.split(';')
+                .filter(|part| !part.trim().is_empty())
+                .count(),
             1
         );
         assert_eq!(
@@ -3470,6 +3476,13 @@ mod tests {
             .migrate(&git_pr_migrations(), &git_pr_hot_tables())
             .await
             .expect("Git PR migrations");
+        bootstrap
+            .migrate(
+                &crate::check_status_store::check_status_migrations(),
+                &crate::check_status_store::check_status_hot_tables(),
+            )
+            .await
+            .expect("Git check projection migrations");
         assert!(bootstrap
             .verify_index_ready("missing_git_pr_index")
             .await
@@ -3534,6 +3547,79 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(abort_events, 0, "aborted open emitted no ghost event");
+
+        // Production merge admission ignores legacy PR-record green arrays and rereads Git's
+        // projection while it freezes the intent. With no projection row, a required context blocks
+        // even if the old array claims green.
+        let projection_slug = format!("projection-admission-{suffix}");
+        let projection_loc = RepoLoc::new(&tenant_a, &region, &projection_slug);
+        let projection_root =
+            std::env::temp_dir().join(format!("myelin-pg-pr-projection-{suffix}"));
+        let projection_policy = DurablePrStore::rooted(&projection_root);
+        projection_policy
+            .put_protection(
+                &projection_loc,
+                &crate::pr_store::BranchProtectionConfig {
+                    rulesets: vec![BranchProtectionRuleset {
+                        ref_pattern: "refs/heads/main".into(),
+                        required_contexts: vec!["ci/build".into()],
+                        required_approvals: 0,
+                        require_codeowner_review: false,
+                        require_conversation_resolution: false,
+                        allow_force_push: false,
+                    }],
+                },
+            )
+            .unwrap();
+        let projection_open_op = PrOperationId::parse("open-projection-admission").unwrap();
+        let mut legacy_green = record(&"f".repeat(40), "legacy green", &projection_slug);
+        legacy_green.green_contexts.push("build".into());
+        let projected_pr = store
+            .open(
+                &scope_a,
+                &projection_slug,
+                legacy_green,
+                &projection_open_op,
+                &actor,
+            )
+            .unwrap();
+        let projection_op = PrOperationId::parse("merge-projection-admission").unwrap();
+        let projection_intent = MergeIntent {
+            operation_id: projection_op.as_str().into(),
+            actor_subject_id: actor.principal_id.0.clone(),
+            base_ref: projected_pr.base_ref.clone(),
+            expected_old_oid: PushOid::zero().0,
+            head_oid: projected_pr.head_oid.clone(),
+            head_repo_slug: projection_slug.clone(),
+        };
+        let projection_hash = merge_payload_hash(projected_pr.number, &projection_intent).unwrap();
+        let projection_ctx = store.emit_context(&scope_a, &actor).unwrap();
+        assert!(matches!(
+            store
+                .begin_merge(
+                    &scope_a,
+                    &projection_slug,
+                    projected_pr.number,
+                    MergeAdmission {
+                        intent: projection_intent,
+                        command_hash: projection_hash,
+                        ctx: projection_ctx,
+                        ruleset: projection_policy
+                            .effective_ruleset_for(&projection_loc, &projected_pr.base_ref)
+                            .unwrap(),
+                        project_checks: true,
+                    },
+                )
+                .unwrap(),
+            Some(MergeAttempt::Blocked(_))
+        ));
+        assert!(
+            store
+                .pending_merge_intent(&scope_a, &projection_slug, projected_pr.number)
+                .unwrap()
+                .is_none(),
+            "a blocked projection decision never freezes a merge intent"
+        );
 
         // Exact retry replays one historical result/event; divergent reuse is rejected.
         let open_op = PrOperationId::parse("open-1").unwrap();
@@ -3683,7 +3769,10 @@ mod tests {
         .fetch_one(&admin)
         .await
         .unwrap();
-        assert_eq!(lifecycle_events, 11, "9 opens + 2 mutations, exactly once");
+        assert_eq!(
+            lifecycle_events, 12,
+            "10 opens (including projection admission) + 2 mutations, exactly once"
+        );
 
         // Tenant RLS makes the same repo/number invisible; region mismatch fails before SQL.
         assert!(store.get(&scope_b, repo, opened.number).unwrap().is_none());
@@ -3842,7 +3931,10 @@ mod tests {
                 "runtime://raw-pg-worker/session",
                 "human:raw-pg-delegator",
             ] {
-                assert!(!serialized_actor.contains(raw), "PG event actor leaked {raw}");
+                assert!(
+                    !serialized_actor.contains(raw),
+                    "PG event actor leaked {raw}"
+                );
             }
             let ctx = store.emit_context(&scope_a, &actor).unwrap();
             assert!(store
@@ -3850,9 +3942,15 @@ mod tests {
                     &scope_a,
                     slug,
                     opened.number,
-                    intent.clone(),
-                    &hash,
-                    ctx.clone()
+                    MergeAdmission {
+                        intent: intent.clone(),
+                        command_hash: hash.clone(),
+                        ctx: ctx.clone(),
+                        ruleset: policy_store
+                            .effective_ruleset_for(&loc, &opened.base_ref)
+                            .unwrap(),
+                        project_checks: false,
+                    },
                 )
                 .unwrap()
                 .is_none());
@@ -3890,9 +3988,7 @@ mod tests {
                 "pending recovery record cap plus one is rejected"
             );
             assert!(
-                store
-                    .list_pending_merges_bounded(&scope_a, 100, 0)
-                    .is_err(),
+                store.list_pending_merges_bounded(&scope_a, 100, 0).is_err(),
                 "pending recovery byte cap plus one is rejected"
             );
             assert!(store
@@ -4011,6 +4107,7 @@ mod tests {
                         &target,
                         &ref_store,
                         "merger@tenant.noreply",
+                        false,
                     )
                     .unwrap();
                 assert_eq!(first, retry, "cancelled command replays deterministically");
@@ -4135,5 +4232,6 @@ mod tests {
         }
         admin.close().await;
         std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(projection_root).ok();
     }
 }

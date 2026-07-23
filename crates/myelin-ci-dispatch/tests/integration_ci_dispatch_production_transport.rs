@@ -16,10 +16,12 @@ use myelin_events::relay::{EventConsumer, EventPublisher};
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, BrokerDeliveryRef, CorrelationId, DataRole, DedupLedger,
     DeliveryQuarantineReason, DurableDedup, DurableDeliveryQuarantine, EventEnvelope, EventId,
-    EventType, OutboxStore, Timestamp, UlidMinter, Visibility,
-    CONSUMER_DEAD_LETTER_MIGRATION, CONSUMER_DEDUP_MIGRATION,
-    CONSUMER_DELIVERY_QUARANTINE_MIGRATION, OUTBOX_MIGRATION,
+    EventType, OutboxStore, Timestamp, UlidMinter, Visibility, CONSUMER_DEAD_LETTER_MIGRATION,
+    CONSUMER_DEDUP_MIGRATION, CONSUMER_DELIVERY_QUARANTINE_MIGRATION, OUTBOX_MIGRATION,
 };
+use myelin_git::check_status::{CheckContext, CheckState, CheckStatusConsumer, GitOid};
+use myelin_git::check_status_store::PgCheckStatusProjection;
+use myelin_git::merge_gate::{MergeGateOutcome, MergeGatePolicy};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::events_durable::{DurableDeadLetterBacking, DurableDedupBacking};
 use myelin_storage::outbox_durable::PgOutboxBacking;
@@ -166,8 +168,6 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     let git_root = AuthoritativeGitRoot::validate(&git_root).unwrap();
 
     let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(pool.clone(), rt.clone())));
-    let reserve_outbox =
-        OutboxStore::durable(Arc::new(PgOutboxBacking::new(pool.clone(), rt.clone())));
     let dedup = DedupLedger::durable(
         Arc::new(DurableDedupBacking::new(pool.clone(), rt.clone())) as Arc<dyn DurableDedup>
     );
@@ -179,7 +179,6 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
         git_root,
         s3.clone(),
         ci_run_store_factory(pool.clone()),
-        reserve_outbox,
         dedup,
         dead_letters,
         "fr-par",
@@ -231,7 +230,11 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
         ),
     );
     let spec = dispatch_app_spec_with_intake(
-        Config::default(), outbox, consumers, Box::new(intake), quarantine.clone(),
+        Config::default(),
+        outbox,
+        consumers,
+        Box::new(intake),
+        quarantine.clone(),
     );
     let handle = boot(spec).unwrap();
     let raw_client = async_nats::connect(&cfg.nats_url).await.unwrap();
@@ -245,7 +248,9 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
         .unwrap()
         .await
         .unwrap();
-    publisher.publish(&envelope.subject, &envelope, &envelope.event_id).unwrap();
+    publisher
+        .publish(&envelope.subject, &envelope, &envelope.event_id)
+        .unwrap();
     raw_js
         .publish(
             format!("{subject_root}.evt.{tenant}.git.poison.route_mismatch"),
@@ -256,19 +261,104 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
         .await
         .unwrap();
     publisher
-        .publish(&second_envelope.subject, &second_envelope, &second_envelope.event_id)
+        .publish(
+            &second_envelope.subject,
+            &second_envelope,
+            &second_envelope.event_id,
+        )
         .unwrap();
     handle.tick();
 
-    let run_count: i64 = sqlx::query_scalar(
-        "SELECT count(*)::bigint FROM ci_run WHERE cause_event_id IN ($1, $2)",
-    )
+    let run_count: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM ci_run WHERE cause_event_id IN ($1, $2)")
             .bind(&event_id)
             .bind(&second_event_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(run_count, 2, "both valid siblings create their independent ci_run");
+    assert_eq!(
+        run_count, 2,
+        "both valid siblings create their independent ci_run"
+    );
+    let queued_envelopes: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT envelope FROM outbox \
+          WHERE envelope->>'type_'='ci.check.updated' \
+            AND envelope->>'causation_id' IN ($1,$2) \
+          ORDER BY (envelope->'payload'->>'run_attempt')::integer",
+    )
+    .bind(&event_id)
+    .bind(&second_event_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let queued_attempts = queued_envelopes
+        .iter()
+        .map(|envelope| envelope["payload"]["run_attempt"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued_attempts,
+        vec![1, 2],
+        "the production dispatch transaction allocates a new monotonic attempt before each queued fact"
+    );
+
+    // Regression for the audit's gate-green rerun window: make attempt 1 a settled success, prove
+    // it admits, then consume the second production-dispatch queued fact. Its allocated attempt 2
+    // must supersede immediately and block before PgPipelineStarter emits InProgress.
+    let projection = PgCheckStatusProjection::connect(
+        pool.clone(),
+        "dispatch_check_status",
+        "dispatch_check_dedup",
+        "dispatch-check-proof",
+    )
+    .await
+    .unwrap();
+    let first_envelope: EventEnvelope =
+        serde_json::from_value(queued_envelopes[0].clone()).unwrap();
+    let second_envelope: EventEnvelope =
+        serde_json::from_value(queued_envelopes[1].clone()).unwrap();
+    let mut settled_success = CheckStatusConsumer::decode(&first_envelope.payload).unwrap();
+    settled_success.state = CheckState::Success;
+    settled_success.cost_settled = true;
+    projection
+        .apply("dispatch-terminal-attempt-1", "fr-par", &settled_success)
+        .await
+        .unwrap();
+    let policy = MergeGatePolicy {
+        required: vec![CheckContext::ci("build")],
+    };
+    assert_eq!(
+        projection
+            .merge_gate(
+                &tenant,
+                "fr-par",
+                &settled_success.repo.0,
+                &GitOid(commit.clone()),
+                &policy,
+                &[],
+            )
+            .await
+            .unwrap(),
+        MergeGateOutcome::Admitted
+    );
+    let queued_rerun = CheckStatusConsumer::decode(&second_envelope.payload).unwrap();
+    projection
+        .apply(&second_envelope.event_id.0, "fr-par", &queued_rerun)
+        .await
+        .unwrap();
+    assert!(matches!(
+        projection
+            .merge_gate(
+                &tenant,
+                "fr-par",
+                &queued_rerun.repo.0,
+                &GitOid(commit.clone()),
+                &policy,
+                &[],
+            )
+            .await
+            .unwrap(),
+        MergeGateOutcome::Blocked { .. }
+    ));
     let row = sqlx::query("SELECT definition_snapshot FROM ci_run WHERE cause_event_id=$1")
         .bind(&event_id)
         .fetch_one(&pool)
@@ -300,7 +390,10 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     .unwrap();
     assert_eq!(
         quarantine_reasons,
-        vec!["malformed_envelope".to_string(), "subject_mismatch".to_string()]
+        vec![
+            "malformed_envelope".to_string(),
+            "subject_mismatch".to_string()
+        ]
     );
     let quarantine_json: Vec<String> = sqlx::query_scalar(
         "SELECT row_to_json(q)::text FROM consumer_delivery_quarantine q WHERE consumer=$1",
@@ -309,7 +402,9 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert!(quarantine_json.iter().all(|row| !row.contains("ATTACKER_PII_SENTINEL")));
+    assert!(quarantine_json
+        .iter()
+        .all(|row| !row.contains("ATTACKER_PII_SENTINEL")));
     let (quarantine_stream, quarantine_sequence, quarantine_attempt): (String, i64, i64) =
         sqlx::query_as(
             "SELECT stream, stream_sequence, delivery_attempt \
@@ -338,11 +433,13 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(quarantine_count, 2, "re-record is idempotent on broker reference");
+    assert_eq!(
+        quarantine_count, 2,
+        "re-record is idempotent on broker reference"
+    );
     handle.tick();
-    let after_redelivery: i64 = sqlx::query_scalar(
-        "SELECT count(*)::bigint FROM ci_run WHERE cause_event_id IN ($1, $2)",
-    )
+    let after_redelivery: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM ci_run WHERE cause_event_id IN ($1, $2)")
             .bind(&event_id)
             .bind(&second_event_id)
             .fetch_one(&pool)

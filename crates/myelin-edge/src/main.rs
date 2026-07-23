@@ -35,8 +35,8 @@ use myelin_edge::{
     register_git_wire, register_issues, register_notif, serve_edge_until_shutdown_with_probe,
     spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
     AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
-    Gateway, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, ShutdownOutcome,
-    StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
+    Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method, ReadinessCheck,
+    ReadinessProbe, ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
@@ -614,6 +614,16 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         eprintln!("edge: cannot apply the Git PR lifecycle migrations: {e}");
         std::process::exit(1);
     }
+    if let Err(e) = bootstrap
+        .migrate(
+            &myelin_git::check_status_store::check_status_migrations(),
+            &myelin_git::check_status_store::check_status_hot_tables(),
+        )
+        .await
+    {
+        eprintln!("edge: cannot apply the Git check projection migrations: {e}");
+        std::process::exit(1);
+    }
     if let Err(e) = bootstrap.verify_index_ready("git_pr_head_repo_idx").await {
         eprintln!("edge: Git PR provenance index is not ready: {e}");
         std::process::exit(1);
@@ -759,6 +769,18 @@ async fn serve(
         git_wire.runsc.display(),
         git_wire.rootfs.display()
     );
+
+    // Protected pushes hold a PostgreSQL advisory-lock transaction through the ref mutation, whose
+    // durable outbox uses the ordinary provider pool. A separately bounded runtime lane prevents
+    // nested acquisition from exhausting one shared pool under concurrent protected pushes.
+    let git_check_admission_provider =
+        provider
+            .auxiliary_runtime_lane(4)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("edge: protected-push admission lane refused to start: {error}");
+                std::process::exit(1);
+            });
 
     // The DURABLE transactional outbox (SI-007) for the git backend's ref-CAS co-commit.
     let git_outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
@@ -949,7 +971,7 @@ async fn serve(
         DurableGitBackend::rooted(
             git_root,
             public_base_url.clone(),
-            provider.clone(),
+            GitDatabaseProviders::new(provider.clone(), git_check_admission_provider),
             kms.clone(),
             handle.clone(),
             git_outbox,

@@ -10,17 +10,18 @@
 //! `run_attempt` supersession + the merge gate). **Contract:** index row **5.9** (the Git↔CI
 //! CheckStatus seam — CI produces, Git is the consumer + gate).
 //!
-//! ## What this prompt (GIT-P6 / P-232) ships — and what it deliberately does NOT
-//! This is the **DECLARED, COMPILING, NOT-YET-LIVE consumer seam module**. It declares — as a
-//! compiling contract surface against the M2-frozen 5.9 shape:
+//! ## Contract model and production binding
+//! This module owns the typed contract and pure decision model. The production binding is
+//! [`crate::check_status_store`]: a durable same-transaction consumer, RLS projection, and the reads
+//! used by Edge and Git's merge/protected-push gates.
 //!
 //! 1. **The typed [`CheckStatus`] consumer view** — the Git-side decode of the `CheckStatus` fact CI
 //!    carries OPAQUE over the Bus (`myelin_events::check_seam` carries it as a `serde_json::Value`;
 //!    Git is the consumer that names + interprets the fields). Keyed half: `(commit_oid, context)`.
-//! 2. **The [`CheckStatusRow`] projection-table schema** keyed `(tenant, commit_oid, context)` — the
-//!    Git-owned mirror the merge gate reads (exactly ONE current row per key). The DDL is
-//!    [`CHECK_STATUS_PROJECTION_DDL`]; no migration is RUN here (the live store + migration is the
-//!    GIT-P20 consumer leg).
+//! 2. **The [`CheckStatusRow`] projection-table schema** keyed
+//!    `(tenant, region, repo, commit_oid, context)` — the Git-owned mirror the merge gate reads
+//!    (exactly ONE current row per key). [`CHECK_STATUS_PROJECTION_DDL`] is the production DDL
+//!    exported from the store module, so the declaration cannot drift from the migration.
 //! 3. **The monotonic `run_attempt` supersession rule** — [`supersedes`] / [`CheckStatusProjection`]:
 //!    an incoming fact supersedes the stored row IFF its `run_attempt >= stored.run_attempt`
 //!    (re-run supersession is monotonic on the attempt COUNTER, never on wall-clock `completed_at` —
@@ -31,24 +32,9 @@
 //!    decides which facts gate, X-1 / Δ1). An `untrusted_fork` success is **neutral for gating**
 //!    until endorsed/re-run-trusted (Δ3 — the poisoned-pipeline defence).
 //!
-//! ## The consumer leg is now LIVE (EB-26 / P-246, M3) — and what is still a FLOOR
-//! As of **EB-26 (P-246, M3)** the consumer leg is **WIRED**: [`CheckStatusConsumer`] is an
-//! idempotent [`myelin_events::EventHandler`] over the Bus's per-aggregate-ordered `ci.check.updated`
-//! carriage (the §4.2 idempotent template — idempotent on `event_id`, applying the monotonic
-//! `run_attempt` supersession). The Bus's narrow carriage half (envelope conformance + per-aggregate
-//! ordering + the durable `ci.result` wait substrate) lives in `myelin_events::check_seam` (EB-24) —
-//! this module is the GIT CONSUMER half that decodes that ordered carriage; it does NOT re-define the
-//! Bus carriage (EI-01 §7: extend/reconcile, never duplicate — the opaque payload
-//! `myelin_events::check_seam::OrderedCheck::check_status` decodes to exactly the [`CheckStatus`]
-//! declared here).
-//!
-//! **FLOOR (named — VISION §3 / roadmap §5 seam-floor register).** Two legs remain:
-//! 1. **The real CI PRODUCER** (CI emits `ci.check.updated` + the rollup `ci.result`) lands
-//!    **EB-27/M4** — it makes the seam END-TO-END (the **M4 co-gate GIT-D10 / CI-D8**). In M3 the
-//!    consumer is proven against a synthetic `ci.check.updated` emitter (the carriage drill fixture).
-//! 2. **The store-backed projection** — the real `check_status` table + the migration + the same-tx
-//!    `consumer_dedup` write — is the data-layer follow-on; here the projection is the in-memory
-//!    [`CheckStatusProjection`] (the SEMANTICS the live store implements byte-for-byte).
+//! CI's real [`myelin_events::check_seam`] producer and Git's durable consumer are chained in the
+//! live integration gate. [`CheckStatusConsumer`] remains the compact in-memory contract model used
+//! by pure tests; production consumption is [`crate::check_status_store::DurableCheckStatusConsumer`].
 //!
 //! ## Acyclic-by-construction (EI-02 §3)
 //! Git **never synchronously calls CI**. It reads its OWN [`CheckStatusProjection`] (a mirror of CI's
@@ -264,10 +250,8 @@ pub struct CheckKey {
 // 2. The check_status projection-table schema (keyed (commit_oid, context))
 // ---------------------------------------------------------------------------
 
-/// **The Git-owned `check_status` projection-table schema** keyed `(tenant, commit_oid, context)` —
-/// the mirror the merge gate reads (Δ1). Exactly ONE current row per key (last-writer-wins by
-/// monotonic `run_attempt`). This is the row SHAPE the GIT-P20 consumer leg materialises; no
-/// migration is RUN here (the live table + the idempotent consumer is GIT-P20 — the seam-floor).
+/// **The Git-owned `check_status` projection row** returned from a repository- and region-scoped
+/// store read. Exactly one current row per context within that already-verified scope.
 ///
 /// The row mirrors the [`CheckStatus`] fact 1:1 plus the `run_attempt` column the supersession rule
 /// reads. `required_by_policy` is **Git's** computed gating decision (from [`RequiredSetPolicy`]),
@@ -322,29 +306,10 @@ impl CheckStatusRow {
     }
 }
 
-/// **The DDL for the `check_status` projection table** (Δ1 / X-1) — keyed `(tenant, commit_oid,
-/// context_provider, context_name)`, exactly one current row per key. DECLARED here (the contract
-/// surface); the migration is **RUN in GIT-P20** (the named seam-floor — no live store here). The
-/// `run_attempt` column is the supersession high-water mark; `trust_tier` is read off the fact.
-///
-/// This is a DERIVED projection (contract 2.6/11.5): rebuilt from CI's facts, never restored — the
-/// `replay` path asks the Bus to `reindex` `ci.check.updated` for the scope (the glue doc §4).
-pub const CHECK_STATUS_PROJECTION_DDL: &str = "\
-CREATE TABLE check_status (\
-  tenant            text  NOT NULL,\
-  commit_oid        text  NOT NULL,\
-  context_provider  text  NOT NULL,\
-  context_name      text  NOT NULL,\
-  state             text  NOT NULL,\
-  run_ref           text  NOT NULL,\
-  run_attempt       bigint NOT NULL,\
-  trust_tier        text  NOT NULL,\
-  details_ref       text  NOT NULL,\
-  summary_key       text  NOT NULL,\
-  summary_args      jsonb NOT NULL,\
-  cost_settled      boolean NOT NULL,\
-  required_by_policy boolean NOT NULL,\
-  PRIMARY KEY (tenant, commit_oid, context_provider, context_name))";
+/// Production DDL, re-exported from its migration owner to keep the contract declaration and live
+/// schema byte-identical.
+pub const CHECK_STATUS_PROJECTION_DDL: &str =
+    crate::check_status_store::CREATE_CHECK_STATUS_DDL;
 
 // ---------------------------------------------------------------------------
 // 3. The monotonic run_attempt supersession rule (X-1)
@@ -487,7 +452,7 @@ impl RequiredSetPolicy {
 /// is **neutral for gating** (recorded, but cannot self-satisfy — a fork must not turn its own gate
 /// green by running attacker-controlled CI config).
 pub fn is_acceptable_satisfaction(row: &CheckStatusRow, fork_endorsed: bool) -> bool {
-    if !row.state.is_success() {
+    if !row.state.is_success() || !row.cost_settled {
         return false;
     }
     match row.trust_tier {
@@ -502,8 +467,7 @@ pub fn is_acceptable_satisfaction(row: &CheckStatusRow, fork_endorsed: bool) -> 
 /// Given the [`RequiredSetPolicy`] for the target ref + the current projection rows for the commit +
 /// the set of fork-endorsed contexts (the maintainer endorsements via `approve_untrusted_ci`),
 /// returns the [`GateOutcome`]. **Git reads its OWN projection — it never synchronously calls CI**
-/// (EI-02 §3, acyclic). This is the gate LOGIC the GIT-P20 merge gate fires; here it is the declared,
-/// proven shape (no live merge, no event consumer wired — the seam-floor).
+/// (EI-02 §3, acyclic). The durable store and Edge reuse this decision logic.
 pub fn gate_outcome(
     policy: &RequiredSetPolicy,
     projection: &CheckStatusProjection,
@@ -562,7 +526,10 @@ fn check_status_subjects() -> &'static [SubjectPattern] {
     use std::sync::OnceLock;
     static SUBJECTS: OnceLock<Vec<SubjectPattern>> = OnceLock::new();
     SUBJECTS
-        .get_or_init(|| vec![SubjectPattern(CI_CHECK_UPDATED.to_string())])
+        // The production pump routes application consumers by the envelope's ArtifactRef subject,
+        // not by its event-type token. The broker filter narrows to `ci.check.updated`; this
+        // application whitelist then admits only canonical Myelin refs.
+        .get_or_init(|| vec![SubjectPattern("myelin://".to_string())])
         .as_slice()
 }
 
@@ -1001,13 +968,13 @@ mod tests {
         );
     }
 
-    /// The projection-table DDL is keyed `(tenant, commit_oid, context)` (the X-1 key) and carries
-    /// the `run_attempt` supersession column + the trust tier.
+    /// The production DDL carries every authority dimension and the supersession/trust fields.
     #[test]
     fn projection_ddl_is_keyed_on_commit_oid_and_context() {
         assert!(CHECK_STATUS_PROJECTION_DDL.contains("CREATE TABLE check_status"));
-        assert!(CHECK_STATUS_PROJECTION_DDL
-            .contains("PRIMARY KEY (tenant, commit_oid, context_provider, context_name)"));
+        assert!(CHECK_STATUS_PROJECTION_DDL.contains(
+            "tenant_id, region, repo_ref, commit_oid, context_provider, context_name"
+        ));
         assert!(CHECK_STATUS_PROJECTION_DDL.contains("run_attempt"));
         assert!(CHECK_STATUS_PROJECTION_DDL.contains("trust_tier"));
     }

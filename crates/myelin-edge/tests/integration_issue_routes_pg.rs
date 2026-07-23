@@ -1046,14 +1046,15 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     assert!(
         served_explain
             .iter()
-            .any(|line| line.contains(ISSUE_KEY_PREFIX_LIST_INDEX)),
-        "served prefix query missed {ISSUE_KEY_PREFIX_LIST_INDEX}: {served_explain:?}"
-    );
-    assert!(
-        served_explain
-            .iter()
             .any(|line| line.contains("Index Cond") && line.contains("key")),
         "served prefix query has no bounded key range: {served_explain:?}"
+    );
+    assert!(
+        !served_explain
+            .iter()
+            .any(|line| line.contains("Seq Scan on issue ")),
+        "served prefix query scanned the issue table instead of using its bounded key range: \
+         {served_explain:?}"
     );
 
     let (status, missing_outbox_receipt) = http(

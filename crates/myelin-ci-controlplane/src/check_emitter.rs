@@ -344,7 +344,7 @@ pub fn summary_for(state: CheckState, context: &str) -> (String, BTreeMap<String
 
 /// **The jump-to-failure `details_ref` sub-anchor (`#step-<n>`, OQ-D / contract 5.7).** Git renders
 /// it as a link into CI's run view — it NEVER reads CI's DB to resolve it. A failure anchors on the
-/// failing step; a success anchors on the run summary. References-not-payloads (a ref, never bytes).
+/// failing step; otherwise it anchors on the run root. References-not-payloads (a ref, never bytes).
 pub fn details_ref(run_ref: &str, state: CheckState, fail_step: Option<u32>) -> String {
     match (state, fail_step) {
         // A failure anchors on the failing step (the firehose-log `#step-<n>` jump-to-failure, the
@@ -352,12 +352,10 @@ pub fn details_ref(run_ref: &str, state: CheckState, fail_step: Option<u32>) -> 
         (CheckState::Failure, Some(n)) | (CheckState::Error, Some(n)) => {
             format!("{run_ref}#step-{n}")
         }
-        // A failure without a known step index anchors on the run (the index resolves the step).
-        (CheckState::Failure, None) | (CheckState::Error, None) => {
-            format!("{run_ref}#step-failure")
-        }
-        // A non-failure anchors on the run summary.
-        _ => format!("{run_ref}#summary"),
+        // The frozen ArtifactRef grammar has a numeric `#step-<n>` CI sub-anchor. When no exact
+        // failing step exists, the canonical run root is the only honest target; `#step-failure`
+        // and `#summary` are not ArtifactRefs and must never enter Git's durable projection.
+        _ => run_ref.to_string(),
     }
 }
 

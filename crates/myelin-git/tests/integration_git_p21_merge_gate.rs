@@ -26,6 +26,8 @@ use myelin_tenancy::{ArtifactRef, TenantId};
 use std::collections::BTreeMap;
 
 const TENANT: &str = "acme";
+const REGION: &str = "fr-par";
+const REPO: &str = "myelin://acme/git/repo/core";
 const HEAD: &str = "feedface00";
 
 fn admin_url() -> String {
@@ -39,7 +41,7 @@ fn fact(context: &str, attempt: u32, state: CheckState, trust: TrustTier) -> Che
     args.insert("context".to_string(), context.to_string());
     CheckStatus {
         tenant: TenantId(TENANT.into()),
-        repo: ArtifactRef(format!("myelin://{TENANT}/git/repo/core")),
+        repo: ArtifactRef(REPO.into()),
         commit_oid: GitOid(HEAD.into()),
         context: CheckContext::ci(context),
         state,
@@ -92,13 +94,18 @@ async fn merge_gate_blocks_until_required_set_complete_over_postgres() {
     // partial: build green; test MISSING.
     proj.apply(
         "p21-build-1",
+        REGION,
         &fact("build", 1, CheckState::Success, TrustTier::Trusted),
     )
     .await
     .unwrap();
 
     // the gate BLOCKS over the live table — test is missing (0 under-gated merges).
-    match proj.merge_gate(TENANT, &head, &policy, &[]).await.unwrap() {
+    match proj
+        .merge_gate(TENANT, REGION, REPO, &head, &policy, &[])
+        .await
+        .unwrap()
+    {
         MergeGateOutcome::Blocked { unmet } => {
             assert_eq!(unmet.len(), 1);
             assert_eq!(unmet[0].context, CheckContext::ci("test"));
@@ -110,6 +117,7 @@ async fn merge_gate_blocks_until_required_set_complete_over_postgres() {
     // complete the set: test green.
     proj.apply(
         "p21-test-1",
+        REGION,
         &fact("test", 1, CheckState::Success, TrustTier::Trusted),
     )
     .await
@@ -117,7 +125,9 @@ async fn merge_gate_blocks_until_required_set_complete_over_postgres() {
 
     // the gate is ADMITTED.
     assert_eq!(
-        proj.merge_gate(TENANT, &head, &policy, &[]).await.unwrap(),
+        proj.merge_gate(TENANT, REGION, REPO, &head, &policy, &[])
+            .await
+            .unwrap(),
         MergeGateOutcome::Admitted,
         "a complete green required set admits over Postgres"
     );
@@ -137,13 +147,18 @@ async fn fork_gate_neutral_until_endorsed_over_postgres() {
     // the fork self-greens build — untrusted_fork.
     proj.apply(
         "p21-fork-1",
+        REGION,
         &fact("build", 1, CheckState::Success, TrustTier::UntrustedFork),
     )
     .await
     .unwrap();
 
     // un-endorsed → neutral → block.
-    match proj.merge_gate(TENANT, &head, &policy, &[]).await.unwrap() {
+    match proj
+        .merge_gate(TENANT, REGION, REPO, &head, &policy, &[])
+        .await
+        .unwrap()
+    {
         MergeGateOutcome::Blocked { unmet } => {
             assert_eq!(unmet[0].reason, UnmetReason::UntrustedForkNeutral);
         }
@@ -154,7 +169,14 @@ async fn fork_gate_neutral_until_endorsed_over_postgres() {
 
     // endorsed (the GIT-P22 input) → admit.
     assert_eq!(
-        proj.merge_gate(TENANT, &head, &policy, &[CheckContext::ci("build")])
+        proj.merge_gate(
+            TENANT,
+            REGION,
+            REPO,
+            &head,
+            &policy,
+            &[CheckContext::ci("build")],
+        )
             .await
             .unwrap(),
         MergeGateOutcome::Admitted,
@@ -164,12 +186,15 @@ async fn fork_gate_neutral_until_endorsed_over_postgres() {
     // a trusted re-run (attempt 2) supersedes the fork fact IN SQL → now admits with NO endorsement.
     proj.apply(
         "p21-rerun-2",
+        REGION,
         &fact("build", 2, CheckState::Success, TrustTier::Trusted),
     )
     .await
     .unwrap();
     assert_eq!(
-        proj.merge_gate(TENANT, &head, &policy, &[]).await.unwrap(),
+        proj.merge_gate(TENANT, REGION, REPO, &head, &policy, &[])
+            .await
+            .unwrap(),
         MergeGateOutcome::Admitted,
         "a trusted re-run supersedes the fork fact and admits with no explicit endorsement"
     );
@@ -187,23 +212,31 @@ async fn superseding_failure_reblocks_over_postgres() {
 
     proj.apply(
         "p21-ok-1",
+        REGION,
         &fact("build", 1, CheckState::Success, TrustTier::Trusted),
     )
     .await
     .unwrap();
     assert_eq!(
-        proj.merge_gate(TENANT, &head, &policy, &[]).await.unwrap(),
+        proj.merge_gate(TENANT, REGION, REPO, &head, &policy, &[])
+            .await
+            .unwrap(),
         MergeGateOutcome::Admitted
     );
 
     // a re-run FAILS (attempt 2) — supersedes in SQL → re-blocked.
     proj.apply(
         "p21-fail-2",
+        REGION,
         &fact("build", 2, CheckState::Failure, TrustTier::Trusted),
     )
     .await
     .unwrap();
-    match proj.merge_gate(TENANT, &head, &policy, &[]).await.unwrap() {
+    match proj
+        .merge_gate(TENANT, REGION, REPO, &head, &policy, &[])
+        .await
+        .unwrap()
+    {
         MergeGateOutcome::Blocked { unmet } => {
             assert_eq!(
                 unmet[0].reason,
@@ -213,6 +246,35 @@ async fn superseding_failure_reblocks_over_postgres() {
             );
         }
         MergeGateOutcome::Admitted => panic!("a superseding failure must re-block over Postgres"),
+    }
+
+    proj.drop_tables().await.unwrap();
+}
+
+/// A successful execution is not green until the runner has durably settled its reservation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_but_unsettled_check_blocks_over_postgres() {
+    let proj = connect().await;
+    let head = GitOid(HEAD.into());
+    let policy = MergeGatePolicy::from_required_contexts(&["ci/build"]).unwrap();
+    let mut unsettled = fact("build", 1, CheckState::Success, TrustTier::Trusted);
+    unsettled.cost_settled = false;
+
+    proj.apply("p21-unsettled-1", REGION, &unsettled)
+        .await
+        .unwrap();
+
+    match proj
+        .merge_gate(TENANT, REGION, REPO, &head, &policy, &[])
+        .await
+        .unwrap()
+    {
+        MergeGateOutcome::Blocked { unmet } => {
+            assert_eq!(unmet[0].reason, UnmetReason::CostUnsettled);
+        }
+        MergeGateOutcome::Admitted => {
+            panic!("a successful check with an unsettled reservation must block")
+        }
     }
 
     proj.drop_tables().await.unwrap();

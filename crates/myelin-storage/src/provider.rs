@@ -690,6 +690,29 @@ impl SubstrateProvider {
         &self.pool
     }
 
+    /// Open a separately bounded connection lane with the same validated runtime credential and
+    /// reset-on-release discipline. This is for compositions that must hold one PostgreSQL lock
+    /// transaction while performing a second durable operation: using the ordinary pool for both
+    /// sides can deadlock at pool capacity. The lane is still the constrained runtime role, never
+    /// the migration credential.
+    pub async fn auxiliary_runtime_lane(
+        &self,
+        max_connections: u32,
+    ) -> Result<SubstrateProvider, ProviderError> {
+        self.require_validated_runtime()?;
+        let pool = connect_pool_with_reset(
+            &self.config.database_url,
+            &self.config.region,
+            max_connections,
+        )
+        .await?;
+        Ok(SubstrateProvider {
+            pool,
+            config: self.config.clone(),
+            runtime_role_validated: true,
+        })
+    }
+
     /// Execute a real, tenant-neutral PostgreSQL round trip for orchestration readiness. This never
     /// exposes the driver error or DSN; callers need only the verdict and must keep liveness separate.
     pub async fn database_is_ready(&self) -> bool {

@@ -39,7 +39,7 @@ fail() { echo "backup-drill: FAIL — $*" >&2; exit 1; }
 psql_admin() { docker exec -e PGPASSWORD="${MYELIN_PG_ADMIN_PW:-myelin_dev_pw}" "${PG_CONTAINER}" psql -U "${PG_USER}" "$@"; }
 
 # The dogfood-bearing tables whose row counts must survive the round trip (loud if a table is missing).
-VERIFY_TABLES=(principal rebac_tuple cell_token_root outbox kms_sealed_root revocation)
+VERIFY_TABLES=(principal rebac_tuple cell_token_root outbox kms_sealed_root revocation check_status)
 
 run_drill() {
   command -v docker >/dev/null 2>&1 || fail "docker is required (the dev PG runs in ${PG_CONTAINER})"
