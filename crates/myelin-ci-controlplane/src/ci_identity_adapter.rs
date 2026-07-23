@@ -198,6 +198,7 @@ fn bridge<F: Future>(rt: &tokio::runtime::Handle, future: F) -> F::Output {
 #[derive(Clone)]
 pub struct IdentityCiJobLaunchAuthorizer {
     authorizer: RunTokenAuthorizer,
+    region: Region,
     claim_gate: Arc<dyn CiJobLaunchClaimGate>,
 }
 
@@ -205,10 +206,12 @@ impl IdentityCiJobLaunchAuthorizer {
     pub fn new(
         authorizer: RunTokenAuthorizer,
         store: CiJobQueueStore,
+        region: Region,
         rt: tokio::runtime::Handle,
     ) -> Self {
         Self {
             authorizer,
+            region,
             claim_gate: Arc::new(PgCiJobLaunchClaimGate { store, rt }),
         }
     }
@@ -216,10 +219,12 @@ impl IdentityCiJobLaunchAuthorizer {
     #[cfg(test)]
     fn with_claim_gate(
         authorizer: RunTokenAuthorizer,
+        region: Region,
         claim_gate: Arc<dyn CiJobLaunchClaimGate>,
     ) -> Self {
         Self {
             authorizer,
+            region,
             claim_gate,
         }
     }
@@ -250,7 +255,7 @@ impl IdentityCiJobLaunchAuthorizer {
         if context.principal_id != CI_JOB_PRINCIPAL_ID
             || context.required_capabilities != required
             || context.tenant_id.trim().is_empty()
-            || context.region.trim().is_empty()
+            || context.region != self.region.0
             || context.wf_run_id.trim().is_empty()
             || context.job_id.trim().is_empty()
             || context.lease_owner.trim().is_empty()
@@ -476,6 +481,7 @@ mod tests {
         let boundary = IdentityCiJobLaunchAuthorizer::with_claim_gate(
             RunTokenAuthorizer::new(Arc::new(verifier), s7.clone())
                 .with_clock(|| timestamp_from_epoch(NOW).unwrap()),
+            Region("eu-west".into()),
             Arc::new(AllowClaimGate),
         );
         let spec = job(credential.clone(), &claim);
@@ -559,6 +565,7 @@ mod tests {
         let boundary = IdentityCiJobLaunchAuthorizer::with_claim_gate(
             RunTokenAuthorizer::new(Arc::new(verifier), s7)
                 .with_clock(|| timestamp_from_epoch(NOW).unwrap()),
+            Region("eu-west".into()),
             Arc::new(RefuseClaimGate),
         );
         assert!(

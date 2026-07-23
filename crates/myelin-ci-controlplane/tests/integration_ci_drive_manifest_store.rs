@@ -8,15 +8,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use myelin_ci_controlplane::{
-    CiDriveManifestStore, CiDriveManifestV1, CiJobCredentialMinter, CiJobRuntimeAuthorityRequest,
-    CiJobTokenIssueError, CiJobTokenIssuer, CiJobTokenRequest, CiManifestLaneV1,
-    CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1,
-    GrantedCiJobV1, LockedManifestCiJobTokenIssuer, ManifestBoundCiJobTokenAuthority,
+    ci_job_authorization_context, ci_runner_identity_authorities, CiDriveManifestStore,
+    CiDriveManifestV1, CiJobCredentialMinter, CiJobRuntimeAuthorityRequest, CiJobTokenIssueError,
+    CiJobTokenIssuer, CiJobTokenRequest, CiManifestLaneV1, CiManifestLimitsV1,
+    CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, GrantedCiJobV1,
+    LockedManifestCiJobTokenIssuer, ManifestBoundCiJobTokenAuthority,
     ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CI_PIPELINE_WF_TYPE,
     CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
 };
-use myelin_ci_sandbox::RunTokenCredential;
+use myelin_ci_sandbox::{
+    EgressPolicy, IdemToken, ImageRef, JobKind, JobSpecTemplate, MeterTarget, ResourceLimits,
+    RunTokenCredential, TrustTier, WorkspaceSpec,
+};
+use myelin_config::MyelinConfig;
+use myelin_storage::{
+    cell_root_durable_migrations, identity_durable_migrations, PgMigrator, SealKey,
+    SubstrateProvider,
+};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
 
@@ -27,6 +36,11 @@ fn app_url() -> String {
 
 fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
+}
+
+fn scoped_url(url: &str, schema: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}options=-csearch_path%3D{schema}%2Cpublic")
 }
 
 fn unique_schema() -> String {
@@ -191,7 +205,7 @@ fn claim(manifest: &CiDriveManifestV1) -> CiJobTokenRequest {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     let bare_admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -211,6 +225,12 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
 
     let admin = pinned_pool(&admin_url(), &schema).await;
     let app = pinned_pool(&app_url(), &schema).await;
+    PgMigrator::apply(&admin, &identity_durable_migrations())
+        .await
+        .expect("apply the durable Identity/S7 schema");
+    PgMigrator::apply(&admin, &cell_root_durable_migrations())
+        .await
+        .expect("apply the durable cell-root schema");
     sqlx::raw_sql(&format!(
         "{CREATE_CI_RUN_DDL};
          {ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL};
@@ -314,7 +334,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         .is_err());
 
     let raw_minter = Arc::new(RecordingCredentialMinter::default());
-    let issuer = LockedManifestCiJobTokenIssuer::new(app.clone(), raw_minter.clone());
+    let issuer = LockedManifestCiJobTokenIssuer::new(app.clone(), "fr-par", raw_minter.clone());
     let credential = issuer
         .mint(exact_claim.clone())
         .await
@@ -322,6 +342,99 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     assert_eq!(credential.ttl_secs(), 30);
     assert_eq!(raw_minter.calls.load(Ordering::SeqCst), 1);
     assert_eq!(*raw_minter.authority.lock().unwrap(), Some(authority()));
+    let mut cross_cell_region = exact_claim.clone();
+    cross_cell_region.region = "us-east".into();
+    let cross_cell_error = issuer.mint(cross_cell_region).await.unwrap_err();
+    assert!(cross_cell_error
+        .0
+        .contains("region differs from the runner cell"));
+    assert_eq!(
+        raw_minter.calls.load(Ordering::SeqCst),
+        1,
+        "a cross-cell-region claim is refused before durable reads or Identity mint"
+    );
+
+    // The exact production Identity composition survives a factory reconstruction: the first
+    // instance mints through the locked durable claim, while a second instance reloads the same
+    // sealed cell root and durable S7 state, verifies the signed credential, and wins the one-shot
+    // durable launch CAS.
+    let mut provider_config = MyelinConfig::dev();
+    provider_config.database_url = scoped_url(&app_url(), &schema);
+    provider_config.region = expected.region.clone();
+    let provider = SubstrateProvider::connect(provider_config, 4)
+        .await
+        .expect("connect the production app-role provider");
+    let seal_key = SealKey::from_bytes([0x5a; 32]);
+    let first_identity = ci_runner_identity_authorities(
+        provider.clone(),
+        "ci-identity-restart-cell",
+        &seal_key,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .expect("compose the first production Identity instance");
+    let signed = first_identity
+        .token_issuer()
+        .mint(exact_claim.clone())
+        .await
+        .expect("mint a real claim-bound PASETO credential");
+    let wrong_seal_error = ci_runner_identity_authorities(
+        provider.clone(),
+        "ci-identity-restart-cell",
+        &SealKey::from_bytes([0xa5; 32]),
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .err()
+    .expect("an existing cell root must never be replaced after unseal refusal");
+    assert_eq!(
+        wrong_seal_error,
+        myelin_ci_controlplane::CiRunnerIdentityCompositionError::DurableCellRootUnavailable
+    );
+    let second_identity = ci_runner_identity_authorities(
+        provider.clone(),
+        "ci-identity-restart-cell",
+        &seal_key,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .expect("reconstruct production Identity from durable state");
+    let spec = JobSpecTemplate::new(
+        JobKind::Ci,
+        ImageRef::pinned(expected.jobs[0].image.clone()).unwrap(),
+        expected.jobs[0].command.clone(),
+        Vec::new(),
+        Vec::new(),
+        EgressPolicy::deny_all(),
+        ResourceLimits {
+            cpu_millis: expected.jobs[0].limits.cpu_millis,
+            mem_bytes: expected.jobs[0].limits.mem_bytes,
+            disk_bytes: expected.jobs[0].limits.disk_bytes,
+            pids_max: expected.jobs[0].limits.pids_max,
+            timeout_secs: expected.jobs[0].limits.timeout_secs,
+        },
+        WorkspaceSpec::default(),
+        TrustTier::Trusted,
+        MeterTarget {
+            reserve_id: expected.jobs[0].reserve_handle.clone(),
+        },
+        IdemToken(exact_claim.idem_token.clone()),
+    )
+    .unwrap()
+    .resolve_with_authorization(signed, Some(ci_job_authorization_context(&exact_claim)));
+    second_identity
+        .launch_authorizer()
+        .authorize(&spec)
+        .expect("a reconstructed production verifier authorizes the exact durable claim");
+    let launched_state: String = sqlx::query_scalar(
+        "SELECT state FROM job_queue WHERE tenant_id = $1 AND job_id = $2::uuid",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.jobs[0].job_id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(launched_state, "running");
 
     let mut forged = exact_claim.clone();
     forged.token_authority_handle = format!("ci-token-authority:v1:{}", "0".repeat(64));
@@ -371,6 +484,9 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         "stale, reaped, reclaimed, or forged claim facts never reach Identity"
     );
 
+    drop(second_identity);
+    drop(first_identity);
+    drop(provider);
     admin.close().await;
     app.close().await;
     sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))

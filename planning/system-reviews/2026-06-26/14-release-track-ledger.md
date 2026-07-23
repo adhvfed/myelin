@@ -1003,8 +1003,26 @@ fixture test were removed. Full row gates are green. Independent adversarial re-
 CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding after catching and closing an initial
 scheduler-cap semantic mismatch.
 
-**Honest remaining activation floors:** compose the Identity minter, exact launch authorizer,
-exact-tenant region poller/worker, reporter-owned runner hooks, and terminal bookends in one
+**Production durable Identity composition (2026-07-23).** The dormant production runner path now
+constructs one cell-scoped Identity authority pair from a sealed durable cell root, durable S7
+revocation state, the real PASETO signer/verifier, the locked durable-claim token issuer, and the
+exact durable final-launch CAS authorizer. Both mint and launch are bound to the provider's exact
+cell region. Cell IDs must be nonempty, canonical (no surrounding whitespace), control-free, and no
+longer than 128 characters before any root lookup, preventing visually ambiguous IDs from creating
+separate signing roots.
+
+The live PostgreSQL proof mints through a first production authority construction, proves that a
+wrong seal key cannot replace its root, reconstructs the authorities from the same root and S7
+state, and uses the second construction to verify that token and win the one-shot durable launch
+CAS. A cross-region request is refused before the raw minter runs. The production-source gate
+requires every durable and cryptographic component, forbids ephemeral roots/revocation stores and
+structural signers/verifiers, pins provider-region binding, and preserves startup refusal before
+database access. Independent adversarial review initially found the whitespace split-root risk;
+after the canonical-ID guard and both-sided regression coverage, re-review reported
+CONFIRMED-SOUND with no HIGH, MEDIUM, or LOW findings.
+
+**Honest remaining activation floors:** compose the exact-tenant region poller/worker,
+reporter-owned runner hooks, scoped reservation begin/release, and terminal bookends in one
 production runner. Then inject crashes across mint→CAS and CAS→spawn plus cancellation, retry,
 recovery, and settlement races in the complete composition. No Commercial wallet, billing, or
 Stripe work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.

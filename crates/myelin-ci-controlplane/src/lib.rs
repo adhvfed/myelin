@@ -71,6 +71,7 @@ pub mod ci_manifest_pipeline;
 pub mod ci_manifest_job_runner;
 pub mod ci_pipeline;
 pub mod ci_result_signal;
+pub mod ci_runner_composition;
 pub use ci_claim_token_issuer::{CiJobCredentialMinter, LockedManifestCiJobTokenIssuer};
 pub use ci_drive_manifest::{
     ci_check_context_v1, CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1,
@@ -82,6 +83,10 @@ pub use ci_drive_manifest::{
 pub use ci_identity_adapter::{
     ci_job_authorization_context, IdentityCiJobCredentialMinter, IdentityCiJobLaunchAuthorizer,
     CI_JOB_PRINCIPAL_ID, CI_JOB_REQUIRED_CAPABILITIES,
+};
+pub use ci_runner_composition::{
+    ci_runner_identity_authorities, CiRunnerIdentityAuthorities,
+    CiRunnerIdentityCompositionError,
 };
 pub use ci_launch_authority::{
     CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority,
@@ -105,8 +110,9 @@ pub use ci_manifest_job_runner::{
 /// through the outbox (the honest #7 H1 split). Constructed at the composition root by
 /// [`ci_run_store_factory`]; the `ci_run` table it writes is created by the shared
 /// [`ci_durable_migrations`] both CI mains apply at boot. Manifest-backed registration now lives in
-/// [`register_durable_ci_manifest_pipeline`]; production activation remains gated on its real policy
-/// and token-authority adapters, settle bookend, and poller.
+/// [`register_durable_ci_manifest_pipeline`]; production activation remains gated on composing the
+/// exact-tenant worker/poller and scoped reservation/terminal bookends around the now-real policy
+/// and Identity authorities, then closing the complete crash/recovery matrix.
 pub mod ci_run_region;
 pub mod ci_run_starter_poller;
 pub mod ci_run_store;

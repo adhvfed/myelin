@@ -32,7 +32,8 @@
 //! endpoint and both PostgreSQL roles are explicit through `Mode::RequireEnv`. The per-table
 //! behaviour (the scheduler claim, the check emitter, the log index, the metering) is the
 //! CI-P12..CI-P24 surface. This shell runs no job: requesting the incomplete production runner
-//! fails before database bootstrap until its durable billing and run-token authorities are wired.
+//! fails before database bootstrap until its exact-tenant worker, scoped reservation lifecycle, and
+//! complete crash/recovery path are wired around the now-real durable token authorities.
 
 use myelin_ci_controlplane::run_controlplane_until_shutdown;
 use myelin_config::{Mode, MyelinConfig};
@@ -64,8 +65,8 @@ impl fmt::Display for StartupRefusal {
         match self {
             Self::IncompleteProductionRunner => write!(
                 f,
-                "MYELIN_CI_RUNNER=1 requires a real durable CostLedger reserve/settle authority \
-                 and live per-run-token verification; production runner activation is refused"
+                "MYELIN_CI_RUNNER=1 requires the exact-tenant worker, scoped reservation lifecycle, \
+                 and complete launch/recovery composition; production runner activation is refused"
             ),
             Self::InvalidRunnerSetting(value) => write!(
                 f,
@@ -302,6 +303,40 @@ async fn main() {
                 eprintln!(
                     "ci-controlplane: Tier-P operational reservation composition refused: {error}"
                 );
+                std::process::exit(1);
+            }
+        };
+        let runner_cell_id = match std::env::var("MYELIN_CELL_ID") {
+            Ok(cell_id) => cell_id,
+            Err(_) => {
+                eprintln!(
+                    "ci-controlplane: runner Identity composition refused: MYELIN_CELL_ID is \
+                     required"
+                );
+                std::process::exit(1);
+            }
+        };
+        let runner_seal_key = match myelin_storage::seal_key_from_env() {
+            Ok(seal_key) => seal_key,
+            Err(error) => {
+                eprintln!(
+                    "ci-controlplane: runner Identity composition refused: durable seal key is \
+                     unavailable: {error}"
+                );
+                std::process::exit(1);
+            }
+        };
+        let _runner_identity = match myelin_ci_controlplane::ci_runner_identity_authorities(
+            provider.clone(),
+            runner_cell_id,
+            &runner_seal_key,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                eprintln!("ci-controlplane: runner Identity composition refused: {error}");
                 std::process::exit(1);
             }
         };
