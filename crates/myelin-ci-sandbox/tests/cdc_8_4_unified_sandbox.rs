@@ -73,19 +73,22 @@ impl SandboxBackend for RunnerSeam {
 
     fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
         // #4 isolation floor FIRST — the hardening profile must hold before any code runs.
-        (hooks.isolation_floor)(spec)?;
+        hooks.enforce_isolation_floor(spec)?;
         self.order.lock().unwrap().push("isolation_floor");
         // #1a cost gate — reserve at dispatch; refuse-to-start on exhaustion (never starts).
         let reserve = if self.exhausted {
-            (hooks.reserve)(&MeterTarget {
+            hooks.reserve(&MeterTarget {
                 reserve_id: "__exhausted__".into(),
             })
         } else {
-            (hooks.reserve)(&spec.meter_to)
+            hooks.reserve(&spec.meter_to)
         }?;
         self.order.lock().unwrap().push("reserve");
         // #2 final attribution — immediately before untrusted code would spawn.
-        (hooks.attribute)(spec)?;
+        if let Err(error) = hooks.attribute(spec) {
+            hooks.release_unused(&reserve)?;
+            return Err(error);
+        }
         self.order.lock().unwrap().push("attribute");
         // ... the hardened guest would run the (compute/external) command here; the seam carries
         // the result back (RESHAPE-001 / CT-001 stub) ...
@@ -94,7 +97,7 @@ impl SandboxBackend for RunnerSeam {
             mem_byte_seconds: 4,
         });
         // #1b settle — release the unused reserve on completion (never interrupt in-flight).
-        (hooks.settle)(&reserve, result.usage)?;
+        hooks.settle_completed(&reserve, result.usage)?;
         self.order.lock().unwrap().push("settle");
         Ok(SandboxLaunch {
             handle: SandboxHandle {
@@ -152,12 +155,13 @@ fn consumer_builds_agent_exec_spec() -> JobSpec {
 }
 
 fn working_hooks() -> RunnerHooks {
-    RunnerHooks {
-        reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-        settle: Box::new(|_h, _u| Ok(())),
-        attribute: Box::new(|_t| Ok(())),
-        isolation_floor: Box::new(|_s| Ok(())),
-    }
+    RunnerHooks::new(
+        myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+        Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+        Box::new(|_h, _u| Ok(())),
+        Box::new(|_t| Ok(())),
+        Box::new(|_s| Ok(())),
+    )
 }
 
 /// The PROVIDER admits the CONSUMER's CI spec and drives all four guarantees in the mandated order.
@@ -212,8 +216,9 @@ fn provider_refuses_to_start_when_the_cost_gate_is_exhausted() {
         order: Arc::new(std::sync::Mutex::new(Vec::new())),
         exhausted: true,
     };
-    let hooks = RunnerHooks {
-        reserve: Box::new(move |m| {
+    let hooks = RunnerHooks::new(
+        myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+        Box::new(move |m| {
             if m.reserve_id == "__exhausted__" {
                 Err(HookError("wallet exhausted — refuse to start".into()))
             } else {
@@ -221,10 +226,10 @@ fn provider_refuses_to_start_when_the_cost_gate_is_exhausted() {
                 Ok(ReserveHandle(m.reserve_id.clone()))
             }
         }),
-        settle: Box::new(|_h, _u| Ok(())),
-        attribute: Box::new(|_t| Ok(())),
-        isolation_floor: Box::new(|_s| Ok(())),
-    };
+        Box::new(|_h, _u| Ok(())),
+        Box::new(|_t| Ok(())),
+        Box::new(|_s| Ok(())),
+    );
     let r = provider.launch(&consumer_builds_ci_spec(), &hooks);
     assert!(
         r.is_err(),

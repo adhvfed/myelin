@@ -12,7 +12,9 @@
 
 use std::sync::Arc;
 
-use myelin_ci_sandbox::{CompletionClaim, TerminalReport, TerminalReporter};
+use myelin_ci_sandbox::{
+    CompletionClaim, CompletionSettlementOwner, TerminalReport, TerminalReporter,
+};
 use myelin_flow::{ExecutorError, SignalOutcome};
 use myelin_tenancy::{Region, TenantId};
 
@@ -74,6 +76,12 @@ impl CiPipelineReporterRouter {
 }
 
 impl TerminalReporter for CiPipelineReporterRouter {
+    fn completion_settlement_owner(&self) -> CompletionSettlementOwner {
+        // The factory type is production-only by contract: every constructed reporter carries
+        // durable accounting. Test-only bypass reporters are never a valid router composition.
+        CompletionSettlementOwner::TerminalReporter
+    }
+
     fn report_done(
         &self,
         claim: &CompletionClaim,
@@ -92,6 +100,12 @@ impl TerminalReporter for CiPipelineReporterRouter {
         if reporter.tenant() != &claim.tenant || reporter.region() != self.region.0 {
             return Err(ExecutorError::InvalidInput(
                 "ci.pipeline job.done refused: reporter factory returned a mismatched scope".into(),
+            ));
+        }
+        if reporter.completion_settlement_owner() != self.completion_settlement_owner() {
+            return Err(ExecutorError::InvalidInput(
+                "ci.pipeline job.done refused: reporter factory returned an unaccounted reporter"
+                    .into(),
             ));
         }
         reporter.report_done(claim, report)
@@ -162,7 +176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_each_claim_to_its_exact_tenant_and_region_before_delegating() {
+    async fn routes_each_claim_to_its_exact_tenant_and_region_and_refuses_test_bypass() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let observed = calls.clone();
         let factory: CiPipelineReporterFactory = Arc::new(move |tenant, region| {
@@ -176,8 +190,11 @@ mod tests {
         for tenant in ["tenant-a", "tenant-b"] {
             let error = router
                 .report_done(&claim(tenant), &contradictory_report())
-                .expect_err("the exact reporter delegates and rejects contradictory verdicts");
-            assert!(error.to_string().contains("timed-out job cannot pass"));
+                .expect_err("the router must reject a test-bypass reporter before database access");
+            assert!(
+                error.to_string().contains("unaccounted reporter"),
+                "{error}"
+            );
         }
         assert_eq!(
             *calls.lock().expect("call recorder"),

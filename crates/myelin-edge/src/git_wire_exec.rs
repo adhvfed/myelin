@@ -342,24 +342,12 @@ impl GitWireExecutor {
         hooks: RunnerHooks,
         credential_issuer: Arc<dyn GitWireCredentialIssuer>,
     ) -> Self {
-        let RunnerHooks {
-            reserve,
-            settle,
-            attribute,
-            isolation_floor,
-        } = hooks;
         let verifier = credential_issuer.clone();
-        let hooks = RunnerHooks {
-            reserve,
-            settle,
-            attribute: Box::new(move |spec| {
-                verifier
-                    .verify(&spec.run_token)
-                    .map_err(myelin_ci_sandbox::HookError)?;
-                attribute(spec)
-            }),
-            isolation_floor,
-        };
+        let hooks = hooks.with_attribute_guard(move |spec| {
+            verifier
+                .verify(&spec.run_token)
+                .map_err(myelin_ci_sandbox::HookError)
+        });
         Self {
             backend: GvisorBackend::new(),
             root: root.into(),
@@ -408,12 +396,13 @@ impl GitWireExecutor {
     /// wallet (11.7) / token mint (4.7). Returning `Ok` here does NOT skip the floor — the floor is
     /// enforced unconditionally inside `launch_git_wire`.
     pub fn serving_hooks() -> RunnerHooks {
-        RunnerHooks {
-            reserve: Box::new(|m| Ok(myelin_ci_sandbox::ReserveHandle(m.reserve_id.clone()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Ok(())),
-        }
+        RunnerHooks::new(
+            myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+            Box::new(|m| Ok(myelin_ci_sandbox::ReserveHandle(m.reserve_id.clone()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        )
     }
 
     /// The git environment the sandboxed `upload-pack` needs: the git-core exec dir, a writable `$HOME`

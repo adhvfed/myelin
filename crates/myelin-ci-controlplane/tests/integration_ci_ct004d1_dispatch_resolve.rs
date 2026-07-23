@@ -242,12 +242,13 @@ impl IdMinter for FixedMinter {
 }
 
 fn ok_hooks() -> RunnerHooks {
-    RunnerHooks {
-        reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-        settle: Box::new(|_h, _u| Ok(())),
-        attribute: Box::new(|_t| Ok(())),
-        isolation_floor: Box::new(|_s| Ok(())),
-    }
+    RunnerHooks::new(
+        myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+        Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+        Box::new(|_h, _u| Ok(())),
+        Box::new(|_t| Ok(())),
+        Box::new(|_s| Ok(())),
+    )
 }
 
 /// A real compute `JobSpec` running `command` at `trust`. The spec's `trust_tier` is the truth the

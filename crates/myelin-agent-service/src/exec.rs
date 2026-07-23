@@ -854,18 +854,21 @@ mod tests {
             spec: &JobSpec,
             hooks: &RunnerHooks,
         ) -> Result<SandboxLaunch, Self::Error> {
-            (hooks.isolation_floor)(spec)?;
+            hooks.enforce_isolation_floor(spec)?;
             self.order.lock().unwrap().push("isolation_floor");
-            let res = (hooks.reserve)(&spec.meter_to)?;
+            let res = hooks.reserve(&spec.meter_to)?;
             self.order.lock().unwrap().push("reserve");
-            (hooks.attribute)(spec)?;
+            if let Err(error) = hooks.attribute(spec) {
+                hooks.release_unused(&res)?;
+                return Err(error);
+            }
             self.order.lock().unwrap().push("attribute");
             // ... the hardened guest runs the compute here; the seam carries the result back ...
             let result = SandboxResult::stub_ok(ResourceUsage {
                 cpu_seconds: 1,
                 mem_byte_seconds: 1,
             });
-            (hooks.settle)(&res, result.usage)?;
+            hooks.settle_completed(&res, result.usage)?;
             self.order.lock().unwrap().push("settle");
             Ok(SandboxLaunch {
                 handle: SandboxHandle {
@@ -881,12 +884,13 @@ mod tests {
     }
 
     fn working_hooks() -> RunnerHooks {
-        RunnerHooks {
-            reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Ok(())),
-        }
+        RunnerHooks::new(
+            myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        )
     }
 
     fn hands<'a>(
@@ -940,12 +944,13 @@ mod tests {
             order: order.clone(),
             kills: Arc::new(AtomicU32::new(0)),
         };
-        let hooks = RunnerHooks {
-            reserve: Box::new(|_m| Err(HookError("wallet exhausted — refuse to start".into()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Ok(())),
-        };
+        let hooks = RunnerHooks::new(
+            myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+            Box::new(|_m| Err(HookError("wallet exhausted — refuse to start".into()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
         let hands = hands(&backend, hooks);
         let out = hands.exec(Command("cargo test".into()));
         assert!(
@@ -965,12 +970,13 @@ mod tests {
             order: order.clone(),
             kills: Arc::new(AtomicU32::new(0)),
         };
-        let hooks = RunnerHooks {
-            reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Err(HookError("hardening profile not met".into()))),
-        };
+        let hooks = RunnerHooks::new(
+            myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Err(HookError("hardening profile not met".into()))),
+        );
         let hands = hands(&backend, hooks);
         let out = hands.exec(Command("sh".into()));
         assert!(out.0.starts_with("exec-refused:"), "{out:?}");
@@ -987,12 +993,13 @@ mod tests {
             order: Arc::new(Mutex::new(Vec::new())),
             kills: Arc::new(AtomicU32::new(0)),
         };
-        let hooks = RunnerHooks {
-            reserve: Box::new(|_m| Err(HookError("exhausted".into()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Ok(())),
-        };
+        let hooks = RunnerHooks::new(
+            myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+            Box::new(|_m| Err(HookError("exhausted".into()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
         let hands = hands(&backend, hooks);
         let job = hands
             .build_compute_job(&compute_tool_def(), &Command("sh".into()))

@@ -144,12 +144,13 @@ fn parse_batch(mut buf: &[u8]) -> Vec<(String, String, Vec<u8>)> {
 }
 
 fn ok_hooks() -> RunnerHooks {
-    RunnerHooks {
-        reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-        settle: Box::new(|_h, _u| Ok(())),
-        attribute: Box::new(|_t| Ok(())),
-        isolation_floor: Box::new(|_s| Ok(())),
-    }
+    RunnerHooks::new(
+        myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+        Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+        Box::new(|_h, _u| Ok(())),
+        Box::new(|_t| Ok(())),
+        Box::new(|_s| Ok(())),
+    )
 }
 
 #[test]

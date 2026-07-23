@@ -51,8 +51,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use myelin_ci_sandbox::{
-    CompletionClaim, IdemToken, JobSpec as SandboxJobSpec, ResourceUsage, TerminalReport,
-    TerminalReporter,
+    CompletionClaim, CompletionSettlementOwner, IdemToken, JobSpec as SandboxJobSpec,
+    ResourceUsage, TerminalReport, TerminalReporter,
 };
 #[cfg(any(test, feature = "test-support"))]
 use myelin_ci_sandbox::{
@@ -830,6 +830,14 @@ impl CiPipelineReporter {
 }
 
 impl TerminalReporter for CiPipelineReporter {
+    fn completion_settlement_owner(&self) -> CompletionSettlementOwner {
+        match self.accounting {
+            ReporterAccounting::Durable(_) => CompletionSettlementOwner::TerminalReporter,
+            #[cfg(any(test, feature = "test-support"))]
+            ReporterAccounting::TestBypass => CompletionSettlementOwner::Hook,
+        }
+    }
+
     fn report_done(
         &self,
         claim: &CompletionClaim,

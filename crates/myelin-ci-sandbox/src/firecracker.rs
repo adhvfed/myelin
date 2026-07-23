@@ -456,7 +456,7 @@ impl FirecrackerBackend {
         F: FnOnce(&JobSpec, &HardeningProfile) -> Result<GuestRun, String>,
     {
         // #4 isolation floor FIRST — the hardening profile must hold before any code runs.
-        (hooks.isolation_floor)(spec)?;
+        hooks.enforce_isolation_floor(spec)?;
         // The mandatory backend-independent hardening profile (arch 02 §5.3).
         let mut profile = HardeningProfile::derive(spec);
         // R0.1 (DELTA now-live HIGH): if the job requests egress (non-empty allowlist), EMIT+APPLY+
@@ -470,17 +470,11 @@ impl FirecrackerBackend {
         // network-device profile carries the enforced-egress record just recorded above.
         profile.assert_enforced().map_err(FcError::Hardening)?;
         // #1a cost gate — reserve before the final claim CAS; refusal starts nothing.
-        let reserve = (hooks.reserve)(&spec.meter_to)?;
+        let reserve = hooks.reserve(&spec.meter_to)?;
         // #2 attribution is the final mutable authorization boundary before spawn. If it refuses,
         // release the unused reserve immediately; no untrusted code has run.
-        if let Err(attribute_error) = (hooks.attribute)(spec) {
-            (hooks.settle)(
-                &reserve,
-                ResourceUsage {
-                    cpu_seconds: 0,
-                    mem_byte_seconds: 0,
-                },
-            )?;
+        if let Err(attribute_error) = hooks.attribute(spec) {
+            hooks.release_unused(&reserve)?;
             return Err(attribute_error.into());
         }
 
@@ -501,7 +495,7 @@ impl FirecrackerBackend {
 
         // #1b settle — release the unused reserve on completion (never interrupt in-flight), now
         // settling against the result's REAL measured usage (CT-002a).
-        (hooks.settle)(&reserve, result.usage)?;
+        hooks.settle_completed(&reserve, result.usage)?;
 
         Ok(SandboxLaunch {
             handle: SandboxHandle { guest_id },
@@ -1119,8 +1113,8 @@ mod tests {
     use super::*;
     use crate::hardening::{emit_egress_ruleset, HardeningProfile};
     use crate::{
-        EgressPolicy, IdemToken, ImageRef, JobKind, MeterTarget, ReserveHandle, ResourceLimits,
-        RunTokenCredential, TrustTier, WorkspaceSpec,
+        CompletionSettlementOwner, EgressPolicy, IdemToken, ImageRef, JobKind, MeterTarget,
+        ReserveHandle, ResourceLimits, RunTokenCredential, TrustTier, WorkspaceSpec,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
@@ -1184,12 +1178,13 @@ mod tests {
     }
 
     fn ok_hooks() -> RunnerHooks {
-        RunnerHooks {
-            reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Ok(())),
-        }
+        RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        )
     }
 
     /// A fake VMM that records kill (so we can assert whole-guest-kill on teardown) without a real VM.
@@ -1299,12 +1294,13 @@ mod tests {
     #[test]
     fn launch_refuses_to_start_on_an_exhausted_wallet() {
         let backend = FirecrackerBackend::new();
-        let hooks = RunnerHooks {
-            reserve: Box::new(|_m| Err(crate::HookError("wallet exhausted".into()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Ok(())),
-        };
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|_m| Err(crate::HookError("wallet exhausted".into()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
         let spawned = Arc::new(AtomicBool::new(false));
         let spawned2 = spawned.clone();
         let r = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _profile| {
@@ -1319,19 +1315,47 @@ mod tests {
     }
 
     #[test]
+    fn successful_reporter_owned_launch_defers_settlement_to_terminal_reporter() {
+        let backend = FirecrackerBackend::new();
+        let hook_settled = Arc::new(AtomicBool::new(false));
+        let hook_settled_at = hook_settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            Box::new(move |_h, _u| {
+                hook_settled_at.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+
+        backend
+            .launch_with(&spec(vec![]), &hooks, |_spec, _profile| {
+                Ok(fake_run(Arc::new(AtomicBool::new(false))))
+            })
+            .expect("the sandbox returns measured usage for the reporter transaction");
+        assert!(
+            !hook_settled.load(Ordering::SeqCst),
+            "reporter-owned completion must not settle through the hook"
+        );
+    }
+
+    #[test]
     fn launch_releases_the_unused_reserve_when_final_attribution_refuses() {
         let backend = FirecrackerBackend::new();
         let settled = Arc::new(Mutex::new(None));
         let settled_at = settled.clone();
-        let hooks = RunnerHooks {
-            reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            settle: Box::new(move |_h, usage| {
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            Box::new(move |_h, usage| {
                 *settled_at.lock().unwrap() = Some(usage);
                 Ok(())
             }),
-            attribute: Box::new(|_t| Err(crate::HookError("claim canceled".into()))),
-            isolation_floor: Box::new(|_s| Ok(())),
-        };
+            Box::new(|_t| Err(crate::HookError("claim canceled".into()))),
+            Box::new(|_s| Ok(())),
+        );
         let spawned = Arc::new(AtomicBool::new(false));
         let spawned_at = spawned.clone();
         let result = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _profile| {
@@ -1352,12 +1376,13 @@ mod tests {
     #[test]
     fn launch_fails_closed_when_the_isolation_floor_hook_rejects() {
         let backend = FirecrackerBackend::new();
-        let hooks = RunnerHooks {
-            reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Err(crate::HookError("hardening not met".into()))),
-        };
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Err(crate::HookError("hardening not met".into()))),
+        );
         let spawned = Arc::new(AtomicBool::new(false));
         let spawned2 = spawned.clone();
         let r = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _profile| {

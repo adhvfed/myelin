@@ -946,9 +946,11 @@ pub trait FleetProvider {
 /// **by construction**, no subsystem re-implementing them (contract 8.4). The hooks are typed
 /// SEAM functions wired here at P-129; their bodies are consumed contracts:
 ///
-/// 1. **Universal cost gate** ([`reserve`](RunnerHooks::reserve) / [`settle`](RunnerHooks::settle))
-///    — reserve at dispatch, refuse-on-exhaustion, settle on completion, never interrupt
-///    in-flight; CI runs and agent runs meter into the SAME wallet (contract 11.7).
+/// 1. **Universal cost gate** ([`reserve`](RunnerHooks::reserve) /
+///    [`settle_completed`](RunnerHooks::settle_completed)) — reserve at dispatch,
+///    refuse-on-exhaustion, settle on completion, never interrupt in-flight; CI runs and agent runs
+///    meter into the SAME ledger (contract 11.7). Completion settlement has one explicit owner:
+///    either this hook or the terminal reporter's atomic transaction.
 /// 2. **Attribution** ([`attribute`](RunnerHooks::attribute)) — the job runs under a per-run
 ///    attenuated token (`mint_run_token`, contract 4.7); after reserve, this is the final pre-spawn
 ///    authorization boundary. A refusal settles the unused reserve at zero and starts no guest.
@@ -962,18 +964,30 @@ pub trait FleetProvider {
 /// At P-129 a `RunnerHooks` value is a bundle of boxed closures; a backend (CI-P2) calls them at
 /// the right lifecycle points. This keeps the four guarantees a single, typed, testable seam.
 pub struct RunnerHooks {
+    /// The one component allowed to commit successful completion settlement. Generic agent execution
+    /// settles through the hook; CI defers to its claim/receipt/signal reporter transaction.
+    completion_settlement_owner: CompletionSettlementOwner,
     /// Guarantee #1a: reserve budget at dispatch; `Err` == exhausted → refuse-to-start (contract
     /// 11.7, `reserve_budget`). Returns the reserve handle on success.
-    pub reserve: ReserveHook,
+    reserve: ReserveHook,
     /// Guarantee #1b: settle the reserve on completion (contract 11.7, `settle_budget`); the
     /// unused reserve is released, never interrupting in-flight.
-    pub settle: SettleHook,
+    settle: SettleHook,
     /// Guarantee #2: reauthorize the per-run attenuated token and any durable launch generation
     /// after reserve, immediately before spawn.
-    pub attribute: AttributeHook,
+    attribute: AttributeHook,
     /// Guarantee #4: the isolation-floor hook the escape drill (CI-P5) drives — apply + verify the
     /// mandatory hardening profile (arch 02 §5.3) before any untrusted code runs.
-    pub isolation_floor: IsolationFloorHook,
+    isolation_floor: IsolationFloorHook,
+}
+
+/// Single durable owner of successful completion settlement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionSettlementOwner {
+    /// The sandbox completion hook commits settlement before returning the result.
+    Hook,
+    /// The terminal reporter co-commits settlement with claim consumption, receipt, and signal.
+    TerminalReporter,
 }
 
 /// Guarantee #1a hook type (contract 11.7 reserve_budget): reserve at dispatch, `Err` == exhausted.
@@ -987,9 +1001,93 @@ pub type AttributeHook = Box<dyn Fn(&JobSpec) -> Result<(), HookError> + Send + 
 /// Guarantee #4 hook type (arch 02 §5.3): apply + verify the mandatory hardening profile.
 pub type IsolationFloorHook = Box<dyn Fn(&JobSpec) -> Result<(), HookError> + Send + Sync>;
 
+impl RunnerHooks {
+    /// Build the lifecycle hook bundle with one explicit successful-completion settlement owner.
+    ///
+    /// The closures stay private so a backend cannot bypass [`settle_completed`](Self::settle_completed)
+    /// and accidentally settle in both the sandbox hook and terminal reporter.
+    pub fn new(
+        completion_settlement_owner: CompletionSettlementOwner,
+        reserve: ReserveHook,
+        settle: SettleHook,
+        attribute: AttributeHook,
+        isolation_floor: IsolationFloorHook,
+    ) -> Self {
+        Self {
+            completion_settlement_owner,
+            reserve,
+            settle,
+            attribute,
+            isolation_floor,
+        }
+    }
+
+    /// The one configured owner of successful completion settlement.
+    pub fn completion_settlement_owner(&self) -> CompletionSettlementOwner {
+        self.completion_settlement_owner
+    }
+
+    /// Apply and verify the mandatory isolation floor before any reservation or guest launch.
+    pub fn enforce_isolation_floor(&self, spec: &JobSpec) -> Result<(), HookError> {
+        (self.isolation_floor)(spec)
+    }
+
+    /// Reserve operational capacity before final attribution and guest launch.
+    pub fn reserve(&self, target: &MeterTarget) -> Result<ReserveHandle, HookError> {
+        (self.reserve)(target)
+    }
+
+    /// Perform the final launch-attribution check.
+    pub fn attribute(&self, spec: &JobSpec) -> Result<(), HookError> {
+        (self.attribute)(spec)
+    }
+
+    /// Prepend a final attribution guard while preserving the configured settlement owner and all
+    /// other lifecycle hooks.
+    pub fn with_attribute_guard(
+        mut self,
+        guard: impl Fn(&JobSpec) -> Result<(), HookError> + Send + Sync + 'static,
+    ) -> Self {
+        let attribute = self.attribute;
+        self.attribute = Box::new(move |spec| {
+            guard(spec)?;
+            attribute(spec)
+        });
+        self
+    }
+
+    /// Release a reservation after final attribution refuses before spawn. There will be no terminal
+    /// report in this path, so the real hook always owns the zero-usage release.
+    pub fn release_unused(&self, reserve: &ReserveHandle) -> Result<(), HookError> {
+        (self.settle)(
+            reserve,
+            ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            },
+        )
+    }
+
+    /// Settle completed usage exactly once, or explicitly defer it to the terminal reporter.
+    pub fn settle_completed(
+        &self,
+        reserve: &ReserveHandle,
+        usage: ResourceUsage,
+    ) -> Result<(), HookError> {
+        match self.completion_settlement_owner {
+            CompletionSettlementOwner::Hook => (self.settle)(reserve, usage),
+            CompletionSettlementOwner::TerminalReporter => Ok(()),
+        }
+    }
+}
+
 impl std::fmt::Debug for RunnerHooks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunnerHooks")
+            .field(
+                "completion_settlement_owner",
+                &self.completion_settlement_owner,
+            )
             .field("reserve", &"<fn>")
             .field("settle", &"<fn>")
             .field("attribute", &"<fn>")
@@ -1402,16 +1500,10 @@ mod tests {
             hooks: &RunnerHooks,
         ) -> Result<SandboxLaunch, Self::Error> {
             // Drive the four-guarantee seam exactly as a real backend must:
-            (hooks.isolation_floor)(spec)?; // #4 isolation floor
-            let res = (hooks.reserve)(&spec.meter_to)?; // #1a cost gate (reserve)
-            if let Err(attribute_error) = (hooks.attribute)(spec) {
-                (hooks.settle)(
-                    &res,
-                    ResourceUsage {
-                        cpu_seconds: 0,
-                        mem_byte_seconds: 0,
-                    },
-                )?;
+            hooks.enforce_isolation_floor(spec)?; // #4 isolation floor
+            let res = hooks.reserve(&spec.meter_to)?; // #1a cost gate (reserve)
+            if let Err(attribute_error) = hooks.attribute(spec) {
+                hooks.release_unused(&res)?;
                 return Err(attribute_error);
             }
             // ... the guest would run here (a real backend launches the hardened VM) ...
@@ -1421,7 +1513,7 @@ mod tests {
                 cpu_seconds: 1,
                 mem_byte_seconds: 1,
             });
-            (hooks.settle)(&res, result.usage)?; // #1b settle (against the result's usage)
+            hooks.settle_completed(&res, result.usage)?; // #1b settle or explicit reporter deferral
             Ok(SandboxLaunch {
                 handle: SandboxHandle {
                     guest_id: "noop-guest".into(),
@@ -1435,12 +1527,13 @@ mod tests {
     }
 
     fn test_hooks() -> RunnerHooks {
-        RunnerHooks {
-            reserve: Box::new(|m| Ok(ReserveHandle(format!("reserved:{}", m.reserve_id)))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Ok(())),
-        }
+        RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|m| Ok(ReserveHandle(format!("reserved:{}", m.reserve_id)))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        )
     }
 
     #[test]
@@ -1461,10 +1554,11 @@ mod tests {
         let backend = NoopBackend;
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
         let seen_at_boundary = seen.clone();
-        let hooks = RunnerHooks {
-            reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(move |spec| {
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(move |spec| {
                 let credential = &spec.run_token;
                 *seen_at_boundary.lock().unwrap() = Some((
                     credential.expose_bearer().to_owned(),
@@ -1474,8 +1568,8 @@ mod tests {
                 ));
                 Ok(())
             }),
-            isolation_floor: Box::new(|_s| Ok(())),
-        };
+            Box::new(|_s| Ok(())),
+        );
 
         let mut spec = ci_spec();
         let expected = RunTokenAuthorizationContext::CiJob(CiJobAuthorizationContext {
@@ -1508,12 +1602,13 @@ mod tests {
     fn the_cost_gate_hook_can_refuse_to_start_on_exhaustion() {
         // Guarantee #1: reserve refuses on exhaustion → launch fails fail-closed (never starts).
         let backend = NoopBackend;
-        let hooks = RunnerHooks {
-            reserve: Box::new(|_m| Err(HookError("wallet exhausted".into()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Ok(())),
-        };
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|_m| Err(HookError("wallet exhausted".into()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
         let r = backend.launch(&ci_spec(), &hooks);
         assert_eq!(r.unwrap_err(), HookError("wallet exhausted".into()));
     }
@@ -1523,12 +1618,13 @@ mod tests {
         // Guarantee #4: if the hardening profile cannot be applied/verified, launch fails closed
         // BEFORE any untrusted code runs (the seam CI-P5's escape drill drives).
         let backend = NoopBackend;
-        let hooks = RunnerHooks {
-            reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            settle: Box::new(|_h, _u| Ok(())),
-            attribute: Box::new(|_t| Ok(())),
-            isolation_floor: Box::new(|_s| Err(HookError("hardening profile not met".into()))),
-        };
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            Box::new(|_h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Err(HookError("hardening profile not met".into()))),
+        );
         let r = backend.launch(&ci_spec(), &hooks);
         assert!(r.is_err());
     }

@@ -13,9 +13,9 @@ use myelin_ci_controlplane::{
     DurableCiRunFinalizer, GrantedCiJobV1, PricedCiJobUsage, TIER_P_OPERATIONAL_PRICING_REVISION,
 };
 use myelin_ci_sandbox::{
-    CompletionClaim, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
-    ResourceLimits, ResourceUsage, RunTokenCredential, TerminalReport, TerminalReporter, TrustTier,
-    WorkspaceSpec,
+    CompletionClaim, CompletionSettlementOwner, EgressPolicy, IdemToken, ImageRef, JobKind,
+    JobSpec, MeterTarget, ResourceLimits, ResourceUsage, RunTokenCredential, TerminalReport,
+    TerminalReporter, TrustTier, WorkspaceSpec,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::{IdMinter, MonotonicMinter};
@@ -491,6 +491,11 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         "the run cannot become terminal before its immutable accounting receipt exists"
     );
 
+    assert_eq!(
+        reporter(false).completion_settlement_owner(),
+        CompletionSettlementOwner::TerminalReporter,
+        "the durable accounting transaction is the sole successful-completion settlement owner"
+    );
     assert!(reporter(false).report_done(&claim, &report).is_err());
     assert_eq!(
         counts(&pool, job, wf_run).await,

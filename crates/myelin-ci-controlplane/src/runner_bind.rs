@@ -468,6 +468,12 @@ impl CiRunnerLoop {
                         return;
                     }
                 }
+                Err(e @ RunnerError::SettlementOwnerMismatch { .. }) => {
+                    // Static composition failure: retrying cannot make an unowned/double settlement
+                    // safe. Stop this runner lane fail-closed before it claims any work.
+                    eprintln!("ci-runner[{worker_id}]: CONFIGURATION REFUSED: {e}");
+                    return;
+                }
             }
         }
     }
