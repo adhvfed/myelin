@@ -89,17 +89,16 @@ impl SandboxBackend for RunnerSeam {
     fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
         hooks.enforce_isolation_floor(spec)?;
         self.order.lock().unwrap().push("isolation_floor");
-        let target = if self.reserve_exhausted {
-            MeterTarget {
+        let mut reserve_spec = spec.clone();
+        if self.reserve_exhausted {
+            reserve_spec.meter_to = MeterTarget {
                 reserve_id: "__exhausted__".into(),
-            }
-        } else {
-            spec.meter_to.clone()
-        };
-        let res = hooks.reserve(&target)?;
+            };
+        }
+        let res = hooks.reserve(&reserve_spec)?;
         self.order.lock().unwrap().push("reserve");
         if let Err(error) = hooks.attribute(spec) {
-            hooks.release_unused(&res)?;
+            hooks.release_unused(&reserve_spec, &res)?;
             return Err(error);
         }
         self.order.lock().unwrap().push("attribute");
@@ -108,7 +107,7 @@ impl SandboxBackend for RunnerSeam {
             cpu_seconds: 2,
             mem_byte_seconds: 4,
         });
-        hooks.settle_completed(&res, result.usage)?;
+        hooks.settle_completed(&reserve_spec, &res, result.usage)?;
         self.order.lock().unwrap().push("settle");
         Ok(SandboxLaunch {
             handle: SandboxHandle {
@@ -126,14 +125,14 @@ impl SandboxBackend for RunnerSeam {
 fn working_hooks() -> RunnerHooks {
     RunnerHooks::new(
         myelin_ci_sandbox::CompletionSettlementOwner::Hook,
-        Box::new(|m| {
-            if m.reserve_id == "__exhausted__" {
+        Box::new(|spec| {
+            if spec.meter_to.reserve_id == "__exhausted__" {
                 Err(HookError("wallet exhausted — refuse to start".into()))
             } else {
-                Ok(ReserveHandle(m.reserve_id.clone()))
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
             }
         }),
-        Box::new(|_h, _u| Ok(())),
+        Box::new(|_spec, _h, _u| Ok(())),
         Box::new(|_t| Ok(())),
         Box::new(|_s| Ok(())),
     )

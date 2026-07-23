@@ -163,10 +163,17 @@ impl DurableCostLedger {
     /// Build the durable ledger over the MR-022 provider. **Must be called inside a tokio runtime**
     /// (captures `Handle::current()` for the sync→async bridge).
     pub fn new(provider: SubstrateProvider) -> DurableCostLedger {
-        DurableCostLedger {
-            provider,
-            rt: tokio::runtime::Handle::current(),
-        }
+        Self::with_runtime(provider, tokio::runtime::Handle::current())
+    }
+
+    /// Build the durable ledger with the composition root's explicit runtime handle. Production
+    /// runner hooks use this form because their synchronous callbacks execute on a dedicated OS
+    /// thread outside the Tokio runtime.
+    pub fn with_runtime(
+        provider: SubstrateProvider,
+        rt: tokio::runtime::Handle,
+    ) -> DurableCostLedger {
+        DurableCostLedger { provider, rt }
     }
 
     fn region(&self) -> String {
@@ -253,41 +260,23 @@ impl DurableCostLedger {
         let tenant_s = tenant.0.clone();
         let run_s = run.0.clone();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |conn| {
-            Box::pin(async move {
-                let state: Option<String> = sqlx::query_scalar(
-                    "SELECT state FROM cost_reservation \
-                     WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
-                )
-                .bind(&tenant_s)
-                .bind(&region)
-                .bind(&run_s)
-                .fetch_optional(&mut *conn)
-                .await
-                .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                let Some(state) = state else {
-                    return Ok(Err(SettleError::NoSuchReservation));
-                };
-                match parse_state(&state)? {
-                    ReservationState::Reserved | ReservationState::InFlight => {
-                        sqlx::query(
-                            "UPDATE cost_reservation SET state = $4 \
-                             WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
-                        )
-                        .bind(&tenant_s)
-                        .bind(&region)
-                        .bind(&run_s)
-                        .bind(state_token(ReservationState::InFlight))
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                        Ok(Ok(()))
-                    }
-                    ReservationState::Settled | ReservationState::Cancelled => {
-                        Ok(Err(SettleError::NoSuchReservation))
-                    }
-                }
-            })
+            Box::pin(async move { begin_on_conn(conn, &tenant_s, &region, &run_s).await })
         }))
+    }
+
+    /// Mark a reserved run in-flight inside a caller-owned tenant-scoped transaction. This is the
+    /// launch-side counterpart to [`Self::settle_in_tx`]: a caller can verify its immutable launch
+    /// authority and advance the exact reservation under the same row-locking transaction.
+    pub async fn begin_in_tx(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant: &TenantId,
+        run: &RunId,
+    ) -> Result<(), DurableSettleError> {
+        begin_on_conn(conn, &tenant.0, &self.region(), &run.0)
+            .await
+            .map_err(|_| DurableSettleError::Store)?
+            .map_err(DurableSettleError::Ledger)
     }
 
     /// **Settle-on-completion** (invariants 2/3/4). Exact-idempotent: a settle on an already-`Settled`
@@ -476,6 +465,46 @@ impl DurableCostLedger {
                 rows_to_events(&tenant_s, &run_s, &rows)
             })
         }))
+    }
+}
+
+async fn begin_on_conn(
+    conn: &mut sqlx::PgConnection,
+    tenant_s: &str,
+    region: &str,
+    run_s: &str,
+) -> Result<Result<(), SettleError>, PgError> {
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM cost_reservation \
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3 FOR UPDATE",
+    )
+    .bind(tenant_s)
+    .bind(region)
+    .bind(run_s)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|error| PgError::Query(error.to_string()))?;
+    let Some(state) = state else {
+        return Ok(Err(SettleError::NoSuchReservation));
+    };
+    match parse_state(&state)? {
+        ReservationState::Reserved | ReservationState::InFlight => {
+            sqlx::query(
+                "UPDATE cost_reservation SET state = $4 \
+                 WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+            )
+            .bind(tenant_s)
+            .bind(region)
+            .bind(run_s)
+            .bind(state_token(ReservationState::InFlight))
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+            Ok(Ok(()))
+        }
+        ReservationState::Settled | ReservationState::Cancelled => {
+            Ok(Err(SettleError::NoSuchReservation))
+        }
     }
 }
 

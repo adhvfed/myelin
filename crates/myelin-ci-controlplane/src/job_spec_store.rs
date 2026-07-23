@@ -436,20 +436,45 @@ impl CiJobSpecStore {
         let row = with_tenant_tx(&self.pool, tenant_id, region, move |conn| {
             Box::pin(async move {
                 sqlx::query(SELECT_JOB_SPEC_QUERY)
-                    .bind(&tenant_id_owned) // $1 tenant_id (the RLS/tenant predicate)
-                    .bind(job_uuid) // $2 job_id
+                    .bind(&tenant_id_owned)
+                    .bind(job_uuid)
                     .fetch_optional(&mut *conn)
                     .await
-                    .map_err(|e| PgError::Query(e.to_string()))
+                    .map_err(|error| PgError::Query(error.to_string()))
             })
         })
         .await
         .map_err(CiJobSpecStoreError::from_pg)?;
-
         let row = row.ok_or_else(|| CiJobSpecStoreError::SpecNotFound {
             tenant_id: tenant_id.to_string(),
             job_id: job_id.to_string(),
         })?;
+        let spec_json: serde_json::Value = row
+            .try_get("spec")
+            .map_err(|error| CiJobSpecStoreError::Db(error.to_string()))?;
+        decode_launch_template(job_id, spec_json)
+    }
+
+    /// Resolve the complete immutable launch template inside a caller-owned tenant transaction.
+    /// Final pre-spawn authorization uses this form so executable-spec verification and the exact
+    /// scheduler-generation lock are read under one scoped transaction.
+    pub(crate) async fn get_launch_template_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: &str,
+        job_id: &str,
+    ) -> Result<DurableCiJobLaunchTemplate, CiJobSpecStoreError> {
+        let job_uuid = parse_id_local("job_id", job_id)?;
+        let row = sqlx::query(SELECT_JOB_SPEC_QUERY)
+            .bind(tenant_id)
+            .bind(job_uuid)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|error| CiJobSpecStoreError::Db(error.to_string()))?
+            .ok_or_else(|| CiJobSpecStoreError::SpecNotFound {
+                tenant_id: tenant_id.to_string(),
+                job_id: job_id.to_string(),
+            })?;
         let spec_json: serde_json::Value = row
             .try_get("spec")
             .map_err(|e| CiJobSpecStoreError::Db(e.to_string()))?;

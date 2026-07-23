@@ -856,10 +856,10 @@ mod tests {
         ) -> Result<SandboxLaunch, Self::Error> {
             hooks.enforce_isolation_floor(spec)?;
             self.order.lock().unwrap().push("isolation_floor");
-            let res = hooks.reserve(&spec.meter_to)?;
+            let res = hooks.reserve(spec)?;
             self.order.lock().unwrap().push("reserve");
             if let Err(error) = hooks.attribute(spec) {
-                hooks.release_unused(&res)?;
+                hooks.release_unused(spec, &res)?;
                 return Err(error);
             }
             self.order.lock().unwrap().push("attribute");
@@ -868,7 +868,7 @@ mod tests {
                 cpu_seconds: 1,
                 mem_byte_seconds: 1,
             });
-            hooks.settle_completed(&res, result.usage)?;
+            hooks.settle_completed(spec, &res, result.usage)?;
             self.order.lock().unwrap().push("settle");
             Ok(SandboxLaunch {
                 handle: SandboxHandle {
@@ -886,8 +886,8 @@ mod tests {
     fn working_hooks() -> RunnerHooks {
         RunnerHooks::new(
             myelin_ci_sandbox::CompletionSettlementOwner::Hook,
-            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         )
@@ -946,8 +946,8 @@ mod tests {
         };
         let hooks = RunnerHooks::new(
             myelin_ci_sandbox::CompletionSettlementOwner::Hook,
-            Box::new(|_m| Err(HookError("wallet exhausted — refuse to start".into()))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|_spec| Err(HookError("wallet exhausted — refuse to start".into()))),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         );
@@ -972,8 +972,8 @@ mod tests {
         };
         let hooks = RunnerHooks::new(
             myelin_ci_sandbox::CompletionSettlementOwner::Hook,
-            Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Err(HookError("hardening profile not met".into()))),
         );
@@ -995,8 +995,8 @@ mod tests {
         };
         let hooks = RunnerHooks::new(
             myelin_ci_sandbox::CompletionSettlementOwner::Hook,
-            Box::new(|_m| Err(HookError("exhausted".into()))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|_spec| Err(HookError("exhausted".into()))),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         );

@@ -74,8 +74,8 @@ fn ci_spec(idem: &str) -> JobSpec {
 fn hooks() -> RunnerHooks {
     RunnerHooks::new(
         myelin_ci_sandbox::CompletionSettlementOwner::Hook,
-        Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-        Box::new(|_h, _u| Ok(())),
+        Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+        Box::new(|_spec, _h, _u| Ok(())),
         Box::new(|_t| Ok(())),
         Box::new(|_s| Ok(())),
     )
@@ -88,16 +88,16 @@ impl SandboxBackend for NoopBackend {
     type Error = myelin_ci_sandbox::HookError;
     fn launch(&self, spec: &JobSpec, h: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
         h.enforce_isolation_floor(spec)?;
-        let r = h.reserve(&spec.meter_to)?;
+        let r = h.reserve(spec)?;
         if let Err(error) = h.attribute(spec) {
-            h.release_unused(&r)?;
+            h.release_unused(spec, &r)?;
             return Err(error);
         }
         let result = SandboxResult::stub_ok(ResourceUsage {
             cpu_seconds: 1,
             mem_byte_seconds: 1,
         });
-        h.settle_completed(&r, result.usage)?;
+        h.settle_completed(spec, &r, result.usage)?;
         Ok(SandboxLaunch {
             handle: SandboxHandle {
                 guest_id: "g".into(),

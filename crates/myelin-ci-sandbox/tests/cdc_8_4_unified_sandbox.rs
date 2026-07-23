@@ -76,17 +76,17 @@ impl SandboxBackend for RunnerSeam {
         hooks.enforce_isolation_floor(spec)?;
         self.order.lock().unwrap().push("isolation_floor");
         // #1a cost gate — reserve at dispatch; refuse-to-start on exhaustion (never starts).
-        let reserve = if self.exhausted {
-            hooks.reserve(&MeterTarget {
+        let mut reserve_spec = spec.clone();
+        if self.exhausted {
+            reserve_spec.meter_to = MeterTarget {
                 reserve_id: "__exhausted__".into(),
-            })
-        } else {
-            hooks.reserve(&spec.meter_to)
-        }?;
+            };
+        }
+        let reserve = hooks.reserve(&reserve_spec)?;
         self.order.lock().unwrap().push("reserve");
         // #2 final attribution — immediately before untrusted code would spawn.
         if let Err(error) = hooks.attribute(spec) {
-            hooks.release_unused(&reserve)?;
+            hooks.release_unused(&reserve_spec, &reserve)?;
             return Err(error);
         }
         self.order.lock().unwrap().push("attribute");
@@ -97,7 +97,7 @@ impl SandboxBackend for RunnerSeam {
             mem_byte_seconds: 4,
         });
         // #1b settle — release the unused reserve on completion (never interrupt in-flight).
-        hooks.settle_completed(&reserve, result.usage)?;
+        hooks.settle_completed(&reserve_spec, &reserve, result.usage)?;
         self.order.lock().unwrap().push("settle");
         Ok(SandboxLaunch {
             handle: SandboxHandle {
@@ -157,8 +157,8 @@ fn consumer_builds_agent_exec_spec() -> JobSpec {
 fn working_hooks() -> RunnerHooks {
     RunnerHooks::new(
         myelin_ci_sandbox::CompletionSettlementOwner::Hook,
-        Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-        Box::new(|_h, _u| Ok(())),
+        Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+        Box::new(|_spec, _h, _u| Ok(())),
         Box::new(|_t| Ok(())),
         Box::new(|_s| Ok(())),
     )
@@ -218,15 +218,15 @@ fn provider_refuses_to_start_when_the_cost_gate_is_exhausted() {
     };
     let hooks = RunnerHooks::new(
         myelin_ci_sandbox::CompletionSettlementOwner::Hook,
-        Box::new(move |m| {
-            if m.reserve_id == "__exhausted__" {
+        Box::new(move |spec| {
+            if spec.meter_to.reserve_id == "__exhausted__" {
                 Err(HookError("wallet exhausted — refuse to start".into()))
             } else {
                 fired2.store(1, Ordering::SeqCst);
-                Ok(ReserveHandle(m.reserve_id.clone()))
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
             }
         }),
-        Box::new(|_h, _u| Ok(())),
+        Box::new(|_spec, _h, _u| Ok(())),
         Box::new(|_t| Ok(())),
         Box::new(|_s| Ok(())),
     );

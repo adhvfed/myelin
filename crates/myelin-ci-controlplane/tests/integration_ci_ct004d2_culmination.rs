@@ -248,8 +248,8 @@ impl CapturingFirehose {
 fn ok_hooks() -> RunnerHooks {
     RunnerHooks::new(
         myelin_ci_sandbox::CompletionSettlementOwner::Hook,
-        Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
-        Box::new(|_h, _u| Ok(())),
+        Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+        Box::new(|_spec, _h, _u| Ok(())),
         Box::new(|_t| Ok(())),
         Box::new(|_s| Ok(())),
     )

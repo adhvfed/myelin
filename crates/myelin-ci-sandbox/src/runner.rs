@@ -973,8 +973,13 @@ mod tests {
     fn test_hooks() -> RunnerHooks {
         RunnerHooks::new(
             CompletionSettlementOwner::Hook,
-            Box::new(|m| Ok(ReserveHandle(format!("reserved:{}", m.reserve_id)))),
-            Box::new(|_h, _u| Ok(())),
+            Box::new(|spec| {
+                Ok(ReserveHandle(format!(
+                    "reserved:{}",
+                    spec.meter_to.reserve_id
+                )))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         )
@@ -1023,12 +1028,12 @@ mod tests {
             }
             // Drive the four-guarantee seam exactly as a real backend must (X-6).
             hooks.enforce_isolation_floor(spec)?;
-            let res = hooks.reserve(&spec.meter_to)?;
+            let res = hooks.reserve(spec)?;
             if let Err(error) = hooks.attribute(spec) {
-                hooks.release_unused(&res)?;
+                hooks.release_unused(spec, &res)?;
                 return Err(error);
             }
-            hooks.settle_completed(&res, self.result.usage)?;
+            hooks.settle_completed(spec, &res, self.result.usage)?;
             self.launches.fetch_add(1, Ordering::SeqCst);
             Ok(SandboxLaunch {
                 handle: SandboxHandle {
@@ -1088,8 +1093,13 @@ mod tests {
     ) -> RunnerHooks {
         RunnerHooks::new(
             owner,
-            Box::new(|m| Ok(ReserveHandle(format!("reserved:{}", m.reserve_id)))),
-            Box::new(move |_handle, usage| {
+            Box::new(|spec| {
+                Ok(ReserveHandle(format!(
+                    "reserved:{}",
+                    spec.meter_to.reserve_id
+                )))
+            }),
+            Box::new(move |_spec, _handle, usage| {
                 hook_settlements.lock().unwrap().push(usage);
                 Ok(())
             }),
