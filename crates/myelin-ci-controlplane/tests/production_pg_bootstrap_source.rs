@@ -7,6 +7,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let launch_authority_source = include_str!("../src/ci_launch_authority.rs");
     let claim_issuer_source = include_str!("../src/ci_claim_token_issuer.rs");
     let identity_adapter_source = include_str!("../src/ci_identity_adapter.rs");
+    let runtime_composition_source = include_str!("../src/ci_runtime_composition.rs");
     let runner_identity_source = include_str!("../src/ci_runner_composition.rs");
     let job_queue_store_source = include_str!("../src/job_queue_store.rs");
     let region_store_source = include_str!("../src/job_queue_region.rs");
@@ -48,6 +49,15 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let starter_lane = source
         .find("ci_run_starter_factory(")
         .expect("the per-tenant ci_run starter lane must be composed at the root");
+    let runtime_factory = source
+        .find("ci_production_runtime_factory(")
+        .expect("the exact-tenant workflow/reporter factory must be composed at the root");
+    let starter_poller = source
+        .find("PgCiRunStarterPoller::new(")
+        .expect("the region discovery to exact-tenant starter poller must be composed at the root");
+    let reporter_router = source
+        .find("runner_runtime.reporter_router()")
+        .expect("the accounted exact-tenant reporter router must be composed at the root");
     let runner_identity = source
         .find("ci_runner_identity_authorities(")
         .expect("the real CI Identity authorities must be composed at the root");
@@ -110,6 +120,23 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         );
     }
     assert!(runner_identity_source.contains("provider.config().region.clone()"));
+    for production_runtime_dependency in [
+        "include_bytes!(\"ci_manifest_pipeline.rs\")",
+        "include_bytes!(\"ci_manifest_job_runner.rs\")",
+        "TenantScope::from_verified_token",
+        "PgWorkerScope::new",
+        "CiManifestInputResolver::new",
+        "register_durable_ci_manifest_pipeline",
+        "DurableCiRunFinalizer::new",
+        "DurableCiJobAccounting::new",
+        "TierPOperationalCiJobPricer",
+        "CiPipelineReporter::new_accounted",
+    ] {
+        assert!(
+            runtime_composition_source.contains(production_runtime_dependency),
+            "production exact-tenant runtime must retain {production_runtime_dependency}"
+        );
+    }
     assert!(claim_issuer_source.contains("request.region != self.region"));
     assert!(identity_adapter_source.contains("context.region != self.region.0"));
     assert!(job_queue_store_source.contains(
@@ -186,7 +213,10 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(shape_check < first_store);
     assert!(first_store < reaper);
     assert!(reaper < starter_lane);
-    assert!(starter_lane < runner_identity);
+    assert!(starter_lane < runtime_factory);
+    assert!(runtime_factory < starter_poller);
+    assert!(starter_poller < reporter_router);
+    assert!(reporter_router < runner_identity);
     assert!(runner_identity < runner_hooks);
     assert!(runner_hooks < runner_cancellations);
     assert!(runner_cancellations < service);
@@ -234,7 +264,7 @@ fn runner_activation_is_refused_before_any_database_attempt() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
-    assert!(stderr.contains("exact-tenant workflow worker/reporter"));
+    assert!(stderr.contains("exact-tenant workflow-worker fan-out"));
     assert!(stderr.contains("complete launch/recovery proof"));
     assert!(stderr.contains("production runner activation is refused"));
     assert!(!stderr.contains("database bootstrap refused to start"));

@@ -4,24 +4,23 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use myelin_ci_controlplane::{
-    ci_controlplane_hot_tables, ci_controlplane_migrations, ci_job_queue_store, ci_job_spec_store,
-    ci_run_store_factory, CiDriveManifestStore, CiDriveManifestV1, CiJobAccountingPricer,
-    CiJobAccountingStore, CiJobPricingError, CiManifestLaneV1, CiManifestLimitsV1,
-    CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiPipelineReporter,
-    CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert,
-    CiRunStoreError, CiRunTerminalState, DurableCiJobAccounting, DurableCiJobLaunchTemplate,
+    ci_artifact_ref, ci_controlplane_hot_tables, ci_controlplane_migrations, ci_job_queue_store,
+    ci_job_spec_store, ci_manifest_pipeline_definition, ci_production_runtime_factory_test_support,
+    ci_run_ref, ci_run_store_factory, CiDriveManifestStore, CiDriveManifestV1,
+    CiJobAccountingPricer, CiJobAccountingStore, CiJobPricingError, CiManifestLaneV1,
+    CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1,
+    CiPipelineReporter, CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite,
+    CiRunFinalizer, CiRunInsert, CiRunStoreError, CiRunTerminalState, DurableCiJobAccounting,
     DurableCiRunFinalizer, GrantedCiJobV1, PricedCiJobUsage, TIER_P_OPERATIONAL_PRICING_REVISION,
 };
 use myelin_ci_sandbox::{
-    CompletionClaim, CompletionSettlementOwner, EgressPolicy, IdemToken, ImageRef, JobKind,
-    JobSpec, MeterTarget, ResourceLimits, ResourceUsage, RunTokenCredential, TerminalReport,
-    TerminalReporter, TrustTier, WorkspaceSpec,
+    CompletionClaim, CompletionSettlementOwner, ResourceUsage, TerminalReport, TerminalReporter,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::{IdMinter, MonotonicMinter};
 use myelin_flow::{
-    migrations::migrations as flow_migrations, DurableExecutor, MinorUnits, PgFlowExecutor, RunId,
-    SignalOutcome, StartSpec, CI_PIPELINE_WF_TYPE,
+    migrations::migrations as flow_migrations, partition_for_run_id, DurableExecutor, MinorUnits,
+    PgFlowExecutor, PgRunOnceOutcome, RunId, SignalOutcome, StartSpec, CI_PIPELINE_WF_TYPE,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::{
@@ -87,6 +86,7 @@ fn manifest(
     ci_run: &str,
     job: &str,
     skipped_job: &str,
+    workflow_code_hash: &str,
 ) -> CiDriveManifestV1 {
     let digest = |byte: char| format!("blake3:{}", byte.to_string().repeat(64));
     CiDriveManifestV1 {
@@ -100,7 +100,7 @@ fn manifest(
         launch_request_digest: digest('b'),
         workflow_type: CI_PIPELINE_WF_TYPE.into(),
         workflow_definition_version: 1,
-        workflow_code_hash: digest('c'),
+        workflow_code_hash: workflow_code_hash.into(),
         authority_policy_revision: "ci-policy:2026-07-21".into(),
         repo_ref: format!("myelin://{tenant}/git/repo/core"),
         commit_oid: "deadbeef".into(),
@@ -184,32 +184,6 @@ fn manifest(
     }
 }
 
-fn sandbox_spec(idem: &str) -> JobSpec {
-    JobSpec::new(
-        JobKind::Ci,
-        ImageRef::pinned(format!("registry.example/build@sha256:{}", "d".repeat(64))).unwrap(),
-        vec!["/bin/true".into()],
-        Vec::new(),
-        Vec::new(),
-        EgressPolicy::deny_all(),
-        ResourceLimits {
-            cpu_millis: 1_000,
-            mem_bytes: 1_073_741_824,
-            disk_bytes: 1_073_741_824,
-            pids_max: 64,
-            timeout_secs: 60,
-        },
-        WorkspaceSpec::default(),
-        TrustTier::Trusted,
-        RunTokenCredential::new("test-bearer", "test-jti", 300).unwrap(),
-        MeterTarget {
-            reserve_id: OPERATIONAL_RESERVE_HANDLE.into(),
-        },
-        IdemToken(idem.into()),
-    )
-    .unwrap()
-}
-
 async fn counts(pool: &PgPool, job: &str, wf_run: &str) -> (i64, i64, i64, String) {
     let accounting: i64 =
         sqlx::query_scalar("SELECT count(*) FROM ci_job_accounting WHERE job_id = $1::uuid")
@@ -234,6 +208,17 @@ async fn counts(pool: &PgPool, job: &str, wf_run: &str) -> (i64, i64, i64, Strin
         .await
         .unwrap();
     (accounting, projection, signals, state)
+}
+
+async fn drive_clock(pool: &PgPool) -> (i64, String) {
+    sqlx::query_as(
+        "SELECT extract(epoch FROM instant)::bigint,
+                to_char(instant AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+         FROM (SELECT clock_timestamp() AS instant) clock",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -281,7 +266,6 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     let job = "33333333-3333-8333-8333-333333333333";
     let skipped_job = "77777777-7777-8777-8777-777777777777";
     let nonce = "44444444-4444-8444-8444-444444444444";
-    let idem = "terminal-accounting-live";
     let owner = "runner-live";
 
     let ci_runs = ci_run_store_factory(pool.clone());
@@ -315,7 +299,8 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         .unwrap();
     let manifest_store =
         CiDriveManifestStore::new(pool.clone(), tenant.clone(), region.clone()).unwrap();
-    manifest_store
+    let production_definition = ci_manifest_pipeline_definition();
+    let manifest_digest = manifest_store
         .insert(&manifest(
             &tenant.0,
             &region.0,
@@ -323,47 +308,11 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
             ci_run,
             job,
             skipped_job,
+            production_definition.code_hash(),
         ))
         .await
         .unwrap();
 
-    let (spec_template, _credential) = sandbox_spec(idem).into_template();
-    let spec = serde_json::to_value(DurableCiJobLaunchTemplate {
-        spec: spec_template,
-        ci_run_id: ci_run.into(),
-        token_authority_handle: "token-authority:live".into(),
-    })
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO job_queue
-         (tenant_id, region, job_id, run_id, lane, labels, trust_tier, fair_key, idem_token,
-          lease_owner, lease_expires, state, lease_epoch, claim_nonce, stage)
-         VALUES ($1, $2, $3::uuid, $4::uuid, 'interactive', ARRAY['linux'], 'trusted', $1, $5,
-                 $6, now() + interval '1 hour', 'leased', 1, $7::uuid, 'build')",
-    )
-    .bind(&tenant.0)
-    .bind(&region.0)
-    .bind(job)
-    .bind(wf_run)
-    .bind(idem)
-    .bind(owner)
-    .bind(nonce)
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO ci_job_spec (tenant_id, region, job_id, run_id, idem_token, spec, stage)
-         VALUES ($1, $2, $3::uuid, $4::uuid, $5, $6, 'build')",
-    )
-    .bind(&tenant.0)
-    .bind(&region.0)
-    .bind(job)
-    .bind(wf_run)
-    .bind(idem)
-    .bind(spec)
-    .execute(&pool)
-    .await
-    .unwrap();
     sqlx::query(
         "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
          VALUES ($1, $2, $3, 100, 'inflight'),
@@ -375,31 +324,6 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     .execute(&pool)
     .await
     .unwrap();
-
-    let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-    let pg_executor = PgFlowExecutor::new(
-        pool.clone(),
-        tokio::runtime::Handle::current(),
-        minter,
-        tenant.clone(),
-        region.clone(),
-    );
-    tokio::task::block_in_place(|| {
-        pg_executor
-            .register_definition(CI_PIPELINE_WF_TYPE, 1, "blake3:accounting-live")
-            .unwrap();
-        pg_executor
-            .start_with_id(
-                StartSpec {
-                    wf_type: CI_PIPELINE_WF_TYPE.into(),
-                    input: Vec::new(),
-                    budget: None,
-                    idem_key: "accounting-live".into(),
-                },
-                Some(RunId(wf_run.into())),
-            )
-            .unwrap();
-    });
 
     let principal = Principal::new(
         tenant.clone(),
@@ -415,6 +339,97 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     config.region = region.0.clone();
     let provider = SubstrateProvider::connect(config, 1).await.unwrap();
     let ledger = DurableCostLedger::new(provider);
+    let production_runtime = ci_production_runtime_factory_test_support(
+        pool.clone(),
+        region.clone(),
+        ledger.clone(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let production_worker = production_runtime
+        .worker_for(
+            tenant.clone(),
+            partition_for_run_id(wf_run),
+            "ci-flow-accounting-proof",
+        )
+        .unwrap();
+    let production_reporter = production_runtime.reporter_router().unwrap();
+    let registered_code_hash: String = sqlx::query_scalar(
+        "SELECT code_hash FROM wf_definition WHERE wf_type = $1 AND version = $2",
+    )
+    .bind(CI_PIPELINE_WF_TYPE)
+    .bind(production_runtime.definition().version())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        registered_code_hash,
+        production_runtime.definition().code_hash()
+    );
+    assert_eq!(
+        production_reporter.completion_settlement_owner(),
+        CompletionSettlementOwner::TerminalReporter
+    );
+
+    let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+    let pg_executor = PgFlowExecutor::new(
+        pool.clone(),
+        tokio::runtime::Handle::current(),
+        minter,
+        tenant.clone(),
+        region.clone(),
+    );
+    tokio::task::block_in_place(|| {
+        pg_executor
+            .start_with_id(
+                StartSpec {
+                    wf_type: CI_PIPELINE_WF_TYPE.into(),
+                    input: vec![
+                        ci_artifact_ref(&tenant.0, &format!("drive-manifest-{manifest_digest}")),
+                        ci_run_ref(&tenant.0, ci_run),
+                    ],
+                    budget: None,
+                    idem_key: "accounting-live".into(),
+                },
+                Some(RunId(wf_run.into())),
+            )
+            .unwrap();
+    });
+    let (first_secs, first_stamp) = drive_clock(&pool).await;
+    assert!(matches!(
+        production_worker
+            .run_once(first_secs, &first_stamp)
+            .await
+            .unwrap(),
+        PgRunOnceOutcome::Driven { .. }
+    ));
+    let (idem, queued_state): (String, String) = sqlx::query_as(
+        "SELECT idem_token, state FROM job_queue
+         WHERE tenant_id = $1 AND job_id = $2::uuid",
+    )
+    .bind(&tenant.0)
+    .bind(job)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queued_state, "queued");
+    sqlx::query(
+        "UPDATE job_queue
+            SET lease_owner = $3,
+                lease_expires = now() + interval '1 hour',
+                state = 'leased',
+                lease_epoch = 1,
+                claim_nonce = $4::uuid
+          WHERE tenant_id = $1 AND job_id = $2::uuid",
+    )
+    .bind(&tenant.0)
+    .bind(job)
+    .bind(owner)
+    .bind(nonce)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let reporter = |valid| {
         CiPipelineReporter::new_accounted(
             pg_executor.clone(),
@@ -435,7 +450,7 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         tenant: tenant.clone(),
         run: RunId(wf_run.into()),
         job_id: job.into(),
-        idem_token: idem.into(),
+        idem_token: idem.clone(),
         lease_owner: owner.into(),
         lease_epoch: 1,
         claim_nonce: nonce.into(),
@@ -511,7 +526,7 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     assert_eq!(reservation_state, "inflight");
 
     assert_eq!(
-        reporter(true).report_done(&claim, &report).unwrap(),
+        production_reporter.report_done(&claim, &report).unwrap(),
         SignalOutcome::Buffered
     );
     assert_eq!(
@@ -573,15 +588,19 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     .unwrap();
     assert_eq!(skipped_after_rollback, (0, "reserved".into()));
 
-    let finalized = durable_finalizer.finalize(&finalization).unwrap();
-    assert_eq!(finalized.write, CiRunFinalizationWrite::Finalized);
-    assert_eq!(finalized.completed_at, "2026-07-21T13:00:00.000000Z");
+    let (second_secs, second_stamp) = drive_clock(&pool).await;
+    assert!(matches!(
+        production_worker
+            .run_once(second_secs, &second_stamp)
+            .await
+            .unwrap(),
+        PgRunOnceOutcome::Driven { .. }
+    ));
     let run_terminal: (String, bool, bool) = sqlx::query_as(
-        "SELECT state, cost_settled, finished_at = $2::timestamptz
+        "SELECT state, cost_settled, finished_at IS NOT NULL
          FROM ci_run WHERE run_id = $1::uuid",
     )
     .bind(ci_run)
-    .bind(&finalization.completed_at)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -609,7 +628,6 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
 
     let replay = durable_finalizer.finalize(&finalization).unwrap();
     assert_eq!(replay.write, CiRunFinalizationWrite::ExactReplay);
-    assert_eq!(replay.completed_at, finalized.completed_at);
     let mut divergent_finalization = finalization.clone();
     divergent_finalization.completed_at = "2026-07-21T13:00:01Z".into();
     let acknowledgement_loss_replay = durable_finalizer.finalize(&divergent_finalization).unwrap();
@@ -619,7 +637,7 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     );
     assert_eq!(
         acknowledgement_loss_replay.completed_at,
-        finalized.completed_at
+        replay.completed_at
     );
 
     assert!(

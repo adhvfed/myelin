@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — operational reservation + scoped runner hooks + claim/launch fences proven; exact-tenant worker/reporter and full crash path remain; production start disabled** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — operational reservation, scoped hooks, claim/launch fences, and exact-tenant worker/reporter/finalizer composition proven; bounded fan-out + full crash path remain; production start disabled** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1063,11 +1063,44 @@ lint, erosion budgets, contract coverage, and the production-source activation g
 adversarial re-review reported CONFIRMED-SOUND after the two HIGH and one MEDIUM findings were
 closed, with no remaining finding. Production activation remains refused.
 
-**Honest remaining activation floors:** compose the exact-tenant region poller, workflow worker,
-accounted reporter router, durable CI-run finalizer, and the now-scoped hooks into one production
-runner. Then inject crashes across mint→CAS and CAS→spawn plus cancellation, retry, recovery, and
-settlement races in the complete composition. No Commercial wallet, billing, or Stripe work is
-admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
+**Production exact-tenant workflow composition (2026-07-23).** One production factory now derives a
+domain-separated, length-framed definition pin from the complete bytes of both the manifest workflow
+body and its job-dispatch implementation. The dormant starter and each worker consume that same pin,
+so a source change cannot conventionally leave the two sides on different workflow definitions.
+Given one authoritative tenant and Flow partition, the factory creates the exact service principal
+and `TenantScope`, immutable-manifest resolver, `PgFlowWorker`, durable CI-run finalizer, and
+manifest-native workflow registration. Its reporter router derives the same exact tenant from the
+claim and constructs the accounted reporter with the durable job accounting store, Tier-P
+operational pricer, manifest, money ledger, cost projection, and completion receipt store. No
+default/global tenant worker exists.
+
+The production main now composes the region run-discovery starter poller and accounted reporter
+router from that factory after constrained bootstrap. It deliberately creates no `CiRunnerLoop`,
+worker fan-out, task, or spawn: `MYELIN_CI_RUNNER=1` still refuses before database access. The live
+PostgreSQL proof uses the same production factory to register the source-derived definition, drives
+its worker through real immutable-manifest dispatch and park, leases the resulting durable queue row,
+reports completion through the production accounted router, and drives the same worker again so its
+captured durable finalizer terminalizes the CI run and zero-settles the skipped reservation. The
+existing injected-pricer refusal still proves that claim, accounting, projection, reservation, and
+signal roll back as one transaction.
+
+Independent adversarial review initially found two MEDIUM fixture-honesty defects: the first pin
+covered the workflow body but not the dispatch implementation, and the live proof only constructed a
+worker without driving its captured finalizer. Both were corrected before re-review, which reported
+CONFIRMED-SOUND with no remaining finding. The complete suite also exposed a retry-poisoning test
+fixture: a prior failed scheduler-boundary invocation left its reserved test tenants queued. Setup now
+cleans only that test-owned namespace before asserting oldest-first discovery; the least-privilege
+probe itself was retained unchanged and caught the contamination correctly. The full control-plane
+all-target/all-feature suite, workspace all-target/all-feature check, warnings-denied clippy,
+architecture lint, erosion budgets, contract coverage, production-source activation guard, and diff
+check are green.
+
+**Honest remaining activation floors:** turn region discovery into bounded exact-tenant
+tenant/partition worker fan-out, then compose that fan-out, the accounted reporter, the now-scoped
+hooks, and the accounted cancellation coordinator into the real `CiRunnerLoop`. Inject crashes
+across mint→CAS and CAS→spawn plus cancellation, retry, recovery, and settlement races through that
+complete root before activation. No Commercial wallet, billing, or Stripe work is admitted before
+the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
 
 ## R5–R6
 

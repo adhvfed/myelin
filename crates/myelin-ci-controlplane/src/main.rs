@@ -32,7 +32,7 @@
 //! endpoint and both PostgreSQL roles are explicit through `Mode::RequireEnv`. The per-table
 //! behaviour (the scheduler claim, the check emitter, the log index, the metering) is the
 //! CI-P12..CI-P24 surface. This shell runs no job: requesting the incomplete production runner
-//! fails before database bootstrap until its exact-tenant workflow worker/reporter and complete
+//! fails before database bootstrap until exact-tenant workflow-worker fan-out and the complete
 //! crash/recovery path are wired around the now-real durable token and reservation authorities.
 
 use myelin_ci_controlplane::run_controlplane_until_shutdown;
@@ -65,7 +65,7 @@ impl fmt::Display for StartupRefusal {
         match self {
             Self::IncompleteProductionRunner => write!(
                 f,
-                "MYELIN_CI_RUNNER=1 requires the exact-tenant workflow worker/reporter and complete \
+                "MYELIN_CI_RUNNER=1 requires exact-tenant workflow-worker fan-out and the complete \
                  launch/recovery proof; production runner activation is refused"
             ),
             Self::InvalidRunnerSetting(value) => write!(
@@ -289,7 +289,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        let _starter_factory = match myelin_ci_controlplane::ci_run_starter_factory(
+        let starter_factory = match myelin_ci_controlplane::ci_run_starter_factory(
             provider.db_pool().clone(),
             myelin_tenancy::Region(provider.config().region.clone()),
             Arc::new(myelin_storage::s3blob::S3BlobStore::connect(
@@ -303,6 +303,28 @@ async fn main() {
                 eprintln!(
                     "ci-controlplane: Tier-P operational reservation composition refused: {error}"
                 );
+                std::process::exit(1);
+            }
+        };
+        let runner_runtime = match myelin_ci_controlplane::ci_production_runtime_factory(
+            provider.clone(),
+            tokio::runtime::Handle::current(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("ci-controlplane: exact-tenant runtime composition refused: {error}");
+                std::process::exit(1);
+            }
+        };
+        let _starter_poller = myelin_ci_controlplane::PgCiRunStarterPoller::new(
+            scheduler_provider.region_run_discovery(),
+            starter_factory,
+            runner_runtime.definition().clone(),
+        );
+        let _runner_reporter = match runner_runtime.reporter_router() {
+            Ok(reporter) => reporter,
+            Err(error) => {
+                eprintln!("ci-controlplane: terminal reporter composition refused: {error}");
                 std::process::exit(1);
             }
         };
