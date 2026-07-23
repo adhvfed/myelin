@@ -73,6 +73,12 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let runner_cancellations = source
         .find("ci_runner_cancellation_coordinator(")
         .expect("accounted cancel-superseded capability must be composed at the root");
+    let runner_resolver = source
+        .find("durable_spec_resolver(")
+        .expect("the claim-bound durable spec resolver must be composed at the root");
+    let runner_loop = source
+        .find("CiRunnerLoop::new(")
+        .expect("the real sandbox runner loop must be composed at the dormant root");
     let runner_gate = source
         .find("verify_startup_activation(runner_setting)")
         .expect("production runner activation must be refused explicitly");
@@ -83,8 +89,12 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         .find("run_controlplane_until_shutdown(Config::default()")
         .expect("signal-driven service lifecycle must remain wired");
 
-    assert!(!source.contains("CiRunnerLoop::new"));
     assert!(!source.contains("spawn_until_shutdown"));
+    assert!(!source.contains("runner.spawn("));
+    assert!(!source.contains("runner.spawn_until_shutdown("));
+    assert!(source.contains(
+        "Some((\n            starter_poller,\n            workflow_poller,\n            runner_cancellations,\n            runner,"
+    ));
     assert!(!source.contains("CiPipelineDriver"));
     assert!(!source.contains("unresolved_stage_spec_builder"));
     assert!(!source.contains("TenantId(\"ci-controlplane\""));
@@ -177,6 +187,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(
         launch_authority_source.contains("ManifestBoundCiJobTokenAuthority::handle_for(request)")
     );
+    assert!(launch_authority_source.contains("labels: LINUX_SMALL_V1_RUNNER_LABELS"));
+    assert!(source.contains("myelin_ci_controlplane::LINUX_SMALL_V1_RUNNER_LABELS"));
     assert!(!launch_authority_source.contains("CiJobTokenAuthorityProvider"));
     assert!(runner_bind_source.contains("token_issuer: LockedManifestCiJobTokenIssuer"));
     assert!(runner_bind_source.contains("pub fn durable_spec_resolver_test_support"));
@@ -205,7 +217,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(source.contains("InvalidRunnerSetting(String)"));
     assert!(source.contains("NonUnicodeRunnerSetting(OsString)"));
     assert!(!source.contains("std::env::var(\"MYELIN_CI_RUNNER\").ok()"));
-    assert!(!source.contains("ci_job_queue_store(provider.db_pool().clone())"));
+    assert!(source.contains("ci_job_queue_store(provider.db_pool().clone())"));
     assert!(source.contains("scheduler_provider.region_queue_store()"));
     assert!(source.contains("reaper.run_until_shutdown(shutdown_rx)"));
     assert!(source.contains("shutdown_signal().await"));
@@ -228,8 +240,10 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(starter_poller < workflow_poller);
     assert!(workflow_poller < reporter_router);
     assert!(reporter_router < runner_identity);
-    assert!(runner_identity < runner_hooks);
+    assert!(runner_identity < runner_resolver);
+    assert!(runner_resolver < runner_hooks);
     assert!(runner_hooks < runner_cancellations);
+    assert!(runner_cancellations < runner_loop);
     assert!(runner_cancellations < service);
     assert!(runner_hooks < service);
     assert!(starter_lane < service);
@@ -275,8 +289,7 @@ fn runner_activation_is_refused_before_any_database_attempt() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
-    assert!(stderr.contains("exact-tenant workflow-worker fan-out"));
-    assert!(stderr.contains("complete launch/recovery proof"));
+    assert!(stderr.contains("complete composed launch/recovery crash proof"));
     assert!(stderr.contains("production runner activation is refused"));
     assert!(!stderr.contains("database bootstrap refused to start"));
     assert!(!stderr.contains("DATABASE_URL"));

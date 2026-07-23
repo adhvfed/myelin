@@ -28,6 +28,8 @@ use myelin_storage::{with_tenant_tx, PgError};
 use sqlx::{PgPool, Row};
 
 pub const LINUX_SMALL_V1_POLICY_REVISION: &str = "linux-small-v1:1";
+/// Exact scheduler labels emitted by the production policy and advertised by its runner pool.
+pub const LINUX_SMALL_V1_RUNNER_LABELS: [&str; 2] = ["linux", "linux-small-v1"];
 /// Production-for-one ceiling on durable Tier-P reservations for one tenant and region.
 ///
 /// Reservations cover every queued DAG job, so this is deliberately distinct from the measured
@@ -584,7 +586,10 @@ fn finish_linux_small_authority(
             limits: limits.clone(),
             scheduling: CiManifestSchedulingV1 {
                 lane: CiManifestLaneV1::Batch,
-                labels: vec!["linux".into(), "linux-small-v1".into()],
+                labels: LINUX_SMALL_V1_RUNNER_LABELS
+                    .iter()
+                    .map(|label| (*label).to_owned())
+                    .collect(),
                 concurrency_group: None,
                 fair_key: format!("project:{}", record.project_id),
             },
@@ -871,7 +876,10 @@ mod tests {
             assert_eq!(grant.scheduling.lane, CiManifestLaneV1::Batch);
             assert_eq!(
                 grant.scheduling.labels,
-                vec!["linux".to_string(), "linux-small-v1".to_string()]
+                LINUX_SMALL_V1_RUNNER_LABELS
+                    .iter()
+                    .map(|label| (*label).to_owned())
+                    .collect::<Vec<_>>()
             );
             assert_eq!(
                 grant.scheduling.fair_key,

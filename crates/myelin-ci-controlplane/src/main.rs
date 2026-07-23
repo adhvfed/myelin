@@ -65,8 +65,8 @@ impl fmt::Display for StartupRefusal {
         match self {
             Self::IncompleteProductionRunner => write!(
                 f,
-                "MYELIN_CI_RUNNER=1 requires exact-tenant workflow-worker fan-out and the complete \
-                 launch/recovery proof; production runner activation is refused"
+                "MYELIN_CI_RUNNER=1 requires the complete composed launch/recovery crash proof; \
+                 production runner activation is refused"
             ),
             Self::InvalidRunnerSetting(value) => write!(
                 f,
@@ -277,11 +277,10 @@ async fn main() {
     // run when the tenant has no prior live reservations; the scheduler separately limits
     // leased/running work. Initial checks and the manifest-native DAG body are implemented and
     // live-PG proven but deliberately unwired.
-    // NAMED FLOORS the activation change must close explicitly: attach the existing region-wide
-    // `PgCiRunStarterPoller` to coordinated shutdown with the deployed workflow-definition pin,
-    // compose exact-tenant `PgFlowWorker`/accounted reporter routing and durable CI-run
-    // finalization, then close the complete launch/recovery crash matrix.
-    if runner_host_requested {
+    // NAMED FLOORS the activation change must close explicitly: attach the already-composed starter,
+    // workflow-recovery, and sandbox runner drivers to coordinated shutdown, then close the complete
+    // launch/recovery crash matrix.
+    let _runner_host = if runner_host_requested {
         // ROLLING-UPGRADE FLOOR (CT-004d.2): refuse activation while any non-terminal NULL-stage
         // dispatch is still live — completion refuses such a job without consuming its claim, so the
         // lane must not start until the backlog is repaired. A CHECKED invariant (a healthy never-activated
@@ -330,12 +329,12 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        let _starter_poller = myelin_ci_controlplane::PgCiRunStarterPoller::new(
+        let starter_poller = myelin_ci_controlplane::PgCiRunStarterPoller::new(
             scheduler_provider.region_run_discovery(),
             starter_factory,
             runner_runtime.definition().clone(),
         );
-        let _workflow_poller = match runner_runtime
+        let workflow_poller = match runner_runtime
             .workflow_poller(scheduler_provider.region_run_discovery(), "ci-flow")
         {
             Ok(poller) => poller,
@@ -344,7 +343,7 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        let _runner_reporter = match runner_runtime.reporter_router() {
+        let runner_reporter = match runner_runtime.reporter_router() {
             Ok(reporter) => reporter,
             Err(error) => {
                 eprintln!("ci-controlplane: terminal reporter composition refused: {error}");
@@ -385,16 +384,48 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        let _runner_hooks = myelin_ci_controlplane::ci_runner_hooks(
+        let runner_resolver = myelin_ci_controlplane::durable_spec_resolver(
+            myelin_ci_controlplane::ci_job_spec_store(provider.db_pool().clone()),
+            provider.config().region.clone(),
+            tokio::runtime::Handle::current(),
+            runner_identity.token_issuer().clone(),
+        );
+        let runner_hooks = myelin_ci_controlplane::ci_runner_hooks(
             provider.clone(),
             runner_identity.launch_authorizer(),
             tokio::runtime::Handle::current(),
         );
-        let _runner_cancellations = myelin_ci_controlplane::ci_runner_cancellation_coordinator(
+        let runner_cancellations = myelin_ci_controlplane::ci_runner_cancellation_coordinator(
             provider.clone(),
             tokio::runtime::Handle::current(),
         );
-    }
+        let runner = myelin_ci_controlplane::CiRunnerLoop::new(
+            format!("ci-runner-{}", std::process::id()),
+            myelin_ci_controlplane::LINUX_SMALL_V1_RUNNER_LABELS
+                .iter()
+                .map(|label| (*label).to_owned())
+                .collect(),
+            vec![myelin_ci_sandbox::TrustTier::Trusted],
+            provider.config().region.clone(),
+            myelin_ci_controlplane::CI_RUNNER_LEASE_TTL_SECS,
+            region_queue_store.clone(),
+            myelin_ci_controlplane::ci_job_queue_store(provider.db_pool().clone()),
+            tokio::runtime::Handle::current(),
+            runner_resolver,
+            runner_reporter,
+            runner_hooks,
+            provider.db_pool().clone(),
+            provider.config().s3.clone(),
+        );
+        Some((
+            starter_poller,
+            workflow_poller,
+            runner_cancellations,
+            runner,
+        ))
+    } else {
+        None
+    };
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
     let signal_shutdown = shutdown_tx.clone();

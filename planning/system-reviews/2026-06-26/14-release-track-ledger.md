@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — operational reservation, scoped hooks, claim/launch fences, exact-tenant worker/reporter/finalizer composition, and bounded active-workflow fan-out proven; full runner/crash path remains; production start disabled** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — operational reservation, claim/launch fences, exact-tenant runtime/fan-out, and dormant full runner-host composition proven; lifecycle/crash activation remains; production start disabled** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1131,11 +1131,30 @@ all-target/all-feature suite, including every live PostgreSQL proof, workspace a
 check, warnings-denied clippy, production migration checksum audit, architecture lint, erosion
 budgets, contract coverage, production-source activation guard, and diff check are green.
 
-**Honest remaining activation floors:** compose the bounded fan-out, accounted reporter, scoped
-hooks, and accounted cancellation coordinator into the real `CiRunnerLoop`. Inject crashes across
-mint→CAS and CAS→spawn plus cancellation, retry, recovery, and settlement races through that complete
-root before activation. No Commercial wallet, billing, or Stripe work is admitted before the Tier-B
-go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
+**Dormant full runner-host composition (2026-07-23).** The production root now retains one complete
+but unstarted runner host: the queued-run starter, bounded active-workflow poller, accounted
+cancel-superseded coordinator, and a real `CiRunnerLoop`. The loop receives the constrained regional
+claim capability, tenant-scoped heartbeat/complete store, durable launch-template resolver, exact
+claim-generation Identity minter, exact-tenant accounted reporter, scoped reservation/final-launch
+hooks, production lease TTL, gVisor backend path, and durable PostgreSQL/S3 log backings. There is no
+compatibility resolver, synthetic tenant, permissive token signer, unaccounted reporter, spawn, or
+runner task.
+
+The production launch policy and runner now share one `LINUX_SMALL_V1_RUNNER_LABELS` authority.
+Adversarial review found the initial dormant composition advertised only `linux`, while every
+production job required both `linux` and `linux-small-v1`; PostgreSQL's subset predicate therefore
+made all real jobs unclaimable. The duplicated literals were replaced by the shared policy-owned
+constant, and the production-source guard requires both manifest emission and runner advertisement
+to consume it. Final independent re-review reported CONFIRMED-SOUND with no remaining HIGH or
+MEDIUM finding. The full control-plane all-target/all-feature suite and the pre-database
+activation-refusal/source guards, workspace all-target/all-feature check, warnings-denied clippy,
+architecture lint, erosion budgets, contract coverage, and diff check are green.
+
+**Honest remaining activation floors:** attach the retained starter, bounded fan-out, and sandbox
+runner to coordinated lifecycle shutdown, and wire accounted supersession into the durable dispatch
+path. Inject crashes across mint→CAS and CAS→spawn plus cancellation, retry, recovery, and settlement
+races through that complete running root before activation. No Commercial wallet, billing, or Stripe
+work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
 
 ## R5–R6
 
