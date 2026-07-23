@@ -88,6 +88,9 @@ pub struct CiRunInsert {
     pub definition_snapshot: String,
     /// `ci_run.trigger_kind` — the CHECK token (`push`/`pull_request`/…), NOT NULL.
     pub trigger_kind: String,
+    /// Canonical PR supersession identity (`pr:{repo}:{number}`). Required for every newly written
+    /// pull-request run and forbidden for other trigger kinds.
+    pub concurrency_group: Option<String>,
     /// `ci_run.trust_tier` — the stamped CHECK token (`trusted`/`untrusted_fork`/`self_hosted`),
     /// NOT NULL; the SAME value stamped on every `ci.check.updated.trust_tier` (X-1).
     pub trust_tier: String,
@@ -143,6 +146,9 @@ pub struct CiRunRecord {
     pub definition_snapshot: String,
     /// `ci_run.trigger_kind`.
     pub trigger_kind: String,
+    /// Canonical PR supersession identity. Historical rows may be `NULL`; production launch
+    /// authority refuses such legacy PR rows rather than inventing a group.
+    pub concurrency_group: Option<String>,
     /// `ci_run.trust_tier`.
     pub trust_tier: String,
     /// `ci_run.state`.
@@ -161,10 +167,10 @@ pub const INSERT_CI_RUN_QUERY: &str = "\
 INSERT INTO ci_run (
   tenant_id, region, run_id, project_id, pipeline_id, wf_run_id,
   repo_ref, commit_oid, cause_event_id, cause_depth, caused_by, definition_snapshot,
-  trigger_kind, triggered_by, trust_tier, state, correlation_id
+  trigger_kind, concurrency_group, triggered_by, trust_tier, state, correlation_id
 ) VALUES (
   $1, $2, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
-  $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+  $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
 )
 ON CONFLICT (tenant_id, run_id) DO NOTHING
 RETURNING run_id";
@@ -190,10 +196,11 @@ SELECT
   caused_by IS NOT DISTINCT FROM $11::text          AS caused_by_matches,
   definition_snapshot = $12                        AS definition_snapshot_matches,
   trigger_kind = $13                               AS trigger_kind_matches,
-  trust_tier = $14                                 AS trust_tier_matches,
-  correlation_id = $15                             AS correlation_id_matches,
-  (triggered_by IS NOT DISTINCT FROM $16::text
-    OR triggered_by = $17::text)                   AS triggered_by_matches
+  concurrency_group IS NOT DISTINCT FROM $14::text AS concurrency_group_matches,
+  trust_tier = $15                                 AS trust_tier_matches,
+  correlation_id = $16                             AS correlation_id_matches,
+  (triggered_by IS NOT DISTINCT FROM $17::text
+    OR triggered_by = $18::text)                   AS triggered_by_matches
 FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
 FOR KEY SHARE";
@@ -216,6 +223,7 @@ SELECT
   caused_by               AS caused_by,
   definition_snapshot     AS definition_snapshot,
   trigger_kind            AS trigger_kind,
+  concurrency_group       AS concurrency_group,
   trust_tier              AS trust_tier,
   state                   AS state,
   correlation_id          AS correlation_id
@@ -239,6 +247,7 @@ SELECT
   caused_by               AS caused_by,
   definition_snapshot     AS definition_snapshot,
   trigger_kind            AS trigger_kind,
+  concurrency_group       AS concurrency_group,
   trust_tier              AS trust_tier,
   state                   AS state,
   correlation_id          AS correlation_id
@@ -371,6 +380,9 @@ pub enum CiRunStoreError {
     /// The retained triggering-envelope depth cannot be represented by the canonical `u32`
     /// envelope depth. Checked before opening a transaction or executing SQL.
     InvalidCausalDepth,
+    /// New pull-request runs require one canonical `pr:{repo}:{number}` identity; other triggers
+    /// must not carry one.
+    InvalidConcurrencyGroup,
     /// The primary key already exists, but its immutable run identity differs from this replay.
     /// Field names only: submitted and stored values are deliberately never exposed in the error.
     ReplayCollision {
@@ -413,6 +425,10 @@ impl core::fmt::Display for CiRunStoreError {
             CiRunStoreError::InvalidCausalDepth => write!(
                 f,
                 "durable ci_run insert requires cause_depth in the canonical u32 range"
+            ),
+            CiRunStoreError::InvalidConcurrencyGroup => write!(
+                f,
+                "durable ci_run insert requires a canonical PR concurrency group only for pull-request triggers"
             ),
             CiRunStoreError::ReplayCollision { differing_fields } => write!(
                 f,
@@ -775,6 +791,7 @@ fn ci_run_record_from_row(row: sqlx::postgres::PgRow) -> CiRunRecord {
         caused_by: row.get("caused_by"),
         definition_snapshot: row.get("definition_snapshot"),
         trigger_kind: row.get("trigger_kind"),
+        concurrency_group: row.get("concurrency_group"),
         trust_tier: row.get("trust_tier"),
         state: row.get("state"),
         correlation_id: row.get("correlation_id"),
@@ -1003,10 +1020,11 @@ async fn insert_on_conn(
         .bind(&row.caused_by) // $11 caused_by (nullable)
         .bind(&row.definition_snapshot) // $12 definition_snapshot
         .bind(&row.trigger_kind) // $13 trigger_kind
-        .bind(&row.triggered_by) // $14 triggered_by (nullable pseudonym)
-        .bind(&row.trust_tier) // $15 trust_tier
-        .bind(&row.state) // $16 state
-        .bind(&row.correlation_id) // $17 correlation_id
+        .bind(&row.concurrency_group) // $14 canonical PR group (nullable for non-PR)
+        .bind(&row.triggered_by) // $15 triggered_by (nullable pseudonym)
+        .bind(&row.trust_tier) // $16 trust_tier
+        .bind(&row.state) // $17 state
+        .bind(&row.correlation_id) // $18 correlation_id
         .fetch_optional(&mut *conn)
         .await
         .map_err(|e| CiRunStoreError::Db(e.to_string()))?;
@@ -1030,6 +1048,7 @@ async fn insert_on_conn(
         .bind(&row.caused_by)
         .bind(&row.definition_snapshot)
         .bind(&row.trigger_kind)
+        .bind(&row.concurrency_group)
         .bind(&row.trust_tier)
         .bind(&row.correlation_id)
         .bind(&row.triggered_by)
@@ -1061,6 +1080,10 @@ async fn insert_on_conn(
             "trigger_kind",
             stored.get::<bool, _>("trigger_kind_matches"),
         ),
+        (
+            "concurrency_group",
+            stored.get::<bool, _>("concurrency_group_matches"),
+        ),
         ("trust_tier", stored.get::<bool, _>("trust_tier_matches")),
         (
             "correlation_id",
@@ -1087,9 +1110,52 @@ fn validate_initial_state(row: &CiRunInsert) -> Result<(), CiRunStoreError> {
     if row.state != "queued" {
         return Err(CiRunStoreError::InvalidInitialState);
     }
+    match (row.trigger_kind.as_str(), row.concurrency_group.as_deref()) {
+        ("pull_request", Some(group)) if valid_pr_concurrency_group(group) => {}
+        ("pull_request", _) => {
+            return Err(CiRunStoreError::InvalidConcurrencyGroup);
+        }
+        (_, None) => {}
+        (_, Some(_)) => {
+            return Err(CiRunStoreError::InvalidConcurrencyGroup);
+        }
+    }
     u32::try_from(row.cause_depth)
         .map(|_| ())
         .map_err(|_| CiRunStoreError::InvalidCausalDepth)
+}
+
+pub(crate) fn valid_pr_concurrency_group(group: &str) -> bool {
+    if group.len() > 512 || group.chars().any(char::is_control) {
+        return false;
+    }
+    let Some(rest) = group.strip_prefix("pr:") else {
+        return false;
+    };
+    let Some((repo, number)) = rest.rsplit_once(':') else {
+        return false;
+    };
+    let Ok(parsed_number) = number.parse::<u64>() else {
+        return false;
+    };
+    if parsed_number == 0 || parsed_number.to_string() != number {
+        return false;
+    }
+    let mut pieces = repo.split('/');
+    let mut saw_piece = false;
+    for piece in &mut pieces {
+        saw_piece = true;
+        if piece.is_empty()
+            || piece == "."
+            || piece == ".."
+            || !piece
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return false;
+        }
+    }
+    saw_piece
 }
 
 #[cfg(test)]
@@ -1117,6 +1183,7 @@ mod tests {
             wf_run_id: "44444444-4444-4444-4444-444444444444".into(),
             definition_snapshot: "blake3:abcd".into(),
             trigger_kind: "push".into(),
+            concurrency_group: None,
             trust_tier: "trusted".into(),
             state: "queued".into(),
             correlation_id: "corr-1".into(),
@@ -1146,7 +1213,7 @@ mod tests {
         }
     }
 
-    /// The INSERT binds all 17 columns + is idempotent on the `(tenant_id, run_id)` PK (the DB-free
+    /// The INSERT binds all 18 columns + is idempotent on the `(tenant_id, run_id)` PK (the DB-free
     /// shape assertions; the live round-trip + co-commit atomicity are the integration proofs).
     #[test]
     fn insert_query_is_idempotent_on_the_pk_and_binds_every_column() {
@@ -1154,13 +1221,13 @@ mod tests {
             INSERT_CI_RUN_QUERY.contains("ON CONFLICT (tenant_id, run_id) DO NOTHING"),
             "idempotent on the run-of-record PK"
         );
-        // 17 bind placeholders ($1..$17) for the 17 writer-set columns.
-        for n in 1..=17 {
+        // 18 bind placeholders ($1..$18) for the 18 writer-set columns.
+        for n in 1..=18 {
             assert!(INSERT_CI_RUN_QUERY.contains(&format!("${n}")), "binds ${n}");
         }
         assert!(
-            !INSERT_CI_RUN_QUERY.contains("$18"),
-            "no over-bind past $17"
+            !INSERT_CI_RUN_QUERY.contains("$19"),
+            "no over-bind past $18"
         );
         // The uuid columns are cast from text (the CT-004b proven posture).
         assert!(INSERT_CI_RUN_QUERY.contains("$3::uuid"));
@@ -1192,6 +1259,7 @@ mod tests {
             "caused_by",
             "definition_snapshot",
             "trigger_kind",
+            "concurrency_group",
             "trust_tier",
             "correlation_id",
             "triggered_by",
@@ -1232,6 +1300,44 @@ mod tests {
         assert_eq!(
             validate_initial_state(&r),
             Err(CiRunStoreError::InvalidCausalDepth)
+        );
+    }
+
+    #[test]
+    fn new_run_concurrency_identity_is_pr_only_and_canonical() {
+        let mut row = sample_row();
+        row.trigger_kind = "pull_request".into();
+        assert_eq!(
+            validate_initial_state(&row),
+            Err(CiRunStoreError::InvalidConcurrencyGroup),
+            "new PR rows cannot omit the supersession identity"
+        );
+
+        row.concurrency_group = Some("pr:team/core:42".into());
+        assert!(validate_initial_state(&row).is_ok());
+
+        for invalid in [
+            "pr:team//core:42",
+            "pr:../core:42",
+            "pr:team/core:0",
+            "pr:team/core:042",
+            "pr:team/core:not-a-number",
+            "deploy:prod",
+        ] {
+            row.concurrency_group = Some(invalid.into());
+            assert_eq!(
+                validate_initial_state(&row),
+                Err(CiRunStoreError::InvalidConcurrencyGroup),
+                "invalid group {invalid:?} is refused"
+            );
+        }
+
+        row.trigger_kind = "push".into();
+        row.concurrency_group = Some("pr:team/core:42".into());
+        assert_eq!(
+            validate_initial_state(&row),
+            Err(CiRunStoreError::InvalidConcurrencyGroup),
+            "non-PR rows cannot smuggle PR scheduler authority"
         );
     }
 

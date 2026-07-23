@@ -149,6 +149,7 @@ fn run_for(hash: &ContentHash) -> CiRunRecord {
             hash.to_multihash_string()
         ),
         trigger_kind: "push".into(),
+        concurrency_group: None,
         trust_tier: "trusted".into(),
         state: "queued".into(),
         correlation_id: "correlation_01".into(),

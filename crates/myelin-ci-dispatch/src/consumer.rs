@@ -296,6 +296,9 @@ pub struct ReserveFacts {
     pub correlation_id: String,
     pub repo_ref: String,
     pub commit_oid: String,
+    /// Canonical PR supersession identity derived from validated event provenance. `None` for
+    /// non-PR triggers.
+    pub concurrency_group: Option<String>,
 }
 
 /// A fully-armed run ready to persist: the atomic [`StartHandoff`] bundle + the extra `ci_run` facts
@@ -466,6 +469,7 @@ pub fn ci_run_insert_from_armed(armed: &ArmedRun) -> myelin_ci_controlplane::CiR
         wf_run_id: armed.reserve.wf_run_id.clone(),
         definition_snapshot: rw.definition_snapshot.0.clone(),
         trigger_kind: rw.trigger_kind.clone(),
+        concurrency_group: armed.reserve.concurrency_group.clone(),
         trust_tier: rw.trust_tier.clone(),
         state: rw.state.clone(),
         correlation_id: armed.reserve.correlation_id.clone(),
@@ -623,6 +627,7 @@ struct TriggerFacts {
     repo: String,
     new_oid: String,
     is_fork: bool,
+    concurrency_group: Option<String>,
 }
 
 /// Parse the triggering-event provenance from the envelope payload (arch 02 §1). `git.ref.updated`
@@ -643,7 +648,7 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
 
     // Subject, aggregate, and payload are mutually distrustful provenance inputs. All three must
     // identify the same push/PR before any Git or CAS read is attempted.
-    let oid_field = if ev.type_.0 == myelin_git::events::GIT_REF_UPDATED {
+    let (oid_field, concurrency_group) = if ev.type_.0 == myelin_git::events::GIT_REF_UPDATED {
         let ref_name = p.get("ref").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
             .ok_or_else(|| SkipReason::MalformedPayload("missing `ref`".into()))?;
         validate_git_ref_name(ref_name)?;
@@ -652,7 +657,7 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
             &format!("myelin://{}/git/ref/{repo}:{ref_name}", ev.tenant.0),
             &format!("{repo}:{ref_name}"),
         )?;
-        "new_oid"
+        ("new_oid", None)
     } else {
         let number = p.get("number").and_then(|v| v.as_u64()).filter(|number| *number > 0)
             .ok_or_else(|| SkipReason::InvalidProvenance("PR `number` must be a positive integer".into()))?;
@@ -661,7 +666,13 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
             &format!("myelin://{}/git/pr/{repo}:{number}", ev.tenant.0),
             &format!("git/pr/{repo}:{number}"),
         )?;
-        "head_oid"
+        let group = format!("pr:{repo}:{number}");
+        if group.len() > 512 {
+            return Err(SkipReason::InvalidProvenance(
+                "PR concurrency identity exceeds 512 bytes".into(),
+            ));
+        }
+        ("head_oid", Some(group))
     };
 
     // Only an immutable full SHA-1 oid is admitted. Refs, HEAD, revspecs, and abbreviations are
@@ -683,6 +694,7 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
         repo,
         new_oid,
         is_fork,
+        concurrency_group,
     })
 }
 
@@ -925,6 +937,7 @@ pub fn plan_dispatch(
         correlation_id: ev.correlation_id.0.clone(),
         repo_ref: facts.repo,
         commit_oid: facts.new_oid,
+        concurrency_group: facts.concurrency_group,
     };
     let emit_ctx = EmitContextBase {
         tenant: tenant.clone(),
@@ -1792,6 +1805,14 @@ mod tests {
         let mut invalid_number = pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
         invalid_number.payload["number"] = serde_json::json!(0);
         cases.push(invalid_number);
+        let oversized_repo = "a".repeat(510);
+        let mut oversized_group =
+            pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
+        oversized_group.payload["repo"] = serde_json::json!(&oversized_repo);
+        oversized_group.subject =
+            ArtifactRef(format!("myelin://acme/git/pr/{oversized_repo}:42"));
+        oversized_group.aggregate = AggregateKey(format!("git/pr/{oversized_repo}:42"));
+        cases.push(oversized_group);
         for event in cases {
             assert_invalid_provenance_is_poison_before_effects(event);
         }
@@ -1961,8 +1982,10 @@ mod tests {
         assert_eq!(armed.reserve.correlation_id, "corr-1");
         assert_eq!(armed.reserve.repo_ref, "web");
         assert_eq!(armed.reserve.commit_oid, TEST_OID);
+        assert!(armed.reserve.concurrency_group.is_none());
         let insert = ci_run_insert_from_armed(&armed);
         assert_eq!(insert.triggered_by.as_deref(), Some("pusher"));
+        assert!(insert.concurrency_group.is_none());
         assert_eq!(armed.tenant, TenantId("acme".into()));
     }
 
@@ -2009,6 +2032,11 @@ mod tests {
         };
         assert_eq!(armed.handoff.run_write.trust_tier, "untrusted_fork");
         assert_eq!(armed.handoff.run_write.trigger_kind, "pull_request");
+        assert_eq!(armed.reserve.concurrency_group.as_deref(), Some("pr:web:42"));
+        assert_eq!(
+            ci_run_insert_from_armed(&armed).concurrency_group.as_deref(),
+            Some("pr:web:42")
+        );
         for c in &armed.handoff.queued_checks {
             assert_eq!(c.payload["trust_tier"], "untrusted_fork", "X-1: 0 divergence");
         }

@@ -515,6 +515,7 @@ fn prepare_linux_small_requests(
     definition: &CiWorkflowDefinitionPin,
 ) -> Result<(CiManifestLimitsV1, Vec<CiJobRuntimeAuthorityRequest>), CiLaunchAuthorityError> {
     let run_id = validate_run_scope(record, prepared)?;
+    launch_concurrency_group(record)?;
     if prepared.plan().execution.profile != CiExecutionProfileV1::LinuxSmallV1 {
         return Err(refused("unsupported CI execution profile"));
     }
@@ -562,6 +563,7 @@ fn finish_linux_small_authority(
         ));
     }
     let mut unique_reservations = BTreeSet::new();
+    let concurrency_group = launch_concurrency_group(record)?;
     let mut grants = Vec::with_capacity(prepared.plan().jobs.len());
     for ((job, request), reserve_handle) in prepared
         .plan()
@@ -590,7 +592,7 @@ fn finish_linux_small_authority(
                     .iter()
                     .map(|label| (*label).to_owned())
                     .collect(),
-                concurrency_group: None,
+                concurrency_group: concurrency_group.clone(),
                 fair_key: format!("project:{}", record.project_id),
             },
             reserve_handle,
@@ -602,6 +604,26 @@ fn finish_linux_small_authority(
         jobs: grants,
         merge_waiter: None,
     })
+}
+
+fn launch_concurrency_group(
+    record: &CiRunRecord,
+) -> Result<Option<String>, CiLaunchAuthorityError> {
+    match (
+        record.trigger_kind.as_str(),
+        record.concurrency_group.as_deref(),
+    ) {
+        ("pull_request", Some(group)) if crate::ci_run_store::valid_pr_concurrency_group(group) => {
+            Ok(Some(group.to_owned()))
+        }
+        ("pull_request", _) => Err(refused(
+            "pull-request run lacks canonical concurrency identity",
+        )),
+        (_, None) => Ok(None),
+        (_, Some(_)) => Err(refused(
+            "non-pull-request run carries PR concurrency identity",
+        )),
+    }
 }
 
 const CI_TOKEN_AUTHORITY_V1_DOMAIN: &[u8] = b"myelin.ci.token-authority.v1\0";
@@ -849,6 +871,7 @@ mod tests {
                 hash.to_multihash_string()
             ),
             trigger_kind: "push".into(),
+            concurrency_group: None,
             trust_tier: "trusted".into(),
             state: "queued".into(),
             correlation_id: "50000000-0000-0000-0000-000000000001".into(),
@@ -884,6 +907,10 @@ mod tests {
             assert_eq!(
                 grant.scheduling.fair_key,
                 "project:20000000-0000-0000-0000-000000000001"
+            );
+            assert!(
+                grant.scheduling.concurrency_group.is_none(),
+                "push runs carry no PR supersession key"
             );
             assert!(grant
                 .token_authority_handle
@@ -928,6 +955,35 @@ mod tests {
             assert_eq!(request.policy_revision, LINUX_SMALL_V1_POLICY_REVISION);
             assert_eq!(request.limits, linux_small_limits());
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_pr_identity_reaches_every_grant_and_missing_identity_refuses_pre_reserve() {
+        let (mut record, prepared) = fixture();
+        record.trigger_kind = "pull_request".into();
+        record.concurrency_group = Some("pr:team/core:42".into());
+        let budget = Arc::new(RecordingBudget::default());
+        let policy = policy(budget.clone());
+        let pin = CiWorkflowDefinitionPin::new(1, "ci-body-v1").unwrap();
+
+        let authority = policy.materialize(&record, &prepared, &pin).await.unwrap();
+        assert!(authority
+            .jobs
+            .iter()
+            .all(|job| { job.scheduling.concurrency_group.as_deref() == Some("pr:team/core:42") }));
+        assert_eq!(budget.batches.lock().unwrap().len(), 1);
+
+        record.concurrency_group = None;
+        let error = policy
+            .materialize(&record, &prepared, &pin)
+            .await
+            .expect_err("a legacy PR row without its event-derived identity fails closed");
+        assert!(error.0.contains("lacks canonical concurrency identity"));
+        assert_eq!(
+            budget.batches.lock().unwrap().len(),
+            1,
+            "invalid PR authority is refused before reserving operational capacity"
+        );
     }
 
     #[tokio::test]

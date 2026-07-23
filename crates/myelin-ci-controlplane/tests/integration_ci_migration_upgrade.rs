@@ -9,6 +9,7 @@
 use myelin_ci_controlplane::{
     ci_controlplane_hot_tables, ci_controlplane_migrations,
     CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID,
+    CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
     CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID,
     CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID, CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID,
 };
@@ -45,6 +46,7 @@ async fn pinned_pool(schema: &str) -> PgPool {
 
 /// The additive follow-ons; every other migration id/DDL represents the deployed WIP schema.
 const NEW_SUB_MIGRATION_IDS: &[&str] = &[
+    CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
     CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID,
     CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
     CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID,
@@ -118,6 +120,10 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
     );
     assert!(!column_exists(&pool, &schema, "job_queue", "claim_nonce").await);
     assert!(!column_exists(&pool, &schema, "job_queue", "stage").await);
+    assert!(
+        !column_exists(&pool, &schema, "ci_run", "concurrency_group").await,
+        "the deployed WIP schema predates canonical PR concurrency identity"
+    );
 
     // ── 2. Apply the NEW full set over the old schema — the shared applied ids checksum-match (the base
     //       a-suffix DDL is byte-frozen), and only the additive follow-ons apply. ──
@@ -157,6 +163,10 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
     assert!(
         column_exists(&pool, &schema, "job_queue", "claim_expires_at").await,
         "ci_0004c added job_queue.claim_expires_at on the upgrade"
+    );
+    assert!(
+        column_exists(&pool, &schema, "ci_run", "concurrency_group").await,
+        "ci_0001c added canonical PR concurrency identity on the upgrade"
     );
 
     // ── 4. Idempotent re-apply is a clean no-op (every id already recorded). ──

@@ -37,9 +37,10 @@ use myelin_ci_controlplane::{
     CheckFacts, CiJobTokenIssueError, CiJobTokenIssuer, CiJobTokenRequest, CiPipelineDriver,
     CiPipelineReporter, CiRunInsert, DurableJobRunner, DurableLeaseAdapter, JobScheduleTerms, Lane,
     PipelineRun, PipelineStage, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
-    ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CREATE_CI_JOB_SPEC_DDL,
-    CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL,
+    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
 };
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
@@ -138,6 +139,10 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL)
         .await
         .expect("add ci_run causal provenance");
+    admin
+        .execute(ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL)
+        .await
+        .expect("add ci_run concurrency identity");
     admin
         .execute(CREATE_JOB_QUEUE_DDL)
         .await
@@ -380,6 +385,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
             wf_run_id: wf_run_uuid.clone(),
             definition_snapshot: "blake3:d2snapshot".into(),
             trigger_kind: "push".into(),
+            concurrency_group: None,
             trust_tier: "trusted".into(), // the stamped tier — forwarded UNCHANGED into the dispatch
             state: "queued".into(),
             correlation_id: "corr-d2".into(),
@@ -708,6 +714,7 @@ async fn arm_and_dispatch(
             wf_run_id: wf_run_uuid.clone(),
             definition_snapshot: "blake3:cbcsnapshot".into(),
             trigger_kind: "push".into(),
+            concurrency_group: None,
             trust_tier: "trusted".into(),
             state: "queued".into(),
             correlation_id: format!("corr-{seed}"),
