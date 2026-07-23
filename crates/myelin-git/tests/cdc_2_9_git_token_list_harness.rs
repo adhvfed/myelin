@@ -7,20 +7,24 @@
 //!
 //! ## What this pins (the harness as the cross-subsystem 2.9 registry)
 //! Git already self-checks `GIT_EVENT_TOKENS` against the one Bus grammar in-crate
-//! (`register_git_tokens`). This pins the COMPLEMENTARY seam: git's WHOLE list is admitted into the
-//! Bus's cross-subsystem harness IN FULL (every name §6.1-conformant + carries the `git.` prefix +
-//! unique), and a malformed addition to git's list is REJECTED LOUDLY by the harness.
+//! (`register_git_tokens`). This pins the COMPLEMENTARY seam: git's WHOLE list and current schema
+//! lineages are admitted into the Bus's cross-subsystem harness IN FULL (every name
+//! §6.1-conformant + carries the `git.` prefix + unique), and a malformed addition to git's list is
+//! REJECTED LOUDLY by the harness.
 
 use myelin_events::{
-    HarnessError, RegisteredToken, SubsystemTokenList, TaxonomyError, TokenListHarness,
+    HarnessError, RegisteredToken, TaxonomyError, TokenListHarness,
 };
-use myelin_git::events::GIT_EVENT_TOKENS;
+use myelin_git::events::{
+    git_event_token_list, GIT_EVENT_TOKENS, GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_OPENED,
+    GIT_PR_SYNCHRONIZED,
+};
 
 /// **PROVIDER (git) registers its COMPLETE list; the CONSUMER (the Bus harness) admits it in full.**
 #[test]
 fn git_complete_list_is_admitted_by_the_bus_harness_in_full() {
     let mut harness = TokenListHarness::new();
-    let git = SubsystemTokenList::references_only("git", GIT_EVENT_TOKENS);
+    let git = git_event_token_list();
     let admitted = harness
         .register(&git)
         .expect("git's complete list is admitted by the harness");
@@ -34,6 +38,12 @@ fn git_complete_list_is_admitted_by_the_bus_harness_in_full() {
     assert!(harness.is_registered("git.ref.updated"));
     assert!(harness.is_registered("git.repo.snapshot"));
     assert!(harness.is_registered("git.repo.erased"));
+    for name in [GIT_PR_OPENED, GIT_PR_SYNCHRONIZED] {
+        let (_, token) = harness
+            .lookup(name)
+            .expect("PR head-trigger token is registered");
+        assert_eq!(token.current_schema_ver, GIT_PR_HEAD_TRIGGER_SCHEMA_V2);
+    }
 }
 
 /// **The harness REJECTS a malformed ADDITION to git's list — LOUDLY, by the rule.**
@@ -41,10 +51,7 @@ fn git_complete_list_is_admitted_by_the_bus_harness_in_full() {
 fn the_harness_rejects_a_malformed_addition_to_gits_list() {
     let mut harness = TokenListHarness::new();
     harness
-        .register(&SubsystemTokenList::references_only(
-            "git",
-            GIT_EVENT_TOKENS,
-        ))
+        .register(&git_event_token_list())
         .unwrap();
 
     // present-tense verb.

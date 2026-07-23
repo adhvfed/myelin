@@ -319,12 +319,14 @@ fn push_envelope(ev: &str, repo: &str, new_oid: &str) -> EventEnvelope {
 fn pr_envelope(ev: &str, repo: &str, number: u64, head_oid: &str) -> EventEnvelope {
     let mut envelope = push_envelope(ev, repo, head_oid);
     envelope.type_ = EventType(myelin_git::events::GIT_PR_OPENED.into());
+    envelope.schema_ver = myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2;
     envelope.subject = ArtifactRef(format!("myelin://acme/git/pr/{repo}:{number}"));
     envelope.aggregate = AggregateKey(format!("git/pr/{repo}:{number}"));
     envelope.payload = serde_json::json!({
         "repo": repo,
         "number": number,
         "head_oid": head_oid,
+        "head_generation": 1,
         "is_fork": false,
     });
     envelope
@@ -689,7 +691,8 @@ async fn production_pr_cocommit_persists_canonical_concurrency_identity() {
         Delivered::Acked
     );
     let row = sqlx::query(
-        "SELECT trigger_kind, concurrency_group FROM ci_run WHERE run_id = $1::uuid",
+        "SELECT trigger_kind, concurrency_group, pr_head_generation \
+           FROM ci_run WHERE run_id = $1::uuid",
     )
     .bind(run_id)
     .fetch_one(&p)
@@ -700,6 +703,7 @@ async fn production_pr_cocommit_persists_canonical_concurrency_identity() {
         row.get::<Option<String>, _>("concurrency_group").as_deref(),
         Some("pr:team/web:42")
     );
+    assert_eq!(row.get::<Option<i64>, _>("pr_head_generation"), Some(1));
 
     p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
         .await

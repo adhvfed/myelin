@@ -19,7 +19,8 @@
 
 use myelin_ci_controlplane::{
     ci_run_store_factory, CiRunInsert, CiRunStoreError, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
-    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, CREATE_CI_RUN_DDL, ERASED_PSEUDONYM,
+    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
+    CREATE_CI_RUN_DDL, ERASED_PSEUDONYM,
 };
 use myelin_events::{HandlerTx, CONSUMER_DEDUP_MIGRATION};
 use sqlx::{Executor, PgPool};
@@ -68,6 +69,7 @@ fn row(tenant: &str, run_id: &str) -> CiRunInsert {
         definition_snapshot: "blake3:snap-abcd".into(),
         trigger_kind: "push".into(),
         concurrency_group: None,
+        pr_head_generation: None,
         trust_tier: "trusted".into(),
         state: "queued".into(),
         correlation_id: "corr-1".into(),
@@ -111,6 +113,10 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         .execute(ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL)
         .await
         .expect("add ci_run concurrency identity");
+    admin
+        .execute(ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL)
+        .await
+        .expect("add ci_run PR ordering authority");
     admin
         .execute(CONSUMER_DEDUP_MIGRATION)
         .await
@@ -164,6 +170,7 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
     assert_eq!(got.definition_snapshot, "blake3:snap-abcd");
     assert_eq!(got.trigger_kind, "push");
     assert!(got.concurrency_group.is_none());
+    assert!(got.pr_head_generation.is_none());
     assert_eq!(got.trust_tier, "trusted");
     assert_eq!(got.state, "queued");
     assert_eq!(got.correlation_id, "corr-1");
@@ -186,6 +193,7 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
     let mut pr = row("tenantA", &run_id(3));
     pr.trigger_kind = "pull_request".into();
     pr.concurrency_group = Some("pr:team/web:42".into());
+    pr.pr_head_generation = Some(7);
     assert!(store.insert_ci_run(&pr).await.unwrap());
     let stored_pr = store
         .get_ci_run("tenantA", "fr-par", &pr.run_id)
@@ -197,6 +205,11 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         Some("pr:team/web:42"),
         "event-derived PR concurrency identity round-trips durably"
     );
+    assert_eq!(
+        stored_pr.pr_head_generation,
+        Some(7),
+        "producer-authored PR ordering authority round-trips durably"
+    );
     assert!(
         sqlx::query(
             "UPDATE ci_run SET concurrency_group = 'pr:web:42' \
@@ -207,6 +220,28 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         .await
         .is_err(),
         "the database refuses PR scheduler authority on a non-PR run"
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE ci_run SET pr_head_generation = 7 \
+             WHERE tenant_id = 'tenantA' AND run_id = $1::uuid"
+        )
+        .bind(run_a)
+        .execute(&admin)
+        .await
+        .is_err(),
+        "the database refuses PR ordering authority on a non-PR run"
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE ci_run SET pr_head_generation = 0 \
+             WHERE tenant_id = 'tenantA' AND run_id = $1::uuid"
+        )
+        .bind(&pr.run_id)
+        .execute(&admin)
+        .await
+        .is_err(),
+        "the database refuses a non-positive PR ordering generation"
     );
     assert!(
         sqlx::query(
@@ -291,6 +326,7 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         "definition_snapshot",
         "trigger_kind",
         "concurrency_group",
+        "pr_head_generation",
         "trust_tier",
         "correlation_id",
         "triggered_by",
@@ -298,9 +334,10 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
     for (index, field) in immutable_fields.into_iter().enumerate() {
         let collision_run = run_id(10 + index as u64);
         let mut original = row("tenantA", &collision_run);
-        if field == "concurrency_group" {
+        if matches!(field, "concurrency_group" | "pr_head_generation") {
             original.trigger_kind = "pull_request".into();
             original.concurrency_group = Some("pr:web:42".into());
+            original.pr_head_generation = Some(7);
         }
         assert!(
             store.insert_ci_run(&original).await.unwrap(),
@@ -318,6 +355,7 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
             "definition_snapshot" => replay.definition_snapshot = "blake3:other".into(),
             "trigger_kind" => replay.trigger_kind = "manual".into(),
             "concurrency_group" => replay.concurrency_group = Some("pr:web:43".into()),
+            "pr_head_generation" => replay.pr_head_generation = Some(8),
             "trust_tier" => replay.trust_tier = "self_hosted".into(),
             "correlation_id" => replay.correlation_id = "corr-other".into(),
             "triggered_by" => replay.triggered_by = None,

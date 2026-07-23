@@ -9,15 +9,11 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CausedBy, DataRole, EmitContextBase, EventDraft, EventType,
-    IdMinter, OutboxTransaction, OutboxTx, Timestamp, UlidMinter, Visibility,
-};
+use myelin_events::{Actor, CausedBy, EmitContextBase, IdMinter, Timestamp, UlidMinter};
 use myelin_gdpr::ErasureMethod;
 use myelin_identity::Principal;
 use myelin_storage::encryption::{ColumnCryptor, EncryptedColumn, SubjectId};
 use myelin_storage::kms::{KekId, KeyClass, KmsEngine, PiiKeyRef, NONCE_LEN};
-use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::{
     HotTables, Migration, MigrationPhase, Migrations, SubstrateProvider, TenantScope,
 };
@@ -31,6 +27,7 @@ use crate::events::{
     GIT_PR_UPDATED,
 };
 use crate::lifecycle::PrState;
+use crate::pg_pr_event::co_commit_event;
 use crate::pr_list_pagination::{PrListDirection, PrListPage};
 use crate::pr_store::{
     ensure_pr_record_size, evaluate_merge, DurablePrStore, MergeAttempt, MergeEval,
@@ -2431,60 +2428,6 @@ fn accepted_merge_update_seq(
     }
 }
 
-async fn co_commit_event(
-    conn: &mut sqlx::PgConnection,
-    minter: Arc<dyn IdMinter>,
-    ctx: EmitContextBase,
-    loc: &RepoLoc,
-    record: &PrRecord,
-    event_type: &'static str,
-    operation: Option<&serde_json::Value>,
-) -> Result<(), myelin_storage::PgError> {
-    let safe_operation = operation.map(|value| {
-        serde_json::json!({
-            "operation_id": value.get("operation_id"),
-            "base_ref": value.get("base_ref"),
-            "expected_old_oid": value.get("expected_old_oid"),
-            "head_oid": value.get("head_oid"),
-            "head_repo_slug": value.get("head_repo_slug"),
-        })
-    });
-    let mut tx = OutboxTransaction::detached(minter, ctx);
-    tx.emit(
-        EventDraft {
-            type_: EventType(event_type.into()),
-            subject: ArtifactRef(format!(
-                "myelin://{}/git/pr/{}:{}",
-                loc.tenant, loc.repo, record.number
-            )),
-            aggregate: AggregateKey(format!("git/pr/{}:{}", loc.repo, record.number)),
-            payload: serde_json::json!({
-                "repo": loc.repo,
-                "number": record.number,
-                "base_ref": record.base_ref,
-                "head_repo": record.head_repo_slug,
-                "head_ref": record.head_ref,
-                "head_oid": record.head_oid,
-                "is_fork": record.head_repo_slug != loc.repo,
-                "state": format!("{:?}", record.state).to_ascii_lowercase(),
-                "operation": safe_operation,
-            }),
-            data_role: DataRole::Processor,
-            visibility: Visibility::Internal,
-            contains_personal_data: false,
-            pii_key_ref: None,
-        },
-        None,
-    )
-    .map_err(|_| pg_query("stage PR lifecycle event"))?;
-    let row = tx
-        .into_staged_rows()
-        .map_err(|_| pg_query("encode PR lifecycle event"))?
-        .pop()
-        .ok_or_else(|| myelin_storage::PgError::Query("missing PR envelope".into()))?;
-    PgRelay::co_commit_in_tx(conn, &row.aggregate.0, &row.envelope).await
-}
-
 async fn lock_operation(
     conn: &mut sqlx::PgConnection,
     loc: &RepoLoc,
@@ -3035,6 +2978,9 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{
+        GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_SYNCHRONIZED,
+    };
 
     #[test]
     fn accepted_merge_requires_one_exact_nonzero_move_witness() {
@@ -4099,6 +4045,41 @@ mod tests {
                 assert_eq!(count(GIT_PR_UPDATED), 1, "one durable merge intent");
                 assert_eq!(count(GIT_PR_MERGED), 1, "one exact finalization");
             }
+            let wire_rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+                "SELECT envelope->>'type_',(envelope->>'schema_ver')::bigint, \
+                        (envelope->'payload'->>'head_generation')::bigint \
+                   FROM outbox WHERE aggregate=$1 AND envelope->>'tenant'=$2 ORDER BY seq",
+            )
+            .bind(&aggregate)
+            .bind(&tenant_a)
+            .fetch_all(&admin)
+            .await
+            .unwrap();
+            let generations = wire_rows
+                .iter()
+                .filter_map(|(kind, schema_ver, generation)| {
+                    if matches!(kind.as_str(), GIT_PR_OPENED | GIT_PR_SYNCHRONIZED) {
+                        assert_eq!(
+                            *schema_ver,
+                            i64::from(GIT_PR_HEAD_TRIGGER_SCHEMA_V2),
+                            "head-trigger events advertise the required generation shape"
+                        );
+                        Some(generation.expect("v2 head-trigger event carries its generation"))
+                    } else {
+                        assert_eq!(*schema_ver, 1, "unrelated PR event lineage stays v1");
+                        assert_eq!(
+                            *generation, None,
+                            "unrelated PR events do not claim head-ordering authority"
+                        );
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                generations.iter().all(|generation| *generation > 0)
+                    && generations.windows(2).all(|pair| pair[0] < pair[1]),
+                "head-trigger events carry positive serialized git_pr.version in commit order: {generations:?}"
+            );
         }
         let terminal_leaks: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM git_pr_command

@@ -134,6 +134,10 @@ pub const CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID: &str = "ci_0001b_ci_run_causal_
 /// Forward-only canonical PR concurrency identity carried from the triggering event into launch
 /// authority. The original `ci_0001_ci_run` create remains byte-frozen.
 pub const CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID: &str = "ci_0001c_ci_run_concurrency_group";
+/// Forward-only producer-authored PR row generation. This is separate from `ci_0001c` so the
+/// already-applied concurrency-group migration remains byte-identical.
+pub const CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID: &str =
+    "ci_0001d_ci_run_pr_head_generation";
 /// Forward-only migration id for [`ALTER_CI_JOB_SPEC_ADD_STAGE_DDL`]. A sub-migration of the
 /// already-applied `ci_0015_ci_job_spec` table (the `ci_0002a` convention), applied immediately after
 /// it so its checksum is never rewritten and the `ci_0015` create stays byte-frozen.
@@ -227,6 +231,14 @@ trigger_kind = 'pull_request' \
 AND concurrency_group ~ '^pr:[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*:[1-9][0-9]*$' \
 AND octet_length(concurrency_group) BETWEEN 4 AND 512 \
 AND concurrency_group !~ '[[:cntrl:]]'))";
+
+/// Historical and old-dispatcher rows remain nullable for rolling upgrade. Non-NULL values are
+/// positive producer-authored generations; new writers require this column together with the
+/// canonical concurrency group.
+pub const ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL: &str = "ALTER TABLE ci_run \
+ADD COLUMN pr_head_generation bigint \
+CHECK (pr_head_generation IS NULL OR (\
+trigger_kind = 'pull_request' AND pr_head_generation > 0))";
 
 /// `ci_drive_manifest` — the immutable, canonical launch authority for one CI workflow run.
 ///
@@ -930,6 +942,11 @@ pub fn ci_controlplane_migrations() -> Migrations {
                 ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
                 CI_RUN_TABLE,
             ));
+            migrations.push(Migration::plain_on(
+                CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID,
+                ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
+                CI_RUN_TABLE,
+            ));
         }
         if table == CI_JOB_TABLE {
             migrations.push(Migration::plain_on(
@@ -1061,6 +1078,14 @@ pub fn ci_durable_migrations() -> Migrations {
         Migration::plain_on(
             CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
             ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
+            CI_RUN_TABLE,
+        ),
+    );
+    migrations.insert(
+        3,
+        Migration::plain_on(
+            CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID,
+            ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
             CI_RUN_TABLE,
         ),
     );
@@ -1219,8 +1244,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            37,
-            "17 table/RLS + 2 ci_run ALTERs + 6 concurrent-index + 1 index-validation + 3 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 2 scheduler ci_run discovery grants"
+            38,
+            "17 table/RLS + 3 ci_run ALTERs + 6 concurrent-index + 1 index-validation + 3 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 2 scheduler ci_run discovery grants"
         );
         for m in &migrations.0 {
             assert!(
@@ -1246,6 +1271,8 @@ mod tests {
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL);
             } else if m.id == CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL);
+            } else if m.id == CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL);
             } else if m.id == CI_JOB_SPEC_STAGE_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL);
             } else if m.id == CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID {
@@ -1298,8 +1325,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            37,
-            "the runner applied all 17 table/RLS, 2 ci_run ALTERs, 6 concurrent-index, 1 index-validation, 3 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, and 2 scheduler ci_run discovery grants"
+            38,
+            "the runner applied all 17 table/RLS, 3 ci_run ALTERs, 6 concurrent-index, 1 index-validation, 3 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, and 2 scheduler ci_run discovery grants"
         );
         assert_eq!(
             runner.applied()[0],
@@ -1711,6 +1738,7 @@ mod tests {
                 "ci_0001_ci_run",
                 CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
                 CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
+                CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID,
                 "ci_0003_check_attempt",
                 "ci_0014_ci_cost_event",
             ],
@@ -1744,8 +1772,8 @@ mod tests {
         let subset = ci_durable_migrations();
         assert_eq!(
             subset.0.len(),
-            5,
-            "three writer-critical CI tables plus two forward ci_run ALTERs"
+            6,
+            "three writer-critical CI tables plus three forward ci_run ALTERs"
         );
         for m in &subset.0 {
             assert!(
@@ -1757,6 +1785,8 @@ mod tests {
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL);
             } else if m.id == CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL);
+            } else if m.id == CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL);
             } else {
                 assert!(
                     m.ddl.contains("myelin_make_tenant_scoped"),
@@ -1769,6 +1799,6 @@ mod tests {
         runner
             .run(&subset, &ci_durable_hot_tables())
             .expect("the CI durable writer subset applies forward-only");
-        assert_eq!(runner.applied().len(), 5);
+        assert_eq!(runner.applied().len(), 6);
     }
 }

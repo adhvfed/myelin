@@ -42,6 +42,7 @@ fn ci_run_record(tenant_id: &str) -> CiRunRecord {
         definition_snapshot: "blake3:abcd".into(),
         trigger_kind: "push".into(),
         concurrency_group: None,
+        pr_head_generation: None,
         trust_tier: "trusted".into(),
         state: "queued".into(),
         correlation_id: "corr-1".into(),

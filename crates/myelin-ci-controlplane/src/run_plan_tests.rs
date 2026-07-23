@@ -150,6 +150,7 @@ fn run_for(hash: &ContentHash) -> CiRunRecord {
         ),
         trigger_kind: "push".into(),
         concurrency_group: None,
+        pr_head_generation: None,
         trust_tier: "trusted".into(),
         state: "queued".into(),
         correlation_id: "correlation_01".into(),
