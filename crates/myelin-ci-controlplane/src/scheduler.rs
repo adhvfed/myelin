@@ -146,7 +146,8 @@ WHERE tenant_id = $1
 RETURNING job_id";
 
 /// **The dead-runner reaper (arch 02 §2.1) — sweep expired leases → re-queue.** A runner that died
-/// mid-lease leaves a `leased` row whose `lease_expires` has passed; the reaper moves it back to
+/// mid-lease or after the final launch fence leaves a `leased`/`running` row whose `lease_expires`
+/// has passed; the reaper moves it back to
 /// `queued` (clearing the lease) so it is claimable again. The re-queue is idempotent (the same row
 /// returns to `queued`); the run's `SCHEDULE_AND_RUN_JOB` activity re-dispatch is ONE row (the
 /// `jq_idem` unique on `(tenant_id, idem_token)` rejects a duplicate enqueue). Bind: `$1 region`.
@@ -154,9 +155,32 @@ pub const REAP_QUERY: &str = "\
 UPDATE job_queue
 SET state = 'queued', lease_owner = NULL, lease_expires = NULL, claim_nonce = NULL
 WHERE region = $1
-  AND state = 'leased'
+  AND state IN ('leased', 'running')
   AND lease_expires < now()
 RETURNING tenant_id, job_id";
+
+/// **Final exact-generation launch fence.** Atomically move one still-live scheduler generation
+/// from `leased` to `running` immediately before sandbox spawn. Cancellation and this CAS serialize
+/// on the same row: cancellation winning first makes this match zero rows; this winning first makes
+/// the row ineligible for cancel-superseded. Every persisted generation fact is compared, including
+/// the original (heartbeat-independent) claim timestamps. Bind: `$1 tenant`, `$2 region`, `$3 job`,
+/// `$4 workflow run`, `$5 owner`, `$6 epoch`, `$7 nonce`, `$8 claim start`, `$9 claim expiry`.
+pub const AUTHORIZE_JOB_LAUNCH_QUERY: &str = "\
+UPDATE job_queue
+SET state = 'running'
+WHERE tenant_id = $1
+  AND region = $2
+  AND job_id = $3::uuid
+  AND run_id = $4::uuid
+  AND state = 'leased'
+  AND lease_owner = $5
+  AND lease_epoch = $6
+  AND claim_nonce = $7::uuid
+  AND EXTRACT(EPOCH FROM claim_started_at)::bigint = $8
+  AND EXTRACT(EPOCH FROM claim_expires_at)::bigint = $9
+  AND claim_expires_at > statement_timestamp()
+  AND completion_receipt IS NULL
+RETURNING job_id";
 
 /// **The idempotent enqueue (arch 02 §2.1 / §3.2) — insert ONE schedulable `job_queue` row.** The
 /// durable equivalent of [`SchedulerState::enqueue`]: a job the run's `SCHEDULE_AND_RUN_JOB`
@@ -191,7 +215,8 @@ WHERE tenant_id = $1
 RETURNING job_id";
 
 /// **Heartbeat — a LIVE runner extends its lease (arch 02 §2.1).** The durable equivalent of
-/// [`SchedulerState::heartbeat`]: while a job is `leased` by this owner, push `lease_expires` forward
+/// [`SchedulerState::heartbeat`]: while a job is `leased`/`running` by this owner, push
+/// `lease_expires` forward
 /// so a heart-beating runner is NOT swept by the [`REAP_QUERY`] (only a DEAD runner's expired lease
 /// is reaped). Guarded to the lease OWNER (`lease_owner = $3`) so a stale/other runner cannot extend
 /// a lease it does not hold. Bind: `$1 tenant_id`, `$2 job_id`, `$3 lease_owner`,
@@ -201,7 +226,7 @@ UPDATE job_queue
 SET lease_expires = now() + ($4 || ' seconds')::interval
 WHERE tenant_id = $1
   AND job_id = $2
-  AND state = 'leased'
+  AND state IN ('leased', 'running')
   AND lease_owner = $3
 RETURNING job_id";
 
@@ -673,7 +698,7 @@ impl SchedulerState {
     }
 
     /// **The dead-runner reaper ([`REAP_QUERY`], arch 02 §2.1): re-queue every expired lease.** A
-    /// `leased` job whose `lease_expires < now` is moved back to `queued` (clearing the lease) so it
+    /// `leased`/`running` job whose `lease_expires < now` is moved back to `queued` (clearing the lease) so it
     /// is claimable again. The re-queue is idempotent — a job already `queued` is untouched; a job
     /// whose lease has NOT expired is untouched. Returns the re-queued `(tenant_id, job_id)` set.
     ///
@@ -684,7 +709,9 @@ impl SchedulerState {
         let now = self.now;
         let mut reaped = Vec::new();
         for j in &mut self.jobs {
-            if j.state == JobState::Leased && j.lease_expires.is_some_and(|e| e < now) {
+            if matches!(j.state, JobState::Leased | JobState::Running)
+                && j.lease_expires.is_some_and(|e| e < now)
+            {
                 j.state = JobState::Queued;
                 j.lease_owner = None;
                 j.lease_expires = None;
@@ -696,12 +723,14 @@ impl SchedulerState {
 
     /// Heartbeat: a live runner extends its lease (`lease_expires = now + ttl`) — proves a
     /// heart-beating runner is NOT reaped (only a DEAD runner's expired lease is swept). Returns true
-    /// if the lease was extended (the job is leased by this owner).
+    /// if the lease was extended (the job is leased/running under this owner).
     pub fn heartbeat(&mut self, tenant_id: &str, job_id: &str, owner: &str, ttl: u64) -> bool {
         let now = self.now;
         if let Some(i) = self.find(tenant_id, job_id) {
             let j = &mut self.jobs[i];
-            if j.state == JobState::Leased && j.lease_owner.as_deref() == Some(owner) {
+            if matches!(j.state, JobState::Leased | JobState::Running)
+                && j.lease_owner.as_deref() == Some(owner)
+            {
                 j.lease_expires = Some(now + ttl);
                 return true;
             }

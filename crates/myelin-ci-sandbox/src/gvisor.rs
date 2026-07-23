@@ -104,6 +104,8 @@ pub struct OciConfig {
     no_new_privileges: bool,
     seccomp: bool,
     has_network: bool,
+    /// Emitted twice deliberately: OCI `linux.resources.pids.limit` for cgroup-capable runtimes and
+    /// `RLIMIT_NPROC` for rootless `runsc`, which cannot install the host pids cgroup itself.
     pids_max: u32,
     /// The memory ceiling (bytes) — emitted as `linux.resources.memory.limit`. IMPORTANT (CT-003b /
     /// SI-017): `runsc --rootless` does NOT enforce this OCI field (rootless runsc cannot manage a
@@ -248,6 +250,7 @@ impl OciConfig {
              \"args\": [{args}],\n    \"cwd\": \"/\",\n    \
              \"env\": [{env_json}],\n    \
              \"noNewPrivileges\": {nnp},\n    \
+             \"rlimits\": [{{ \"type\": \"RLIMIT_NPROC\", \"hard\": {pids}, \"soft\": {pids} }}],\n    \
              \"capabilities\": {{ \"bounding\": [], \"effective\": [], \"permitted\": [] }}\n  }},\n  \
              \"root\": {{ \"path\": {root_path:?}, \"readonly\": {ro} }},\n  \
              \"mounts\": [ {mounts_json} ],\n  \
@@ -527,7 +530,7 @@ impl GvisorBackend {
     }
 
     /// Drive the four-guarantee seam in the mandated order — **isolation floor → hardening assert →
-    /// attribution → reserve → run → settle** — fail-closed at every step, then hand the captured
+    /// reserve → final attribution/claim CAS → run → settle** — fail-closed at every step, then hand the captured
     /// [`SandboxResult`] back behind the redrawn CT-001 seam. The `run` closure does the actual run:
     /// it stages an OCI bundle from the built [`OciConfig`], runs `runsc run --bundle` (the untrusted
     /// `spec.command`), captures the real exit/streams/usage and enforces `spec.limits.timeout_secs`,
@@ -549,10 +552,18 @@ impl GvisorBackend {
         (hooks.isolation_floor)(spec)?;
         let profile = HardeningProfile::derive(spec);
         profile.assert_enforced().map_err(GvisorError::Hardening)?;
-        (hooks.attribute)(&spec.run_token)?;
         let reserve = (hooks.reserve)(&spec.meter_to)?;
-
         let cfg = OciConfig::from_spec(spec, &profile);
+        if let Err(attribute_error) = (hooks.attribute)(spec) {
+            (hooks.settle)(
+                &reserve,
+                ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0,
+                },
+            )?;
+            return Err(attribute_error.into());
+        }
         // Run the container + capture the REAL result (the ONE legitimate `runsc`-spawn site — the
         // sandbox seam's mechanism; the `no-host-exec` named exclusion). `run` cleans up its own
         // bundle/container on error.
@@ -1156,10 +1167,31 @@ if timeout 3 nc -w 2 192.168.13.37 443 </dev/null 2>/dev/null; then echo "T1_cro
 SECRET="myelin-drill-canary-$$"
 if timeout 3 nc -w 2 93.184.216.34 80 </dev/null 2>/dev/null; then echo "E1_secret_exfil ESCAPED $SECRET"; else echo "E1_secret_exfil CONTAINED"; fi
 
-# ---- fork bomb: the OCI bundle sets linux.resources.pids.limit={pids_max}; the ceiling must HOLD and
-#      the guest must STAY UP (reaching the END marker proves it survived). ----
-n=0; while [ $n -lt 300 ]; do /bin/sleep 30 & n=$((n+1)); done 2>/dev/null
-echo "F1_forkbomb CONTAINED survived=yes ceiling={pids_max}"
+# ---- fork bomb: the OCI bundle sets both linux.resources.pids.limit and RLIMIT_NPROC={pids_max}.
+#      Run the saturation loop in a child shell: BusyBox exits that child with status 2 when the
+#      rlimit rejects fork, while the corpus PID 1 survives to reap children and continue D1/D2/Mx. ----
+F1_COUNT=/tmp/myelin-f1-count
+: > "$F1_COUNT"
+(
+  children=""
+  cleanup_f1() {{ for child in $children; do kill "$child" 2>/dev/null || true; done; wait 2>/dev/null || true; }}
+  trap cleanup_f1 EXIT
+  n=0; admitted=0
+  while [ $n -lt 300 ]; do
+    /bin/sleep 30 &
+    child=$!
+    children="$children $child"
+    admitted=$((admitted+1))
+    echo "$admitted" > "$F1_COUNT"
+    n=$((n+1))
+  done
+  if [ $admitted -le {pids_max} ]; then exit 0; else exit 42; fi
+) 2>/dev/null
+f1_status=$?
+admitted=0
+[ -r "$F1_COUNT" ] && read admitted < "$F1_COUNT"
+rm -f "$F1_COUNT" 2>/dev/null || true
+if [ "$f1_status" -eq 42 ] || [ "$admitted" -gt {pids_max} ]; then echo "F1_forkbomb ESCAPED admitted=$admitted ceiling={pids_max} status=$f1_status"; elif [ "$f1_status" -eq 0 ] || [ "$f1_status" -eq 2 ]; then echo "F1_forkbomb CONTAINED survived=yes admitted=$admitted ceiling={pids_max} status=$f1_status"; else echo "F1_forkbomb ESCAPED unexpected_probe_status=$f1_status admitted=$admitted ceiling={pids_max}"; fi
 
 # ---- disk fill + read-only root ----
 if echo x 2>/dev/null > /root_write_probe; then echo "D1_root_readonly ESCAPED"; rm -f /root_write_probe 2>/dev/null; else echo "D1_root_readonly CONTAINED"; fi
@@ -1211,6 +1243,7 @@ pub fn gvisor_drill_config_json(spec: &JobSpec, script_name: &str) -> Result<Str
     "env": ["PATH=/bin:/sbin:/usr/bin:/usr/sbin"],
     "cwd": "/",
     "noNewPrivileges": {nnp},
+    "rlimits": [{{ "type": "RLIMIT_NPROC", "hard": {pids}, "soft": {pids} }}],
     "capabilities": {{ "bounding": [], "effective": [], "permitted": [], "inheritable": [], "ambient": [] }}
   }},
   "root": {{ "path": "rootfs", "readonly": {ro} }},
@@ -1635,7 +1668,7 @@ impl GitWireSpec {
 impl GvisorBackend {
     /// **Run a canonical-`git` wire op in the hardened gVisor sandbox (CT-006a).** Drives the SAME
     /// four-guarantee seam as [`launch`](SandboxBackend::launch) (isolation floor → hardening assert →
-    /// attribution → reserve → run → settle), with the git-wire additions: the bare repo is bound
+    /// reserve → final attribution → run → settle), with the git-wire additions: the bare repo is bound
     /// READ-ONLY at `/repo`, an optional writable quarantine at `/quarantine`, the bounded request body
     /// is piped to stdin, and the response is captured (bounded). The command is `git <argv> /repo`,
     /// run under the full hardening (ro-root, caps dropped, no-new-privs, seccomp, no-netns, non-root
@@ -1758,12 +1791,10 @@ impl GvisorBackend {
         )
         .map_err(|e| WireError::Runtime(e.to_string()))?;
 
-        // The four-guarantee seam, in the mandated order (identical to `launch_with`).
+        // Derive the isolation/config posture before the final mutable launch boundary.
         (hooks.isolation_floor)(&job)?;
         let profile = HardeningProfile::derive(&job);
         profile.assert_enforced().map_err(WireError::Hardening)?;
-        (hooks.attribute)(&job.run_token)?;
-        let reserve = (hooks.reserve)(&job.meter_to)?;
 
         // The git-wire mounts: the RO bare repo, then (if requested) the writable quarantine.
         let mut mounts = vec![WireMount {
@@ -1787,6 +1818,17 @@ impl GvisorBackend {
             .with_extra_env(spec.env.clone())
             .with_extra_mounts(mounts)
             .with_root_path(root_abs);
+        let reserve = (hooks.reserve)(&job.meter_to)?;
+        if let Err(attribute_error) = (hooks.attribute)(&job) {
+            (hooks.settle)(
+                &reserve,
+                ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0,
+                },
+            )?;
+            return Err(attribute_error.into());
+        }
 
         let (
             ContainerRun {
@@ -1915,6 +1957,8 @@ fn stage_git_wire_bundle(cfg: &OciConfig) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::{ReserveHandle, RunTokenCredential};
 
@@ -2088,6 +2132,12 @@ mod tests {
             json.contains("\"bounding\": []"),
             "all capabilities dropped"
         );
+        assert!(
+            json.contains("\"type\": \"RLIMIT_NPROC\"")
+                && json.contains("\"hard\": 64")
+                && json.contains("\"soft\": 64"),
+            "rootless gVisor gets an in-sandbox process ceiling independent of host cgroups"
+        );
         // CT-002b: the untrusted process runs NON-ROOT (defense in depth — never uid 0 in the
         // sandbox) and the config is RUNNABLE (`cwd` set, else `runsc run` rejects the spec).
         assert!(
@@ -2153,6 +2203,18 @@ mod tests {
         assert!(script.contains("mknod /dev/port"));
         // The fork-bomb ceiling is carried from the arg.
         assert!(script.contains("ceiling=64"));
+        assert!(script.contains("trap cleanup_f1 EXIT"));
+        assert!(script.contains("exit 42"));
+        assert!(script.contains("[ \"$admitted\" -gt 64 ]"));
+        assert!(script.contains("F1_forkbomb ESCAPED admitted=$admitted"));
+        // The admitted children are reaped before D2/Mx so the fork-bomb probe cannot consume the
+        // shared memory cgroup and vacuously kill a later independent resource probe.
+        let reap = script.find("cleanup_f1()").unwrap();
+        let verdict = script.find("if [ \"$f1_status\" -eq 42 ]").unwrap();
+        let diskfill = script.find("if dd if=/dev/zero").unwrap();
+        assert!(
+            script.contains("wait 2>/dev/null || true") && reap < verdict && verdict < diskfill
+        );
         // CT-003b: the anon-memory hog's ATTEMPT sentinel + the END marker precede the oversized
         // alloc, so the corpus COMPLETES even when the contained hog OOM-kills the whole sentry
         // mid-alloc (the host cgroup bounds host RAM). The ESCAPED line follows only if it HELD.
@@ -2212,6 +2274,7 @@ mod tests {
         assert!(json.contains("\"noNewPrivileges\": true"));
         assert!(json.contains("\"bounding\": []"));
         assert!(json.contains("\"limit\": 64"));
+        assert!(json.contains("\"type\": \"RLIMIT_NPROC\""));
         // NO network namespace ⇒ with --network=none only loopback exists (egress closed).
         assert!(
             !json.contains("\"type\": \"network\""),
@@ -2237,6 +2300,37 @@ mod tests {
         };
         let r = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg| Ok(fake_run()));
         assert!(matches!(r, Err(GvisorError::Hook(_))));
+    }
+
+    #[test]
+    fn gvisor_releases_the_unused_reserve_when_final_attribution_refuses() {
+        let backend = GvisorBackend::new();
+        let settled = Arc::new(Mutex::new(None));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks {
+            reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            settle: Box::new(move |_h, usage| {
+                *settled_at.lock().unwrap() = Some(usage);
+                Ok(())
+            }),
+            attribute: Box::new(|_t| Err(crate::HookError("claim canceled".into()))),
+            isolation_floor: Box::new(|_s| Ok(())),
+        };
+        let spawned = Arc::new(AtomicBool::new(false));
+        let spawned_at = spawned.clone();
+        let result = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _cfg| {
+            spawned_at.store(true, Ordering::SeqCst);
+            Ok(fake_run())
+        });
+        assert!(matches!(result, Err(GvisorError::Hook(_))));
+        assert!(!spawned.load(Ordering::SeqCst));
+        assert_eq!(
+            *settled.lock().unwrap(),
+            Some(ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            })
+        );
     }
 
     #[test]

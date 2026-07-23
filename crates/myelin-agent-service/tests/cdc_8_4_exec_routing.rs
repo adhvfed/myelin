@@ -89,8 +89,6 @@ impl SandboxBackend for RunnerSeam {
     fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
         (hooks.isolation_floor)(spec)?;
         self.order.lock().unwrap().push("isolation_floor");
-        (hooks.attribute)(&spec.run_token)?;
-        self.order.lock().unwrap().push("attribute");
         let target = if self.reserve_exhausted {
             MeterTarget {
                 reserve_id: "__exhausted__".into(),
@@ -100,6 +98,8 @@ impl SandboxBackend for RunnerSeam {
         };
         let res = (hooks.reserve)(&target)?;
         self.order.lock().unwrap().push("reserve");
+        (hooks.attribute)(spec)?;
+        self.order.lock().unwrap().push("attribute");
         // ... the hardened guest runs the (compute) command here; the seam carries the result back ...
         let result = SandboxResult::stub_ok(ResourceUsage {
             cpu_seconds: 2,
@@ -205,7 +205,7 @@ fn fabric_exec_dispatches_kind_agent_job_through_the_four_guarantees() {
     assert_eq!(out, myelin_agent::ToolResult("sandbox:fabric-guest".into()));
     assert_eq!(
         *order.lock().unwrap(),
-        vec!["isolation_floor", "attribute", "reserve", "settle"],
+        vec!["isolation_floor", "reserve", "attribute", "settle"],
         "the four uniform guarantees fire in the mandated order (X-6 §5.2)"
     );
     assert_eq!(

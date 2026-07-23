@@ -24,9 +24,10 @@ use crate::ci_run_store::{CiRunRecord, CiRunStore};
 use crate::job_queue_store::{CiJobQueueStore, LockedJobClaim};
 
 /// The narrow Identity-facing mint seam. Implementations receive only server-reconstructed durable
-/// authority plus the exact live claim. They must be exact-retry stable, use the claim's absolute
-/// expiry as a ceiling, and report a lifetime no greater than either the complete claim lifetime or
-/// [`MAX_CI_JOB_TOKEN_TTL_SECS`].
+/// authority plus the exact live claim. They must be exact-retry stable while the deterministic
+/// token generation is live, refuse that same claim after the generation expires, use the claim's
+/// absolute expiry as a ceiling, and report a lifetime no greater than either the complete claim
+/// lifetime or [`MAX_CI_JOB_TOKEN_TTL_SECS`].
 pub trait CiJobCredentialMinter: Send + Sync {
     fn mint_verified<'a>(
         &'a self,

@@ -108,9 +108,9 @@ impl std::fmt::Display for CiJobTokenIssueError {
 impl std::error::Error for CiJobTokenIssueError {}
 
 /// Explicit short-lived token mint. Implementations must be retry-safe for the complete request:
-/// repeated calls for the same live claim generation must resolve the same active credential. A
-/// reaped and newly claimed job carries a new epoch/nonce and may receive a fresh token. There is no
-/// permissive default.
+/// repeated calls for the same claim generation resolve the same credential while its deterministic
+/// short token window is live and refuse after that window expires. A reaped and newly claimed job
+/// carries a new epoch/nonce and may receive a fresh token. There is no permissive default.
 pub trait CiJobTokenIssuer: Send + Sync {
     fn mint(
         &self,
