@@ -125,6 +125,8 @@ pub const CI_JOB_RUN_LEDGER_INDEX: &str = "ci_job_run_ledger";
 pub const CI_RUN_QUEUED_REGION_INDEX: &str = "ci_run_queued_region";
 /// Region recovery index over nonterminal CI workflow runs, covering the persisted partition.
 pub const CI_WORKFLOW_ACTIVE_REGION_INDEX: &str = "ci_workflow_active_region";
+/// Tenant/repository keyset used by the authenticated CT-005 run-list surface.
+pub const CI_RUN_SURFACE_REPO_CREATED_INDEX: &str = "ci_run_surface_repo_created";
 /// Forward-only migration id for [`CI_JOB_RUN_LEDGER_INDEX`]. Kept separate from the already-applied
 /// `ci_0002_ci_job` table/RLS migration so its checksum is never rewritten.
 pub const CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID: &str = "ci_0002a_ci_job_run_ledger";
@@ -177,6 +179,9 @@ pub const CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID: &str = "ci_0018b_ci_work
 /// Additive, column-minimal workflow route used only for exact-tenant worker routing.
 pub const CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID: &str =
     "ci_0018c_scheduler_ci_workflow_discovery";
+/// Additive CT-005 run-list keyset index. Appended after every previously applied migration.
+pub const CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID: &str =
+    "ci_0018d_ci_run_surface_repo_created";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -876,6 +881,13 @@ ci_workflow_active_region ON workflow_run (region, created_at, tenant_id, run_id
 INCLUDE (partition) \
 WHERE wf_type = 'ci.pipeline' AND state IN ('running', 'waiting')";
 
+/// Non-blocking keyset index for the authenticated per-visible-repository run list.
+pub const CREATE_CI_RUN_SURFACE_REPO_CREATED_INDEX_DDL: &str =
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+ci_run_surface_repo_created ON ci_run \
+(tenant_id, region, repo_ref, created_at DESC, run_id DESC) \
+WHERE repo_ref IS NOT NULL";
+
 /// Exact column grant plus the same server-mapped, empty-tenant RLS boundary as CI-run discovery.
 pub const GRANT_SCHEDULER_CI_WORKFLOW_DISCOVERY_DDL: &str = "\
 CREATE POLICY myelin_ci_scheduler_workflow_discovery_access ON workflow_run
@@ -1067,6 +1079,11 @@ pub fn ci_controlplane_migrations() -> Migrations {
         GRANT_SCHEDULER_CI_WORKFLOW_DISCOVERY_DDL,
         "workflow_run",
     ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID,
+        CREATE_CI_RUN_SURFACE_REPO_CREATED_INDEX_DDL,
+        CI_RUN_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -1130,10 +1147,11 @@ pub fn ci_durable_hot_tables() -> HotTables {
 
 /// **The CI Control-Plane hot-table declaration** (contract 1.5 / C-3; arch 01 §3 "Hot-table flags
 /// declared"). `job_queue` (the scheduler claim churn), `log_segment` (the firehose archive
-/// volume), `cost_event` (the per-metered-unit log), and `check_attempt` (the per-`(commit_oid,
-/// context)` re-dispatch bump) are the write-QPS tables. A declared-hot table refuses a blocking
-/// `ALTER` at boot (the migration runner) and is read by the `forward-only-migration` lint at
-/// source-scan — so a future ALTER on one of them MUST go expand→backfill→contract (§9.4).
+/// volume), `cost_event` (the per-metered-unit log), `check_attempt` (the per-`(commit_oid, context)`
+/// re-dispatch bump), and `ci_run_check_attempt` (immutable per-run issuance) are the write-QPS
+/// tables. A declared-hot table refuses a blocking `ALTER` at boot (the migration runner) and is
+/// read by the `forward-only-migration` lint at source-scan — so a future ALTER on one of them MUST
+/// go expand→backfill→contract (§9.4).
 pub fn ci_controlplane_hot_tables() -> HotTables {
     HotTables::declare([
         JOB_QUEUE_TABLE,
@@ -1274,8 +1292,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            39,
-            "18 table/RLS + 3 ci_run ALTERs + 6 concurrent-index + 1 index-validation + 3 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 2 scheduler ci_run discovery grants"
+            40,
+            "18 table/RLS + 3 ci_run ALTERs + 7 concurrent-index + 1 index-validation + 3 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 2 scheduler ci_run discovery grants"
         );
         for m in &migrations.0 {
             assert!(
@@ -1355,8 +1373,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            39,
-            "the runner applied all 18 table/RLS, 3 ci_run ALTERs, 6 concurrent-index, 1 index-validation, 3 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, and 2 scheduler ci_run discovery grants"
+            40,
+            "the runner applied all 18 table/RLS, 3 ci_run ALTERs, 7 concurrent-index, 1 index-validation, 3 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, and 2 scheduler ci_run discovery grants"
         );
         assert_eq!(
             runner.applied()[0],
@@ -1368,12 +1386,12 @@ mod tests {
     #[test]
     fn region_scheduler_boundary_is_additive_restrictive_and_least_privilege() {
         let migrations = ci_controlplane_migrations();
-        // The workflow-route grant is the final additive migration. The already-shipped queued
-        // discovery and claim grants remain byte-identical.
+        // The workflow-route grant remains byte-identical; CT-005 appends its new index after it.
         let workflow_discovery = migrations
             .0
-            .last()
-            .expect("the workflow-route grant is the final additive migration");
+            .iter()
+            .find(|migration| migration.id == CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID)
+            .expect("the workflow-route grant remains present");
         assert_eq!(
             workflow_discovery.id,
             CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID
@@ -1382,6 +1400,19 @@ mod tests {
         assert_eq!(
             workflow_discovery.ddl,
             GRANT_SCHEDULER_CI_WORKFLOW_DISCOVERY_DDL
+        );
+        let run_surface_index = migrations
+            .0
+            .last()
+            .expect("the CT-005 run-surface index is appended");
+        assert_eq!(
+            run_surface_index.id,
+            CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID
+        );
+        assert_eq!(run_surface_index.table, Some(CI_RUN_TABLE));
+        assert_eq!(
+            run_surface_index.ddl,
+            CREATE_CI_RUN_SURFACE_REPO_CREATED_INDEX_DDL
         );
         let discovery = migrations
             .0

@@ -273,6 +273,7 @@ pub mod secret_broker;
 pub mod supply_chain;
 pub mod surfacing;
 pub mod surfacing_index;
+pub mod surfacing_store;
 pub mod surfacing_tools;
 pub mod surge;
 
@@ -652,7 +653,8 @@ pub use migrations::{
     CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
     CI_RUN_CHECK_ATTEMPT_TABLE, CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
     CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID, CI_RUN_QUEUED_REGION_INDEX,
-    CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID, CI_RUN_TABLE,
+    CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID, CI_RUN_SURFACE_REPO_CREATED_INDEX,
+    CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID, CI_RUN_TABLE,
     CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID,
     CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID, CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID,
     CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID, CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID,
@@ -660,14 +662,14 @@ pub use migrations::{
     CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_ACCOUNTING_DDL,
     CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL,
     CREATE_CI_REGION_SCHEDULER_RLS_DDL, CREATE_CI_RUN_CHECK_ATTEMPT_DDL, CREATE_CI_RUN_DDL,
-    CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL, CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL,
-    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
-    CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL, CREATE_SECRET_BINDING_DDL,
-    DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE, GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL,
-    GRANT_SCHEDULER_CLAIM_NONCE_DDL, GRANT_SCHEDULER_CLAIM_TIME_DDL,
-    GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE, JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX,
-    JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE, RUNNER_TABLE, SECRET_BINDING_TABLE,
-    VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+    CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL, CREATE_CI_RUN_SURFACE_REPO_CREATED_INDEX_DDL,
+    CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL,
+    CREATE_SECRET_BINDING_DDL, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE,
+    GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL, GRANT_SCHEDULER_CLAIM_NONCE_DDL,
+    GRANT_SCHEDULER_CLAIM_TIME_DDL, GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE,
+    JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE,
+    RUNNER_TABLE, SECRET_BINDING_TABLE, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
 };
 
 pub use permanent_gates::{
@@ -1054,7 +1056,7 @@ mod tests {
         );
     }
 
-    /// **The shell's AppSpec carries the complete data model + the four hot tables + the critical
+    /// **The shell's AppSpec carries the complete data model + the five hot tables + the critical
     /// deps, and NO consumers (the behaviour floor).** Pins the shell's surface so a later edit that
     /// smuggles in a consumer without reconciliation, or drops a table / a hot-table flag, is loud.
     #[test]
@@ -1062,19 +1064,20 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            38,
-            "all 17 tables, three ci_run forward ALTERs, 6 concurrent indexes, the ledger validator, 3 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, and both ci_run discovery grants are present"
+            40,
+            "all 18 tables, three ci_run forward ALTERs, 7 concurrent indexes, the ledger validator, 3 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, and both ci_run discovery grants are present"
         );
         assert!(
             spec.consumers.is_empty(),
             "no consumers at the shell (the scheduler is not a bus consumer; dedup is the dispatch shell)"
         );
-        // the four hot tables are declared.
+        // the five hot tables are declared.
         for t in [
             JOB_QUEUE_TABLE,
             LOG_SEGMENT_TABLE,
             CI_COST_EVENT_TABLE,
             CHECK_ATTEMPT_TABLE,
+            CI_RUN_CHECK_ATTEMPT_TABLE,
         ] {
             assert!(spec.hot_tables.is_hot(t), "`{t}` is declared hot");
         }

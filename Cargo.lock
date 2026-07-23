@@ -2358,6 +2358,7 @@ name = "myelin-ci-controlplane"
 version = "0.0.0"
 dependencies = [
  "aws-sdk-s3",
+ "base64",
  "blake3",
  "chrono",
  "myelin-agent",
@@ -2384,6 +2385,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "toml",
+ "zeroize",
 ]
 
 [[package]]
@@ -2517,10 +2519,12 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "myelin-agent",
+ "myelin-ci-controlplane",
  "myelin-ci-sandbox",
  "myelin-config",
  "myelin-edge",
  "myelin-events",
+ "myelin-flow",
  "myelin-git",
  "myelin-identity",
  "myelin-identity-service",
@@ -2536,6 +2540,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tokio-stream",
+ "zeroize",
 ]
 
 [[package]]
@@ -2949,6 +2954,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "toml",
+ "zeroize",
 ]
 
 [[package]]

@@ -79,6 +79,14 @@ myelin-events = { path = "../myelin-events" }
 # eleven-crate library DAG; ci-sandbox does NOT depend on edge). `myelin-git` is ci-sandbox's DEV-dep
 # only (the validator replica is drift-pinned by a committed test), so no production edge ci→git either.
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
+# CT-005: Edge binds CI's subsystem-owned durable run read authority to authenticated HTTP. The
+# control-plane crate remains transport-agnostic; Edge is the leaf composition root.
+myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
+# CI's complete migration set includes its durable Flow recovery index. Edge applies that exact
+# prerequisite before the CI schema so a fresh-cell public read surface has no boot-order dependency
+# on the Controlplane deployable.
+myelin-flow = { path = "../myelin-flow" }
+zeroize = "1"
 # The {error:{message,code?}} envelope + the JSON view-model/data contract are serde_json::Value (the
 # one workspace-pinned shape). Issues uses a deny-unknown-fields request carrier so duplicate,
 # surplus, or tenant-selecting fields fail before a durable mutation.

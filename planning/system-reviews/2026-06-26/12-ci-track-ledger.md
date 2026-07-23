@@ -6,13 +6,16 @@ shortcut-inventory CI CRITICALs (SI-016/017) + MR-006 RESHAPE-001 + roadmap E2.1
 **no rush; get the sandbox right before trusting it with your supply chain.** CI runs your own build +
 dependency code, so a weak sandbox is a supply-chain hole.
 
-**Execution reconciliation (2026-07-23):** this file remains the decomposition; the live source of
+**Execution reconciliation (2026-07-24):** this file remains the decomposition; the live source of
 truth is release ledger 14 §R4.2. CT-004 now includes the opt-in coordinated production runner and the
 durable CI→Git check projection. Attempt numbers are allocated immutably per run/context in the same
 reserve commit as the run, queued outbox rows, and trigger dedup; PipelineStarter consumes rather than
 reallocates them. CT-004 remains in progress until a real founder push produces, settles, and surfaces
-its exact-head check. CT-007 is still unopened; GitHub Actions must not be removed before that
-acceptance pass and the required CT-005 surface are genuinely usable.
+its exact-head check. CT-005 is now **IN PROGRESS**: CT-005a mounts production durable run-list and
+run-detail reads at Edge, prefiltered through the parent Git repository's Pull visibility and backed by
+an opaque scope-bound keyset cursor plus a ready-at-boot index. It does not yet serve log bytes/live
+tail, web, CLI, or MCP. CT-007 is still unopened; GitHub Actions must not be removed before the founder
+acceptance pass and the complete CT-005 surface are genuinely usable.
 
 ## Environment (confirmed — this track is testable here)
 Firecracker v1.16.0 + gVisor (`runsc`) on PATH; `/dev/kvm` present. So the production microVM boot + the

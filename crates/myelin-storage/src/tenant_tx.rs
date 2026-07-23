@@ -134,6 +134,50 @@ where
     with_tenant_tx_error(pool, tenant, region, op).await
 }
 
+/// Run one tenant-scoped read over a PostgreSQL `REPEATABLE READ`, read-only snapshot.
+///
+/// Multi-statement materializers use this when an authorization-bearing identity row and its child
+/// rows must describe one database instant. A concurrent parent mutation may commit, but it cannot
+/// change what later statements in this transaction observe. The tenant/region GUCs remain
+/// transaction-local exactly as in [`with_tenant_tx`].
+pub async fn with_tenant_repeatable_read_tx<R, F>(
+    pool: &PgPool,
+    tenant: &str,
+    region: &str,
+    op: F,
+) -> Result<R, PgError>
+where
+    F: for<'c> FnOnce(&'c mut PgConnection) -> TxScope<'c, R> + Send,
+    R: Send,
+{
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| PgError::Query(format!("begin tenant-scoped read transaction: {e}")))?;
+    // @tenant-cross-scope: configures the transaction snapshot before the tenant GUC is installed.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| PgError::Query(format!("set tenant read snapshot isolation: {e}")))?;
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        PgError::Query(format!(
+            "set repeatable-read transaction-scoped tenant GUC: {e}"
+        ))
+    })?;
+    let out = op(&mut tx).await?;
+    tx.commit()
+        .await
+        .map_err(|e| PgError::Query(format!("commit tenant-scoped read transaction: {e}")))?;
+    Ok(out)
+}
+
 /// Open a bounded sqlx pool with **reset-on-release** wired (RESHAPE-002 defence-in-depth). The
 /// `after_release` hook runs `RESET ALL` on every connection as it returns to the pool — scrubbing
 /// any session-level configuration residue so no GUC can bleed to the next checkout, even from a code

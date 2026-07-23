@@ -31,7 +31,7 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
-    bootstrap_principal_and_mint, recover_placed_git_at_boot, register_git_durable,
+    bootstrap_principal_and_mint, recover_placed_git_at_boot, register_ci, register_git_durable,
     register_git_wire, register_issues, register_notif, serve_edge_until_shutdown_with_probe,
     spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
     AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
@@ -311,6 +311,7 @@ struct ComposedCore {
     provider: SubstrateProvider,
     kms: Arc<KmsEngine>,
     cell: Arc<CellTokenAuthority>,
+    ci_surface_cursor_key: zeroize::Zeroizing<[u8; 32]>,
     cell_id: String,
     handle: tokio::runtime::Handle,
 }
@@ -624,8 +625,38 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         eprintln!("edge: cannot apply the Git check projection migrations: {e}");
         std::process::exit(1);
     }
+    // CT-005's authenticated run views read the complete CI run/job/log index. Edge owns the
+    // public route, so it applies the subsystem-owned schema before dropping migration authority
+    // instead of assuming another deployable happened to run first.
+    if let Err(e) = bootstrap
+        .migrate(
+            &myelin_flow::migrations::migrations(),
+            &HotTables::declare(["workflow_run"]),
+        )
+        .await
+    {
+        eprintln!("edge: cannot apply the CI Flow prerequisite migrations: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap
+        .migrate(
+            &myelin_ci_controlplane::ci_controlplane_migrations(),
+            &myelin_ci_controlplane::ci_controlplane_hot_tables(),
+        )
+        .await
+    {
+        eprintln!("edge: cannot apply the CI run-surface migrations: {e}");
+        std::process::exit(1);
+    }
     if let Err(e) = bootstrap.verify_index_ready("git_pr_head_repo_idx").await {
         eprintln!("edge: Git PR provenance index is not ready: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap
+        .verify_index_ready(myelin_ci_controlplane::CI_RUN_SURFACE_REPO_CREATED_INDEX)
+        .await
+    {
+        eprintln!("edge: CI run-list keyset index is not ready: {e}");
         std::process::exit(1);
     }
     if let Err(e) = bootstrap
@@ -653,6 +684,8 @@ async fn compose_core(cell_id: String) -> ComposedCore {
             std::process::exit(1);
         }
     };
+    let ci_surface_cursor_key =
+        seal_key.derive_service_key("myelin 2026-07-24 ci run surface cursor v1");
     // The explicitly configured cell whose sealed roots this edge serves. The KMS root AND the cell
     // token-authority root are both scoped to this cell id; there is no shared development fallback.
     // The shared cell KMS (crypto-shred substrate) — DURABLE-BY-DEFAULT. A missing/malformed seal
@@ -694,6 +727,7 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         provider,
         kms,
         cell,
+        ci_surface_cursor_key,
         cell_id,
         handle,
     }
@@ -753,6 +787,7 @@ async fn serve(
         provider,
         kms,
         cell,
+        ci_surface_cursor_key,
         cell_id,
         handle,
     } = core;
@@ -1029,6 +1064,15 @@ async fn serve(
         )
         .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
     builder = register_git_durable(builder, git_backend.clone());
+    builder = register_ci(
+        builder,
+        myelin_ci_controlplane::CiRunStore::with_pg_surface_cursor_key(
+            provider.db_pool().clone(),
+            ci_surface_cursor_key,
+        ),
+        git_backend.clone(),
+        handle.clone(),
+    );
     builder = register_git_wire(builder, git_backend);
     builder = register_issues(
         builder,

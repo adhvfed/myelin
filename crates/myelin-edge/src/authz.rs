@@ -63,6 +63,9 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "issues.authorization_status",
     "issues.view",
     "issues.close",
+    // -- the durable CI run read API (register_ci) --
+    "ci.runs.list",
+    "ci.run.view",
     // -- the durable notification inbox (register_notif) --
     "notif.inbox.list",
     // -- the git JSON product API (register_git_durable over Git's catalogue) --
@@ -173,6 +176,8 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("issues.authorization_status", "issue.view", OP_AGENT_PAT),
     requirement!("issues.view", "issue.view", OP_AGENT_PAT),
     requirement!("issues.close", "issue.transition", OP_AGENT_PAT),
+    requirement!("ci.runs.list", "run.view", OP_AGENT_PAT),
+    requirement!("ci.run.view", "run.view", OP_AGENT_PAT),
     requirement!("notif.inbox.list", "notification.read", OP_AGENT_PAT),
     requirement!("git.repos.list", "repo.pull", OP_AGENT_PAT),
     requirement!("git.repo.create", "repo.create", OP_PAT),
@@ -239,7 +244,10 @@ fn purpose_class(purpose: &CredentialPurpose) -> Option<AcceptedPurpose> {
 pub fn human_session_authority() -> Vec<String> {
     ACTION_REQUIREMENTS
         .iter()
-        .filter(|rule| rule.accepted_purposes.contains(&AcceptedPurpose::HumanSession))
+        .filter(|rule| {
+            rule.accepted_purposes
+                .contains(&AcceptedPurpose::HumanSession)
+        })
         .map(|rule| rule.required_capability.to_string())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -613,5 +621,40 @@ mod tests {
             "issues.authorization_status"
         ));
         assert!(!authorize_edge_action(&AllowAll, &create, "issues.close"));
+    }
+
+    #[test]
+    fn ci_run_reads_require_exact_authority_and_never_accept_a_job_token() {
+        let viewer = identity(
+            CredentialPurpose::Pat,
+            CredentialAudience::Edge,
+            &["run.view"],
+        );
+        assert!(authorize_edge_action(&AllowAll, &viewer, "ci.runs.list"));
+        assert!(authorize_edge_action(&AllowAll, &viewer, "ci.run.view"));
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &viewer,
+            "git.checks.report"
+        ));
+
+        let repo_only = identity(
+            CredentialPurpose::Pat,
+            CredentialAudience::Edge,
+            &["repo.pull"],
+        );
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &repo_only,
+            "ci.runs.list"
+        ));
+        let ci_job = identity(
+            CredentialPurpose::CiJob {
+                run_id: "ci-run-read".into(),
+            },
+            CredentialAudience::Edge,
+            &["run.view"],
+        );
+        assert!(!authorize_edge_action(&AllowAll, &ci_job, "ci.run.view"));
     }
 }

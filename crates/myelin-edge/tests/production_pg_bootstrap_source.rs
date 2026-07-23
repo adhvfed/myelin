@@ -35,6 +35,15 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
     let operation_index = source
         .find("verify_index_ready(\"git_pr_command_operation_scope_uidx\")")
         .expect("Git PR operation namespace index must be ready before serving");
+    let ci_migrations = source
+        .find("&myelin_ci_controlplane::ci_controlplane_migrations()")
+        .expect("CI run-surface schema must run through PgBootstrap");
+    let flow_migrations = source
+        .find("&myelin_flow::migrations::migrations()")
+        .expect("CI's Flow prerequisite must run through PgBootstrap");
+    let ci_index = source
+        .find("verify_index_ready(myelin_ci_controlplane::CI_RUN_SURFACE_REPO_CREATED_INDEX)")
+        .expect("CI run-list keyset index must be ready before serving");
     let handoff = source
         .find("bootstrap.into_runtime()")
         .expect("bootstrap must be consumed by the runtime handoff");
@@ -46,6 +55,9 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
         .expect("serving listener must remain wired");
 
     assert!(foundation < durable);
+    assert!(durable < flow_migrations);
+    assert!(flow_migrations < ci_migrations);
+    assert!(durable < ci_migrations);
     assert!(durable < issues);
     assert!(issues < notif);
     assert!(notif < notif_index);
@@ -53,7 +65,9 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
     assert!(issues < issues_recent_index);
     assert!(issues_recent_index < issues_prefix_index);
     assert!(issues_prefix_index < head_index);
-    assert!(head_index < operation_index);
+    assert!(head_index < ci_index);
+    assert!(ci_index < operation_index);
+    assert!(ci_migrations < ci_index);
     assert!(operation_index < handoff);
     assert!(handoff < first_runtime_store);
     assert!(handoff < bind);
@@ -74,6 +88,27 @@ fn production_edge_mounts_the_durable_recipient_scoped_notification_read() {
     assert!(route.contains("can_read_subject"));
     assert!(!route.contains("query_param(\"tenant\")"));
     assert!(!route.contains("query_param(\"recipient\")"));
+}
+
+#[test]
+fn production_edge_mounts_the_repo_authorized_durable_ci_reads() {
+    let main = include_str!("../src/main.rs");
+    let route = include_str!("../src/ci_http.rs");
+    let authz = include_str!("../src/authz.rs");
+
+    assert!(main.contains("register_ci("));
+    assert!(main.contains("CiRunStore::with_pg_surface_cursor_key("));
+    assert!(main.contains("seal_key.derive_service_key("));
+    assert!(route.contains("/v1/ci/runs"));
+    assert!(route.contains("/v1/ci/runs/{run}"));
+    assert!(route.contains("visible_repo_slugs_for_ci(ctx.principal)"));
+    assert!(route.contains("may_view_ci_repo(ctx.principal, repo_slug)"));
+    assert!(route.contains("ctx.principal.tenant.as_str()"));
+    assert!(route.contains("ctx.principal.region.as_str()"));
+    assert!(!route.contains("query_param(\"tenant\")"));
+    assert!(!route.contains("query_param(\"region\")"));
+    assert!(authz.contains("requirement!(\"ci.runs.list\", \"run.view\", OP_AGENT_PAT)"));
+    assert!(authz.contains("requirement!(\"ci.run.view\", \"run.view\", OP_AGENT_PAT)"));
 }
 
 #[test]
@@ -154,7 +189,10 @@ fn production_git_wire_binds_the_verified_principal_to_the_live_identity_minter(
     let main = include_str!("../src/main.rs");
     let durable = include_str!("../src/git_durable.rs");
     let http = include_str!("../src/git_wire_http.rs");
-    let compact_main: String = main.split_whitespace().collect::<String>().replace(",)", ")");
+    let compact_main: String = main
+        .split_whitespace()
+        .collect::<String>()
+        .replace(",)", ")");
 
     assert!(compact_main.contains("IdentityGitWireCredentialIssuerFactory::new(check.clone())"));
     assert!(main.contains(".with_git_wire_credential_issuer(git_wire_credentials)"));
