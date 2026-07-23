@@ -59,22 +59,54 @@ accepting sockets, drains HTTP connections for up to 20 seconds, then closes any
 
 ### Bring the CI runner up
 
-In another foreground-owned terminal, start the CI control plane with its coordinated runner host:
+CI dogfood has three independently restartable service roots. Start each in its own foreground-owned
+terminal after the edge:
 
 ```sh
-./scripts/dogfood.sh ci
+./scripts/dogfood.sh dispatch      # Git events → durable CI runs + initial queued checks
+./scripts/dogfood.sh ci            # coordinated CI control plane and runner host
+./scripts/dogfood.sh git-checks    # ci.check.updated → Git-owned durable projection
 ```
 
-This uses the same dogfood cell, seal key, split PostgreSQL credentials, region, and data services as
-the edge, and sets the exact opt-in `MYELIN_CI_RUNNER=1`. The host owns queued-run start, durable Flow
-recovery, real gVisor execution, terminal accounting, and bounded shutdown as one lifecycle. Unset or
-`MYELIN_CI_RUNNER=0` keeps those lanes dormant; any other value is refused before database access.
+The `check:v1-<BLAKE3>` aggregate is a deliberate broker-routing cutover. Events emitted by an older
+build used the raw repository ArtifactRef as their aggregate and are not projection backfill
+authority. For an existing cell, keep the old Edge serving only as the rerun/verification front
+door, deploy the new `git-checks`, Dispatch, and coordinated CI/control-plane builds, drain every old
+Dispatch or CI producer instance, and start all three new service roots. Only then trigger a fresh CI
+rerun for every protected head and verify each exact OID with `verify-check`. Deploy the new Edge
+build that reads only the projection after every verification passes. Abort that Edge rollout if any
+producer cannot be upgraded/drained or any protected head cannot be re-established. A new
+personal-production cell has no historical check state and needs no backfill. This is fail-closed:
+old or in-flight facts can strand a head blocked, but can never make it green.
+
+All three use the same dogfood cell, seal key, split PostgreSQL credentials, region, durable bus, and
+data services. Dispatch consumes the production Git event stream and owns reserve/start. The
+control-plane command sets the exact opt-in `MYELIN_CI_RUNNER=1`; its host owns queued-run start,
+durable Flow recovery, real gVisor execution, terminal accounting, and bounded shutdown as one
+lifecycle. Git's projection consumer applies every check fact and its consumer-dedup mark in one
+transaction; the edge reads that Git-owned table rather than calling CI or trusting a PR mutation.
+Unset or `MYELIN_CI_RUNNER=0` keeps the runner lanes dormant; any other value is refused before
+database access.
 Activation also refuses before database access unless `MYELIN_RUNSC_BIN` is an absolute executable
 that identifies itself as gVisor `runsc`, `MYELIN_GVISOR_ROOTFS` is an absolute staged base rootfs
 with the required executables, and the host can execute a bounded non-root `/bin/false` smoke through
 the real rootless runsc, read-only OCI bundle, and delegated cgroup-v2 memory boundary.
 Keep the process in the foreground during dogfood. Stop it with SIGINT/SIGTERM and require a clean
-drain before restarting or upgrading it.
+drain before restarting or upgrading it. Do the same for dispatch and the Git projection consumer.
+
+After pushing a branch, opening its PR, and waiting for CI, run the read-only surfaced-check proof
+with the exact pushed commit. It performs only authenticated GETs; it neither changes the PR nor
+manually reports a check:
+
+```sh
+export MYELIN_TOKEN="$TOKEN"
+./scripts/dogfood.sh verify-check <repo> <pr-number> "$(git rev-parse <head-ref>)" build
+```
+
+The command exits nonzero unless the PR still points at that exact OID and `build` is in both the
+repository ruleset's required set and Git's settled, trusted green projection. Its JSON result also
+reports the full merge-gate verdict; the verdict may remain false until the separate review threshold
+is satisfied.
 
 ## 3. Mint an operator token (`edge bootstrap`)
 

@@ -82,6 +82,7 @@ pub const CI_RUN_TABLE: &str = "ci_run";
 pub const CI_DRIVE_MANIFEST_TABLE: &str = "ci_drive_manifest";
 pub const CI_JOB_TABLE: &str = "ci_job";
 pub const CHECK_ATTEMPT_TABLE: &str = "check_attempt";
+pub const CI_RUN_CHECK_ATTEMPT_TABLE: &str = "ci_run_check_attempt";
 pub const JOB_QUEUE_TABLE: &str = "job_queue";
 pub const FAIR_DEFICIT_TABLE: &str = "fair_deficit";
 pub const RUNNER_TABLE: &str = "runner";
@@ -136,8 +137,7 @@ pub const CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID: &str = "ci_0001b_ci_run_causal_
 pub const CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID: &str = "ci_0001c_ci_run_concurrency_group";
 /// Forward-only producer-authored PR row generation. This is separate from `ci_0001c` so the
 /// already-applied concurrency-group migration remains byte-identical.
-pub const CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID: &str =
-    "ci_0001d_ci_run_pr_head_generation";
+pub const CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID: &str = "ci_0001d_ci_run_pr_head_generation";
 /// Forward-only migration id for [`ALTER_CI_JOB_SPEC_ADD_STAGE_DDL`]. A sub-migration of the
 /// already-applied `ci_0015_ci_job_spec` table (the `ci_0002a` convention), applied immediately after
 /// it so its checksum is never rewritten and the `ci_0015` create stays byte-frozen.
@@ -341,6 +341,24 @@ CREATE TABLE IF NOT EXISTS check_attempt (
   current_run  uuid,
   PRIMARY KEY (tenant_id, repo_ref, commit_oid, context)
 )";
+
+/// Immutable attempt issued to one concrete run/context at dispatch reserve time. `check_attempt`
+/// remains the per-commit high-water allocator; this run-scoped row is the authority every later
+/// lifecycle fact must reuse even after a newer run advances the high-water row.
+pub const CREATE_CI_RUN_CHECK_ATTEMPT_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS ci_run_check_attempt (
+  tenant_id    text NOT NULL,
+  region       text NOT NULL,
+  run_id       uuid NOT NULL,
+  repo_ref     text NOT NULL,
+  commit_oid   text NOT NULL,
+  context      text NOT NULL,
+  run_attempt  integer NOT NULL CHECK (run_attempt > 0),
+  PRIMARY KEY (tenant_id, run_id, context),
+  UNIQUE (tenant_id, repo_ref, commit_oid, context, run_attempt),
+  FOREIGN KEY (tenant_id, run_id) REFERENCES ci_run(tenant_id, run_id) ON DELETE CASCADE
+);
+REVOKE UPDATE, DELETE ON ci_run_check_attempt FROM myelin_app";
 
 /// `job_queue` (arch 01 §3.3) — one row per schedulable job; the scheduler's hot claim surface. HOT.
 pub const CREATE_JOB_QUEUE_DDL: &str = "\
@@ -689,6 +707,11 @@ fn create_statements() -> Vec<(&'static str, &'static str, String)> {
             CREATE_CHECK_ATTEMPT_DDL.to_string(),
         ),
         (
+            "ci_0003a_ci_run_check_attempt",
+            CI_RUN_CHECK_ATTEMPT_TABLE,
+            CREATE_CI_RUN_CHECK_ATTEMPT_DDL.to_string(),
+        ),
+        (
             "ci_0004_job_queue",
             JOB_QUEUE_TABLE,
             CREATE_JOB_QUEUE_DDL.to_string(),
@@ -882,6 +905,7 @@ GRANT SELECT (tenant_id, region, run_id, wf_type, state, partition, created_at)
 pub const CI_DURABLE_WRITER_IDS: &[&str] = &[
     "ci_0001_ci_run",
     "ci_0003_check_attempt",
+    "ci_0003a_ci_run_check_attempt",
     "ci_0014_ci_cost_event",
 ];
 
@@ -1097,7 +1121,11 @@ pub fn ci_durable_migrations() -> Migrations {
 /// re-dispatch bump). `ci_run` is not hot. Consistent with [`ci_controlplane_hot_tables`] so the
 /// migration runner reads the SAME hot flags whichever set applies these tables.
 pub fn ci_durable_hot_tables() -> HotTables {
-    HotTables::declare([CI_COST_EVENT_TABLE, CHECK_ATTEMPT_TABLE])
+    HotTables::declare([
+        CI_COST_EVENT_TABLE,
+        CHECK_ATTEMPT_TABLE,
+        CI_RUN_CHECK_ATTEMPT_TABLE,
+    ])
 }
 
 /// **The CI Control-Plane hot-table declaration** (contract 1.5 / C-3; arch 01 §3 "Hot-table flags
@@ -1112,6 +1140,7 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
         LOG_SEGMENT_TABLE,
         CI_COST_EVENT_TABLE,
         CHECK_ATTEMPT_TABLE,
+        CI_RUN_CHECK_ATTEMPT_TABLE,
     ])
 }
 
@@ -1119,12 +1148,12 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
 mod tests {
     use super::*;
 
-    /// **All seventeen CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
+    /// **All eighteen CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
     /// The complete arch 01 §3 control-plane schema (+ CT-004d.1's `ci_job_spec`) lands here; `ci_run`
     /// precedes `ci_job` (the FK dependency). This is the prompt's "the complete forward-only
     /// data-model migrations" gate.
     #[test]
-    fn all_seventeen_controlplane_tables_are_present_fk_ordered() {
+    fn all_eighteen_controlplane_tables_are_present_fk_ordered() {
         let migrations = ci_controlplane_migrations();
         let tables: Vec<&str> = migrations
             .0
@@ -1139,6 +1168,7 @@ mod tests {
                 CI_DRIVE_MANIFEST_TABLE,
                 CI_JOB_TABLE,
                 CHECK_ATTEMPT_TABLE,
+                CI_RUN_CHECK_ATTEMPT_TABLE,
                 JOB_QUEUE_TABLE,
                 FAIR_DEFICIT_TABLE,
                 RUNNER_TABLE,
@@ -1153,7 +1183,7 @@ mod tests {
                 CI_JOB_SPEC_TABLE,
                 CI_JOB_ACCOUNTING_TABLE,
             ],
-            "all 17 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
+            "all 18 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
         );
         // ci_run precedes ci_job (the FK target before the FK source).
         let run_pos = tables.iter().position(|t| *t == CI_RUN_TABLE).unwrap();
@@ -1244,8 +1274,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            38,
-            "17 table/RLS + 3 ci_run ALTERs + 6 concurrent-index + 1 index-validation + 3 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 2 scheduler ci_run discovery grants"
+            39,
+            "18 table/RLS + 3 ci_run ALTERs + 6 concurrent-index + 1 index-validation + 3 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 2 scheduler ci_run discovery grants"
         );
         for m in &migrations.0 {
             assert!(
@@ -1325,8 +1355,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            38,
-            "the runner applied all 17 table/RLS, 3 ci_run ALTERs, 6 concurrent-index, 1 index-validation, 3 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, and 2 scheduler ci_run discovery grants"
+            39,
+            "the runner applied all 18 table/RLS, 3 ci_run ALTERs, 6 concurrent-index, 1 index-validation, 3 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, and 2 scheduler ci_run discovery grants"
         );
         assert_eq!(
             runner.applied()[0],
@@ -1540,17 +1570,18 @@ mod tests {
         );
     }
 
-    /// **The four hot tables are declared (arch 01 §3 "Hot-table flags declared").** `job_queue` /
-    /// `log_segment` / `ci_cost_event` / `check_attempt` — the write-QPS tables that refuse a blocking
-    /// ALTER (the C-3 expand→backfill→contract discipline) at boot.
+    /// **The five hot tables are declared (arch 01 §3 "Hot-table flags declared").** `job_queue` /
+    /// `log_segment` / `ci_cost_event` / the high-water and run-scoped check-attempt ledgers — the
+    /// write-QPS tables that refuse a blocking ALTER at boot.
     #[test]
-    fn the_four_hot_tables_are_declared() {
+    fn the_five_hot_tables_are_declared() {
         let hot = ci_controlplane_hot_tables();
         for t in [
             JOB_QUEUE_TABLE,
             LOG_SEGMENT_TABLE,
             CI_COST_EVENT_TABLE,
             CHECK_ATTEMPT_TABLE,
+            CI_RUN_CHECK_ATTEMPT_TABLE,
         ] {
             assert!(hot.is_hot(t), "`{t}` is declared hot (arch 01 §3)");
         }
@@ -1725,8 +1756,9 @@ mod tests {
 
     /// **CT-004m — the shared writer subset is byte-identical to the full set (no DDL divergence).**
     /// `ci_durable_migrations()` (the tables both CI mains apply at boot) carries EXACTLY the
-    /// `ci_run` / `check_attempt` / `ci_cost_event` migrations from the full `ci_controlplane_migrations()`
-    /// — same ids, same assembled DDL — so applying both at one boot is idempotent (shared ids no-op).
+    /// `ci_run` / `check_attempt` / `ci_run_check_attempt` / `ci_cost_event` migrations from the
+    /// full `ci_controlplane_migrations()` — same ids, same assembled DDL — so applying both at one
+    /// boot is idempotent (shared ids no-op).
     #[test]
     fn ci_durable_subset_matches_the_full_set_for_the_writer_tables() {
         let full = ci_controlplane_migrations();
@@ -1740,6 +1772,7 @@ mod tests {
                 CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
                 CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID,
                 "ci_0003_check_attempt",
+                "ci_0003a_ci_run_check_attempt",
                 "ci_0014_ci_cost_event",
             ],
             "the subset is exactly the writer-critical creates plus ci_run's forward ALTERs"
@@ -1757,23 +1790,28 @@ mod tests {
             );
             assert_eq!(full_m.table, m.table, "same table binding: {}", m.id);
         }
-        // The two hot tables in the subset agree with the full control-plane hot-table declaration.
+        // The hot tables in the subset agree with the full control-plane declaration.
         let hot = ci_durable_hot_tables();
-        assert!(hot.is_hot(CI_COST_EVENT_TABLE) && hot.is_hot(CHECK_ATTEMPT_TABLE));
+        assert!(
+            hot.is_hot(CI_COST_EVENT_TABLE)
+                && hot.is_hot(CHECK_ATTEMPT_TABLE)
+                && hot.is_hot(CI_RUN_CHECK_ATTEMPT_TABLE)
+        );
         assert!(!hot.is_hot(CI_RUN_TABLE), "ci_run is not hot");
     }
 
     /// **CT-004m — the shared subset applies forward-only at boot (no DROP), FK-safe.** The runner
-    /// admits `ci_run` / `check_attempt` / `ci_cost_event` (the CREATEs are Plain on empty tables); a
-    /// re-run is idempotent. This is the boot-time half of the both-mains-apply gate.
+    /// admits `ci_run` / `check_attempt` / `ci_run_check_attempt` / `ci_cost_event` (the CREATEs are
+    /// Plain on empty tables); a re-run is idempotent. This is the boot-time half of the
+    /// both-mains-apply gate.
     #[test]
     fn the_ci_durable_subset_applies_forward_only() {
         use myelin_substrate::MigrationRunner;
         let subset = ci_durable_migrations();
         assert_eq!(
             subset.0.len(),
-            6,
-            "three writer-critical CI tables plus three forward ci_run ALTERs"
+            7,
+            "four writer-critical CI tables plus three forward ci_run ALTERs"
         );
         for m in &subset.0 {
             assert!(
@@ -1799,6 +1837,6 @@ mod tests {
         runner
             .run(&subset, &ci_durable_hot_tables())
             .expect("the CI durable writer subset applies forward-only");
-        assert_eq!(runner.applied().len(), 6);
+        assert_eq!(runner.applied().len(), 7);
     }
 }

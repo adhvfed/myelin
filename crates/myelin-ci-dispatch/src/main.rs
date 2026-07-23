@@ -135,8 +135,8 @@ async fn main() {
     // outbox above):
     //   - reserve = `CoCommitReserveStore` (CT-004d.2 chunk 4): the run-of-record `ci_run` ROW
     //     co-commits ATOMICALLY with the dedup mark on the consumer's `HandlerTx`
-    //     (`CiRunStore::co_commit_insert`); the events ride the DURABLE outbox in ABSORB mode (the
-    //     honest #7 H1 split). Its `ci_run`/`consumer_dedup` tables are migrated above (foundation +
+    //     (`CiRunStore::co_commit_reserve`); check-attempt allocation and queued outbox rows share
+    //     that exact transaction. Its `ci_run`/`consumer_dedup` tables are migrated above (foundation +
     //     CT-004m), so no boot-order coupling.
     //   - CAS = the real `S3BlobStore` (RustFS/Scaleway). The former "INTEGRATION-GATED CAS" note was
     //     STALE: `aws-sdk-s3` is a NON-OPTIONAL dep via `myelin-storage` (MR-009b Wave 1), so the CAS
@@ -176,20 +176,16 @@ async fn main() {
             tokio::runtime::Handle::current(),
         ),
     );
-    // A SEPARATE durable outbox handle for the reserve store's event-absorb: the `outbox` above is
-    // MOVED into `run_dispatch` below; both are cheap handles over the same pool.
-    let reserve_outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
-        provider.db_pool().clone(),
-        tokio::runtime::Handle::current(),
-    )));
     let blobs = Arc::new(myelin_storage::s3blob::S3BlobStore::connect(
         &provider.config().s3,
         tokio::runtime::Handle::current(),
     ));
     match blobs.preflight() {
         Ok(()) => {}
-        Err(error @ (myelin_storage::blob::BlobDependencyError::PermanentConfig
-            | myelin_storage::blob::BlobDependencyError::PermanentAuth)) => {
+        Err(
+            error @ (myelin_storage::blob::BlobDependencyError::PermanentConfig
+            | myelin_storage::blob::BlobDependencyError::PermanentAuth),
+        ) => {
             eprintln!("ci-dispatch: {error}; refusing broker intake");
             std::process::exit(1);
         }
@@ -201,7 +197,6 @@ async fn main() {
         git_root,
         blobs.clone(),
         ci_run,
-        reserve_outbox,
         dedup,
         dead_letters,
         provider.config().region.clone(),

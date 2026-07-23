@@ -30,9 +30,11 @@ use myelin_identity_service::ResolvedDelegationPolicy;
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 
-use myelin_edge::{DenyAllRepos, DurableGitBackend, GitEffectApi, GrantBackedRepos};
 #[cfg(feature = "integration")]
 use myelin_edge::recover_placed_git_at_boot;
+use myelin_edge::{
+    DenyAllRepos, DurableGitBackend, GitDatabaseProviders, GitEffectApi, GrantBackedRepos,
+};
 use myelin_mcp::{
     GateApproverPolicy, GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal,
     ToolRegistry,
@@ -383,7 +385,10 @@ fn caller_keys_distinguish_intentional_identical_calls() {
     )
     .unwrap();
     assert_eq!(missing_key["error"]["code"], -32602);
-    assert!(backend.get_pr(TENANT, REGION, "alpha", 1, &actor).unwrap().is_none());
+    assert!(backend
+        .get_pr(TENANT, REGION, "alpha", 1, &actor)
+        .unwrap()
+        .is_none());
 
     for key in ["intentional-call-1", "intentional-call-2"] {
         let response: serde_json::Value = serde_json::from_str(
@@ -394,7 +399,10 @@ fn caller_keys_distinguish_intentional_identical_calls() {
         .unwrap();
         assert_eq!(response["result"]["isError"], false, "{response}");
     }
-    assert!(backend.get_pr(TENANT, REGION, "alpha", 2, &actor).unwrap().is_some());
+    assert!(backend
+        .get_pr(TENANT, REGION, "alpha", 2, &actor)
+        .unwrap()
+        .is_some());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -445,10 +453,7 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
         .verify_index_ready("git_pr_command_operation_scope_uidx")
         .await
         .expect("tenant/region-global PR operation index");
-    let provider = bootstrap
-        .into_runtime()
-        .await
-        .expect("runtime provider");
+    let provider = bootstrap.into_runtime().await.expect("runtime provider");
     let handle = tokio::runtime::Handle::current();
     let root = temp_root("response-lost-pg");
     let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
@@ -464,11 +469,15 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
     let other_slug = format!("mcp-retry-other-{suffix}");
     let backend_outbox = outbox.clone();
     let recovery_provider = provider.clone();
+    let check_admission_provider = provider
+        .auxiliary_runtime_lane(1)
+        .await
+        .expect("dedicated check-admission lane");
     let backend = Arc::new(
         DurableGitBackend::rooted(
             &root,
             String::new(),
-            provider,
+            GitDatabaseProviders::new(provider, check_admission_provider),
             Arc::new(KmsEngine::new()),
             handle,
             outbox,
@@ -579,10 +588,7 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
         "response-lost-open-1",
     );
     let mut open_jtis = Vec::new();
-    for timestamp in [
-        "2026-06-29T00:00:00Z",
-        "2026-06-29T00:00:01Z",
-    ] {
+    for timestamp in ["2026-06-29T00:00:00Z", "2026-06-29T00:00:01Z"] {
         // A fresh server/router has no in-memory token state and therefore remints a new JTI. The
         // caller-stable namespaced key is the only invocation identity carried across this restart.
         let server = governed_git_server_with_grants_scoped_at(
@@ -597,12 +603,18 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
             REGION,
             Timestamp(timestamp.into()),
         );
-        let value: serde_json::Value = serde_json::from_str(
-            &server.handle_line(&open).expect("open response"),
-        )
-        .unwrap();
-        assert_eq!(value["result"]["isError"], false, "open retry applied: {value}");
-        open_jtis.push(value["result"]["_meta"]["runToken"].as_str().unwrap().to_owned());
+        let value: serde_json::Value =
+            serde_json::from_str(&server.handle_line(&open).expect("open response")).unwrap();
+        assert_eq!(
+            value["result"]["isError"], false,
+            "open retry applied: {value}"
+        );
+        open_jtis.push(
+            value["result"]["_meta"]["runToken"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
     }
     assert_ne!(open_jtis[0], open_jtis[1], "restart reminted the run token");
 
@@ -638,7 +650,10 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
             .expect("cross-repo misuse response"),
     )
     .unwrap();
-    assert_eq!(cross_repo_value["result"]["isError"], true, "{cross_repo_value}");
+    assert_eq!(
+        cross_repo_value["result"]["isError"], true,
+        "{cross_repo_value}"
+    );
     assert!(
         cross_repo_value["result"]["_meta"]["reason"]
             .as_str()
@@ -672,7 +687,9 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
         Timestamp("2026-06-29T00:00:03Z".into()),
     );
     let misuse_value: serde_json::Value = serde_json::from_str(
-        &misuse_server.handle_line(&misused).expect("misuse response"),
+        &misuse_server
+            .handle_line(&misused)
+            .expect("misuse response"),
     )
     .unwrap();
     assert_eq!(misuse_value["result"]["isError"], true, "{misuse_value}");
@@ -689,10 +706,7 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
         "response-lost-review-1",
     );
     let mut review_jtis = Vec::new();
-    for timestamp in [
-        "2026-06-29T00:00:04Z",
-        "2026-06-29T00:00:05Z",
-    ] {
+    for timestamp in ["2026-06-29T00:00:04Z", "2026-06-29T00:00:05Z"] {
         let server = governed_git_server_with_grants_scoped_at(
             backend.clone(),
             &[
@@ -705,15 +719,18 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
             REGION,
             Timestamp(timestamp.into()),
         );
-        let value: serde_json::Value = serde_json::from_str(
-            &server.handle_line(&review).expect("review response"),
-        )
-        .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&server.handle_line(&review).expect("review response")).unwrap();
         assert_eq!(
             value["result"]["isError"], false,
             "review retry applied: {value}"
         );
-        review_jtis.push(value["result"]["_meta"]["runToken"].as_str().unwrap().to_owned());
+        review_jtis.push(
+            value["result"]["_meta"]["runToken"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
     }
     assert_ne!(review_jtis[0], review_jtis[1], "review retry also reminted");
 
@@ -721,11 +738,18 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
         .get_pr(&live_tenant, REGION, &slug, 1, &actor)
         .unwrap()
         .expect("one PR");
-    assert_eq!(record.reviews.len(), 1, "review retry appended exactly once");
-    assert!(backend
-        .get_pr(&live_tenant, REGION, &slug, 2, &actor)
-        .unwrap()
-        .is_none(), "open retry allocated no second PR");
+    assert_eq!(
+        record.reviews.len(),
+        1,
+        "review retry appended exactly once"
+    );
+    assert!(
+        backend
+            .get_pr(&live_tenant, REGION, &slug, 2, &actor)
+            .unwrap()
+            .is_none(),
+        "open retry allocated no second PR"
+    );
 
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
@@ -756,7 +780,10 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
     .fetch_one(&admin)
     .await
     .unwrap();
-    assert_eq!(cross_repo_events, 0, "cross-repo key misuse emitted no event");
+    assert_eq!(
+        cross_repo_events, 0,
+        "cross-repo key misuse emitted no event"
+    );
     let commands: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM git_pr_command
           WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3
@@ -768,7 +795,10 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
     .fetch_one(&admin)
     .await
     .unwrap();
-    assert_eq!(commands, 2, "one digest-only command per logical MCP effect");
+    assert_eq!(
+        commands, 2,
+        "one digest-only command per logical MCP effect"
+    );
 
     // Seed both boot-recovery classes. First, a committed ref witness whose filesystem CAS did not
     // run. Second, a durable pending merge intent/command whose locked target CAS still has to run.

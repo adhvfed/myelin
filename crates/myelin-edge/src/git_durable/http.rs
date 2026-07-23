@@ -53,13 +53,7 @@ impl Handler for DRepoList {
         let limit = ctx.page.limit;
         let (page, has_more) = self
             .be
-            .list_repos_visible(
-                tenant_of(ctx),
-                region_of(ctx),
-                ctx.principal,
-                offset,
-                limit,
-            )
+            .list_repos_visible(tenant_of(ctx), region_of(ctx), ctx.principal, offset, limit)
             .map_err(map_durable_err)?;
         let items: Vec<Value> = page.iter().map(|repo| repo.to_json()).collect();
         let next = if has_more {
@@ -869,18 +863,9 @@ mod tree_page_backend_tests {
                 .expect("move main");
         }
 
-        fn tree_json(
-            &self,
-            request: TreePageRequest,
-        ) -> Result<Value, TreePageError> {
-            self.be.tree_json(
-                TENANT,
-                REGION,
-                self.label(),
-                "refs/heads/main",
-                "",
-                request,
-            )
+        fn tree_json(&self, request: TreePageRequest) -> Result<Value, TreePageError> {
+            self.be
+                .tree_json(TENANT, REGION, self.label(), "refs/heads/main", "", request)
         }
 
         fn label(&self) -> &str {
@@ -901,8 +886,8 @@ mod tree_page_backend_tests {
     fn oid_bytes(oid: &CoreOid) -> [u8; 20] {
         let mut bytes = [0_u8; 20];
         for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&oid.as_str()[index * 2..index * 2 + 2], 16)
-                .expect("hex oid");
+            *byte =
+                u8::from_str_radix(&oid.as_str()[index * 2..index * 2 + 2], 16).expect("hex oid");
         }
         bytes
     }
@@ -1187,11 +1172,8 @@ mod tree_page_backend_tests {
         let fixture = Fixture::new("snapshot-meta");
         let (_, first) = fixture.commit_named_files(&[("file.txt", b"first\n")], &[], "first");
         fixture.create_main(&first);
-        let (_, second) = fixture.commit_named_files(
-            &[("file.txt", b"second\n")],
-            &[&first],
-            "second",
-        );
+        let (_, second) =
+            fixture.commit_named_files(&[("file.txt", b"second\n")], &[&first], "second");
         fixture.move_main(&first, &second);
 
         let tree = fixture
@@ -1854,16 +1836,8 @@ mod pr_commit_pagination_tests {
         let third_oid = third["items"][0]["oid"].as_str().unwrap().to_string();
         assert!(third["page"]["next_cursor"].is_null());
         assert_eq!(
-            std::collections::BTreeSet::from([
-                fixture.head.0.clone(),
-                second_oid,
-                third_oid,
-            ]),
-            std::collections::BTreeSet::from([
-                fixture.head.0,
-                fixture.third.0,
-                fixture.second.0,
-            ]),
+            std::collections::BTreeSet::from([fixture.head.0.clone(), second_oid, third_oid,]),
+            std::collections::BTreeSet::from([fixture.head.0, fixture.third.0, fixture.second.0,]),
             "the pinned pages contain each PR-owned commit exactly once"
         );
         std::fs::remove_dir_all(&fixture.root).ok();
@@ -2095,7 +2069,9 @@ fn decode_form_query_component(raw: &str, subject: &str) -> Result<String, EdgeE
 
 fn parse_file_lines_query(query: &str) -> Result<FileLinesQuery, EdgeError> {
     if query.len() > FILE_LINES_MAX_QUERY_BYTES {
-        return Err(EdgeError::BadRequest("file-lines query is too large".into()));
+        return Err(EdgeError::BadRequest(
+            "file-lines query is too large".into(),
+        ));
     }
     let mut path = None;
     let mut start = None;
@@ -2119,7 +2095,11 @@ fn parse_file_lines_query(query: &str) -> Result<FileLinesQuery, EdgeError> {
                 path = Some(decoded);
             }
             "start" | "end" => {
-                let slot = if name == "start" { &mut start } else { &mut end };
+                let slot = if name == "start" {
+                    &mut start
+                } else {
+                    &mut end
+                };
                 if slot.is_some() {
                     return Err(duplicate(name));
                 }
@@ -2135,7 +2115,11 @@ fn parse_file_lines_query(query: &str) -> Result<FileLinesQuery, EdgeError> {
                 }
                 *slot = Some(number as usize);
             }
-            "" => return Err(EdgeError::BadRequest("empty file-lines query parameter".into())),
+            "" => {
+                return Err(EdgeError::BadRequest(
+                    "empty file-lines query parameter".into(),
+                ))
+            }
             other => {
                 return Err(EdgeError::BadRequest(format!(
                     "unknown file-lines query parameter `{other}`"
@@ -2144,7 +2128,8 @@ fn parse_file_lines_query(query: &str) -> Result<FileLinesQuery, EdgeError> {
         }
     }
     let path = path.ok_or_else(|| EdgeError::BadRequest("file-lines path is required".into()))?;
-    let start = start.ok_or_else(|| EdgeError::BadRequest("file-lines start is required".into()))?;
+    let start =
+        start.ok_or_else(|| EdgeError::BadRequest("file-lines start is required".into()))?;
     let end = end.ok_or_else(|| EdgeError::BadRequest("file-lines end is required".into()))?;
     if end < start || end - start + 1 > FILE_LINES_MAX_RANGE {
         return Err(EdgeError::BadRequest(format!(
@@ -2425,7 +2410,7 @@ impl Handler for DPrChecks {
             .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
         let vm = self
             .be
-            .pr_checks_json(&loc, &rec)
+            .pr_checks_json(&loc, &rec, ctx.principal)
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(200, &vm))
     }
@@ -2699,7 +2684,7 @@ impl Handler for DMerge {
                     .pr_get(&loc, num_param(ctx, "n")?, ctx.principal)
                     .ok()
                     .flatten()
-                    .and_then(|rec| self.be.pr_checks_json(&loc, &rec).ok());
+                    .and_then(|rec| self.be.pr_checks_json(&loc, &rec, ctx.principal).ok());
                 Ok(EdgeResponse::json(
                     409,
                     &json!({
@@ -4096,8 +4081,8 @@ mod pr_list_tests {
             .grant_read("u:viewer", TENANT, "alpha")
             .grant_read("u:viewer", TENANT, "beta")
             .grant_read("u:viewer", TENANT, "gamma");
-        let be = DurableGitBackend::rooted_inmem_for_test(&root)
-            .with_repo_authorizer(Arc::new(authz));
+        let be =
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
         let viewer = human("u:viewer");
         for slug in ["alpha", "beta", "gamma"] {
             be.create_repo_as(TENANT, REGION, slug, &viewer).unwrap();
@@ -4230,12 +4215,7 @@ mod pr_list_tests {
             ));
         }
 
-        let first = serve(
-            &handler,
-            &viewer,
-            None,
-            "bucket=yours&sort=created&limit=1",
-        );
+        let first = serve(&handler, &viewer, None, "bucket=yours&sort=created&limit=1");
         assert_eq!(first["counts"]["bucket"], 2);
         assert_eq!(first["items"][0]["repo"], "alpha");
         let next = first["page"]["next_cursor"].as_str().unwrap();
@@ -4741,7 +4721,10 @@ mod pr_list_tests {
     #[test]
     fn pr_number_allocation_never_resets_or_wraps() {
         assert_eq!(DurableGitBackend::next_pr_number_after(None).unwrap(), 1);
-        assert_eq!(DurableGitBackend::next_pr_number_after(Some(41)).unwrap(), 42);
+        assert_eq!(
+            DurableGitBackend::next_pr_number_after(Some(41)).unwrap(),
+            42
+        );
         let err = DurableGitBackend::next_pr_number_after(Some(u64::MAX))
             .expect_err("an exhausted namespace must fail instead of wrapping");
         assert!(err.to_string().contains("number space exhausted"));
@@ -4811,13 +4794,16 @@ mod pr_list_tests {
             "F8: a non-existent head_ref is a 400 at open, not a merge-time surprise"
         );
         let oversized = be.raw_response_bounded(
-                TENANT,
-                REGION,
-                "core",
-                "refs/heads/feature",
-                "f.txt",
-                RawResponseOptions { attachment: true, maximum_bytes: 1 },
-            );
+            TENANT,
+            REGION,
+            "core",
+            "refs/heads/feature",
+            "f.txt",
+            RawResponseOptions {
+                attachment: true,
+                maximum_bytes: 1,
+            },
+        );
         assert!(matches!(oversized, Err(error) if error.status() == 413));
         assert_eq!(
             read_text_blob_at_snapshot_bounded(&repo, &tip, "f.txt", 1).unwrap(),
@@ -4923,7 +4909,10 @@ mod pr_list_tests {
         ] {
             let mapped = map_durable_err(DurableError::Git(private.into()));
             assert_eq!(mapped.status(), 413);
-            assert_eq!(mapped.to_string(), format!("413 (payload_too_large): {public}"));
+            assert_eq!(
+                mapped.to_string(),
+                format!("413 (payload_too_large): {public}")
+            );
         }
     }
 }

@@ -69,8 +69,19 @@ use std::collections::BTreeMap;
 /// PII-free identifiers (a repo ref + a git OID); never a payload. The Bus carries this opaque —
 /// it does not parse the repo ref's internals (Refs owns the `ArtifactRef` grammar, contract 5.7).
 pub fn check_aggregate(repo: &str, commit_oid: &str) -> AggregateKey {
-    // `repo#commit-<oid>` — the commit-anchored aggregate; every context for this commit lands here.
-    AggregateKey(format!("{repo}#commit-{commit_oid}"))
+    // `check:v1-<BLAKE3(repo NUL commit_oid)>` — a fixed-width commit-anchored aggregate; every
+    // context for this exact pair lands here. `check:` is the mandatory structured aggregate-type
+    // prefix used by the durable JetStream subject codec (`<aggregate_type>:<aggregate_id>`).
+    // Hashing is required rather than cosmetic: a canonical repository ArtifactRef may contain `.`
+    // or exceed one broker token, while NATS permits neither. The human-facing envelope subject
+    // remains the canonical ArtifactRef; this key is only the opaque ordering partition. The domain
+    // separator and version prefix make future codec changes explicit.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"myelin.check.aggregate.v1\0");
+    hasher.update(repo.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(commit_oid.as_bytes());
+    AggregateKey(format!("check:v1-{}", hasher.finalize().to_hex()))
 }
 
 /// The `ci.check.updated` envelope `subject` (§4.12 / X-1): `repo#commit-<oid>/check-<context>` — a
@@ -512,7 +523,8 @@ mod tests {
             "subject = repo#commit-<oid>/check-<context> (§4.12)"
         );
         assert_eq!(
-            draft.aggregate.0, "myelin://acme/git/repo/core#commit-abc123",
+            draft.aggregate,
+            check_aggregate("myelin://acme/git/repo/core", "abc123"),
             "aggregate = (repo, commit_oid) — all contexts for one commit share it"
         );
         // The Bus carries the CheckStatus OPAQUE — it round-trips untouched.
@@ -534,6 +546,30 @@ mod tests {
         assert_ne!(
             a_build, a_other_commit,
             "a different commit → a different aggregate"
+        );
+    }
+
+    #[test]
+    fn dotted_repository_ref_encodes_to_one_structured_stream_token() {
+        let envelope = check_env(
+            "myelin://acme/git/repo/myelin.rs",
+            "deadbeef",
+            "build",
+            1,
+            "success",
+        );
+        assert!(envelope.aggregate.0.starts_with("check:v1-"));
+        assert_eq!(envelope.aggregate.0.len(), "check:v1-".len() + 64);
+        let aggregate_id = envelope
+            .aggregate
+            .0
+            .strip_prefix("check:")
+            .expect("structured aggregate prefix");
+        assert_eq!(
+            crate::partition::StreamSubject::of(&envelope)
+                .expect("every valid dotted Git repository is broker-routable")
+                .to_subject(),
+            format!("evt.acme.ci.check.{aggregate_id}.updated")
         );
     }
 
@@ -787,7 +823,8 @@ mod tests {
             "subject = repo#commit-<oid>/ci-result (§4.12 #sub)"
         );
         assert_eq!(
-            draft.aggregate.0, "myelin://acme/git/repo/core#commit-abc123",
+            draft.aggregate,
+            check_aggregate("myelin://acme/git/repo/core", "abc123"),
             "the rollup shares the per-commit aggregate so it linearises after its checks"
         );
         assert_eq!(

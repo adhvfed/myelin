@@ -65,15 +65,15 @@ pub mod ci_identity_adapter;
 /// Server-owned mapping from the authored `linux-small-v1` request to fixed default-deny runtime
 /// terms plus explicit durable budget/token authority handles.
 pub mod ci_launch_authority;
-/// Production manifest resolver and DAG-native durable `ci.pipeline` body.
-pub mod ci_manifest_pipeline;
 /// Exact manifest job identity, sandbox translation, and explicit token authority.
 pub mod ci_manifest_job_runner;
+/// Production manifest resolver and DAG-native durable `ci.pipeline` body.
+pub mod ci_manifest_pipeline;
 pub mod ci_pipeline;
 pub mod ci_result_signal;
-pub mod ci_runtime_composition;
 pub mod ci_runner_composition;
 pub mod ci_runner_host;
+pub mod ci_runtime_composition;
 pub use ci_claim_token_issuer::{CiJobCredentialMinter, LockedManifestCiJobTokenIssuer};
 pub use ci_drive_manifest::{
     ci_check_context_v1, CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1,
@@ -86,6 +86,21 @@ pub use ci_identity_adapter::{
     ci_job_authorization_context, IdentityCiJobCredentialMinter, IdentityCiJobLaunchAuthorizer,
     CI_JOB_PRINCIPAL_ID, CI_JOB_REQUIRED_CAPABILITIES,
 };
+pub use ci_launch_authority::{
+    CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority,
+    ManifestBoundCiJobTokenAuthority, PgTierPCiJobBudgetReservation, TierPOperationalCiJobPricer,
+    LINUX_SMALL_V1_POLICY_REVISION, LINUX_SMALL_V1_RUNNER_LABELS,
+    TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
+};
+pub use ci_manifest_job_runner::{
+    register_durable_ci_manifest_pipeline, CiJobTokenIssueError, CiJobTokenIssuer,
+    CiJobTokenRequest, CiManifestDurableJobRunner,
+};
+pub use ci_manifest_pipeline::{
+    decode_resolved_ci_manifest, drive_resolved_ci_manifest_pipeline,
+    register_ci_manifest_pipeline, run_ci_manifest_pipeline, CiManifestInputResolver,
+    CiManifestPipelineOutcome,
+};
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use ci_runner_composition::{
@@ -95,28 +110,14 @@ pub use ci_runner_composition::{
     ci_runner_hooks, ci_runner_identity_authorities, CiRunnerIdentityAuthorities,
     CiRunnerIdentityCompositionError,
 };
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use ci_runtime_composition::ci_production_runtime_factory_test_support;
 pub use ci_runtime_composition::{
     ci_manifest_pipeline_definition, ci_production_runtime_factory, CiProductionRuntimeFactory,
     CiProductionWorkflowPoller, CiRuntimeCompositionError, CiWorkflowFanoutBatch,
     CI_FLOW_OUTBOX_SCHEMA_VERSION, CI_FLOW_WORKER_LEASE_TTL_SECS, CI_MANIFEST_PIPELINE_VERSION,
     MAX_CI_WORKFLOW_DRIVES_PER_SCOPE, MAX_CI_WORKFLOW_SCOPES_PER_PASS,
-};
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub use ci_runtime_composition::ci_production_runtime_factory_test_support;
-pub use ci_launch_authority::{
-    CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority,
-    ManifestBoundCiJobTokenAuthority, PgTierPCiJobBudgetReservation, TierPOperationalCiJobPricer,
-    LINUX_SMALL_V1_POLICY_REVISION, LINUX_SMALL_V1_RUNNER_LABELS,
-    TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
-};
-pub use ci_manifest_pipeline::{
-    decode_resolved_ci_manifest, drive_resolved_ci_manifest_pipeline, register_ci_manifest_pipeline,
-    run_ci_manifest_pipeline, CiManifestInputResolver, CiManifestPipelineOutcome,
-};
-pub use ci_manifest_job_runner::{
-    register_durable_ci_manifest_pipeline, CiJobTokenIssueError, CiJobTokenIssuer,
-    CiJobTokenRequest, CiManifestDurableJobRunner,
 };
 /// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
 /// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`
@@ -132,9 +133,9 @@ pub use ci_manifest_job_runner::{
 /// now-real policy, Identity, and scoped reservation authorities, then closing the complete
 /// crash/recovery matrix.
 pub mod ci_run_region;
-pub mod ci_run_supersession;
 pub mod ci_run_starter_poller;
 pub mod ci_run_store;
+pub mod ci_run_supersession;
 pub mod ci_scheduler_db;
 /// CT-004a (CI backend reconcile-and-harden — the FOUNDATION chunk): the REAL durable `cost_event`
 /// projection store ([`cost_store::CiCostEventStore`]). Turns the previously model-only CI metering
@@ -562,6 +563,13 @@ pub use job_spec_store::{
 // check-emitter resolve path). A conflict on `(tenant_id, run_id)` is accepted only after a separate
 // locking query verifies every immutable field; divergent/invisible conflicts fail typed and loud.
 // The co-emitted events stay absorb-mode through the outbox (the honest #7 H1 split).
+pub use ci_run_region::{
+    CiActiveRunCursor, CiActiveRunPage, CiActiveRunRoute, CiRegionRunDiscovery,
+    DISCOVER_ACTIVE_CI_RUNS_QUERY, DISCOVER_QUEUED_CI_RUN_TENANT_QUERY, MAX_ACTIVE_CI_RUN_PAGE,
+};
+pub use ci_run_starter_poller::{
+    CiRunStarterBatch, CiRunStarterPollerError, PgCiRunStarterPoller, MAX_CI_RUN_START_BATCH,
+};
 pub use ci_run_store::{
     CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationOutcome, CiRunFinalizationWrite,
     CiRunFinalizer, CiRunInsert, CiRunRecord, CiRunStore, CiRunStoreError, CiRunTerminalState,
@@ -569,14 +577,7 @@ pub use ci_run_store::{
     LOCK_CI_RUN_FOR_FINALIZE_QUERY, LOCK_CI_RUN_FOR_TOKEN_MINT_QUERY,
     SELECT_CI_RUN_ACCOUNTING_QUERY, SELECT_CI_RUN_QUERY, VERIFY_CI_RUN_REPLAY_QUERY,
 };
-pub use ci_run_region::{
-    CiActiveRunCursor, CiActiveRunPage, CiActiveRunRoute, CiRegionRunDiscovery,
-    DISCOVER_ACTIVE_CI_RUNS_QUERY, DISCOVER_QUEUED_CI_RUN_TENANT_QUERY, MAX_ACTIVE_CI_RUN_PAGE,
-};
 pub use ci_run_supersession::{CiRunSupersessionError, PgCiRunSupersession};
-pub use ci_run_starter_poller::{
-    CiRunStarterBatch, CiRunStarterPollerError, PgCiRunStarterPoller, MAX_CI_RUN_START_BATCH,
-};
 pub use ci_runner_host::{
     wait_for_ci_runner_host_drain_timeout, wait_for_ci_runner_host_failure, CiRunnerHost,
     CiRunnerHostConfig, CiRunnerHostFailure, CiRunnerHostHandle, CI_RUNNER_HOST_DRAIN_TIMEOUT,
@@ -649,24 +650,24 @@ pub use migrations::{
     CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID, CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID,
     CI_JOB_SPEC_STAGE_MIGRATION_ID, CI_JOB_SPEC_TABLE, CI_JOB_TABLE,
     CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
-    CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID, CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID,
-    CI_RUN_QUEUED_REGION_INDEX,
+    CI_RUN_CHECK_ATTEMPT_TABLE, CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
+    CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID, CI_RUN_QUEUED_REGION_INDEX,
     CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID, CI_RUN_TABLE,
-    CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
-    CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID,
-    CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID, CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID,
-    CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID, CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL,
-    CREATE_CHECK_ATTEMPT_DDL,
+    CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID,
+    CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID, CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID,
+    CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID, CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID,
+    CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL, CREATE_CHECK_ATTEMPT_DDL,
     CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_ACCOUNTING_DDL,
     CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL,
-    CREATE_CI_REGION_SCHEDULER_RLS_DDL, CREATE_CI_RUN_DDL, CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL,
-    CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
-    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL,
-    CREATE_SECRET_BINDING_DDL, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE,
-    GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL, GRANT_SCHEDULER_CLAIM_NONCE_DDL,
-    GRANT_SCHEDULER_CLAIM_TIME_DDL, GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE,
-    JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE,
-    RUNNER_TABLE, SECRET_BINDING_TABLE, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+    CREATE_CI_REGION_SCHEDULER_RLS_DDL, CREATE_CI_RUN_CHECK_ATTEMPT_DDL, CREATE_CI_RUN_DDL,
+    CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL, CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL,
+    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL, CREATE_SECRET_BINDING_DDL,
+    DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE, GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL,
+    GRANT_SCHEDULER_CLAIM_NONCE_DDL, GRANT_SCHEDULER_CLAIM_TIME_DDL,
+    GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE, JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX,
+    JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE, RUNNER_TABLE, SECRET_BINDING_TABLE,
+    VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
 };
 
 pub use permanent_gates::{

@@ -15,7 +15,7 @@
 //! PRODUCTION durable `ci_run` writer that test proved: a `PgPool`-holding `…Store` running
 //! byte-identical SQL, mirroring [`crate::job_spec_store::CiJobSpecStore`].
 //!
-//! ## The co-commit shape (the load-bearing invariant) — and the honest events-stay-absorb split
+//! ## The co-commit shape (the load-bearing invariant)
 //! The `ci_run` ROW is the exactly-once RUN-OF-RECORD, so it MUST land atomically with the consumer's
 //! dedup mark (the #7 / MR-023b floor): a crash (rollback) between them leaves NEITHER, a redelivery
 //! re-runs and lands both exactly once. [`CiRunStore::co_commit_insert`] writes the row on the
@@ -23,12 +23,9 @@
 //! SAME `sqlx` transaction the dedup mark is in — so the row + the mark commit or roll back as ONE unit
 //! (the runtime commits the tx on `Done`, rolls it back on `Retry`/failure — `myelin_events::consumer`).
 //!
-//! **HONEST SCOPE (the #7 H1 finding, unchanged):** the co-emitted `ci.run.started` / `ci.check.updated`
-//! EVENTS still go through the OUTBOX (which owns its OWN pool — the ci-dispatch leaf crate cannot name
-//! `sqlx` outside `--features integration`), so they stay on ABSORB mode (`commit_absorb` →
-//! `ON CONFLICT (event_id) DO NOTHING`, idempotent on the deterministic ids). This chunk co-commits the
-//! run-of-record ROW with the mark; the events remain absorb-idempotent. Forcing the outbox events onto
-//! the external connection was H1's REJECTED path (the leaf crate has no `sqlx` there) — NOT re-opened.
+//! [`CiRunStore::co_commit_reserve`] extends that boundary to the retry-stable `check_attempt`
+//! allocation and detached canonical outbox rows. It uses the sanctioned `PgRelay` insertion on the
+//! caller's connection, so run, attempt, queued facts, and dedup mark have one commit point.
 //!
 //! ## Idempotency + RLS (fail-closed)
 //! `ON CONFLICT (tenant_id, run_id) DO NOTHING` — a redelivered trigger mints the SAME deterministic
@@ -49,6 +46,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use myelin_ci_sandbox::ResourceUsage;
+use myelin_events::OutboxRow;
+use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::{
     with_tenant_tx, with_tenant_tx_error, DurableCostLedger, MinorUnits, PgError,
     RunId as CostRunId, TenantScope,
@@ -695,6 +694,46 @@ impl CiRunStore {
         tokio::task::block_in_place(|| rt.block_on(insert_on_conn(conn, row)))
     }
 
+    /// Reserve a queued run, allocate its authoritative per-context check attempts, and stage the
+    /// resulting outbox envelopes in the consumer's existing dedup transaction. The callback sees
+    /// the committed-if-this-transaction-commits attempt map and must return detached canonical
+    /// outbox rows stamped with those exact attempts. Run row, attempt allocation, queued facts,
+    /// and consumer dedup mark therefore share one PostgreSQL commit boundary.
+    pub fn co_commit_reserve<F>(
+        &self,
+        tx: &mut myelin_events::HandlerTx<'_>,
+        row: &CiRunInsert,
+        contexts: &BTreeSet<String>,
+        rt: &tokio::runtime::Handle,
+        stage: F,
+    ) -> Result<BTreeMap<String, u32>, CiRunStoreError>
+    where
+        F: FnOnce(&BTreeMap<String, u32>) -> Result<Vec<OutboxRow>, String>,
+    {
+        validate_initial_state(row)?;
+        if contexts.is_empty() {
+            return Err(CiRunStoreError::Db(
+                "reserve requires at least one check context".into(),
+            ));
+        }
+        let conn = tx
+            .connection::<sqlx::PgConnection>()
+            .ok_or(CiRunStoreError::NoCoCommitTx)?;
+        tokio::task::block_in_place(|| {
+            rt.block_on(async {
+                insert_on_conn(conn, row).await?;
+                let attempts = allocate_reserve_check_attempts(conn, row, contexts).await?;
+                let rows = stage(&attempts).map_err(|error| {
+                    CiRunStoreError::Db(format!("stage reserve events: {error}"))
+                })?;
+                PgRelay::co_commit_rows_in_tx(conn, &rows)
+                    .await
+                    .map_err(CiRunStoreError::from)?;
+                Ok(attempts)
+            })
+        })
+    }
+
     /// **INSERT a `ci_run` row on the store's OWN pool under a tenant-scoped tx (the standalone /
     /// round-trip write).** Acquires through [`with_tenant_tx_error`] (BEGIN → set the `(tenant,
     /// region)` GUC transaction-scoped → INSERT/verify → COMMIT), so it is RLS-isolated, leaves no
@@ -1014,6 +1053,91 @@ fn validate_finalization_scope(
         ));
     }
     Ok(())
+}
+
+async fn allocate_reserve_check_attempts(
+    conn: &mut sqlx::PgConnection,
+    row: &CiRunInsert,
+    contexts: &BTreeSet<String>,
+) -> Result<BTreeMap<String, u32>, CiRunStoreError> {
+    let repo_ref = row
+        .repo_ref
+        .as_deref()
+        .ok_or_else(|| CiRunStoreError::Db("reserve lacks repository provenance".into()))?;
+    let commit_oid = row
+        .commit_oid
+        .as_deref()
+        .ok_or_else(|| CiRunStoreError::Db("reserve lacks commit provenance".into()))?;
+    let run_id = Uuid::parse_str(&row.run_id)
+        .map_err(|_| CiRunStoreError::Db("reserve run id is not a UUID".into()))?;
+    let mut attempts = BTreeMap::new();
+    for context in contexts {
+        if let Some((stored_repo, stored_commit, stored_attempt)) =
+            sqlx::query_as::<_, (String, String, i32)>(
+                "SELECT repo_ref, commit_oid, run_attempt FROM ci_run_check_attempt \
+                 WHERE tenant_id=$1 AND region=$2 AND run_id=$3 AND context=$4 FOR SHARE",
+            )
+            .bind(&row.tenant_id)
+            .bind(&row.region)
+            .bind(run_id)
+            .bind(context)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|error| CiRunStoreError::Db(format!("read reserved check attempt: {error}")))?
+        {
+            if stored_repo != repo_ref || stored_commit != commit_oid || stored_attempt <= 0 {
+                return Err(CiRunStoreError::Db(
+                    "reserved check attempt provenance diverged".into(),
+                ));
+            }
+            attempts.insert(context.clone(), stored_attempt as u32);
+            continue;
+        }
+
+        let attempt_i32: i32 = sqlx::query_scalar(crate::check_emitter::BUMP_CHECK_ATTEMPT_SQL)
+            .bind(&row.tenant_id)
+            .bind(&row.region)
+            .bind(repo_ref)
+            .bind(commit_oid)
+            .bind(context)
+            .bind(run_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|error| {
+                CiRunStoreError::Db(format!("allocate reserve check attempt: {error}"))
+            })?;
+        let attempt = u32::try_from(attempt_i32)
+            .map_err(|_| CiRunStoreError::Db("check attempt is not a positive u32".into()))?;
+        if attempt == 0 {
+            return Err(CiRunStoreError::Db(
+                "check attempt allocation returned zero".into(),
+            ));
+        }
+        let inserted: Option<i32> = sqlx::query_scalar(
+            "INSERT INTO ci_run_check_attempt \
+             (tenant_id,region,run_id,repo_ref,commit_oid,context,run_attempt) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7) \
+             ON CONFLICT (tenant_id,run_id,context) DO NOTHING \
+             RETURNING run_attempt",
+        )
+        .bind(&row.tenant_id)
+        .bind(&row.region)
+        .bind(run_id)
+        .bind(repo_ref)
+        .bind(commit_oid)
+        .bind(context)
+        .bind(attempt_i32)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|error| CiRunStoreError::Db(format!("persist reserved check attempt: {error}")))?;
+        if inserted != Some(attempt_i32) {
+            return Err(CiRunStoreError::Db(
+                "reserved check attempt collided with divergent authority".into(),
+            ));
+        }
+        attempts.insert(context.clone(), attempt);
+    }
+    Ok(attempts)
 }
 
 /// The ONE `ci_run` INSERT execution — bound identically whether it runs on the co-commit connection or

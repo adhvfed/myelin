@@ -18,10 +18,11 @@ use myelin_ci_controlplane::{
     ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
     ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
-    CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_ACCOUNTING_DDL,
-    CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL,
-    CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, BUMP_CHECK_ATTEMPT_SQL, CI_JOB_RUN_LEDGER_INDEX,
+    CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL,
+    CREATE_CI_JOB_ACCOUNTING_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+    CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_CHECK_ATTEMPT_DDL, CREATE_CI_RUN_DDL,
+    CREATE_JOB_QUEUE_DDL,
 };
 use myelin_ci_sandbox::{
     CompletionClaim, EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpecTemplate,
@@ -372,6 +373,7 @@ async fn insert_run(
     .execute(admin)
     .await
     .expect("insert queued ci_run");
+    reserve_test_attempts(admin, tenant, run_id).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -415,6 +417,37 @@ async fn insert_pr_run(
     .execute(admin)
     .await
     .expect("insert queued PR ci_run");
+    reserve_test_attempts(admin, tenant, run_id).await;
+}
+
+async fn reserve_test_attempts(admin: &PgPool, tenant: &str, run_id: &str) {
+    let run_id = sqlx::types::Uuid::parse_str(run_id).expect("test run UUID");
+    let repo_ref = format!("myelin://{tenant}/git/repo/core");
+    for context in ["build", "package", "test"] {
+        let attempt: i32 = sqlx::query_scalar(BUMP_CHECK_ATTEMPT_SQL)
+            .bind(tenant)
+            .bind("fr-par")
+            .bind(&repo_ref)
+            .bind("deadbeef")
+            .bind(context)
+            .bind(run_id)
+            .fetch_one(admin)
+            .await
+            .expect("allocate test check attempt");
+        sqlx::query(
+            "INSERT INTO ci_run_check_attempt \
+             (tenant_id,region,run_id,repo_ref,commit_oid,context,run_attempt) \
+             VALUES ($1,'fr-par',$2,$3,'deadbeef',$4,$5)",
+        )
+        .bind(tenant)
+        .bind(run_id)
+        .bind(&repo_ref)
+        .bind(context)
+        .bind(attempt)
+        .execute(admin)
+        .await
+        .expect("persist test run-scoped check attempt");
+    }
 }
 
 struct SeededLaunch {
@@ -755,7 +788,7 @@ async fn assert_initial_checks(admin: &PgPool, tenant: &str, run_id: &str, attem
         assert_eq!(payload["run"], run_ref);
         assert_eq!(payload["run_attempt"], attempt);
         assert_eq!(payload["trust_tier"], "trusted");
-        assert_eq!(payload["details_ref"], format!("{run_ref}#summary"));
+        assert_eq!(payload["details_ref"], run_ref);
         assert_eq!(payload["started_at"], started_at);
         assert!(payload["completed_at"].is_null());
         assert_eq!(payload["cost_settled"], false);
@@ -1124,6 +1157,10 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .execute(CREATE_CHECK_ATTEMPT_DDL)
         .await
         .expect("check_attempt DDL");
+    sqlx::raw_sql(CREATE_CI_RUN_CHECK_ATTEMPT_DDL)
+        .execute(&admin)
+        .await
+        .expect("ci_run_check_attempt DDL");
     admin
         .execute(CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL)
         .await
@@ -1144,6 +1181,10 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .execute("SELECT myelin_make_tenant_scoped('check_attempt')")
         .await
         .expect("force RLS on check_attempt");
+    admin
+        .execute("SELECT myelin_make_tenant_scoped('ci_run_check_attempt')")
+        .await
+        .expect("force RLS on ci_run_check_attempt");
     for table in [
         "job_queue",
         "ci_job_spec",
@@ -1299,8 +1340,9 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         "racing discovery passes cannot duplicate launch authority"
     );
 
-    // Production composition has no implicit runtime policy. A fresh V2 run is refused before any
-    // attempt, manifest, job, workflow, or lifecycle mutation when no authority adapter is wired.
+    // Production composition has no implicit runtime policy. Reserve-time attempt authority already
+    // exists; a fresh V2 run is refused before any manifest, job, workflow, or lifecycle mutation
+    // when no launch-authority adapter is wired.
     let denied_run = "10000000-0000-0000-0000-0000000000d0";
     let denied_wf = "20000000-0000-0000-0000-0000000000d0";
     insert_run(
@@ -1319,15 +1361,16 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .to_string()
         .contains("no policy-aware launch-authority"));
     assert_atomic_started(&admin, "tenant_no_authority", denied_run, false, false).await;
-    let denied_side_effects: (i64, i64) = sqlx::query_as(
+    let denied_side_effects: (i64, i64, i64) = sqlx::query_as(
         "SELECT
            (SELECT count(*) FROM ci_drive_manifest WHERE tenant_id='tenant_no_authority'),
-           (SELECT count(*) FROM check_attempt WHERE tenant_id='tenant_no_authority')",
+           (SELECT count(*) FROM check_attempt WHERE tenant_id='tenant_no_authority'),
+           (SELECT count(*) FROM ci_run_check_attempt WHERE tenant_id='tenant_no_authority')",
     )
     .fetch_one(&admin)
     .await
     .unwrap();
-    assert_eq!(denied_side_effects, (0, 0));
+    assert_eq!(denied_side_effects, (0, 3, 3));
     assert!(
         initial_check_envelopes(&admin, "tenant_no_authority", denied_run)
             .await
@@ -1381,11 +1424,12 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .to_string()
         .contains("injected post-reservation manifest failure"));
     assert_atomic_started(&admin, reservation_tenant, reservation_run, false, false).await;
-    let atomic_side_effects: (i64, i64, i64) = sqlx::query_as(
+    let atomic_side_effects: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
            (SELECT count(*) FROM cost_reservation WHERE tenant_id=$1),
            (SELECT count(*) FROM ci_drive_manifest WHERE tenant_id=$1),
-           (SELECT count(*) FROM check_attempt WHERE tenant_id=$1)",
+           (SELECT count(*) FROM check_attempt WHERE tenant_id=$1),
+           (SELECT count(*) FROM ci_run_check_attempt WHERE tenant_id=$1)",
     )
     .bind(reservation_tenant)
     .fetch_one(&admin)
@@ -1393,8 +1437,8 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .unwrap();
     assert_eq!(
         atomic_side_effects,
-        (0, 0, 0),
-        "reservation, manifest, and check-attempt state share one commit"
+        (0, 0, 3, 3),
+        "failed start preserves reserve-time attempts but commits no capacity reservation or manifest"
     );
     admin
         .execute("DROP TRIGGER fail_atomic_reservation_manifest ON ci_drive_manifest")
@@ -2574,6 +2618,63 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         "only the exact queued-row lock winner may invoke launch authority"
     );
 
+    // Reserve two runs before either starter executes. Their immutable attempts stay A=1/B=2;
+    // starting the older run never reallocates it above the newer queued fact.
+    let prequeued_tenant = "tenant_prequeued_attempts";
+    let prequeued_a = "11000000-0000-0000-0000-000000000001";
+    let prequeued_b = "11000000-0000-0000-0000-000000000002";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        prequeued_tenant,
+        prequeued_a,
+        "21000000-0000-0000-0000-000000000001",
+    )
+    .await;
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        prequeued_tenant,
+        prequeued_b,
+        "21000000-0000-0000-0000-000000000002",
+    )
+    .await;
+    starter(&app, prequeued_tenant, blobs.clone())
+        .run_once()
+        .await
+        .expect("start older prequeued run");
+    assert_initial_checks(&admin, prequeued_tenant, prequeued_a, 1).await;
+    starter(&app, prequeued_tenant, blobs.clone())
+        .run_once()
+        .await
+        .expect("start newer prequeued run");
+    assert_initial_checks(&admin, prequeued_tenant, prequeued_b, 2).await;
+
+    let mut newer_queued =
+        initial_check_envelopes(&admin, prequeued_tenant, prequeued_b).await[0]["payload"].clone();
+    newer_queued["state"] = serde_json::json!("queued");
+    let newer_queued: myelin_git::check_status::CheckStatus =
+        serde_json::from_value(newer_queued).expect("decode newer queued fact");
+    let mut older_terminal =
+        initial_check_envelopes(&admin, prequeued_tenant, prequeued_a).await[0]["payload"].clone();
+    older_terminal["state"] = serde_json::json!("success");
+    older_terminal["cost_settled"] = serde_json::json!(true);
+    older_terminal["completed_at"] = serde_json::json!("2026-07-23T00:00:01Z");
+    let older_terminal: myelin_git::check_status::CheckStatus =
+        serde_json::from_value(older_terminal).expect("decode older terminal fact");
+    let mut projected = myelin_git::check_status::CheckStatusProjection::new();
+    projected.apply(&newer_queued);
+    projected.apply(&older_terminal);
+    let current = projected
+        .current(&newer_queued.key())
+        .expect("newer queued attempt remains current");
+    assert_eq!(current.run_attempt, 2);
+    assert_eq!(
+        current.state,
+        myelin_git::check_status::CheckState::Queued,
+        "an older terminal fact cannot supersede the newer queued rerun"
+    );
+
     // ── CT-004: the per-tenant starter COMPOSITION SEAM (`PgCiRunStarterFactory`) against the real
     // migrated schema — the exact router the service main composes at the root (dormant behind the
     // runner activation gate). (a) A factory-minted starter CONSTRUCTS against the live schema and starts
@@ -2908,18 +3009,19 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .await
         .is_err());
     assert_atomic_started(&admin, "tenant_rollback", run3, false, false).await;
-    let rolled_back_side_effects: (i64, i64) = sqlx::query_as(
+    let rolled_back_side_effects: (i64, i64, i64) = sqlx::query_as(
         "SELECT
            (SELECT count(*) FROM ci_drive_manifest WHERE tenant_id='tenant_rollback'),
-           (SELECT count(*) FROM check_attempt WHERE tenant_id='tenant_rollback')",
+           (SELECT count(*) FROM check_attempt WHERE tenant_id='tenant_rollback'),
+           (SELECT count(*) FROM ci_run_check_attempt WHERE tenant_id='tenant_rollback')",
     )
     .fetch_one(&admin)
     .await
     .unwrap();
     assert_eq!(
         rolled_back_side_effects,
-        (0, 0),
-        "manifest and attempt allocation roll back with workflow, jobs, and state"
+        (0, 3, 3),
+        "failed start preserves reserve-time attempt authority but rolls back starter state"
     );
     assert!(initial_check_envelopes(&admin, "tenant_rollback", run3)
         .await
@@ -2965,7 +3067,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     );
     assert_eq!(AUTHORITY_CALLS.load(Ordering::SeqCst), calls_before_orphan);
 
-    // Frozen attempts are checked against the live monotonic ledger. Removing one context makes
+    // Frozen attempts are checked against the immutable per-run ledger. Removing one context makes
     // replay fail before any workflow/job/lifecycle mutation.
     let attempt_run = "10000000-0000-0000-0000-0000000000a2";
     let attempt_wf = "20000000-0000-0000-0000-0000000000a2";
@@ -2990,7 +3092,8 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await
     .unwrap();
     sqlx::query(
-        "DELETE FROM check_attempt WHERE tenant_id='tenant_attempt_tamper' AND context='test'",
+        "DELETE FROM ci_run_check_attempt \
+         WHERE tenant_id='tenant_attempt_tamper' AND context='test'",
     )
     .execute(&admin)
     .await
@@ -3001,7 +3104,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
             .await
             .expect_err("missing attempt allocation must fail closed")
             .to_string()
-            .contains("has no allocation ledger")
+            .contains("has no run-scoped allocation ledger")
     );
     assert_manifest_backed_queued(&admin, "tenant_attempt_tamper", attempt_run).await;
 

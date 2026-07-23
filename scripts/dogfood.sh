@@ -7,6 +7,11 @@
 #   ./scripts/dogfood.sh edge              build + run the edge over the dogfood env (serves :8080)
 #   ./scripts/dogfood.sh ci                build + run the opt-in CI control plane/runner in the
 #                                          foreground over the same dogfood cell
+#   ./scripts/dogfood.sh dispatch          build + run the Git-event→CI-run dispatch consumer
+#   ./scripts/dogfood.sh git-checks        build + run Git's CI-check projection consumer
+#   ./scripts/dogfood.sh verify-check <repo> <pr> <head-oid> [context]
+#                                          read-only proof that an exact PR head surfaced a required
+#                                          settled green context through the production edge
 #   ./scripts/dogfood.sh bootstrap -- <flags>
 #                                          run `edge bootstrap <flags>` over the dogfood env, e.g.
 #                                            ./scripts/dogfood.sh bootstrap -- --tenant acme --principal founder \
@@ -124,6 +129,68 @@ case "${cmd}" in
     echo "dogfood: building + serving the CI control plane with the runner enabled" >&2
     exec cargo run --quiet -p myelin-ci-controlplane --bin ci-controlplane
     ;;
+  dispatch)
+    load_env
+    echo "dogfood: building + serving the Git-event → CI-run dispatch consumer" >&2
+    exec cargo run --quiet -p myelin-ci-dispatch --bin ci-dispatch
+    ;;
+  git-checks)
+    load_env
+    echo "dogfood: building + serving Git's durable CI-check projection consumer" >&2
+    exec cargo run --quiet -p myelin-git --bin git-check-projection
+    ;;
+  verify-check)
+    if [[ "$#" -lt 3 || "$#" -gt 4 ]]; then
+      echo "usage: $0 verify-check <repo> <pr-number> <head-oid> [context]" >&2
+      exit 2
+    fi
+    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+      echo "dogfood: verify-check requires curl and jq" >&2
+      exit 2
+    fi
+    if [[ -z "${MYELIN_TOKEN:-}" ]]; then
+      echo "dogfood: MYELIN_TOKEN is required for the read-only verification" >&2
+      exit 2
+    fi
+    repo="$1"
+    pr_number="$2"
+    expected_head="$3"
+    context="${4:-build}"
+    if [[ ! "${pr_number}" =~ ^[1-9][0-9]*$ || -z "${repo}" || -z "${expected_head}" || -z "${context}" ]]; then
+      echo "dogfood: repo, positive PR number, head OID, and context must be non-empty" >&2
+      exit 2
+    fi
+    edge_url="${MYELIN_EDGE_URL:-http://127.0.0.1:8080}"
+    repo_segment="$(jq -rn --arg value "${repo}" '$value | @uri')"
+    pr_json="$(curl --fail --silent --show-error \
+      -H "authorization: Bearer ${MYELIN_TOKEN}" \
+      "${edge_url}/v1/git/repos/${repo_segment}/prs/${pr_number}")"
+    checks_json="$(curl --fail --silent --show-error \
+      -H "authorization: Bearer ${MYELIN_TOKEN}" \
+      "${edge_url}/v1/git/repos/${repo_segment}/prs/${pr_number}/checks")"
+    jq -e --arg expected_head "${expected_head}" \
+      '.durable == true and .head_oid == $expected_head' \
+      <<<"${pr_json}" >/dev/null || {
+        echo "dogfood: PR head does not match the expected pushed commit" >&2
+        exit 1
+      }
+    jq -e --arg context "${context}" '
+      .durable == true
+      and (.required_contexts | index($context) != null)
+      and (.green_contexts | index($context) != null)
+      and (.fork_unendorsed_contexts | index($context) == null)
+    ' <<<"${checks_json}" >/dev/null || {
+      echo "dogfood: the required context is not a surfaced settled trusted success" >&2
+      exit 1
+    }
+    jq -n \
+      --arg repo "${repo}" \
+      --argjson pr "${pr_number}" \
+      --arg head_oid "${expected_head}" \
+      --arg context "${context}" \
+      --argjson gate_admitted "$(jq '.gate_admitted' <<<"${checks_json}")" \
+      '{verified:true, repo:$repo, pr:$pr, head_oid:$head_oid, context:$context, gate_admitted:$gate_admitted}'
+    ;;
   bootstrap)
     # Everything after an optional `--` is passed straight to `edge bootstrap`.
     if [[ "${1:-}" == "--" ]]; then shift; fi
@@ -167,7 +234,7 @@ cd frontend/apps/web && pnpm install && pnpm dev
 EOF
     ;;
   *)
-    echo "usage: $0 {env|edge|ci|bootstrap -- <flags>|web}" >&2
+    echo "usage: $0 {env|edge|ci|dispatch|git-checks|verify-check <repo> <pr> <head-oid> [context]|bootstrap -- <flags>|web}" >&2
     exit 2
     ;;
 esac

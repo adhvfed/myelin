@@ -219,11 +219,19 @@ pub struct VersionedCiDefinition {
 
 impl VersionedCiDefinition {
     pub fn v1(on: OnTrigger, jobs: Vec<JobDef>) -> Self {
-        Self { contract: CiPlanContract::V1, on, jobs }
+        Self {
+            contract: CiPlanContract::V1,
+            on,
+            jobs,
+        }
     }
 
     pub fn v2(on: OnTrigger, execution: CiExecutionRequestV1, jobs: Vec<JobDef>) -> Self {
-        Self { contract: CiPlanContract::V2(execution), on, jobs }
+        Self {
+            contract: CiPlanContract::V2(execution),
+            on,
+            jobs,
+        }
     }
 }
 
@@ -366,9 +374,14 @@ fn validate_dag(jobs: &[JobDef]) -> Result<(), ResolveError> {
     for j in jobs {
         let mut seen_needs = BTreeSet::new();
         for need in &j.needs {
-            if need == &j.name { return Err(ResolveError::SelfNeed(j.name.clone())); }
+            if need == &j.name {
+                return Err(ResolveError::SelfNeed(j.name.clone()));
+            }
             if !seen_needs.insert(need.as_str()) {
-                return Err(ResolveError::DuplicateNeed { job: j.name.clone(), need: need.clone() });
+                return Err(ResolveError::DuplicateNeed {
+                    job: j.name.clone(),
+                    need: need.clone(),
+                });
             }
             if !names.contains(need.as_str()) {
                 return Err(ResolveError::UnknownNeed {
@@ -410,26 +423,46 @@ fn validate_dag(jobs: &[JobDef]) -> Result<(), ResolveError> {
 
 fn valid_machine_token(value: &str, maximum: usize) -> bool {
     let mut bytes = value.bytes();
-    let Some(first) = bytes.next() else { return false; };
-    value.len() <= maximum && first.is_ascii_alphanumeric()
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    value.len() <= maximum
+        && first.is_ascii_alphanumeric()
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn validate_authored_tokens(jobs: &[JobDef]) -> Result<(), ResolveError> {
-    use myelin_ci_controlplane::run_plan::{MAX_JOB_NAME_BYTES, MAX_MATRIX_AXES, MAX_MATRIX_KEY_BYTES, MAX_MATRIX_VALUE_BYTES};
+    use myelin_ci_controlplane::run_plan::{
+        MAX_JOB_NAME_BYTES, MAX_MATRIX_AXES, MAX_MATRIX_KEY_BYTES, MAX_MATRIX_VALUE_BYTES,
+    };
     for job in jobs {
         if !valid_machine_token(&job.name, MAX_JOB_NAME_BYTES) {
-            return Err(ResolveError::InvalidPlan(format!("authored job name `{}` is not a bounded machine token", job.name)));
+            return Err(ResolveError::InvalidPlan(format!(
+                "authored job name `{}` is not a bounded machine token",
+                job.name
+            )));
         }
         if job.matrix.len() > MAX_MATRIX_AXES {
-            return Err(ResolveError::InvalidPlan(format!("job `{}` declares more than {MAX_MATRIX_AXES} matrix axes", job.name)));
+            return Err(ResolveError::InvalidPlan(format!(
+                "job `{}` declares more than {MAX_MATRIX_AXES} matrix axes",
+                job.name
+            )));
         }
         for (axis, values) in &job.matrix {
             if !valid_machine_token(axis, MAX_MATRIX_KEY_BYTES) || values.is_empty() {
-                return Err(ResolveError::InvalidPlan(format!("job `{}` matrix axis `{axis}` is invalid or empty", job.name)));
+                return Err(ResolveError::InvalidPlan(format!(
+                    "job `{}` matrix axis `{axis}` is invalid or empty",
+                    job.name
+                )));
             }
-            if values.iter().any(|value| !valid_machine_token(value, MAX_MATRIX_VALUE_BYTES)) {
-                return Err(ResolveError::InvalidPlan(format!("job `{}` has an invalid matrix value for `{axis}`", job.name)));
+            if values
+                .iter()
+                .any(|value| !valid_machine_token(value, MAX_MATRIX_VALUE_BYTES))
+            {
+                return Err(ResolveError::InvalidPlan(format!(
+                    "job `{}` has an invalid matrix value for `{axis}`",
+                    job.name
+                )));
             }
         }
     }
@@ -515,35 +548,54 @@ pub fn resolve_versioned_snapshot(
             });
         }
     }
-    let concrete_by_authored: BTreeMap<&str, Vec<String>> = def.jobs.iter().map(|job| {
-        let mut names: Vec<_> = expand_matrix(&job.matrix).iter()
-            .map(|assignment| instance_name(&job.name, assignment)).collect();
-        names.sort(); names.dedup(); (job.name.as_str(), names)
-    }).collect();
-    for (job, authored) in resolved.iter_mut().zip(def.jobs.iter().flat_map(|job| {
-        std::iter::repeat_n(job, expand_matrix(&job.matrix).len())
-    })) {
-        job.needs = authored.needs.iter()
-            .flat_map(|need| concrete_by_authored[need.as_str()].iter().cloned()).collect();
-        job.needs.sort(); job.needs.dedup();
+    let concrete_by_authored: BTreeMap<&str, Vec<String>> = def
+        .jobs
+        .iter()
+        .map(|job| {
+            let mut names: Vec<_> = expand_matrix(&job.matrix)
+                .iter()
+                .map(|assignment| instance_name(&job.name, assignment))
+                .collect();
+            names.sort();
+            names.dedup();
+            (job.name.as_str(), names)
+        })
+        .collect();
+    for (job, authored) in resolved.iter_mut().zip(
+        def.jobs
+            .iter()
+            .flat_map(|job| std::iter::repeat_n(job, expand_matrix(&job.matrix).len())),
+    ) {
+        job.needs = authored
+            .needs
+            .iter()
+            .flat_map(|need| concrete_by_authored[need.as_str()].iter().cloned())
+            .collect();
+        job.needs.sort();
+        job.needs.dedup();
     }
     // Deterministic order — the reproducibility floor (the same input → byte-identical snapshot).
     resolved.sort_by(|a, b| a.name.cmp(&b.name));
     for pair in resolved.windows(2) {
-        if pair[0].name == pair[1].name { return Err(ResolveError::ConcreteNameCollision(pair[0].name.clone())); }
+        if pair[0].name == pair[1].name {
+            return Err(ResolveError::ConcreteNameCollision(pair[0].name.clone()));
+        }
     }
 
     let snapshot = match &def.contract {
         CiPlanContract::V1 => VersionedResolvedSnapshot::V1(ResolvedRunPlanV1 {
             schema_version: myelin_ci_controlplane::RUN_PLAN_SCHEMA_V1,
-            jobs: resolved.into_iter().map(|job| ResolvedJobV1 {
-                name: job.name,
-                image: job.image,
-                command: job.command,
-                needs: job.needs,
-                is_generator: job.is_generator,
-                matrix_key: job.matrix_key,
-            }).collect(),
+            jobs: resolved
+                .into_iter()
+                .map(|job| ResolvedJobV1 {
+                    name: job.name,
+                    image: job.image,
+                    command: job.command,
+                    needs: job.needs,
+                    is_generator: job.is_generator,
+                    matrix_key: job.matrix_key,
+                })
+                .collect(),
         }),
         CiPlanContract::V2(execution) => VersionedResolvedSnapshot::V2(ResolvedRunPlanV2 {
             schema_version: myelin_ci_controlplane::RUN_PLAN_SCHEMA_V2,
@@ -551,10 +603,10 @@ pub fn resolve_versioned_snapshot(
             jobs: resolved,
         }),
     };
-    let bytes = snapshot.canonical_bytes().map_err(|error| ResolveError::InvalidPlan(error.to_string()))?;
-    let address = blobs
-        .put(tenant, &bytes)
-        .map_err(ResolveError::BlobWrite)?;
+    let bytes = snapshot
+        .canonical_bytes()
+        .map_err(|error| ResolveError::InvalidPlan(error.to_string()))?;
+    let address = blobs.put(tenant, &bytes).map_err(ResolveError::BlobWrite)?;
     Ok((snapshot, address))
 }
 
@@ -713,6 +765,8 @@ fn check_subject(repo: &str, commit_oid: &str, context: &str) -> ArtifactRef {
 pub struct RunFacts {
     /// The opaque run id (a uuid string).
     pub run_id: String,
+    /// The envelope tenant. Kept explicit so the initial run/details refs are canonical.
+    pub tenant_id: String,
     /// The repo ref the check seam keys on (X-1: `repo#commit-<oid>/check-<context>`).
     pub repo_ref: String,
     /// The commit oid the run ran against (the CheckStatus key half).
@@ -721,6 +775,8 @@ pub struct RunFacts {
     pub contexts: Vec<CheckContext>,
     /// The triggering `event_id` (the cause provenance — `cause_event_id` + the `idem_key` derivation).
     pub cause_event_id: EventId,
+    /// Deterministic display timestamp inherited from the triggering event.
+    pub started_at: String,
 }
 
 /// **Build the atomic reserve+start handoff (arch 02 §1.5; the prompt's second GATE).** Given the
@@ -783,20 +839,41 @@ pub fn reserve_and_start(
     // §1.1 / §4: the first ci.check.updated{state: queued} per context (X-1). The CheckStatus is the
     // frozen small + PII-free struct; trust_tier is the SAME stamped value (0 divergence). REUSES the
     // frozen check_seam subject + aggregate grammar so Git's gate consumes a byte-identical subject.
+    let run_ref = format!("myelin://{}/ci/run/{}", facts.tenant_id, facts.run_id);
     let queued_checks = facts
         .contexts
         .iter()
         .map(|ctx| {
-            let check_status = serde_json::json!({
-                "repo": facts.repo_ref,
-                "commit_oid": facts.commit_oid,
-                "context": { "provider": "ci", "name": ctx.name },
-                "state": "queued",
-                "run": format!("ci/run/{}", facts.run_id),
-                "run_attempt": 1,
-                "trust_tier": git_trust_token(stamp),
-                "cost_settled": false,
-            });
+            let emit_context = myelin_ci_controlplane::CheckEmitContext {
+                tenant: facts.tenant_id.clone(),
+                repo: facts.repo_ref.clone(),
+                commit_oid: facts.commit_oid.clone(),
+                run_ref: run_ref.clone(),
+                // Dispatch does not invent the supersession authority. The durable reserve store
+                // allocates the monotonic attempt in the same transaction as the run, queued
+                // outbox fact, and consumer dedup mark, then replaces this non-emittable template
+                // value before staging.
+                run_attempt: 0,
+                trust_tier: match stamp.check_tier {
+                    myelin_git::check_status::TrustTier::Trusted => {
+                        myelin_ci_controlplane::TrustTier::Trusted
+                    }
+                    myelin_git::check_status::TrustTier::UntrustedFork => {
+                        myelin_ci_controlplane::TrustTier::UntrustedFork
+                    }
+                },
+                started_at: facts.started_at.clone(),
+                completed_at: None,
+            };
+            let check_status = myelin_ci_controlplane::check_status_payload(
+                &emit_context,
+                myelin_ci_controlplane::CheckProvider::Ci,
+                &ctx.name,
+                myelin_ci_controlplane::CheckState::Queued,
+                true,
+                myelin_ci_controlplane::CostPosture::Unsettled,
+                None,
+            );
             EventDraft {
                 type_: EventType(myelin_ci_sandbox::events::CI_CHECK_UPDATED.to_string()),
                 subject: check_subject(&facts.repo_ref, &facts.commit_oid, &ctx.name),
@@ -818,17 +895,6 @@ pub fn reserve_and_start(
         run_write,
         run_started,
         queued_checks,
-    }
-}
-
-/// The `ci.check.updated.trust_tier` token (the 2-way merge-gate projection, X-1):
-/// `untrusted_fork` for a fork, `trusted` otherwise (a self-hosted member run is trusted CODE for the
-/// gate). REUSES the CI-P10 [`TrustStamp::check_tier`] (the git projection) — never recomputed.
-fn git_trust_token(stamp: &TrustStamp) -> &'static str {
-    use myelin_git::check_status::TrustTier as GitTrustTier;
-    match stamp.check_tier {
-        GitTrustTier::Trusted => "trusted",
-        GitTrustTier::UntrustedFork => "untrusted_fork",
     }
 }
 
@@ -923,7 +989,10 @@ mod tests {
                 (0..10u32).map(|v| v.to_string()).collect(),
             );
         }
-        let def = CiDefinition { on: OnTrigger::Push, jobs: vec![job] };
+        let def = CiDefinition {
+            on: OnTrigger::Push,
+            jobs: vec![job],
+        };
         let err = resolve_snapshot(&def, &blobs(), &tenant())
             .expect_err("an astronomical matrix must be refused");
         assert!(
@@ -936,7 +1005,10 @@ mod tests {
         let ok = JobDef::normal("test", PINNED2, ["test"])
             .with_matrix("os", vec!["linux".into(), "mac".into(), "win".into()])
             .with_matrix("v", vec!["1".into(), "2".into(), "3".into(), "4".into()]);
-        let def_ok = CiDefinition { on: OnTrigger::Push, jobs: vec![ok] };
+        let def_ok = CiDefinition {
+            on: OnTrigger::Push,
+            jobs: vec![ok],
+        };
         let (snap, _addr) = resolve_snapshot(&def_ok, &blobs(), &tenant())
             .expect("a modestly-sized matrix resolves");
         assert_eq!(snap.jobs.len(), 12, "3×4 expands to 12 instances");
@@ -1007,20 +1079,33 @@ mod tests {
 
     #[test]
     fn command_hash_and_concrete_matrix_fan_in_are_deterministic() {
-        let definition = |command: &str| CiDefinition { on: OnTrigger::Push, jobs: vec![
-            JobDef::normal("build", PINNED, [command]).with_matrix("os", vec!["linux".into(), "macos".into()]),
-            JobDef::normal("test", PINNED2, ["test"]).with_needs(["build"])
-                .with_matrix("rust", vec!["stable".into(), "beta".into()]),
-        ] };
+        let definition = |command: &str| CiDefinition {
+            on: OnTrigger::Push,
+            jobs: vec![
+                JobDef::normal("build", PINNED, [command])
+                    .with_matrix("os", vec!["linux".into(), "macos".into()]),
+                JobDef::normal("test", PINNED2, ["test"])
+                    .with_needs(["build"])
+                    .with_matrix("rust", vec!["stable".into(), "beta".into()]),
+            ],
+        };
         let (first, hash) = resolve_snapshot(&definition("build"), &blobs(), &tenant()).unwrap();
         let (_, repeat) = resolve_snapshot(&definition("build"), &blobs(), &tenant()).unwrap();
         let (_, changed) = resolve_snapshot(&definition("build-v2"), &blobs(), &tenant()).unwrap();
         assert_eq!(hash, repeat);
         assert_ne!(hash, changed);
-        let builds: Vec<String> = first.jobs.iter().filter(|job| job.name.starts_with("build--"))
-            .map(|job| job.name.clone()).collect();
+        let builds: Vec<String> = first
+            .jobs
+            .iter()
+            .filter(|job| job.name.starts_with("build--"))
+            .map(|job| job.name.clone())
+            .collect();
         assert_eq!(builds.len(), 2);
-        for test in first.jobs.iter().filter(|job| job.name.starts_with("test--")) {
+        for test in first
+            .jobs
+            .iter()
+            .filter(|job| job.name.starts_with("test--"))
+        {
             assert_eq!(test.needs, builds);
         }
     }
@@ -1028,26 +1113,58 @@ mod tests {
     #[test]
     fn malformed_programmatic_plans_fail_closed_without_name_collisions() {
         let prefix = "a".repeat(70);
-        let def = CiDefinition { on: OnTrigger::Push, jobs: vec![
-            JobDef::normal(format!("{prefix}x"), PINNED, ["a"]).with_matrix("os", vec!["linux".into()]),
-            JobDef::normal(format!("{prefix}y"), PINNED2, ["b"]).with_matrix("os", vec!["linux".into()]),
-        ] };
+        let def = CiDefinition {
+            on: OnTrigger::Push,
+            jobs: vec![
+                JobDef::normal(format!("{prefix}x"), PINNED, ["a"])
+                    .with_matrix("os", vec!["linux".into()]),
+                JobDef::normal(format!("{prefix}y"), PINNED2, ["b"])
+                    .with_matrix("os", vec!["linux".into()]),
+            ],
+        };
         let (plan, _) = resolve_snapshot(&def, &blobs(), &tenant()).unwrap();
         assert_ne!(plan.jobs[0].name, plan.jobs[1].name);
-        let bad = CiDefinition { on: OnTrigger::Push, jobs: vec![JobDef::normal("unicode-雪", PINNED, ["run"])] };
-        assert!(matches!(resolve_snapshot(&bad, &blobs(), &tenant()), Err(ResolveError::InvalidPlan(_))));
-        let empty = CiDefinition { on: OnTrigger::Push, jobs: vec![JobDef::normal("build", PINNED, std::iter::empty::<String>())] };
-        assert!(matches!(resolve_snapshot(&empty, &blobs(), &tenant()), Err(ResolveError::InvalidPlan(_))));
+        let bad = CiDefinition {
+            on: OnTrigger::Push,
+            jobs: vec![JobDef::normal("unicode-雪", PINNED, ["run"])],
+        };
+        assert!(matches!(
+            resolve_snapshot(&bad, &blobs(), &tenant()),
+            Err(ResolveError::InvalidPlan(_))
+        ));
+        let empty = CiDefinition {
+            on: OnTrigger::Push,
+            jobs: vec![JobDef::normal(
+                "build",
+                PINNED,
+                std::iter::empty::<String>(),
+            )],
+        };
+        assert!(matches!(
+            resolve_snapshot(&empty, &blobs(), &tenant()),
+            Err(ResolveError::InvalidPlan(_))
+        ));
     }
 
     #[test]
     fn snapshot_ref_is_exact_tenant_scoped_lowercase_blake3() {
         let address = ContentHash::blake3(b"snapshot");
         let reference = snapshot_ref(&tenant(), &address);
-        assert_eq!(reference.0, format!("myelin://acme/ci/snapshot/{}", address.to_multihash_string()));
-        let digest = reference.0.strip_prefix("myelin://acme/ci/snapshot/blake3:").unwrap();
+        assert_eq!(
+            reference.0,
+            format!(
+                "myelin://acme/ci/snapshot/{}",
+                address.to_multihash_string()
+            )
+        );
+        let digest = reference
+            .0
+            .strip_prefix("myelin://acme/ci/snapshot/blake3:")
+            .unwrap();
         assert_eq!(digest.len(), 64);
-        assert!(digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert!(digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
     }
 
     /// An empty definition + a structural-DAG defect (a cycle / a dangling need / a dup name) is
@@ -1107,16 +1224,32 @@ mod tests {
             Err(ResolveError::DuplicateJob(n)) if n == "a"
         ));
         assert_eq!(
-            resolve_snapshot(&CiDefinition { on: OnTrigger::Push,
-                jobs: vec![JobDef::normal("a", PINNED, ["a"]).with_needs(["a"])] }, &store, &tenant()),
+            resolve_snapshot(
+                &CiDefinition {
+                    on: OnTrigger::Push,
+                    jobs: vec![JobDef::normal("a", PINNED, ["a"]).with_needs(["a"])]
+                },
+                &store,
+                &tenant()
+            ),
             Err(ResolveError::SelfNeed("a".into()))
         );
         assert_eq!(
-            resolve_snapshot(&CiDefinition { on: OnTrigger::Push, jobs: vec![
-                JobDef::normal("a", PINNED, ["a"]),
-                JobDef::normal("b", PINNED2, ["b"]).with_needs(["a", "a"]),
-            ] }, &store, &tenant()),
-            Err(ResolveError::DuplicateNeed { job: "b".into(), need: "a".into() })
+            resolve_snapshot(
+                &CiDefinition {
+                    on: OnTrigger::Push,
+                    jobs: vec![
+                        JobDef::normal("a", PINNED, ["a"]),
+                        JobDef::normal("b", PINNED2, ["b"]).with_needs(["a", "a"]),
+                    ]
+                },
+                &store,
+                &tenant()
+            ),
+            Err(ResolveError::DuplicateNeed {
+                job: "b".into(),
+                need: "a".into()
+            })
         );
     }
 
@@ -1132,7 +1265,10 @@ mod tests {
             on: OnTrigger::Push,
             jobs: vec![JobDef::normal("gen-matrix", PINNED, ["generate"]).as_generator()],
         };
-        assert!(matches!(resolve_snapshot(&def, &blobs(), &tenant()), Err(ResolveError::InvalidPlan(_))));
+        assert!(matches!(
+            resolve_snapshot(&def, &blobs(), &tenant()),
+            Err(ResolveError::InvalidPlan(_))
+        ));
         // A normal definition has no generator.
         let plain = CiDefinition {
             on: OnTrigger::Push,
@@ -1147,10 +1283,12 @@ mod tests {
     fn facts() -> RunFacts {
         RunFacts {
             run_id: "run-0001".into(),
+            tenant_id: "acme".into(),
             repo_ref: "myelin://acme/git/repo/web".into(),
             commit_oid: "deadbeef".into(),
             contexts: vec![CheckContext::ci("build"), CheckContext::ci("test/unit")],
             cause_event_id: EventId("ev-push-1".into()),
+            started_at: "2026-07-23T00:00:00Z".into(),
         }
     }
 
@@ -1184,7 +1322,10 @@ mod tests {
         for c in &handoff.queued_checks {
             assert_eq!(c.type_.0, myelin_ci_sandbox::events::CI_CHECK_UPDATED);
             assert_eq!(c.payload["state"], "queued");
-            assert_eq!(c.payload["run_attempt"], 1);
+            assert_eq!(
+                c.payload["run_attempt"], 0,
+                "the pure planner carries a non-emittable template; durable reserve allocates it"
+            );
         }
         // The StartSpec names the ci.pipeline workflow + starts on the snapshot ref.
         assert_eq!(handoff.start_spec.wf_type, CI_PIPELINE_WF_TYPE);
@@ -1228,7 +1369,11 @@ mod tests {
         // The aggregate is the per-commit ordering partition (all contexts share it).
         for c in &handoff.queued_checks {
             assert_eq!(
-                c.aggregate.0, "myelin://acme/git/repo/web#commit-deadbeef",
+                c.aggregate,
+                myelin_events::check_seam::check_aggregate(
+                    "myelin://acme/git/repo/web",
+                    "deadbeef",
+                ),
                 "the per-commit aggregate (the ordering partition the contexts share)"
             );
         }

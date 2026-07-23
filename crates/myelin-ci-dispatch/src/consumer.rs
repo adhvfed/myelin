@@ -50,7 +50,7 @@
 //! - **The `ci_run` ROW one-tx co-commit — SHIPPED LIVE (CT-004d.2 chunk 4).** The durable run-of-record
 //!   ROW now co-commits with the dedup mark in PRODUCTION: [`CoCommitReserveStore`] writes the `ci_run`
 //!   row on the consumer's co-commit `HandlerTx` connection via
-//!   [`myelin_ci_controlplane::CiRunStore::co_commit_insert`] (which downcasts
+//!   [`myelin_ci_controlplane::CiRunStore::co_commit_reserve`] (which downcasts
 //!   `tx.connection::<sqlx::PgConnection>()` INSIDE ci-controlplane, where `sqlx` is nameable — the leaf
 //!   ci-dispatch crate only threads the type-erased `tx` through). So the ROW + the mark commit together
 //!   (runtime `Done`) or roll back together (`Retry`/failure) — a crash between leaves NEITHER, a
@@ -59,18 +59,11 @@
 //!   it at boot via the shared `ci_durable_migrations()` writer subset. The writer lives in
 //!   ci-controlplane (NOT `myelin-storage`) because ci-dispatch already depends on it (acyclic — the
 //!   controlplane is a terminal leaf), so no new dependency edge is introduced.
-//! - **H1 (be brutally honest about the EVENTS — they stay ABSORB, unchanged):** the co-emitted
-//!   `ci.run.started` + queued `ci.check.updated` EVENTS still commit through the DURABLE [`OutboxStore`]
-//!   in its OWN outbox transaction — SEPARATE from the mark's co-commit tx (this leaf crate cannot name
-//!   `sqlx` outside `--features integration` to ride the connection for the OUTBOX rows, and forcing them
-//!   there was H1's REJECTED path). A crash between the outbox commit and the mark's commit makes the
-//!   redelivery re-emit the SAME deterministic ids; the commit uses
-//!   [`OutboxTransaction::commit_absorb`] (`ON CONFLICT (event_id) DO NOTHING` + payload verify) so the
-//!   re-emit is ABSORBED, NOT rejected into a `Retry` LIVELOCK (the H1 bug). **This chunk co-commits the
-//!   ROW with the mark; the EVENTS remain absorb-idempotent** — the honest split. The IDEAL all-in-one-tx
-//!   co-commit (ROW + BOTH events + mark) is still proven in the integration test's `CoCommitReserveStore`
-//!   (which CAN name `sqlx` in a test), as the aspirational shape; production ships the row-co-commit +
-//!   events-absorb split above.
+//! - **The queued fact is mechanically atomic with its authority.** [`CoCommitReserveStore`] asks
+//!   `CiRunStore` to insert the run, allocate the retry-stable monotonic attempts, and insert detached
+//!   canonical outbox rows on the SAME `HandlerTx` connection as the trigger dedup mark. A rollback
+//!   leaves none of them; redelivery rebuilds the same complete bundle. No hard-coded attempt can
+//!   escape and no old successful attempt stays green during a queued rerun.
 //! - **`DurableExecutor::start` (CT-004c/CT-004d — OUT OF SCOPE):** this consumer STOPS at the durable
 //!   reserve bundle. It does NOT call [`myelin_flow::StartSpec`]'s executor, does NOT register /
 //!   run the `ci.pipeline` body (`CI_PIPELINE_WF_TYPE`), and does NOT touch the scheduler/runner. The
@@ -85,11 +78,14 @@
 //!   are deterministic placeholders derived from the repo ref here; the real registry that maps a
 //!   pushed repo to its CI project/pipeline is the named follow-on.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[cfg(any(test, feature = "test-support", feature = "integration"))]
+use myelin_events::OutboxStore;
 use myelin_events::{
     Actor, EmitContextBase, EventEnvelope, EventHandler, EventId, HandleOutcome, IdMinter,
-    OutboxStore, SubjectPattern, UpcasterRegistry,
+    OutboxTransaction, SubjectPattern, UpcasterRegistry,
 };
 use myelin_storage::BlobStore;
 use myelin_tenancy::TenantId;
@@ -122,16 +118,23 @@ impl AuthoritativeGitRoot {
     pub fn validate(path: impl AsRef<std::path::Path>) -> Result<Self, GitRootError> {
         let path = path.as_ref();
         if !path.is_absolute() {
-            return Err(GitRootError(format!("{} is not an absolute path", path.display())));
+            return Err(GitRootError(format!(
+                "{} is not an absolute path",
+                path.display()
+            )));
         }
         let canonical = path
             .canonicalize()
             .map_err(|error| GitRootError(format!("{}: {error}", path.display())))?;
         if !canonical.is_dir() {
-            return Err(GitRootError(format!("{} is not a directory", canonical.display())));
+            return Err(GitRootError(format!(
+                "{} is not a directory",
+                canonical.display()
+            )));
         }
-        std::fs::read_dir(&canonical)
-            .map_err(|error| GitRootError(format!("{} is not readable: {error}", canonical.display())))?;
+        std::fs::read_dir(&canonical).map_err(|error| {
+            GitRootError(format!("{} is not readable: {error}", canonical.display()))
+        })?;
         Ok(Self(canonical))
     }
 
@@ -206,7 +209,9 @@ impl GitReadError {
 impl std::fmt::Display for GitReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GitReadError::Unavailable(message) => write!(f, "git config backing unavailable: {message}"),
+            GitReadError::Unavailable(message) => {
+                write!(f, "git config backing unavailable: {message}")
+            }
             GitReadError::Invalid(message) => write!(f, "invalid git config read: {message}"),
         }
     }
@@ -231,11 +236,22 @@ pub trait GitConfigReader: Send + Sync {
         path: &str,
     ) -> Result<Option<Vec<u8>>, GitReadError>;
     fn read_repo_file_bounded(
-        &self, tenant: &str, region: &str, repo: &str, oid: &str, path: &str, maximum_bytes: usize,
+        &self,
+        tenant: &str,
+        region: &str,
+        repo: &str,
+        oid: &str,
+        path: &str,
+        maximum_bytes: usize,
     ) -> Result<Option<Vec<u8>>, GitReadError> {
         let bytes = self.read_repo_file(tenant, region, repo, oid, path)?;
-        if bytes.as_ref().is_some_and(|bytes| bytes.len() > maximum_bytes) {
-            return Err(GitReadError::Invalid(format!("{path}@{oid} exceeds the {maximum_bytes}-byte config limit")));
+        if bytes
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() > maximum_bytes)
+        {
+            return Err(GitReadError::Invalid(format!(
+                "{path}@{oid} exceeds the {maximum_bytes}-byte config limit"
+            )));
         }
         Ok(bytes)
     }
@@ -261,7 +277,14 @@ pub fn resolve_ci_config(
     oid: &str,
 ) -> Result<Option<(Vec<u8>, ConfigFormat)>, GitReadError> {
     for (path, format) in CI_CONFIG_CANDIDATES {
-        if let Some(bytes) = reader.read_repo_file_bounded(tenant, region, repo, oid, path, crate::config::MAX_CI_CONFIG_BYTES)? {
+        if let Some(bytes) = reader.read_repo_file_bounded(
+            tenant,
+            region,
+            repo,
+            oid,
+            path,
+            crate::config::MAX_CI_CONFIG_BYTES,
+        )? {
             return Ok(Some((bytes, *format)));
         }
     }
@@ -335,32 +358,16 @@ impl std::fmt::Display for ReserveError {
 
 impl std::error::Error for ReserveError {}
 
-/// **The seam that DURABLY persists the atomic reserve/start bundle.** Two shapes, both idempotent:
-///
-/// - **True co-commit (the target / proven path):** the reserve bundle rides the consumer-runtime
-///   co-commit connection ([`HandlerTx::connection`] → the SAME `sqlx` transaction the dedup mark is
-///   in), so the `ci_run` ROW + `ci.run.started` + queued `ci.check.updated` + the dedup mark ALL
-///   commit or ALL roll back in ONE tx. A crash rolls back EVERYTHING; a redelivery re-runs cleanly.
-///   The integration test's `PgReserveStore` implements this (it can name `sqlx`). This is the honest
-///   #7 shape and the one the H1 probe proves.
-/// - **Separate-tx outbox + ABSORB (the production floor):** [`OutboxReserveStore`] runs in the
-///   production leaf crate, which cannot name `sqlx` outside `--features integration`, so it CANNOT
-///   ride the type-erased co-commit connection. It commits the events through its own DURABLE
-///   [`OutboxStore`] in a SEPARATE tx, using [`OutboxTransaction::commit_absorb`] so a crash-window
-///   redelivery (mark not yet committed) re-emits the SAME deterministic ids and is ABSORBED — no
-///   `Err`-into-`Retry` LIVELOCK (the H1 bug). The `ci_run` ROW is the named `myelin-storage`-backing
-///   floor here (not written by this path yet). Wiring the true co-commit into production (a
-///   `myelin-storage` `ci_run` writer riding the co-commit connection) is the named follow-on.
+/// **The seam that DURABLY persists the atomic reserve/start bundle.** Production rides the
+/// consumer-runtime co-commit connection, so `ci_run`, `check_attempt`, `ci.run.started`, queued
+/// `ci.check.updated`, and the trigger dedup mark commit or roll back together.
 ///
 /// A unit test uses [`RecordingReserveStore`]. The trait is SYNC to match the [`EventHandler::handle`]
 /// body (the durable impls bridge to async at their own boundary, the `PgOutboxBacking` idiom).
 pub trait ReserveStore: Send + Sync {
     /// Persist the armed run's atomic bundle. Idempotent on the run identity (a redelivered trigger
     /// mints the SAME `run_id` + the SAME deterministic event ids). `tx` is the consumer-runtime
-    /// co-commit handle (#7/MR-023b): an impl that can name `sqlx` (the integration `PgReserveStore`)
-    /// downcasts `tx.connection::<sqlx::PgConnection>()` and writes the bundle on the SAME tx as the
-    /// dedup mark (true co-commit); the production [`OutboxReserveStore`] ignores `tx` and rides its
-    /// own DURABLE outbox with [`OutboxTransaction::commit_absorb`] (absorb-mode idempotency).
+    /// co-commit handle (#7/MR-023b); production fails closed if it carries no durable connection.
     fn persist(
         &self,
         armed: &ArmedRun,
@@ -368,18 +375,15 @@ pub trait ReserveStore: Send + Sync {
     ) -> Result<(), ReserveError>;
 }
 
-/// **The production reserve store: co-commit the reserve bundle's EVENTS through the DURABLE
-/// [`OutboxStore`] (dispatch-owned, survives restart).** Emits `ci.run.started` then the queued
-/// `ci.check.updated` per context via the sanctioned [`OutboxTx::emit`] path (co-committed in ONE
-/// outbox transaction — `emit`-iff-`commit`); `main.rs` binds `OutboxStore::durable(PgOutboxBacking)`
-/// so the rows are durable. The `ci_run` ROW one-tx co-commit is the named `myelin-storage`-backing
-/// floor (this leaf crate has no `sqlx` outside `--features integration`); it is proven against live
-/// PG in the integration test's `PgReserveStore`.
+/// Historical events-only store retained only as a test fixture for deterministic absorb behavior.
+/// It is not production-reachable and may only stamp the first-attempt fixture shape.
+#[cfg(any(test, feature = "test-support", feature = "integration"))]
 pub struct OutboxReserveStore {
     outbox: OutboxStore,
     minter: Arc<dyn IdMinter>,
 }
 
+#[cfg(any(test, feature = "test-support", feature = "integration"))]
 impl OutboxReserveStore {
     /// Build the store over the service's DURABLE outbox (the `main.rs`
     /// `OutboxStore::durable(PgOutboxBacking)`) + the shared ULID minter.
@@ -388,19 +392,13 @@ impl OutboxReserveStore {
     }
 }
 
+#[cfg(any(test, feature = "test-support", feature = "integration"))]
 impl ReserveStore for OutboxReserveStore {
     fn persist(
         &self,
         armed: &ArmedRun,
         _tx: &mut myelin_events::HandlerTx<'_>,
     ) -> Result<(), ReserveError> {
-        // **The production separate-tx floor (events-only).** This leaf crate cannot name `sqlx`
-        // outside `--features integration`, so it CANNOT ride the type-erased co-commit connection
-        // (`_tx`) — it commits the events through its OWN durable outbox in a separate tx. This store
-        // does NOT write the ci_run ROW (it only stages a NOTE); the store that co-commits the durable
-        // run-of-record ROW on `_tx` (atomic with the dedup mark) is [`CoCommitReserveStore`] below
-        // (CT-004d.2 chunk 4). Kept as the events-only absorb path (its livelock proof is
-        // `h1_production_outbox_absorb_closes_the_livelock`).
         let mut tx = self
             .outbox
             .begin(Arc::clone(&self.minter), armed.emit_ctx.clone());
@@ -408,7 +406,11 @@ impl ReserveStore for OutboxReserveStore {
             "ci_run {} reserved (queued) — the durable ROW co-commit is CoCommitReserveStore (chunk 4)",
             armed.handoff.run_write.run_id
         ));
-        emit_reserve_events(&mut tx, armed)?;
+        let attempts = queued_contexts(armed)?
+            .into_iter()
+            .map(|context| (context, 1))
+            .collect();
+        emit_reserve_events(&mut tx, armed, &attempts)?;
         // **H1 — ABSORB-mode commit (not the reject-arm `commit`).** A crash-window redelivery (the
         // dedup mark not yet committed) re-runs this whole method and re-emits the SAME deterministic
         // ids; `commit_absorb` `ON CONFLICT (event_id) DO NOTHING`s the byte-identical re-emit instead
@@ -421,8 +423,7 @@ impl ReserveStore for OutboxReserveStore {
 
 /// **Emit the reserve bundle's two co-emitted EVENTS (`ci.run.started` + the queued `ci.check.updated`
 /// per context) into an open outbox tx, with DETERMINISTIC ids (the absorb-mode idempotency anchor).**
-/// The shared emit both [`OutboxReserveStore`] and [`CoCommitReserveStore`] use so the id derivation is
-/// authored ONCE (no drift). The caller `commit_absorb`s the tx.
+/// The shared staging helper keeps deterministic id derivation authored once.
 ///
 /// **Peer-review #8: DETERMINISTIC co-emitted event ids.** The `ci.run.started` + each queued
 /// `ci.check.updated` id is derived from the (deterministic) `run_id` + the event's stable subject, so
@@ -437,6 +438,7 @@ impl ReserveStore for OutboxReserveStore {
 fn emit_reserve_events(
     tx: &mut myelin_events::OutboxTransaction,
     armed: &ArmedRun,
+    attempts: &BTreeMap<String, u32>,
 ) -> Result<(), ReserveError> {
     let started_id = EventId(deterministic_uuid(&format!(
         "evt:{}",
@@ -449,8 +451,16 @@ fn emit_reserve_events(
     )
     .map_err(|e| ReserveError(format!("ci.run.started emit: {e:?}")))?;
     for check in &armed.handoff.queued_checks {
+        let context = queued_context(check)?;
+        let attempt = attempts.get(&context).copied().ok_or_else(|| {
+            ReserveError(format!(
+                "queued check {context:?} lacks an allocated attempt"
+            ))
+        })?;
+        let mut check = check.clone();
+        check.payload["run_attempt"] = serde_json::json!(attempt);
         let check_id = check_event_id(&armed.handoff.run_write.run_id, &check.subject.0);
-        tx.emit_with_id(check_id, check.clone(), Some(&armed.cause))
+        tx.emit_with_id(check_id, check, Some(&armed.cause))
             .map_err(|e| ReserveError(format!("queued ci.check.updated emit: {e:?}")))?;
     }
     Ok(())
@@ -486,63 +496,27 @@ pub fn ci_run_insert_from_armed(armed: &ArmedRun) -> myelin_ci_controlplane::CiR
     }
 }
 
-/// **The PRODUCTION reserve store that co-commits the durable `ci_run` ROW with the dedup mark
-/// (CT-004d.2 chunk 4 — the run-of-record writer the CT-004b integration test proved).** On `persist`:
-///
-/// 1. **CO-COMMIT the `ci_run` ROW on the consumer's co-commit `HandlerTx` connection** via
-///    [`CiRunStore::co_commit_insert`] (which downcasts `tx.connection::<sqlx::PgConnection>()` inside
-///    ci-controlplane, where `sqlx` is nameable). The row rides the SAME `sqlx` transaction the dedup
-///    mark is in, so the run-of-record + the mark commit together (runtime `Done`) or roll back together
-///    (`Retry`/failure) — the load-bearing atomicity invariant. `ON CONFLICT (tenant_id, run_id) DO
-///    NOTHING` makes a redelivery land the row exactly once. A missing co-commit connection is
-///    fail-closed (`Retry`), never a write outside the mark's tx.
-/// 2. **EMIT the co-emitted EVENTS through the DURABLE outbox in ABSORB mode (the honest #7 H1 split).**
-///    The `ci.run.started` + queued `ci.check.updated` events go through the outbox (which owns its OWN
-///    pool — this leaf crate cannot name `sqlx` there), `commit_absorb`ed so the deterministic re-emit
-///    of a crash-window redelivery is ABSORBED, not a livelock. The ROW co-commits; the EVENTS are
-///    absorb-idempotent. Forcing the events onto the external connection was H1's REJECTED path.
-///
-/// **The crash consistency (why the split is safe):** the events are absorb-idempotent on their
-/// deterministic ids and the row is `ON CONFLICT`-idempotent on its deterministic `run_id`, so ANY
-/// interleaving of the two commits under a crash converges to exactly ONE run + its events on
-/// redelivery. The row + mark atomicity means a run-of-record is NEVER durably present without its
-/// dedup mark (or vice-versa); the events being present without the row (order-2-before-1 crash) is
-/// self-healing (the redelivery writes the row + re-absorbs the events).
-///
-/// **The ONE non-auto-self-healing state (adversarial-verify LOW, 2026-07-17):** if the handler PANICS
-/// AFTER the events `commit_absorb` but before the runtime commits the row+mark, the #7 H2 panic path
-/// rolls back the co-commit tx (no row, no mark) and dead-letters TERMINALLY (acked) — so the queued
-/// `ci.check.updated` events stay durable with NO `ci_run` row until the durable-DLQ (#7b) poison is
-/// replayed. Direction is SAFE (the merge gate BLOCKS on a queued/absent required context, never
-/// admits — a run-of-record can't be silently missing in a way that green-lights a merge); it simply
-/// does not converge without operator replay. Named, not silently skipped.
+/// **The PRODUCTION reserve store.** Run row, retry-stable monotonic check attempts, canonical queued
+/// events, and trigger dedup mark share the consumer's transaction. The event envelopes are staged
+/// through the frozen detached-outbox builder and inserted through `PgRelay` on that same connection.
 ///
 /// Out of scope (named): `DurableExecutor::start` (chunk 3), the `ci.pipeline` body (chunk 2), the
 /// scheduler/runner (chunk 5). This store writes the reserve run-of-record + emits the reserve events.
 pub struct CoCommitReserveStore {
     ci_run: myelin_ci_controlplane::CiRunStore,
-    outbox: OutboxStore,
     minter: Arc<dyn IdMinter>,
     rt: tokio::runtime::Handle,
 }
 
 impl CoCommitReserveStore {
-    /// Build the production reserve store from the durable `ci_run` writer (over the CI OLTP pool), the
-    /// service's DURABLE outbox (the `main.rs` `OutboxStore::durable(PgOutboxBacking)`), the shared ULID
-    /// minter, and the serve runtime handle (bridges the async co-commit `sqlx` write to the sync
-    /// `persist` body — the `PgOutboxBacking` idiom).
+    /// Build the production reserve store from the durable CI writer, deterministic event-id source,
+    /// and runtime bridge.
     pub fn new(
         ci_run: myelin_ci_controlplane::CiRunStore,
-        outbox: OutboxStore,
         minter: Arc<dyn IdMinter>,
         rt: tokio::runtime::Handle,
     ) -> CoCommitReserveStore {
-        CoCommitReserveStore {
-            ci_run,
-            outbox,
-            minter,
-            rt,
-        }
+        CoCommitReserveStore { ci_run, minter, rt }
     }
 }
 
@@ -552,20 +526,57 @@ impl ReserveStore for CoCommitReserveStore {
         armed: &ArmedRun,
         tx: &mut myelin_events::HandlerTx<'_>,
     ) -> Result<(), ReserveError> {
-        // (1) CO-COMMIT the run-of-record ROW on the dedup mark's tx (fail-closed on no co-commit conn).
+        // Allocate the monotonic attempt before the queued fact is materialised. The run row,
+        // check_attempt bump, queued facts, and consumer dedup mark all use the caller's transaction;
+        // a rerun can therefore never publish a stale hard-coded attempt or expose a green window.
         let row = ci_run_insert_from_armed(armed);
+        let contexts = queued_contexts(armed)?;
+        let minter = Arc::clone(&self.minter);
         self.ci_run
-            .co_commit_insert(tx, &row, &self.rt)
-            .map_err(|e| ReserveError(format!("ci_run co-commit: {e}")))?;
-        // (2) EMIT the events through the DURABLE outbox in ABSORB mode (the honest #7 H1 split — the
-        // events stay absorb-idempotent; the ROW above co-committed with the mark).
-        let mut otx = self
-            .outbox
-            .begin(Arc::clone(&self.minter), armed.emit_ctx.clone());
-        emit_reserve_events(&mut otx, armed)?;
-        otx.commit_absorb()
-            .map_err(|e| ReserveError(format!("outbox commit_absorb: {e:?}")))
+            .co_commit_reserve(tx, &row, &contexts, &self.rt, |attempts| {
+                stage_reserve_events(armed, attempts, minter)
+            })
+            .map(|_| ())
+            .map_err(|e| ReserveError(format!("reserve co-commit: {e}")))
     }
+}
+
+fn queued_contexts(armed: &ArmedRun) -> Result<BTreeSet<String>, ReserveError> {
+    armed
+        .handoff
+        .queued_checks
+        .iter()
+        .map(queued_context)
+        .collect()
+}
+
+fn queued_context(check: &myelin_events::EventDraft) -> Result<String, ReserveError> {
+    let context = check
+        .payload
+        .get("context")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| ReserveError("queued check lacks context".into()))?;
+    if context.get("provider").and_then(|value| value.as_str()) != Some("ci") {
+        return Err(ReserveError(
+            "queued check is outside the CI provider namespace".into(),
+        ));
+    }
+    context
+        .get("name")
+        .and_then(|value| value.as_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ReserveError("queued check lacks context name".into()))
+}
+
+fn stage_reserve_events(
+    armed: &ArmedRun,
+    attempts: &BTreeMap<String, u32>,
+    minter: Arc<dyn IdMinter>,
+) -> Result<Vec<myelin_events::OutboxRow>, String> {
+    let mut tx = OutboxTransaction::detached(minter, armed.emit_ctx.clone());
+    emit_reserve_events(&mut tx, armed, attempts).map_err(|error| error.to_string())?;
+    tx.into_staged_rows().map_err(|error| error.0)
 }
 
 // =================================================================================================
@@ -605,12 +616,16 @@ impl std::fmt::Display for SkipReason {
             SkipReason::MalformedPayload(m) => write!(f, "malformed trigger payload: {m}"),
             SkipReason::InvalidProvenance(m) => write!(f, "invalid trigger provenance: {m}"),
             SkipReason::ReadFailed(e) => write!(f, "{e}"),
-            SkipReason::NoConfig => write!(f, "no `.myelin/ci.*` at the pushed ref — no pipeline armed"),
+            SkipReason::NoConfig => {
+                write!(f, "no `.myelin/ci.*` at the pushed ref — no pipeline armed")
+            }
             SkipReason::ConfigError(e) => write!(f, "malformed `.myelin/ci.*` (fail-closed): {e}"),
             SkipReason::TriggerNotMatched => {
                 write!(f, "the armed trigger does not match this event — no run")
             }
-            SkipReason::ResolveError(e) => write!(f, "the definition failed to resolve (fail-closed): {e}"),
+            SkipReason::ResolveError(e) => {
+                write!(f, "the definition failed to resolve (fail-closed): {e}")
+            }
         }
     }
 }
@@ -655,45 +670,53 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
     // identify the same push/PR before any Git or CAS read is attempted.
     let (oid_field, concurrency_group, pr_head_generation) =
         if ev.type_.0 == myelin_git::events::GIT_REF_UPDATED {
-        let ref_name = p.get("ref").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-            .ok_or_else(|| SkipReason::MalformedPayload("missing `ref`".into()))?;
-        validate_git_ref_name(ref_name)?;
-        validate_envelope_provenance(
-            ev,
-            &format!("myelin://{}/git/ref/{repo}:{ref_name}", ev.tenant.0),
-            &format!("{repo}:{ref_name}"),
-        )?;
-        ("new_oid", None, None)
-    } else {
-        let number = p.get("number").and_then(|v| v.as_u64()).filter(|number| *number > 0)
-            .ok_or_else(|| SkipReason::InvalidProvenance("PR `number` must be a positive integer".into()))?;
-        validate_envelope_provenance(
-            ev,
-            &format!("myelin://{}/git/pr/{repo}:{number}", ev.tenant.0),
-            &format!("git/pr/{repo}:{number}"),
-        )?;
-        let group = format!("pr:{repo}:{number}");
-        if group.len() > 512 {
-            return Err(SkipReason::InvalidProvenance(
-                "PR concurrency identity exceeds 512 bytes".into(),
-            ));
-        }
-        if ev.schema_ver < myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2 {
-            return Err(SkipReason::InvalidProvenance(
-                "PR head-trigger event did not pass the required schema upcaster".into(),
-            ));
-        }
-        let generation = p
-            .get("head_generation")
-            .and_then(|value| value.as_i64())
-            .filter(|generation| *generation > 0)
-            .ok_or_else(|| {
-                SkipReason::InvalidProvenance(
-                    "PR `head_generation` must be a positive signed 64-bit integer".into(),
-                )
-            })?;
-        ("head_oid", Some(group), Some(generation))
-    };
+            let ref_name = p
+                .get("ref")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| SkipReason::MalformedPayload("missing `ref`".into()))?;
+            validate_git_ref_name(ref_name)?;
+            validate_envelope_provenance(
+                ev,
+                &format!("myelin://{}/git/ref/{repo}:{ref_name}", ev.tenant.0),
+                &format!("{repo}:{ref_name}"),
+            )?;
+            ("new_oid", None, None)
+        } else {
+            let number = p
+                .get("number")
+                .and_then(|v| v.as_u64())
+                .filter(|number| *number > 0)
+                .ok_or_else(|| {
+                    SkipReason::InvalidProvenance("PR `number` must be a positive integer".into())
+                })?;
+            validate_envelope_provenance(
+                ev,
+                &format!("myelin://{}/git/pr/{repo}:{number}", ev.tenant.0),
+                &format!("git/pr/{repo}:{number}"),
+            )?;
+            let group = format!("pr:{repo}:{number}");
+            if group.len() > 512 {
+                return Err(SkipReason::InvalidProvenance(
+                    "PR concurrency identity exceeds 512 bytes".into(),
+                ));
+            }
+            if ev.schema_ver < myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2 {
+                return Err(SkipReason::InvalidProvenance(
+                    "PR head-trigger event did not pass the required schema upcaster".into(),
+                ));
+            }
+            let generation = p
+                .get("head_generation")
+                .and_then(|value| value.as_i64())
+                .filter(|generation| *generation > 0)
+                .ok_or_else(|| {
+                    SkipReason::InvalidProvenance(
+                        "PR `head_generation` must be a positive signed 64-bit integer".into(),
+                    )
+                })?;
+            ("head_oid", Some(group), Some(generation))
+        };
 
     // Only an immutable full SHA-1 oid is admitted. Refs, HEAD, revspecs, and abbreviations are
     // permanently invalid and are refused before crossing the Git reader seam.
@@ -726,12 +749,14 @@ fn validate_envelope_provenance(
 ) -> Result<(), SkipReason> {
     if ev.subject.0 != expected_subject {
         return Err(SkipReason::InvalidProvenance(format!(
-            "subject/payload provenance mismatch: expected {expected_subject:?}, got {:?}", ev.subject.0
+            "subject/payload provenance mismatch: expected {expected_subject:?}, got {:?}",
+            ev.subject.0
         )));
     }
     if ev.aggregate.0 != expected_aggregate {
         return Err(SkipReason::InvalidProvenance(format!(
-            "aggregate/payload provenance mismatch: expected {expected_aggregate:?}, got {:?}", ev.aggregate.0
+            "aggregate/payload provenance mismatch: expected {expected_aggregate:?}, got {:?}",
+            ev.aggregate.0
         )));
     }
     Ok(())
@@ -746,12 +771,18 @@ fn validate_git_ref_name(ref_name: &str) -> Result<(), SkipReason> {
         || ref_name.contains("..")
         || ref_name.contains("@{")
         || ref_name.contains([':', '\\'])
-        || ref_name.split('/').any(|part| {
-            part.is_empty() || part.starts_with('.') || part.ends_with(".lock")
-        })
-        || ref_name.chars().any(|c| c.is_ascii_control() || c.is_ascii_whitespace() || matches!(c, '~' | '^' | '?' | '*' | '['));
+        || ref_name
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+        || ref_name.chars().any(|c| {
+            c.is_ascii_control()
+                || c.is_ascii_whitespace()
+                || matches!(c, '~' | '^' | '?' | '*' | '[')
+        });
     if invalid {
-        Err(SkipReason::InvalidProvenance(format!("invalid canonical Git ref {ref_name:?}")))
+        Err(SkipReason::InvalidProvenance(format!(
+            "invalid canonical Git ref {ref_name:?}"
+        )))
     } else {
         Ok(())
     }
@@ -892,9 +923,7 @@ pub fn plan_dispatch(
     };
     let def: VersionedCiDefinition = match parse_versioned_ci_config(&bytes, format_hint) {
         Ok(d) => d,
-        Err(e) => {
-            return DispatchOutcome::Skip(SkipReason::ConfigError(e.into_legacy_surface()))
-        }
+        Err(e) => return DispatchOutcome::Skip(SkipReason::ConfigError(e.into_legacy_surface())),
     };
 
     // 4. Compile the armed trigger and ask: does THIS event match? The config's `on:` compiles to the
@@ -908,7 +937,9 @@ pub fn plan_dispatch(
     //    type match" question, whose subject is a git ref, not a run. The two-halves seam: the type
     //    predicate here, the run-object visibility at the authz layer — named.)
     if let Err(e) = compile_trigger(&def.on) {
-        return DispatchOutcome::Skip(SkipReason::MalformedPayload(format!("trigger compile: {e}")));
+        return DispatchOutcome::Skip(SkipReason::MalformedPayload(format!(
+            "trigger compile: {e}"
+        )));
     }
     if def.on != on || !def.on.event_types().contains(&ev.type_.0.as_str()) {
         return DispatchOutcome::Skip(SkipReason::TriggerNotMatched);
@@ -941,12 +972,15 @@ pub fn plan_dispatch(
         .iter()
         .map(|j| CheckContext::ci(myelin_ci_controlplane::ci_check_context_v1(&j.name)))
         .collect();
+    let repo_ref = format!("myelin://{}/git/repo/{}", tenant.0, facts.repo);
     let run_facts = RunFacts {
         run_id: run_id.clone(),
-        repo_ref: facts.repo.clone(),
+        tenant_id: tenant.0.clone(),
+        repo_ref: repo_ref.clone(),
         commit_oid: facts.new_oid.clone(),
         contexts,
         cause_event_id: ev.event_id.clone(),
+        started_at: ev.occurred_at.0.clone(),
     };
     let handoff = reserve_and_start(&snapshot, &stamp, &def.on, &run_facts);
 
@@ -956,7 +990,7 @@ pub fn plan_dispatch(
         pipeline_id: deterministic_uuid(&format!("pipeline:{}", facts.repo)),
         wf_run_id,
         correlation_id: ev.correlation_id.0.clone(),
-        repo_ref: facts.repo,
+        repo_ref,
         commit_oid: facts.new_oid,
         concurrency_group: facts.concurrency_group,
         pr_head_generation: facts.pr_head_generation,
@@ -1045,10 +1079,7 @@ impl CiTriggerHandler {
     /// The bounded outcome trace (the surfaced skips + armed-run ids) — the observability a drill
     /// reads to assert a malformed config was a surfaced skip, not a silent swallow.
     pub fn trace(&self) -> Vec<String> {
-        self.trace
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.trace.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn record(&self, line: String) {
@@ -1255,7 +1286,9 @@ impl GitConfigReader for MapGitConfigReader {
     ) -> Result<Option<Vec<u8>>, GitReadError> {
         let key = (repo.to_string(), oid.to_string(), path.to_string());
         if self.fail.contains(&key) {
-            return Err(GitReadError::Unavailable(format!("injected read failure at {path}")));
+            return Err(GitReadError::Unavailable(format!(
+                "injected read failure at {path}"
+            )));
         }
         Ok(self.files.get(&key).cloned())
     }
@@ -1339,7 +1372,13 @@ impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> GitConfigReader
     }
 
     fn read_repo_file_bounded(
-        &self, tenant: &str, region: &str, repo: &str, oid: &str, path: &str, maximum_bytes: usize,
+        &self,
+        tenant: &str,
+        region: &str,
+        repo: &str,
+        oid: &str,
+        path: &str,
+        maximum_bytes: usize,
     ) -> Result<Option<Vec<u8>>, GitReadError> {
         let loc = myelin_git::core::RepoLoc::new(tenant, region, repo);
         if !self.store.repo_exists(&loc) {
@@ -1357,7 +1396,12 @@ impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> GitConfigReader
             .map_err(|e| GitReadError::Unavailable(format!("read {path}@{}: {e}", oid.as_str())))?
         {
             myelin_git::durable::BlobPathLookup::Found { bytes, .. } => Ok(Some(bytes)),
-            myelin_git::durable::BlobPathLookup::TooLarge { size, maximum, .. } => Err(GitReadError::Invalid(format!("{path}@{} is {size} bytes, above the {maximum}-byte config limit", oid.as_str()))),
+            myelin_git::durable::BlobPathLookup::TooLarge { size, maximum, .. } => {
+                Err(GitReadError::Invalid(format!(
+                    "{path}@{} is {size} bytes, above the {maximum}-byte config limit",
+                    oid.as_str()
+                )))
+            }
             // Absent or a directory at that name → no config file (a clean skip).
             myelin_git::durable::BlobPathLookup::Missing
             | myelin_git::durable::BlobPathLookup::IsDir => Ok(None),
@@ -1434,7 +1478,10 @@ mod tests {
             "head_oid": TEST_OID,
             "head_generation": 1,
         });
-        ev.payload.as_object_mut().unwrap().extend(fork_fields.as_object().unwrap().clone());
+        ev.payload
+            .as_object_mut()
+            .unwrap()
+            .extend(fork_fields.as_object().unwrap().clone());
         ev
     }
 
@@ -1477,7 +1524,12 @@ mod tests {
 
     impl GitConfigReader for NoConfigRead {
         fn read_repo_file(
-            &self, _tenant: &str, _region: &str, _repo: &str, _oid: &str, _path: &str,
+            &self,
+            _tenant: &str,
+            _region: &str,
+            _repo: &str,
+            _oid: &str,
+            _path: &str,
         ) -> Result<Option<Vec<u8>>, GitReadError> {
             panic!("malformed provenance reached a config read")
         }
@@ -1486,16 +1538,32 @@ mod tests {
     struct NoCasAccess;
 
     impl BlobStore for NoCasAccess {
-        fn put(&self, _tenant: &TenantId, _bytes: &[u8]) -> myelin_storage::blob::Result<ContentHash> {
+        fn put(
+            &self,
+            _tenant: &TenantId,
+            _bytes: &[u8],
+        ) -> myelin_storage::blob::Result<ContentHash> {
             panic!("malformed provenance reached CAS")
         }
-        fn get(&self, _tenant: &TenantId, _hash: &ContentHash) -> myelin_storage::blob::Result<Vec<u8>> {
+        fn get(
+            &self,
+            _tenant: &TenantId,
+            _hash: &ContentHash,
+        ) -> myelin_storage::blob::Result<Vec<u8>> {
             panic!("malformed provenance reached CAS")
         }
-        fn head(&self, _tenant: &TenantId, _hash: &ContentHash) -> myelin_storage::blob::Result<myelin_storage::blob::BlobMeta> {
+        fn head(
+            &self,
+            _tenant: &TenantId,
+            _hash: &ContentHash,
+        ) -> myelin_storage::blob::Result<myelin_storage::blob::BlobMeta> {
             panic!("malformed provenance reached CAS")
         }
-        fn delete(&self, _tenant: &TenantId, _hash: &ContentHash) -> myelin_storage::blob::Result<()> {
+        fn delete(
+            &self,
+            _tenant: &TenantId,
+            _hash: &ContentHash,
+        ) -> myelin_storage::blob::Result<()> {
             panic!("malformed provenance reached CAS")
         }
     }
@@ -1524,7 +1592,10 @@ mod tests {
     }
 
     fn message(envelope: EventEnvelope) -> Message {
-        Message { subject: envelope.subject.0.clone(), envelope }
+        Message {
+            subject: envelope.subject.0.clone(),
+            envelope,
+        }
     }
 
     fn temp_git_root(label: &str) -> std::path::PathBuf {
@@ -1546,7 +1617,10 @@ mod tests {
             AuthoritativeGitRoot::validate("relative/git-root"),
             Err(GitRootError(message)) if message.contains("absolute")
         ));
-        let missing = std::env::temp_dir().join(format!("myelin-ci-dispatch-missing-root-{}", std::process::id()));
+        let missing = std::env::temp_dir().join(format!(
+            "myelin-ci-dispatch-missing-root-{}",
+            std::process::id()
+        ));
         assert!(AuthoritativeGitRoot::validate(missing).is_err());
 
         let root = temp_git_root("validated-root");
@@ -1559,7 +1633,10 @@ mod tests {
     fn region_mismatch_dlqs_before_git_cas_or_reserve_then_records_terminal_tombstone() {
         let reserve = Arc::new(RecordingReserveStore::new());
         let handler = CiTriggerHandler::for_region(
-            Arc::new(NoConfigRead), Arc::new(NoCasAccess), reserve.clone(), "us-east",
+            Arc::new(NoConfigRead),
+            Arc::new(NoCasAccess),
+            reserve.clone(),
+            "us-east",
         );
         let ledger = DedupLedger::new();
         let consumer = runtime(handler, ledger.clone());
@@ -1568,8 +1645,15 @@ mod tests {
             consumer.deliver(&message(push_envelope("web", TEST_OID))),
             Delivered::DeadLettered(_)
         ));
-        assert!(reserve.persisted().is_empty(), "region mismatch has zero reserve effects");
-        assert_eq!(ledger.len(), 1, "DLQ persistence precedes the terminal tombstone");
+        assert!(
+            reserve.persisted().is_empty(),
+            "region mismatch has zero reserve effects"
+        );
+        assert_eq!(
+            ledger.len(),
+            1,
+            "DLQ persistence precedes the terminal tombstone"
+        );
     }
 
     #[test]
@@ -1587,7 +1671,10 @@ mod tests {
             ));
             let reserve = Arc::new(RecordingReserveStore::new());
             let handler = CiTriggerHandler::for_region(
-                reader, Arc::new(FsBlobStore::new()), reserve.clone(), "fr-par",
+                reader,
+                Arc::new(FsBlobStore::new()),
+                reserve.clone(),
+                "fr-par",
             );
             let ledger = DedupLedger::new();
             let consumer = runtime(handler, ledger.clone());
@@ -1610,7 +1697,12 @@ mod tests {
             .expect("create bare repo");
         let (commit, _, _) = repo
             .build_file_commit(
-                "refs/heads/main", "README.md", b"no CI definition\n", "seed", "ci", "ci@invalid",
+                "refs/heads/main",
+                "README.md",
+                b"no CI definition\n",
+                "seed",
+                "ci",
+                "ci@invalid",
             )
             .expect("seed commit");
         let reserve = Arc::new(RecordingReserveStore::new());
@@ -1628,7 +1720,11 @@ mod tests {
             Delivered::Acked
         );
         assert!(reserve.persisted().is_empty());
-        assert_eq!(ledger.len(), 1, "genuine NoConfig is terminally acknowledged");
+        assert_eq!(
+            ledger.len(),
+            1,
+            "genuine NoConfig is terminally acknowledged"
+        );
         drop(consumer);
         std::fs::remove_dir_all(root).ok();
     }
@@ -1636,13 +1732,14 @@ mod tests {
     #[test]
     fn oversized_config_is_terminal_poison_without_business_effect() {
         let reader: Arc<dyn GitConfigReader> = Arc::new(MapGitConfigReader::new().with_file(
-            "web", TEST_OID, ".myelin/ci.toml",
+            "web",
+            TEST_OID,
+            ".myelin/ci.toml",
             vec![b' '; crate::config::MAX_CI_CONFIG_BYTES + 1],
         ));
         let reserve = Arc::new(RecordingReserveStore::new());
-        let handler = CiTriggerHandler::for_region(
-            reader, Arc::new(NoCasAccess), reserve.clone(), "fr-par",
-        );
+        let handler =
+            CiTriggerHandler::for_region(reader, Arc::new(NoCasAccess), reserve.clone(), "fr-par");
         let ledger = DedupLedger::new();
         let consumer = runtime(handler, ledger.clone());
 
@@ -1651,13 +1748,21 @@ mod tests {
             Delivered::DeadLettered(_)
         ));
         assert!(reserve.persisted().is_empty());
-        assert_eq!(ledger.len(), 1, "DLQ persistence precedes the terminal tombstone");
+        assert_eq!(
+            ledger.len(),
+            1,
+            "DLQ persistence precedes the terminal tombstone"
+        );
     }
 
     struct FailingBlobStore;
 
     impl BlobStore for FailingBlobStore {
-        fn put(&self, _tenant: &TenantId, _bytes: &[u8]) -> myelin_storage::blob::Result<ContentHash> {
+        fn put(
+            &self,
+            _tenant: &TenantId,
+            _bytes: &[u8],
+        ) -> myelin_storage::blob::Result<ContentHash> {
             Err(myelin_storage::blob::BlobError::Backend(
                 myelin_storage::blob::BlobDependencyError::Transient,
             ))
@@ -1665,7 +1770,11 @@ mod tests {
         fn get(&self, _: &TenantId, _: &ContentHash) -> myelin_storage::blob::Result<Vec<u8>> {
             panic!("CAS read reached during write-failure test")
         }
-        fn head(&self, _: &TenantId, _: &ContentHash) -> myelin_storage::blob::Result<myelin_storage::blob::BlobMeta> {
+        fn head(
+            &self,
+            _: &TenantId,
+            _: &ContentHash,
+        ) -> myelin_storage::blob::Result<myelin_storage::blob::BlobMeta> {
             panic!("CAS head reached during write-failure test")
         }
         fn delete(&self, _: &TenantId, _: &ContentHash) -> myelin_storage::blob::Result<()> {
@@ -1675,22 +1784,25 @@ mod tests {
 
     #[test]
     fn cas_snapshot_write_failure_retries_without_dedup_or_reserve_effect() {
-        let reader: Arc<dyn GitConfigReader> = Arc::new(
-            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", valid_toml()),
-        );
+        let reader: Arc<dyn GitConfigReader> = Arc::new(MapGitConfigReader::new().with_file(
+            "web",
+            TEST_OID,
+            ".myelin/ci.toml",
+            valid_toml(),
+        ));
         let reserve = Arc::new(RecordingReserveStore::new());
         let handler = CiTriggerHandler::for_region(
-            reader, Arc::new(FailingBlobStore), reserve.clone(), "fr-par",
+            reader,
+            Arc::new(FailingBlobStore),
+            reserve.clone(),
+            "fr-par",
         );
         let ledger = DedupLedger::new();
         let consumer = runtime(handler, ledger.clone());
 
         assert_eq!(
             consumer.deliver(&message(push_envelope("web", TEST_OID))),
-            Delivered::DependencyUnavailable(
-                myelin_events::relay::IntakeDependency::Blob,
-                5,
-            )
+            Delivered::DependencyUnavailable(myelin_events::relay::IntakeDependency::Blob, 5,)
         );
         assert!(reserve.persisted().is_empty());
         assert!(ledger.is_empty(), "S3 retry rolls back the dedup mark");
@@ -1717,7 +1829,10 @@ mod tests {
         let patterns = ci_trigger_subjects();
         assert!(!patterns.is_empty(), "subjects() is a non-empty whitelist");
         for p in patterns {
-            assert!(!p.0.is_empty(), "no EMPTY (match-all) SubjectPattern in subjects() — finding #12");
+            assert!(
+                !p.0.is_empty(),
+                "no EMPTY (match-all) SubjectPattern in subjects() — finding #12"
+            );
             assert_ne!(p.0, "*");
             assert_ne!(p.0, ">");
         }
@@ -1733,15 +1848,22 @@ mod tests {
     fn no_config_is_a_clean_skip() {
         let ev = push_envelope("web", TEST_OID);
         let reader = MapGitConfigReader::new();
-        assert!(matches!(arm(&ev, &reader), DispatchOutcome::Skip(SkipReason::NoConfig)));
+        assert!(matches!(
+            arm(&ev, &reader),
+            DispatchOutcome::Skip(SkipReason::NoConfig)
+        ));
     }
 
     /// **A malformed `.myelin/ci.toml` → a fail-closed, SURFACED ConfigError skip (no run, no crash).**
     #[test]
     fn a_malformed_config_is_a_surfaced_skip() {
         let ev = push_envelope("web", TEST_OID);
-        let reader =
-            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", &b"on = = broken"[..]);
+        let reader = MapGitConfigReader::new().with_file(
+            "web",
+            TEST_OID,
+            ".myelin/ci.toml",
+            &b"on = = broken"[..],
+        );
         assert!(matches!(
             arm(&ev, &reader),
             DispatchOutcome::Skip(SkipReason::ConfigError(_))
@@ -1763,9 +1885,15 @@ mod tests {
     fn an_oversized_config_is_refused_before_parsing() {
         let ev = push_envelope("web", TEST_OID);
         let reader = MapGitConfigReader::new().with_file(
-            "web", TEST_OID, ".myelin/ci.toml", vec![b' '; crate::config::MAX_CI_CONFIG_BYTES + 1],
+            "web",
+            TEST_OID,
+            ".myelin/ci.toml",
+            vec![b' '; crate::config::MAX_CI_CONFIG_BYTES + 1],
         );
-        assert!(matches!(arm(&ev, &reader), DispatchOutcome::Skip(SkipReason::ReadFailed(_))));
+        assert!(matches!(
+            arm(&ev, &reader),
+            DispatchOutcome::Skip(SkipReason::ReadFailed(_))
+        ));
     }
 
     /// **A non-matching trigger (a `pull_request` config on a push) → TriggerNotMatched skip.**
@@ -1778,8 +1906,12 @@ mod tests {
             "image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"\n",
             "command = [\"build\"]\n"
         );
-        let reader =
-            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", pr_config.as_bytes());
+        let reader = MapGitConfigReader::new().with_file(
+            "web",
+            TEST_OID,
+            ".myelin/ci.toml",
+            pr_config.as_bytes(),
+        );
         assert!(matches!(
             arm(&ev, &reader),
             DispatchOutcome::Skip(SkipReason::TriggerNotMatched)
@@ -1791,8 +1923,12 @@ mod tests {
     fn a_floating_tag_is_a_surfaced_resolve_skip() {
         let ev = push_envelope("web", TEST_OID);
         let floating = "on = \"push\"\n\n[[jobs]]\nname = \"build\"\nimage = \"alpine:3\"\ncommand = [\"build\"]\n";
-        let reader =
-            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", floating.as_bytes());
+        let reader = MapGitConfigReader::new().with_file(
+            "web",
+            TEST_OID,
+            ".myelin/ci.toml",
+            floating.as_bytes(),
+        );
         assert!(matches!(
             arm(&ev, &reader),
             DispatchOutcome::Skip(SkipReason::ResolveError(ResolveError::FloatingTag { .. }))
@@ -1813,7 +1949,10 @@ mod tests {
     fn assert_invalid_provenance_is_poison_before_effects(ev: EventEnvelope) {
         let reserve = Arc::new(RecordingReserveStore::new());
         let handler = CiTriggerHandler::for_region(
-            Arc::new(NoConfigRead), Arc::new(NoCasAccess), reserve.clone(), "fr-par",
+            Arc::new(NoConfigRead),
+            Arc::new(NoCasAccess),
+            reserve.clone(),
+            "fr-par",
         );
         match handler.handle(&ev, &mut myelin_events::HandlerTx::none()) {
             HandleOutcome::NonRetryable(myelin_events::Reason(reason)) => {
@@ -1824,18 +1963,27 @@ mod tests {
         }
         let ledger = DedupLedger::new();
         let consumer = runtime(handler, ledger.clone());
-        assert!(matches!(consumer.deliver(&message(ev)), Delivered::DeadLettered(_)));
-        assert!(reserve.persisted().is_empty(), "invalid provenance has zero reserve effects");
-        assert_eq!(ledger.len(), 1, "permanent poison records a terminal tombstone after DLQ");
+        assert!(matches!(
+            consumer.deliver(&message(ev)),
+            Delivered::DeadLettered(_)
+        ));
+        assert!(
+            reserve.persisted().is_empty(),
+            "invalid provenance has zero reserve effects"
+        );
+        assert_eq!(
+            ledger.len(),
+            1,
+            "permanent poison records a terminal tombstone after DLQ"
+        );
     }
 
     #[test]
     fn push_subject_aggregate_payload_and_ref_provenance_must_cohere_before_effects() {
         let mut cases = Vec::new();
         let mut wrong_subject_repo = push_envelope("team/web", TEST_OID);
-        wrong_subject_repo.subject = ArtifactRef(
-            "myelin://acme/git/ref/other/web:refs/heads/main".into(),
-        );
+        wrong_subject_repo.subject =
+            ArtifactRef("myelin://acme/git/ref/other/web:refs/heads/main".into());
         cases.push(wrong_subject_repo);
         let mut wrong_tenant = push_envelope("web", TEST_OID);
         wrong_tenant.subject = ArtifactRef("myelin://other/git/ref/web:refs/heads/main".into());
@@ -1863,21 +2011,22 @@ mod tests {
         let mut wrong_subject = pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
         wrong_subject.subject = ArtifactRef("myelin://acme/git/pr/other:42".into());
         cases.push(wrong_subject);
-        let mut wrong_aggregate = pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
+        let mut wrong_aggregate =
+            pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
         wrong_aggregate.aggregate = AggregateKey("git/pr/web:41".into());
         cases.push(wrong_aggregate);
         let mut invalid_repo = pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
         invalid_repo.payload["repo"] = serde_json::json!("group//web");
         cases.push(invalid_repo);
-        let mut invalid_number = pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
+        let mut invalid_number =
+            pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
         invalid_number.payload["number"] = serde_json::json!(0);
         cases.push(invalid_number);
         let oversized_repo = "a".repeat(510);
         let mut oversized_group =
             pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
         oversized_group.payload["repo"] = serde_json::json!(&oversized_repo);
-        oversized_group.subject =
-            ArtifactRef(format!("myelin://acme/git/pr/{oversized_repo}:42"));
+        oversized_group.subject = ArtifactRef(format!("myelin://acme/git/pr/{oversized_repo}:42"));
         oversized_group.aggregate = AggregateKey(format!("git/pr/{oversized_repo}:42"));
         cases.push(oversized_group);
         for event in cases {
@@ -1957,7 +2106,13 @@ mod tests {
 
     #[test]
     fn revspecs_refs_head_abbreviations_and_non_hex_oids_are_permanent_before_git_read() {
-        for invalid in ["HEAD", "main", "refs/heads/main", "deadbeef", "ATTACKER_SENTINEL"] {
+        for invalid in [
+            "HEAD",
+            "main",
+            "refs/heads/main",
+            "deadbeef",
+            "ATTACKER_SENTINEL",
+        ] {
             let mut event = push_envelope("web", TEST_OID);
             event.payload["new_oid"] = serde_json::json!(invalid);
             assert!(matches!(
@@ -1968,22 +2123,24 @@ mod tests {
         let mut event = push_envelope("web", TEST_OID);
         event.payload["new_oid"] = serde_json::json!("ATTACKER_SENTINEL");
         let handler = CiTriggerHandler::for_region(
-            Arc::new(NoConfigRead), Arc::new(NoCasAccess),
-            Arc::new(RecordingReserveStore::new()), "fr-par",
+            Arc::new(NoConfigRead),
+            Arc::new(NoCasAccess),
+            Arc::new(RecordingReserveStore::new()),
+            "fr-par",
         );
         let HandleOutcome::NonRetryable(myelin_events::Reason(reason)) =
-            handler.handle(&event, &mut myelin_events::HandlerTx::none()) else {
-                panic!("invalid oid must be permanent poison");
-            };
+            handler.handle(&event, &mut myelin_events::HandlerTx::none())
+        else {
+            panic!("invalid oid must be permanent poison");
+        };
         assert!(!reason.contains("ATTACKER_SENTINEL"));
     }
 
     #[test]
     fn uppercase_exact_oid_is_canonicalized_before_git_read_and_persistence() {
         let uppercase = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
-        let reader = MapGitConfigReader::new().with_file(
-            "web", TEST_OID, ".myelin/ci.toml", valid_toml(),
-        );
+        let reader =
+            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", valid_toml());
         let DispatchOutcome::Arm(armed) = arm(&push_envelope("web", uppercase), &reader) else {
             panic!("uppercase exact oid must canonicalize and arm");
         };
@@ -1994,28 +2151,40 @@ mod tests {
     fn durable_reader_preserves_namespaced_repository_slugs() {
         let root = temp_git_root("namespaced-repo");
         let store = myelin_git::durable::DurableGitStore::rooted(&root);
-        let repo = store.create_repo(&myelin_git::core::RepoLoc::new(
-            "acme", "fr-par", "team/web",
-        )).expect("create namespaced bare repo");
+        let repo = store
+            .create_repo(&myelin_git::core::RepoLoc::new(
+                "acme", "fr-par", "team/web",
+            ))
+            .expect("create namespaced bare repo");
         let raw = git2::Repository::open_bare(repo.path()).expect("open namespaced repo");
         let blob = raw.blob(valid_toml()).expect("write CI config blob");
         let mut ci = raw.treebuilder(None).expect("CI tree builder");
         ci.insert("ci.toml", blob, 0o100644).expect("insert config");
         let ci_tree = ci.write().expect("write CI tree");
         let mut root_tree = raw.treebuilder(None).expect("root tree builder");
-        root_tree.insert(".myelin", ci_tree, 0o040000).expect("insert .myelin tree");
-        let root_tree = raw.find_tree(root_tree.write().expect("write root tree")).unwrap();
+        root_tree
+            .insert(".myelin", ci_tree, 0o040000)
+            .expect("insert .myelin tree");
+        let root_tree = raw
+            .find_tree(root_tree.write().expect("write root tree"))
+            .unwrap();
         let signature = git2::Signature::now("ci", "ci@invalid").unwrap();
-        let commit = raw.commit(
-            Some("refs/heads/main"), &signature, &signature, "seed", &root_tree, &[],
-        ).expect("seed CI config").to_string();
+        let commit = raw
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "seed",
+                &root_tree,
+                &[],
+            )
+            .expect("seed CI config")
+            .to_string();
         let reader = DurableGitConfigReader::new(store);
-        let DispatchOutcome::Arm(armed) = arm(
-            &push_envelope("team/web", &commit), &reader,
-        ) else {
+        let DispatchOutcome::Arm(armed) = arm(&push_envelope("team/web", &commit), &reader) else {
             panic!("the full namespaced slug must select its own repository");
         };
-        assert_eq!(armed.reserve.repo_ref, "team/web");
+        assert_eq!(armed.reserve.repo_ref, "myelin://acme/git/repo/team/web");
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -2040,15 +2209,26 @@ mod tests {
         let cases = [
             (serde_json::json!({ "is_fork": false }), "trusted"),
             (serde_json::json!({ "forked": false }), "trusted"),
-            (serde_json::json!({ "is_fork": false, "forked": false }), "trusted"),
+            (
+                serde_json::json!({ "is_fork": false, "forked": false }),
+                "trusted",
+            ),
             (serde_json::json!({ "is_fork": true }), "untrusted_fork"),
             (serde_json::json!({ "forked": true }), "untrusted_fork"),
-            (serde_json::json!({ "is_fork": true, "forked": true }), "untrusted_fork"),
+            (
+                serde_json::json!({ "is_fork": true, "forked": true }),
+                "untrusted_fork",
+            ),
         ];
         for event_type in [GIT_PR_OPENED, GIT_PR_SYNCHRONIZED] {
             for (fields, expected_tier) in &cases {
                 let ev = pr_envelope(event_type, fields.clone());
-                let reader = MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", valid_pr_toml());
+                let reader = MapGitConfigReader::new().with_file(
+                    "web",
+                    TEST_OID,
+                    ".myelin/ci.toml",
+                    valid_pr_toml(),
+                );
                 let DispatchOutcome::Arm(armed) = arm(&ev, &reader) else {
                     panic!("explicit boolean fork evidence must reach the matching PR config");
                 };
@@ -2059,7 +2239,8 @@ mod tests {
 
     #[test]
     fn push_preserves_absence_and_true_but_refuses_mistyped_or_conflicting_fork_evidence() {
-        let reader = MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", valid_toml());
+        let reader =
+            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", valid_toml());
         let DispatchOutcome::Arm(absent) = arm(&push_envelope("web", TEST_OID), &reader) else {
             panic!("legacy push without fork evidence remains compatible");
         };
@@ -2078,7 +2259,10 @@ mod tests {
             serde_json::json!({ "is_fork": false, "forked": true }),
         ] {
             let mut ev = push_envelope("web", TEST_OID);
-            ev.payload.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            ev.payload
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
             assert_malformed_before_side_effects(&ev);
         }
     }
@@ -2106,18 +2290,31 @@ mod tests {
             panic!("the digest-pinned config on a matching push must arm a run");
         };
         // The atomic bundle invariant holds (the prompt GATE).
-        assert!(armed.handoff.is_atomic_bundle(), "the reserve bundle is atomic");
+        assert!(
+            armed.handoff.is_atomic_bundle(),
+            "the reserve bundle is atomic"
+        );
         assert_eq!(armed.handoff.run_write.state, "queued");
-        assert_eq!(armed.handoff.run_write.trust_tier, "trusted", "a member push is trusted");
+        assert_eq!(
+            armed.handoff.run_write.trust_tier, "trusted",
+            "a member push is trusted"
+        );
         assert_eq!(armed.handoff.run_write.trigger_kind, "push");
         assert_eq!(armed.handoff.run_write.cause_event_id, "ev-push-1");
         // One queued ci.check.updated per top-level job (build).
-        assert_eq!(armed.handoff.queued_checks.len(), 1, "one queued check per job");
+        assert_eq!(
+            armed.handoff.queued_checks.len(),
+            1,
+            "one queued check per job"
+        );
         // The run_id is deterministic from the event_id (idempotency anchor).
-        assert_eq!(armed.handoff.run_write.run_id, deterministic_uuid("run:ev-push-1"));
+        assert_eq!(
+            armed.handoff.run_write.run_id,
+            deterministic_uuid("run:ev-push-1")
+        );
         assert_eq!(armed.reserve.wf_run_id, deterministic_uuid("wf:ev-push-1"));
         assert_eq!(armed.reserve.correlation_id, "corr-1");
-        assert_eq!(armed.reserve.repo_ref, "web");
+        assert_eq!(armed.reserve.repo_ref, "myelin://acme/git/repo/web");
         assert_eq!(armed.reserve.commit_oid, TEST_OID);
         assert!(armed.reserve.concurrency_group.is_none());
         let insert = ci_run_insert_from_armed(&armed);
@@ -2162,30 +2359,43 @@ mod tests {
             "image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"\n",
             "command = [\"build\"]\n"
         );
-        let reader =
-            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", pr_config.as_bytes());
+        let reader = MapGitConfigReader::new().with_file(
+            "web",
+            TEST_OID,
+            ".myelin/ci.toml",
+            pr_config.as_bytes(),
+        );
         let DispatchOutcome::Arm(armed) = arm(&ev, &reader) else {
             panic!("a fork PR with a matching config arms an untrusted-fork run");
         };
         assert_eq!(armed.handoff.run_write.trust_tier, "untrusted_fork");
         assert_eq!(armed.handoff.run_write.trigger_kind, "pull_request");
-        assert_eq!(armed.reserve.concurrency_group.as_deref(), Some("pr:web:42"));
-        assert_eq!(armed.reserve.pr_head_generation, Some(1));
         assert_eq!(
-            ci_run_insert_from_armed(&armed).concurrency_group.as_deref(),
+            armed.reserve.concurrency_group.as_deref(),
             Some("pr:web:42")
         );
+        assert_eq!(armed.reserve.pr_head_generation, Some(1));
         assert_eq!(
-            ci_run_insert_from_armed(&armed).pr_head_generation,
-            Some(1)
+            ci_run_insert_from_armed(&armed)
+                .concurrency_group
+                .as_deref(),
+            Some("pr:web:42")
         );
+        assert_eq!(ci_run_insert_from_armed(&armed).pr_head_generation, Some(1));
         for c in &armed.handoff.queued_checks {
-            assert_eq!(c.payload["trust_tier"], "untrusted_fork", "X-1: 0 divergence");
+            assert_eq!(
+                c.payload["trust_tier"], "untrusted_fork",
+                "X-1: 0 divergence"
+            );
         }
         // Cross-check the pure classifier agrees.
         assert_eq!(
-            stamp_trust(&RunProvenance { is_fork: true, targets_self_hosted: false, read_excludes_fork: false })
-                .job_tier,
+            stamp_trust(&RunProvenance {
+                is_fork: true,
+                targets_self_hosted: false,
+                read_excludes_fork: false
+            })
+            .job_tier,
             TrustTier::UntrustedFork
         );
     }
@@ -2195,15 +2405,25 @@ mod tests {
     #[test]
     fn the_handler_persists_and_is_idempotent() {
         let ev = push_envelope("web", TEST_OID);
-        let reader: Arc<dyn GitConfigReader> = Arc::new(
-            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", valid_toml()),
-        );
+        let reader: Arc<dyn GitConfigReader> = Arc::new(MapGitConfigReader::new().with_file(
+            "web",
+            TEST_OID,
+            ".myelin/ci.toml",
+            valid_toml(),
+        ));
         let blobs: Arc<dyn BlobStore + Send + Sync> = Arc::new(FsBlobStore::new());
         let store = Arc::new(RecordingReserveStore::new());
         let handler = CiTriggerHandler::new(reader, blobs, store.clone());
 
-        assert_eq!(handler.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
-        assert_eq!(handler.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done, "redelivery is handled");
+        assert_eq!(
+            handler.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
+        assert_eq!(
+            handler.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done,
+            "redelivery is handled"
+        );
         let persisted = store.persisted();
         // The ReserveStore itself is called twice (the runtime's consumer_dedup is what suppresses the
         // second delivery in production; here we prove BOTH calls mint the SAME run_id — the second
@@ -2214,7 +2434,10 @@ mod tests {
             "the redelivery mints the SAME deterministic run_id (exactly-once run)"
         );
         // The surfaced trace shows the armed run (never a silent swallow).
-        assert!(handler.trace().iter().any(|l| l.starts_with("armed run_id=")));
+        assert!(handler
+            .trace()
+            .iter()
+            .any(|l| l.starts_with("armed run_id=")));
     }
 
     /// **H3: the check event id includes the run_id — distinct runs on the SAME (repo, commit,

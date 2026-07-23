@@ -53,10 +53,12 @@ fn definition() -> CiDefinition {
 fn facts(snapshot_run_id: &str) -> RunFacts {
     RunFacts {
         run_id: snapshot_run_id.into(),
+        tenant_id: "acme".into(),
         repo_ref: "myelin://acme/git/repo/web".into(),
         commit_oid: "deadbeef".into(),
         contexts: vec![CheckContext::ci("build"), CheckContext::ci("test/unit")],
         cause_event_id: EventId("ev-pr-1".into()),
+        started_at: "2026-07-23T00:00:00Z".into(),
     }
 }
 

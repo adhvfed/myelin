@@ -146,9 +146,8 @@ pub mod check_status;
 /// The **STORE-BACKED `check_status` projection** (GIT-P20 / P-281, M3): the LIVE Postgres binding of
 /// the in-memory [`check_status::CheckStatusProjection`] — the real table + migration + the same-tx
 /// idempotent-on-`event_id` + monotonic `run_attempt` supersession apply (contract 5.9 / X-1 / §6.1).
-/// Compiled ONLY under `--features integration` (the default build stays DB-free); the GIT-D10
-/// part-(a) green artifact is proven against the dev Postgres stack.
-#[cfg(feature = "integration")]
+/// This is a production module: the Git check-projection service writes it and Edge reads it.
+/// The `integration` feature only enables live-stack test configuration.
 pub mod check_status_store;
 /// The **code-projection EMITTER for Search** (GIT-P25 / P-287, M3-G5 — the §9 TE-27 code
 /// projection). The receive-pack post-commit hook that, on a `git.ref.updated` to an indexed ref,

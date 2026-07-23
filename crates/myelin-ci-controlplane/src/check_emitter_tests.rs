@@ -143,8 +143,8 @@ fn assembled_payload_carries_every_frozen_5_9_field() {
     assert_eq!(p["run_attempt"], 2, "the monotonic supersession key");
     assert_eq!(p["trust_tier"], "trusted");
     assert_eq!(
-        p["details_ref"], "myelin://acme/ci/run/run-7#summary",
-        "a success anchors on the run summary"
+        p["details_ref"], "myelin://acme/ci/run/run-7",
+        "a success anchors on the canonical run root"
     );
     assert_eq!(p["started_at"], "2026-06-23T00:00:00Z");
     assert_eq!(p["completed_at"], "2026-06-23T00:01:00Z");
@@ -277,8 +277,8 @@ fn trust_tier_is_stamped_from_provenance_fork_never_endorsed() {
     );
 }
 
-/// **The `details_ref` is the `#step-<n>` jump-to-failure on failure, the run summary on success
-/// (OQ-D / 5.7).** Git renders it as a link; CI never resolves it. References-not-payloads.
+/// **The `details_ref` is the `#step-<n>` jump-to-failure when known and otherwise the canonical
+/// run root (OQ-D / 5.7).** Git renders it as a link; CI never resolves it.
 #[test]
 fn details_ref_anchors_on_the_failing_step() {
     let run = "myelin://acme/ci/run/run-7";
@@ -287,15 +287,15 @@ fn details_ref_anchors_on_the_failing_step() {
         details_ref(run, CheckState::Failure, Some(4)),
         "myelin://acme/ci/run/run-7#step-4"
     );
-    // A failure without a known step → #step-failure (the log index resolves the step).
+    // A failure without a known step → the canonical run root.
     assert_eq!(
         details_ref(run, CheckState::Failure, None),
-        "myelin://acme/ci/run/run-7#step-failure"
+        "myelin://acme/ci/run/run-7"
     );
-    // A success → the run summary.
+    // A success → the canonical run root.
     assert_eq!(
         details_ref(run, CheckState::Success, None),
-        "myelin://acme/ci/run/run-7#summary"
+        "myelin://acme/ci/run/run-7"
     );
     // An error with a step also anchors on the step.
     assert_eq!(
@@ -326,7 +326,8 @@ fn assembled_draft_rides_the_frozen_envelope_grammar() {
         "subject = repo#commit-<oid>/check-<context> (§4.12 — byte-identical to Git's consumer)"
     );
     assert_eq!(
-        draft.aggregate.0, "myelin://acme/git/repo/core#commit-deadbeef",
+        draft.aggregate,
+        myelin_events::check_seam::check_aggregate("myelin://acme/git/repo/core", "deadbeef",),
         "aggregate = (repo, commit_oid) — all contexts for one commit share the ordering partition"
     );
     assert!(

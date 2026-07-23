@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — complete running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, and opt-in production runner boot proven; live founder push→CI→check and GitHub-Actions cutover remain** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — complete running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and the durable CI→Git check projection proven; live founder push→CI→surfaced check and GitHub-Actions cutover remain** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -689,6 +689,13 @@ seam gap); required-contexts config alignment is operational. **CT-004f** [log p
 exist, needs live firehose/BlobStore binding], then **CT-005** (surfaces) → **CT-007** (GitHub Actions cutover — the reward). ·
 **CT-004e** check/result producers live → closes the X-1 seam to the merge gate (d) · **CT-004f** log
 pipeline live substrate (a; SSE tail is CT-005) · **CT-004g** fleet/residency (c, optional split).
+
+**CT-004e CODE-WINS CORRECTION (2026-07-23).** The 2026-07-17 “complete by construction”
+paragraph immediately above is historical and **SUPERSEDED**. It proved compatible codecs and
+in-process models, not a production Git consumer service or durable authority read by Edge; the
+initial queued check also omitted frozen fields, and the human-readable aggregate was not a legal
+structured-broker token for every canonical repository ref. The production closure is recorded in
+the 2026-07-23 durable CI→Git check-projection increment below.
 
 **CI launch-wire V2 increment (2026-07-18 late, `435bf7c` + `5cb3124`; recorded 2026-07-20 by code-wins
 reconciliation — this landed AFTER the last ledger edit).** A staged V1→V2 migration of the CI plan
@@ -1396,6 +1403,65 @@ a bootstrap-time termination request = 0; runner-host lanes outside the coordina
 Myelin push → CI → check dogfood/cutover pass. No Commercial wallet, billing, or Stripe work is
 admitted before the Tier-B go decision. The runner is now locally boot-proven, but that is not
 evidence that a real founder push produced and surfaced its check.
+
+**Durable CI→Git check-projection closure (2026-07-23).** CI Dispatch now emits the initial queued
+check through the same frozen `CheckStatus` builder as terminal reporting, including tenant,
+repository, commit, context, required flag, canonical run/details refs, attempt, trust tier,
+timestamps, summary, and unsettled-cost state. Every check for one repository commit routes on the
+fixed-width broker-safe `check:v1-<BLAKE3>` aggregate; the human-facing subject remains the canonical
+ArtifactRef. Git owns forward-only `git_0014`/`git_0015` projection migrations with FORCE RLS and the
+full `(tenant, region, repo, commit, provider, context)` authority key. The production
+`git-check-projection` service consumes the structured JetStream subject, validates exact
+tenant/region/subject/aggregate provenance, and co-commits the shared `(consumer,event_id)` dedup mark
+with monotonic attempt supersession, DLQ, and quarantine.
+
+Production Edge check cards, PR list summaries, merge 409 responses, merge admission, and protected
+push policy read Git's own projection rather than CI or legacy PR-record green arrays. Missing or
+unavailable projection truth fails closed; successful-but-unsettled work remains blocked. Merge
+admission and projection updates share a transaction-scoped advisory lock over the exact
+tenant/region/repository/commit authority. Admission rereads projection rows while holding the locked
+PR row and persists either the blocked terminal result or the admitted merge intent in that same
+transaction, defining the durable “facts frozen at admission” boundary even when the required row is
+absent.
+
+Mechanical evidence: the CI producer-builder → durable Git consumer integration proves rollback
+before a missing projection, lossless redelivery, duplicate absorption, stale-attempt refusal,
+CI-only provider and same-tenant canonical run-reference provenance, forged-provenance DLQ,
+constrained-app-role write, and tenant/region RLS isolation. The production Dispatch/NATS proof
+drives two distinct triggers for the same commit through the real durable reserve path and asserts
+queued attempts `1 → 2`; its second queued fact supersedes a seeded settled success and flips the
+Git merge gate back to blocked before PipelineStarter can emit `in_progress`. The run row, authority
+high-water allocation, immutable per-run/context attempt issuance, queued outbox rows, and
+trigger-dedup mark now share one PostgreSQL commit. A reserve-A/reserve-B-before-either-starts proof
+holds those attempts at `1`/`2` through PipelineStarter and proves an older terminal A cannot
+supersede newer queued B. Reserve-crash injection rolls the run, both attempt records, outbox rows,
+and dedup mark back together. Live Git proofs cover same-commit cross-repository isolation,
+missing/failing/fork/unsettled gate postures, and a dishonest legacy-green PR array that still blocks
+at production merge admission. Full relevant Git and Edge suites, all-target/all-feature
+warnings-denied clippy, architecture lint, shrink-only erosion gate, frontend-aware contract
+coverage, shell syntax, targeted rustfmt, and diff checks pass. `scripts/dogfood.sh git-checks`
+starts the consumer and `verify-check` performs a read-only exact-head/check/gate verification;
+backup verification now includes `check_status`.
+
+Protected direct pushes now hold the projection consumer's exact check-admission lock while reading
+the head facts, evaluating branch protection, promoting objects, and performing the ref mutation;
+a concurrent check update is serialized after that admission boundary rather than racing between a
+completed read transaction and ref CAS. Projection admission uses a separately bounded runtime lane,
+so its callback can mutate the ref/outbox through the ordinary store lane even when each pool is
+limited to one connection. The hashed aggregate is a hard, fail-closed routing cutover, not a
+fabricated backfill: keep the old Edge as the verification front door; deploy the new
+`git-check-projection`, Dispatch, and coordinated CI/controlplane; drain every old Dispatch/CI
+producer; start all three new services; rerun and verify every protected head; and only after every
+exact-OID verification passes deploy the projection-only Edge. Personal production has no
+pre-cutover production facts; any future existing-cell upgrade must abort if that rerun cannot be
+completed. Independent adversarial re-review of immutable attempt issuance, reserve rollback,
+bounded admission-lane composition, canonical detail refs, and the cutover order reports
+**CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding**.
+
+**Honest remaining R4.2 acceptance:** start the three CI services and the production Edge against the
+founder cell, push a real Myelin commit, observe the exact head's required check settle green through
+the verifier and browser, then remove GitHub Actions only after that pass. This increment does not
+claim that founder act, does not start the four-week R4 exit clock, and does not spend GitHub Actions.
 
 ## R5–R6
 
