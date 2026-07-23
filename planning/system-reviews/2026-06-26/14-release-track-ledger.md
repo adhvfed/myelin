@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — operational reservation, claim/launch fences, exact-tenant runtime/fan-out, dormant full runner-host composition, and producer-authored PR head ordering proven; run supersession/lifecycle/crash activation remains; production start disabled** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — operational reservation, claim/launch fences, exact-tenant runtime/fan-out, dormant full runner-host composition, producer-authored PR head ordering, and serialized run supersession proven; coordinated lifecycle/crash activation remains; production start disabled** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1198,11 +1198,53 @@ reported CONFIRMED-SOUND with no HIGH or MEDIUM finding, including after the ext
 ordering prerequisite only; serialized run cancellation, Flow finalization, and reservation
 settlement remain the next coherent R4.2 row.
 
+**Serialized PR run supersession (2026-07-23).** Producer insertion and every starter/canceller now
+take one exact `(tenant, region, canonical PR group)` transaction lock. Every retained positive
+generation, including terminal history, remains durable high-water authority: a delayed strictly
+lower or rolling-upgrade `NULL` run is cancelled before CAS lookup or launch materialization, equal
+positive generations remain unordered, and two legacy rows still do not invent an order. A positive
+replacement becomes fully materialized before it cancels strictly older active peers in the same
+transaction; any replacement or cancellation failure rolls back both sides.
+
+Running-run cancellation now has one production owner at the run-start boundary. It terminates Flow,
+closes queued/leased and never-dispatched manifest jobs, zero-settles their exact Storage reservations,
+persists the CI cost projection and immutable skipped receipts, transitions `ci_run`, and co-commits
+`ci.run.cancelled` plus cancelled per-context checks. A launched job remains the reporter's settlement
+owner; its late exact report is a terminal Flow no-op, records actual usage once, and flips the
+cancelled run/check set to settled only when the complete manifest receipt set exists. Existing
+receipts are accepted only after immutable identity, queue disposition, deterministic completion
+receipt, re-priced policy, Storage's ordered settlement log, billed/refunded outcome, and the exact CI
+projection all agree. The obsolete job-local production cancellation coordinator is test-support
+only.
+
+The concurrency boundary is mechanical rather than conventional. Production manifest dispatch locks
+and requires the exact live Flow row before co-persisting queue+spec, using the same
+Flow→queue→accounting/reservation→`ci_run` order as cancellation and reporting. Thus dispatch-first is
+observed and closed, while cancellation-first makes a stale body write zero queue/spec rows. Flow and
+product terminal CAS outcomes must agree; a finalizer/canceller split rolls the replacement and Flow
+termination back. Live PostgreSQL proofs cover terminal high-water, producer-lock blocking,
+dispatch/cancel and final-launch/cancel outcomes, completed-before-cancel accounting, forged monetary
+projection and skipped receipts, finalizer-winning rollback, launch-winning late report, exact replay,
+legacy ordering, rollback coupling, RLS, and bounded polling.
+
+The independent verifier initially returned HOLD with four HIGH findings (non-durable high-water,
+producer insertion outside serialization, unfenced Flow dispatch, and split Flow/product
+finalization) plus one MED monetary-verification finding. After each was made load-bearing and the
+unrepresentative dispatch-lock test was replaced with the real production method, final re-review
+reported **CONFIRMED-SOUND with no HIGH or MEDIUM finding**. Complete Flow, Controlplane, and Dispatch
+all-target/all-feature suites (including live PostgreSQL, `runsc`, RustFS, migrations, production
+source guards, and recovery drills), workspace check, warnings-denied clippy, architecture lint,
+erosion budgets, contract coverage, and diff check are green. Mechanical payoff: accepted delayed
+lower/legacy starts after a retained positive generation = 0; stale production dispatch rows written
+after committed cancellation = 0; undispatched reservations left open after supersession = 0;
+cancelled runs with complete receipts but `cost_settled=false` = 0; production supersession owners =
+2→1.
+
 **Honest remaining activation floors:** attach the retained starter, bounded fan-out, and sandbox
-runner to coordinated lifecycle shutdown, and wire accounted supersession into the durable dispatch
-path. Inject crashes across mint→CAS and CAS→spawn plus cancellation, retry, recovery, and settlement
-races through that complete running root before activation. No Commercial wallet, billing, or Stripe
-work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
+runner to coordinated lifecycle shutdown. Inject crashes across mint→CAS and CAS→spawn plus
+cancellation, retry, recovery, and settlement races through that complete running root before
+activation. No Commercial wallet, billing, or Stripe work is admitted before the Tier-B go decision.
+`MYELIN_CI_RUNNER=1` remains startup-refused.
 
 ## R5–R6
 

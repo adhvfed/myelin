@@ -340,7 +340,7 @@ pub use pg_dispatcher::{
     PgWorkerError, PgWorkerScope, PgWorkflowBody, PgWorkflowInputResolver,
     MAX_PG_RESOLVED_INPUT_BYTES, OPERATIONAL_PROBE_WF_TYPE,
 };
-pub use pg_executor::PgFlowExecutor;
+pub use pg_executor::{CancelOnConnOutcome, PgFlowExecutor};
 pub use remint::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter};
 #[cfg(any(test, feature = "test-support"))]
 pub use restore_verify::{

@@ -60,6 +60,8 @@ use sqlx::Row;
 use crate::ci_drive_manifest::CiDriveManifestStore;
 use crate::job_accounting_store::{CiJobAccountingRecord, CiJobAccountingStore};
 
+const PR_RUN_SUPERSESSION_LOCK_DOMAIN: &str = "myelin.ci.pr-run-supersession.v1";
+
 /// **The `ci_run` row a reserve/start bundle persists (all the `CREATE_CI_RUN_DDL` columns the writer
 /// binds).** Owned `String`s so the durable store binds them directly (the `uuid` columns are bound as
 /// text and cast `$n::uuid` in SQL — the SAME posture the CT-004b integration test proved). The
@@ -1023,6 +1025,11 @@ async fn insert_on_conn(
     row: &CiRunInsert,
 ) -> Result<bool, CiRunStoreError> {
     validate_initial_state(row)?;
+    if let Some(group) = &row.concurrency_group {
+        lock_pr_concurrency_group_on_conn(conn, &row.tenant_id, &row.region, group)
+            .await
+            .map_err(|_| CiRunStoreError::Db("PR concurrency-group lock".into()))?;
+    }
     let inserted = sqlx::query(INSERT_CI_RUN_QUERY)
         .bind(&row.tenant_id) // $1 tenant_id (RLS/tenant predicate)
         .bind(&row.region) // $2 region
@@ -1127,6 +1134,28 @@ async fn insert_on_conn(
     } else {
         Err(CiRunStoreError::ReplayCollision { differing_fields })
     }
+}
+
+/// Serialize producer insertion and every starter/canceller for one exact canonical PR group.
+///
+/// This lock must be acquired inside the caller's transaction before either inserting a new
+/// producer generation or classifying/cancelling existing generations. Hash collisions can only
+/// serialize unrelated groups because all row authority remains exact `(tenant, region, group)`.
+pub(crate) async fn lock_pr_concurrency_group_on_conn(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    group: &str,
+) -> Result<(), sqlx::Error> {
+    // @tenant-cross-scope: advisory locking reads no tenant rows. The framed key contains the
+    // already-validated exact tenant, region, and canonical PR concurrency group.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "{PR_RUN_SUPERSESSION_LOCK_DOMAIN}:{tenant}:{region}:{group}"
+        ))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 fn validate_initial_state(row: &CiRunInsert) -> Result<(), CiRunStoreError> {

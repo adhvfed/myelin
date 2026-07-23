@@ -96,7 +96,8 @@ impl PgCiRunStarterPoller {
             return Err(CiRunStarterPollerError::InvalidConfig);
         }
         let mut started = 0;
-        while started < max_starts {
+        let mut processed = 0;
+        while processed < max_starts {
             match self.run_once().await? {
                 StartQueuedOutcome::Idle => {
                     return Ok(CiRunStarterBatch {
@@ -104,7 +105,13 @@ impl PgCiRunStarterPoller {
                         saturated: false,
                     });
                 }
-                StartQueuedOutcome::Started { .. } => started += 1,
+                StartQueuedOutcome::Started { .. } => {
+                    started += 1;
+                    processed += 1;
+                }
+                // A stale row was durably consumed, so the bounded loop made progress even though
+                // no workflow started. Do not count it as a start, but continue discovery.
+                StartQueuedOutcome::Superseded { .. } => processed += 1,
             }
         }
         Ok(CiRunStarterBatch {
