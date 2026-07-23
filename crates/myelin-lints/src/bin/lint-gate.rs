@@ -18,7 +18,7 @@
 //! swallowed by a shell `||`; the `ci_gate_fails_loudly` test (`tests/ci_gate.rs`) proves the
 //! red-fixture run exits non-zero and the clean tree exits zero.
 
-use myelin_lints::lints::{all_twelve, no_raw_ci_verdict, NO_RAW_CI_VERDICT};
+use myelin_lints::lints::{all_twelve, no_raw_ci_verdict, NO_HOST_EXEC, NO_RAW_CI_VERDICT};
 use myelin_lints::LintId;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -274,6 +274,11 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
 /// being held to tenant-predicate / no-host-exec / no-raw-publish / every other rule. Same NAMED,
 /// LOUD, self-justifying discipline as the global list.
 const PER_LINT_EXCLUSIONS: &[(LintId, &[&str])] = &[
+    // The durable launch guard is part of the unified sandbox enforcement mechanism. Its trusted
+    // `/bin/sh` child is spawned blocked, commits the exact scheduler launch CAS, and only then
+    // execs the already-selected Firecracker/runsc runtime. Exclude this file from no-host-exec
+    // ONLY; every other architecture lint still scans it.
+    (NO_HOST_EXEC, &["myelin-ci-sandbox/src/launch_gate.rs"]),
     // The CI stage-verdict seam (`no-raw-ci-verdict`, P-FLOW CI durability). The typed `job.done`
     // verdict (`SignalPayload::CiJobDone` / `signal_typed`) is trusted by the pipeline body as the
     // runner's verified result, so naming/constructing/delivering it is forbidden everywhere EXCEPT the

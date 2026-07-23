@@ -8,21 +8,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use myelin_ci_controlplane::{
-    ci_job_authorization_context, ci_runner_cancellation_coordinator, ci_runner_hooks,
-    ci_runner_identity_authorities, CiDriveManifestStore, CiDriveManifestV1, CiJobCredentialMinter,
-    CiJobRuntimeAuthorityRequest, CiJobTokenIssueError, CiJobTokenIssuer, CiJobTokenRequest,
-    CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1,
-    CiManifestWorkspaceV1, DurableCiJobLaunchTemplate, GrantedCiJobV1,
-    LockedManifestCiJobTokenIssuer, ManifestBoundCiJobTokenAuthority,
-    ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
-    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
+    ci_job_authorization_context, ci_region_queue_store_test_support,
+    ci_runner_cancellation_coordinator, ci_runner_hooks, ci_runner_identity_authorities,
+    CiDriveManifestStore, CiDriveManifestV1, CiJobCredentialMinter, CiJobRuntimeAuthorityRequest,
+    CiJobTokenIssueError, CiJobTokenIssuer, CiJobTokenRequest, CiManifestLaneV1,
+    CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1,
+    DurableCiJobLaunchTemplate, GrantedCiJobV1, LockedManifestCiJobTokenIssuer,
+    ManifestBoundCiJobTokenAuthority, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
+    ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
+    ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CI_PIPELINE_WF_TYPE,
-    CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL,
+    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
 };
+use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpecTemplate, MeterTarget,
-    ResourceLimits, ResourceUsage, RunTokenCredential, SecretRef, TrustTier, WorkspaceSpec,
+    ResourceLimits, RunTokenCredential, SandboxBackend, SecretRef, TrustTier, WorkspaceSpec,
 };
 use myelin_config::MyelinConfig;
 use myelin_storage::{
@@ -157,7 +159,11 @@ fn manifest() -> CiDriveManifestV1 {
                 needs: Vec::new(),
                 matrix_key: BTreeMap::new(),
                 image: format!("registry.example/build@sha256:{}", "d".repeat(64)),
-                command: vec!["/bin/true".into()],
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf crash-recovered".into(),
+                ],
                 env: BTreeMap::new(),
                 secret_handles: BTreeMap::new(),
                 egress_allow: Vec::new(),
@@ -371,6 +377,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
          SELECT myelin_make_tenant_scoped('ci_run');
          {CREATE_CI_DRIVE_MANIFEST_DDL};
          SELECT myelin_make_tenant_scoped('ci_drive_manifest');
+         {CREATE_FAIR_DEFICIT_DDL};
          {CREATE_JOB_QUEUE_DDL};
          {ALTER_JOB_QUEUE_ADD_COMPLETION_DDL};
          {ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL};
@@ -611,7 +618,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     )
     .await
     .expect("compose the first production Identity instance");
-    let signed = first_identity
+    let pre_cas_signed = first_identity
         .token_issuer()
         .mint(exact_claim.clone())
         .await
@@ -637,7 +644,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     )
     .await
     .expect("reconstruct production Identity from durable state");
-    let spec = JobSpecTemplate::new(
+    let pre_cas_spec = JobSpecTemplate::new(
         JobKind::Ci,
         ImageRef::pinned(expected.jobs[0].image.clone()).unwrap(),
         expected.jobs[0].command.clone(),
@@ -663,7 +670,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     )
     .unwrap()
     .resolve_with_authorization(
-        signed.clone(),
+        pre_cas_signed,
         Some(ci_job_authorization_context(&exact_claim)),
     );
     let runner_hooks = ci_runner_hooks(
@@ -673,6 +680,67 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     );
     let cancellation_coordinator =
         ci_runner_cancellation_coordinator(provider.clone(), tokio::runtime::Handle::current());
+
+    // Crash window 1, mint → launch CAS: the first production issuer has committed a credential,
+    // but no reservation begin or launch CAS follows. Expiry + the real regional reaper return the
+    // leased row to the queue. The next real claim increments the durable generation, the stale
+    // credential/context can no longer begin or launch, and production Identity remints for the
+    // replacement generation.
+    sqlx::query(
+        "UPDATE job_queue SET lease_expires = statement_timestamp() - interval '1 second'
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[0].job_id)
+    .execute(&admin)
+    .await
+    .expect("expire the minted-but-not-launched generation");
+    let region_store = ci_region_queue_store_test_support(admin.clone());
+    assert_eq!(
+        region_store.reap(&expected.region).await.unwrap(),
+        1,
+        "the production reaper recovers the minted-but-not-launched lease"
+    );
+    let reminted_lease = region_store
+        .claim(
+            &expected.region,
+            &["linux".into()],
+            &[TrustTier::Trusted],
+            "runner-reminted",
+            300,
+        )
+        .await
+        .unwrap()
+        .expect("the recovered row is claimable by a fresh runner generation");
+    assert_eq!(reminted_lease.job_id.to_string(), expected.jobs[0].job_id);
+    assert_eq!(reminted_lease.lease_epoch, exact_claim.lease_epoch + 1);
+    assert_ne!(reminted_lease.claim_nonce, exact_claim.claim_nonce);
+    assert!(
+        runner_hooks.reserve(&pre_cas_spec).is_err(),
+        "the stale pre-crash generation cannot begin the reservation"
+    );
+    assert!(
+        runner_hooks.attribute(&pre_cas_spec).is_err(),
+        "the stale pre-crash credential cannot win the launch CAS"
+    );
+    exact_claim.lease_owner = "runner-reminted".into();
+    exact_claim.lease_epoch = reminted_lease.lease_epoch;
+    exact_claim.claim_nonce = reminted_lease.claim_nonce;
+    exact_claim.claim_started_at_epoch_secs = reminted_lease.claim_started_at_epoch_secs;
+    exact_claim.claim_expires_at_epoch_secs = reminted_lease.claim_expires_at_epoch_secs;
+    let signed = second_identity
+        .token_issuer()
+        .mint(exact_claim.clone())
+        .await
+        .expect("production Identity remints for the reaped claim generation");
+    let spec = launch_template(&expected, 0, &exact_claim.idem_token)
+        .spec
+        .resolve_with_authorization(
+            signed.clone(),
+            Some(ci_job_authorization_context(&exact_claim)),
+        );
+
     let mut mutated_spec = spec.clone();
     mutated_spec.command = vec!["/bin/echo".into(), "mutated".into()];
     assert!(
@@ -704,44 +772,149 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .await
     .unwrap();
     assert_eq!(begun_state, "inflight");
-    runner_hooks
-        .attribute(&spec)
-        .expect("the final hook verifies Identity and wins the exact durable launch CAS");
-    runner_hooks
-        .settle_completed(
-            &spec,
-            &reservation,
-            ResourceUsage {
-                cpu_seconds: 7,
-                mem_byte_seconds: 11,
-            },
-        )
-        .expect("successful settlement is explicitly deferred to the terminal reporter");
-    runner_hooks
-        .release_unused(&spec, &reservation)
-        .expect("a CAS-acknowledgement-loss retry must retain a running job's reservation");
-    let launched_state: String = sqlx::query_scalar(
-        "SELECT state FROM job_queue WHERE tenant_id = $1 AND job_id = $2::uuid",
-    )
-    .bind(&expected.tenant_id)
-    .bind(&expected.jobs[0].job_id)
-    .fetch_one(&admin)
-    .await
-    .unwrap();
-    assert_eq!(launched_state, "running");
-    let still_inflight: String = sqlx::query_scalar(
-        "SELECT state FROM cost_reservation
-         WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    // Crash window 2, launch CAS → spawn: arm the lazy production permit, commit the exact CAS, and
+    // retain only its session advisory ownership while the sandbox child would still be gated. The
+    // committed `running` state is immediately visible (no hours-long transaction/row lock). Even
+    // after forcing its execution lease expired, the real reaper must not replace this paused live
+    // continuation. Dropping ownership simulates process/connection death; only then may a fresh
+    // generation claim and spawn.
+    let paused_ownership = runner_hooks
+        .acquire_launch_permit(&spec)
+        .expect("the production hook returns a lazy exact-generation permit")
+        .commit()
+        .expect("the armed-child boundary commits CAS and retains session ownership");
+    let committed_state: String = sqlx::query_scalar(
+        "SELECT state FROM job_queue
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
     )
     .bind(&expected.tenant_id)
     .bind(&expected.region)
+    .bind(&expected.jobs[0].job_id)
+    .fetch_one(&admin)
+    .await
+    .expect("the committed launch state is visible outside the ownership session");
+    assert_eq!(committed_state, "running");
+    sqlx::query(
+        "UPDATE job_queue SET lease_expires = statement_timestamp() - interval '1 second'
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[0].job_id)
+    .execute(&admin)
+    .await
+    .expect("expire the committed generation while its live session owns the launch");
+    assert_eq!(
+        region_store.reap(&expected.region).await.unwrap(),
+        0,
+        "the reaper refuses a paused post-CAS continuation whose session lock is still live"
+    );
+    assert!(
+        region_store
+            .claim(
+                &expected.region,
+                &["linux".into()],
+                &[TrustTier::Trusted],
+                "runner-must-not-double-spawn",
+                300,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "no replacement generation exists while the original launch fence is retained"
+    );
+    drop(paused_ownership);
+    let mut reaped_after_death = 0;
+    for _ in 0..50 {
+        reaped_after_death = region_store.reap(&expected.region).await.unwrap();
+        if reaped_after_death == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        reaped_after_death, 1,
+        "connection death releases ownership and makes the committed running row recoverable"
+    );
+    let spawned_lease = region_store
+        .claim(
+            &expected.region,
+            &["linux".into()],
+            &[TrustTier::Trusted],
+            "runner-spawn-recovery",
+            300,
+        )
+        .await
+        .unwrap()
+        .expect("the committed-CAS-before-release crash is claimable as a fresh generation");
+    assert_eq!(spawned_lease.job_id.to_string(), expected.jobs[0].job_id);
+    assert_eq!(spawned_lease.lease_epoch, exact_claim.lease_epoch + 1);
+    let stale_cas_spec = spec.clone();
+    exact_claim.lease_owner = "runner-spawn-recovery".into();
+    exact_claim.lease_epoch = spawned_lease.lease_epoch;
+    exact_claim.claim_nonce = spawned_lease.claim_nonce;
+    exact_claim.claim_started_at_epoch_secs = spawned_lease.claim_started_at_epoch_secs;
+    exact_claim.claim_expires_at_epoch_secs = spawned_lease.claim_expires_at_epoch_secs;
+    assert!(
+        runner_hooks.reserve(&stale_cas_spec).is_err(),
+        "the generation that died after CAS cannot begin again after reaping"
+    );
+    assert!(
+        runner_hooks.attribute(&stale_cas_spec).is_err(),
+        "the generation that died after CAS cannot relaunch after reaping"
+    );
+    let spawn_signed = second_identity
+        .token_issuer()
+        .mint(exact_claim.clone())
+        .await
+        .expect("production Identity remints after the CAS-before-spawn crash");
+    let spawn_spec = launch_template(&expected, 0, &exact_claim.idem_token)
+        .spec
+        .resolve_with_authorization(
+            spawn_signed,
+            Some(ci_job_authorization_context(&exact_claim)),
+        );
+    let backend = GvisorBackend::new();
+    let launch = backend
+        .launch(&spawn_spec, &runner_hooks)
+        .expect("the recovered generation reaches the real production gVisor spawn");
+    assert!(launch.result.passed(), "the recovered guest passes");
+    assert_eq!(
+        launch.result.stdout, b"crash-recovered",
+        "the immutable recovered command ran inside the real guest"
+    );
+    backend
+        .kill(&launch.handle)
+        .expect("the recovered one-job guest tears down");
+    let recovered_shape: (String, i64, String, i64, i64) = sqlx::query_as(
+        "SELECT q.state, q.lease_epoch, r.state,
+                (SELECT count(*) FROM cost_reservation rr
+                 WHERE rr.tenant_id = q.tenant_id AND rr.region = q.region AND rr.run_id = $4),
+                (SELECT count(*) FROM cost_event e
+                 WHERE e.tenant_id = q.tenant_id AND e.region = q.region AND e.run_id = $4)
+         FROM job_queue q
+         JOIN cost_reservation r
+           ON r.tenant_id = q.tenant_id AND r.region = q.region AND r.run_id = $4
+         WHERE q.tenant_id = $1 AND q.region = $2 AND q.job_id = $3::uuid",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[0].job_id)
     .bind(&expected.jobs[0].reserve_handle)
     .fetch_one(&admin)
     .await
     .unwrap();
     assert_eq!(
-        still_inflight, "inflight",
-        "the sandbox hook cannot double-own successful terminal settlement"
+        recovered_shape,
+        (
+            "running".into(),
+            exact_claim.lease_epoch,
+            "inflight".into(),
+            1,
+            0,
+        ),
+        "recovery spawns under only the fresh generation, duplicates no reservation, and retains \
+         reporter settlement ownership"
     );
 
     // A final-attribution refusal while the exact claim is still retryable retains its deterministic

@@ -72,8 +72,10 @@ serde.workspace = true
 # (not dev-only). Still DB-free / VM-free: a pure value serializer.
 serde_json.workspace = true
 zeroize = "1"
+libc = "0.2"
 
 [features]
+test-support = []
 # Two REAL live-stack proofs, both DB/VM-free by default:
 #   - tests/hardened_boot_selftest.rs (CI-P2) boots a Firecracker microVM with the full hardening
 #     profile ON; gated to SKIP gracefully without /dev/kvm or `firecracker`.

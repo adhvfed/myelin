@@ -62,10 +62,12 @@ use std::time::Duration;
 
 use myelin_ci_sandbox::TrustTier;
 use myelin_storage::{with_tenant_tx, PgError};
+use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPool;
 use sqlx::types::Uuid;
-use sqlx::Row;
+use sqlx::{Acquire, Postgres, Row};
 
+use crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS;
 #[cfg(any(test, feature = "test-support"))]
 use crate::scheduler::CANCEL_SUPERSEDED_QUERY;
 use crate::scheduler::{
@@ -286,6 +288,87 @@ pub struct CiJobQueueStore {
     pub(crate) pool: PgPool,
 }
 
+/// Committed launch ownership held only between durable CAS and gated child release. The session
+/// advisory lock makes a paused continuation unreapable without hiding `running` or retaining a
+/// transaction/row lock. Dropping without an explicit release closes the connection, which releases
+/// the lock rather than leaking it into the pool.
+pub(crate) struct RetainedCiJobLaunch {
+    connection: Option<PoolConnection<Postgres>>,
+    lock_key: i64,
+}
+
+impl RetainedCiJobLaunch {
+    pub(crate) async fn validate(&mut self) -> Result<(), JobQueueStoreError> {
+        let connection = self
+            .connection
+            .as_mut()
+            .expect("launch ownership validates one database session");
+        // @tenant-cross-scope: this inspects only the current PostgreSQL session's advisory-lock
+        // state. The lock key was derived from the complete tenant-scoped generation by the
+        // committed launch CAS; no tenant table is read here.
+        let owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM pg_locks
+                WHERE pid = pg_backend_pid()
+                  AND locktype = 'advisory'
+                  AND granted
+                  AND objsubid = 1
+                  AND ((classid::bigint << 32) | objid::bigint) = $1
+             )",
+        )
+        .bind(self.lock_key)
+        .fetch_one(&mut **connection)
+        .await
+        .map_err(|error| {
+            connection.close_on_drop();
+            JobQueueStoreError::Db(format!("validate launch session lock: {error}"))
+        })?;
+        if !owned {
+            connection.close_on_drop();
+            return Err(JobQueueStoreError::Db(
+                "launch session lock was lost before sandbox release".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn release(mut self) -> Result<(), JobQueueStoreError> {
+        let mut connection = self
+            .connection
+            .take()
+            .expect("launch ownership releases one database session");
+        // @tenant-cross-scope: this releases one PostgreSQL session advisory lock by its derived
+        // generation key; it reads no tenant table and the immediately preceding launch CAS
+        // already bound the complete tenant-scoped generation.
+        let released: bool = sqlx::query_scalar(
+            "SELECT pg_advisory_unlock($1) /* tenant_id generation verified by launch CAS */",
+        )
+        .bind(self.lock_key)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| {
+            connection.close_on_drop();
+            JobQueueStoreError::Db(format!("validate/release launch session lock: {error}"))
+        })?;
+        if !released {
+            connection.close_on_drop();
+            return Err(JobQueueStoreError::Db(
+                "launch session lock was lost during sandbox release".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RetainedCiJobLaunch {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.as_mut() {
+            connection.close_on_drop();
+        }
+    }
+}
+
 impl CiJobQueueStore {
     /// Wrap the controlplane OLTP pool as the durable `job_queue` store. The production composition
     /// root constructs this from the MR-022 `SubstrateProvider` pool
@@ -452,36 +535,137 @@ impl CiJobQueueStore {
         &self,
         claim: &CiJobLaunchClaim,
     ) -> Result<bool, JobQueueStoreError> {
+        let Some(mut launch) = self.authorize_launch_retained(claim).await? else {
+            return Ok(false);
+        };
+        launch.validate().await?;
+        launch.release().await?;
+        Ok(true)
+    }
+
+    /// Win and commit the exact launch CAS while retaining a session advisory lock through the
+    /// gated-child release. The lock key is a fail-closed hash of the complete durable generation:
+    /// a collision can delay an unrelated launch/reap but can never admit one.
+    pub(crate) async fn authorize_launch_retained(
+        &self,
+        claim: &CiJobLaunchClaim,
+    ) -> Result<Option<RetainedCiJobLaunch>, JobQueueStoreError> {
         let job_id = parse_id("job_id", &claim.job_id)?;
         let wf_run_id = parse_id("run_id", &claim.wf_run_id)?;
         let claim_nonce = parse_id("claim_nonce", &claim.claim_nonce)?;
-        let tenant_id = claim.tenant_id.clone();
-        let region = claim.region.clone();
-        let lease_owner = claim.lease_owner.clone();
-        let lease_epoch = claim.lease_epoch;
-        let claim_started_at = claim.claim_started_at_epoch_secs;
-        let claim_expires_at = claim.claim_expires_at_epoch_secs;
-        let authorized = with_tenant_tx(&self.pool, &claim.tenant_id, &claim.region, move |conn| {
-            Box::pin(async move {
-                let row = sqlx::query(AUTHORIZE_JOB_LAUNCH_QUERY)
-                    .bind(&tenant_id)
-                    .bind(&region)
-                    .bind(job_id)
-                    .bind(wf_run_id)
-                    .bind(&lease_owner)
-                    .bind(lease_epoch)
-                    .bind(claim_nonce)
-                    .bind(claim_started_at)
-                    .bind(claim_expires_at)
-                    .fetch_optional(&mut *conn)
-                    .await
-                    .map_err(|error| PgError::Query(error.to_string()))?;
-                Ok(row.is_some())
-            })
-        })
+        let mut connection = self.pool.acquire().await.map_err(|error| {
+            JobQueueStoreError::Db(format!("acquire launch fence session: {error}"))
+        })?;
+        // @tenant-cross-scope: PostgreSQL session-lock state is connection infrastructure, not a
+        // tenant table. A pooled session carrying any advisory lock is unsafe here because
+        // pg_try_advisory_lock is re-entrant; close it rather than mistaking stale ownership for a
+        // fresh launch fence.
+        let clean_session: bool = sqlx::query_scalar(
+            "SELECT NOT EXISTS (
+                SELECT 1
+                FROM pg_locks
+                WHERE pid = pg_backend_pid() AND locktype = 'advisory'
+             )",
+        )
+        .fetch_one(&mut *connection)
         .await
-        .map_err(JobQueueStoreError::from_pg)?;
-        Ok(authorized)
+        .map_err(|error| {
+            connection.close_on_drop();
+            JobQueueStoreError::Db(format!("inspect launch fence session: {error}"))
+        })?;
+        if !clean_session {
+            connection.close_on_drop();
+            return Err(JobQueueStoreError::Db(
+                "launch fence session retained an advisory lock; refusing re-entrant ownership"
+                    .into(),
+            ));
+        }
+        let mut transaction = connection.begin().await.map_err(|error| {
+            JobQueueStoreError::Db(format!("begin launch fence transaction: {error}"))
+        })?;
+        sqlx::query(
+            "SELECT set_config('myelin.tenant_id', $1, true),
+                    set_config('myelin.region', $2, true)",
+        )
+        .bind(&claim.tenant_id)
+        .bind(&claim.region)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| JobQueueStoreError::Db(format!("scope retained launch fence: {error}")))?;
+        let row = sqlx::query(AUTHORIZE_JOB_LAUNCH_QUERY)
+            .bind(&claim.tenant_id)
+            .bind(&claim.region)
+            .bind(job_id)
+            .bind(wf_run_id)
+            .bind(&claim.lease_owner)
+            .bind(claim.lease_epoch)
+            .bind(claim_nonce)
+            .bind(claim.claim_started_at_epoch_secs)
+            .bind(claim.claim_expires_at_epoch_secs)
+            .bind(CI_RUNNER_LEASE_TTL_SECS)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| JobQueueStoreError::Db(format!("authorize launch fence: {error}")))?;
+        if row.is_none() {
+            transaction.rollback().await.map_err(|error| {
+                JobQueueStoreError::Db(format!("rollback refused launch fence: {error}"))
+            })?;
+            return Ok(None);
+        }
+        let lock_key: i64 = sqlx::query_scalar(
+            "SELECT hashtextextended(
+                jsonb_build_array($1::text, $2::text, $3::text, $4::text, $5::text)::text,
+                0
+             )",
+        )
+        .bind(&claim.tenant_id)
+        .bind(&claim.region)
+        .bind(job_id)
+        .bind(claim.lease_epoch)
+        .bind(claim_nonce)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| JobQueueStoreError::Db(format!("derive launch session lock: {error}")))?;
+        // @tenant-cross-scope: this acquires one PostgreSQL session advisory lock by its derived
+        // generation key; it reads no tenant table and remains inside the transaction whose
+        // launch CAS bound the complete tenant-scoped generation.
+        let locked_result: Result<bool, sqlx::Error> = sqlx::query_scalar(
+            "SELECT pg_try_advisory_lock($1) /* tenant_id generation verified by launch CAS */",
+        )
+        .bind(lock_key)
+        .fetch_one(&mut *transaction)
+        .await;
+        let locked = match locked_result {
+            Ok(locked) => locked,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                // The server may have acquired the session lock before its acknowledgement was
+                // lost. Never return that session to the pool under ambiguity.
+                connection.close_on_drop();
+                return Err(JobQueueStoreError::Db(format!(
+                    "acquire launch session lock: {error}"
+                )));
+            }
+        };
+        if !locked {
+            transaction.rollback().await.map_err(|error| {
+                JobQueueStoreError::Db(format!("rollback colliding launch fence: {error}"))
+            })?;
+            return Err(JobQueueStoreError::Db(
+                "launch session lock is already owned; refusing a colliding or duplicate launch"
+                    .into(),
+            ));
+        }
+        if let Err(error) = transaction.commit().await {
+            connection.close_on_drop();
+            return Err(JobQueueStoreError::Db(format!(
+                "commit launch fence: {error}"
+            )));
+        }
+        Ok(Some(RetainedCiJobLaunch {
+            connection: Some(connection),
+            lock_key,
+        }))
     }
 
     /// Claim CAS for the durable completion reporter. This is intentionally caller-transaction-only:
@@ -766,15 +950,20 @@ mod tests {
         assert!(CONSUME_CLAIM_QUERY.contains("claim_nonce = $5::uuid"));
         assert!(CONSUME_CLAIM_QUERY.contains("stage = $7"));
         // Final launch is a one-shot exact-generation CAS, including original claim times.
-        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("$9"));
-        assert!(!AUTHORIZE_JOB_LAUNCH_QUERY.contains("$10"));
+        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("$10"));
+        assert!(!AUTHORIZE_JOB_LAUNCH_QUERY.contains("$11"));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("SET state = 'running'"));
+        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("lease_expires = statement_timestamp()"));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("state = 'leased'"));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("claim_nonce = $7::uuid"));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("claim_expires_at > statement_timestamp()"));
         // REAP: one bind ($1 region), an in-place UPDATE (no INSERT → 0 duplicate enqueues).
         assert!(REAP_QUERY.contains("$1") && !REAP_QUERY.contains("$2"));
-        assert!(REAP_QUERY.trim_start().starts_with("UPDATE"));
+        assert!(REAP_QUERY
+            .trim_start()
+            .starts_with("WITH candidates AS MATERIALIZED"));
+        assert!(REAP_QUERY.contains("FOR UPDATE SKIP LOCKED"));
+        assert!(REAP_QUERY.contains("pg_try_advisory_xact_lock"));
         // CANCEL: four binds ($1..$4), keeping the new head.
         assert!(CANCEL_SUPERSEDED_QUERY.contains("$4") && !CANCEL_SUPERSEDED_QUERY.contains("$5"));
         assert!(CANCEL_SUPERSEDED_QUERY.contains("job_id <> $4"));

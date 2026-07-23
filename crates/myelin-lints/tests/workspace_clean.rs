@@ -30,8 +30,8 @@
 //! `search-requires-acl-filter`, `no-llm-in-platform`, `forward-only-migration`) admit the
 //! current substrate because no such call-site exists yet; if one is added it must be clean.
 
-use myelin_lints::engine::run;
-use myelin_lints::lints::all_twelve;
+use myelin_lints::lints::{all_twelve, NO_HOST_EXEC};
+use myelin_lints::LintId;
 use std::path::{Path, PathBuf};
 
 fn workspace_root() -> PathBuf {
@@ -83,6 +83,16 @@ fn is_excluded(path: &Path) -> bool {
     EXCLUDED_SUBSTRINGS.iter().any(|ex| s.contains(ex))
 }
 
+const PER_LINT_EXCLUSIONS: &[(LintId, &[&str])] =
+    &[(NO_HOST_EXEC, &["myelin-ci-sandbox/src/launch_gate.rs"])];
+
+fn is_excluded_for_lint(lint: LintId, path: &Path) -> bool {
+    let path = path.to_string_lossy().replace('\\', "/");
+    PER_LINT_EXCLUSIONS
+        .iter()
+        .any(|(id, excluded)| *id == lint && excluded.iter().any(|item| path.contains(item)))
+}
+
 /// Recursively collect every `*.rs` file under `crates/*/src`.
 fn rust_source_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -123,8 +133,11 @@ fn the_twelve_lints_are_clean_over_the_workspace_source() {
             continue;
         }
         let src = std::fs::read_to_string(&file).expect("readable source file");
-        if let Err(violations) = run(&lints, &src) {
-            for v in violations {
+        for lint in &lints {
+            if is_excluded_for_lint(lint.id, &file) {
+                continue;
+            }
+            for v in lint.run(&src) {
                 all_violations.push(format!("{}: {v}", file.display()));
             }
         }
