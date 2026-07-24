@@ -171,19 +171,20 @@ pub trait EventConsumer: Send + Sync {
     ) -> std::result::Result<(), TransportError>;
 
     /// Stop broker redelivery after the application durably quarantined an exhausted retry.
-    fn terminate(
-        &self,
-        token: DeliveryToken,
-    ) -> std::result::Result<(), TransportError>;
+    fn terminate(&self, token: DeliveryToken) -> std::result::Result<(), TransportError>;
 }
 
 /// Fixed critical dependencies that can gate intake before a broker pull.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum IntakeDependency { Blob }
+pub enum IntakeDependency {
+    Blob,
+}
 
 impl IntakeDependency {
     pub const fn name(self) -> &'static str {
-        match self { Self::Blob => "blob" }
+        match self {
+            Self::Blob => "blob",
+        }
     }
 }
 
@@ -885,11 +886,24 @@ mod tests {
     fn consumer_delivery_quarantine_migration_is_fixed_code_and_payload_free() {
         let ddl = CONSUMER_DELIVERY_QUARANTINE_MIGRATION;
         assert!(ddl.contains("PRIMARY KEY (consumer, stream, stream_sequence)"));
-        for code in ["malformed_envelope", "subject_mismatch", "no_registered_consumer"] {
+        for code in [
+            "malformed_envelope",
+            "subject_mismatch",
+            "no_registered_consumer",
+        ] {
             assert!(ddl.contains(code));
         }
-        for forbidden in ["payload ", "raw_payload", "raw_subject", "tenant ", "payload_hash"] {
-            assert!(!ddl.contains(forbidden), "forbidden quarantine column {forbidden}");
+        for forbidden in [
+            "payload ",
+            "raw_payload",
+            "raw_subject",
+            "tenant ",
+            "payload_hash",
+        ] {
+            assert!(
+                !ddl.contains(forbidden),
+                "forbidden quarantine column {forbidden}"
+            );
         }
     }
     use crate::outbox::{EmitContextBase, IdMinter, MonotonicMinter};

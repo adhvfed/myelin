@@ -53,6 +53,126 @@ pub const MAX_SUBJECT_TOKEN_BYTES: usize = 255;
 /// The maximum wire-subject size produced by the event bus, including the `evt.` root.
 pub const MAX_STREAM_SUBJECT_BYTES: usize = 1024;
 
+/// Defensive allocation bound for one reversibly encoded component.
+pub const MAX_ENCODED_COMPONENT_BYTES: usize = MAX_STREAM_SUBJECT_BYTES;
+
+/// A reversible canonical encoding for one logical identifier carried inside a transport token.
+/// Only ASCII alphanumerics, `-`, and `_` remain literal; every other UTF-8 byte is strict uppercase
+/// `%XX`, so delimiters such as `.`, `/`, `:`, `#`, and `%` cannot change the wire grammar.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SubjectComponent(String);
+
+/// A component was empty, malformed, non-canonical, or exceeded the finite codec bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubjectComponentError {
+    Empty,
+    NonCanonical,
+    TooLong,
+}
+
+impl std::fmt::Display for SubjectComponentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "subject component is empty"),
+            Self::NonCanonical => write!(f, "subject component encoding is non-canonical"),
+            Self::TooLong => write!(f, "subject component exceeds its bounded size"),
+        }
+    }
+}
+
+impl std::error::Error for SubjectComponentError {}
+
+impl SubjectComponent {
+    pub fn encode(raw: &str) -> Result<Self, SubjectComponentError> {
+        if raw.is_empty() {
+            return Err(SubjectComponentError::Empty);
+        }
+        let mut encoded = String::with_capacity(raw.len().min(MAX_ENCODED_COMPONENT_BYTES + 1));
+        for byte in raw.as_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                encoded.push(*byte as char);
+            } else {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+            if encoded.len() > MAX_ENCODED_COMPONENT_BYTES {
+                return Err(SubjectComponentError::TooLong);
+            }
+        }
+        Ok(Self(encoded))
+    }
+
+    pub fn parse(encoded: &str) -> Result<Self, SubjectComponentError> {
+        if encoded.is_empty() {
+            return Err(SubjectComponentError::Empty);
+        }
+        if encoded.len() > MAX_ENCODED_COMPONENT_BYTES {
+            return Err(SubjectComponentError::TooLong);
+        }
+        let bytes = encoded.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'%' => {
+                    if index + 2 >= bytes.len() {
+                        return Err(SubjectComponentError::NonCanonical);
+                    }
+                    let hi = decode_upper_hex(bytes[index + 1])
+                        .ok_or(SubjectComponentError::NonCanonical)?;
+                    let lo = decode_upper_hex(bytes[index + 2])
+                        .ok_or(SubjectComponentError::NonCanonical)?;
+                    decoded.push((hi << 4) | lo);
+                    index += 3;
+                }
+                byte if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') => {
+                    decoded.push(byte);
+                    index += 1;
+                }
+                _ => return Err(SubjectComponentError::NonCanonical),
+            }
+        }
+        let raw = std::str::from_utf8(&decoded).map_err(|_| SubjectComponentError::NonCanonical)?;
+        let canonical = Self::encode(raw)?;
+        if canonical.0 != encoded {
+            return Err(SubjectComponentError::NonCanonical);
+        }
+        Ok(canonical)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn decode(&self) -> String {
+        let bytes = self.0.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' {
+                let hi = decode_upper_hex(bytes[index + 1]).expect("validated uppercase escape");
+                let lo = decode_upper_hex(bytes[index + 2]).expect("validated uppercase escape");
+                decoded.push((hi << 4) | lo);
+                index += 3;
+            } else {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+        String::from_utf8(decoded).expect("validated UTF-8 component")
+    }
+}
+
+fn decode_upper_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// The `(tenant, region)` first-class partition key the streams are keyed under (contract 12.1,
 /// **CONSUMED**; injected by the harness; ADR-11). This is the Bus's consumer side of 12.1: it
 /// composes the two `myelin-tenancy` value types ([`TenantId`] + [`Region`]) into the partition the
@@ -581,5 +701,48 @@ mod tests {
         let env = sample_envelope();
         let wire = StreamSubject::of(&env).unwrap().to_subject();
         assert_eq!(wire, "evt.acme.issue.issue.PROJ-1.created");
+    }
+
+    #[test]
+    fn subject_component_is_reversible_and_delimiter_safe() {
+        let raw = "repo.with/slash:and%percent#anchor";
+        let component = SubjectComponent::encode(raw).unwrap();
+        assert_eq!(
+            component.as_str(),
+            "repo%2Ewith%2Fslash%3Aand%25percent%23anchor"
+        );
+        assert_eq!(component.decode(), raw);
+        assert_eq!(
+            SubjectComponent::parse(component.as_str()).unwrap(),
+            component
+        );
+    }
+
+    #[test]
+    fn subject_component_rejects_non_canonical_encodings() {
+        for encoded in ["repo%2ewith", "repo%2F%", "repo%41", "repo.with", ""] {
+            assert!(
+                SubjectComponent::parse(encoded).is_err(),
+                "{encoded:?} must not acquire a second wire spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn subject_component_has_a_finite_encoded_bound() {
+        let long_but_valid = "a".repeat(MAX_SUBJECT_TOKEN_BYTES + 1);
+        let component = SubjectComponent::encode(&long_but_valid).unwrap();
+        assert_eq!(component.decode(), long_but_valid);
+
+        for raw in ["/".repeat(1024), "/".repeat(1_000_000)] {
+            assert_eq!(
+                SubjectComponent::encode(&raw),
+                Err(SubjectComponentError::TooLong)
+            );
+        }
+        assert_eq!(
+            SubjectComponent::parse(&"a".repeat(MAX_ENCODED_COMPONENT_BYTES + 1)),
+            Err(SubjectComponentError::TooLong)
+        );
     }
 }

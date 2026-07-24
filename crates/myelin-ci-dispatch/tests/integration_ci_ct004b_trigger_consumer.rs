@@ -283,6 +283,11 @@ fn principal() -> Principal {
 }
 
 fn push_envelope(ev: &str, repo: &str, new_oid: &str) -> EventEnvelope {
+    let ref_key = myelin_git::receive_pack::GitRefEventKey::new(
+        repo,
+        &myelin_git::receive_pack::RefName::new("refs/heads/main"),
+    )
+    .unwrap();
     EventEnvelope {
         event_id: EventId(ev.into()),
         type_: EventType(myelin_git::events::GIT_REF_UPDATED.into()),
@@ -290,8 +295,8 @@ fn push_envelope(ev: &str, repo: &str, new_oid: &str) -> EventEnvelope {
         tenant: TenantId("acme".into()),
         region: Region("fr-par".into()),
         actor: Actor(principal()),
-        subject: ArtifactRef(format!("myelin://acme/git/ref/{repo}:refs/heads/main")),
-        aggregate: AggregateKey(format!("{repo}:refs/heads/main")),
+        subject: ref_key.subject("acme").unwrap(),
+        aggregate: ref_key.aggregate(),
         causation_id: None,
         correlation_id: CorrelationId(format!("corr-{ev}")),
         caused_by: None,

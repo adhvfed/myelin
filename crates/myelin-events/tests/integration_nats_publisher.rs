@@ -67,9 +67,9 @@ async fn publisher_provisions_bounded_stream_without_consumer_or_purge_capabilit
     };
     JetStreamProvisioner::ensure(config.clone(), tokio::runtime::Handle::current())
         .expect("provision publisher-only stream");
-    let publisher = NatsJetStreamPublisher::connect_existing(
-        config, tokio::runtime::Handle::current(),
-    ).expect("connect runtime publisher to existing stream");
+    let publisher =
+        NatsJetStreamPublisher::connect_existing(config, tokio::runtime::Handle::current())
+            .expect("connect runtime publisher to existing stream");
     let event = envelope(&format!("01JNP{suffix:021}"));
     publisher
         .publish(&event.subject, &event, &event.event_id)
@@ -110,17 +110,22 @@ async fn runtime_publisher_never_provisions_a_missing_stream() {
         duplicate_window: std::time::Duration::from_secs(60),
         publish_ack_timeout: std::time::Duration::from_millis(250),
     };
-    let publisher = NatsJetStreamPublisher::connect_existing(
-        config, tokio::runtime::Handle::current(),
-    ).expect("runtime connection requires no admin request");
+    let publisher =
+        NatsJetStreamPublisher::connect_existing(config, tokio::runtime::Handle::current())
+            .expect("runtime connection requires no admin request");
     let event = envelope(&format!("runtime-only-{suffix}"));
-    publisher.publish(&event.subject, &event, &event.event_id)
+    publisher
+        .publish(&event.subject, &event, &event.event_id)
         .expect_err("a missing stream cannot acknowledge publication");
 
-    let client = async_nats::connect(&dev.nats_url).await.expect("inspect NATS");
+    let client = async_nats::connect(&dev.nats_url)
+        .await
+        .expect("inspect NATS");
     let js = async_nats::jetstream::new(client);
-    assert!(js.get_stream(&stream_name).await.is_err(),
-        "runtime publish authority must not create the absent stream");
+    assert!(
+        js.get_stream(&stream_name).await.is_err(),
+        "runtime publish authority must not create the absent stream"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -129,7 +134,9 @@ async fn provisioner_refuses_existing_stream_policy_drift() {
     let suffix = format!("{}_stream_drift", std::process::id());
     let stream_name = format!("MYELIN_PUBLISHER_{suffix}");
     let subject_root = format!("myelin.publisher_{suffix}");
-    let client = async_nats::connect(&dev.nats_url).await.expect("connect NATS admin");
+    let client = async_nats::connect(&dev.nats_url)
+        .await
+        .expect("connect NATS admin");
     let js = async_nats::jetstream::new(client);
     js.create_stream(async_nats::jetstream::stream::Config {
         name: stream_name.clone(),
@@ -143,7 +150,9 @@ async fn provisioner_refuses_existing_stream_policy_drift() {
         retention: async_nats::jetstream::stream::RetentionPolicy::Limits,
         discard: async_nats::jetstream::stream::DiscardPolicy::Old,
         ..Default::default()
-    }).await.expect("create drifted stream");
+    })
+    .await
+    .expect("create drifted stream");
     let error = JetStreamProvisioner::ensure(
         JetStreamPublisherConfig {
             nats_url: dev.nats_url.clone(),
@@ -157,9 +166,15 @@ async fn provisioner_refuses_existing_stream_policy_drift() {
             publish_ack_timeout: std::time::Duration::from_secs(2),
         },
         tokio::runtime::Handle::current(),
-    ).expect_err("drifted stream must be refused");
-    assert_eq!(error.0, "existing JetStream stream configuration is incompatible");
-    js.delete_stream(&stream_name).await.expect("delete drift test stream");
+    )
+    .expect_err("drifted stream must be refused");
+    assert_eq!(
+        error.0,
+        "existing JetStream stream configuration is incompatible"
+    );
+    js.delete_stream(&stream_name)
+        .await
+        .expect("delete drift test stream");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -191,8 +206,8 @@ async fn durable_pull_rebind_redelivers_unacked_git_event_then_persists_ack() {
 
     let mut event = envelope(&format!("01JNR{suffix:0>21}"));
     event.type_ = EventType("git.ref.updated".into());
-    event.subject = ArtifactRef("myelin://publisher-test/git/ref/web:refs/heads/main".into());
-    event.aggregate = AggregateKey("git/ref/web:refs/heads/main".into());
+    event.subject = ArtifactRef("myelin://publisher-test/git/ref/web:refs%2Fheads%2Fmain".into());
+    event.aggregate = AggregateKey("ref:web:refs%2Fheads%2Fmain".into());
     publisher
         .publish(&event.subject, &event, &event.event_id)
         .expect("publish git event");
@@ -222,7 +237,11 @@ async fn durable_pull_rebind_redelivers_unacked_git_event_then_persists_ack() {
     )
     .expect("rebind exact durable name after restart");
     let redelivered = rebound.consume("").expect("redelivery after restart");
-    assert_eq!(redelivered.len(), 1, "unacked event survives consumer restart");
+    assert_eq!(
+        redelivered.len(),
+        1,
+        "unacked event survives consumer restart"
+    );
     assert_eq!(delivered_event(&redelivered[0]).event_id, event.event_id);
     assert!(redelivered[0].delivery_attempt >= Some(2));
     rebound
@@ -231,14 +250,14 @@ async fn durable_pull_rebind_redelivers_unacked_git_event_then_persists_ack() {
     drop(rebound);
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-    let after_ack = NatsJetStreamBus::connect_consumer(
-        consumer_config,
-        tokio::runtime::Handle::current(),
-    )
-    .expect("rebind after acknowledged restart");
+    let after_ack =
+        NatsJetStreamBus::connect_consumer(consumer_config, tokio::runtime::Handle::current())
+            .expect("rebind after acknowledged restart");
     assert!(after_ack.consume("").expect("pull after ack").is_empty());
 
-    let client = async_nats::connect(&dev.nats_url).await.expect("cleanup NATS");
+    let client = async_nats::connect(&dev.nats_url)
+        .await
+        .expect("cleanup NATS");
     async_nats::jetstream::new(client)
         .delete_stream(&stream_name)
         .await
@@ -269,27 +288,33 @@ async fn existing_durable_consumer_with_semantic_drift_refuses_boot() {
             publish_ack_timeout: std::time::Duration::from_secs(2),
         },
         tokio::runtime::Handle::current(),
-    ).expect("provision publisher-only stream");
+    )
+    .expect("provision publisher-only stream");
 
-    let client = async_nats::connect(&dev.nats_url).await.expect("connect raw NATS client");
+    let client = async_nats::connect(&dev.nats_url)
+        .await
+        .expect("connect raw NATS client");
     let js = async_nats::jetstream::new(client);
     let stream = js.get_stream(&stream_name).await.expect("get stream");
-    stream.create_consumer(async_nats::jetstream::consumer::pull::Config {
-        durable_name: Some(durable_name.clone()),
-        name: Some(durable_name.clone()),
-        deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::All,
-        ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
-        ack_wait: std::time::Duration::from_secs(30),
-        max_deliver: -1,
-        filter_subject: format!("{subject_root}.evt.*.git.>"),
-        replay_policy: async_nats::jetstream::consumer::ReplayPolicy::Instant,
-        max_waiting: 9, // production pins 8: this pre-existing durable has semantic drift.
-        max_ack_pending: 256,
-        max_batch: 256,
-        max_bytes: 4 * 1024 * 1024,
-        max_expires: std::time::Duration::from_secs(1),
-        ..Default::default()
-    }).await.expect("create intentionally drifted durable consumer");
+    stream
+        .create_consumer(async_nats::jetstream::consumer::pull::Config {
+            durable_name: Some(durable_name.clone()),
+            name: Some(durable_name.clone()),
+            deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::All,
+            ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+            ack_wait: std::time::Duration::from_secs(30),
+            max_deliver: -1,
+            filter_subject: format!("{subject_root}.evt.*.git.>"),
+            replay_policy: async_nats::jetstream::consumer::ReplayPolicy::Instant,
+            max_waiting: 9, // production pins 8: this pre-existing durable has semantic drift.
+            max_ack_pending: 256,
+            max_batch: 256,
+            max_bytes: 4 * 1024 * 1024,
+            max_expires: std::time::Duration::from_secs(1),
+            ..Default::default()
+        })
+        .await
+        .expect("create intentionally drifted durable consumer");
 
     let result = NatsJetStreamBus::connect_consumer(
         JetStreamConsumerConfig::bounded(
@@ -305,10 +330,18 @@ async fn existing_durable_consumer_with_semantic_drift_refuses_boot() {
         Ok(_) => panic!("consumer drift must refuse boot"),
         Err(error) => error,
     };
-    assert!(error.0.contains("configuration drifted"), "unexpected refusal: {error:?}");
-    assert!(error.0.contains("max_waiting"), "drift field must be named: {error:?}");
+    assert!(
+        error.0.contains("configuration drifted"),
+        "unexpected refusal: {error:?}"
+    );
+    assert!(
+        error.0.contains("max_waiting"),
+        "drift field must be named: {error:?}"
+    );
 
-    js.delete_stream(&stream_name).await.expect("delete drift test stream");
+    js.delete_stream(&stream_name)
+        .await
+        .expect("delete drift test stream");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -335,15 +368,22 @@ async fn nak_increments_attempt_then_term_makes_durable_rebind_empty() {
             publish_ack_timeout: std::time::Duration::from_secs(2),
         },
         tokio::runtime::Handle::current(),
-    ).expect("create nonce-scoped settle stream");
+    )
+    .expect("create nonce-scoped settle stream");
     let event = envelope(&format!("settle-event-{nonce}"));
-    publisher.publish(&event.subject, &event, &event.event_id).unwrap();
+    publisher
+        .publish(&event.subject, &event, &event.event_id)
+        .unwrap();
     let config = JetStreamConsumerConfig::bounded(
-        &dev.nats_url, &stream_name, &subject_root, format!("{subject_root}.>"), &durable_name,
+        &dev.nats_url,
+        &stream_name,
+        &subject_root,
+        format!("{subject_root}.>"),
+        &durable_name,
     );
-    let consumer = NatsJetStreamBus::connect_consumer(
-        config.clone(), tokio::runtime::Handle::current(),
-    ).unwrap();
+    let consumer =
+        NatsJetStreamBus::connect_consumer(config.clone(), tokio::runtime::Handle::current())
+            .unwrap();
     let first = consumer.consume("").unwrap();
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].delivery_attempt, Some(1));
@@ -354,7 +394,10 @@ async fn nak_increments_attempt_then_term_makes_durable_rebind_empty() {
         if !batch.is_empty() {
             break batch;
         }
-        assert!(tokio::time::Instant::now() < deadline, "NAK redelivery deadline exceeded");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "NAK redelivery deadline exceeded"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     };
     assert_eq!(second.len(), 1);
@@ -362,13 +405,18 @@ async fn nak_increments_attempt_then_term_makes_durable_rebind_empty() {
     consumer.terminate(second[0].token).unwrap();
     drop(consumer);
 
-    let rebound = NatsJetStreamBus::connect_consumer(
-        config, tokio::runtime::Handle::current(),
-    ).unwrap();
-    assert!(rebound.consume("").unwrap().is_empty(), "TERM survives durable rebind");
+    let rebound =
+        NatsJetStreamBus::connect_consumer(config, tokio::runtime::Handle::current()).unwrap();
+    assert!(
+        rebound.consume("").unwrap().is_empty(),
+        "TERM survives durable rebind"
+    );
     drop(rebound);
     let client = async_nats::connect(&dev.nats_url).await.unwrap();
-    async_nats::jetstream::new(client).delete_stream(&stream_name).await.unwrap();
+    async_nats::jetstream::new(client)
+        .delete_stream(&stream_name)
+        .await
+        .unwrap();
 }
 
 /// Two-phase operator proof for the server/volume boundary. Run once with phase `seed`, restart the
@@ -384,7 +432,9 @@ async fn jetstream_file_storage_survives_server_restart() {
     let phase = std::env::var("MYELIN_NATS_RESTART_PHASE").expect("seed or verify phase");
 
     if phase == "seed" {
-        let client = async_nats::connect(&dev.nats_url).await.expect("connect seed cleanup");
+        let client = async_nats::connect(&dev.nats_url)
+            .await
+            .expect("connect seed cleanup");
         let js = async_nats::jetstream::new(client);
         let _ = js.delete_stream(stream_name).await;
         let publisher = NatsJetStreamPublisher::connect(
@@ -404,7 +454,8 @@ async fn jetstream_file_storage_survives_server_restart() {
         .expect("create file-backed stream");
         let mut event = envelope("server-restart-event");
         event.type_ = EventType("git.ref.updated".into());
-        event.subject = ArtifactRef("myelin://publisher-test/git/ref/web:refs/heads/main".into());
+        event.subject =
+            ArtifactRef("myelin://publisher-test/git/ref/web:refs%2Fheads%2Fmain".into());
         publisher
             .publish(&event.subject, &event, &event.event_id)
             .expect("persist event before server restart");
@@ -425,12 +476,17 @@ async fn jetstream_file_storage_survives_server_restart() {
     .expect("stream survived server restart");
     let delivery = consumer.consume("").expect("pull persisted event");
     assert_eq!(delivery.len(), 1);
-    assert_eq!(delivered_event(&delivery[0]).event_id.0, "server-restart-event");
+    assert_eq!(
+        delivered_event(&delivery[0]).event_id.0,
+        "server-restart-event"
+    );
     consumer
         .ack(delivery[0].token)
         .expect("ack persisted event");
 
-    let client = async_nats::connect(&dev.nats_url).await.expect("connect cleanup");
+    let client = async_nats::connect(&dev.nats_url)
+        .await
+        .expect("connect cleanup");
     async_nats::jetstream::new(client)
         .delete_stream(stream_name)
         .await

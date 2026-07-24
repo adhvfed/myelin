@@ -811,9 +811,7 @@ impl Firehose {
         let key = (stream.to_string(), scope.clone());
         self.windows
             .get(&key)
-            .map(|window| {
-                window.tail_bounded(lo, hi, maximum_frames, maximum_payload_bytes)
-            })
+            .map(|window| window.tail_bounded(lo, hi, maximum_frames, maximum_payload_bytes))
             .unwrap_or_else(|| Ok(Vec::new()))
     }
 

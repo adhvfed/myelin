@@ -405,7 +405,9 @@ fn classify_delivery_body(
 
 fn allocate_delivery_token(sequence: &AtomicU64) -> Result<DeliveryToken, TransportError> {
     let previous = sequence
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
         .map_err(|_| TransportError("delivery token space exhausted".into()))?;
     DeliveryToken::new(previous + 1)
         .ok_or_else(|| TransportError("delivery token allocation failed".into()))
@@ -431,16 +433,13 @@ fn queue_on_settlement_failure<T>(
     result: &Result<(), TransportError>,
 ) {
     if result.is_err() {
-        retries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                token,
-                QueuedSettlement {
-                    handle: retained,
-                    intent,
-                },
-            );
+        retries.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            token,
+            QueuedSettlement {
+                handle: retained,
+                intent,
+            },
+        );
     }
 }
 
@@ -658,19 +657,27 @@ mod routing_tests {
         let valid_subject = event_subject("root", &first).unwrap();
         let bodies = [
             classify_delivery_body("root", &valid_subject, b"ATTACKER_SENTINEL not json"),
+            classify_delivery_body("root", &valid_subject, &serde_json::to_vec(&first).unwrap()),
             classify_delivery_body(
-                "root", &valid_subject, &serde_json::to_vec(&first).unwrap(),
+                "root",
+                "root.evt.other.route",
+                &serde_json::to_vec(&first).unwrap(),
             ),
             classify_delivery_body(
-                "root", "root.evt.other.route", &serde_json::to_vec(&first).unwrap(),
-            ),
-            classify_delivery_body(
-                "root", &valid_subject, &serde_json::to_vec(&second).unwrap(),
+                "root",
+                &valid_subject,
+                &serde_json::to_vec(&second).unwrap(),
             ),
         ];
-        assert!(matches!(bodies[0], BrokerDeliveryBody::Poison(DeliveryPoisonKind::MalformedEnvelope)));
+        assert!(matches!(
+            bodies[0],
+            BrokerDeliveryBody::Poison(DeliveryPoisonKind::MalformedEnvelope)
+        ));
         assert!(matches!(bodies[1], BrokerDeliveryBody::Event(_)));
-        assert!(matches!(bodies[2], BrokerDeliveryBody::Poison(DeliveryPoisonKind::SubjectMismatch)));
+        assert!(matches!(
+            bodies[2],
+            BrokerDeliveryBody::Poison(DeliveryPoisonKind::SubjectMismatch)
+        ));
         assert!(matches!(bodies[3], BrokerDeliveryBody::Event(_)));
     }
 
@@ -681,7 +688,11 @@ mod routing_tests {
         let second = allocate_delivery_token(&sequence).unwrap();
         assert_ne!(first, second);
         let pending = HashMap::from([(first, "handle-a"), (second, "handle-b")]);
-        assert_eq!(pending.len(), 2, "duplicate payload identity cannot collide handles");
+        assert_eq!(
+            pending.len(),
+            2,
+            "duplicate payload identity cannot collide handles"
+        );
     }
 
     #[test]
@@ -718,7 +729,11 @@ mod routing_tests {
                 "broker settlement retry remains unresolved".into()
             ))
         );
-        assert_eq!(retries.lock().unwrap().len(), 1, "failed retry remains gated");
+        assert_eq!(
+            retries.lock().unwrap().len(),
+            1,
+            "failed retry remains gated"
+        );
 
         drain_queued_settlements(&retries, |handle, intent| {
             assert_eq!(handle, "raw-handle");
@@ -923,7 +938,10 @@ impl NatsJetStreamBus {
             let token = allocate_delivery_token(&self.next_delivery_token)?;
             let classify = msg.clone();
             // Insert the raw handle before any fallible metadata/decode/routing operation.
-            self.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(token, msg);
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(token, msg);
 
             let metadata = classify.info().ok().and_then(|info| {
                 let delivery_attempt = u64::try_from(info.delivered).ok().filter(|n| *n > 0)?;
@@ -1106,12 +1124,18 @@ mod publisher_tests {
         let mut actual = expected.clone();
         actual.num_replicas = 1;
         let err = validate_stream_config(&actual, &expected).expect_err("replica drift");
-        assert_eq!(err.0, "existing JetStream stream configuration is incompatible");
+        assert_eq!(
+            err.0,
+            "existing JetStream stream configuration is incompatible"
+        );
 
         let mut actual = expected.clone();
         actual.discard = DiscardPolicy::New;
         let err = validate_stream_config(&actual, &expected).expect_err("discard drift");
-        assert_eq!(err.0, "existing JetStream stream configuration is incompatible");
+        assert_eq!(
+            err.0,
+            "existing JetStream stream configuration is incompatible"
+        );
     }
 
     #[tokio::test]
@@ -1174,13 +1198,17 @@ mod publisher_tests {
             "myelin.events",
             "myelin.events.evt.*.git.>",
             "ci-dispatch-trigger",
-        ).pull_config();
+        )
+        .pull_config();
         let baseline = expected.clone().into_consumer_config();
         validate_consumer_config(&baseline, &expected).expect("the exact policy matches");
 
         let assert_drift = |actual: jetstream::consumer::Config, field: &str| {
             let error = validate_consumer_config(&actual, &expected).expect_err(field);
-            assert!(error.0.contains(field), "{field} drift was not named: {error:?}");
+            assert!(
+                error.0.contains(field),
+                "{field} drift was not named: {error:?}"
+            );
         };
         macro_rules! drift {
             ($field:ident, $value:expr) => {{
@@ -1334,11 +1362,7 @@ impl crate::relay::EventConsumer for NatsJetStreamBus {
         self.try_ack(token)
     }
 
-    fn retry(
-        &self,
-        token: DeliveryToken,
-        delay_secs: u64,
-    ) -> Result<(), TransportError> {
+    fn retry(&self, token: DeliveryToken, delay_secs: u64) -> Result<(), TransportError> {
         self.try_retry(token, delay_secs)
     }
 

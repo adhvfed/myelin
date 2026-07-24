@@ -444,8 +444,9 @@ pub use outbox::{
     OUTBOX_QUARANTINE_MIGRATION,
 };
 pub use partition::{
-    stream_name_for, PartitionKey, StreamSubject, SubjectError, MAX_STREAM_SUBJECT_BYTES,
-    MAX_SUBJECT_TOKEN_BYTES, SUBJECT_ROOT,
+    stream_name_for, PartitionKey, StreamSubject, SubjectComponent, SubjectComponentError,
+    SubjectError, MAX_ENCODED_COMPONENT_BYTES, MAX_STREAM_SUBJECT_BYTES, MAX_SUBJECT_TOKEN_BYTES,
+    SUBJECT_ROOT,
 };
 pub use relay::{
     dlq_subject, BrokerDelivery, BrokerDeliveryBody, BrokerDeliveryRef, BusTransport,

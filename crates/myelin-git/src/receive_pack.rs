@@ -132,6 +132,30 @@ impl RefName {
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
+    /// Validate Git's canonical fully-qualified ref-name rules.
+    pub fn validate(&self) -> Result<(), RefNameError> {
+        let name = self.0.as_str();
+        let invalid = !name.starts_with("refs/")
+            || name.ends_with('/')
+            || name.ends_with('.')
+            || name.contains("//")
+            || name.contains("..")
+            || name.contains("@{")
+            || name.contains([':', '\\'])
+            || name
+                .split('/')
+                .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+            || name.chars().any(|c| {
+                c.is_ascii_control()
+                    || c.is_ascii_whitespace()
+                    || matches!(c, '~' | '^' | '?' | '*' | '[')
+            });
+        if invalid {
+            Err(RefNameError)
+        } else {
+            Ok(())
+        }
+    }
     /// `true` iff this is a protected branch under the (modeled) ruleset — `refs/heads/main` and
     /// `refs/heads/release/*` here (the real ruleset is the GIT-P13/GIT-P26 branch-protection
     /// resolver; this is the minimal protected-set the policy gates on).
@@ -139,6 +163,79 @@ impl RefName {
         self.0 == "refs/heads/main" || self.0.starts_with("refs/heads/release/")
     }
 }
+
+/// A ref name failed Git's canonical check-ref-format subset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefNameError;
+
+impl std::fmt::Display for RefNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid canonical Git ref name")
+    }
+}
+
+impl std::error::Error for RefNameError {}
+
+/// The canonical delimiter-safe identity of one repository ref on the event bus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitRefEventKey {
+    encoded_repo: myelin_events::SubjectComponent,
+    encoded_ref: myelin_events::SubjectComponent,
+}
+
+impl GitRefEventKey {
+    pub fn new(repo: &str, ref_name: &RefName) -> Result<Self, GitRefEventKeyError> {
+        ref_name.validate().map_err(|_| GitRefEventKeyError)?;
+        Ok(Self {
+            encoded_repo: myelin_events::SubjectComponent::encode(repo)
+                .map_err(|_| GitRefEventKeyError)?,
+            encoded_ref: myelin_events::SubjectComponent::encode(&ref_name.0)
+                .map_err(|_| GitRefEventKeyError)?,
+        })
+    }
+
+    pub fn parse_id(id: &str) -> Result<(String, RefName), GitRefEventKeyError> {
+        let (repo, ref_name) = id.split_once(':').ok_or(GitRefEventKeyError)?;
+        let repo = myelin_events::SubjectComponent::parse(repo)
+            .map_err(|_| GitRefEventKeyError)?
+            .decode();
+        let ref_name = RefName::new(
+            myelin_events::SubjectComponent::parse(ref_name)
+                .map_err(|_| GitRefEventKeyError)?
+                .decode(),
+        );
+        ref_name.validate().map_err(|_| GitRefEventKeyError)?;
+        Ok((repo, ref_name))
+    }
+
+    pub fn aggregate(&self) -> AggregateKey {
+        AggregateKey(format!("ref:{}", self.id()))
+    }
+
+    pub fn subject(&self, tenant: &str) -> Result<ArtifactRef, GitRefEventKeyError> {
+        myelin_refs::parse(&format!("myelin://{tenant}/git/ref/{}", self.id()))
+            .map_err(|_| GitRefEventKeyError)
+    }
+
+    fn id(&self) -> String {
+        format!(
+            "{}:{}",
+            self.encoded_repo.as_str(),
+            self.encoded_ref.as_str()
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GitRefEventKeyError;
+
+impl std::fmt::Display for GitRefEventKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid canonical Git ref event key")
+    }
+}
+
+impl std::error::Error for GitRefEventKeyError {}
 
 /// A git object id (rendered hex; the data model stores `bytea`, hash-agnostic — arch `01 §3.0`).
 /// The all-zeros oid is the **create/delete sentinel** (a push from zero is a create; a push to
@@ -224,6 +321,8 @@ pub struct PushSession {
 /// rule that fired (a rejected push is LOUD, never a silent partial write).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RejectReason {
+    /// A proposed update did not name a canonical, bus-encodable fully-qualified Git ref.
+    InvalidRefName,
     /// The same ref appeared more than once in one push. A push is a set of ref transitions; allowing
     /// duplicates would plan multiple witnesses from one old generation and fail only after commit.
     DuplicateRefUpdate {
@@ -549,7 +648,11 @@ pub fn evaluate_protected_ref_push(
     }
     for c in fork_unendorsed_contexts {
         let ctx = parse_required_context(c).map_err(|e| gate_input(e.to_string()))?;
-        proj.apply(&synthetic_check_fact(head_oid, ctx, TrustTier::UntrustedFork));
+        proj.apply(&synthetic_check_fact(
+            head_oid,
+            ctx,
+            TrustTier::UntrustedFork,
+        ));
     }
     let endorsed: Vec<CheckContext> = endorsed_contexts
         .iter()
@@ -856,9 +959,7 @@ impl RefStore {
             ctx_base,
             outbox,
             minter,
-            backing: RefBacking::Disk {
-                repo: durable_repo,
-            },
+            backing: RefBacking::Disk { repo: durable_repo },
             locks: std::sync::Mutex::new(BTreeMap::new()),
             holder: crate::holder_intent::HolderRegistration::auto_register(),
         }
@@ -931,13 +1032,13 @@ impl RefStore {
                 let mut input_bytes = 0usize;
                 let mut output_bytes = 0usize;
                 for (name, _tip) in repo.list_refs_bounded(crate::durable::WIRE_MAX_REFS)? {
-                    let remaining_entries = maximum_total_entries.checked_sub(out.len()).ok_or_else(
-                        || {
+                    let remaining_entries = maximum_total_entries
+                        .checked_sub(out.len())
+                        .ok_or_else(|| {
                             crate::durable::DurableError::Git(
                                 "audit reflog limit exceeded: total entry count".into(),
                             )
-                        },
-                    )?;
+                        })?;
                     let remaining_input_bytes = maximum_total_bytes
                         .checked_sub(input_bytes)
                         .ok_or_else(|| {
@@ -1046,7 +1147,10 @@ impl RefStore {
                 .map(|r| r.update_seq)
                 .unwrap_or(0)),
             RefBacking::Disk { repo } => repo.ref_generation(&ref_name.0).map_err(|e| {
-                OutboxError(format!("read durable ref generation for {}: {e}", ref_name.0))
+                OutboxError(format!(
+                    "read durable ref generation for {}: {e}",
+                    ref_name.0
+                ))
             }),
         }
     }
@@ -1078,13 +1182,16 @@ impl RefStore {
                     );
                 }
                 drop(rows);
-                reflog.lock().unwrap_or_else(|e| e.into_inner()).push(ReflogEntry {
-                    ref_name: ref_name.clone(),
-                    old_oid: old,
-                    new_oid: new_oid.clone(),
-                    update_seq: new_seq,
-                    pusher_pseudonym: pseudonym.to_string(),
-                });
+                reflog
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(ReflogEntry {
+                        ref_name: ref_name.clone(),
+                        old_oid: old,
+                        new_oid: new_oid.clone(),
+                        update_seq: new_seq,
+                        pusher_pseudonym: pseudonym.to_string(),
+                    });
                 Ok(())
             }
             RefBacking::Disk { repo } => {
@@ -1104,12 +1211,18 @@ impl RefStore {
                 // whose on-disk `update_seq` is behind the durable reflog and re-applies the CAS
                 // (idempotent on `update_seq`, arch §4.2). It is NOT silent-loss (the committed event is
                 // the durable witness), so the durable store may now reach the live front door (GT-003).
-                repo.update_ref_cas(&ref_name.0, old_core.as_ref(), new_core.as_ref(), &msg, pseudonym)
-                    // Post-commit apply failure is a should-not-happen invariant breach (the CAS was
-                    // pre-checked under the held lock + the objects were migrated before commit). It
-                    // surfaces LOUD, never silently — the event is committed; the GT-003 reconciler
-                    // (above) re-applies from the durable reflog.
-                    .map_err(|e| OutboxError(format!("durable ref apply failed (post-commit): {e}")))
+                repo.update_ref_cas(
+                    &ref_name.0,
+                    old_core.as_ref(),
+                    new_core.as_ref(),
+                    &msg,
+                    pseudonym,
+                )
+                // Post-commit apply failure is a should-not-happen invariant breach (the CAS was
+                // pre-checked under the held lock + the objects were migrated before commit). It
+                // surfaces LOUD, never silently — the event is committed; the GT-003 reconciler
+                // (above) re-applies from the durable reflog.
+                .map_err(|e| OutboxError(format!("durable ref apply failed (post-commit): {e}")))
             }
         }
     }
@@ -1118,15 +1231,17 @@ impl RefStore {
     /// separates the repo from the ref; the per-aggregate ordering the outbox enforces is per-ref
     /// (so different refs of one repo advance in parallel; one ref is strictly serialised).
     fn aggregate_for(&self, ref_name: &RefName) -> AggregateKey {
-        AggregateKey(format!("{}:{}", self.repo, ref_name.0))
+        GitRefEventKey::new(&self.repo, ref_name)
+            .expect("receive validates canonical Git ref event keys")
+            .aggregate()
     }
 
     /// The subject ref for the `git.ref.updated` event (`myelin://<tenant>/git/ref/<repo>:<ref>`).
     fn subject_for(&self, ref_name: &RefName) -> ArtifactRef {
-        ArtifactRef(format!(
-            "myelin://{}/git/ref/{}:{}",
-            self.ctx_base.tenant.0, self.repo, ref_name.0
-        ))
+        GitRefEventKey::new(&self.repo, ref_name)
+            .expect("receive validates canonical Git ref event keys")
+            .subject(&self.ctx_base.tenant.0)
+            .expect("validated Git ref key forms a canonical ArtifactRef")
     }
 
     /// **The receive-pack write path** (arch §2): policy → (reject-before-ref-move) → object
@@ -1148,6 +1263,9 @@ impl RefStore {
         // The smart-HTTP parser enforces this too; this guard protects every direct/internal caller.
         let mut unique_refs = std::collections::BTreeSet::new();
         for update in &push.updates {
+            if GitRefEventKey::new(&self.repo, &update.ref_name).is_err() {
+                return Ok(PushOutcome::Rejected(RejectReason::InvalidRefName));
+            }
             if !unique_refs.insert(update.ref_name.clone()) {
                 return Ok(PushOutcome::Rejected(RejectReason::DuplicateRefUpdate {
                     ref_name: update.ref_name.clone(),
@@ -1234,9 +1352,12 @@ impl RefStore {
         // single stale ref aborts the WHOLE atomic push (no partial write). Reading the backing under
         // the held lock is the `SELECT … FOR UPDATE` row read.
         for u in &push.updates {
-            let actual = self.tip_of(&u.ref_name).map_err(|e| {
-                OutboxError(format!("read durable ref tip for {}: {e}", u.ref_name.0))
-            })?.unwrap_or_else(Oid::zero);
+            let actual = self
+                .tip_of(&u.ref_name)
+                .map_err(|e| {
+                    OutboxError(format!("read durable ref tip for {}: {e}", u.ref_name.0))
+                })?
+                .unwrap_or_else(Oid::zero);
             if actual != u.expected_old {
                 // Reject BEFORE moving any ref — drop the locks (transaction never opened) → 0 ghost.
                 return Ok(PushOutcome::Rejected(RejectReason::NonFastForward {
@@ -1830,7 +1951,7 @@ mod tests {
 
     /// **The happy path: receive-pack → one-tx ref-CAS + outbox.** A push to a non-protected ref is
     /// accepted; the ref moves, ONE `git.ref.updated` row is durable + unsent, the quarantine is
-    /// migrated, the per-ref aggregate is `<repo>:<ref>`, and `update_seq` is 1.
+    /// migrated, the per-ref aggregate is `ref:<encoded-repo>:<encoded-ref>`, and `update_seq` is 1.
     #[test]
     fn accepted_push_moves_ref_and_emits_one_event_in_one_tx() {
         let (store, outbox) = store();
@@ -1861,7 +1982,7 @@ mod tests {
         assert_eq!(outbox.committed_count(), 1);
         // The quarantine was migrated (promoted into the object DB).
         assert!(db.contains(&Oid::new("cafe")));
-        // The emitted row is git.ref.updated on the per-ref aggregate `core:refs/heads/feature`.
+        // The emitted row is git.ref.updated on the canonical, delimiter-safe per-ref aggregate.
         let id = match store
             .receive(
                 &human_push("refs/heads/x", Oid::zero(), Oid::new("bb")),
@@ -1875,7 +1996,51 @@ mod tests {
         };
         let row = outbox.row(&id).unwrap();
         assert_eq!(row.envelope.type_.0, GIT_REF_UPDATED);
-        assert_eq!(row.aggregate, AggregateKey("core:refs/heads/x".into()));
+        assert_eq!(
+            row.aggregate,
+            AggregateKey("ref:core:refs%2Fheads%2Fx".into())
+        );
+    }
+
+    #[test]
+    fn git_ref_event_key_round_trips_delimiter_bearing_components() {
+        let key = GitRefEventKey::new(
+            "repo.with:delimiter%value",
+            &RefName::new("refs/heads/main"),
+        )
+        .unwrap();
+        assert_eq!(
+            key.aggregate(),
+            AggregateKey("ref:repo%2Ewith%3Adelimiter%25value:refs%2Fheads%2Fmain".into())
+        );
+        assert_eq!(
+            key.subject("acme").unwrap(),
+            ArtifactRef(
+                "myelin://acme/git/ref/repo%2Ewith%3Adelimiter%25value:refs%2Fheads%2Fmain".into()
+            )
+        );
+        assert_eq!(
+            GitRefEventKey::parse_id("repo%2Ewith%3Adelimiter%25value:refs%2Fheads%2Fmain")
+                .unwrap(),
+            (
+                "repo.with:delimiter%value".into(),
+                RefName::new("refs/heads/main")
+            )
+        );
+    }
+
+    #[test]
+    fn invalid_ref_names_are_rejected_before_any_receive_effect() {
+        let (store, outbox) = store();
+        let db = InMemoryObjectDb::new();
+        let push = human_push("HEAD", Oid::zero(), Oid::new("aaaa"));
+
+        assert_eq!(
+            store.receive(&push, &db, CrashPoint::None).unwrap(),
+            PushOutcome::Rejected(RejectReason::InvalidRefName)
+        );
+        assert_eq!(outbox.outbox_depth(), 0);
+        assert_eq!(store.tip(&RefName::new("HEAD")), None);
     }
 
     /// **emit-iff-committed: crash AFTER policy (before commit) emits NOTHING (0 ghost).** The ref
@@ -2423,7 +2588,7 @@ mod tests {
             .collect();
         assert_eq!(seqs, vec![1, 2, 3], "update_seq is monotonic per ref");
         // The outbox carries three rows on the one per-ref aggregate, seqs 0,1,2 (per-aggregate order).
-        let agg = AggregateKey("core:refs/heads/feature".into());
+        let agg = AggregateKey("ref:core:refs%2Fheads%2Ffeature".into());
         let mut agg_seqs: Vec<u64> = ids
             .iter()
             .map(|id| {
@@ -2547,7 +2712,7 @@ mod tests {
             prev = new;
         }
         // The outbox per-aggregate seqs are gap-free 0..k-1 in push order (the ref-update order).
-        let agg = AggregateKey("core:refs/heads/hot".into());
+        let agg = AggregateKey("ref:core:refs%2Fheads%2Fhot".into());
         let outbox_seqs: Vec<u64> = ids
             .iter()
             .map(|id| {
@@ -2728,14 +2893,24 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("inject repository disappearance");
 
         assert!(store.try_tip(&RefName::new("refs/heads/feature")).is_err());
-        assert!(store.reflog().is_err(), "audit history faults must not become an empty log");
+        assert!(
+            store.reflog().is_err(),
+            "audit history faults must not become an empty log"
+        );
         let result = store.receive(
             &human_push("refs/heads/feature", Oid::zero(), Oid::new("new")),
             &InMemoryObjectDb::new(),
             CrashPoint::None,
         );
-        assert!(result.is_err(), "a missing durable repo is not an absent ref");
-        assert_eq!(outbox.committed_count(), 0, "no event commits on an invented empty tip");
+        assert!(
+            result.is_err(),
+            "a missing durable repo is not an absent ref"
+        );
+        assert_eq!(
+            outbox.committed_count(),
+            0,
+            "no event commits on an invented empty tip"
+        );
     }
 
     #[test]
@@ -2755,7 +2930,9 @@ mod tests {
                 .expect("create durable repo"),
         );
         let blob = durable.write_blob(b"audit\n").expect("write blob");
-        let tree = durable.write_tree(&[("README.md", &blob)]).expect("write tree");
+        let tree = durable
+            .write_tree(&[("README.md", &blob)])
+            .expect("write tree");
         let first = durable
             .write_commit(
                 &tree,
@@ -2819,8 +2996,15 @@ mod tests {
             Arc::new(MonotonicMinter::new()),
         );
         let log = store.reflog().expect("read durable reflog");
-        assert_eq!(log.len(), 1, "only the recreated ref's physical history survives");
-        assert_eq!(log[0].update_seq, 4, "durable generation must not reset to one");
+        assert_eq!(
+            log.len(),
+            1,
+            "only the recreated ref's physical history survives"
+        );
+        assert_eq!(
+            log[0].update_seq, 4,
+            "durable generation must not reset to one"
+        );
 
         drop(store);
         drop(durable);
@@ -2861,10 +3045,18 @@ mod tests {
         let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
         let stores = [
             RefStore::open_durable(
-                Arc::clone(&durable), "core", ctx_base(), outbox.clone(), Arc::clone(&minter),
+                Arc::clone(&durable),
+                "core",
+                ctx_base(),
+                outbox.clone(),
+                Arc::clone(&minter),
             ),
             RefStore::open_durable(
-                Arc::clone(&durable), "core", ctx_base(), outbox.clone(), minter,
+                Arc::clone(&durable),
+                "core",
+                ctx_base(),
+                outbox.clone(),
+                minter,
             ),
         ];
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -2907,7 +3099,11 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(outbox.committed_count(), 1, "only the winning witness commits");
+        assert_eq!(
+            outbox.committed_count(),
+            1,
+            "only the winning witness commits"
+        );
         assert_eq!(durable.ref_generation("refs/heads/topic"), Ok(1));
         std::fs::remove_dir_all(&root).ok();
     }

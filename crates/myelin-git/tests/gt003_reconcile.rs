@@ -16,13 +16,13 @@ use myelin_events::{
 };
 use myelin_git::core::RepoLoc;
 use myelin_git::durable::{DurableGitRepo, DurableGitStore};
+use myelin_git::receive_pack::{
+    CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher,
+    RefName, RefStore,
+};
 use myelin_git::reconcile::{
     reconcile_refs, refs_by_repo_from_outbox_scoped_bounded, refs_from_outbox_scoped_bounded,
     repo_slugs_from_outbox_scoped_bounded,
-};
-use myelin_git::receive_pack::{
-    CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher, RefName,
-    RefStore,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
@@ -59,9 +59,15 @@ fn seed_commit(repo: &DurableGitRepo, content: &[u8]) -> Oid {
     let blob = repo.write_blob(content).expect("blob");
     let tree = repo.write_tree(&[("file.txt", &blob)]).expect("tree");
     Oid::new(
-        repo.write_commit(&tree, &[], "feat: seed", "psn@acme.noreply", "psn@acme.noreply")
-            .expect("commit")
-            .0,
+        repo.write_commit(
+            &tree,
+            &[],
+            "feat: seed",
+            "psn@acme.noreply",
+            "psn@acme.noreply",
+        )
+        .expect("commit")
+        .0,
     )
 }
 
@@ -99,8 +105,8 @@ fn git_fsck(repo_path: &std::path::Path) -> (bool, String) {
 
 fn retained_ref_witness(id: &str, payload: serde_json::Value) -> OutboxRow {
     let event_id = EventId(id.into());
-    let aggregate = AggregateKey("core:refs/heads/main".into());
-    let subject = ArtifactRef("myelin://acme/git/ref/core:refs/heads/main".into());
+    let aggregate = AggregateKey("ref:core:refs%2Fheads%2Fmain".into());
+    let subject = ArtifactRef("myelin://acme/git/ref/core:refs%2Fheads%2Fmain".into());
     OutboxRow {
         event_id: event_id.clone(),
         aggregate: aggregate.clone(),
@@ -167,7 +173,10 @@ fn malformed_scoped_retained_witnesses_fail_discovery_and_replay_loudly() {
         SNAPSHOT_MAX_BYTES,
     )
     .unwrap();
-    assert_eq!(grouped.keys().map(String::as_str).collect::<Vec<_>>(), ["other"]);
+    assert_eq!(
+        grouped.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["other"]
+    );
     assert_eq!(grouped["other"].len(), 1);
     assert!(
         refs_from_outbox_scoped_bounded(
@@ -178,8 +187,8 @@ fn malformed_scoped_retained_witnesses_fail_discovery_and_replay_loudly() {
             SNAPSHOT_MAX_ROWS,
             SNAPSHOT_MAX_BYTES,
         )
-            .unwrap()
-            .is_empty(),
+        .unwrap()
+        .is_empty(),
         "a fully valid different-repository witness is the only skippable payload"
     );
     replay.restore_committed_row_for_test(retained_ref_witness(
@@ -226,7 +235,11 @@ fn reconciler_recovers_the_apply_after_outbox_commit_window_idempotently_fsck_cl
     // Crash in the apply-after-outbox-commit window.
     let db = InMemoryObjectDb::new();
     let outcome = rs
-        .receive(&push_create("refs/heads/main", &c1), &db, CrashPoint::AfterCommitBeforeApply)
+        .receive(
+            &push_create("refs/heads/main", &c1),
+            &db,
+            CrashPoint::AfterCommitBeforeApply,
+        )
         .expect("receive");
     assert!(
         matches!(outcome, PushOutcome::Crashed(c) if c.at == CrashPoint::AfterCommitBeforeApply),
@@ -249,7 +262,11 @@ fn reconciler_recovers_the_apply_after_outbox_commit_window_idempotently_fsck_cl
         )
         .expect("commit same-slug foreign-tenant witness");
     // The event is the durable witness (committed); the on-disk ref is BEHIND (not yet applied).
-    assert_eq!(outbox.committed_count(), 2, "both tenant witnesses committed");
+    assert_eq!(
+        outbox.committed_count(),
+        2,
+        "both tenant witnesses committed"
+    );
     assert_eq!(
         repo.read_ref("refs/heads/main").expect("read"),
         None,
@@ -267,7 +284,10 @@ fn reconciler_recovers_the_apply_after_outbox_commit_window_idempotently_fsck_cl
     for _ in 0..MAX_PUBLISH_ATTEMPTS {
         relay.drain_once();
     }
-    assert!(outbox.committed_rows().is_empty(), "live-set semantics unchanged");
+    assert!(
+        outbox.committed_rows().is_empty(),
+        "live-set semantics unchanged"
+    );
     assert_eq!(outbox.dead_letters().len(), 2);
     assert_eq!(
         outbox.try_retained_rows().unwrap().len(),
@@ -314,7 +334,10 @@ fn reconciler_recovers_the_apply_after_outbox_commit_window_idempotently_fsck_cl
         "the window was recovered"
     );
     assert_eq!(
-        repo2.read_ref("refs/heads/main").expect("read").map(|o| o.0),
+        repo2
+            .read_ref("refs/heads/main")
+            .expect("read")
+            .map(|o| o.0),
         Some(c1.0.clone()),
         "the committed ref move is now on disk (recovered to the committed update_seq)"
     );

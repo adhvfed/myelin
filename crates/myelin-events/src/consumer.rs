@@ -229,7 +229,6 @@ impl ConsumerSpec {
             per_tenant_inflight: PerTenantInflight::DEFAULT,
         }
     }
-
 }
 
 /// **The one sanctioned consumer entry-point (EB-05).** Validates the `ConsumerSpec` (rule 3:
@@ -535,7 +534,10 @@ impl<H: EventHandler> Consumer<H> {
     /// The contract-1.8 `consumer_lag` signal reads this; a drill asserts it recovers to 0 after
     /// a reconnect.
     pub fn lag(&self) -> u64 {
-        self.pending().values().map(|events| events.len() as u64).sum()
+        self.pending()
+            .values()
+            .map(|events| events.len() as u64)
+            .sum()
     }
 
     /// The un-acked backlog on ONE subject (rule 6+7: a slow subject's lag does not stall a fast
@@ -791,7 +793,10 @@ impl<H: EventHandler> Consumer<H> {
                 self.bump_pending(&msg.subject, &event_id);
                 Delivered::Retried(backoff.seconds)
             }
-            HandleOutcome::DependencyUnavailable { dependency, backoff } => {
+            HandleOutcome::DependencyUnavailable {
+                dependency,
+                backoff,
+            } => {
                 cotx.rollback();
                 self.bump_pending(&msg.subject, &event_id);
                 Delivered::DependencyUnavailable(dependency, backoff.seconds)
@@ -1549,9 +1554,9 @@ mod tests {
             sub("indexer", &["myelin://acme/issues/"]),
             DedupLedger::new(),
         )
-        .with_dead_letter_sink(DeadLetterSink::durable(Arc::new(FailOnce(AtomicBool::new(
-            true,
-        )))));
+        .with_dead_letter_sink(DeadLetterSink::durable(Arc::new(FailOnce(
+            AtomicBool::new(true),
+        ))));
         let off = msg("01J-off-retry", "myelin://acme/chat/message/1");
 
         assert!(matches!(c.deliver(&off), Delivered::Retried(_)));
