@@ -15,10 +15,16 @@ use myelin_storage::elected_relay::{
     ElectedDrainOutcome, ElectedRelayError, SHARED_OUTBOX_PUBLISHER_LOCK_ID,
 };
 use myelin_storage::pg::PgError;
+use myelin_storage::{foundation_migrations, PgMigrator};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
 
 static DB_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn isolated_url(base: &str, schema: &str) -> String {
+    let separator = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{separator}options=-csearch_path%3D{schema}%2Cpublic")
+}
 
 fn envelope(event_id: &str, aggregate: &str) -> EventEnvelope {
     let tenant = TenantId("publisher-live".into());
@@ -90,6 +96,67 @@ impl DrainPass for UnresponsiveDbPass {
         drop(tx);
         unreachable!("an unresponsive pass never completes without its whole-pass timeout")
     }
+}
+
+#[tokio::test]
+async fn isolated_foundation_migrations_reconcile_the_global_publisher_scope() {
+    let _serial = DB_TEST.lock().await;
+    let admin_url = std::env::var("DATABASE_MIGRATION_URL").expect("migration authority");
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&admin_url)
+        .await
+        .expect("admin pool");
+    let schema = format!("publisher_scope_{}", std::process::id());
+    sqlx::raw_sql(&format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE;
+         CREATE SCHEMA {schema} AUTHORIZATION myelin_admin;"
+    ))
+    .execute(&admin)
+    .await
+    .expect("fresh isolated schema");
+
+    let isolated = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&isolated_url(&admin_url, &schema))
+        .await
+        .expect("schema-pinned migration pool");
+    PgMigrator::apply(&isolated, &foundation_migrations())
+        .await
+        .expect("foundation migrations reconcile the publisher capability");
+
+    for relation in ["outbox", "outbox_quarantine"] {
+        let qualified = format!("{schema}.{relation}");
+        for privilege in ["SELECT", "INSERT", "UPDATE", "DELETE"] {
+            let admitted: bool = sqlx::query_scalar(
+                "SELECT pg_catalog.has_table_privilege(
+                    'myelin_outbox_publisher_fr_par', $1, $2
+                 )",
+            )
+            .bind(&qualified)
+            .bind(privilege)
+            .fetch_one(&admin)
+            .await
+            .expect("read effective isolated-schema privilege");
+            assert!(
+                !admitted,
+                "the global publisher retained {privilege} on disposable {qualified}"
+            );
+        }
+    }
+
+    let config = PublisherConfig::from_env().expect("publisher config");
+    let provider = PublisherDbProvider::connect(&config)
+        .await
+        .expect("the exact public relay capability remains valid");
+    drop(provider);
+
+    isolated.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .expect("drop isolated schema");
+    admin.close().await;
 }
 
 #[tokio::test]

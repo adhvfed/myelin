@@ -2255,24 +2255,14 @@ mod tests {
             .parent()
             .and_then(std::path::Path::parent)
             .expect("myelin-git is a crate in the workspace");
-        let listed = std::process::Command::new("git")
-            .args(["ls-files", "-z"])
-            .current_dir(root)
-            .output()
-            .expect("git ls-files runs");
-        assert!(
-            listed.status.success(),
-            "git ls-files must enumerate the self-hosted snapshot"
-        );
+        let repository = git2::Repository::discover(root).expect("workspace is a Git repository");
+        let workdir = repository.workdir().expect("workspace is non-bare");
+        let index = repository.index().expect("workspace index is readable");
 
         let patterns = PushPolicy::default().secret_patterns;
-        for raw_path in listed
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-        {
-            let path = std::str::from_utf8(raw_path).expect("tracked paths are UTF-8");
-            let bytes = std::fs::read(root.join(path)).expect("tracked file remains readable");
+        for entry in index.iter() {
+            let path = std::str::from_utf8(&entry.path).expect("tracked paths are UTF-8");
+            let bytes = std::fs::read(workdir.join(path)).expect("tracked file remains readable");
             let contents = String::from_utf8_lossy(&bytes);
             for pattern in &patterns {
                 assert!(
