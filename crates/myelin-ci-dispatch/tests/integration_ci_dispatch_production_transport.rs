@@ -25,8 +25,8 @@ use myelin_git::check_status::{CheckContext, CheckState, CheckStatusConsumer, Gi
 use myelin_git::check_status_store::PgCheckStatusProjection;
 use myelin_git::merge_gate::{MergeGateOutcome, MergeGatePolicy};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_storage::events_durable::{DurableDeadLetterBacking, DurableDedupBacking};
 use myelin_storage::elected_relay::{ElectedDrainOutcome, ElectedPgRelay};
+use myelin_storage::events_durable::{DurableDeadLetterBacking, DurableDedupBacking};
 use myelin_storage::outbox_durable::PgOutboxBacking;
 use myelin_storage::pgrelay::{PgRelay, RelayValidationConfig};
 use myelin_storage::s3blob::S3BlobStore;
@@ -203,22 +203,23 @@ async fn elected_publisher_delivers_trigger_then_dispatch_leaves_new_rows_for_ne
     .unwrap();
 
     let publisher_config = JetStreamPublisherConfig {
-            nats_url: cfg.nats_url.clone(),
-            stream_name: stream_name.clone(),
-            subject_root: subject_root.clone(),
-            max_age: std::time::Duration::from_secs(24 * 60 * 60),
-            max_bytes: 64 * 1024 * 1024,
-            max_messages: 100_000,
-            replicas: 1,
-            duplicate_window: std::time::Duration::from_secs(120),
-            publish_ack_timeout: std::time::Duration::from_secs(2),
-        };
+        nats_url: cfg.nats_url.clone(),
+        stream_name: stream_name.clone(),
+        subject_root: subject_root.clone(),
+        max_age: std::time::Duration::from_secs(24 * 60 * 60),
+        max_bytes: 64 * 1024 * 1024,
+        max_messages: 100_000,
+        replicas: 1,
+        duplicate_window: std::time::Duration::from_secs(120),
+        publish_ack_timeout: std::time::Duration::from_secs(2),
+    };
     JetStreamProvisioner::ensure(publisher_config.clone(), rt.clone()).unwrap();
     let publisher = NatsJetStreamPublisher::connect_existing(publisher_config, rt.clone()).unwrap();
     let elected = ElectedPgRelay::new(
         pool.clone(),
         RelayValidationConfig::new(Region("fr-par".into()), 256 * 1024).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
     let intake_config = JetStreamConsumerConfig::bounded(
         &cfg.nats_url,
         &stream_name,
@@ -253,7 +254,10 @@ async fn elected_publisher_delivers_trigger_then_dispatch_leaves_new_rows_for_ne
         .await
         .unwrap();
     let relay_store = PgRelay::new(pool.clone());
-    relay_store.enqueue(&envelope.aggregate.0, 0, &envelope).await.unwrap();
+    relay_store
+        .enqueue(&envelope.aggregate.0, 0, &envelope)
+        .await
+        .unwrap();
     raw_js
         .publish(
             format!("{subject_root}.evt.{tenant}.git.poison.route_mismatch"),
@@ -263,7 +267,10 @@ async fn elected_publisher_delivers_trigger_then_dispatch_leaves_new_rows_for_ne
         .unwrap()
         .await
         .unwrap();
-    relay_store.enqueue(&second_envelope.aggregate.0, 1, &second_envelope).await.unwrap();
+    relay_store
+        .enqueue(&second_envelope.aggregate.0, 1, &second_envelope)
+        .await
+        .unwrap();
     assert_eq!(
         elected.drain_once(&publisher, 64).await.unwrap(),
         ElectedDrainOutcome::Published(2),
@@ -282,14 +289,13 @@ async fn elected_publisher_delivers_trigger_then_dispatch_leaves_new_rows_for_ne
     .unwrap();
     assert_eq!(source_rows_marked, 2);
 
-    let run_count: i64 = sqlx::query_scalar(
-        "SELECT count(*)::bigint FROM ci_run WHERE cause_event_id IN ($1, $2)",
-    )
-    .bind(&event_id)
-    .bind(&second_event_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let run_count: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM ci_run WHERE cause_event_id IN ($1, $2)")
+            .bind(&event_id)
+            .bind(&second_event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         run_count, 2,
         "both valid siblings create their independent ci_run"
@@ -404,7 +410,10 @@ async fn elected_publisher_delivers_trigger_then_dispatch_leaves_new_rows_for_ne
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(newly_emitted > 0, "dispatch never embeds a relay; its emitted rows await election");
+    assert!(
+        newly_emitted > 0,
+        "dispatch never embeds a relay; its emitted rows await election"
+    );
     let quarantine_reasons: Vec<String> = sqlx::query_scalar(
         "SELECT reason_code FROM consumer_delivery_quarantine \
          WHERE consumer=$1 ORDER BY stream_sequence",
@@ -482,7 +491,10 @@ async fn elected_publisher_delivers_trigger_then_dispatch_leaves_new_rows_for_ne
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(foreign_owned_by_shared_publisher, "dispatch never claims the shared outbox");
+    assert!(
+        foreign_owned_by_shared_publisher,
+        "dispatch never claims the shared outbox"
+    );
 
     handle.signal_drain();
     // `drain(self)` consumes and drops the original handle/boxed transport. Dropping the returned

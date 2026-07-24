@@ -638,7 +638,6 @@ impl PgRelay {
         batch: i64,
         config: &RelayValidationConfig,
     ) -> Result<usize, PgError> {
-
         let rows = sqlx::query(
             "SELECT o.event_id, o.aggregate, o.seq, o.subject, o.envelope FROM outbox o \
              WHERE o.published_at IS NULL \

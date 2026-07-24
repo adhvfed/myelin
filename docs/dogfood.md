@@ -59,10 +59,12 @@ accepting sockets, drains HTTP connections for up to 20 seconds, then closes any
 
 ### Bring the CI runner up
 
-CI dogfood has three independently restartable service roots. Start each in its own foreground-owned
-terminal after the edge:
+CI dogfood has four independently restartable service roots. Start the publisher first so its
+separate provision authority can create or validate the bounded shared stream before any consumer
+binds, then start each remaining root in its own foreground-owned terminal:
 
 ```sh
+./scripts/dogfood.sh publisher     # elected PostgreSQL outbox → bounded shared JetStream
 ./scripts/dogfood.sh dispatch      # Git events → durable CI runs + initial queued checks
 ./scripts/dogfood.sh ci            # coordinated CI control plane and runner host
 ./scripts/dogfood.sh git-checks    # ci.check.updated → Git-owned durable projection
@@ -71,17 +73,22 @@ terminal after the edge:
 The `check:v1-<BLAKE3>` aggregate is a deliberate broker-routing cutover. Events emitted by an older
 build used the raw repository ArtifactRef as their aggregate and are not projection backfill
 authority. For an existing cell, keep the old Edge serving only as the rerun/verification front
-door, deploy the new `git-checks`, Dispatch, and coordinated CI/control-plane builds, drain every old
-Dispatch or CI producer instance, and start all three new service roots. Only then trigger a fresh CI
-rerun for every protected head and verify each exact OID with `verify-check`. Deploy the new Edge
+door, deploy the new publisher, `git-checks`, Dispatch, and coordinated CI/control-plane builds,
+drain every old Dispatch or CI producer instance, and start all four new service roots. Only then
+trigger a fresh CI rerun for every protected head and verify each exact OID with `verify-check`.
+Deploy the new Edge
 build that reads only the projection after every verification passes. Abort that Edge rollout if any
 producer cannot be upgraded/drained or any protected head cannot be re-established. A new
 personal-production cell has no historical check state and needs no backfill. This is fail-closed:
 old or in-flight facts can strand a head blocked, but can never make it green.
 
-All three use the same dogfood cell, seal key, split PostgreSQL credentials, region, durable bus, and
-data services. Dispatch consumes the production Git event stream and owns reserve/start. The
-control-plane command sets the exact opt-in `MYELIN_CI_RUNNER=1`; its host owns queued-run start,
+All four use the same dogfood cell, region, durable bus, and data services. The publisher connects
+through a dedicated one-connection database capability that can only read the shared outbox, update
+its `published_at` column, and insert payload-free quarantine rows. Provisioning and runtime publish
+authority are separate: startup provisions or validates the finite stream, while the long-running
+publisher can only publish to that existing stream. Dispatch consumes the production Git event
+stream and owns reserve/start. The control-plane command sets the exact opt-in
+`MYELIN_CI_RUNNER=1`; its host owns queued-run start,
 durable Flow recovery, real gVisor execution, terminal accounting, and bounded shutdown as one
 lifecycle. Git's projection consumer applies every check fact and its consumer-dedup mark in one
 transaction; the edge reads that Git-owned table rather than calling CI or trusting a PR mutation.

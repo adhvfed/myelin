@@ -9,6 +9,8 @@
 #                                          foreground over the same dogfood cell
 #   ./scripts/dogfood.sh verify-ci-rootfs  prove the staged runner rootfs matches the digest pinned
 #                                          by the checked-in founder pipeline
+#   ./scripts/dogfood.sh publisher         provision the bounded shared JetStream stream, then run
+#                                          the elected least-privilege outbox publisher
 #   ./scripts/dogfood.sh dispatch          build + run the Git-event→CI-run dispatch consumer
 #   ./scripts/dogfood.sh git-checks        build + run Git's CI-check projection consumer
 #   ./scripts/dogfood.sh verify-check <repo> <pr> <head-oid> [context]
@@ -212,6 +214,13 @@ case "${cmd}" in
     export MYELIN_CI_RUNNER=1
     echo "dogfood: building + serving the CI control plane with the runner enabled" >&2
     exec cargo run --quiet -p myelin-ci-controlplane --bin ci-controlplane
+    ;;
+  publisher)
+    load_env
+    echo "dogfood: provisioning the bounded shared event stream" >&2
+    cargo run --quiet -p myelin-outbox-publisher -- provision
+    echo "dogfood: serving the elected least-privilege outbox publisher" >&2
+    exec cargo run --quiet -p myelin-outbox-publisher -- serve
     ;;
   verify-ci-rootfs)
     if [[ "$#" -ne 0 ]]; then
@@ -520,7 +529,7 @@ cd frontend/apps/web && pnpm install && pnpm dev
 EOF
     ;;
   *)
-    echo "usage: $0 {env|edge|ci|verify-ci-rootfs|dispatch|git-checks|verify-check <repo> <pr> <head-oid> [context]|verify-ci <run> <job> <marker> [evidence-dir]|bootstrap -- <flags>|web}" >&2
+    echo "usage: $0 {env|edge|ci|publisher|verify-ci-rootfs|dispatch|git-checks|verify-check <repo> <pr> <head-oid> [context]|verify-ci <run> <job> <marker> [evidence-dir]|bootstrap -- <flags>|web}" >&2
     exit 2
     ;;
 esac

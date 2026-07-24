@@ -89,22 +89,6 @@ pub struct JetStreamConsumerConfig {
     pub max_expires: std::time::Duration,
 }
 
-impl core::fmt::Debug for JetStreamPublisherConfig {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter
-            .debug_struct("JetStreamPublisherConfig")
-            .field("nats_url", &"<redacted>")
-            .field("stream_name", &self.stream_name)
-            .field("subject_root", &self.subject_root)
-            .field("max_age", &self.max_age)
-            .field("max_bytes", &self.max_bytes)
-            .field("max_messages", &self.max_messages)
-            .field("replicas", &self.replicas)
-            .field("duplicate_window", &self.duplicate_window)
-            .finish()
-    }
-}
-
 impl core::fmt::Debug for JetStreamConsumerConfig {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
