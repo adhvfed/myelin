@@ -70,7 +70,6 @@ use myelin_storage::{
     with_tenant_tx_error, DurableCostLedger, DurableSettleError, MeteredUnit, MinorUnits, PgError,
     RunId as CostRunId, TenantScope,
 };
-#[cfg(any(test, feature = "test-support"))]
 use myelin_tenancy::Region;
 use myelin_tenancy::TenantId;
 use serde::{Deserialize, Serialize};
@@ -904,6 +903,7 @@ async fn co_commit_terminal_accounting(
     if granted_job.reserve_handle != input.reserve_handle {
         return Err(CompletionTxError::Refused);
     }
+    let ci_run_id = manifest.ci_run_id.clone();
 
     if input.replay {
         let existing = accounting
@@ -921,74 +921,124 @@ async fn co_commit_terminal_accounting(
             && existing.timed_out == input.report.timed_out
             && existing.usage == input.report.usage
             && existing.completion_receipt == input.receipt;
-        return if exact {
-            Ok(())
-        } else {
-            Err(CompletionTxError::Refused)
-        };
-    }
-
-    let priced = accounting
-        .pricer
-        .price(input.report.usage)
-        .map_err(CompletionTxError::Pricing)?;
-    validate_reservation_pricing_policy(input.reserve_handle, input.report.usage, &priced)
-        .map_err(CompletionTxError::Pricing)?;
-    let rows = priced_cost_rows(
-        input.tenant,
-        &manifest.ci_run_id,
-        input.job_id,
-        input.report.usage,
-        &priced,
-    )
-    .map_err(CompletionTxError::Pricing)?;
-    let units: Vec<MeteredUnit> = rows
-        .iter()
-        .map(|row| MeteredUnit {
-            unit: row.meter.token(),
-            wholesale: row.wholesale,
-            markup: row.markup,
-        })
-        .collect();
-    let settled = accounting
-        .money_ledger
-        .settle_in_tx(
-            conn,
+        if !exact {
+            return Err(CompletionTxError::Refused);
+        }
+    } else {
+        let priced = accounting
+            .pricer
+            .price(input.report.usage)
+            .map_err(CompletionTxError::Pricing)?;
+        validate_reservation_pricing_policy(input.reserve_handle, input.report.usage, &priced)
+            .map_err(CompletionTxError::Pricing)?;
+        let rows = priced_cost_rows(
             input.tenant,
-            &CostRunId(input.reserve_handle.to_owned()),
-            &units,
+            &ci_run_id,
+            input.job_id,
+            input.report.usage,
+            &priced,
         )
-        .await
-        .map_err(CompletionTxError::Money)?;
-    accounting
-        .cost_store
-        .settle_in_tx(conn, &accounting.scope, &rows)
-        .await
-        .map_err(CompletionTxError::Projection)?;
-    accounting
-        .receipt_store
-        .record_in_tx(
-            conn,
-            &accounting.scope,
-            &CiJobAccountingRecord {
-                tenant: input.tenant.clone(),
-                job_id: input.job_id.to_owned(),
-                wf_run_id: input.wf_run.0.clone(),
-                ci_run_id: manifest.ci_run_id,
-                reserve_handle: input.reserve_handle.to_owned(),
-                passed: input.report.passed,
-                timed_out: input.report.timed_out,
-                skipped: false,
-                usage: input.report.usage,
-                pricing_revision: priced.pricing_revision,
-                billed: settled.billed_total,
-                refunded: settled.refunded,
-                completion_receipt: input.receipt.to_owned(),
-            },
-        )
-        .await
-        .map_err(CompletionTxError::Accounting)?;
+        .map_err(CompletionTxError::Pricing)?;
+        let units: Vec<MeteredUnit> = rows
+            .iter()
+            .map(|row| MeteredUnit {
+                unit: row.meter.token(),
+                wholesale: row.wholesale,
+                markup: row.markup,
+            })
+            .collect();
+        let settled = accounting
+            .money_ledger
+            .settle_in_tx(
+                conn,
+                input.tenant,
+                &CostRunId(input.reserve_handle.to_owned()),
+                &units,
+            )
+            .await
+            .map_err(CompletionTxError::Money)?;
+        accounting
+            .cost_store
+            .settle_in_tx(conn, &accounting.scope, &rows)
+            .await
+            .map_err(CompletionTxError::Projection)?;
+        accounting
+            .receipt_store
+            .record_in_tx(
+                conn,
+                &accounting.scope,
+                &CiJobAccountingRecord {
+                    tenant: input.tenant.clone(),
+                    job_id: input.job_id.to_owned(),
+                    wf_run_id: input.wf_run.0.clone(),
+                    ci_run_id: ci_run_id.clone(),
+                    reserve_handle: input.reserve_handle.to_owned(),
+                    passed: input.report.passed,
+                    timed_out: input.report.timed_out,
+                    skipped: false,
+                    usage: input.report.usage,
+                    pricing_revision: priced.pricing_revision,
+                    billed: settled.billed_total,
+                    refunded: settled.refunded,
+                    completion_receipt: input.receipt.to_owned(),
+                },
+            )
+            .await
+            .map_err(CompletionTxError::Accounting)?;
+    }
+    settle_ci_job_surface_on_conn(
+        conn,
+        input.tenant,
+        accounting.scope.region(),
+        &ci_run_id,
+        input.job_id,
+        input.report,
+    )
+    .await?;
     Ok(())
+}
+
+async fn settle_ci_job_surface_on_conn(
+    conn: &mut sqlx::PgConnection,
+    tenant: &TenantId,
+    region: &Region,
+    ci_run_id: &str,
+    job_id: &str,
+    report: &TerminalReport,
+) -> Result<(), CompletionTxError> {
+    let state = if report.passed && !report.timed_out {
+        "succeeded"
+    } else {
+        "failed"
+    };
+    let summary = serde_json::json!({
+        "passed": report.passed,
+        "timed_out": report.timed_out,
+    });
+    let updated = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE ci_job
+         SET state=$5, result_summary=$6
+         WHERE tenant_id=$1 AND region=$2 AND run_id=$3::uuid AND job_id=$4::uuid
+           AND (
+             state IN ('queued','leased','running')
+             OR (state=$5 AND result_summary=$6)
+           )
+         RETURNING job_id",
+    )
+    .bind(tenant.as_str())
+    .bind(region.as_str())
+    .bind(ci_run_id)
+    .bind(job_id)
+    .bind(state)
+    .bind(summary)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|_| CompletionTxError::Accounting(CiJobAccountingError::Db("job surface update")))?;
+    if updated.is_some() {
+        Ok(())
+    } else {
+        Err(CompletionTxError::Refused)
+    }
 }
 
 pub(crate) async fn close_cancelled_run_if_accounted(

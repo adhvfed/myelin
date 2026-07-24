@@ -72,8 +72,12 @@ pub struct FlushedJobLogs {
 }
 
 /// Durable append position recovered before a retried execution emits its first new frame.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogResume {
+    /// Canonical externally visible CI run id. Production resolves the workflow-run queue key
+    /// through the immutable launch template; test stores may leave this absent to preserve the
+    /// caller's run id.
+    pub canonical_run_id: Option<String>,
     /// The next `log_segment.segment_seq`.
     pub next_segment_seq: i32,
     /// The first byte offset of the retry's next frame.
@@ -148,7 +152,12 @@ pub struct LogPipelineSink<S: BlobStore + Clone, P: LogPersist> {
     persist: P,
     /// The OPEN pipelines keyed by `(tenant, run, job)` — opened lazily on the first frame, removed on
     /// `finish` (so a re-delivered `finish` is a no-op — idempotent).
-    pipelines: Mutex<HashMap<(String, String, String), LogPipeline<S>>>,
+    pipelines: Mutex<HashMap<(String, String, String), OpenLogPipeline<S>>>,
+}
+
+struct OpenLogPipeline<S: BlobStore + Clone> {
+    canonical_run_id: String,
+    pipeline: LogPipeline<S>,
 }
 
 impl<S: BlobStore + Clone, P: LogPersist> LogPipelineSink<S, P> {
@@ -198,11 +207,15 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
         } else {
             LogResume::default()
         };
+        let canonical_run_id = resume
+            .canonical_run_id
+            .clone()
+            .unwrap_or_else(|| run_id.to_string());
         let flushed = {
             let mut map = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
             // Open lazily with an empty defence-in-depth redactor: the sandbox callback has already
             // applied the authoritative boundary plan.
-            let pipe = map.entry(key.clone()).or_insert_with(|| {
+            let open = map.entry(key.clone()).or_insert_with(|| {
                 let mut pipeline = LogPipeline::new(
                     tenant.clone(),
                     self.region.clone(),
@@ -210,26 +223,31 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
                     SecretRedactor::for_job(std::iter::empty::<String>()),
                 );
                 pipeline.resume_stream(
-                    &LogCoord::new(run_id, job_id, SINGLE_STEP_ID),
+                    &LogCoord::new(&canonical_run_id, job_id, SINGLE_STEP_ID),
                     resume.step_byte_start,
                     resume.next_byte_offset,
                     resume.next_segment_seq,
                 );
-                pipeline
+                OpenLogPipeline {
+                    canonical_run_id: canonical_run_id.clone(),
+                    pipeline,
+                }
             });
-            let coord = LogCoord::new(run_id, job_id, SINGLE_STEP_ID);
-            pipe.ship_frame(&coord, frame)
+            let coord = LogCoord::new(&open.canonical_run_id, job_id, SINGLE_STEP_ID);
+            open.pipeline
+                .ship_frame(&coord, frame)
                 .map_err(|error| error.to_string())?;
             // Force a seal at the bounded backend frame so Edge can observe the segment while the
             // command is still executing; the open buffer never exceeds one callback.
-            pipe.seal_open_segment(&coord)
+            open.pipeline
+                .seal_open_segment(&coord)
                 .map_err(|error| error.to_string())?;
             FlushedJobLogs {
-                run_id: run_id.to_string(),
+                run_id: open.canonical_run_id.clone(),
                 job_id: job_id.to_string(),
-                segments: pipe.drain_segment_rows(),
-                anchors: pipe.anchor_rows().into_iter().cloned().collect(),
-                pointers: pipe.drain_pointers(),
+                segments: open.pipeline.drain_segment_rows(),
+                anchors: open.pipeline.anchor_rows().into_iter().cloned().collect(),
+                pointers: open.pipeline.drain_pointers(),
             }
         };
         if let Err(error) = self.persist.persist(tenant, flushed) {
@@ -259,8 +277,8 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
             let mut map = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
             map.remove(&key)
         };
-        let mut pipe = match existing {
-            Some(pipe) => pipe,
+        let mut open = match existing {
+            Some(open) => open,
             None => {
                 let resume = self
                     .persist
@@ -277,15 +295,24 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
                     SecretRedactor::for_job(std::iter::empty::<String>()),
                 );
                 pipeline.resume_stream(
-                    &LogCoord::new(run_id, job_id, SINGLE_STEP_ID),
+                    &LogCoord::new(
+                        resume.canonical_run_id.as_deref().unwrap_or(run_id),
+                        job_id,
+                        SINGLE_STEP_ID,
+                    ),
                     resume.step_byte_start,
                     resume.next_byte_offset,
                     resume.next_segment_seq,
                 );
-                pipeline
+                OpenLogPipeline {
+                    canonical_run_id: resume
+                        .canonical_run_id
+                        .unwrap_or_else(|| run_id.to_string()),
+                    pipeline,
+                }
             }
         };
-        let coord = LogCoord::new(run_id, job_id, SINGLE_STEP_ID);
+        let coord = LogCoord::new(&open.canonical_run_id, job_id, SINGLE_STEP_ID);
         // CLOSE the step anchor with the job verdict (the single-command job's verdict IS its one
         // step's), then flush (seal the remaining open segment + emit the final coalesced pointer).
         let status = if passed {
@@ -293,16 +320,18 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
         } else {
             AnchorStatus::Failed
         };
-        pipe.close_step(&coord, status)
+        open.pipeline
+            .close_step(&coord, status)
             .map_err(|error| error.to_string())?;
-        pipe.flush_job(run_id, job_id, SINGLE_STEP_ID)
+        open.pipeline
+            .flush_job(&open.canonical_run_id, job_id, SINGLE_STEP_ID)
             .map_err(|error| error.to_string())?;
         let flushed = FlushedJobLogs {
-            run_id: run_id.to_string(),
+            run_id: open.canonical_run_id,
             job_id: job_id.to_string(),
-            segments: pipe.drain_segment_rows(),
-            anchors: pipe.anchor_rows().into_iter().cloned().collect(),
-            pointers: pipe.drain_pointers(),
+            segments: open.pipeline.drain_segment_rows(),
+            anchors: open.pipeline.anchor_rows().into_iter().cloned().collect(),
+            pointers: open.pipeline.drain_pointers(),
         };
         self.persist
             .persist(tenant, flushed)

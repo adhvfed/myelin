@@ -64,7 +64,7 @@ impl DurableLogPersist {
         run_id: &str,
         job_id: &str,
     ) -> Result<LogResume, PgError> {
-        let run = parse_uuid("run_id", run_id)?;
+        let workflow_run = parse_uuid("workflow_run_id", run_id)?;
         let job = parse_uuid("job_id", job_id)?;
         let tenant_str = tenant.as_str().to_string();
         let region_str = region.as_str().to_string();
@@ -72,6 +72,25 @@ impl DurableLogPersist {
         let region_bind = region_str.clone();
         with_tenant_tx(&self.pool, &tenant_str, &region_str, move |conn| {
             Box::pin(async move {
+                let canonical_run_id: String = sqlx::query_scalar(
+                    "SELECT launch.spec->>'ci_run_id' \
+                     FROM ci_job_spec AS launch \
+                     JOIN job_queue AS queue \
+                       ON queue.tenant_id=launch.tenant_id AND queue.region=launch.region \
+                      AND queue.job_id=launch.job_id AND queue.run_id=launch.run_id \
+                     WHERE launch.tenant_id=$1 AND launch.region=$2 \
+                       AND launch.job_id=$3 AND launch.run_id=$4",
+                )
+                .bind(&tenant_bind)
+                .bind(&region_bind)
+                .bind(job)
+                .bind(workflow_run)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|error| {
+                    PgError::Query(format!("resolve canonical CI log run: {error}"))
+                })?;
+                let run = parse_uuid("ci_run_id", &canonical_run_id)?;
                 let row = sqlx::query(
                     "SELECT segment_seq, byte_start, byte_end \
                      FROM log_segment \
@@ -140,6 +159,7 @@ impl DurableLogPersist {
                     ));
                 }
                 Ok(LogResume {
+                    canonical_run_id: Some(canonical_run_id),
                     next_segment_seq,
                     next_byte_offset,
                     step_byte_start,
