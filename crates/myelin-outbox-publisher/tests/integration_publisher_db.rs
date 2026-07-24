@@ -147,13 +147,12 @@ async fn repeated_unresponsive_passes_time_out_with_rows_unsent_and_locks_releas
 
     for _ in 0..3 {
         assert_eq!(runtime.run_pass().await, PassResult::Unavailable);
-        let published: bool = sqlx::query_scalar(
-            "SELECT published_at IS NOT NULL FROM outbox WHERE event_id=$1",
-        )
-        .bind(&event_id)
-        .fetch_one(&admin)
-        .await
-        .unwrap();
+        let published: bool =
+            sqlx::query_scalar("SELECT published_at IS NOT NULL FROM outbox WHERE event_id=$1")
+                .bind(&event_id)
+                .fetch_one(&admin)
+                .await
+                .unwrap();
         assert!(!published, "a timed-out pass rolls its row state back");
 
         let mut probe = contender_pool.begin().await.unwrap();
@@ -162,7 +161,10 @@ async fn repeated_unresponsive_passes_time_out_with_rows_unsent_and_locks_releas
             .fetch_one(&mut *probe)
             .await
             .unwrap();
-        assert!(elected, "publisher contender B acquires the released election lock");
+        assert!(
+            elected,
+            "publisher contender B acquires the released election lock"
+        );
         probe.rollback().await.unwrap();
     }
 

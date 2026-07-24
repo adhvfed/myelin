@@ -676,12 +676,7 @@ pub struct PublisherRuntime<D> {
 }
 
 impl<D: DrainPass> PublisherRuntime<D> {
-    pub fn new(
-        drain: D,
-        poll: Duration,
-        backoff: Duration,
-        pass_timeout: Duration,
-    ) -> Self {
+    pub fn new(drain: D, poll: Duration, backoff: Duration, pass_timeout: Duration) -> Self {
         Self {
             drain,
             poll,
@@ -742,10 +737,13 @@ impl<D: DrainPass> PublisherRuntime<D> {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            sleep_until_stop(stop, match result {
-                PassResult::Unavailable => self.backoff,
-                PassResult::Standby | PassResult::Published(_) => self.poll,
-            })
+            sleep_until_stop(
+                stop,
+                match result {
+                    PassResult::Unavailable => self.backoff,
+                    PassResult::Standby | PassResult::Published(_) => self.poll,
+                },
+            )
             .await;
         }
         let mut state = self
