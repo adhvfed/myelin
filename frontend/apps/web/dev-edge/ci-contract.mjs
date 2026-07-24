@@ -11,9 +11,6 @@ const CURSOR_KEY = Buffer.from(
 const RUN_STATES = new Set([
   "all", "queued", "running", "succeeded", "failed", "cancelled", "timed_out", "reaped",
 ]);
-const JOB_STATES = new Set([
-  "queued", "leased", "running", "succeeded", "failed", "cancelled", "reaped",
-]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CURSOR_PREFIX = "cr1_";
 const TIMESTAMP_BYTES = 27;
@@ -29,7 +26,9 @@ const PIPELINE = "93000000-0000-4000-8000-000000000001";
 export const CI_NEWEST_RUN = "91000000-0000-4000-8000-000000000001";
 export const CI_OLDER_RUN = "91000000-0000-4000-8000-000000000002";
 export const CI_FAILED_JOB = "92000000-0000-4000-8000-000000000001";
+export const CI_LIVE_JOB = "92000000-0000-4000-8000-000000000002";
 const ARCHIVED_LOG = Buffer.from("prep\ncafé\nfailed\n", "utf8");
+export const CI_LIVE_INITIAL_LOG = Buffer.from("boot\n", "utf8");
 export const CI_VISIBLE_REPO_REFS = Object.freeze([
   "myelin://acme/git/repo/😀",
   "myelin://acme/git/repo/alpha",
@@ -96,6 +95,32 @@ const FAILED_DETAIL = Object.freeze({
       byte_end: ARCHIVED_LOG.byteLength,
       status: "failed",
       details_ref: "#step-contract",
+    }),
+  ]),
+});
+
+const RUNNING_DETAIL = Object.freeze({
+  run: OLDER_RUN,
+  jobs: Object.freeze([
+    Object.freeze({
+      job_id: CI_LIVE_JOB,
+      stage: "test",
+      name: "live-contract",
+      needs: Object.freeze([]),
+      matrix_key: null,
+      state: "running",
+      attempt: 1,
+      result_summary: null,
+    }),
+  ]),
+  steps: Object.freeze([
+    Object.freeze({
+      job_id: CI_LIVE_JOB,
+      step_id: "live-contract",
+      byte_start: 0,
+      byte_end: null,
+      status: "running",
+      details_ref: "#step-live-contract",
     }),
   ]),
 });
@@ -248,8 +273,10 @@ export function ciRunsEnvelope(input, options = {}) {
 }
 
 export function ciRunJson(runId, options = {}) {
-  if (options.empty || runId !== CI_NEWEST_RUN) return null;
-  return FAILED_DETAIL;
+  if (options.empty) return null;
+  if (runId === CI_NEWEST_RUN) return FAILED_DETAIL;
+  if (runId === CI_OLDER_RUN) return RUNNING_DETAIL;
+  return null;
 }
 
 export function parseCiLogQuery(query) {
@@ -267,19 +294,91 @@ export function parseCiLogQuery(query) {
 }
 
 export function ciLogJson(runId, jobId, input, options = {}) {
-  if (options.empty || runId !== CI_NEWEST_RUN || jobId !== CI_FAILED_JOB) return null;
-  if (!JOB_STATES.has(FAILED_DETAIL.jobs[0].state)) throw new Error("invalid CI fixture state");
-  const byteEnd = input.start < ARCHIVED_LOG.byteLength
-    ? Math.min(input.start + input.limit, ARCHIVED_LOG.byteLength)
+  if (options.empty) return null;
+  const log = runId === CI_NEWEST_RUN && jobId === CI_FAILED_JOB
+    ? ARCHIVED_LOG
+    : runId === CI_OLDER_RUN && jobId === CI_LIVE_JOB
+      ? options.liveLog ?? CI_LIVE_INITIAL_LOG
+      : null;
+  if (!log) return null;
+  const byteEnd = input.start < log.byteLength
+    ? Math.min(input.start + input.limit, log.byteLength)
     : input.start;
   return {
     run_id: runId,
     job_id: jobId,
     byte_start: input.start,
     byte_end: byteEnd,
-    total_end: ARCHIVED_LOG.byteLength,
-    next_offset: byteEnd < ARCHIVED_LOG.byteLength ? byteEnd : null,
+    total_end: log.byteLength,
+    next_offset: byteEnd < log.byteLength ? byteEnd : null,
     encoding: "base64",
-    data: ARCHIVED_LOG.subarray(input.start, byteEnd).toString("base64"),
+    data: log.subarray(input.start, byteEnd).toString("base64"),
+  };
+}
+
+export function parseCiLogCursor(value) {
+  if (value === undefined) return { ok: true };
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(value)) return null;
+  try {
+    const cursor = BigInt(value);
+    return cursor <= 18_446_744_073_709_551_615n ? { ok: true, cursor } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The actual dev-edge live-open state machine. The HTTP server writes these finite initial events
+ * and, when `hold` is true, registers the response for later appends.
+ */
+export function ciLiveOpen(runId, jobId, cursor, options = {}) {
+  const terminal = runId === CI_NEWEST_RUN && jobId === CI_FAILED_JOB;
+  const running = runId === CI_OLDER_RUN && jobId === CI_LIVE_JOB;
+  if (!terminal && !running) return { status: 404 };
+  const parsed = parseCiLogCursor(cursor);
+  if (!parsed) return { status: 400 };
+  const segments = options.segments ?? (terminal
+    ? [{ cursor: 1n, byteStart: 0, bytes: ARCHIVED_LOG }]
+    : [{ cursor: 1n, byteStart: 0, bytes: CI_LIVE_INITIAL_LOG }]);
+  const head = segments.at(-1)?.cursor ?? 0n;
+  const floor = segments[0]?.cursor;
+  if (parsed.cursor !== undefined &&
+      (options.forceStale === true || segments.length === 0 ||
+        parsed.cursor + 1n < floor)) return { status: 409 };
+  if (parsed.cursor !== undefined && parsed.cursor > head) return { status: 400 };
+
+  const data = (body) => ({ run_id: runId, job_id: jobId, ...body });
+  const byteEnd = segments.at(-1)
+    ? segments.at(-1).byteStart + segments.at(-1).bytes.byteLength
+    : 0;
+  const isTerminal = options.terminal ?? terminal;
+  const complete = isTerminal
+    ? [{
+        event: "ci.log.complete",
+        ...(head === 0n ? {} : { id: head.toString() }),
+        data: data({ byte_end: byteEnd }),
+      }]
+    : [];
+  const events = parsed.cursor === undefined
+    ? [{
+        event: "ci.log.ready",
+        id: head.toString(),
+        data: data({ byte_end: byteEnd }),
+      }]
+    : segments
+      .filter((segment) => segment.cursor > parsed.cursor)
+      .map((segment) => ({
+        event: "ci.log.appended",
+        id: segment.cursor.toString(),
+        data: data({
+          byte_start: segment.byteStart,
+          byte_end: segment.byteStart + segment.bytes.byteLength,
+        }),
+      }));
+  return {
+    status: 200,
+    events: [...events, ...complete],
+    resume_cursor: head.toString(),
+    hold: !isTerminal,
   };
 }

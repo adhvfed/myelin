@@ -5,6 +5,8 @@ import AxeBuilder from "@axe-core/playwright";
 // Browser proof for the shared production-Rust/dev-edge CI read vectors.
 const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 const FAILED_RUN = "91000000-0000-4000-8000-000000000001";
+const RUNNING_RUN = "91000000-0000-4000-8000-000000000002";
+const LIVE_JOB = "92000000-0000-4000-8000-000000000002";
 
 async function setCiConfig(config: {
   resetCi?: boolean;
@@ -12,11 +14,18 @@ async function setCiConfig(config: {
   ciUnavailable?: boolean;
   ciLogUnavailable?: boolean;
   addCiVisibleRepo?: boolean;
+  appendCiLive?: string;
+  completeCiLive?: boolean;
+  ciLiveStaleNextResume?: boolean;
+  ciLiveRejectNextAccess?: boolean;
+  severCiLive?: boolean;
 }) {
   const context = await pwRequest.newContext();
   const response = await context.post(`${EDGE}/__test/config`, { data: config });
   expect(response.ok(), "dev-edge CI config must be accepted").toBeTruthy();
+  const body = await response.json() as { state: Record<string, unknown> };
   await context.dispose();
+  return body.state;
 }
 
 async function devLogin(page: Page) {
@@ -40,6 +49,14 @@ test.beforeEach(async () => setCiConfig({ resetCi: true }));
 test.afterEach(async () => setCiConfig({ resetCi: true }));
 
 test.describe("CT-005 CI web read surface", () => {
+  test("the same-origin live proxy requires a session and rejects a noncanonical cursor", async ({ request }) => {
+    const path = `/api/ci/runs/${RUNNING_RUN}/jobs/${LIVE_JOB}/log/live`;
+    const unauthenticated = await request.get(path);
+    expect(unauthenticated.status()).toBe(401);
+    const malformed = await request.get(path, { headers: { "last-event-id": "01" } });
+    expect(malformed.status()).toBe(400);
+  });
+
   test("an unauthenticated deep run preserves the 401 to login floor", async ({ page }) => {
     await page.goto(`/ci/runs/${FAILED_RUN}`);
     await page.waitForURL("**/login");
@@ -68,15 +85,53 @@ test.describe("CT-005 CI web read surface", () => {
     await expect(page.getByRole("heading", { level: 1, name: "Run 91000000" })).toBeVisible();
     await expect(page.getByRole("heading", { level: 3, name: "contract" })).toBeVisible();
     await expect(page.getByText("byte 0")).toBeVisible();
-    await expect(page.getByText("Live updates are not available yet.")).toBeVisible();
     await expect(page.getByText("Archived", { exact: true })).toBeVisible();
     await expectNoAxeViolations(page, "CI run detail");
 
     await page.getByRole("link", { name: "Read archived output" }).click();
     await expect(page).toHaveURL(/job=92000000-0000-4000-8000-000000000001/);
     await expect(page.getByTestId("ci-archived-log")).toHaveValue("prep\ncafé\nfailed\n");
-    await expect(page.getByText("Bytes 0–18 of 18")).toBeVisible();
+    await expect(page.getByText("Archived bytes 0–18 of 18")).toBeVisible();
+    await expect(page.getByTestId("ci-live-log")).toHaveValue("prep\ncafé\nfailed\n");
+    await expect(page.getByTestId("ci-live-state")).toContainText("Complete");
     await expectNoAxeViolations(page, "CI archived log");
+  });
+
+  test("live bytes append durably and a stale resume cursor reloads the archive", async ({ page }) => {
+    await devLogin(page);
+    await page.goto(`/ci/runs/${RUNNING_RUN}?job=${LIVE_JOB}#archived-log`);
+
+    await expect(page.getByRole("heading", { level: 1, name: "Run 91000000" })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 3, name: "live-contract" })).toBeVisible();
+    await expect(page.getByTestId("ci-live-log")).toHaveValue("boot\n");
+    await expect(page.getByTestId("ci-live-state")).toContainText("Live");
+
+    await setCiConfig({ ciLiveRejectNextAccess: true, severCiLive: true });
+    await expect.poll(async () => {
+      const state = await setCiConfig({});
+      return [state.ciLiveAccessFailures, state.ciLiveRefreshRequests];
+    }).toEqual([1, 1]);
+    await expect(page.getByTestId("ci-live-state")).toContainText("Live");
+
+    await setCiConfig({ appendCiLive: "build\n" });
+    expect((await setCiConfig({})).ciLiveAppends).toBe(1);
+    await expect(page.getByTestId("ci-live-log")).toHaveValue("boot\nbuild\n");
+    await expect(page.getByText("Recent bytes 0–11")).toBeVisible();
+
+    await setCiConfig({ ciLiveStaleNextResume: true, severCiLive: true });
+    await expect(page.getByTestId("ci-live-resynced")).toContainText(
+      "Reloaded the durable archive",
+    );
+    await expect(page.getByTestId("ci-live-log")).toHaveValue("boot\nbuild\n");
+    await expect(page.getByTestId("ci-live-state")).toContainText("Live");
+
+    const state = await setCiConfig({});
+    expect(state.ciLiveResumeRequests).toBeGreaterThanOrEqual(1);
+    expect(state.ciLiveStaleResponses).toBe(1);
+
+    await setCiConfig({ completeCiLive: true });
+    await expect(page.getByTestId("ci-live-state")).toContainText("Complete");
+    await expectNoAxeViolations(page, "CI live log");
   });
 
   test("opaque next-page navigation replaces the page and browser Back restores newest", async ({ page }) => {

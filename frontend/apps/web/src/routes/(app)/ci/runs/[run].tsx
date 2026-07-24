@@ -6,6 +6,7 @@ import { CiRouteError, getCiLog, getCiRun } from "~/lib/api";
 import { isCiUuid } from "~/lib/ci-read-input";
 import { ciRepoLabel, type CiJobVM, type CiStepVM } from "~/lib/ci-read-response";
 import { CiErrorState, ciErrKind } from "~/components/CiErrorState";
+import { CiLiveLog } from "~/components/CiLiveLog";
 import { CiStatus, formatCiDate } from "~/components/CiStatus";
 
 const ARCHIVE_CHUNK = 64 * 1024;
@@ -104,58 +105,60 @@ export default function CiRunDetail() {
                     </div>
                     <span class="ci-archive-label"><Icon name="database" /> Archived</span>
                   </div>
-                  <p class="ci-live-floor" role="note">
-                    <Icon name="check-pending" />
-                    Live updates are not available yet. Refresh the run for its latest durable state.
-                  </p>
                   <Show
                     when={selectedJob()}
                     fallback={<p data-testid="ci-log-unselected">Choose a job to read its archived output.</p>}
+                    keyed
                   >
-                    <ErrorBoundary
-                      fallback={(error, reset) => (
-                        <CiErrorState kind={ciErrKind(error)} onRetry={reset} />
-                      )}
-                    >
-                      <Suspense
-                        fallback={
-                          <Skeleton
-                            label="Loading archived output…"
-                            rows={4}
-                            rowHeight="1rem"
-                            data-testid="ci-log-loading"
-                          />
-                        }
-                      >
-                        <Show when={archivedLog()} keyed>
-                          {(range) => (
-                            <>
-                              <p class="ci-log-range">
-                                Bytes {range.byte_start}–{range.byte_end} of {range.total_end}
-                              </p>
-                              <textarea
-                                readOnly
-                                aria-label="Archived job output"
-                                data-testid="ci-archived-log"
-                                value={range.text.length > 0 ? range.text : "No archived bytes in this range."}
-                              />
-                              <nav aria-label="Archived log ranges" class="ci-pagination">
-                                <Show when={range.byte_start > 0}>
-                                  <A href={logHref(view.run.run_id, range.job_id, 0)}>
-                                    Start of log
-                                  </A>
-                                </Show>
-                                <Show when={range.next_offset !== null}>
-                                  <A href={logHref(view.run.run_id, range.job_id, range.next_offset!)}>
-                                    Next archived chunk <Icon name="chevron" />
-                                  </A>
-                                </Show>
-                              </nav>
-                            </>
+                    {(job) => (
+                      <>
+                        <CiLiveLog run={view.run.run_id} job={job} />
+                        <ErrorBoundary
+                          fallback={(error, reset) => (
+                            <CiErrorState kind={ciErrKind(error)} onRetry={reset} />
                           )}
-                        </Show>
-                      </Suspense>
-                    </ErrorBoundary>
+                        >
+                          <Suspense
+                            fallback={
+                              <Skeleton
+                                label="Loading archived output…"
+                                rows={4}
+                                rowHeight="1rem"
+                                data-testid="ci-log-loading"
+                              />
+                            }
+                          >
+                            <Show when={archivedLog()} keyed>
+                              {(range) => (
+                                <>
+                                  <p class="ci-log-range">
+                                    Archived bytes {range.byte_start}–{range.byte_end} of {range.total_end}
+                                  </p>
+                                  <textarea
+                                    readOnly
+                                    aria-label="Archived job output"
+                                    data-testid="ci-archived-log"
+                                    value={range.text.length > 0 ? range.text : "No archived bytes in this range."}
+                                  />
+                                  <nav aria-label="Archived log ranges" class="ci-pagination">
+                                    <Show when={range.byte_start > 0}>
+                                      <A href={logHref(view.run.run_id, range.job_id, 0)}>
+                                        Start of log
+                                      </A>
+                                    </Show>
+                                    <Show when={range.next_offset !== null}>
+                                      <A href={logHref(view.run.run_id, range.job_id, range.next_offset!)}>
+                                        Next archived chunk <Icon name="chevron" />
+                                      </A>
+                                    </Show>
+                                  </nav>
+                                </>
+                              )}
+                            </Show>
+                          </Suspense>
+                        </ErrorBoundary>
+                      </>
+                    )}
                   </Show>
                 </section>
               </>

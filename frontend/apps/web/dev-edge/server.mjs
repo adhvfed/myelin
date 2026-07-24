@@ -47,7 +47,11 @@ import {
   notFoundEnvelope,
 } from "./dev-contract.mjs";
 import {
+  CI_LIVE_INITIAL_LOG,
+  CI_LIVE_JOB,
+  CI_OLDER_RUN,
   CI_VISIBLE_REPO_REFS,
+  ciLiveOpen,
   ciLogJson,
   ciRunJson,
   ciRunsEnvelope,
@@ -102,7 +106,19 @@ const state = {
   ciUnavailable: false,
   ciLogUnavailable: false,
   ciVisibleRepoRefs: [...CI_VISIBLE_REPO_REFS],
+  ciLiveRequests: 0,
+  ciLiveResumeRequests: 0,
+  ciLiveStaleResponses: 0,
+  ciLiveAccessFailures: 0,
+  ciLiveRefreshRequests: 0,
+  ciLiveRejectNextAccess: false,
+  ciLiveAppends: 0,
 };
+
+let ciLiveSegments = [{ cursor: 1n, byteStart: 0, bytes: Buffer.from(CI_LIVE_INITIAL_LOG) }];
+let ciLiveTerminal = false;
+let ciLiveStaleNextResume = false;
+const ciLiveClients = new Set();
 
 let issueRows = freshIssueFixtures();
 const issueReceipts = new Map();
@@ -158,10 +174,81 @@ function resetPrCommitPagination() {
 }
 
 function resetCi() {
+  for (const client of ciLiveClients) client.res.end();
+  ciLiveClients.clear();
   state.emptyCi = false;
   state.ciUnavailable = false;
   state.ciLogUnavailable = false;
   state.ciVisibleRepoRefs = [...CI_VISIBLE_REPO_REFS];
+  state.ciLiveRequests = 0;
+  state.ciLiveResumeRequests = 0;
+  state.ciLiveStaleResponses = 0;
+  state.ciLiveAccessFailures = 0;
+  state.ciLiveRefreshRequests = 0;
+  state.ciLiveRejectNextAccess = false;
+  state.ciLiveAppends = 0;
+  ciLiveSegments = [{ cursor: 1n, byteStart: 0, bytes: Buffer.from(CI_LIVE_INITIAL_LOG) }];
+  ciLiveTerminal = false;
+  ciLiveStaleNextResume = false;
+}
+
+function ciLiveBytes() {
+  return Buffer.concat(ciLiveSegments.map((segment) => segment.bytes));
+}
+
+function writeCiLiveEvent(res, runId, jobId, event, id, body) {
+  res.write(`event: ${event}\n`);
+  if (id !== undefined) res.write(`id: ${id}\n`);
+  res.write(`data: ${JSON.stringify({
+    run_id: runId,
+    job_id: jobId,
+    ...body,
+  })}\n\n`);
+}
+
+function writeCiLiveOpenEvent(res, frame) {
+  res.write(`event: ${frame.event}\n`);
+  if (frame.id !== undefined) res.write(`id: ${frame.id}\n`);
+  res.write(`data: ${JSON.stringify(frame.data)}\n\n`);
+}
+
+function appendCiLive(value) {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength === 0 || bytes.byteLength > 64 * 1024) return false;
+  const last = ciLiveSegments.at(-1);
+  const cursor = (last?.cursor ?? 0n) + 1n;
+  const byteStart = last ? last.byteStart + last.bytes.byteLength : 0;
+  const segment = { cursor, byteStart, bytes };
+  ciLiveSegments.push(segment);
+  state.ciLiveAppends += 1;
+  for (const client of ciLiveClients) {
+    if (cursor <= client.cursor) continue;
+    writeCiLiveEvent(client.res, CI_OLDER_RUN, CI_LIVE_JOB, "ci.log.appended", cursor.toString(), {
+      byte_start: byteStart,
+      byte_end: byteStart + bytes.byteLength,
+    });
+    client.cursor = cursor;
+  }
+  return true;
+}
+
+function completeCiLive() {
+  ciLiveTerminal = true;
+  const last = ciLiveSegments.at(-1);
+  const cursor = last?.cursor;
+  const byteEnd = last ? last.byteStart + last.bytes.byteLength : 0;
+  for (const client of ciLiveClients) {
+    writeCiLiveEvent(
+      client.res,
+      CI_OLDER_RUN,
+      CI_LIVE_JOB,
+      "ci.log.complete",
+      cursor?.toString(),
+      { byte_end: byteEnd },
+    );
+    client.res.end();
+  }
+  ciLiveClients.clear();
 }
 
 function decodeCiPathSegment(value) {
@@ -265,6 +352,14 @@ const server = createServer((req, res) => {
         if (typeof body.emptyCi === "boolean") state.emptyCi = body.emptyCi;
         if (typeof body.ciUnavailable === "boolean") state.ciUnavailable = body.ciUnavailable;
         if (typeof body.ciLogUnavailable === "boolean") state.ciLogUnavailable = body.ciLogUnavailable;
+        if (typeof body.appendCiLive === "string") appendCiLive(body.appendCiLive);
+        if (body.completeCiLive === true) completeCiLive();
+        if (body.ciLiveStaleNextResume === true) ciLiveStaleNextResume = true;
+        if (body.ciLiveRejectNextAccess === true) state.ciLiveRejectNextAccess = true;
+        if (body.severCiLive === true) {
+          for (const client of ciLiveClients) client.res.end();
+          ciLiveClients.clear();
+        }
         if (body.addCiVisibleRepo === true &&
             !state.ciVisibleRepoRefs.includes("myelin://acme/git/repo/z")) {
           state.ciVisibleRepoRefs.push("myelin://acme/git/repo/z");
@@ -305,6 +400,7 @@ const server = createServer((req, res) => {
   // The refresh round-trip: a valid refresh token mints a fresh access token (here, the same dev
   // token — the dev seam's token is long-lived); anything else is a uniform 401.
   if (method === "POST" && path === "/v1/auth/refresh") {
+    state.ciLiveRefreshRequests += 1;
     if (!state.forceUnauthorized && bearer(req) === DEV_REFRESH_TOKEN) {
       return send(res, 200, { access_token: DEV_ACCESS_TOKEN });
     }
@@ -349,6 +445,79 @@ const server = createServer((req, res) => {
   let ciMatch;
   if (
     method === "GET" &&
+    (ciMatch = path.match(/^\/v1\/ci\/runs\/([^/]+)\/jobs\/([^/]+)\/log\/live$/))
+  ) {
+    if (state.ciLiveRejectNextAccess) {
+      state.ciLiveRejectNextAccess = false;
+      state.ciLiveAccessFailures += 1;
+      return send(res, 401, unauthorizedEnvelope());
+    }
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (state.ciUnavailable || state.ciLogUnavailable) {
+      return send(res, 503, {
+        error: { message: "CI log data is temporarily unavailable", code: "unavailable" },
+      });
+    }
+    if (url.search) {
+      return send(res, 400, {
+        error: { message: "CI live log tail accepts no query parameters", code: "bad_request" },
+      });
+    }
+    const runId = decodeCiPathSegment(ciMatch[1]);
+    const jobId = decodeCiPathSegment(ciMatch[2]);
+    if (!isCiUuid(runId) || !isCiUuid(jobId)) {
+      return send(res, 400, {
+        error: { message: "CI run and job ids must be canonical UUIDs", code: "bad_request" },
+      });
+    }
+    const rawCursor = Array.isArray(req.headers["last-event-id"])
+      ? null
+      : req.headers["last-event-id"];
+    state.ciLiveRequests += 1;
+    if (rawCursor !== undefined) state.ciLiveResumeRequests += 1;
+    const isRunningLive = runId === CI_OLDER_RUN && jobId === CI_LIVE_JOB;
+    const open = state.emptyCi
+      ? { status: 404 }
+      : ciLiveOpen(runId, jobId, rawCursor, {
+          ...(isRunningLive ? { segments: ciLiveSegments, terminal: ciLiveTerminal } : {}),
+          forceStale: rawCursor !== undefined && ciLiveStaleNextResume,
+        });
+    if (rawCursor !== undefined && ciLiveStaleNextResume) {
+      ciLiveStaleNextResume = false;
+    }
+    if (open.status === 409) {
+      state.ciLiveStaleResponses += 1;
+      return send(res, 409, {
+        error: { message: "CI log cursor is stale; reload archived log", code: "conflict" },
+      });
+    }
+    if (open.status === 400) {
+      return send(res, 400, {
+        error: { message: "CI log Last-Event-ID must be a canonical integer", code: "bad_request" },
+      });
+    }
+    if (open.status === 404) return send(res, 404, notFoundEnvelope("CI run"));
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+    });
+    res.write(": connected\n\n");
+    for (const event of open.events) {
+      writeCiLiveOpenEvent(res, event);
+    }
+    if (!open.hold) {
+      res.end();
+      return;
+    }
+    const client = { res, cursor: BigInt(open.resume_cursor) };
+    ciLiveClients.add(client);
+    req.on("close", () => ciLiveClients.delete(client));
+    return;
+  }
+
+  if (
+    method === "GET" &&
     (ciMatch = path.match(/^\/v1\/ci\/runs\/([^/]+)\/jobs\/([^/]+)\/log$/))
   ) {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
@@ -370,7 +539,10 @@ const server = createServer((req, res) => {
         error: { message: "CI run and job ids must be canonical UUIDs", code: "bad_request" },
       });
     }
-    const response = ciLogJson(runId, jobId, input, { empty: state.emptyCi });
+    const response = ciLogJson(runId, jobId, input, {
+      empty: state.emptyCi,
+      liveLog: ciLiveBytes(),
+    });
     return response
       ? send(res, 200, response, { "cache-control": "no-store" })
       : send(res, 404, notFoundEnvelope("CI run"));

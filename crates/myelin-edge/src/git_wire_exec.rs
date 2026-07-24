@@ -491,12 +491,21 @@ impl GitWireExecutor {
         )
         .map_err(|e| GitCoreError::Wire(e.to_string()))?;
 
-        let SandboxLaunch { handle, result } = self
+        let SandboxLaunch {
+            handle,
+            result,
+            output_complete,
+        } = self
             .backend
             .launch_git_receive_pack_until_cancelled(&spec, &self.hooks, &self.shutdown)
             .map_err(|e| GitCoreError::Wire(e.to_string()))?;
         let _ = self.backend.kill(&handle);
 
+        if !output_complete {
+            return Err(GitCoreError::Wire(
+                "sandboxed receive-pack ingest returned incomplete output".into(),
+            ));
+        }
         if self.shutdown.load(Ordering::Acquire) {
             return Err(GitCoreError::Wire(
                 "sandboxed receive-pack ingest cancelled by process shutdown".into(),
@@ -547,7 +556,11 @@ impl WireExecutor for GitWireExecutor {
         )
         .map_err(|e| GitCoreError::Wire(e.to_string()))?;
 
-        let SandboxLaunch { handle, result } = self
+        let SandboxLaunch {
+            handle,
+            result,
+            output_complete,
+        } = self
             .backend
             .launch_git_wire_until_cancelled(&spec, &self.hooks, &self.shutdown)
             .map_err(|e| GitCoreError::Wire(e.to_string()))?;
@@ -555,6 +568,12 @@ impl WireExecutor for GitWireExecutor {
         // One sandbox per wire op — tear it down (idempotent; the guest has already exited).
         let _ = self.backend.kill(&handle);
 
+        if !output_complete {
+            return Err(GitCoreError::Wire(format!(
+                "sandboxed `git {}` returned incomplete output",
+                inv.argv.join(" ")
+            )));
+        }
         // Honor the exit/timeout: a timeout or a non-zero `git` exit is a HARD error, never a silent
         // empty stdout. stderr is folded into the error message (capped capture; never the payload).
         if self.shutdown.load(Ordering::Acquire) {
