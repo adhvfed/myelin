@@ -368,6 +368,10 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+        if let Err(error) = runner_runtime.activate_definition() {
+            eprintln!("ci-controlplane: ci.pipeline definition activation refused: {error}");
+            std::process::exit(1);
+        }
         let starter_poller = myelin_ci_controlplane::PgCiRunStarterPoller::new(
             scheduler_provider.region_run_discovery(),
             starter_factory,

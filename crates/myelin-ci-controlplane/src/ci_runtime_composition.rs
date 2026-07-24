@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
 use myelin_events::{Actor, MonotonicMinter};
-use myelin_flow::{PgFlowExecutor, PgFlowWorker, PgWorkerScope};
+use myelin_flow::{PgFlowExecutor, PgFlowWorker, PgWorkerScope, CI_PIPELINE_WF_TYPE};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::{DurableCostLedger, SubstrateProvider, TenantScope};
 use myelin_tenancy::{Region, TenantId};
@@ -135,6 +135,25 @@ impl CiProductionRuntimeFactory {
     /// The source-derived definition pin shared by starter and worker composition.
     pub fn definition(&self) -> &CiWorkflowDefinitionPin {
         &self.definition
+    }
+
+    /// Register the exact source-derived definition pin in Flow's durable global code registry.
+    /// Re-registration is idempotent; a changed hash at the same version fails closed before any
+    /// queued run can be admitted.
+    pub fn activate_definition(&self) -> Result<(), CiRuntimeCompositionError> {
+        PgFlowExecutor::new(
+            self.pool.clone(),
+            self.rt.clone(),
+            Arc::new(MonotonicMinter::new()),
+            TenantId("ci-definition-registry".into()),
+            self.region.clone(),
+        )
+        .register_definition(
+            CI_PIPELINE_WF_TYPE,
+            self.definition.version(),
+            self.definition.code_hash(),
+        )
+        .map_err(|_| CiRuntimeCompositionError)
     }
 
     /// Bind restart-safe region discovery to this exact-cell worker factory.
