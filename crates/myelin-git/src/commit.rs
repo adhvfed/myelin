@@ -658,8 +658,9 @@ mod tests {
             !is_commit_object(b"just some file contents\n"),
             "a blob is not a commit"
         );
+        let secret_blob = [b"AK".as_slice(), b"IAEXAMPLE secret blob"].concat();
         assert!(
-            !is_commit_object(b"AKIAEXAMPLE secret blob"),
+            !is_commit_object(&secret_blob),
             "a secret blob is not a commit"
         );
     }

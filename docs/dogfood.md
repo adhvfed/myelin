@@ -304,6 +304,15 @@ git config user.email "founder@acme.noreply"
 git config user.name  "founder@acme.noreply"
 ```
 
+For the one-time Myelin source migration, do not push the legacy GitHub commit graph into an empty
+Myelin lineage. Historical commits with non-pseudonymous identities are correctly rejected, and
+rewriting them would destroy the GitHub archive's identity. Instead, make one new pseudonymous
+snapshot commit whose parent is the hosted Myelin `main` and whose tree is the clean, reviewed
+current source tree; GitHub remains the read-only historical mirror for the planned quarter. Run
+`cargo test -p myelin-git self_hosting_tree_contains_no_complete_default_secret_sentinel` before
+that snapshot. The test derives the production scanner's default patterns and fails if scanner or
+redaction fixtures make the repository reject its own source blobs.
+
 > Only the git **wire** routes accept HTTP Basic. The JSON product API (`/v1/git/...`, `/v1/whoami`)
 > is **Bearer-only** — send `Authorization: Bearer $TOKEN` (the CLI does this for you).
 
