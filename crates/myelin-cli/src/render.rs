@@ -209,6 +209,7 @@ fn render_ci_run_detail(value: &Value) -> String {
             .get("state")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        let is_running = state == "running";
         let marker = state_marker(state);
         let state = terminal_safe_single_line(state);
         let stage =
@@ -230,6 +231,11 @@ fn render_ci_run_detail(value: &Value) -> String {
             output.push_str(&format!(
                 "    archived output: myelin ci logs {run_id} --job {job_id}\n"
             ));
+            if is_running {
+                output.push_str(&format!(
+                    "    live output: myelin ci watch {run_id} --job {job_id}\n"
+                ));
+            }
         }
     }
     for step in value["steps"].as_array().expect("shape checked") {
@@ -297,7 +303,9 @@ fn render_ci_log_range(value: &Value) -> String {
     output
 }
 
-fn terminal_safe_log_bytes(bytes: &[u8]) -> String {
+/// Render arbitrary log bytes without allowing terminal-control injection. Invalid UTF-8 remains
+/// byte-identifiable as `\xNN`; printable Unicode and line boundaries stay readable.
+pub fn terminal_safe_log_bytes(bytes: &[u8]) -> String {
     let mut output = String::new();
     let mut remaining = bytes;
     while !remaining.is_empty() {
@@ -678,6 +686,30 @@ mod tests {
         assert!(!archive.contains('\u{a9}'));
         assert!(archive.contains("--start 16 --limit 7"));
         assert!(!archive.contains("watch"));
+    }
+
+    #[test]
+    fn running_ci_job_surfaces_the_exact_scoped_watch_command() {
+        let run = "91000000-0000-4000-8000-000000000002";
+        let job = "92000000-0000-4000-8000-000000000002";
+        let detail = json!({
+            "run": {
+                "run_id": run,
+                "repo_ref": "myelin://acme/git/repo/alpha",
+                "state": "running",
+                "created_at": "now"
+            },
+            "jobs": [{
+                "job_id": job,
+                "stage": "test",
+                "name": "contract",
+                "state": "running",
+                "attempt": 1
+            }],
+            "steps": []
+        });
+        let output = render(&detail, false);
+        assert!(output.contains(&format!("live output: myelin ci watch {run} --job {job}")));
     }
 
     #[test]

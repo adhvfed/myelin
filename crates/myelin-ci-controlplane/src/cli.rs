@@ -1,8 +1,9 @@
 //! Total command grammar for the durable CI read surface.
 //!
 //! The platform CLI reuses this parser and only maps validated commands to Edge routes. This module
-//! intentionally exposes archived reads only: the existing process-local `LiveTail` is not an
-//! honest cross-service resume source, so `watch` remains a named unsupported floor.
+//! exposes the durable reads plus the repository-authorized Edge live-log route. `watch` names one
+//! exact job because the production transport is scoped to `(run_id, job_id)`; it does not invent a
+//! run-wide aggregation the durable API cannot authorize or resume.
 
 use crate::surfacing_store::{
     CiLogRangeRequest, CiRunPageRequest, CiRunStateFilter, CI_LOG_RANGE_DEFAULT,
@@ -10,7 +11,7 @@ use crate::surfacing_store::{
 };
 use base64::Engine as _;
 
-/// A validated `myelin ci` read command.
+/// A validated `myelin ci` read or live-observation command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliCommand {
     /// List repository-authorized durable runs.
@@ -23,6 +24,8 @@ pub enum CliCommand {
         job_id: String,
         range: CiLogRangeRequest,
     },
+    /// Follow one job's durable log through the resume-cursor Edge stream.
+    Watch { run_id: String, job_id: String },
 }
 
 /// A total, human-readable CI command parse failure.
@@ -40,18 +43,19 @@ impl std::error::Error for CliParseError {}
 /// Parse the arguments after `myelin ci`.
 pub fn parse_cli(args: &[&str]) -> Result<CliCommand, CliParseError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
-        usage("no CI command given (try: list | view <run> | logs <run> --job <job>)")
+        usage(
+            "no CI command given (try: list | view <run> | logs <run> --job <job> | \
+             watch <run> --job <job>)",
+        )
     })?;
     match *verb {
         "list" => parse_list(rest),
         "view" | "show" => parse_view(verb, rest),
         "logs" => parse_logs(rest),
-        "watch" => Err(usage(
-            "`ci watch` is unavailable until cross-service resumable live logs are implemented; \
-             use `ci logs <run> --job <job>` for archived output",
-        )),
+        "watch" => parse_watch(rest),
         other => Err(usage(format!(
-            "unknown CI command `{other}` (try: list | view <run> | logs <run> --job <job>)"
+            "unknown CI command `{other}` (try: list | view <run> | logs <run> --job <job> | \
+             watch <run> --job <job>)"
         ))),
     }
 }
@@ -147,6 +151,34 @@ fn parse_logs(args: &[&str]) -> Result<CliCommand, CliParseError> {
         run_id: (*run_id).to_string(),
         job_id,
         range,
+    })
+}
+
+fn parse_watch(args: &[&str]) -> Result<CliCommand, CliParseError> {
+    let (run_id, flags) = args
+        .split_first()
+        .ok_or_else(|| usage("`ci watch` needs a <run> and `--job <job>`"))?;
+    validate_uuid("run", run_id)?;
+    let mut job_id = None;
+    let mut index = 0;
+    while index < flags.len() {
+        let flag = flags[index];
+        let value = flags
+            .get(index + 1)
+            .ok_or_else(|| usage(format!("`ci watch {flag}` needs a value")))?;
+        match flag {
+            "--job" if job_id.is_none() => {
+                validate_uuid("job", value)?;
+                job_id = Some((*value).to_string());
+            }
+            "--job" => return Err(usage("duplicate CI watch flag `--job`")),
+            other => return Err(usage(format!("unknown CI watch flag `{other}`"))),
+        }
+        index += 2;
+    }
+    Ok(CliCommand::Watch {
+        run_id: (*run_id).to_string(),
+        job_id: job_id.ok_or_else(|| usage("`ci watch` requires `--job <job>`"))?,
     })
 }
 
@@ -252,12 +284,18 @@ mod tests {
                 range: CiLogRangeRequest::new(9, 7).unwrap(),
             }
         );
+        assert_eq!(
+            parse_cli(&["watch", RUN, "--job", JOB]).unwrap(),
+            CliCommand::Watch {
+                run_id: RUN.into(),
+                job_id: JOB.into(),
+            }
+        );
     }
 
     #[test]
-    fn rejects_live_claims_and_noncanonical_or_ambiguous_input() {
+    fn rejects_noncanonical_or_ambiguous_input() {
         for invalid in [
-            vec!["watch", RUN],
             vec!["view", "NOT-A-UUID"],
             vec!["view", RUN, RUN],
             vec!["list", "--status", "passed"],
@@ -270,6 +308,10 @@ mod tests {
             vec!["logs", RUN, "--job", "NOT-A-UUID"],
             vec!["logs", RUN, "--job", JOB, "--start", "-1"],
             vec!["logs", RUN, "--job", JOB, "--limit", "0"],
+            vec!["watch", RUN],
+            vec!["watch", RUN, "--job", "NOT-A-UUID"],
+            vec!["watch", RUN, "--job", JOB, "--job", JOB],
+            vec!["watch", RUN, "--job", JOB, "--cursor", "1"],
         ] {
             assert!(parse_cli(&invalid).is_err(), "{invalid:?} must be refused");
         }

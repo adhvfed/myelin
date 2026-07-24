@@ -33,8 +33,10 @@ session-only proxy performs one bounded refresh/retry, the browser snapshots the
 acknowledging SSE cursors, and stale retention cursors reload the archive before a fresh subscription.
 The dev Edge's actual live state machine and production Rust Edge execute the same committed golden
 vectors, including fresh, replay, terminal, ahead-of-head, and pruned-cursor branches. Authenticated CLI
-live consumption, the production-path CI-D11 sever/resume drill, and the founder acceptance pass remain
-open.
+live consumption is now closed by CT-005f4: the compiled thin client snapshots archived bytes, consumes
+the pointer-only stream, fetches every appended range before acknowledging its cursor, and catches up
+the archive before clearing a retention-stale cursor. The production-path CI-D11 sever/resume drill and
+the founder acceptance pass remain open.
 CT-007 is still unopened; GitHub Actions must not be
 removed before the founder acceptance pass and the complete CT-005 surface are genuinely usable.
 
@@ -177,6 +179,16 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   Eight Chromium CI flows include the previously missing tree next-page click and stale list-cursor
   reload, plus forced live reconnect 401→one refresh, append, stale live-cursor 409→archive reload,
   resume, and completion.
+- **CT-005f4 — authenticated CLI live-log consumer:** the CI-owned total grammar now admits
+  `ci watch <run> --job <job>` and maps it to the exact job-scoped durable Edge stream. The CLI
+  snapshots and validates the archive before subscribing, reads every pointer range through the
+  bounded integrity-checked archive route before acknowledging its event id, resumes from only the
+  last acknowledged canonical cursor, and catches the archive up before clearing a retention-stale
+  cursor. SSE frames, error bodies, reconnects, archive chunks, and recent transport state are
+  bounded; malformed scope, ranges, cursor transitions, media types, success statuses, and fresh
+  409s fail closed. Human bytes and every error field are terminal-safe; `--json` emits validated
+  archive envelopes as NDJSON. The compiled binary executes the shared terminal live vector plus
+  abrupt-body disconnect/resume and stale-cursor recovery without duplicate bytes.
 
 **Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
 services. It is not an honest production SSE resume source. SSE remains open until a real
@@ -188,10 +200,11 @@ remains an Agent-runtime trace artifact rather than a claim made by the stdio tr
 CT-005f1 and CT-005f2 close the durable consumer/resume and producer-persistence halves without
 overstating the remaining surface. The real gVisor and Firecracker paths now persist bounded output
 while commands execute. CT-005f3 closes the authenticated web consumer and makes mock parity
-mechanical rather than conventional. The CLI still needs authenticated live-tail UX over the
-existing Edge route, and CI-D11 must sever and resume the composed production path across service
-boundaries. The live founder push→settled check→surfaced archived/live log pass and CT-007 also
-remain open.
+mechanical rather than conventional. CT-005f4 closes the authenticated CLI consumer without
+inventing run-wide aggregation: the production resume authority is exact `(run_id, job_id)`, so the
+code requires `--job` even though the frozen plan used the shorthand `ci watch <run>`. CI-D11 must
+still sever and resume the composed production path across service boundaries. The live founder
+push→settled check→surfaced archived/live log pass and CT-007 also remain open.
 
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod
