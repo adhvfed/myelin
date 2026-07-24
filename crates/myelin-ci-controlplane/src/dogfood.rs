@@ -409,8 +409,8 @@ pub fn proven_ci_rows(date: &str) -> Vec<ProvenCiRow> {
         ),
         row(
             "CI-D11",
-            "resume-cursor live-tail — 0 lines lost on reconnect (details_ref jump-to-failure)",
-            "cargo test -p myelin-ci-controlplane --test drills_ci_p21_live_tail",
+            "durable live-tail — committed-prefix producer/Edge sever resumes with 0 lost/duplicate bytes",
+            "cargo test -p myelin-edge --features integration --test integration_ci_http_surface production_sink_and_edge_resume_exactly_after_both_services_are_severed",
             date,
         ),
         row(

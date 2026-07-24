@@ -35,8 +35,8 @@ The dev Edge's actual live state machine and production Rust Edge execute the sa
 vectors, including fresh, replay, terminal, ahead-of-head, and pruned-cursor branches. Authenticated CLI
 live consumption is now closed by CT-005f4: the compiled thin client snapshots archived bytes, consumes
 the pointer-only stream, fetches every appended range before acknowledging its cursor, and catches up
-the archive before clearing a retention-stale cursor. The production-path CI-D11 sever/resume drill and
-the founder acceptance pass remain open.
+the archive before clearing a retention-stale cursor. CT-005f5 now closes the production-path CI-D11
+committed-prefix sever/resume drill. The founder acceptance pass remains open.
 CT-007 is still unopened; GitHub Actions must not be
 removed before the founder acceptance pass and the complete CT-005 surface are genuinely usable.
 
@@ -189,6 +189,14 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   409s fail closed. Human bytes and every error field are terminal-safe; `--json` emits validated
   archive envelopes as NDJSON. The compiled binary executes the shared terminal live vector plus
   abrupt-body disconnect/resume and stale-cursor recovery without duplicate bytes.
+- **CT-005f5 — composed production CI-D11:** a live PostgreSQL + S3/RustFS drill writes the first
+  frame through the production `LogPipelineSink`/`DurableLogPersist`, observes pointer 1 through the
+  authenticated production Edge, then destroys both sink and Gateway. A reconstructed sink recovers
+  the durable sequence/byte head and appends the second frame; a reconstructed Gateway resumes from
+  `Last-Event-ID: 1` and emits only pointer 2. The ordinary archive route returns the exact
+  concatenated bytes and PostgreSQL independently contains exactly two contiguous segments. This
+  proves the committed-prefix sever boundary; it does not claim a kill inside CAS/PG commit,
+  commit-unknown replay, or HTTP-wire serialization.
 
 **Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
 services. It is not an honest production SSE resume source. SSE remains open until a real
@@ -202,9 +210,10 @@ overstating the remaining surface. The real gVisor and Firecracker paths now per
 while commands execute. CT-005f3 closes the authenticated web consumer and makes mock parity
 mechanical rather than conventional. CT-005f4 closes the authenticated CLI consumer without
 inventing run-wide aggregation: the production resume authority is exact `(run_id, job_id)`, so the
-code requires `--job` even though the frozen plan used the shorthand `ci watch <run>`. CI-D11 must
-still sever and resume the composed production path across service boundaries. The live founder
-push→settled check→surfaced archived/live log pass and CT-007 also remain open.
+code requires `--job` even though the frozen plan used the shorthand `ci watch <run>`. CT-005f5
+closes the remaining composed CI-D11 committed-prefix drill without overstating unproven
+commit-unknown or HTTP-wire failure modes. The live founder push→settled check→surfaced archived/live
+log pass and CT-007 remain open.
 
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod

@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification; CT-005f1 adds the repository-authorized durable SSE resume consumer; CT-005f2 persists bounded byte-exact output during execution on both production backends and closes retry/supersession recovery without resurrection; CT-005f3 adds the authenticated web live consumer and executes shared resume vectors through the actual dev and production implementations; CT-005f4 adds the authenticated strict resumable CLI live-tail consumer. Still required: composed CI-D11 sever/resume, the live founder push→CI→surfaced-check/log pass, then CT-007.** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification; CT-005f1 adds the repository-authorized durable SSE resume consumer; CT-005f2 persists bounded byte-exact output during execution on both production backends and closes retry/supersession recovery without resurrection; CT-005f3 adds the authenticated web live consumer and executes shared resume vectors through the actual dev and production implementations; CT-005f4 adds the authenticated strict resumable CLI live-tail consumer; CT-005f5 closes the composed production CI-D11 committed-prefix sever/resume drill. Still required: the live founder push→CI→surfaced-check/log pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1884,10 +1884,47 @@ empty-terminal tests = 0.
 L3 CT-005f4 footprint: **12 files, +1,446 / -53 lines** for the CI-owned grammar, authenticated stream transport,
 strict archive-before-ack consumer, compiled failure/recovery proofs, and ledgers.
 
-**Honest remaining CT-005 floor:** run CI-D11 sever/resume through the composed production services.
-Then the founder must perform a real Myelin push and observe its exact-head required check settle
-with archived and live output through the verifier, browser, and CLI. CT-007 and the four-week R4
-exit clock remain closed until that evidence exists.
+**CT-005f5 composed production CI-D11 increment (2026-07-24; founder acceptance remains open).**
+The prior scorecard green named the process-local Firehose drill, so it did not prove the separately
+deployed durable producer and Edge consumer together. The replacement live integration opens an
+authenticated repository-authorized Edge stream at cursor zero, writes the first frame through the
+production `LogPipelineSink<S3BlobStore, DurableLogPersist>`, and observes pointer 1. It then
+destroys both the producer sink and Gateway. A newly constructed sink recovers the exact durable
+sequence and byte head from tenant/RLS-scoped PostgreSQL before appending the second frame to
+S3/RustFS; a newly composed authenticated Gateway resumes with `Last-Event-ID: 1` and emits pointer
+2 without replaying pointer 1.
+
+The ordinary production archive materializer reads both content-addressed S3 objects and returns
+the exact first-plus-second byte sequence. An independent PostgreSQL read requires exactly two
+contiguous `(segment_seq, byte_start, byte_end)` rows, and terminal completion retains cursor 2.
+The permanent M4 scorecard and CI dogfood truth-up now name this production-path drill instead of
+the obsolete process-local proof. Scope remains precise: the sever occurs after the first
+`ship_frame` durable return and after cursor acknowledgement. This row does not claim an arbitrary
+kill inside CAS/PG commit, commit-unknown replay, or HTTP-wire serialization; those are not needed
+to establish the committed-prefix resume contract and remain bounded failure-injection depth.
+
+Mechanical evidence: the focused composed test and all three production CI HTTP-surface
+integrations pass against live PostgreSQL and S3/RustFS; targeted rustfmt and diff check are clean.
+The Controlplane dogfood truth-up tests and all 48 focused harness scorecard tests pass. Warnings-denied
+all-target/all-feature Edge, Controlplane, and Harness clippy passes; architecture lint scans 763
+files with zero violations, shrink-only erosion/dependency budgets pass, and frontend-aware contract
+coverage remains green (99 rows, 83 covered, 16 deferred, two shared frontend contracts, zero false
+claims). CI-D11 is now the third M4 permanent integration gate alongside the sandbox-escape and
+restore drills.
+Independent adversarial review reported **CONFIRMED-SOUND for the stated committed-prefix boundary
+with no HIGH or MEDIUM finding** and confirmed the assertions are independent rather than
+self-fulfilling.
+
+Mechanical payoff: production CI-D11 provider/consumer compositions proven across service
+reconstruction = 0→1; committed log bytes lost across the composed sever = 0; duplicate resumed
+pointers/bytes = 0; M4 CI-D11 evidence still pointing only at the process-local Firehose = 1→0.
+
+L3 CT-005f5 footprint: **6 files, +285 / -33 lines** for the composed live-PG/S3 failure-injection drill,
+permanent scorecard evidence, and ledgers.
+
+**Honest remaining CT-005 floor:** the founder must perform a real Myelin push and observe its
+exact-head required check settle with archived and live output through the verifier, browser, and
+CLI. CT-007 and the four-week R4 exit clock remain closed until that evidence exists.
 
 ## R5–R6
 
