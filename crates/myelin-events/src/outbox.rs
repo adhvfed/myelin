@@ -113,9 +113,9 @@ fn bounded_retained_rows(
         let envelope_bytes = serde_json::to_vec(&row.envelope)
             .map_err(|_| OutboxError("retained outbox envelope could not be measured".into()))?
             .len();
-        total_bytes = total_bytes.checked_add(envelope_bytes).ok_or_else(|| {
-            OutboxError("retained outbox envelope byte count overflowed".into())
-        })?;
+        total_bytes = total_bytes
+            .checked_add(envelope_bytes)
+            .ok_or_else(|| OutboxError("retained outbox envelope byte count overflowed".into()))?;
         if total_bytes > maximum_envelope_bytes {
             return Err(OutboxError(
                 "retained outbox snapshot exceeds its envelope byte limit".into(),
@@ -1236,7 +1236,9 @@ mod tests {
     fn publisher_grants_are_column_scoped_and_forbid_outbox_mutation() {
         assert!(OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("GRANT SELECT ON TABLE outbox"));
         assert!(OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("UPDATE (published_at)"));
-        assert!(OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("SELECT, INSERT ON TABLE outbox_quarantine"));
+        assert!(
+            OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("SELECT, INSERT ON TABLE outbox_quarantine")
+        );
         assert!(!OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("GRANT INSERT ON TABLE outbox "));
         assert!(!OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("GRANT DELETE"));
         assert!(!OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("UPDATE (attempts)"));
@@ -1368,9 +1370,7 @@ mod tests {
                 .unwrap();
             match mismatch {
                 "event_id" => tx.staged_rows[0].event_id = EventId("different-id".into()),
-                "aggregate" => {
-                    tx.staged_rows[0].aggregate = AggregateKey("issue:DIFFERENT".into())
-                }
+                "aggregate" => tx.staged_rows[0].aggregate = AggregateKey("issue:DIFFERENT".into()),
                 "subject" => {
                     tx.staged_rows[0].subject =
                         ArtifactRef("myelin://acme/issues/issue/DIFFERENT".into())
@@ -1739,7 +1739,9 @@ mod tests {
         }
         fn try_committed_rows(&self) -> Result<Vec<OutboxRow>> {
             if self.snapshot_fails {
-                Err(OutboxError("injected committed-row snapshot failure".into()))
+                Err(OutboxError(
+                    "injected committed-row snapshot failure".into(),
+                ))
             } else {
                 Ok(self.committed_rows())
             }

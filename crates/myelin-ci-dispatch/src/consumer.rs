@@ -675,11 +675,20 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| SkipReason::MalformedPayload("missing `ref`".into()))?;
-            validate_git_ref_name(ref_name)?;
+            let ref_name = myelin_git::receive_pack::RefName::new(ref_name);
+            let ref_key =
+                myelin_git::receive_pack::GitRefEventKey::new(&repo, &ref_name).map_err(|_| {
+                    SkipReason::InvalidProvenance("invalid canonical Git ref event key".into())
+                })?;
             validate_envelope_provenance(
                 ev,
-                &format!("myelin://{}/git/ref/{repo}:{ref_name}", ev.tenant.0),
-                &format!("{repo}:{ref_name}"),
+                &ref_key
+                    .subject(&ev.tenant.0)
+                    .map_err(|_| {
+                        SkipReason::InvalidProvenance("invalid canonical Git ref subject".into())
+                    })?
+                    .0,
+                &ref_key.aggregate().0,
             )?;
             ("new_oid", None, None)
         } else {
@@ -760,32 +769,6 @@ fn validate_envelope_provenance(
         )));
     }
     Ok(())
-}
-
-/// Validate the canonical `check-ref-format` rules used by a fully-qualified provider ref.
-fn validate_git_ref_name(ref_name: &str) -> Result<(), SkipReason> {
-    let invalid = !ref_name.starts_with("refs/")
-        || ref_name.ends_with('/')
-        || ref_name.ends_with('.')
-        || ref_name.contains("//")
-        || ref_name.contains("..")
-        || ref_name.contains("@{")
-        || ref_name.contains([':', '\\'])
-        || ref_name
-            .split('/')
-            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
-        || ref_name.chars().any(|c| {
-            c.is_ascii_control()
-                || c.is_ascii_whitespace()
-                || matches!(c, '~' | '^' | '?' | '*' | '[')
-        });
-    if invalid {
-        Err(SkipReason::InvalidProvenance(format!(
-            "invalid canonical Git ref {ref_name:?}"
-        )))
-    } else {
-        Ok(())
-    }
 }
 
 fn canonical_commit_oid(raw: &str) -> Result<String, SkipReason> {
@@ -1437,6 +1420,11 @@ mod tests {
 
     /// A `git.ref.updated` envelope for `repo` pushing `new_oid`, with the given payload extras.
     fn push_envelope(repo: &str, new_oid: &str) -> EventEnvelope {
+        let ref_key = myelin_git::receive_pack::GitRefEventKey::new(
+            repo,
+            &myelin_git::receive_pack::RefName::new("refs/heads/main"),
+        )
+        .unwrap();
         EventEnvelope {
             event_id: EventId("ev-push-1".into()),
             type_: EventType(GIT_REF_UPDATED.into()),
@@ -1444,8 +1432,8 @@ mod tests {
             tenant: TenantId("acme".into()),
             region: Region("fr-par".into()),
             actor: Actor(principal()),
-            subject: ArtifactRef(format!("myelin://acme/git/ref/{repo}:refs/heads/main")),
-            aggregate: AggregateKey(format!("{repo}:refs/heads/main")),
+            subject: ref_key.subject("acme").unwrap(),
+            aggregate: ref_key.aggregate(),
             causation_id: None,
             correlation_id: CorrelationId("corr-1".into()),
             caused_by: None,
@@ -1983,13 +1971,14 @@ mod tests {
         let mut cases = Vec::new();
         let mut wrong_subject_repo = push_envelope("team/web", TEST_OID);
         wrong_subject_repo.subject =
-            ArtifactRef("myelin://acme/git/ref/other/web:refs/heads/main".into());
+            ArtifactRef("myelin://acme/git/ref/other%2Fweb:refs%2Fheads%2Fmain".into());
         cases.push(wrong_subject_repo);
         let mut wrong_tenant = push_envelope("web", TEST_OID);
-        wrong_tenant.subject = ArtifactRef("myelin://other/git/ref/web:refs/heads/main".into());
+        wrong_tenant.subject = ArtifactRef("myelin://other/git/ref/web:refs%2Fheads%2Fmain".into());
         cases.push(wrong_tenant);
         let mut wrong_aggregate = push_envelope("web", TEST_OID);
-        wrong_aggregate.aggregate = AggregateKey("ATTACKER_SENTINEL:refs/heads/main".into());
+        wrong_aggregate.aggregate =
+            AggregateKey("ref:ATTACKER_SENTINEL:refs%2Fheads%2Fmain".into());
         cases.push(wrong_aggregate);
         let mut invalid_repo = push_envelope("web", TEST_OID);
         invalid_repo.payload["repo"] = serde_json::json!("../web");

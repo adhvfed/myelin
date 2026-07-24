@@ -247,7 +247,8 @@ impl BusErasureLedger {
                 // recorded — an unrecorded erasure is a silent resurrection path across a backup
                 // restore (the re-erasure pass would MISS the subject and report BUS-D8 green while a
                 // real identity resolves).
-                if let Err(e) = d.record(&self.tenant, &self.region, subject, key_refs, &erased_at) {
+                if let Err(e) = d.record(&self.tenant, &self.region, subject, key_refs, &erased_at)
+                {
                     panic!(
                         "BUS ERASURE-LEDGER DURABILITY FAILURE (fail-static): the erasure record for \
                          subject={subject} tenant={} could NOT be persisted — an unrecorded erasure is \

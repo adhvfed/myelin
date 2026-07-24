@@ -55,6 +55,11 @@ impl GitConfigReader for CheckedInConfig {
 
 fn push_envelope() -> EventEnvelope {
     let tenant = TenantId("myelin".into());
+    let ref_key = myelin_git::receive_pack::GitRefEventKey::new(
+        "myelin",
+        &myelin_git::receive_pack::RefName::new("refs/heads/main"),
+    )
+    .unwrap();
     EventEnvelope {
         event_id: EventId("founder-push".into()),
         type_: EventType(myelin_git::events::GIT_REF_UPDATED.into()),
@@ -66,8 +71,8 @@ fn push_envelope() -> EventEnvelope {
             PrincipalKind::Human,
             tenant,
         )),
-        subject: ArtifactRef("myelin://myelin/git/ref/myelin:refs/heads/main".into()),
-        aggregate: AggregateKey("myelin:refs/heads/main".into()),
+        subject: ref_key.subject("myelin").unwrap(),
+        aggregate: ref_key.aggregate(),
         causation_id: None,
         correlation_id: CorrelationId("founder-acceptance".into()),
         caused_by: None,
