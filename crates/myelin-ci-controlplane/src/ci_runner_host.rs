@@ -205,7 +205,8 @@ impl CiRunnerHost {
     }
 }
 
-fn map_starter_error(_error: CiRunStarterPollerError) -> CiRunnerHostFailure {
+fn map_starter_error(error: CiRunStarterPollerError) -> CiRunnerHostFailure {
+    eprintln!("ci-controlplane: {error}");
     CiRunnerHostFailure::Starter
 }
 

@@ -83,9 +83,16 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let runtime_factory = source
         .find("ci_production_runtime_factory(")
         .expect("the exact-tenant workflow/reporter factory must be composed at the root");
+    let definition_activation = source
+        .find("runner_runtime.activate_definition()")
+        .expect("the source-pinned ci.pipeline definition must be durably activated");
     let starter_poller = source
         .find("PgCiRunStarterPoller::new(")
         .expect("the region discovery to exact-tenant starter poller must be composed at the root");
+    assert!(
+        runtime_factory < definition_activation && definition_activation < starter_poller,
+        "definition activation must succeed before queued-run intake is constructed"
+    );
     let workflow_poller = source
         .find(".workflow_poller(scheduler_provider.region_run_discovery()")
         .expect("active-run recovery must be composed at the dormant production root");
