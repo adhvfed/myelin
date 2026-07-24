@@ -36,7 +36,12 @@ vectors, including fresh, replay, terminal, ahead-of-head, and pruned-cursor bra
 live consumption is now closed by CT-005f4: the compiled thin client snapshots archived bytes, consumes
 the pointer-only stream, fetches every appended range before acknowledging its cursor, and catches up
 the archive before clearing a retention-stale cursor. CT-005f5 now closes the production-path CI-D11
-committed-prefix sever/resume drill. The founder acceptance pass remains open.
+committed-prefix sever/resume drill. CT-005f6 adds the bounded, no-overwrite founder verifier that
+re-reads the terminal run and complete archive through Edge and emits a checksum-bearing receipt only
+when the independently captured live output and archive contain the exact marker once. CT-005f7 checks
+in the V2 one-job founder pipeline, executes its real file through production Dispatch planning into
+the decoded CAS snapshot, and refuses runner activation unless the staged personal-cell rootfs matches
+the authored digest. The founder acceptance pass itself remains open.
 CT-007 is still unopened; GitHub Actions must not be
 removed before the founder acceptance pass and the complete CT-005 surface are genuinely usable.
 
@@ -197,6 +202,24 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   concatenated bytes and PostgreSQL independently contains exactly two contiguous segments. This
   proves the committed-prefix sever boundary; it does not claim a kill inside CAS/PG commit,
   commit-unknown replay, or HTTP-wire serialization.
+- **CT-005f6 — mechanical founder-acceptance receipt:** `dogfood.sh verify-ci` accepts only the real
+  pipe-delimited capability shape over verified HTTPS or exact numeric-loopback HTTP, disables
+  inherited curl tracing and proxies, and bounds every response. It requires the exact succeeded,
+  cost-settled run/job, walks at most 256 full non-final 256 KiB pages under stable totals and exact
+  continuation coordinates, canonical-decodes each Base64 body, and caps the archive at 64 MiB.
+  Existing, linked, partial, malformed, or cross-scope evidence cannot produce the checksum-bearing
+  receipt. Seven compiled Bash/curl/socket contracts cover the green two-page path plus transport,
+  paging, encoding, and no-overwrite refusals with zero credential disclosure.
+- **CT-005f7 — armed founder pipeline:** the real repository now carries a V2 `on = "push"`
+  `linux-small-v1` pipeline with one `build` job that emits the acceptance marker exactly once. Its
+  compiled contract reads the checked-in file, drives a canonical `git.ref.updated` through
+  `plan_dispatch`, requires one queued CI `build` context, then reads and decodes the emitted CAS
+  snapshot and verifies the exact profile, image, and command. Before intake, `dogfood.sh ci`
+  canonical-hashes the staged personal-cell rootfs and refuses activation unless it matches the
+  authored image pin. A focused required-runsc production test also confirms this host executes and
+  captures an ordinary shell command through the real gVisor backend. The immutable release-grade
+  image/provenance mechanism remains explicitly sequenced in P0; this one-cell binding is the honest
+  R4 founder-dogfood bridge.
 
 **Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
 services. It is not an honest production SSE resume source. SSE remains open until a real
@@ -212,8 +235,9 @@ mechanical rather than conventional. CT-005f4 closes the authenticated CLI consu
 inventing run-wide aggregation: the production resume authority is exact `(run_id, job_id)`, so the
 code requires `--job` even though the frozen plan used the shorthand `ci watch <run>`. CT-005f5
 closes the remaining composed CI-D11 committed-prefix drill without overstating unproven
-commit-unknown or HTTP-wire failure modes. The live founder push→settled check→surfaced archived/live
-log pass and CT-007 remain open.
+commit-unknown or HTTP-wire failure modes. CT-005f6 and CT-005f7 make the remaining founder act
+machine-verifiable and genuinely triggerable without claiming that it already happened. The live
+founder push→settled check→surfaced archived/live log pass and CT-007 remain open.
 
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod
