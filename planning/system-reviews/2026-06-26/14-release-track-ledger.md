@@ -2039,6 +2039,17 @@ post-completion archive pagination, shared-marker comparison, and evidence captu
 finishes before the live consumers attach must be repeated rather than counted. CT-007 and the
 four-week R4 exit clock remain closed until that evidence exists.
 
+**CT-007 handoff floor (pre-registered; phase still closed).** Code wins over a tempting literal
+interpretation of “cut over”: `.myelin/ci.toml` currently proves only the push/runner/log/check
+transport, while `.github/workflows/ci.yml` still carries the real Rust, frontend/browser,
+web-container, architecture, contract, scorecard, mutation, and release-bundle workloads. Deleting
+Actions after the marker pass would remove CI rather than migrate it. Ledger 12 now requires a
+committed inventory that fails on silent job loss, digest-pinned one-cell runner capabilities for
+the mapped workloads, one exact-commit full-graph pass with a trusted required context and zero
+missed mandatory-core mutants, then a second ordinary Myelin-only pass before GitHub execution can
+be disabled. P0 still promotes the temporary one-cell asset into the signed/SBOM supply-chain floor;
+it does not retroactively make a marker-only R4 cutover honest.
+
 ## R5–R6
 
 | Phase | Status |
