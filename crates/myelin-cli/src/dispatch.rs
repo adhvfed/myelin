@@ -308,9 +308,7 @@ pub fn issues_command_to_call(command: &IssuesCliCommand) -> EdgeCall {
     }
 }
 
-/// Parse CI's subsystem-owned durable-read grammar and map it to the authenticated Edge routes.
-/// `ci watch` is refused by that grammar until the separately deployed runner and Edge share a real
-/// bounded resume authority.
+/// Parse CI's subsystem-owned durable-read/live grammar and map it to authenticated Edge routes.
 pub fn ci_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     let command = parse_ci_cli(args).map_err(|error| CliError::Usage(error.to_string()))?;
     Ok(ci_command_to_call(&command))
@@ -349,6 +347,9 @@ pub fn ci_command_to_call(command: &CiCliCommand) -> EdgeCall {
                 payload: None,
             }
         }
+        CiCliCommand::Watch { run_id, job_id } => EdgeCall::get(format!(
+            "/v1/ci/runs/{run_id}/jobs/{job_id}/log/live"
+        )),
     }
 }
 
@@ -709,10 +710,18 @@ mod tests {
         assert_eq!(log.path, format!("/v1/ci/runs/{run}/jobs/{job}/log"));
         assert_eq!(log.query.as_deref(), Some("start=9&limit=7"));
         assert!(log.payload.is_none());
+
+        let watch = ci_dispatch(&["watch", run, "--job", job]).unwrap();
+        assert_eq!(
+            watch.path,
+            format!("/v1/ci/runs/{run}/jobs/{job}/log/live")
+        );
+        assert!(watch.query.is_none());
+        assert!(watch.payload.is_none());
     }
 
     #[test]
-    fn ci_live_and_malformed_requests_fail_locally() {
+    fn malformed_ci_requests_fail_locally() {
         let run = "91000000-0000-4000-8000-000000000001";
         for invalid in [
             vec!["watch", run],

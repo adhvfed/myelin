@@ -10,7 +10,7 @@
 //! `myelin <subsystem> <command> [args]`. The top-level shell (clap) owns ONLY the global flags
 //! (`--json`/`--edge`/`--token`/`--scheme`) + `login`/`whoami`; the per-subsystem command SET is
 //! REUSED from the subsystem crates — git's [`myelin_git::api::parse_cli`] / [`myelin_git::api::CliCommand`]
-//! Issues' [`myelin_issues::api`] grammar, CI's [`myelin_ci_controlplane::cli`] durable-read
+//! Issues' [`myelin_issues::api`] grammar, CI's [`myelin_ci_controlplane::cli`] durable-read/live
 //! grammar, and notif's [`myelin_notif::cli`] grammar — so a new subsystem command flows to the CLI
 //! without re-declaring it here. See [`dispatch`] for the "how a subsystem adds CLI commands"
 //! convention (the mirror of the MR-014 edge plug-in convention).
@@ -29,6 +29,7 @@
 //! eleven-crate library DAG modelled by `myelin_substrate::crate_graph` (substrate_is_root() /
 //! identity_is_sink() are unaffected — a CLI is a terminal consumer).
 
+pub mod ci_watch;
 pub mod client;
 pub mod config;
 pub mod dispatch;

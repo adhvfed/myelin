@@ -17,7 +17,7 @@ use crate::error::CliError;
 use base64::Engine as _;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::{Request, Uri};
+use hyper::{Request, Response, Uri};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -109,6 +109,57 @@ fn is_loopback_host(host: &str) -> bool {
 /// [`CliError::Edge`]. No panic, ever.
 pub async fn execute(config: &EdgeConfig, token: &str, call: &EdgeCall) -> Result<Value, CliError> {
     execute_with_limits(config, token, call, REQUEST_DEADLINE, MAX_RESPONSE_BYTES).await
+}
+
+/// Open a long-lived authenticated SSE response. The deadline covers only request construction and
+/// receipt of response headers; once a valid stream is open, its lifetime belongs to the caller.
+/// Non-success statuses are returned intact so the CI consumer can distinguish retention-stale 409
+/// from terminal authorization/input failures.
+pub async fn open_event_stream(
+    config: &EdgeConfig,
+    token: &str,
+    call: &EdgeCall,
+    last_event_id: Option<u64>,
+) -> Result<Response<hyper::body::Incoming>, CliError> {
+    if call.method != crate::dispatch::HttpMethod::Get
+        || call.query.is_some()
+        || call.payload.is_some()
+    {
+        return Err(CliError::Transport(
+            "event stream call must be a query-free GET".into(),
+        ));
+    }
+    let target = target(config, call)?;
+    let connector = HttpsConnectorBuilder::new()
+        .with_provider_and_native_roots(rustls::crypto::aws_lc_rs::default_provider())
+        .map_err(|e| CliError::Transport(format!("load native TLS trust roots: {e}")))?
+        .https_or_http()
+        .enable_http1()
+        .build();
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(connector);
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(&target.uri)
+        .header("host", &target.authority)
+        .header("accept", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-myelin-token-scheme", &config.scheme);
+    if let Some(cursor) = last_event_id {
+        builder = builder.header("last-event-id", cursor.to_string());
+    }
+    let request = builder
+        .body(Full::new(Bytes::new()))
+        .map_err(|e| CliError::Transport(format!("build event stream request: {e}")))?;
+    tokio::time::timeout(REQUEST_DEADLINE, client.request(request))
+        .await
+        .map_err(|_| {
+            CliError::Transport(format!(
+                "edge event stream connect exceeded the {}-second deadline",
+                REQUEST_DEADLINE.as_secs()
+            ))
+        })?
+        .map_err(|e| CliError::Transport(format!("edge event stream request failed: {e}")))
 }
 
 async fn execute_with_limits(

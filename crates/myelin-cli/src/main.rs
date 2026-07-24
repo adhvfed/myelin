@@ -57,7 +57,8 @@ enum Command {
         args: Vec<String>,
     },
     /// Durable CI reads: `list [--status …]` | `view <run>` |
-    /// `logs <run> --job <job> [--start <byte>] [--limit <bytes>]`.
+    /// `logs <run> --job <job> [--start <byte>] [--limit <bytes>]` |
+    /// `watch <run> --job <job>`.
     Ci {
         /// The CI subcommand + args, parsed by CI's own total grammar.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -151,6 +152,12 @@ async fn run_call(
 ) -> Result<(), CliError> {
     let edge = resolve_edge(cli.edge.as_deref(), cli.scheme.as_deref(), getenv);
     let token = resolve_token(cli.token.as_deref(), getenv, read_file)?;
+    if call.path.starts_with("/v1/ci/runs/") && call.path.ends_with("/log/live") {
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        return myelin_cli::ci_watch::execute_ci_watch(&edge, &token, &call, cli.json, &mut output)
+            .await;
+    }
     let value = execute(&edge, &token, &call).await?;
     print!(
         "{}",
