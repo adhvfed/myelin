@@ -1842,6 +1842,63 @@ mod tests {
         assert!(error.0.contains("injected committed-row snapshot failure"));
     }
 
+    #[test]
+    fn retained_snapshot_accepts_exact_and_slack_ceilings_without_dropping_rows() {
+        let (store, minter) = store_and_minter();
+        let mut tx = store.begin(minter, ctx_base());
+        tx.emit(draft("issues.issue.created", "issue:BOUNDED"), None)
+            .unwrap();
+        tx.commit().unwrap();
+
+        let expected = store.try_retained_rows().unwrap();
+        assert_eq!(expected.len(), 1, "fixture has one retained witness");
+        let envelope_bytes = serde_json::to_vec(&expected[0].envelope).unwrap().len();
+
+        assert_eq!(
+            store
+                .try_retained_rows_bounded(expected.len(), envelope_bytes)
+                .unwrap(),
+            expected,
+            "both ceilings are inclusive"
+        );
+        assert_eq!(
+            store
+                .try_retained_rows_bounded(expected.len() + 1, envelope_bytes + 1)
+                .unwrap(),
+            expected,
+            "a below-ceiling snapshot preserves every retained witness"
+        );
+    }
+
+    #[test]
+    fn retained_snapshot_refuses_one_row_or_envelope_byte_over_a_ceiling() {
+        let (store, minter) = store_and_minter();
+        let mut tx = store.begin(minter, ctx_base());
+        tx.emit(draft("issues.issue.created", "issue:OVERSIZED"), None)
+            .unwrap();
+        tx.commit().unwrap();
+
+        let retained = store.try_retained_rows().unwrap();
+        let envelope_bytes = serde_json::to_vec(&retained[0].envelope).unwrap().len();
+        assert!(envelope_bytes > 0);
+
+        let rows_error = store
+            .try_retained_rows_bounded(0, envelope_bytes)
+            .expect_err("one row over the ceiling must fail closed");
+        assert_eq!(
+            rows_error.0,
+            "retained outbox snapshot exceeds its row limit"
+        );
+
+        let bytes_error = store
+            .try_retained_rows_bounded(retained.len(), envelope_bytes - 1)
+            .expect_err("one envelope byte over the ceiling must fail closed");
+        assert_eq!(
+            bytes_error.0,
+            "retained outbox snapshot exceeds its envelope byte limit"
+        );
+    }
+
     /// **Commit dispatch routes the whole staged buffer to `commit_staged` (the durable arm of the
     /// co-commit).** A `Durable` store's transaction stages rows, and `commit()` hands them — in
     /// ONE atomic call — to the backing (nothing reaches it before commit; emit-iff-committed

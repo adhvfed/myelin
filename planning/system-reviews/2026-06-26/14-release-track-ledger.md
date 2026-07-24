@@ -2090,6 +2090,13 @@ attempts. All four services then shut down cleanly. The older pre-fix rehearsal
 Mechanical payoff: excess non-public publisher grants 1→0; queued snapshot triggers 2→0; trusted
 full-source-tree check projections 0→2.
 
+The same R4.2 boundary then failed its mandatory-core mutation gate on eight retained-snapshot
+mutants: an empty result and incorrect inclusive row/byte comparisons survived. Public-path tests
+now pin exact/slack acceptance, preserved rows, and one-under row/envelope refusal. The full
+configured run accounts for all 464 mutants (360 caught, 104 compile-time unviable, zero missed,
+zero timed out). Code wins: the inclusive production ceiling remains unchanged; the missing
+boundary contract is now executable. Mechanical payoff: missed mandatory-core mutants 8→0.
+
 **CT-007 handoff floor (pre-registered; phase still closed).** Code wins over a tempting literal
 interpretation of “cut over”: `.myelin/ci.toml` currently proves only the push/runner/log/check
 transport, while `.github/workflows/ci.yml` still carries the real Rust, frontend/browser,

@@ -250,6 +250,12 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   `da50c464-28bd-0dc8-3926-5e17ace266ef` settled succeeded/cost-settled with trusted attempt-1
   `ci/build` projections and zero publish retries. The old `5db61d81-…` pre-fix rehearsal remains
   explicit negative evidence, not a green acceptance record.
+- **CT-005f8b — retained-snapshot mutation closure:** the mandatory-core mutation gate exposed eight
+  surviving mutations in the bounded outbox snapshot path: empty snapshots and incorrect inclusive
+  row/byte ceilings were not distinguished. Public-path tests now require exact and slack ceilings
+  to preserve the retained row and require either ceiling at one under the row/envelope size to
+  refuse. The complete configured gate accounts for all 464 mutants: 360 caught, 104 compile-time
+  unviable, zero missed, and zero timed out. Mechanical payoff: missed mandatory-core mutants 8→0.
 
 **Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
 services. It is not an honest production SSE resume source. SSE remains open until a real
