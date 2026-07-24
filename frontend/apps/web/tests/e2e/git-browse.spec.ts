@@ -27,6 +27,13 @@ async function devLogin(page: Page) {
 }
 
 test.describe("GT-004 Git web UI — real browser", () => {
+  test.afterEach(async ({ request }) => {
+    const response = await request.post(`${EDGE}/__test/config`, {
+      data: { forceUnauthorized: false },
+    });
+    expect(response.ok()).toBe(true);
+  });
+
   test("the 401→/login floor holds on a deep git screen (unauthenticated)", async ({ page }) => {
     await page.goto("/git/repos/myelin/prs/1");
     await page.waitForURL("**/login");
@@ -243,17 +250,12 @@ test.describe("GT-004 Git web UI — real browser", () => {
       if (message.type() === "error") consoleErrors.push(message.text());
     });
 
-    await page.request.post(`${EDGE}/__test/config`, {
+    const forced = await page.request.post(`${EDGE}/__test/config`, {
       data: { forceUnauthorized: true },
     });
-    try {
-      await page.goto("/git/repos/myelin");
-      await page.waitForURL("**/login");
-      expect(consoleErrors.filter((message) => message.includes("Content Security Policy"))).toEqual([]);
-    } finally {
-      await page.request.post(`${EDGE}/__test/config`, {
-        data: { forceUnauthorized: false },
-      });
-    }
+    expect(forced.ok()).toBe(true);
+    await page.goto("/git/repos/myelin");
+    await page.waitForURL("**/login");
+    expect(consoleErrors.filter((message) => message.includes("Content Security Policy"))).toEqual([]);
   });
 });

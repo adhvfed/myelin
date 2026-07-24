@@ -19,7 +19,7 @@ import { edgeOrigin } from "./edge-origin";
 import { readLimitedText, streamLimitedBytes } from "./bounded-response";
 import { validSessionToken } from "./session-store";
 
-export { GatewayError, Unauthorized } from "./gateway-core";
+export { GatewayError, Unauthorized, isUnauthorized } from "./gateway-core";
 
 export const DEFAULT_EDGE_REQUEST_TIMEOUT_MS = 15_000;
 export const MAX_EDGE_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;

@@ -59,14 +59,14 @@ interface NavItem {
   soon?: boolean;
 }
 
-// The primary subsystem rail. Code and the founder Issues floor are wired; the rest are declared
+// The primary subsystem rail. Code, CI reads, and the founder Issues floor are wired; the rest are declared
 // destinations (their surfaces land with each subsystem track) — present, HONEST about being unbuilt:
 // reachable "soon" links, not dead/disabled icons (the rail-honesty argument, §6).
 const NAV: NavItem[] = [
   { href: "/git/repos", icon: "nav-code", label: "Code" },
   { href: "/issues", icon: "nav-issues", label: "Issues" },
   { href: "/chat", icon: "nav-chat", label: "Chat", soon: true },
-  { href: "/ci", icon: "nav-ci", label: "CI", soon: true },
+  { href: "/ci", icon: "nav-ci", label: "CI" },
   { href: "/knowledge", icon: "nav-knowledge", label: "Knowledge", soon: true },
 ];
 

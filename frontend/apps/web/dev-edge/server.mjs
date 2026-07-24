@@ -46,6 +46,15 @@ import {
   unauthorizedEnvelope,
   notFoundEnvelope,
 } from "./dev-contract.mjs";
+import {
+  CI_VISIBLE_REPO_REFS,
+  ciLogJson,
+  ciRunJson,
+  ciRunsEnvelope,
+  isCiUuid,
+  parseCiLogQuery,
+  parseCiRunsQuery,
+} from "./ci-contract.mjs";
 
 const PORT = Number(process.env.DEV_EDGE_PORT ?? 8787);
 
@@ -87,6 +96,12 @@ const state = {
   prCommitContinuationFailures: 0,
   prCommitContinuationMalformedPages: 0,
   prCommitContinuationRequests: 0,
+  // CT-005 CI read-surface controls. Cursors bind the canonicalized concrete visible-repository set,
+  // just as production does; tests mutate membership rather than a synthetic generation counter.
+  emptyCi: false,
+  ciUnavailable: false,
+  ciLogUnavailable: false,
+  ciVisibleRepoRefs: [...CI_VISIBLE_REPO_REFS],
 };
 
 let issueRows = freshIssueFixtures();
@@ -140,6 +155,21 @@ function resetPrCommitPagination() {
   state.prCommitContinuationFailures = 0;
   state.prCommitContinuationMalformedPages = 0;
   state.prCommitContinuationRequests = 0;
+}
+
+function resetCi() {
+  state.emptyCi = false;
+  state.ciUnavailable = false;
+  state.ciLogUnavailable = false;
+  state.ciVisibleRepoRefs = [...CI_VISIBLE_REPO_REFS];
+}
+
+function decodeCiPathSegment(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
 }
 
 function send(res, status, json, headers = {}) {
@@ -231,6 +261,14 @@ const server = createServer((req, res) => {
           resetPrCommitPagination();
         }
         if (body.resetIssues === true) resetIssues();
+        if (body.resetCi === true) resetCi();
+        if (typeof body.emptyCi === "boolean") state.emptyCi = body.emptyCi;
+        if (typeof body.ciUnavailable === "boolean") state.ciUnavailable = body.ciUnavailable;
+        if (typeof body.ciLogUnavailable === "boolean") state.ciLogUnavailable = body.ciLogUnavailable;
+        if (body.addCiVisibleRepo === true &&
+            !state.ciVisibleRepoRefs.includes("myelin://acme/git/repo/z")) {
+          state.ciVisibleRepoRefs.push("myelin://acme/git/repo/z");
+        }
         if (typeof body.emptyIssues === "boolean") state.emptyIssues = body.emptyIssues;
         if (typeof body.onlyClosedIssues === "boolean") state.onlyClosedIssues = body.onlyClosedIssues;
         if (typeof body.issuesUnavailable === "boolean") state.issuesUnavailable = body.issuesUnavailable;
@@ -275,6 +313,92 @@ const server = createServer((req, res) => {
 
   // Every data route requires a valid Bearer (the auth floor). A missing/forged token → uniform 401.
   const authed = !state.forceUnauthorized && bearer(req) === DEV_ACCESS_TOKEN;
+
+  // CT-005 read-only CI surface. The dev implementation uses a keyed keyset cursor and the same
+  // strict query grammar, response shapes, and shared golden vectors as the production Rust Edge.
+  if (method === "GET" && path === "/v1/ci/runs") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (state.ciUnavailable) {
+      return send(res, 503, {
+        error: { message: "CI run data is temporarily unavailable", code: "unavailable" },
+      });
+    }
+    const input = parseCiRunsQuery(url.search.slice(1));
+    if (!input) {
+      return send(res, 400, {
+        error: { message: "invalid CI run query", code: "bad_request" },
+      });
+    }
+    const response = ciRunsEnvelope(input, {
+      empty: state.emptyCi,
+      visibleRepoRefs: state.ciVisibleRepoRefs,
+    });
+    if ("stale" in response) {
+      return send(res, 409, {
+        error: { message: "CI run cursor is stale; restart pagination", code: "conflict" },
+      });
+    }
+    if ("bad" in response) {
+      return send(res, 400, {
+        error: { message: "CI run cursor is malformed", code: "bad_request" },
+      });
+    }
+    return send(res, 200, response, { "cache-control": "no-store" });
+  }
+
+  let ciMatch;
+  if (
+    method === "GET" &&
+    (ciMatch = path.match(/^\/v1\/ci\/runs\/([^/]+)\/jobs\/([^/]+)\/log$/))
+  ) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (state.ciUnavailable || state.ciLogUnavailable) {
+      return send(res, 503, {
+        error: { message: "CI log data is temporarily unavailable", code: "unavailable" },
+      });
+    }
+    const input = parseCiLogQuery(url.search.slice(1));
+    if (!input) {
+      return send(res, 400, {
+        error: { message: "invalid CI log query", code: "bad_request" },
+      });
+    }
+    const runId = decodeCiPathSegment(ciMatch[1]);
+    const jobId = decodeCiPathSegment(ciMatch[2]);
+    if (!isCiUuid(runId) || !isCiUuid(jobId)) {
+      return send(res, 400, {
+        error: { message: "CI run and job ids must be canonical UUIDs", code: "bad_request" },
+      });
+    }
+    const response = ciLogJson(runId, jobId, input, { empty: state.emptyCi });
+    return response
+      ? send(res, 200, response, { "cache-control": "no-store" })
+      : send(res, 404, notFoundEnvelope("CI run"));
+  }
+
+  if (method === "GET" && (ciMatch = path.match(/^\/v1\/ci\/runs\/([^/]+)$/))) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (state.ciUnavailable) {
+      return send(res, 503, {
+        error: { message: "CI run data is temporarily unavailable", code: "unavailable" },
+      });
+    }
+    if (url.search) {
+      return send(res, 400, {
+        error: { message: "CI run view accepts no query parameters", code: "bad_request" },
+      });
+    }
+    const runId = decodeCiPathSegment(ciMatch[1]);
+    if (!isCiUuid(runId)) {
+      return send(res, 400, {
+        error: { message: "CI run id must be a canonical UUID", code: "bad_request" },
+      });
+    }
+    const response = ciRunJson(runId, { empty: state.emptyCi });
+    return response
+      ? send(res, 200, response, { "cache-control": "no-store" })
+      : send(res, 404, notFoundEnvelope("CI run"));
+  }
 
   // R4.4 Issues writes. The create body is contract-checked against the one server-injected dogfood
   // target; the dev edge never accepts browser-selected scope IDs either.

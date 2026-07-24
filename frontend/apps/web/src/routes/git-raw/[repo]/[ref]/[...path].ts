@@ -6,8 +6,7 @@
 // `?d=attachment` selects a forced download; anything else is the inert inline `raw` variant.
 import type { APIEvent } from "@solidjs/start/server";
 import { rawResponseHeaders } from "~/lib/raw-response";
-import { edgeGetRaw } from "~/server/gateway";
-import { Unauthorized } from "~/server/gateway";
+import { edgeGetRaw, isUnauthorized } from "~/server/gateway";
 
 export async function GET(event: APIEvent) {
   const { repo, ref } = event.params;
@@ -32,7 +31,7 @@ export async function GET(event: APIEvent) {
     const headers = rawResponseHeaders({ attachment, contentType: res.contentType, path });
     return new Response(res.body, { status: res.status, headers });
   } catch (e) {
-    if (e instanceof Unauthorized) {
+    if (isUnauthorized(e)) {
       // The browser is not authenticated for this byte stream — send it to login.
       return new Response(null, { status: 302, headers: { location: "/login" } });
     }

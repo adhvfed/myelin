@@ -588,7 +588,9 @@ impl CiRunStore {
     }
 }
 
-fn canonical_visible_repo_refs(values: &[String]) -> Result<Vec<String>, CiRunSurfaceError> {
+/// Canonical cursor-scope identity for a bounded visible-repository set. Public so every second
+/// implementation can execute the same golden ordering/deduplication vectors.
+pub fn canonical_visible_repo_refs(values: &[String]) -> Result<Vec<String>, CiRunSurfaceError> {
     if values.len() > CI_RUN_VISIBLE_REPO_MAX {
         return Err(CiRunSurfaceError::BadInput(format!(
             "visible repository set exceeds {CI_RUN_VISIBLE_REPO_MAX}"

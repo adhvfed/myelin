@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   GatewayError,
   Unauthorized,
+  isUnauthorized,
   runGateway,
   type GwResponse,
 } from "./gateway-core";
@@ -13,6 +14,18 @@ const unauthorized = (): GwResponse => ({
 });
 
 describe("gateway-core (the cookie-auth lifecycle, doc 10 §5)", () => {
+  it("recognizes Unauthorized across duplicate server bundle constructor identities", () => {
+    const otherBundleError = new Error("session refresh failed");
+    Object.defineProperty(otherBundleError, Symbol.for("myelin.gateway.Unauthorized.v1"), {
+      value: true,
+    });
+    expect(isUnauthorized(new Unauthorized())).toBe(true);
+    expect(isUnauthorized(otherBundleError)).toBe(true);
+    expect(isUnauthorized(Object.assign(new Error("Unauthorized"), { name: "Unauthorized" })))
+      .toBe(false);
+    expect(isUnauthorized({ name: "GatewayError" })).toBe(false);
+  });
+
   it("throws Unauthorized when there is no session token (never even calls the edge)", async () => {
     const doFetch = vi.fn();
     await expect(

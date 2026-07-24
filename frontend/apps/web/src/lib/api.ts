@@ -3,7 +3,7 @@
 // that survived the single refresh + retry) the query throws a `/login` redirect — the canon's
 // 401→/login behaviour, applied centrally.
 import { action, json, query, redirect } from "@solidjs/router";
-import { edgeGet, edgePost, GatewayError, Unauthorized } from "../server/gateway";
+import { edgeGet, edgePost, GatewayError, isUnauthorized } from "../server/gateway";
 import {
   parseIssueMutation,
   parsePrMutation,
@@ -51,6 +51,23 @@ import {
   type GitRefsInput,
   type GitTreeInput,
 } from "./git-read-input";
+import {
+  ciLogSearchParams,
+  ciRunsSearchParams,
+  parseCiLogInput,
+  parseCiRunId,
+  parseCiRunsInput,
+  type CiLogInput,
+  type CiRunsInput,
+} from "./ci-read-input";
+import {
+  parseCiLogRange,
+  parseCiRunDetail,
+  parseCiRunsPage,
+  type CiLogRangeVM,
+  type CiRunDetailVM,
+  type CiRunsPage,
+} from "./ci-read-response";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
 
@@ -493,6 +510,20 @@ export class RepoRouteError extends Error {
   }
 }
 
+export type CiErrorKind = "bad-input" | "not-found" | "stale" | "unavailable" | "error";
+export const CI_ERR_PREFIX = "CI_ERR:";
+
+/** CI read errors carry only a dignified category across the server boundary; raw Edge storage or
+ * authorization details never become browser copy. */
+export class CiRouteError extends Error {
+  readonly kind: CiErrorKind;
+  constructor(kind: CiErrorKind) {
+    super(`${CI_ERR_PREFIX}${kind}`);
+    this.name = "CiRouteError";
+    this.kind = kind;
+  }
+}
+
 /** Map an edge HTTP status → the dignified error kind. Anti-oracle: policy may make no-access
  *  indistinguishable from not-found (the edge serves the 0-leak 404 on a Pull deny), so a 404 is
  *  `not-found` and a 403 is `no-access`; everything else is the retryable `error`. */
@@ -509,7 +540,7 @@ async function authed<T>(fetcher: () => Promise<T>): Promise<T> {
   try {
     return await fetcher();
   } catch (e) {
-    if (e instanceof Unauthorized) throw redirect("/login");
+    if (isUnauthorized(e)) throw redirect("/login");
     if (e instanceof GatewayError) throw new RepoRouteError(mapStatusToKind(e.status));
     // A transport/parse failure with no HTTP status is the retryable error kind.
     throw new RepoRouteError("error");
@@ -520,7 +551,7 @@ async function treeAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
   try {
     return await fetcher();
   } catch (e) {
-    if (e instanceof Unauthorized) throw redirect("/login");
+    if (isUnauthorized(e)) throw redirect("/login");
     if (e instanceof GatewayError) {
       if (e.status === 409) throw new RepoRouteError("stale-tree");
       throw new RepoRouteError(mapStatusToKind(e.status));
@@ -534,7 +565,7 @@ async function issueAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
   try {
     return await fetcher();
   } catch (e) {
-    if (e instanceof Unauthorized) throw redirect("/login");
+    if (isUnauthorized(e)) throw redirect("/login");
     if (e instanceof GatewayError) {
       if (e.status === 400) throw new IssueRouteError("bad-input");
       if (e.status === 404) throw new IssueRouteError("not-found");
@@ -545,11 +576,27 @@ async function issueAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
   }
 }
 
+async function ciAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
+  try {
+    return await fetcher();
+  } catch (e) {
+    if (isUnauthorized(e)) throw redirect("/login");
+    if (e instanceof GatewayError) {
+      if (e.status === 400) throw new CiRouteError("bad-input");
+      if (e.status === 404) throw new CiRouteError("not-found");
+      if (e.status === 409) throw new CiRouteError("stale");
+      if (e.status === 503) throw new CiRouteError("unavailable");
+    }
+    if (e instanceof CiRouteError) throw e;
+    throw new CiRouteError("error");
+  }
+}
+
 async function inboxAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
   try {
     return await fetcher();
   } catch (e) {
-    if (e instanceof Unauthorized) throw redirect("/login");
+    if (isUnauthorized(e)) throw redirect("/login");
     throw new Error("INBOX_UNAVAILABLE");
   }
 }
@@ -571,6 +618,46 @@ export const getRepos = query(async (request: GitRepoListInput = {}): Promise<Re
     return page;
   });
 }, "git-repos");
+
+/** Repository-authorized durable CI run summaries, newest first under an opaque keyset cursor. */
+export const getCiRuns = query(async (request: CiRunsInput = {}): Promise<CiRunsPage> => {
+  "use server";
+  const input = parseCiRunsInput(request);
+  if (!input) throw new CiRouteError("bad-input");
+  return ciAuthed(async () => {
+    const search = ciRunsSearchParams(input).toString();
+    const page = parseCiRunsPage(await edgeGet(`/v1/ci/runs${search ? `?${search}` : ""}`));
+    if (!page) throw new CiRouteError("error");
+    return page;
+  });
+}, "ci-runs");
+
+/** One authorized durable run with its exact job DAG and archived-log step anchors. */
+export const getCiRun = query(async (run: string): Promise<CiRunDetailVM> => {
+  "use server";
+  const input = parseCiRunId(run);
+  if (!input) throw new CiRouteError("bad-input");
+  return ciAuthed(async () => {
+    const detail = parseCiRunDetail(await edgeGet(`/v1/ci/runs/${seg(input)}`), input);
+    if (!detail) throw new CiRouteError("error");
+    return detail;
+  });
+}, "ci-run");
+
+/** A byte-exact bounded archived log range. This is deliberately not named or rendered as live. */
+export const getCiLog = query(async (request: CiLogInput): Promise<CiLogRangeVM> => {
+  "use server";
+  const input = parseCiLogInput(request);
+  if (!input) throw new CiRouteError("bad-input");
+  return ciAuthed(async () => {
+    const search = ciLogSearchParams(input).toString();
+    const range = parseCiLogRange(await edgeGet(
+      `/v1/ci/runs/${seg(input.run)}/jobs/${seg(input.job)}/log${search ? `?${search}` : ""}`,
+    ), input);
+    if (!range) throw new CiRouteError("error");
+    return range;
+  });
+}, "ci-log");
 
 /** The first bounded page of the authenticated viewer's unified inbox. */
 export const getInbox = query(async (): Promise<InboxPage> => {

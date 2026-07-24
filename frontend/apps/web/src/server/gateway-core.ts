@@ -25,11 +25,23 @@ export class GatewayError extends Error {
 }
 
 /** Authentication failed after the single-refresh-then-retry — the loader maps this to `/login`. */
+const UNAUTHORIZED_BRAND_KEY = "myelin.gateway.Unauthorized.v1";
+
 export class Unauthorized extends Error {
   constructor(message = "Unauthorized") {
     super(message);
     this.name = "Unauthorized";
+    Object.defineProperty(this, Symbol.for(UNAUTHORIZED_BRAND_KEY), { value: true });
   }
+}
+
+/** Vinxi loads the SSR and server-function graphs separately, so the same gateway module can have
+ * two constructor identities in one process. Keep auth classification stable across that boundary
+ * without accepting arbitrary messages or response bodies as authorization failures. */
+export function isUnauthorized(error: unknown): error is Unauthorized {
+  if (error instanceof Unauthorized) return true;
+  if (typeof error !== "object" || error === null) return false;
+  return (error as Record<symbol, unknown>)[Symbol.for(UNAUTHORIZED_BRAND_KEY)] === true;
 }
 
 /** A transport-agnostic edge response (status + raw body text) the core parses. */
