@@ -2039,6 +2039,15 @@ post-completion archive pagination, shared-marker comparison, and evidence captu
 finishes before the live consumers attach must be repeated rather than counted. CT-007 and the
 four-week R4 exit clock remain closed until that evidence exists.
 
+**Founder branch-gate preflight (2026-07-24).** The local Myelin-hosted `myelin` repository had an
+empty required-context set, which would make the documented `verify-check ... build` procedure
+structurally unable to prove a required check. The authenticated production branch-protection API
+now persists `ci/build` for `refs/heads/main`, with zero solo-founder approvals and force-push still
+disabled. The short-lived operator credential used for that write has a durable S7 revocation.
+The runbook's solo-operator example now preserves `ci/build` instead of resetting the ruleset to an
+empty CI gate. This is acceptance preflight only: it is not the founder push, a green check, or
+permission for an agent to push the Myelin repository.
+
 **CT-007 handoff floor (pre-registered; phase still closed).** Code wins over a tempting literal
 interpretation of “cut over”: `.myelin/ci.toml` currently proves only the push/runner/log/check
 transport, while `.github/workflows/ci.yml` still carries the real Rust, frontend/browser,
