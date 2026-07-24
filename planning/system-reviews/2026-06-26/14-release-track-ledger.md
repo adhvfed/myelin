@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract. Still required: honest cross-service live-log SSE, CLI/MCP, the live founder push→CI→surfaced-check/log pass, then CT-007.** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI. Still required: honest cross-service live-log SSE, MCP, the live founder push→CI→surfaced-check/log pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1491,7 +1491,7 @@ Mechanical payoff: frontend contracts in the permanent coverage gate = 1→2; CI
 transparent CI cursors admitted by the dev implementation = 0; live-tail claims without a
 cross-service resume transport = 0.
 
-**Honest remaining R4.2 floors:** complete CT-005's cross-service live-log SSE and CLI/MCP surfaces; start
+**Honest remaining R4.2 floors:** complete CT-005's cross-service live-log SSE and MCP surface; start
 the three CI services and production Edge against the founder cell; push a real Myelin commit; and
 observe the exact head's required check settle green with archived/live output through the verifier
 and browser. Only after the complete surface and founder pass may CT-007 remove GitHub Actions. No
@@ -1581,6 +1581,57 @@ source-string assertions that could pass on comments. Independent re-review repo
 junk-test findings closed.
 
 L3 CT-005b footprint: **10 files, +882 / -33 lines** for archived reads, shared producer bound, proofs, and ledgers.
+
+**CT-005d durable CLI increment (2026-07-24; MCP and live tail remain open).** The compiled
+`myelin` binary now exposes repository-authorized durable CI reads through the existing Edge:
+`ci list` with state/limit/opaque-cursor pagination, `ci view`/`show` for exact run/job/step
+materialization, and `ci logs` for bounded archived job byte ranges. The CLI reuses a total grammar
+owned by CI Controlplane, derives no tenant or region input, and sends only the exact CT-005a/b GET
+routes under the ordinary bearer credential. It does not add a second data path or query store
+directly.
+
+Human output includes state words alongside glyphs, keeps arbitrary printable Unicode, escapes
+terminal controls and invalid UTF-8 bytes, and prints copyable continuation commands only when
+server-issued cursor/identifier fields satisfy their canonical shell-safe grammar. Machine mode
+returns the exact Edge JSON only after the same validation boundary. Every CI 2xx response is bound
+to its originating request before either renderer: list state/limit and the canonical 60-byte v1
+cursor frame; detail run identity, bounded enum/time/string fields, DAG
+membership/uniqueness/acyclicity, and unique step anchors; and archived-log run/job coordinates,
+checked range arithmetic, continuation, canonical base64, and decoded byte length. The
+production-valid empty range for a start beyond `total_end` remains a success with no invented
+continuation. The next-page command preserves the active state and limit; archived-log continuation
+preserves the byte range size. The compiled-binary contract proof consumes the same committed CI
+golden artifact as production Rust Edge and the dev Edge, asserts exact list/view/log request
+targets, proves a mismatched 200 is rejected with empty stdout, and proves both the golden
+invalid-byte range and beyond-end branch. `ci watch` is a local usage refusal that names the missing
+cross-service resume authority; no polling, SSE, or live-output claim was added.
+
+**Code-wins surface reconciliation:** the frozen design names branch/actor list filters and
+step/line log ranges, but the durable production API currently authorizes and indexes only run state
+plus exact job byte ranges. CT-005d exposes that truthful subset rather than accepting flags that
+cannot be enforced. MCP is not folded into this row: its production registry/router remains shaped
+around Git `AgentToolDef` mutations, while the frozen `ToolDef.effect_kind` contract routes reads
+directly. The next MCP increment must project CI's already-owned `read_run`/`read_log` definitions
+and inject a permission-checked Edge/read adapter; routing reads through Git's `EffectApi` would be a
+contract violation.
+
+Mechanical evidence: all 446 CI Controlplane unit tests and its DB-free test suites pass; the
+production boot-time SIGTERM/least-privilege proof passes after reclaiming one exact stale,
+test-owned `ci_http_surface_*` schema left by an interrupted earlier Edge integration. The complete
+CLI suite passes (43 unit + 13 integration/contract tests), including the compiled shared-golden
+list/view/log path, malformed-success refusal, beyond-end empty range, and live refusal. CLI
+all-target check, warnings-denied CLI and all-feature
+Controlplane clippy, architecture lint (761 files, zero violations), shrink-only erosion/dependency
+gate, frontend-aware contract coverage (99 rows, two shared frontend contracts, zero false claims),
+fixture self-tests, targeted rustfmt, and diff check are green. Independent review first found that
+loosely shaped successes could contradict their request, then found the initial strict decoder
+rejected the real beyond-end branch and under-validated detail graphs; both MED rounds were closed
+with request-bound negative matrices and compiled positive/negative proofs. Final re-review reports
+**ACCEPT with no remaining HIGH or MED finding**; its LOW invalid-cursor fixture drift was also
+removed, and the CI-owned grammar now rejects structurally impossible cursor frames locally.
+
+L3 CT-005d footprint: **12 files, +1,798 / -25 lines** for the CI-owned grammar, thin CLI mapping,
+strict request-bound response decoder, compiled contract proof, human renderer, and ledgers.
 
 ## R5–R6
 

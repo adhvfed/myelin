@@ -9,9 +9,10 @@
 use clap::{Parser, Subcommand};
 use myelin_cli::client::execute;
 use myelin_cli::config::{self, resolve_edge, resolve_token, store_token};
-use myelin_cli::dispatch::{git_dispatch, issues_dispatch, notif_dispatch, EdgeCall, HttpMethod};
+use myelin_cli::dispatch::{
+    ci_dispatch, git_dispatch, issues_dispatch, notif_dispatch, EdgeCall, HttpMethod,
+};
 use myelin_cli::error::CliError;
-use myelin_cli::render::render;
 
 /// The `myelin` CLI — drive Git / notifications / … through the product edge with a capability token.
 #[derive(Parser, Debug)]
@@ -52,6 +53,13 @@ enum Command {
     /// Issue commands: `list` | `create --project … --type … --prefix … --title …` | `view` | `close`.
     Issues {
         /// The Issues subcommand + args, parsed by the subsystem's own total grammar.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Durable CI reads: `list [--status …]` | `view <run>` |
+    /// `logs <run> --job <job> [--start <byte>] [--limit <bytes>]`.
+    Ci {
+        /// The CI subcommand + args, parsed by CI's own total grammar.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -121,6 +129,11 @@ async fn run() -> Result<(), CliError> {
             let call = issues_dispatch(&refs)?;
             run_call(&cli, &getenv, &read_file, call).await
         }
+        Command::Ci { args } => {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let call = ci_dispatch(&refs)?;
+            run_call(&cli, &getenv, &read_file, call).await
+        }
         Command::Notif { args } => {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let call = notif_dispatch(&refs)?;
@@ -139,6 +152,9 @@ async fn run_call(
     let edge = resolve_edge(cli.edge.as_deref(), cli.scheme.as_deref(), getenv);
     let token = resolve_token(cli.token.as_deref(), getenv, read_file)?;
     let value = execute(&edge, &token, &call).await?;
-    print!("{}", render(&value, cli.json));
+    print!(
+        "{}",
+        myelin_cli::render::render_for_call(&value, cli.json, &call)
+    );
     Ok(())
 }

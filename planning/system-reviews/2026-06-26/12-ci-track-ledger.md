@@ -17,8 +17,12 @@ an opaque scope-bound keyset cursor plus a ready-at-boot index. CT-005b adds byt
 log reads over sealed `log_segment` rows and the production content-addressed BlobStore. CT-005c adds
 the authenticated durable web list/detail/archive surface and binds its dev Edge to the same
 request/response vectors as the production Rust integration through the permanent contract-coverage
-gate. It deliberately does not call the process-local `LiveTail` an SSE transport: cross-service
-resumable live tail, CLI, and MCP remain open. CT-007 is still unopened; GitHub Actions must not be
+gate. CT-005d adds the thin authenticated CLI list/view/archive client over those same Edge routes
+and executes the shared response vectors through the compiled binary. Its request-bound success
+decoder rejects malformed list/detail/log bodies before either human or JSON rendering while
+preserving the production beyond-end empty-range contract. It deliberately does not call the
+process-local `LiveTail` an SSE transport: cross-service resumable live tail and MCP remain open.
+CT-007 is still unopened; GitHub Actions must not be
 removed before the founder acceptance pass and the complete CT-005 surface are genuinely usable.
 
 ## Environment (confirmed — this track is testable here)
@@ -86,11 +90,30 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   list/filter/detail/archive reads, next-page and
   Back, stale 409 recovery, failure postures, mobile layout, and accessibility. The UI states that
   live updates are unavailable; no polling or SSE capability is implied.
+- **CT-005d — durable CLI reads:** `myelin ci list [--status] [--limit] [--cursor]`,
+  `myelin ci view <run>` (with `show` as the ordinary read alias), and
+  `myelin ci logs <run> --job <job> [--start <byte>] [--limit <bytes>]` reuse a total
+  CI-owned grammar and call only the authenticated CT-005a/b Edge routes. Human output always pairs
+  a glyph with a state word, emits parser-round-trippable next-page/archive commands only for
+  canonical opaque cursors and UUIDs, and renders arbitrary archived bytes without terminal-control
+  injection; `--json` preserves the exact Edge envelope. The compiled CLI executes list/detail/log
+  responses from the same committed golden artifact as Rust Edge and dev Edge and asserts its exact
+  request targets. `ci watch` fails locally and names the missing cross-service resume authority.
+  The frozen architecture's branch/actor filters and line/step ranges are not fabricated: the
+  current durable API has only the indexed state filter plus job byte ranges.
+  Every CI 2xx response is decoded against the exact originating call before rendering: list
+  filter/limit and canonical cursor frame, detail run/DAG/step integrity and bounded enums/times,
+  and log run/job/range/base64/byte length must agree. The production-valid empty response for a
+  start beyond `total_end` remains accepted and never invents a continuation.
 
 **Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
 services. It is not an honest production SSE resume source. SSE remains open until a real
 cross-service bounded resume transport exists; CT-005b/CT-005c claim archived cold-path reads only.
-CLI/MCP, the live founder push→settled check→surfaced log pass, and CT-007 also remain open.
+MCP, the live founder push→settled check→surfaced log pass, and CT-007 also remain open. MCP is a
+separate increment: its current production registry/router is Git-mutation-specific, while the
+frozen agent contract routes reads directly rather than through `EffectApi`; CI reads must gain a
+real permission-checked read adapter and the shared `ToolDef` projection, not a mutation-shaped
+shortcut.
 
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod
