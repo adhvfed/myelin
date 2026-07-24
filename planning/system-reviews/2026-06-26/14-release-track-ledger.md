@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges. Still required: honest cross-service live-log SSE, web, CLI/MCP, the live founder push→CI→surfaced-check pass, then CT-007.** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract. Still required: honest cross-service live-log SSE, CLI/MCP, the live founder push→CI→surfaced-check/log pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1458,11 +1458,45 @@ completed. Independent adversarial re-review of immutable attempt issuance, rese
 bounded admission-lane composition, canonical detail refs, and the cutover order reports
 **CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding**.
 
-**Honest remaining R4.2 floors:** complete CT-005's cross-service live-log SSE, web, and CLI/MCP surfaces; start
+**Durable CI web surface and shared mock contract (2026-07-24).** The authenticated web shell now
+serves repository-authorized durable run history, state filtering, opaque keyset pagination, exact
+run/job/step detail, and bounded archived byte ranges through server-only gateway queries. It renders
+separate empty, invalid, absent-or-denied, stale-cursor, projection-unavailable, and log-unavailable
+states without exposing raw Edge errors. A visibility-stale 409 restarts with a cursor-free document
+load; archived bytes remain selectable and byte-addressed even when a range begins inside UTF-8.
+The surface explicitly says live updates are not available and does not present the process-local
+`LiveTail` as a production SSE source.
+
+The browser mock is now a mechanically gated second implementation. Committed request/response
+vectors execute against both the production Rust Edge integration and the dev Edge, including a
+UTF-8-byte-canonicalized/deduplicated visible-repository set, a keyed
+filter-and-visibility-bound cursor, an actual visibility-membership transition, and a byte-exact
+archived log range. The
+`contract-coverage` frontend registry binds that artifact to both providers and the six Playwright
+flows. Strict browser decoders reject unknown or missing fields, noncanonical identifiers/cursors,
+or contradictory range coordinates. While proving the full suite, a real SolidStart split-bundle
+auth race was closed: authorization classification now uses a narrow stable type guard rather than
+constructor identity, so a global inbox fetch cannot turn expired credentials into a framework
+error before the login redirect. The expiry fixture's global switch is reset in an independent
+`afterEach`, preventing one timeout from poisoning later browser cases.
+
+Mechanical evidence: 479 frontend unit tests pass (8 Valkey integrations skipped by the ordinary
+unit profile); all 82 Chromium flows pass serially; typecheck, lint, production build, the full Edge
+integration suite, warnings-denied Edge clippy, architecture lint and fixture matrix, shrink-only
+erosion gate, frontend-aware contract coverage, targeted rustfmt, and diff check are green.
+Independent adversarial review held MED on convention-based visibility scope until the shared
+UTF-8/dedupe and membership-change vectors landed; re-review found no remaining HIGH or MEDIUM
+finding.
+Mechanical payoff: frontend contracts in the permanent coverage gate = 1→2; CI browser flows = 0→6;
+transparent CI cursors admitted by the dev implementation = 0; live-tail claims without a
+cross-service resume transport = 0.
+
+**Honest remaining R4.2 floors:** complete CT-005's cross-service live-log SSE and CLI/MCP surfaces; start
 the three CI services and production Edge against the founder cell; push a real Myelin commit; and
-observe the exact head's required check settle green through the verifier and browser. Only after the
-complete surface and founder pass may CT-007 remove GitHub Actions. No completed increment claims that
-founder act, starts the four-week R4 exit clock, or spends GitHub Actions.
+observe the exact head's required check settle green with archived/live output through the verifier
+and browser. Only after the complete surface and founder pass may CT-007 remove GitHub Actions. No
+completed increment claims that founder act, starts the four-week R4 exit clock, or spends GitHub
+Actions.
 
 **CT-005a production read-API increment (2026-07-24; not the complete CT-005 surface).** Production
 Edge now mounts authenticated `GET /v1/ci/runs` and `GET /v1/ci/runs/{run}` routes over CI's durable

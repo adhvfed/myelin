@@ -3424,3 +3424,10 @@ golden = "contracts/git-read-dev-edge.golden.json"
 rust_tests = ["crates/myelin-edge/tests/git_edge_durable_integration.rs"]
 frontend_tests = ["frontend/apps/web/src/lib/dev-edge-contract.test.ts"]
 e2e_tests = ["frontend/apps/web/tests/e2e/git-browse.spec.ts"]
+
+[[frontend]]
+id = "ci-read-dev-edge-parity"
+golden = "contracts/ci-read-dev-edge.golden.json"
+rust_tests = ["crates/myelin-edge/tests/integration_ci_http_surface.rs"]
+frontend_tests = ["frontend/apps/web/src/lib/ci-dev-edge-contract.test.ts"]
+e2e_tests = ["frontend/apps/web/tests/e2e/ci.spec.ts"]

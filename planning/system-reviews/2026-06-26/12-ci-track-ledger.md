@@ -14,10 +14,12 @@ reallocates them. CT-004 remains in progress until a real founder push produces,
 its exact-head check. CT-005 is now **IN PROGRESS**: CT-005a mounts production durable run-list and
 run-detail reads at Edge, prefiltered through the parent Git repository's Pull visibility and backed by
 an opaque scope-bound keyset cursor plus a ready-at-boot index. CT-005b adds byte-exact bounded archived
-log reads over sealed `log_segment` rows and the production content-addressed BlobStore. It deliberately
-does not call the process-local `LiveTail` an SSE transport: cross-service resumable live tail, web,
-CLI, and MCP remain open. CT-007 is still unopened; GitHub Actions must not be removed before the
-founder acceptance pass and the complete CT-005 surface are genuinely usable.
+log reads over sealed `log_segment` rows and the production content-addressed BlobStore. CT-005c adds
+the authenticated durable web list/detail/archive surface and binds its dev Edge to the same
+request/response vectors as the production Rust integration through the permanent contract-coverage
+gate. It deliberately does not call the process-local `LiveTail` an SSE transport: cross-service
+resumable live tail, CLI, and MCP remain open. CT-007 is still unopened; GitHub Actions must not be
+removed before the founder acceptance pass and the complete CT-005 surface are genuinely usable.
 
 ## Environment (confirmed — this track is testable here)
 Firecracker v1.16.0 + gVisor (`runsc`) on PATH; `/dev/kvm` present. So the production microVM boot + the
@@ -72,10 +74,22 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   Missing, malformed, corrupt, oversized, gapped, overlapping, or over-fragmented archives fail
   generically; absent jobs and denied parents remain the same 404. The default range is 64 KiB and the
   hard response cap is 256 KiB.
+- **CT-005c — durable web reads and executable mock parity:** the authenticated SolidStart surface
+  lists and filters authorized runs, pages only through Edge-issued opaque cursors, renders exact
+  run/job/step materialization, and reads archived output in bounded byte ranges through server-only
+  gateway queries. Empty, unavailable, absent-or-denied, malformed, and visibility-stale states are
+  distinct and leak-free. A committed golden artifact is executed by the production Rust Edge
+  integration and the dev Edge contract test; `contract-coverage.toml` binds both to the browser
+  suite. Its visible-repository vector includes unsorted ASCII, composed/decomposed Unicode, emoji,
+  and a duplicate; both implementations must produce the same UTF-8 byte order/deduplication, and a
+  real membership addition invalidates the prior cursor. Six Chromium flows cover login refusal,
+  list/filter/detail/archive reads, next-page and
+  Back, stale 409 recovery, failure postures, mobile layout, and accessibility. The UI states that
+  live updates are unavailable; no polling or SSE capability is implied.
 
 **Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
 services. It is not an honest production SSE resume source. SSE remains open until a real
-cross-service bounded resume transport exists; CT-005b claims archived cold-path reads only. Web,
+cross-service bounded resume transport exists; CT-005b/CT-005c claim archived cold-path reads only.
 CLI/MCP, the live founder push→settled check→surfaced log pass, and CT-007 also remain open.
 
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security

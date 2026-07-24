@@ -2,6 +2,7 @@
 #![cfg(feature = "integration")]
 
 use base64::Engine as _;
+use myelin_ci_controlplane::surfacing_store::canonical_visible_repo_refs;
 use myelin_ci_controlplane::{ci_controlplane_migrations, CiRunStore};
 use myelin_edge::repo_authz::GrantBackedRepos;
 use myelin_edge::{
@@ -18,11 +19,12 @@ use myelin_storage::{
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const TENANT: &str = "ci_http_surface";
+const TENANT: &str = "acme";
 const REGION: &str = "eu-north";
 const VISIBLE_RUN: &str = "81000000-0000-4000-8000-000000000001";
 const HIDDEN_RUN: &str = "81000000-0000-4000-8000-000000000002";
@@ -32,6 +34,9 @@ const ABSENT_JOB: &str = "85000000-0000-4000-8000-000000000002";
 const CORRUPT_JOB: &str = "85000000-0000-4000-8000-000000000003";
 const HIDDEN_JOB: &str = "85000000-0000-4000-8000-000000000004";
 const SCHEME: &str = "agent";
+const GOLDEN_NEWEST_RUN: &str = "91000000-0000-4000-8000-000000000001";
+const GOLDEN_OLDER_RUN: &str = "91000000-0000-4000-8000-000000000002";
+const GOLDEN_FAILED_JOB: &str = "92000000-0000-4000-8000-000000000001";
 
 static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -188,6 +193,89 @@ async fn insert_job_and_segments(
     .expect("insert tenant-scoped CI log archive");
 }
 
+async fn insert_golden_ci_surface(app: &PgPool, blob_ref: String, log_len: i64) {
+    with_tenant_tx(app, TENANT, REGION, move |conn| {
+        Box::pin(async move {
+            sqlx::query(
+                "INSERT INTO ci_run (
+                   tenant_id, region, run_id, project_id, repo_ref, commit_oid, pipeline_id,
+                   wf_run_id, definition_snapshot, trigger_kind, trust_tier, state,
+                   cost_settled, correlation_id, created_at, finished_at
+                 ) VALUES
+                 (
+                   $1, $2, $3::uuid, '94000000-0000-4000-8000-000000000001'::uuid, $5,
+                   '0123456789abcdef', '93000000-0000-4000-8000-000000000001'::uuid,
+                   '95000000-0000-4000-8000-000000000001'::uuid, 'cas:golden-newest', 'push',
+                   'trusted', 'failed', TRUE, $3, '2026-07-24T12:00:00Z'::timestamptz,
+                   '2026-07-24T12:05:00Z'::timestamptz
+                 ),
+                 (
+                   $1, $2, $4::uuid, '94000000-0000-4000-8000-000000000001'::uuid, $5,
+                   'fedcba9876543210', '93000000-0000-4000-8000-000000000001'::uuid,
+                   '95000000-0000-4000-8000-000000000002'::uuid, 'cas:golden-older',
+                   'pull_request', 'trusted', 'running', FALSE, $4,
+                   '2026-07-24T11:00:00Z'::timestamptz, NULL
+                 )",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(GOLDEN_NEWEST_RUN)
+            .bind(GOLDEN_OLDER_RUN)
+            .bind(format!("myelin://{TENANT}/git/repo/alpha"))
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+            sqlx::query(
+                "INSERT INTO ci_job (
+                   tenant_id, region, job_id, run_id, stage, name, needs, matrix_key,
+                   spec_ref, state, attempt, result_summary
+                 ) VALUES (
+                   $1, $2, $3::uuid, $4::uuid, 'test', 'contract', '{}', NULL,
+                   'cas:golden-job', 'failed', 1, '{\"message\":\"contract failed\"}'::jsonb
+                 )",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(GOLDEN_FAILED_JOB)
+            .bind(GOLDEN_NEWEST_RUN)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+            sqlx::query(
+                "INSERT INTO log_segment (
+                   tenant_id, region, run_id, job_id, segment_seq, blob_ref,
+                   byte_start, byte_end, pii_key_ref
+                 ) VALUES ($1, $2, $3::uuid, $4::uuid, 0, $5, 0, $6, 'tenant:golden')",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(GOLDEN_NEWEST_RUN)
+            .bind(GOLDEN_FAILED_JOB)
+            .bind(blob_ref)
+            .bind(log_len)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+            sqlx::query(
+                "INSERT INTO log_anchor (
+                   tenant_id, region, run_id, job_id, step_id, byte_start, byte_end, status
+                 ) VALUES ($1, $2, $3::uuid, $4::uuid, 'contract', 0, $5, 'failed')",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(GOLDEN_NEWEST_RUN)
+            .bind(GOLDEN_FAILED_JOB)
+            .bind(log_len)
+            .execute(&mut *conn)
+            .await
+            .map(|_| ())
+            .map_err(|error| PgError::Query(error.to_string()))
+        })
+    })
+    .await
+    .expect("insert shared golden CI surface");
+}
+
 fn admin_scope() -> TenantScope {
     TenantScope::from_verified_token(
         &Principal::stub(
@@ -233,7 +321,11 @@ fn authenticated_gateway(
         Arc::new(KmsEngine::new()),
     )));
 
-    let authz = GrantBackedRepos::new().grant_read("svc:viewer", TENANT, "alpha");
+    let authz = ["alpha", "e\u{301}", "é", "😀", "z"]
+        .into_iter()
+        .fold(GrantBackedRepos::new(), |grants, repo| {
+            grants.grant_read("svc:viewer", TENANT, repo)
+        });
     let git = Arc::new(
         DurableGitBackend::rooted_inmem_for_test(git_root).with_repo_authorizer(Arc::new(authz)),
     );
@@ -441,4 +533,146 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
         .expect("drop isolated schema");
     admin.close().await;
     std::fs::remove_dir_all(root).expect("remove isolated git fixture");
+}
+
+/// FRONTEND-CONTRACT: ci-read-dev-edge-parity
+///
+/// The production provider executes the same committed request/response vectors as the TypeScript
+/// dev Edge. Only the keyed cursor bytes are normalized; their scope-bound behavior remains part of
+/// the vectors. Golden artifact: `contracts/ci-read-dev-edge.golden.json`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_ci_reads_match_the_shared_dev_edge_golden_vectors() {
+    const GOLDEN: &str = include_str!("../../../contracts/ci-read-dev-edge.golden.json");
+    let golden: serde_json::Value =
+        serde_json::from_str(GOLDEN).expect("valid CI read golden JSON");
+    assert_eq!(golden["contract_id"], "ci-read-dev-edge-parity");
+
+    let schema = schema_name();
+    let admin = pool(&admin_url(), &schema).await;
+    setup_schema(&admin, &schema).await;
+    let app = pool(&app_url(), &schema).await;
+    let blobs = Arc::new(FsBlobStore::new());
+    let log = "prep\ncafé\nfailed\n".as_bytes();
+    let blob_ref = blobs
+        .put(&TenantId(TENANT.into()), log)
+        .expect("store golden archived log")
+        .to_multihash_string();
+    insert_golden_ci_surface(&app, blob_ref, log.len() as i64).await;
+
+    let root = std::env::temp_dir().join(format!("{schema}_git"));
+    let repo_dir = root.join(TENANT).join(REGION);
+    for repo in ["😀", "alpha", "é", "e\u{301}"] {
+        std::fs::create_dir_all(repo_dir.join(format!("{repo}.git")))
+            .expect("create golden visible repo");
+    }
+    let (gateway, cell) = authenticated_gateway(app.clone(), &root, blobs);
+    let token = mint(&cell);
+    let mut cursors = BTreeMap::<String, String>::new();
+
+    for vector in golden["vectors"].as_array().expect("golden vectors") {
+        let id = vector["id"].as_str().expect("vector id");
+        let endpoint = vector["endpoint"].as_str().expect("vector endpoint");
+        let request = &vector["request"];
+        if vector["mutation"].as_str() == Some("add-visible-repo") {
+            std::fs::create_dir_all(repo_dir.join("z.git")).expect("add golden visible repository");
+        }
+        if endpoint == "visibility" {
+            let visible = request["visible_repo_refs"]
+                .as_array()
+                .expect("visible repository vector")
+                .iter()
+                .map(|value| value.as_str().expect("visible repository ref").to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                serde_json::json!({
+                    "status": 200,
+                    "visible_repo_refs": canonical_visible_repo_refs(&visible)
+                        .expect("canonical visible repository set"),
+                }),
+                vector["expected"],
+                "golden vector {id}"
+            );
+            continue;
+        }
+        let after = vector["after"].as_str();
+        let cursor = after.map(|source| {
+            cursors
+                .get(source)
+                .unwrap_or_else(|| panic!("missing cursor from {source}"))
+                .as_str()
+        });
+
+        let response = match endpoint {
+            "runs" => {
+                let mut query = vec![
+                    format!("state={}", request["state"].as_str().expect("list state")),
+                    format!("limit={}", request["limit"].as_u64().expect("list limit")),
+                ];
+                if let Some(cursor) = cursor {
+                    query.push(format!("cursor={cursor}"));
+                }
+                get_query(&gateway, &token, "/v1/ci/runs", &query.join("&"))
+            }
+            "run" => get(
+                &gateway,
+                &token,
+                &format!(
+                    "/v1/ci/runs/{}",
+                    request["run_id"].as_str().expect("run id")
+                ),
+            ),
+            "log" => get_query(
+                &gateway,
+                &token,
+                &format!(
+                    "/v1/ci/runs/{}/jobs/{}/log",
+                    request["run_id"].as_str().expect("log run id"),
+                    request["job_id"].as_str().expect("log job id")
+                ),
+                &format!(
+                    "start={}&limit={}",
+                    request["start"].as_u64().expect("log start"),
+                    request["limit"].as_u64().expect("log limit")
+                ),
+            ),
+            other => panic!("unknown golden endpoint {other}"),
+        };
+
+        let mut normalized = serde_json::Map::new();
+        normalized.insert("status".into(), serde_json::json!(response.status()));
+        if response.status() == 200 {
+            let body = response.json_body().expect("golden response JSON");
+            for (key, value) in body.as_object().expect("golden response object") {
+                normalized.insert(key.clone(), value.clone());
+            }
+            if endpoint == "runs" {
+                let next = normalized["page"]["next_cursor"]
+                    .as_str()
+                    .map(str::to_string);
+                if let Some(next) = next {
+                    assert!(next.starts_with("cr1_"), "canonical opaque CI cursor");
+                    cursors.insert(id.to_string(), next);
+                    normalized
+                        .get_mut("page")
+                        .expect("page")
+                        .as_object_mut()
+                        .expect("page object")
+                        .insert("next_cursor".into(), serde_json::json!("cr1_<opaque>"));
+                }
+            }
+        }
+        assert_eq!(
+            serde_json::Value::Object(normalized),
+            vector["expected"],
+            "golden vector {id}"
+        );
+    }
+
+    app.close().await;
+    admin
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .expect("drop isolated golden schema");
+    admin.close().await;
+    std::fs::remove_dir_all(root).expect("remove golden git fixture");
 }
