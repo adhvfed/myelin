@@ -35,12 +35,17 @@ myelin-git = { path = "../myelin-git" }
 # REUSE the Issues-owned total command grammar (`myelin_issues::api`) and map it to the existing
 # durable Edge routes. The CLI never re-declares Issue verbs or accepts tenant/region selectors.
 myelin-issues = { path = "../myelin-issues" }
+# REUSE CI's owned durable-read grammar. The CLI maps it to the authenticated Edge routes and does
+# not manufacture a `watch` command while cross-service resumable live logs remain unavailable.
+myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 # REUSE the notif CLI grammar (cli::CliView — the named scoped views + verb set).
 myelin-notif = { path = "../myelin-notif" }
 
 # The {items,page} + {error:{message,code}} envelopes + the rendered view-models are serde_json::Value
 # (the one workspace-pinned JSON shape) — the CLI parses/renders them directly.
 serde_json = { workspace = true }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Build strict form-query strings for paginated Edge calls without interpolating cursor bytes.
 percent-encoding = "2.3"

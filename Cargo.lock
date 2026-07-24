@@ -2437,12 +2437,15 @@ dependencies = [
 name = "myelin-cli"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "bytes",
+ "chrono",
  "clap",
  "http-body-util",
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "myelin-ci-controlplane",
  "myelin-edge",
  "myelin-git",
  "myelin-identity",

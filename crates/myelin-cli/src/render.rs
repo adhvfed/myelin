@@ -7,6 +7,9 @@
 //!   item, the `whoami` principal as a single line, and an unknown shape falls back to terminal-safe
 //!   JSON (total — it never panics on an unexpected shape).
 
+use crate::dispatch::EdgeCall;
+use base64::Engine as _;
+use myelin_ci_controlplane::surfacing_store::CI_RUN_CURSOR_PREFIX;
 use myelin_git::web::RepoListCursor;
 use serde_json::Value;
 use std::fmt::Write as _;
@@ -39,8 +42,24 @@ fn terminal_safe_single_line(value: &str) -> String {
 /// Render an edge response value. In `json_mode` the raw JSON is pretty-printed; otherwise a compact
 /// human form is produced (the `{items,page}` list, the whoami line, or a JSON fallback).
 pub fn render(value: &Value, json_mode: bool) -> String {
+    render_with_call(value, json_mode, None)
+}
+
+/// Render an Edge response with enough request context to emit an exact, parseable pagination
+/// continuation for surfaces whose cursors are intentionally opaque.
+pub fn render_for_call(value: &Value, json_mode: bool, call: &EdgeCall) -> String {
+    render_with_call(value, json_mode, Some(call))
+}
+
+fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> String {
     if json_mode {
         return serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    }
+    if is_ci_log_range(value) {
+        return render_ci_log_range(value);
+    }
+    if is_ci_run_detail(value) {
+        return render_ci_run_detail(value);
     }
     // The uniform list envelope: one line per item + an optional "more" hint.
     if let Some(items) = value.get("items").and_then(Value::as_array) {
@@ -57,7 +76,9 @@ pub fn render(value: &Value, json_mode: bool) -> String {
             .and_then(|p| p.get("next_cursor"))
             .and_then(Value::as_str)
         {
-            if RepoListCursor::parse(cursor).is_ok() {
+            if let Some(command) = call.and_then(|call| ci_page_command(call, cursor)) {
+                out.push_str(&format!("… (more — run: {command})\n"));
+            } else if RepoListCursor::parse(cursor).is_ok() {
                 let cursor = terminal_safe_single_line(cursor);
                 out.push_str(&format!(
                     "… (more — run: myelin git repo list --cursor {cursor})\n"
@@ -111,6 +132,9 @@ pub fn render(value: &Value, json_mode: bool) -> String {
 /// Render one list item to a line. Known shapes: a RepoHome (`slug`/`state`) and a code-search hit
 /// (`repo`/`path`/`line`/`excerpt`); an unknown item falls back to compact JSON.
 fn render_item(item: &Value) -> String {
+    if is_ci_run_summary(item) {
+        return render_ci_run_summary(item);
+    }
     if is_issue(item) {
         return render_issue(item);
     }
@@ -134,6 +158,250 @@ fn render_item(item: &Value) -> String {
     terminal_safe_single_line(&item.to_string())
 }
 
+fn is_ci_run_summary(value: &Value) -> bool {
+    value.get("run_id").and_then(Value::as_str).is_some()
+        && value.get("repo_ref").and_then(Value::as_str).is_some()
+        && value.get("state").and_then(Value::as_str).is_some()
+        && value.get("created_at").and_then(Value::as_str).is_some()
+}
+
+fn render_ci_run_summary(value: &Value) -> String {
+    let state = value
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let marker = state_marker(state);
+    let state = terminal_safe_single_line(state);
+    let run = terminal_safe_single_line(value.get("run_id").and_then(Value::as_str).unwrap_or("?"));
+    let repo =
+        terminal_safe_single_line(value.get("repo_ref").and_then(Value::as_str).unwrap_or("?"));
+    let commit = terminal_safe_single_line(
+        value
+            .get("commit_oid")
+            .and_then(Value::as_str)
+            .unwrap_or("no-commit"),
+    );
+    let created = terminal_safe_single_line(
+        value
+            .get("created_at")
+            .and_then(Value::as_str)
+            .unwrap_or("?"),
+    );
+    format!("{marker} {state}  {run}  {repo}@{commit}  {created}")
+}
+
+fn is_ci_run_detail(value: &Value) -> bool {
+    value.get("run").is_some_and(is_ci_run_summary)
+        && value.get("jobs").and_then(Value::as_array).is_some()
+        && value.get("steps").and_then(Value::as_array).is_some()
+}
+
+fn render_ci_run_detail(value: &Value) -> String {
+    let run = &value["run"];
+    let run_id = run.get("run_id").and_then(Value::as_str).unwrap_or("?");
+    let mut output = format!("{}\n", render_ci_run_summary(run));
+    let jobs = value["jobs"].as_array().expect("shape checked");
+    if jobs.is_empty() {
+        output.push_str("  (no jobs)\n");
+    }
+    for job in jobs {
+        let state = job
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let marker = state_marker(state);
+        let state = terminal_safe_single_line(state);
+        let stage =
+            terminal_safe_single_line(job.get("stage").and_then(Value::as_str).unwrap_or("?"));
+        let name =
+            terminal_safe_single_line(job.get("name").and_then(Value::as_str).unwrap_or("?"));
+        let job_id =
+            terminal_safe_single_line(job.get("job_id").and_then(Value::as_str).unwrap_or("?"));
+        let attempt = job.get("attempt").and_then(Value::as_i64).unwrap_or(0);
+        output.push_str(&format!(
+            "  {marker} {state}  {stage}/{name}  attempt={attempt}  {job_id}\n"
+        ));
+        if safe_cli_uuid(run_id)
+            && job
+                .get("job_id")
+                .and_then(Value::as_str)
+                .is_some_and(safe_cli_uuid)
+        {
+            output.push_str(&format!(
+                "    archived output: myelin ci logs {run_id} --job {job_id}\n"
+            ));
+        }
+    }
+    for step in value["steps"].as_array().expect("shape checked") {
+        let state = step
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let marker = state_marker(state);
+        let state = terminal_safe_single_line(state);
+        let step_id =
+            terminal_safe_single_line(step.get("step_id").and_then(Value::as_str).unwrap_or("?"));
+        let job_id =
+            terminal_safe_single_line(step.get("job_id").and_then(Value::as_str).unwrap_or("?"));
+        let start = step
+            .get("byte_start")
+            .and_then(Value::as_i64)
+            .map_or_else(|| "?".into(), |value| value.to_string());
+        let end = step
+            .get("byte_end")
+            .and_then(Value::as_i64)
+            .map_or_else(|| "?".into(), |value| value.to_string());
+        output.push_str(&format!(
+            "    {marker} {state}  step {step_id}  job={job_id}  bytes={start}..{end}\n"
+        ));
+    }
+    output
+}
+
+fn is_ci_log_range(value: &Value) -> bool {
+    value.get("run_id").and_then(Value::as_str).is_some()
+        && value.get("job_id").and_then(Value::as_str).is_some()
+        && value.get("encoding").and_then(Value::as_str) == Some("base64")
+        && value.get("data").and_then(Value::as_str).is_some()
+        && value.get("byte_start").and_then(Value::as_i64).is_some()
+        && value.get("byte_end").and_then(Value::as_i64).is_some()
+}
+
+fn render_ci_log_range(value: &Value) -> String {
+    let start = value["byte_start"].as_i64().unwrap_or(0);
+    let end = value["byte_end"].as_i64().unwrap_or(start);
+    let total = value["total_end"].as_i64().unwrap_or(end);
+    let mut output = format!("archived log bytes {start}..{end} of {total}\n");
+    match base64::engine::general_purpose::STANDARD
+        .decode(value["data"].as_str().unwrap_or_default())
+    {
+        Ok(bytes) => {
+            output.push_str(&terminal_safe_log_bytes(&bytes));
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+        Err(_) => output.push_str("(archived log payload is malformed)\n"),
+    }
+    if let Some(next) = value.get("next_offset").and_then(Value::as_i64) {
+        let run = value["run_id"].as_str().unwrap_or_default();
+        let job = value["job_id"].as_str().unwrap_or_default();
+        if next >= 0 && safe_cli_uuid(run) && safe_cli_uuid(job) {
+            if let Some(limit) = end.checked_sub(start).filter(|limit| *limit > 0) {
+                output.push_str(&format!(
+                    "… (more — run: myelin ci logs {run} --job {job} --start {next} --limit {limit})\n"
+                ));
+            }
+        }
+    }
+    output
+}
+
+fn terminal_safe_log_bytes(bytes: &[u8]) -> String {
+    let mut output = String::new();
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(text) => {
+                push_safe_log_text(&mut output, text);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    let text = std::str::from_utf8(&remaining[..valid])
+                        .expect("valid_up_to always identifies valid UTF-8");
+                    push_safe_log_text(&mut output, text);
+                }
+                let invalid = error.error_len().unwrap_or(remaining.len() - valid);
+                for byte in &remaining[valid..valid + invalid] {
+                    let _ = write!(output, "\\x{byte:02x}");
+                }
+                remaining = &remaining[valid + invalid..];
+            }
+        }
+    }
+    output
+}
+
+fn push_safe_log_text(output: &mut String, text: &str) {
+    for character in text.chars() {
+        if character == '\n' {
+            output.push('\n');
+        } else if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+            output.push_str(&terminal_safe_single_line(&character.to_string()));
+        } else {
+            output.push(character);
+        }
+    }
+}
+
+fn state_marker(state: &str) -> &'static str {
+    match state {
+        "succeeded" | "passed" => "✓",
+        "failed" | "timed_out" | "reaped" => "✗",
+        "running" => "●",
+        "queued" => "○",
+        "cancelled" => "–",
+        _ => "?",
+    }
+}
+
+fn ci_page_command(call: &EdgeCall, cursor: &str) -> Option<String> {
+    if call.path != "/v1/ci/runs" || !safe_ci_cursor(cursor) {
+        return None;
+    }
+    let query = call.query.as_deref()?;
+    let state = query_field(query, "state").filter(|value| {
+        matches!(
+            *value,
+            "all"
+                | "queued"
+                | "running"
+                | "succeeded"
+                | "failed"
+                | "cancelled"
+                | "timed_out"
+                | "reaped"
+        )
+    })?;
+    let limit = query_field(query, "limit")?;
+    let parsed_limit = limit.parse::<u32>().ok()?;
+    if parsed_limit.to_string() != limit || !(1..=100).contains(&parsed_limit) {
+        return None;
+    }
+    Some(format!(
+        "myelin ci list --status {state} --limit {limit} --cursor {cursor}"
+    ))
+}
+
+fn query_field<'a>(query: &'a str, field: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == field).then_some(value)
+    })
+}
+
+fn safe_ci_cursor(cursor: &str) -> bool {
+    cursor.len() <= 256
+        && cursor
+            .strip_prefix(CI_RUN_CURSOR_PREFIX)
+            .is_some_and(|encoded| {
+                !encoded.is_empty()
+                    && encoded
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+}
+
+fn safe_cli_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
+}
+
 fn is_issue(value: &Value) -> bool {
     value.get("id").and_then(Value::as_str).is_some()
         && value.get("key").and_then(Value::as_str).is_some()
@@ -153,6 +421,15 @@ fn render_issue(value: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn canonical_ci_cursor() -> String {
+        let mut frame = [0_u8; 60];
+        frame[0] = 1;
+        format!(
+            "cr1_{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(frame)
+        )
+    }
 
     #[test]
     fn json_mode_is_pretty_raw() {
@@ -223,7 +500,8 @@ mod tests {
 
     #[test]
     fn human_whoami_is_a_single_line() {
-        let v = json!({"principal_id":"svc:agent","kind":"service","tenant":"acme","region":"eu-west"});
+        let v =
+            json!({"principal_id":"svc:agent","kind":"service","tenant":"acme","region":"eu-west"});
         let out = render(&v, false);
         assert!(out.contains("svc:agent (service)"));
         assert!(out.contains("tenant=acme"));
@@ -329,5 +607,110 @@ mod tests {
         assert!(fallback_out.contains("safe 🚀\\x7f\\x85"));
         assert!(!fallback_out.contains('\u{7f}'));
         assert!(!fallback_out.contains('\u{85}'));
+    }
+
+    #[test]
+    fn ci_list_has_human_state_words_and_an_actionable_opaque_cursor() {
+        let cursor = canonical_ci_cursor();
+        let value = json!({
+            "items": [{
+                "run_id": "91000000-0000-4000-8000-000000000001",
+                "pipeline_id": "93000000-0000-4000-8000-000000000001",
+                "repo_ref": "myelin://acme/git/repo/alpha",
+                "commit_oid": "0123456789abcdef",
+                "trigger_kind": "push",
+                "trust_tier": "trusted",
+                "state": "failed",
+                "cost_settled": true,
+                "created_at": "2026-07-24T12:00:00.000000Z",
+                "finished_at": "2026-07-24T12:05:00.000000Z"
+            }],
+            "page": {"next_cursor": &cursor, "limit": 1}
+        });
+        let call =
+            crate::dispatch::ci_dispatch(&["list", "--status", "failed", "--limit", "1"]).unwrap();
+        let output = render_for_call(&value, false, &call);
+        assert!(output.contains("✗ failed"));
+        let command = output
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("… (more — run: ")
+                    .and_then(|line| line.strip_suffix(')'))
+            })
+            .expect("actionable next-page command");
+        let words = command.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(&words[..4], &["myelin", "ci", "list", "--status"]);
+        let next = crate::dispatch::ci_dispatch(&words[2..]).unwrap();
+        assert_eq!(
+            next.query.as_deref(),
+            Some(format!("state=failed&limit=1&cursor={cursor}").as_str())
+        );
+    }
+
+    #[test]
+    fn ci_golden_detail_and_archive_render_without_live_claims_or_terminal_injection() {
+        let contract: Value = serde_json::from_str(include_str!(
+            "../../../contracts/ci-read-dev-edge.golden.json"
+        ))
+        .unwrap();
+        let vector = |id: &str| {
+            contract["vectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|vector| vector["id"] == id)
+                .unwrap()["expected"]
+                .clone()
+        };
+
+        let detail = render(&vector("failed-run-detail"), false);
+        assert!(detail.contains("✗ failed"));
+        assert!(detail.contains("test/contract"));
+        assert!(detail.contains(
+            "myelin ci logs 91000000-0000-4000-8000-000000000001 --job \
+             92000000-0000-4000-8000-000000000001"
+        ));
+        assert!(!detail.contains("live"));
+
+        let archive = render(&vector("archived-log-byte-range"), false);
+        assert!(archive.contains("archived log bytes 9..16 of 18"));
+        assert!(archive.contains("\\xa9\nfail"));
+        assert!(!archive.contains('\u{a9}'));
+        assert!(archive.contains("--start 16 --limit 7"));
+        assert!(!archive.contains("watch"));
+    }
+
+    #[test]
+    fn ci_action_hints_require_canonical_shell_safe_identifiers() {
+        let detail = json!({
+            "run": {
+                "run_id": "run; unsafe",
+                "repo_ref": "myelin://acme/git/repo/alpha",
+                "state": "failed",
+                "created_at": "now"
+            },
+            "jobs": [{
+                "job_id": "job $(unsafe)",
+                "stage": "test",
+                "name": "contract",
+                "state": "failed",
+                "attempt": 1
+            }],
+            "steps": []
+        });
+        let output = render(&detail, false);
+        assert!(!output.contains("archived output:"));
+
+        let log = json!({
+            "run_id": "run; unsafe",
+            "job_id": "job $(unsafe)",
+            "byte_start": 0,
+            "byte_end": 1,
+            "total_end": 2,
+            "next_offset": 1,
+            "encoding": "base64",
+            "data": "eA=="
+        });
+        assert!(!render(&log, false).contains("more — run:"));
     }
 }

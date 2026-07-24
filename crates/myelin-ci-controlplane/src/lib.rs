@@ -74,6 +74,8 @@ pub mod ci_result_signal;
 pub mod ci_runner_composition;
 pub mod ci_runner_host;
 pub mod ci_runtime_composition;
+/// The subsystem-owned total grammar for the durable `myelin ci` read surface.
+pub mod cli;
 pub use ci_claim_token_issuer::{CiJobCredentialMinter, LockedManifestCiJobTokenIssuer};
 pub use ci_drive_manifest::{
     ci_check_context_v1, CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1,

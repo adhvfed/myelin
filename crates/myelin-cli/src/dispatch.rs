@@ -21,6 +21,7 @@
 //! parsing, the rendering, and the exit codes are owned ONCE by the shell (this crate), for everyone.
 
 use crate::error::CliError;
+use myelin_ci_controlplane::cli::{parse_cli as parse_ci_cli, CliCommand as CiCliCommand};
 use myelin_git::api::{parse_cli, CliCommand, CliParseError};
 use myelin_issues::api::{parse_cli as parse_issues_cli, CliCommand as IssuesCliCommand};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -307,6 +308,50 @@ pub fn issues_command_to_call(command: &IssuesCliCommand) -> EdgeCall {
     }
 }
 
+/// Parse CI's subsystem-owned durable-read grammar and map it to the authenticated Edge routes.
+/// `ci watch` is refused by that grammar until the separately deployed runner and Edge share a real
+/// bounded resume authority.
+pub fn ci_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let command = parse_ci_cli(args).map_err(|error| CliError::Usage(error.to_string()))?;
+    Ok(ci_command_to_call(&command))
+}
+
+/// Map one validated CI read to the tenant-less Edge route.
+pub fn ci_command_to_call(command: &CiCliCommand) -> EdgeCall {
+    match command {
+        CiCliCommand::List(request) => {
+            let mut query = FormQuery::default();
+            query.push("state", request.state.token());
+            query.push("limit", &request.limit.to_string());
+            if let Some(cursor) = &request.cursor {
+                query.push("cursor", cursor);
+            }
+            EdgeCall {
+                method: HttpMethod::Get,
+                path: "/v1/ci/runs".into(),
+                query: Some(query.finish()),
+                payload: None,
+            }
+        }
+        CiCliCommand::View { run_id } => EdgeCall::get(format!("/v1/ci/runs/{run_id}")),
+        CiCliCommand::Logs {
+            run_id,
+            job_id,
+            range,
+        } => {
+            let mut query = FormQuery::default();
+            query.push("start", &range.start.to_string());
+            query.push("limit", &range.limit.to_string());
+            EdgeCall {
+                method: HttpMethod::Get,
+                path: format!("/v1/ci/runs/{run_id}/jobs/{job_id}/log"),
+                query: Some(query.finish()),
+                payload: None,
+            }
+        }
+    }
+}
+
 /// **Parse + map a `myelin notif …` invocation** (the args AFTER `notif`/`inbox`). REUSES notif's own
 /// grammar ([`myelin_notif::cli::CliView`] for the `--view` flag + its verb set). The durable list
 /// route is live; item detail/read mutation remain honest unsupported floors.
@@ -393,6 +438,16 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+
+    fn canonical_ci_cursor() -> String {
+        let mut frame = [0_u8; 60];
+        frame[0] = 1;
+        format!(
+            "cr1_{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(frame)
+        )
+    }
 
     /// **The REAL command — `myelin git repo list` maps to the opt-in lightweight summary through
     /// git's OWN grammar** (the reuse proof: `parse_cli(["repo","list"])` is git's).
@@ -619,5 +674,53 @@ mod tests {
                 .code(),
             2
         );
+    }
+
+    #[test]
+    fn ci_reads_reuse_the_owned_grammar_and_map_exact_routes() {
+        let run = "91000000-0000-4000-8000-000000000001";
+        let job = "92000000-0000-4000-8000-000000000001";
+        let cursor = canonical_ci_cursor();
+
+        let list = ci_dispatch(&[
+            "list",
+            "--status",
+            "failed",
+            "--limit",
+            "1",
+            "--cursor",
+            &cursor,
+        ])
+        .unwrap();
+        assert_eq!(list.method, HttpMethod::Get);
+        assert_eq!(list.path, "/v1/ci/runs");
+        assert_eq!(
+            list.query.as_deref(),
+            Some(format!("state=failed&limit=1&cursor={cursor}").as_str())
+        );
+        assert!(list.payload.is_none());
+
+        let view = ci_dispatch(&["view", run]).unwrap();
+        assert_eq!(view.path, format!("/v1/ci/runs/{run}"));
+        assert!(view.query.is_none());
+
+        let log =
+            ci_dispatch(&["logs", run, "--job", job, "--start", "9", "--limit", "7"]).unwrap();
+        assert_eq!(log.path, format!("/v1/ci/runs/{run}/jobs/{job}/log"));
+        assert_eq!(log.query.as_deref(), Some("start=9&limit=7"));
+        assert!(log.payload.is_none());
+    }
+
+    #[test]
+    fn ci_live_and_malformed_requests_fail_locally() {
+        let run = "91000000-0000-4000-8000-000000000001";
+        for invalid in [
+            vec!["watch", run],
+            vec!["list", "--limit", "0"],
+            vec!["view", "not-a-uuid"],
+            vec!["logs", run],
+        ] {
+            assert_eq!(ci_dispatch(&invalid).unwrap_err().code(), 2);
+        }
     }
 }
