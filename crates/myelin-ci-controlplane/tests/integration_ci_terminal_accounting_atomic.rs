@@ -386,6 +386,26 @@ async fn run_reporter_scenario(
         drive_manifest.check_attempts.remove("package");
     }
     let manifest_digest = manifest_store.insert(&drive_manifest).await.unwrap();
+    for manifest_job in &drive_manifest.jobs {
+        sqlx::query(
+            "INSERT INTO ci_job \
+             (tenant_id,region,job_id,run_id,stage,name,needs,spec_ref,state,attempt) \
+             VALUES ($1,$2,$3::uuid,$4::uuid,$5,$6,'{}'::uuid[],$7,'queued',1)",
+        )
+        .bind(&tenant.0)
+        .bind(&region.0)
+        .bind(&manifest_job.job_id)
+        .bind(ci_run)
+        .bind(&manifest_job.stage)
+        .bind(&manifest_job.name)
+        .bind(format!(
+            "myelin://{}/ci/job-spec/{}",
+            tenant.0, manifest_job.job_id
+        ))
+        .execute(&pool)
+        .await
+        .expect("seed the starter-owned CI job surface used by the production reporter");
+    }
 
     sqlx::query(
         "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)

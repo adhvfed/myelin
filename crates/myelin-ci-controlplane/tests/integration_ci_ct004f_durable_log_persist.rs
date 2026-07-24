@@ -29,7 +29,7 @@ use myelin_ci_controlplane::{
     ci_controlplane_migrations, log_pipeline::AnchorStatus, log_pipeline::CoalesceBudget,
     log_pipeline::LogAnchorRow, log_pipeline::LogCoord, log_pipeline::LogPipeline,
     log_pipeline::SealThreshold, log_pipeline::SecretRedactor, DurableLogPersist, FlushedJobLogs,
-    LogPersist, LogPipelineSink, SINGLE_STEP_ID,
+    LogPersist, LogPipelineSink, CREATE_CI_JOB_SPEC_DDL, CREATE_JOB_QUEUE_DDL, SINGLE_STEP_ID,
 };
 use myelin_ci_sandbox::FirehoseSink;
 use myelin_events::OUTBOX_MIGRATION;
@@ -147,6 +147,19 @@ async fn setup_schema(admin: &sqlx::PgPool, schema: &str) {
         .execute(OUTBOX_MIGRATION)
         .await
         .expect("apply the outbox migration into the schema");
+    for (table, ddl) in [
+        ("job_queue", CREATE_JOB_QUEUE_DDL),
+        ("ci_job_spec", CREATE_CI_JOB_SPEC_DDL),
+    ] {
+        admin
+            .execute(ddl)
+            .await
+            .unwrap_or_else(|error| panic!("create {table} log-route authority: {error}"));
+        admin
+            .execute(format!("SELECT myelin_make_tenant_scoped('{table}')").as_str())
+            .await
+            .unwrap_or_else(|error| panic!("scope {table} log-route authority: {error}"));
+    }
     // Grant the RLS-enforced app role access to the schema + its tables (the real tenant-scoped write
     // runs as this role; FORCE-RLS + the tx GUC — not a grant — is what isolates it to the tenant).
     admin
@@ -157,6 +170,43 @@ async fn setup_schema(admin: &sqlx::PgPool, schema: &str) {
         .execute(format!("GRANT ALL ON ALL TABLES IN SCHEMA {schema} TO myelin_app").as_str())
         .await
         .expect("grant table access to app");
+}
+
+async fn seed_log_route(
+    admin: &sqlx::PgPool,
+    tenant: &TenantId,
+    region: &Region,
+    workflow_run: &str,
+    ci_run: &str,
+    job: &str,
+) {
+    sqlx::query(
+        "INSERT INTO job_queue \
+         (tenant_id,region,job_id,run_id,lane,labels,trust_tier,fair_key,idem_token,state) \
+         VALUES ($1,$2,$3::uuid,$4::uuid,'batch','{}','trusted',$5,$6,'queued')",
+    )
+    .bind(tenant.as_str())
+    .bind(region.as_str())
+    .bind(job)
+    .bind(workflow_run)
+    .bind(format!("fair-{job}"))
+    .bind(format!("idem-{job}"))
+    .execute(admin)
+    .await
+    .expect("seed workflow queue log route");
+    sqlx::query(
+        "INSERT INTO ci_job_spec (tenant_id,region,job_id,run_id,idem_token,spec) \
+         VALUES ($1,$2,$3::uuid,$4::uuid,$5,jsonb_build_object('ci_run_id',$6))",
+    )
+    .bind(tenant.as_str())
+    .bind(region.as_str())
+    .bind(job)
+    .bind(workflow_run)
+    .bind(format!("idem-{job}"))
+    .bind(ci_run)
+    .execute(admin)
+    .await
+    .expect("seed immutable CI log route");
 }
 
 async fn cleanup_schema(admin: sqlx::PgPool, app: sqlx::PgPool, schema: &str) {
@@ -242,7 +292,9 @@ async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
     let tenant = TenantId::from_token("acme-ct004f");
     let region = Region::new("fr-par");
     let run = uid("ct004f-run");
+    let workflow_run = uid("ct004f-workflow-run");
     let job = uid("ct004f-job");
+    seed_log_route(&admin, &tenant, &region, &workflow_run, &run, &job).await;
 
     // Drive the sink on a DEDICATED off-runtime thread — exactly how the CiRunnerLoop runs it. The
     // sink holds a `LogPipeline` (non-Send: the firehose uses Rc), so it is CONSTRUCTED inside the
@@ -250,8 +302,12 @@ async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
     // Off-runtime → `try_current()` is Err → the persist bridge runs `block_on` directly (production).
     let app_for_thread = app.clone();
     let rt = tokio::runtime::Handle::current();
-    let (run_c, job_c, tenant_c, region_c) =
-        (run.clone(), job.clone(), tenant.clone(), region.clone());
+    let (run_c, job_c, tenant_c, region_c) = (
+        workflow_run.clone(),
+        job.clone(),
+        tenant.clone(),
+        region.clone(),
+    );
     let (live_tx, live_rx) = std::sync::mpsc::channel();
     let (finish_tx, finish_rx) = std::sync::mpsc::channel();
     let runner = std::thread::spawn(move || {
@@ -324,12 +380,14 @@ async fn retried_sink_appends_after_the_committed_live_prefix() {
     let tenant = TenantId::from_token("acme-ct004f-resume");
     let region = Region::new("fr-par");
     let run = uid("ct004f-resume-run");
+    let workflow_run = uid("ct004f-resume-workflow-run");
     let job = uid("ct004f-resume-job");
+    seed_log_route(&admin, &tenant, &region, &workflow_run, &run, &job).await;
     let app_for_thread = app.clone();
     let rt = tokio::runtime::Handle::current();
     let blobs = Arc::new(FsBlobStore::new());
     let (tenant_c, region_c, run_c, job_c) =
-        (tenant.clone(), region.clone(), run.clone(), job.clone());
+        (tenant.clone(), region.clone(), workflow_run, job.clone());
 
     std::thread::spawn(move || {
         let first = LogPipelineSink::new(
@@ -410,7 +468,9 @@ async fn concurrent_retries_cannot_overwrite_the_same_committed_append_position(
     let tenant = TenantId::from_token("acme-ct004f-concurrent-resume");
     let region = Region::new("fr-par");
     let run = uid("ct004f-concurrent-resume-run");
+    let workflow_run = uid("ct004f-concurrent-resume-workflow-run");
     let job = uid("ct004f-concurrent-resume-job");
+    seed_log_route(&admin, &tenant, &region, &workflow_run, &run, &job).await;
     let rt = tokio::runtime::Handle::current();
     let blobs = Arc::new(FsBlobStore::new());
     let prefix = b"prefix\n";
@@ -419,7 +479,7 @@ async fn concurrent_retries_cannot_overwrite_the_same_committed_append_position(
         let app = app.clone();
         let tenant = tenant.clone();
         let region = region.clone();
-        let run = run.clone();
+        let run = workflow_run.clone();
         let job = job.clone();
         let blobs = blobs.clone();
         let rt = rt.clone();
@@ -443,7 +503,7 @@ async fn concurrent_retries_cannot_overwrite_the_same_committed_append_position(
             let app = app.clone();
             let tenant = tenant.clone();
             let region = region.clone();
-            let run = run.clone();
+            let run = workflow_run.clone();
             let job = job.clone();
             let blobs = blobs.clone();
             let rt = rt.clone();
@@ -524,7 +584,7 @@ async fn concurrent_retries_cannot_overwrite_the_same_committed_append_position(
     let app_for_finish = app.clone();
     let tenant_for_finish = tenant.clone();
     let region_for_finish = region.clone();
-    let run_for_finish = run.clone();
+    let run_for_finish = workflow_run;
     let job_for_finish = job.clone();
     std::thread::spawn(move || {
         let sink = LogPipelineSink::new(
