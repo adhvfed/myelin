@@ -875,6 +875,7 @@ mod tests {
                     guest_id: "agent-guest".into(),
                 },
                 result,
+                output_complete: true,
             })
         }
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
