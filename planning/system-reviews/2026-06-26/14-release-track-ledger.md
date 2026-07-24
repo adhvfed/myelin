@@ -1949,9 +1949,10 @@ budgets, frontend-aware contract coverage (99 rows, 83 covered, 16 deferred, two
 contracts), its red/green fixture matrix, targeted rustfmt, shell syntax, and diff check pass.
 Independent adversarial review caught and closed the initial fake-token grammar, then reported
 **CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding**. The broader workspace all-target/
-all-feature check independently exposed an older Agent Service CDC initializer missing the now-
-required `output_complete` field; that unrelated compile failure remains the immediate next
-releasability repair rather than being hidden inside this row.
+all-feature check independently exposed four older Agent Service sandbox stubs missing the now-
+required `output_complete` field. The immediate follow-on makes their simulated successful output
+explicit instead of deleting the meaningful CDC coverage; all 272 Agent Service tests and the
+workspace all-target/all-feature check are green.
 
 Mechanical payoff: founder CI passes producing a machine-checkable receipt = 0→1; verifier response
 or archive paths without an explicit bound = 2→0; credentials admitted to cleartext non-loopback

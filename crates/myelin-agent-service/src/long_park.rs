@@ -432,6 +432,7 @@ mod tests {
                     cpu_seconds: 0,
                     mem_byte_seconds: 0,
                 }),
+                output_complete: true,
             })
         }
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
