@@ -91,6 +91,11 @@ Activation also refuses before database access unless `MYELIN_RUNSC_BIN` is an a
 that identifies itself as gVisor `runsc`, `MYELIN_GVISOR_ROOTFS` is an absolute staged base rootfs
 with the required executables, and the host can execute a bounded non-root `/bin/false` smoke through
 the real rootless runsc, read-only OCI bundle, and delegated cgroup-v2 memory boundary.
+Before starting intake, `dogfood.sh ci` also recomputes a deterministic canonical-tree SHA-256 of
+that staged rootfs and requires it to match the image digest in the checked-in `.myelin/ci.toml`.
+Run `./scripts/dogfood.sh verify-ci-rootfs` for the same read-only preflight explicitly; a mismatch
+must be resolved by intentionally restaging, redrilling, and updating the pin, never by weakening the
+comparison.
 Keep the process in the foreground during dogfood. Stop it with SIGINT/SIGTERM and require a clean
 drain before restarting or upgrading it. Do the same for dispatch and the Git projection consumer.
 
@@ -132,7 +137,8 @@ After completion, prove that the cold path has the same output and that the exac
 myelin --json ci view <run> | tee "$EVIDENCE_DIR/myelin-ci-run-cli-<run>.json"
 myelin ci logs <run> --job <job> --start 0 --limit 262144 \
   | tee "$EVIDENCE_DIR/myelin-ci-archive-cli-<run>-<job>.log"
-./scripts/dogfood.sh verify-ci <run> <job> 'MYELIN-CI-<32-random-lowercase-hex>' "$EVIDENCE_DIR"
+./scripts/dogfood.sh verify-ci <run> <job> \
+  'MYELIN-CI-a005e32fc1bb0c2b64e7d40ac1a01236' "$EVIDENCE_DIR"
 ```
 
 Follow any parser-round-trippable `more — run:` command printed by the archive reader until no
@@ -145,6 +151,9 @@ checksum-bearing JSON receipt. Confirm the same marker appeared once in the brow
 CLI archive too. Preserve that receipt together with the `verify-check` JSON and exact pushed OID. Do
 not mark the founder pass or start the R4 clock if the run fails, costs remain unsettled, the required
 check is absent/stale, a consumer needed GitHub, or any log surface loses/duplicates the marker.
+The marker is emitted exactly once by the checked-in `.myelin/ci.toml`; its compiled Dispatch
+contract fails if that production config stops parsing, resolving, naming `build`, retaining its
+rootfs digest pin, or carrying the exact marker once.
 
 ## 3. Mint an operator token (`edge bootstrap`)
 

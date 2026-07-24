@@ -7,6 +7,8 @@
 #   ./scripts/dogfood.sh edge              build + run the edge over the dogfood env (serves :8080)
 #   ./scripts/dogfood.sh ci                build + run the opt-in CI control plane/runner in the
 #                                          foreground over the same dogfood cell
+#   ./scripts/dogfood.sh verify-ci-rootfs  prove the staged runner rootfs matches the digest pinned
+#                                          by the checked-in founder pipeline
 #   ./scripts/dogfood.sh dispatch          build + run the Git-event→CI-run dispatch consumer
 #   ./scripts/dogfood.sh git-checks        build + run Git's CI-check projection consumer
 #   ./scripts/dogfood.sh verify-check <repo> <pr> <head-oid> [context]
@@ -117,6 +119,35 @@ EOF
   [[ "${response_bytes}" -le 524288 ]] || fail "Edge response exceeds the 524288-byte acceptance bound"
 }
 
+verify_ci_rootfs() {
+  for tool in sed tar sha256sum awk; do
+    command -v "${tool}" >/dev/null 2>&1 || fail "CI rootfs verification requires ${tool}"
+  done
+  local config="${REPO_ROOT}/.myelin/ci.toml"
+  local rootfs="${MYELIN_GVISOR_ROOTFS:-${GVISOR_ROOTFS_DEFAULT}}"
+  [[ -f "${config}" && ! -L "${config}" ]] ||
+    fail "checked-in founder pipeline is absent or linked: ${config}"
+  [[ -d "${rootfs}" && ! -L "${rootfs}" ]] ||
+    fail "staged CI rootfs is absent or linked: ${rootfs}"
+  local expected_digest actual_digest
+  expected_digest="$(
+    sed -nE \
+      's|^image = "myelin\.local/linux-small-v1-rootfs@sha256:([0-9a-f]{64})"$|\1|p' \
+      "${config}"
+  )"
+  [[ "${expected_digest}" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "founder pipeline must contain exactly one canonical linux-small-v1 rootfs digest"
+  actual_digest="$(
+    tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --format=gnu \
+      -C "${rootfs}" -cf - . |
+      sha256sum |
+      awk '{print $1}'
+  )"
+  [[ "${actual_digest}" == "${expected_digest}" ]] ||
+    fail "staged CI rootfs digest ${actual_digest} does not match founder pipeline ${expected_digest}"
+  printf '%s\n' "${actual_digest}"
+}
+
 # Print the eval-able env contract: the dev-stack data-layer env + the edge-only env.
 print_env() {
   ensure_seal_key
@@ -177,9 +208,17 @@ case "${cmd}" in
     ;;
   ci)
     load_env
+    verify_ci_rootfs >/dev/null
     export MYELIN_CI_RUNNER=1
     echo "dogfood: building + serving the CI control plane with the runner enabled" >&2
     exec cargo run --quiet -p myelin-ci-controlplane --bin ci-controlplane
+    ;;
+  verify-ci-rootfs)
+    if [[ "$#" -ne 0 ]]; then
+      echo "usage: $0 verify-ci-rootfs" >&2
+      exit 2
+    fi
+    verify_ci_rootfs
     ;;
   dispatch)
     load_env
@@ -481,7 +520,7 @@ cd frontend/apps/web && pnpm install && pnpm dev
 EOF
     ;;
   *)
-    echo "usage: $0 {env|edge|ci|dispatch|git-checks|verify-check <repo> <pr> <head-oid> [context]|bootstrap -- <flags>|web}" >&2
+    echo "usage: $0 {env|edge|ci|verify-ci-rootfs|dispatch|git-checks|verify-check <repo> <pr> <head-oid> [context]|verify-ci <run> <job> <marker> [evidence-dir]|bootstrap -- <flags>|web}" >&2
     exit 2
     ;;
 esac

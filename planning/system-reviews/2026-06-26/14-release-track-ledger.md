@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification; CT-005f1 adds the repository-authorized durable SSE resume consumer; CT-005f2 persists bounded byte-exact output during execution on both production backends and closes retry/supersession recovery without resurrection; CT-005f3 adds the authenticated web live consumer and executes shared resume vectors through the actual dev and production implementations; CT-005f4 adds the authenticated strict resumable CLI live-tail consumer; CT-005f5 closes the composed production CI-D11 committed-prefix sever/resume drill; CT-005f6 makes the founder pass emit a bounded, no-overwrite, checksum-bearing acceptance receipt under compiled adversarial contracts. Still required: the live founder push→CI→surfaced-check/log pass, then CT-007.** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification; CT-005f1 adds the repository-authorized durable SSE resume consumer; CT-005f2 persists bounded byte-exact output during execution on both production backends and closes retry/supersession recovery without resurrection; CT-005f3 adds the authenticated web live consumer and executes shared resume vectors through the actual dev and production implementations; CT-005f4 adds the authenticated strict resumable CLI live-tail consumer; CT-005f5 closes the composed production CI-D11 committed-prefix sever/resume drill; CT-005f6 makes the founder pass emit a bounded, no-overwrite, checksum-bearing acceptance receipt under compiled adversarial contracts; CT-005f7 checks in the exact one-job founder pipeline and binds its requested image digest to the staged rootfs before runner activation. Still required: the live founder push→CI→surfaced-check/log pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1961,6 +1961,35 @@ overwritten = 1→0.
 
 L3 CT-005f6 footprint: **6 files, +678 / -14 lines** for the bounded founder verifier, compiled
 transport/pagination/filesystem contracts, operator runbook, dependency lock, and ledger.
+
+**CT-005f7 armed founder-pipeline handoff (2026-07-24; the live founder act remains open).** The
+repository now carries the V2 `.myelin/ci.toml` that the production Dispatch consumer already reads
+from the exact pushed OID. Its single `build` job uses the server-owned `linux-small-v1` profile,
+requests the current personal cell's digest-pinned staged rootfs, and prints the acceptance verifier's
+non-self-overlapping marker exactly once. This is intentionally a tiny end-to-end transport/check
+job, not a claim that the one-cell BusyBox rootfs can build the complete workspace.
+
+The checked-in config is now a compiled contract rather than an unparsed runbook example. Dispatch
+reads the real repository file, requires its V2 profile, one `build` context, exact digest pin and
+command, exact single marker, then resolves it through the ordinary content-addressed plan path.
+`dogfood.sh ci` independently canonicalizes the staged rootfs tree and refuses runner activation
+unless its SHA-256 equals that authored image pin; `verify-ci-rootfs` exposes the same read-only
+preflight. The current personal-production asset produces the exact pinned digest. A rootfs restage
+therefore requires an intentional pin update and rerun rather than silently changing executed bytes.
+
+Mechanical evidence: the new real-file Dispatch contract passes; the full Dispatch all-target/
+all-feature suite passes (92 unit tests plus 20 compiled CDC/live integrations), and warnings-denied
+Dispatch clippy is green. The seven acceptance-verifier contracts remain green, shell syntax and
+diff check pass, and the workspace all-target/all-feature check remains green. Independent
+adversarial review held the initial parse-only test for not proving push arming or the resolved
+command, then confirmed both gaps closed with **no remaining HIGH or MEDIUM finding**.
+
+Mechanical payoff: pushed Myelin commits with no authored CI pipeline = 1→0; founder-pipeline config
+parsed only after the human push = 1→0; staged rootfs changes admitted under the old authored digest
+= 1→0.
+
+L3 CT-005f7 footprint: **5 files, +240 / -3 lines** for the checked-in founder pipeline, real-file
+resolver contract, rootfs-pin activation preflight, runbook, and ledger.
 
 **Honest remaining CT-005 floor:** the founder must perform a real Myelin push and observe its
 exact-head required check settle with archived and live output through the verifier, browser, and
