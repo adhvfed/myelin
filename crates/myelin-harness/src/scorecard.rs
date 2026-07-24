@@ -1316,11 +1316,12 @@ pub fn m3_required_rows() -> Vec<GateRow> {
 ///   CHAT-D17 (explicit-first).
 /// - **contract-coverage:** the scanner re-affirm (no falsely-claimed / silently-dropped / un-named row).
 ///
-/// Exactly two rows are `permanent` (re-run-forever): the AG-D4/CI-T1 prod-image escape re-confirm
-/// (EI-01 §2: RCE/sandbox-escape outranks every feature) and the STOR-D1/D2 restore-verify on the CI
-/// stores (the shared Storage-owned permanent restore gate; a backup never restored is not a backup,
-/// EI-01 §3). Both are the only `--features integration` rows — they FAIL without the live stack, and
-/// AG-D4 additionally hard-fails without /dev/kvm + firecracker under `MYELIN_REQUIRE_KVM=1`. The ONE
+/// Exactly three rows are `permanent` (re-run-forever): the composed CI-D11 durable reconnect, the
+/// AG-D4/CI-T1 prod-image escape re-confirm (EI-01 §2: RCE/sandbox-escape outranks every feature), and
+/// the STOR-D1/D2 restore-verify on the CI stores (the shared Storage-owned permanent restore gate; a
+/// backup never restored is not a backup, EI-01 §3). All three use `--features integration` and FAIL
+/// without their live dependencies; AG-D4 additionally hard-fails without /dev/kvm + firecracker
+/// under `MYELIN_REQUIRE_KVM=1`. The ONE
 /// true remaining floor — the world-scale 30× LOAD / surge drills (FLOW-D8 / AG-D6 / the CHAT+Issues
 /// surge) needs real fleet hardware — is a named, dated M5 deferral in `render_markdown`, NOT a row here
 /// (it would red the gate; M4 is *correct*, M5 is *load-hardened*); gVisor as a second escape-drill
@@ -1357,11 +1358,22 @@ pub fn m4_required_rows() -> Vec<GateRow> {
             "seam gate → the check_status producer/consumer seam dead-letters foreign/malformed, idempotent on dup, drops stale supersession",
             &["test", "-p", "myelin-ci-controlplane", "--test", "drills_ci_p19_seam_gate"],
         ),
-        row(
-            "CI-D11",
-            "live-tail → the CI log live-tail is a references-not-payloads firehose pointer; resume replays exactly, no lost/dup byte-range",
-            &["test", "-p", "myelin-ci-controlplane", "--test", "drills_ci_p21_live_tail"],
-        ),
+        GateRow {
+            id: "CI-D11",
+            title: "live-tail → reconstructed durable producer + Edge resume a committed prefix exactly, no lost/dup byte-range",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-edge",
+                "--features",
+                "integration",
+                "--test",
+                "integration_ci_http_surface",
+                "production_sink_and_edge_resume_exactly_after_both_services_are_severed",
+            ],
+            permanent: true,
+            floor: None,
+        },
         row(
             "CI-D6",
             "fork cache-poison → a fork PR cannot poison the trusted build cache (cache key scoped, untrusted writes quarantined)",
@@ -3339,11 +3351,10 @@ mod tests {
         );
     }
 
-    /// EXACTLY the two permanent rows (AG-D4/CI-T1 + STOR-D1/D2) are the M4 permanent gates AND the
-    /// only `--features integration` rows. AG-D4/CI-T1 targets the prod-image re-confirm drill (the
-    /// real-kernel escape gate, EI-01 §2); STOR-D1/D2 targets the CI-store restore-verify drill.
+    /// EXACTLY three permanent rows (CI-D11 + AG-D4/CI-T1 + STOR-D1/D2) are the M4 permanent gates
+    /// and the only `--features integration` rows.
     #[test]
-    fn m4_permanent_rows_are_the_two_integration_gates() {
+    fn m4_permanent_rows_are_the_three_integration_gates() {
         let perm: Vec<&str> = m4_required_rows()
             .into_iter()
             .filter(|r| r.permanent)
@@ -3351,8 +3362,8 @@ mod tests {
             .collect();
         assert_eq!(
             perm,
-            vec!["AG-D4/CI-T1", "STOR-D1/D2"],
-            "the M4 permanent set is exactly the prod-image escape re-confirm + the CI-store restore-verify"
+            vec!["CI-D11", "AG-D4/CI-T1", "STOR-D1/D2"],
+            "the M4 permanent set is exactly durable reconnect + prod-image escape + restore-verify"
         );
         let integration: Vec<&str> = m4_required_rows()
             .into_iter()
@@ -3363,8 +3374,8 @@ mod tests {
             .collect();
         assert_eq!(
             integration,
-            vec!["AG-D4/CI-T1", "STOR-D1/D2"],
-            "exactly the two permanent rows run --features integration (red-until-proven)"
+            vec!["CI-D11", "AG-D4/CI-T1", "STOR-D1/D2"],
+            "exactly the three permanent rows run --features integration (red-until-proven)"
         );
         let ag = m4_required_rows()
             .into_iter()

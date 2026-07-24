@@ -7,7 +7,11 @@
 
 use base64::Engine as _;
 use myelin_ci_controlplane::surfacing_store::canonical_visible_repo_refs;
-use myelin_ci_controlplane::{ci_controlplane_migrations, CiRunStore};
+use myelin_ci_controlplane::{
+    ci_controlplane_migrations, CiRunStore, DurableLogPersist, LogPipelineSink,
+};
+use myelin_ci_sandbox::FirehoseSink;
+use myelin_config::MyelinConfig;
 use myelin_edge::repo_authz::{GrantBackedRepos, RepoPermission};
 use myelin_edge::{
     register_ci, AuthenticatedActionPolicy, DurableCiReadApi, DurableGitBackend, EdgeError,
@@ -20,6 +24,7 @@ use myelin_identity_service::{
     CredentialPurpose, HumanSsoAuthenticator, PasetoCapabilityVerifier, PrincipalStore,
     RevocationStore,
 };
+use myelin_storage::s3blob::S3BlobStore;
 use myelin_storage::{
     with_tenant_tx, BlobStore, ContentHash, FsBlobStore, KmsEngine, PgError, TenantScope,
 };
@@ -132,7 +137,8 @@ async fn setup_schema(admin: &PgPool, schema: &str) {
         .expect("grant isolated schema usage");
     admin
         .execute(
-            format!("GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA {schema} TO myelin_app").as_str(),
+            format!("GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA {schema} TO myelin_app")
+                .as_str(),
         )
         .await
         .expect("grant fixture access");
@@ -977,6 +983,195 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
         .expect("drop isolated schema");
     admin.close().await;
     std::fs::remove_dir_all(root).expect("remove isolated git fixture");
+}
+
+/// CI-D11 through the composed production services: the runner-owned durable sink and the
+/// repository-authorized Edge stream share only PostgreSQL and the content-addressed blob store.
+/// Both service-side objects are destroyed mid-run, then reconstructed. The restarted producer
+/// appends after its durable head and the restarted viewer resumes strictly after its acknowledged
+/// pointer, so the archive remains byte exact with neither loss nor duplication.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_sink_and_edge_resume_exactly_after_both_services_are_severed() {
+    const RUN: &str = "81000000-0000-4000-8000-000000000011";
+    const JOB: &str = "85000000-0000-4000-8000-000000000011";
+    const FIRST: &[u8] = b"producer-before-sever\n";
+    const SECOND: &[u8] = b"producer-after-restart\n";
+
+    let schema = schema_name();
+    let admin = pool(&admin_url(), &schema).await;
+    setup_schema(&admin, &schema).await;
+    let app = pool(&app_url(), &schema).await;
+    insert_run(&app, RUN, "alpha", "2026-07-24T13:00:00Z").await;
+    insert_job_and_segments(&app, RUN, JOB, &[]).await;
+
+    let blobs = S3BlobStore::connect(&MyelinConfig::dev().s3, tokio::runtime::Handle::current());
+    let edge_blobs: Arc<dyn BlobStore + Send + Sync> = Arc::new(blobs.clone());
+    let root = std::env::temp_dir().join(format!("{schema}_git"));
+    let repo_dir = root.join(TENANT).join(REGION);
+    std::fs::create_dir_all(repo_dir.join("alpha.git")).expect("create visible repo");
+    let (gateway, cell, _, _, _) = authenticated_gateway(app.clone(), &root, edge_blobs.clone());
+    let token = mint(&cell);
+    let live_path = format!("/v1/ci/runs/{RUN}/jobs/{JOB}/log/live");
+
+    let live = get(&gateway, &token, &live_path);
+    let mut live_rx = match live {
+        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+        other => panic!(
+            "fresh composed live tail returned status {}",
+            other.status()
+        ),
+    };
+    let ready = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+        .await
+        .expect("initial checkpoint deadline")
+        .expect("initial checkpoint");
+    assert_eq!(ready.event.as_deref(), Some("ci.log.ready"));
+    assert_eq!(ready.id.as_deref(), Some("0"));
+
+    let runtime = tokio::runtime::Handle::current();
+    let first_app = app.clone();
+    let first_blobs = blobs.clone();
+    std::thread::spawn(move || {
+        let sink = LogPipelineSink::new(
+            Region(REGION.into()),
+            first_blobs,
+            DurableLogPersist::with_pg(first_app, runtime),
+        );
+        sink.ship_frame(RUN, JOB, &TenantId(TENANT.into()), FIRST)
+            .expect("first production sink commits before service loss");
+        // Dropping the only sink models loss of the producer service before terminal finish.
+    })
+    .join()
+    .expect("first producer service joins");
+
+    let first_pointer = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+        .await
+        .expect("first live pointer deadline")
+        .expect("first live pointer");
+    assert_eq!(first_pointer.event.as_deref(), Some("ci.log.appended"));
+    assert_eq!(first_pointer.id.as_deref(), Some("1"));
+    let first_data: serde_json::Value =
+        serde_json::from_str(&first_pointer.data).expect("first pointer JSON");
+    assert_eq!(first_data["byte_start"], 0);
+    assert_eq!(first_data["byte_end"], FIRST.len() as i64);
+
+    // Destroy both the viewer-side connection and its production Gateway composition after pointer
+    // 1 was acknowledged. The resumed request below is served by a newly composed Edge instance.
+    drop(live_rx);
+    drop(gateway);
+
+    let runtime = tokio::runtime::Handle::current();
+    let second_app = app.clone();
+    let second_blobs = blobs.clone();
+    std::thread::spawn(move || {
+        let sink = LogPipelineSink::new(
+            Region(REGION.into()),
+            second_blobs,
+            DurableLogPersist::with_pg(second_app, runtime),
+        );
+        sink.ship_frame(RUN, JOB, &TenantId(TENANT.into()), SECOND)
+            .expect("restarted production sink appends after the durable prefix");
+        sink.finish(RUN, JOB, &TenantId(TENANT.into()), true)
+            .expect("restarted production sink closes its durable anchor");
+    })
+    .join()
+    .expect("restarted producer service joins");
+
+    let (gateway, cell, _, _, _) = authenticated_gateway(app.clone(), &root, edge_blobs);
+    let token = mint(&cell);
+    let resumed = get_query_headers(
+        &gateway,
+        &token,
+        &live_path,
+        "",
+        vec![("Last-Event-ID".into(), "1".into())],
+    );
+    let mut resumed_rx = match resumed {
+        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+        other => panic!(
+            "resumed composed live tail returned status {}",
+            other.status()
+        ),
+    };
+    let second_pointer = tokio::time::timeout(Duration::from_secs(2), resumed_rx.recv())
+        .await
+        .expect("resumed pointer deadline")
+        .expect("resumed pointer");
+    assert_eq!(second_pointer.event.as_deref(), Some("ci.log.appended"));
+    assert_eq!(
+        second_pointer.id.as_deref(),
+        Some("2"),
+        "resume starts strictly after the acknowledged pointer; id 1 is not duplicated"
+    );
+    let second_data: serde_json::Value =
+        serde_json::from_str(&second_pointer.data).expect("second pointer JSON");
+    assert_eq!(second_data["byte_start"], FIRST.len() as i64);
+    assert_eq!(second_data["byte_end"], (FIRST.len() + SECOND.len()) as i64);
+
+    let archive = get_query(
+        &gateway,
+        &token,
+        &format!("/v1/ci/runs/{RUN}/jobs/{JOB}/log"),
+        &format!("start=0&limit={}", FIRST.len() + SECOND.len()),
+    );
+    assert_eq!(archive.status(), 200);
+    let archive = archive.json_body().expect("composed archive JSON");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(archive["data"].as_str().expect("archive base64"))
+        .expect("decode composed archive");
+    assert_eq!(
+        bytes,
+        [FIRST, SECOND].concat(),
+        "producer restart plus viewer resume loses and duplicates zero bytes"
+    );
+
+    let coordinates = sqlx::query_as::<_, (i32, i64, i64)>(
+        "SELECT segment_seq, byte_start, byte_end FROM log_segment
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND job_id = $4::uuid
+         ORDER BY segment_seq",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(RUN)
+    .bind(JOB)
+    .fetch_all(&admin)
+    .await
+    .expect("read composed durable coordinates");
+    assert_eq!(
+        coordinates,
+        vec![
+            (0, 0, FIRST.len() as i64),
+            (1, FIRST.len() as i64, (FIRST.len() + SECOND.len()) as i64)
+        ]
+    );
+
+    sqlx::query(
+        "UPDATE ci_job SET state = 'succeeded'
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND job_id = $4::uuid",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(RUN)
+    .bind(JOB)
+    .execute(&admin)
+    .await
+    .expect("terminalize composed job");
+    let complete = tokio::time::timeout(Duration::from_secs(2), resumed_rx.recv())
+        .await
+        .expect("composed completion deadline")
+        .expect("composed completion");
+    assert_eq!(complete.event.as_deref(), Some("ci.log.complete"));
+    assert_eq!(complete.id.as_deref(), Some("2"));
+
+    drop(resumed_rx);
+    drop(gateway);
+    app.close().await;
+    admin
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .expect("drop isolated composed schema");
+    admin.close().await;
+    std::fs::remove_dir_all(root).expect("remove composed git fixture");
 }
 
 /// FRONTEND-CONTRACT: ci-read-dev-edge-parity
