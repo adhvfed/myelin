@@ -1,14 +1,19 @@
-//! Live CT-005a proof through the production CI HTTP handlers and action policy.
+//! Live CT-005 proof through the production CI HTTP handlers and action policy.
+//!
+//! PROVIDER: CI's durable `log_segment` archive supplies monotone segment and byte coordinates.
+//! CONSUMER: Edge turns those coordinates into repository-authorized SSE resume pointers and
+//! rejects stale or discontinuous archives. This is the cross-service 3.5/11.8 CDC leg.
 #![cfg(feature = "integration")]
 
 use base64::Engine as _;
 use myelin_ci_controlplane::surfacing_store::canonical_visible_repo_refs;
 use myelin_ci_controlplane::{ci_controlplane_migrations, CiRunStore};
-use myelin_edge::repo_authz::GrantBackedRepos;
+use myelin_edge::repo_authz::{GrantBackedRepos, RepoPermission};
 use myelin_edge::{
     register_ci, AuthenticatedActionPolicy, DurableCiReadApi, DurableGitBackend, EdgeError,
-    EdgeRequest, Gateway,
+    EdgeRequest, Gateway, RepoAuthorizer,
 };
+use myelin_git::core::RepoLoc;
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, CredentialAudience,
@@ -21,9 +26,9 @@ use myelin_storage::{
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TENANT: &str = "acme";
 const REGION: &str = "eu-north";
@@ -34,12 +39,36 @@ const VISIBLE_JOB: &str = "85000000-0000-4000-8000-000000000001";
 const ABSENT_JOB: &str = "85000000-0000-4000-8000-000000000002";
 const CORRUPT_JOB: &str = "85000000-0000-4000-8000-000000000003";
 const HIDDEN_JOB: &str = "85000000-0000-4000-8000-000000000004";
+const BOUNDARY_JOB: &str = "85000000-0000-4000-8000-000000000005";
 const SCHEME: &str = "agent";
 const GOLDEN_NEWEST_RUN: &str = "91000000-0000-4000-8000-000000000001";
 const GOLDEN_OLDER_RUN: &str = "91000000-0000-4000-8000-000000000002";
 const GOLDEN_FAILED_JOB: &str = "92000000-0000-4000-8000-000000000001";
 
 static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
+
+struct RevocableRepoAuthorizer {
+    grants: GrantBackedRepos,
+    alpha_enabled: Arc<AtomicBool>,
+}
+
+impl RepoAuthorizer for RevocableRepoAuthorizer {
+    fn authorize_repo_permission(
+        &self,
+        principal: &Principal,
+        repo: &RepoLoc,
+        permission: RepoPermission,
+    ) -> bool {
+        if repo.repo == "alpha"
+            && permission == RepoPermission::Pull
+            && !self.alpha_enabled.load(Ordering::SeqCst)
+        {
+            return false;
+        }
+        self.grants
+            .authorize_repo_permission(principal, repo, permission)
+    }
+}
 
 fn app_url() -> String {
     std::env::var("DATABASE_URL")
@@ -194,6 +223,43 @@ async fn insert_job_and_segments(
     .expect("insert tenant-scoped CI log archive");
 }
 
+async fn insert_segment(
+    app: &PgPool,
+    run_id: &str,
+    job_id: &str,
+    sequence: i32,
+    blob_ref: String,
+    byte_start: i64,
+    byte_end: i64,
+) {
+    let run_id = run_id.to_string();
+    let job_id = job_id.to_string();
+    with_tenant_tx(app, TENANT, REGION, move |conn| {
+        Box::pin(async move {
+            sqlx::query(
+                "INSERT INTO log_segment (
+                   tenant_id, region, run_id, job_id, segment_seq, blob_ref,
+                   byte_start, byte_end, pii_key_ref
+                 ) VALUES ($1, $2, $3::uuid, $4::uuid, $5, $6, $7, $8, 'tenant:test')",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(run_id)
+            .bind(job_id)
+            .bind(sequence)
+            .bind(blob_ref)
+            .bind(byte_start)
+            .bind(byte_end)
+            .execute(&mut *conn)
+            .await
+            .map(|_| ())
+            .map_err(|error| PgError::Query(error.to_string()))
+        })
+    })
+    .await
+    .expect("insert tenant-scoped CI log segment");
+}
+
 async fn insert_golden_ci_surface(app: &PgPool, blob_ref: String, log_len: i64) {
     with_tenant_tx(app, TENANT, REGION, move |conn| {
         Box::pin(async move {
@@ -292,7 +358,13 @@ fn authenticated_gateway(
     app: PgPool,
     git_root: &std::path::Path,
     blobs: Arc<dyn BlobStore + Send + Sync>,
-) -> (Gateway, CellTokenAuthority, DurableCiReadApi, Principal) {
+) -> (
+    Gateway,
+    CellTokenAuthority,
+    DurableCiReadApi,
+    Principal,
+    Arc<AtomicBool>,
+) {
     let cell = CellTokenAuthority::from_seed(&[17; 32], &[19; 32]).expect("cell authority");
     let principals = PrincipalStore::new(Arc::new(KmsEngine::new()));
     principals
@@ -327,8 +399,14 @@ fn authenticated_gateway(
         .fold(GrantBackedRepos::new(), |grants, repo| {
             grants.grant_read("svc:viewer", TENANT, repo)
         });
+    let alpha_enabled = Arc::new(AtomicBool::new(true));
     let git = Arc::new(
-        DurableGitBackend::rooted_inmem_for_test(git_root).with_repo_authorizer(Arc::new(authz)),
+        DurableGitBackend::rooted_inmem_for_test(git_root).with_repo_authorizer(Arc::new(
+            RevocableRepoAuthorizer {
+                grants: authz,
+                alpha_enabled: alpha_enabled.clone(),
+            },
+        )),
     );
     let viewer = Principal::new(
         TenantId(TENANT.into()),
@@ -356,7 +434,7 @@ fn authenticated_gateway(
         blobs,
         tokio::runtime::Handle::current(),
     );
-    (builder.build(), cell, direct, viewer)
+    (builder.build(), cell, direct, viewer, alpha_enabled)
 }
 
 fn mint(cell: &CellTokenAuthority) -> String {
@@ -383,16 +461,22 @@ fn get(gateway: &Gateway, token: &str, path: &str) -> myelin_edge::EdgeResponse 
 }
 
 fn get_query(gateway: &Gateway, token: &str, path: &str, query: &str) -> myelin_edge::EdgeResponse {
-    gateway.handle(EdgeRequest::new(
-        "GET",
-        path,
-        query,
-        vec![
-            ("Authorization".into(), format!("Bearer {token}")),
-            ("x-myelin-token-scheme".into(), SCHEME.into()),
-        ],
-        Vec::new(),
-    ))
+    get_query_headers(gateway, token, path, query, Vec::new())
+}
+
+fn get_query_headers(
+    gateway: &Gateway,
+    token: &str,
+    path: &str,
+    query: &str,
+    extra_headers: Vec<(String, String)>,
+) -> myelin_edge::EdgeResponse {
+    let mut headers = vec![
+        ("Authorization".into(), format!("Bearer {token}")),
+        ("x-myelin-token-scheme".into(), SCHEME.into()),
+    ];
+    headers.extend(extra_headers);
+    gateway.handle(EdgeRequest::new("GET", path, query, headers, Vec::new()))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -420,9 +504,9 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
         VISIBLE_RUN,
         VISIBLE_JOB,
         &[
-            (first_ref, 0, first.len() as i64),
+            (first_ref.clone(), 0, first.len() as i64),
             (
-                second_ref,
+                second_ref.clone(),
                 first.len() as i64,
                 (first.len() + second.len()) as i64,
             ),
@@ -451,12 +535,29 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
         )],
     )
     .await;
+    let boundary_segments = (0..65)
+        .map(|sequence| {
+            let byte_start = if sequence == 64 {
+                257
+            } else {
+                i64::from(sequence) * 4
+            };
+            (
+                ContentHash::blake3(format!("boundary-{sequence}").as_bytes())
+                    .to_multihash_string(),
+                byte_start,
+                byte_start + 4,
+            )
+        })
+        .collect::<Vec<_>>();
+    insert_job_and_segments(&app, VISIBLE_RUN, BOUNDARY_JOB, &boundary_segments).await;
 
     let root = std::env::temp_dir().join(format!("{schema}_git"));
     let repo_dir = root.join(TENANT).join(REGION);
     std::fs::create_dir_all(repo_dir.join("alpha.git")).expect("create visible repo");
     std::fs::create_dir_all(repo_dir.join("hidden.git")).expect("create hidden repo");
-    let (gateway, cell, direct, viewer) = authenticated_gateway(app.clone(), &root, blobs);
+    let (gateway, cell, direct, viewer, alpha_enabled) =
+        authenticated_gateway(app.clone(), &root, blobs.clone());
     let token = mint(&cell);
 
     let list = get(&gateway, &token, "/v1/ci/runs");
@@ -523,6 +624,298 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
             .expect("direct visible log"),
         log_body,
         "HTTP and agent/MCP share exact archived-log materialization"
+    );
+
+    let live_path = format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{VISIBLE_JOB}/log/live");
+    let live = get_query_headers(
+        &gateway,
+        &token,
+        &live_path,
+        "",
+        vec![("Last-Event-ID".into(), "0".into())],
+    );
+    let mut live_rx = match live {
+        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+        other => panic!(
+            "visible live tail must stream, got status {}",
+            other.status()
+        ),
+    };
+    let first_live = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+        .await
+        .expect("first live pointer deadline")
+        .expect("first live pointer");
+    let second_live = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+        .await
+        .expect("second live pointer deadline")
+        .expect("second live pointer");
+    assert_eq!(first_live.id.as_deref(), Some("1"));
+    assert_eq!(second_live.id.as_deref(), Some("2"));
+    assert_eq!(first_live.event.as_deref(), Some("ci.log.appended"));
+    let first_pointer: serde_json::Value =
+        serde_json::from_str(&first_live.data).expect("first pointer JSON");
+    assert_eq!(first_pointer["byte_start"], 0);
+    assert_eq!(first_pointer["byte_end"], 6);
+    assert!(
+        first_pointer.get("blob_ref").is_none() && first_pointer.get("data").is_none(),
+        "SSE carries a bounded archive coordinate, never a content address or log bytes"
+    );
+
+    let fresh = get(&gateway, &token, &live_path);
+    let mut fresh_rx = match fresh {
+        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+        other => panic!(
+            "fresh live tail must stream from the current head, got status {}",
+            other.status()
+        ),
+    };
+    let checkpoint = tokio::time::timeout(Duration::from_secs(2), fresh_rx.recv())
+        .await
+        .expect("fresh subscription checkpoint deadline")
+        .expect("fresh subscription checkpoint");
+    assert_eq!(checkpoint.event.as_deref(), Some("ci.log.ready"));
+    assert_eq!(
+        checkpoint.id.as_deref(),
+        Some("2"),
+        "a fresh subscription checkpoints the current head without backfilling"
+    );
+
+    let third = b"gamma\n";
+    let third_ref = blobs
+        .put(&TenantId(TENANT.into()), third)
+        .expect("store third live segment")
+        .to_multihash_string();
+    insert_segment(&app, VISIBLE_RUN, VISIBLE_JOB, 2, third_ref, 11, 17).await;
+    let third_live = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+        .await
+        .expect("cross-service live pointer deadline")
+        .expect("cross-service live pointer");
+    assert_eq!(third_live.id.as_deref(), Some("3"));
+    let fresh_third = tokio::time::timeout(Duration::from_secs(2), fresh_rx.recv())
+        .await
+        .expect("fresh subscription live pointer deadline")
+        .expect("fresh subscription live pointer");
+    assert_eq!(
+        fresh_third.id.as_deref(),
+        Some("3"),
+        "a fresh subscription observes only segments appended after it opened"
+    );
+
+    sqlx::query(
+        "UPDATE ci_job SET state = 'succeeded'
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND job_id = $4::uuid",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(VISIBLE_RUN)
+    .bind(VISIBLE_JOB)
+    .execute(&admin)
+    .await
+    .expect("terminalize visible job");
+    let complete = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+        .await
+        .expect("terminal live event deadline")
+        .expect("terminal live event");
+    assert_eq!(complete.event.as_deref(), Some("ci.log.complete"));
+    assert_eq!(complete.id.as_deref(), Some("3"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&complete.data).unwrap()["byte_end"],
+        17
+    );
+
+    let resumed = get_query_headers(
+        &gateway,
+        &token,
+        &live_path,
+        "",
+        vec![("Last-Event-ID".into(), "1".into())],
+    );
+    let mut resumed_rx = match resumed {
+        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+        other => panic!(
+            "resumed live tail must stream, got status {}",
+            other.status()
+        ),
+    };
+    let resumed_first = tokio::time::timeout(Duration::from_secs(2), resumed_rx.recv())
+        .await
+        .expect("resume deadline")
+        .expect("resume pointer");
+    assert_eq!(
+        resumed_first.id.as_deref(),
+        Some("2"),
+        "resume backfills strictly after Last-Event-ID without duplicating cursor 1"
+    );
+
+    let revocable_path = format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{CORRUPT_JOB}/log/live");
+    let revocable = get_query_headers(
+        &gateway,
+        &token,
+        &revocable_path,
+        "",
+        vec![("Last-Event-ID".into(), "1".into())],
+    );
+    let mut revocable_rx = match revocable {
+        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+        other => panic!(
+            "revocation proof tail must initially open, got status {}",
+            other.status()
+        ),
+    };
+    alpha_enabled.store(false, Ordering::SeqCst);
+    insert_segment(
+        &app,
+        VISIBLE_RUN,
+        CORRUPT_JOB,
+        1,
+        ContentHash::blake3(b"not exposed after revoke").to_multihash_string(),
+        11,
+        35,
+    )
+    .await;
+    let revoked = tokio::time::timeout(Duration::from_secs(2), revocable_rx.recv())
+        .await
+        .expect("revoked stream closes by the next authorization poll");
+    assert!(
+        revoked.is_err(),
+        "revoking parent Pull closes the open stream before the appended pointer is exposed"
+    );
+    alpha_enabled.store(true, Ordering::SeqCst);
+
+    let hidden_live = get(
+        &gateway,
+        &token,
+        &format!("/v1/ci/runs/{HIDDEN_RUN}/jobs/{HIDDEN_JOB}/log/live"),
+    );
+    let absent_live = get(
+        &gateway,
+        &token,
+        &format!("/v1/ci/runs/{ABSENT_RUN}/jobs/{ABSENT_JOB}/log/live"),
+    );
+    assert_eq!(hidden_live.status(), 404);
+    assert_eq!(hidden_live.json_body(), absent_live.json_body());
+
+    sqlx::query(
+        "DELETE FROM log_segment
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
+           AND job_id = $4::uuid AND segment_seq = 0",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(VISIBLE_RUN)
+    .bind(VISIBLE_JOB)
+    .execute(&admin)
+    .await
+    .expect("simulate retention floor advancement");
+    let stale = get_query_headers(
+        &gateway,
+        &token,
+        &live_path,
+        "",
+        vec![("Last-Event-ID".into(), "0".into())],
+    );
+    assert_eq!(stale.status(), 409);
+
+    insert_segment(
+        &app,
+        VISIBLE_RUN,
+        VISIBLE_JOB,
+        0,
+        first_ref,
+        0,
+        first.len() as i64,
+    )
+    .await;
+    sqlx::query(
+        "DELETE FROM log_segment
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
+           AND job_id = $4::uuid AND segment_seq = 1",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(VISIBLE_RUN)
+    .bind(VISIBLE_JOB)
+    .execute(&admin)
+    .await
+    .expect("simulate an internal archive gap");
+    let discontinuous = get_query_headers(
+        &gateway,
+        &token,
+        &live_path,
+        "",
+        vec![("Last-Event-ID".into(), "0".into())],
+    );
+    assert_eq!(
+        discontinuous.status(),
+        503,
+        "a missing durable segment never becomes a successful cursor jump"
+    );
+    let discontinuous_predecessor = get_query_headers(
+        &gateway,
+        &token,
+        &live_path,
+        "",
+        vec![("Last-Event-ID".into(), "2".into())],
+    );
+    assert_eq!(
+        discontinuous_predecessor.status(),
+        503,
+        "a claimed cursor cannot bypass its missing internal predecessor"
+    );
+
+    sqlx::query(
+        "DELETE FROM log_segment
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND job_id = $4::uuid",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(VISIBLE_RUN)
+    .bind(VISIBLE_JOB)
+    .execute(&admin)
+    .await
+    .expect("simulate full retention pruning");
+    let fully_pruned = get_query_headers(
+        &gateway,
+        &token,
+        &live_path,
+        "",
+        vec![("Last-Event-ID".into(), "0".into())],
+    );
+    assert_eq!(
+        fully_pruned.status(),
+        409,
+        "an explicit cursor over a fully pruned archive requires resynchronization"
+    );
+
+    let boundary_path = format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{BOUNDARY_JOB}/log/live");
+    let boundary = get_query_headers(
+        &gateway,
+        &token,
+        &boundary_path,
+        "",
+        vec![("Last-Event-ID".into(), "0".into())],
+    );
+    let mut boundary_rx = match boundary {
+        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+        other => panic!(
+            "the first bounded batch must open before the boundary gap, got status {}",
+            other.status()
+        ),
+    };
+    for expected_cursor in 1..=64 {
+        let expected_id = expected_cursor.to_string();
+        let pointer = tokio::time::timeout(Duration::from_secs(2), boundary_rx.recv())
+            .await
+            .expect("bounded batch pointer deadline")
+            .expect("bounded batch pointer");
+        assert_eq!(pointer.id.as_deref(), Some(expected_id.as_str()));
+    }
+    let boundary_closed = tokio::time::timeout(Duration::from_secs(2), boundary_rx.recv())
+        .await
+        .expect("cross-batch discontinuity closes the stream");
+    assert!(
+        boundary_closed.is_err(),
+        "byte discontinuity at the producer's second poll fails closed"
     );
 
     let absent_job = get(
@@ -598,7 +991,8 @@ async fn production_ci_reads_match_the_shared_dev_edge_golden_vectors() {
         std::fs::create_dir_all(repo_dir.join(format!("{repo}.git")))
             .expect("create golden visible repo");
     }
-    let (gateway, cell, _direct, _viewer) = authenticated_gateway(app.clone(), &root, blobs);
+    let (gateway, cell, _direct, _viewer, _alpha_enabled) =
+        authenticated_gateway(app.clone(), &root, blobs);
     let token = mint(&cell);
     let mut cursors = BTreeMap::<String, String>::new();
 

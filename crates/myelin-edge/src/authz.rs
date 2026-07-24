@@ -67,6 +67,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "ci.runs.list",
     "ci.run.view",
     "ci.run.log.read",
+    "ci.run.log.watch",
     // -- the durable notification inbox (register_notif) --
     "notif.inbox.list",
     // -- the git JSON product API (register_git_durable over Git's catalogue) --
@@ -180,6 +181,7 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("ci.runs.list", "run.view", OP_AGENT_PAT),
     requirement!("ci.run.view", "run.view", OP_AGENT_PAT),
     requirement!("ci.run.log.read", "run.view", OP_AGENT_PAT),
+    requirement!("ci.run.log.watch", "run.view", OP_AGENT_PAT),
     requirement!("notif.inbox.list", "notification.read", OP_AGENT_PAT),
     requirement!("git.repos.list", "repo.pull", OP_AGENT_PAT),
     requirement!("git.repo.create", "repo.create", OP_PAT),

@@ -24,7 +24,10 @@ preserving the production beyond-end empty-range contract. It deliberately does 
 process-local `LiveTail` an SSE transport. CT-005e projects CI's two implemented durable reads from
 their shared `ToolDef`s into MCP and routes them through the same permission-checked Edge/CI adapter,
 under a per-run token re-verified at the final read boundary. Cross-service resumable live tail
-remains open.
+now has its CT-005f consumer/resume half: production Edge tails the durable T3 segment sequence
+through repository-authorized SSE with strict `Last-Event-ID`, retention-gap refusal, and bounded
+pointer-only frames. The producer still persists captured output only after sandbox exit, so honest
+during-execution output remains open.
 CT-007 is still unopened; GitHub Actions must not be
 removed before the founder acceptance pass and the complete CT-005 surface are genuinely usable.
 
@@ -117,6 +120,22 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   Parent visibility remains Git Pull; denied and absent objects remain indistinguishable; archived
   logs retain the same bounded content-addressed integrity path. Git's older catalogue stays behind
   an explicit compatibility adapter, while every unimplemented CI tool remains absent.
+- **CT-005f1 — durable live-log consumer/resume transport:** production Edge mounts
+  `GET /v1/ci/runs/{run}/jobs/{job}/log/live` under `run.view` plus the parent repository's exact
+  Pull decision. The durable T3 `segment_seq + 1` is the SSE cursor; an omitted
+  `Last-Event-ID` emits an ID-bearing current-head checkpoint without historical output, while an
+  explicit cursor replays strictly after it.
+  Each bounded frame carries only run/job and byte-range coordinates; bytes remain behind CT-005b's
+  content-addressed integrity reader. Edge rechecks repository authorization on every poll,
+  returns the denied/absent 404 posture at open, conservatively refuses every explicit cursor over
+  an empty retained set and every old retention cursor with 409, and fails closed on internal
+  sequence or byte-coordinate discontinuity. Head/floor, predecessor, and next-64 reads are
+  index-oriented and work-bounded per poll. The one-connection producer is bounded; lag disconnects
+  so the client must resume rather than silently lose frames. A live
+  PostgreSQL CDC registered on contracts 3.5 and 11.8 proves initial backfill, current-head
+  checkpoint, post-subscribe append across the service boundary, live Pull revocation, terminal
+  completion, reconnect, hidden/absent equivalence, partial/full retention staleness, and
+  within-/cross-batch gap refusal through the actual second poll.
 
 **Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
 services. It is not an honest production SSE resume source. SSE remains open until a real
@@ -125,6 +144,11 @@ The live founder push→settled check→surfaced archived/live log pass and CT-0
 CT-005e closes the prior MCP floor without inventing live output: its two reads are exact durable
 run/detail and archived-log operations, and the complete content-addressed Agent tool transcript
 remains an Agent-runtime trace artifact rather than a claim made by the stdio transport.
+CT-005f1 closes the cross-service consumer/resume half without overstating production: the runner's
+current `SandboxBackend::launch` returns captured stdout/stderr only after the command exits, and
+`DurableLogPersist` seals it at finish. CT-005f2 must persist bounded segments incrementally while
+both gVisor and Firecracker commands are still running; only then may the web/CLI consumers and
+CI-D11 call the output genuinely live.
 
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod
