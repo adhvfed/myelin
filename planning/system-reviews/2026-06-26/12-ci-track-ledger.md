@@ -238,6 +238,18 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   runtime-role-compatible immutable reads, source-pinned workflow activation, CI-run log routing,
   terminal public job state, and direct-SSR archived output. This is readiness evidence, not the
   named Myelin-repository founder acceptance act.
+- **CT-005f8a — exact publisher database capability under isolated migrations:** the production
+  publisher's startup validator detected an excess grant left by applying the original unqualified
+  publisher-grant migration in a disposable-schema test. Immutable migration 0006 now removes
+  table- and column-level publisher authority from every non-public outbox pair and restores only
+  the exact public relay grants. A live PostgreSQL regression applies the full foundation set under
+  an isolated `search_path`, proves the runtime login cannot SELECT/INSERT/UPDATE/DELETE either
+  isolated table, and proves the ordinary production provider still accepts its public capability.
+  The strict startup validator was not weakened. The restarted composed path drained both queued
+  full-source snapshot triggers: runs `1e7f3510-7651-6ffb-a30b-d3267ab68254` and
+  `da50c464-28bd-0dc8-3926-5e17ace266ef` settled succeeded/cost-settled with trusted attempt-1
+  `ci/build` projections and zero publish retries. The old `5db61d81-…` pre-fix rehearsal remains
+  explicit negative evidence, not a green acceptance record.
 
 **Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
 services. It is not an honest production SSE resume source. SSE remains open until a real

@@ -197,6 +197,69 @@ BEGIN
 END
 $$;";
 
+/// Reconcile the global publisher capability after schema-isolated migration runs.
+///
+/// `0005_outbox_publisher_grants` predates schema-isolated integration suites. Because its table
+/// names intentionally followed the active `search_path`, applying the foundation migrations in a
+/// disposable schema could grant the GLOBAL publisher role access to that schema's outbox tables.
+/// A test abort before schema cleanup then made the production publisher correctly refuse startup
+/// for excess privilege. This immutable follow-on removes both table- and column-level authority
+/// from every non-public outbox and reasserts the one supported public-schema capability.
+pub const OUTBOX_PUBLISHER_GRANT_SCOPE_MIGRATION: &str = "\
+DO $$
+DECLARE
+  target record;
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'myelin_outbox_publisher') THEN
+    FOR target IN
+      SELECT namespace.nspname,
+             relation.relname,
+             string_agg(format('%I', attribute.attname), ',' ORDER BY attribute.attnum) AS columns
+        FROM pg_catalog.pg_class relation
+        JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+        JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid = relation.oid
+       WHERE namespace.nspname <> 'public'
+         AND namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+         AND namespace.nspname NOT LIKE 'pg_toast%'
+         AND relation.relkind IN ('r', 'p')
+         AND relation.relname IN ('outbox', 'outbox_quarantine')
+         AND attribute.attnum > 0
+         AND NOT attribute.attisdropped
+       GROUP BY namespace.nspname, relation.relname
+    LOOP
+      EXECUTE format(
+        'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM myelin_outbox_publisher',
+        target.nspname,
+        target.relname
+      );
+      EXECUTE format(
+        'REVOKE ALL PRIVILEGES (%s) ON TABLE %I.%I FROM myelin_outbox_publisher',
+        target.columns,
+        target.nspname,
+        target.relname
+      );
+    END LOOP;
+
+    IF pg_catalog.to_regclass('public.outbox') IS NOT NULL THEN
+      REVOKE ALL PRIVILEGES ON TABLE public.outbox FROM myelin_outbox_publisher;
+      REVOKE ALL PRIVILEGES (
+        event_id, aggregate, seq, subject, envelope, published_at, attempts
+      ) ON TABLE public.outbox FROM myelin_outbox_publisher;
+      GRANT SELECT ON TABLE public.outbox TO myelin_outbox_publisher;
+      GRANT UPDATE (published_at) ON TABLE public.outbox TO myelin_outbox_publisher;
+    END IF;
+
+    IF pg_catalog.to_regclass('public.outbox_quarantine') IS NOT NULL THEN
+      REVOKE ALL PRIVILEGES ON TABLE public.outbox_quarantine FROM myelin_outbox_publisher;
+      REVOKE ALL PRIVILEGES (
+        event_id, aggregate, seq, reason_code, reason_detail, quarantined_at, acknowledged_at
+      ) ON TABLE public.outbox_quarantine FROM myelin_outbox_publisher;
+      GRANT SELECT, INSERT ON TABLE public.outbox_quarantine TO myelin_outbox_publisher;
+    END IF;
+  END IF;
+END
+$$;";
+
 /// A stable ULID — the `event_id` (the idempotency / broker-side-dedup key, ADR-04.1). A
 /// distinct newtype from [`EventId`] at the minting boundary; `From<Ulid> for EventId` carries
 /// it onto the envelope. "Stable" = the SAME row always carries the SAME id across every

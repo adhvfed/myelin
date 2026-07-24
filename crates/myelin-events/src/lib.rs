@@ -441,7 +441,7 @@ pub use harness::{
 pub use outbox::{
     DurableOutboxBacking, EmitContextBase, IdMinter, MonotonicMinter, OutboxRow, OutboxStore,
     OutboxTransaction, Ulid, UlidMinter, OUTBOX_MIGRATION, OUTBOX_PUBLISHER_GRANTS_MIGRATION,
-    OUTBOX_QUARANTINE_MIGRATION,
+    OUTBOX_PUBLISHER_GRANT_SCOPE_MIGRATION, OUTBOX_QUARANTINE_MIGRATION,
 };
 pub use partition::{
     stream_name_for, PartitionKey, StreamSubject, SubjectComponent, SubjectComponentError,

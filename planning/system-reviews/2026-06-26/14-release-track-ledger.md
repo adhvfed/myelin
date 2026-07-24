@@ -2067,6 +2067,29 @@ short-lived credential is durably revoked. This authorizes preparing the equival
 branch, not pushing it. The actual Myelin source push/PR remains the user's act and R4.1 stays open
 until it lands.
 
+**R4.2 publisher-capability reconciliation (2026-07-24).** Draining the two authorized
+full-source-tree rehearsal pushes made the production publisher refuse startup with
+`privileges outside the relay boundary`. The refusal was correct: a schema-isolated integration
+run had applied the original unqualified publisher-grant migration under its test `search_path`,
+granting the global `myelin_outbox_publisher` role access to an abandoned disposable schema. The
+runtime validator remains strict. Immutable migration `0006_outbox_publisher_grant_scope` now
+revokes table- and column-level publisher authority from every non-public outbox pair and reasserts
+only the supported public capability: outbox SELECT, UPDATE of `published_at`, and quarantine
+SELECT/INSERT. A live PostgreSQL integration applies the complete foundation migration set in an
+isolated schema, proves that the login has no effective SELECT/INSERT/UPDATE/DELETE there, and then
+connects through the ordinary production provider to prove the public relay capability remains
+exact.
+
+After reconciliation, the real publisher, Dispatch, coordinated gVisor runner, and Git check
+projection consumer drained both queued source-snapshot triggers. Runs
+`1e7f3510-7651-6ffb-a30b-d3267ab68254` (exact source probe `d7e34164`) and
+`da50c464-28bd-0dc8-3926-5e17ace266ef` (probe `bae43d6c`) each settled succeeded with cost settled,
+a succeeded job/workflow, and trusted attempt-1 `ci/build`; both Git events are published with zero
+attempts. All four services then shut down cleanly. The older pre-fix rehearsal
+`5db61d81-…` remains running/unsettled negative evidence and is not manually relabelled or counted.
+Mechanical payoff: excess non-public publisher grants 1→0; queued snapshot triggers 2→0; trusted
+full-source-tree check projections 0→2.
+
 **CT-007 handoff floor (pre-registered; phase still closed).** Code wins over a tempting literal
 interpretation of “cut over”: `.myelin/ci.toml` currently proves only the push/runner/log/check
 transport, while `.github/workflows/ci.yml` still carries the real Rust, frontend/browser,
