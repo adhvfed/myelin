@@ -256,6 +256,25 @@ proves the same composed path on an authorized disposable repository without rel
 founder/Myelin act. The live Myelin-repository founder push→settled check→surfaced archived/live log
 pass and CT-007 remain open.
 
+**Pre-registered CT-007 cutover floor (does not open CT-007 early).** The founder marker pipeline is
+an end-to-end transport/surfacing acceptance job, not workload parity with `.github/workflows/ci.yml`.
+The current GitHub graph still owns the Rust build/test/warnings-denied clippy, frontend
+lint/unit/build/Chromium suite, production web-container smoke, architecture and contract gates,
+SUB/Identity/self-hosting scorecards, mutation gate, and release-bundle job. CT-007 may begin only
+after the named founder acceptance above, and it may disable or remove GitHub Actions only after:
+
+1. a committed Myelin-native workflow maps every still-required GitHub job to an executable Myelin
+   job or names a mechanically gated, non-CI owner; an inventory test fails on silent job loss;
+2. digest-pinned one-cell runner assets provide the actual Rust/Node/browser/container capabilities
+   those jobs require without weakening gVisor, egress, or privilege boundaries;
+3. the complete mapped graph passes on one exact Myelin commit, its required aggregate context is
+   visible and trusted through Git's projection, and the permanent mutation gate has zero missed
+   mutants; and
+4. a second ordinary Myelin commit repeats the graph without GitHub execution or manual green.
+
+P0 later promotes this one-cell runner asset into the signed/SBOM release supply-chain floor; that
+later provenance work is not an excuse to delete the current CI before R4 workload parity exists.
+
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod
 path (CT-003's guard enforces that). CT-007 (the GitHub-Actions bill killer) is the reward, gated on CT-003.
