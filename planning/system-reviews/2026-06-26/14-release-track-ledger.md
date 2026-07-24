@@ -1924,7 +1924,10 @@ permanent scorecard evidence, and ledgers.
 
 **Honest remaining CT-005 floor:** the founder must perform a real Myelin push and observe its
 exact-head required check settle with archived and live output through the verifier, browser, and
-CLI. CT-007 and the four-week R4 exit clock remain closed until that evidence exists.
+CLI. The dogfood runbook now names the exact running-run discovery, CLI watch, browser run route,
+post-completion archive pagination, shared-marker comparison, and evidence captures; a job that
+finishes before the live consumers attach must be repeated rather than counted. CT-007 and the
+four-week R4 exit clock remain closed until that evidence exists.
 
 ## R5–R6
 

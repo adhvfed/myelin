@@ -1300,12 +1300,12 @@ pub fn m3_required_rows() -> Vec<GateRow> {
 ///
 /// - **CI (myelin-ci-controlplane unless noted):** CI-D9 (ci-pipeline determinism), CI-D1
 ///   (effectively-once), CI-D5 (reserve/settle parity), CI-D8/GIT-D10 (seam gate), CI-D11 (live-tail),
-///   CI-D6 (fork cache-poison), CI-D4 (supply-chain fail-closed), CI-D7 (fork-no-secrets); plus the two
-///   PERMANENT integration gates re-confirmed at the M4 boundary: **AG-D4/CI-T1** (the prod-image
-///   re-confirm in `myelin-ci-sandbox`, run `--features integration` with `MYELIN_REQUIRE_KVM=1` so a
-///   real Firecracker microVM MUST boot — no vacuous green; its three residuals are printed by
-///   [`Scorecard::render_markdown`]) and **STOR-D1/D2** (restore-verify on the CI stores, `--features
-///   integration`, the shared Storage-owned restore gate re-run-forever).
+///   CI-D6 (fork cache-poison), CI-D4 (supply-chain fail-closed), CI-D7 (fork-no-secrets); plus the
+///   three PERMANENT integration gates: **CI-D11** (composed durable producer/Edge reconnect),
+///   **AG-D4/CI-T1** (the prod-image re-confirm in `myelin-ci-sandbox`, run with
+///   `MYELIN_REQUIRE_KVM=1` so a real Firecracker microVM MUST boot — no vacuous green; its three
+///   residuals are printed by [`Scorecard::render_markdown`]), and **STOR-D1/D2** (restore-verify on
+///   the CI stores, the shared Storage-owned restore gate re-run-forever).
 /// - **Issues (myelin-issues):** ISS-P06 (emit-iff-committed), ISS-D2 (cost-bounding), ISS-D3 (setexpr
 ///   zero-leak), ISS-D4 (create-storm), ISS-D5 (reorder zero-clobber), ISS-D6 (SLA business-calendar +
 ///   escalation, two drills), ISS-D7 (stateful trigger), ISS-D8 (rollup + OLAP feed, two drills), ISS-D9
