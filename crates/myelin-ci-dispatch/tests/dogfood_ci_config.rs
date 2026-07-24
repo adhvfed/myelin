@@ -8,8 +8,7 @@ use myelin_ci_dispatch::{
     GitReadError, OnTrigger,
 };
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventId, EventType,
-    Timestamp, Visibility,
+    Actor, CorrelationId, DataRole, EventEnvelope, EventId, EventType, Timestamp, Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
@@ -23,7 +22,7 @@ const OID: &str = "dddddddddddddddddddddddddddddddddddddddd";
 const COMMAND: [&str; 3] = [
     "/bin/sh",
     "-c",
-    "printf '%s\\n' 'MYELIN-CI-a005e32fc1bb0c2b64e7d40ac1a01236'",
+    "printf '%s\\n' 'myelin-ci-acceptance-window-open'; /bin/sleep 120; printf '%s\\n' 'MYELIN-CI-a005e32fc1bb0c2b64e7d40ac1a01236'",
 ];
 
 fn workspace_root() -> PathBuf {
