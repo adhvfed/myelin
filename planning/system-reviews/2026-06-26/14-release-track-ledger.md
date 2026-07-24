@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification; CT-005f1 adds the repository-authorized durable SSE resume consumer; CT-005f2 persists bounded byte-exact output during execution on both production backends and closes retry/supersession recovery without resurrection; CT-005f3 adds the authenticated web live consumer and executes shared resume vectors through the actual dev and production implementations; CT-005f4 adds the authenticated strict resumable CLI live-tail consumer; CT-005f5 closes the composed production CI-D11 committed-prefix sever/resume drill; CT-005f6 makes the founder pass emit a bounded, no-overwrite, checksum-bearing acceptance receipt under compiled adversarial contracts; CT-005f7 checks in the exact one-job founder pipeline and binds its requested image digest to the staged rootfs before runner activation. Still required: the live founder push→CI→surfaced-check/log pass, then CT-007.** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a–f7 close the durable API/web/CLI/MCP/archive/live-log surface and arm the founder verifier/pipeline. CT-005f8 then pushed an authorized disposable repository through the composed production services, closed the transport/runtime defects that rehearsal exposed, and produced matching live/archive/browser evidence. This proves readiness without substituting a demo repository for the named founder act. Still required: the live Myelin-repository founder push→CI→surfaced-check/log pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1990,6 +1990,44 @@ parsed only after the human push = 1→0; staged rootfs changes admitted under t
 
 L3 CT-005f7 footprint: **5 files, +240 / -3 lines** for the checked-in founder pipeline, real-file
 resolver contract, rootfs-pin activation preflight, runbook, and ledger.
+
+**CT-005f8 production push rehearsal (2026-07-24; founder acceptance remains open).** An explicitly
+authorized disposable repository at `/home/adhv/Testing/demo-project` pushed commit
+`f376e1f6e61c6dd7be3241261af3b93f9f1c04a1` over the real Git HTTP wire into the local production
+Edge. The elected outbox publisher, Dispatch, coordinated gVisor runner, Controlplane, durable
+PostgreSQL/S3 log path, Git check projection consumer, CLI, and authenticated web app were separate
+live processes rather than an in-process harness.
+
+The rehearsal was deliberately allowed to fail until the composed path was honest. It exposed and
+closed seven production-only seam clusters: the outbox publisher now elects inside the relay
+transaction, provisions JetStream separately from publish runtime, uses a constrained database
+capability, runs as a dedicated bounded/shutdown-safe service, and receives committed CI triggers;
+published Git ref identities now use the shared uppercase percent-encoded subject component instead
+of raw `/`; immutable attempt/accounting reads no longer request row locks the runtime role cannot
+hold; the source-pinned CI workflow definition is durably activated before intake; terminal log
+routing resolves and validates the canonical CI run rather than storing under the workflow-run
+UUID; terminal accounting updates the public `ci_job` state in the same transaction; and archived
+web output now renders as textarea content on a direct SSR load instead of a browser-ignored
+`value` attribute. The last defect gained a hard-reload Chromium assertion because client-side mock
+navigation had masked it.
+
+The counted rehearsal is run `e5e79ca1-c8fb-4a0f-ce02-c686e7eba714`, job
+`7d6b3d1c-4a9e-86d9-9e9a-1e3bb1906860`. CLI live watch attached while the job was running and
+captured `MYELIN-CI-08a89d982f312a2a29be9cab53b2f2ff`; the run, job, and step then settled
+succeeded/passed with cost settled. `dogfood.sh verify-ci` independently reread all 54 archived
+bytes and emitted a green receipt with live/archive marker counts `1/1` and identical SHA-256
+`18b6ddef0a210b263c5aeb3308f8a98de1fe136083ec748d94944055e7dfb99f`. Authenticated browser
+evidence after a direct reload shows the same complete live and archived text. The bounded
+operator evidence directory is
+`/home/adhv/Testing/demo-project-evidence/2026-07-24-e5e79ca1`; its receipt SHA-256 is
+`ccbd88e115ffc4cc29838c85912cc4e029bc2b36c55c8baf8f8131e5b439213d`.
+
+Mechanical re-affirmation: the shared Git request/response artifact passes the production Rust Edge
+integration and dev-Edge frontend consumer; contract coverage reports 99 rows, 83 covered, 16
+named deferrals, two frontend contracts, and zero false claims. The complete frontend unit suite is
+485 passed / 8 environment integrations skipped, and all 84 Chromium flows pass, including the
+tree next-page click, tree stale-cursor 409 reload, CI list stale-cursor reload, live stale-resume
+409 archive reload, and the new archived-output SSR reload assertion.
 
 **Honest remaining CT-005 floor:** the founder must perform a real Myelin push and observe its
 exact-head required check settle with archived and live output through the verifier, browser, and

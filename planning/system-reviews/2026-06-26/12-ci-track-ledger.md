@@ -41,7 +41,10 @@ re-reads the terminal run and complete archive through Edge and emits a checksum
 when the independently captured live output and archive contain the exact marker once. CT-005f7 checks
 in the V2 one-job founder pipeline, executes its real file through production Dispatch planning into
 the decoded CAS snapshot, and refuses runner activation unless the staged personal-cell rootfs matches
-the authored digest. The founder acceptance pass itself remains open.
+the authored digest. CT-005f8 then proves the composed push-to-terminal path with an authorized
+disposable repository and closes the production-only elected-publisher, subject, immutable-read,
+activation, log-route, terminal-job, and SSR-output defects that the rehearsal exposed. The founder
+acceptance pass itself remains open because the counted repository was not Myelin.
 CT-007 is still unopened; GitHub Actions must not be
 removed before the founder acceptance pass and the complete CT-005 surface are genuinely usable.
 
@@ -220,6 +223,16 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   captures an ordinary shell command through the real gVisor backend. The immutable release-grade
   image/provenance mechanism remains explicitly sequenced in P0; this one-cell binding is the honest
   R4 founder-dogfood bridge.
+- **CT-005f8 — composed production push rehearsal:** an authorized disposable repository push runs
+  through the real Git wire, elected outbox publisher, Dispatch, coordinated gVisor runner,
+  Controlplane, PostgreSQL/S3 log store, Git projection consumer, CLI, and authenticated browser.
+  The terminal counted run/job are `e5e79ca1-c8fb-4a0f-ce02-c686e7eba714` /
+  `7d6b3d1c-4a9e-86d9-9e9a-1e3bb1906860`; the acceptance verifier observes one identical marker in
+  the independently captured live and 54-byte archived streams. Failed rehearsals remain negative
+  evidence and forced repairs to the elected publisher composition, canonical event identities,
+  runtime-role-compatible immutable reads, source-pinned workflow activation, CI-run log routing,
+  terminal public job state, and direct-SSR archived output. This is readiness evidence, not the
+  named Myelin-repository founder acceptance act.
 
 **Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
 services. It is not an honest production SSE resume source. SSE remains open until a real
@@ -236,8 +249,10 @@ inventing run-wide aggregation: the production resume authority is exact `(run_i
 code requires `--job` even though the frozen plan used the shorthand `ci watch <run>`. CT-005f5
 closes the remaining composed CI-D11 committed-prefix drill without overstating unproven
 commit-unknown or HTTP-wire failure modes. CT-005f6 and CT-005f7 make the remaining founder act
-machine-verifiable and genuinely triggerable without claiming that it already happened. The live
-founder push→settled check→surfaced archived/live log pass and CT-007 remain open.
+machine-verifiable and genuinely triggerable without claiming that it already happened. CT-005f8
+proves the same composed path on an authorized disposable repository without relabeling it as the
+founder/Myelin act. The live Myelin-repository founder push→settled check→surfaced archived/live log
+pass and CT-007 remain open.
 
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod
