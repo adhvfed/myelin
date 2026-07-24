@@ -165,8 +165,8 @@ button {
   border: 0;
 }
 
-/* CT-005 CI read surface: compact run history, exact job/step facts, and bounded archived output.
-   Live-tail styling is intentionally absent until a real cross-service resumable transport exists. */
+/* CT-005 CI read surface: compact run history, exact job/step facts, bounded archived output, and
+   a bounded recent-byte window over the production durable SSE resume transport. */
 .ci-screen {
   width: min(100%, 72rem);
   display: flex;
@@ -187,6 +187,7 @@ button {
 .ci-heading-row h1,
 .ci-run-detail-header h1,
 .ci-log-heading h2,
+.ci-log-heading h3,
 .ci-jobs h2,
 .ci-job h3,
 .ci-empty h2 {
@@ -304,7 +305,8 @@ button {
 }
 
 .ci-status,
-.ci-archive-label {
+.ci-archive-label,
+.ci-live-label {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
@@ -352,7 +354,6 @@ button {
 .ci-empty p,
 .ci-run-detail-header p,
 .ci-job p,
-.ci-live-floor,
 .ci-log-range {
   margin: 0;
   color: var(--text-muted);
@@ -401,7 +402,8 @@ button {
 }
 
 .ci-jobs,
-.ci-log-section {
+.ci-log-section,
+.ci-live-log {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
@@ -437,7 +439,8 @@ button {
   font-size: var(--fs-caption);
 }
 
-.ci-live-floor {
+.ci-live-state,
+.ci-live-resynced {
   display: flex;
   align-items: flex-start;
   gap: var(--space-2);
@@ -447,14 +450,34 @@ button {
   background: var(--surface-raised);
 }
 
-.ci-archive-label {
+.ci-archive-label,
+.ci-live-label {
   padding: var(--space-1) var(--space-2);
   border: var(--hairline) solid var(--border);
   border-radius: var(--radius-pill);
   color: var(--text-muted);
 }
 
-.ci-log-section textarea {
+.ci-live-label[data-status="live"],
+.ci-live-label[data-status="complete"] {
+  color: var(--success);
+}
+
+.ci-live-state,
+.ci-live-resynced {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.ci-live-log {
+  padding: var(--space-3);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-1);
+  background: var(--surface-raised);
+}
+
+.ci-log-section textarea,
+.ci-live-log textarea {
   width: 100%;
   max-height: 34rem;
   min-height: 14rem;

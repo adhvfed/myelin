@@ -4,7 +4,8 @@
   "fixtures": {
     "newest_run_id": "91000000-0000-4000-8000-000000000001",
     "older_run_id": "91000000-0000-4000-8000-000000000002",
-    "failed_job_id": "92000000-0000-4000-8000-000000000001"
+    "failed_job_id": "92000000-0000-4000-8000-000000000001",
+    "live_job_id": "92000000-0000-4000-8000-000000000002"
   },
   "vectors": [
     {
@@ -204,6 +205,108 @@
         "next_offset": 16,
         "encoding": "base64",
         "data": "qQpmYWlsZQ=="
+      }
+    },
+    {
+      "id": "live-current-head-checkpoint",
+      "endpoint": "live",
+      "request": {
+        "run_id": "91000000-0000-4000-8000-000000000002",
+        "job_id": "92000000-0000-4000-8000-000000000002"
+      },
+      "expected": {
+        "status": 200,
+        "events": [
+          {
+            "event": "ci.log.ready",
+            "id": "1",
+            "data": {
+              "run_id": "91000000-0000-4000-8000-000000000002",
+              "job_id": "92000000-0000-4000-8000-000000000002",
+              "byte_end": 5
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "live-explicit-zero-replays-first-segment",
+      "endpoint": "live",
+      "request": {
+        "run_id": "91000000-0000-4000-8000-000000000002",
+        "job_id": "92000000-0000-4000-8000-000000000002",
+        "last_event_id": "0"
+      },
+      "expected": {
+        "status": 200,
+        "events": [
+          {
+            "event": "ci.log.appended",
+            "id": "1",
+            "data": {
+              "run_id": "91000000-0000-4000-8000-000000000002",
+              "job_id": "92000000-0000-4000-8000-000000000002",
+              "byte_start": 0,
+              "byte_end": 5
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "live-terminal-job-checkpoints-and-completes",
+      "endpoint": "live",
+      "request": {
+        "run_id": "91000000-0000-4000-8000-000000000001",
+        "job_id": "92000000-0000-4000-8000-000000000001"
+      },
+      "expected": {
+        "status": 200,
+        "events": [
+          {
+            "event": "ci.log.ready",
+            "id": "1",
+            "data": {
+              "run_id": "91000000-0000-4000-8000-000000000001",
+              "job_id": "92000000-0000-4000-8000-000000000001",
+              "byte_end": 18
+            }
+          },
+          {
+            "event": "ci.log.complete",
+            "id": "1",
+            "data": {
+              "run_id": "91000000-0000-4000-8000-000000000001",
+              "job_id": "92000000-0000-4000-8000-000000000001",
+              "byte_end": 18
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "live-cursor-ahead-of-head-is-bad-input",
+      "endpoint": "live",
+      "request": {
+        "run_id": "91000000-0000-4000-8000-000000000002",
+        "job_id": "92000000-0000-4000-8000-000000000002",
+        "last_event_id": "2"
+      },
+      "expected": {
+        "status": 400
+      }
+    },
+    {
+      "id": "live-pruned-cursor-requires-archive-reload",
+      "endpoint": "live",
+      "mutation": "prune-live-log",
+      "request": {
+        "run_id": "91000000-0000-4000-8000-000000000002",
+        "job_id": "92000000-0000-4000-8000-000000000002",
+        "last_event_id": "0"
+      },
+      "expected": {
+        "status": 409
       }
     }
   ]

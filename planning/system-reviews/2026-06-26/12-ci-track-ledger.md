@@ -28,8 +28,13 @@ now has its CT-005f consumer/resume half: production Edge tails the durable T3 s
 through repository-authorized SSE with strict `Last-Event-ID`, retention-gap refusal, and bounded
 pointer-only frames. CT-005f2 now supplies the producer half: both production sandbox backends emit
 bounded byte-exact frames while the command is still running, and the runner acknowledges each frame
-only after durable segment persistence. Authenticated web/CLI live consumption, the production-path
-CI-D11 sever/resume drill, and the founder acceptance pass remain open.
+only after durable segment persistence. CT-005f3 adds the authenticated web consumer: a same-origin
+session-only proxy performs one bounded refresh/retry, the browser snapshots the durable archive before
+acknowledging SSE cursors, and stale retention cursors reload the archive before a fresh subscription.
+The dev Edge's actual live state machine and production Rust Edge execute the same committed golden
+vectors, including fresh, replay, terminal, ahead-of-head, and pruned-cursor branches. Authenticated CLI
+live consumption, the production-path CI-D11 sever/resume drill, and the founder acceptance pass remain
+open.
 CT-007 is still unopened; GitHub Actions must not be
 removed before the founder acceptance pass and the complete CT-005 surface are genuinely usable.
 
@@ -97,7 +102,8 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   real membership addition invalidates the prior cursor. Six Chromium flows cover login refusal,
   list/filter/detail/archive reads, next-page and
   Back, stale 409 recovery, failure postures, mobile layout, and accessibility. The UI states that
-  live updates are unavailable; no polling or SSE capability is implied.
+  live updates are unavailable; no polling or SSE capability is implied. That statement records the
+  CT-005c boundary; CT-005f3 subsequently replaces it with the authenticated durable SSE consumer.
 - **CT-005d — durable CLI reads:** `myelin ci list [--status] [--limit] [--cursor]`,
   `myelin ci view <run>` (with `show` as the ordinary read alias), and
   `myelin ci logs <run> --job <job> [--start <byte>] [--limit <bytes>]` reuse a total
@@ -155,6 +161,22 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   immutable manifest resource ceiling. Cancelled recovery is a rotating keyset page of at most 64
   candidates, isolates poison rows, and reports accumulated failures only after later candidates
   have been attempted.
+- **CT-005f3 — authenticated web live-log consumer and executable resume parity:** the run-detail
+  surface now keeps bounded recent live output beside the existing archived-range reader. A
+  same-origin server route obtains credentials only from the encrypted session, forwards a
+  canonical `Last-Event-ID`, and permits exactly one access-token refresh plus one retry before
+  clearing a failed session. The browser uses an explicit fetch stream so it can distinguish 409:
+  it snapshots and validates the durable archive before acknowledging a cursor, reads through every
+  pointer range serially before advancing, and on a stale cursor reloads the archive before opening
+  a fresh subscription. Initial acquisition and transient disconnects retry with bounded backoff;
+  malformed, oversized, discontinuous, cross-scope, or truncated SSE fails closed. The recent
+  in-memory window is capped at 256 KiB; the complete log remains in the durable archive.
+  The dev Edge HTTP server and its contract test call the same `ciLiveOpen` state machine. Shared
+  golden vectors execute fresh current-head, explicit replay, terminal completion, ahead-of-head
+  400, and pruned-cursor 409 through both that state machine and the production Rust Gateway.
+  Eight Chromium CI flows include the previously missing tree next-page click and stale list-cursor
+  reload, plus forced live reconnect 401→one refresh, append, stale live-cursor 409→archive reload,
+  resume, and completion.
 
 **Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
 services. It is not an honest production SSE resume source. SSE remains open until a real
@@ -165,9 +187,11 @@ run/detail and archived-log operations, and the complete content-addressed Agent
 remains an Agent-runtime trace artifact rather than a claim made by the stdio transport.
 CT-005f1 and CT-005f2 close the durable consumer/resume and producer-persistence halves without
 overstating the remaining surface. The real gVisor and Firecracker paths now persist bounded output
-while commands execute. The web and CLI still need authenticated live-tail UX over the existing Edge
-route, and CI-D11 must sever and resume the composed production path across service boundaries. The
-live founder push→settled check→surfaced archived/live log pass and CT-007 also remain open.
+while commands execute. CT-005f3 closes the authenticated web consumer and makes mock parity
+mechanical rather than conventional. The CLI still needs authenticated live-tail UX over the
+existing Edge route, and CI-D11 must sever and resume the composed production path across service
+boundaries. The live founder push→settled check→surfaced archived/live log pass and CT-007 also
+remain open.
 
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod

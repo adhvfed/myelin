@@ -14,6 +14,7 @@ import {
   MAX_EDGE_PUBLIC_RESPONSE_BYTES,
   MAX_EDGE_RAW_RESPONSE_BYTES,
   edgeGet,
+  edgeGetEventStream,
   edgeGetPublic,
   edgeGetRaw,
   edgeLoginWithOidc,
@@ -190,6 +191,48 @@ describe("gateway response limits", () => {
 });
 
 describe("gateway refresh revocation races", () => {
+  it("preserves the live cursor across one refresh and returns the streaming retry body", async () => {
+    const refresh = new Response(JSON.stringify({ access_token: "fresh-token" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    const stream = new Response(": connected\n\n", {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(unauthorized())
+      .mockResolvedValueOnce(refresh)
+      .mockResolvedValueOnce(stream);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await edgeGetEventStream("/v1/ci/live", { lastEventId: "7" });
+
+    expect(response).toBe(stream);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get("last-event-id")).toBe("7");
+    expect(new Headers(fetchMock.mock.calls[2]?.[1]?.headers).get("last-event-id")).toBe("7");
+    expect(new Headers(fetchMock.mock.calls[2]?.[1]?.headers).get("authorization"))
+      .toBe("Bearer fresh-token");
+    expect(session.updateSessionToken).toHaveBeenCalledWith("fresh-token");
+  });
+
+  it("clears a live session after the refreshed retry is still unauthorized", async () => {
+    const refresh = new Response(JSON.stringify({ access_token: "fresh-token" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(unauthorized())
+      .mockResolvedValueOnce(refresh)
+      .mockResolvedValueOnce(unauthorized()));
+
+    await expect(edgeGetEventStream("/v1/ci/live")).rejects.toMatchObject({
+      name: "Unauthorized",
+    });
+    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+  });
+
   it("preserves a mutation idempotency key across an authentication retry", async () => {
     const refresh = new Response(JSON.stringify({ access_token: "fresh-token" }), {
       status: 200,

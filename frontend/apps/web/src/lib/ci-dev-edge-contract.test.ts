@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   canonicalVisibleRepoRefs,
+  ciLiveOpen,
   ciLogJson,
   ciRunJson,
   ciRunsEnvelope,
@@ -20,15 +21,16 @@ const golden = JSON.parse(readFileSync(
   contract_id: string;
   vectors: Array<{
     id: string;
-    endpoint: "visibility" | "runs" | "run" | "log";
+    endpoint: "visibility" | "runs" | "run" | "log" | "live";
     after?: string;
-    mutation?: "add-visible-repo";
+    mutation?: "add-visible-repo" | "prune-live-log";
     request: {
       state?: string;
       limit?: number;
       run_id?: string;
       job_id?: string;
       start?: number;
+      last_event_id?: string;
       visible_repo_refs?: string[];
     };
     expected: Record<string, unknown>;
@@ -84,7 +86,7 @@ describe("the shared CI read golden contract", () => {
       } else if (vector.endpoint === "run") {
         const response = ciRunJson(vector.request.run_id);
         normalized = response ? { status: 200, ...response } : { status: 404 };
-      } else {
+      } else if (vector.endpoint === "log") {
         const query = new URLSearchParams();
         if (vector.request.start !== undefined) query.set("start", String(vector.request.start));
         if (vector.request.limit !== undefined) query.set("limit", String(vector.request.limit));
@@ -96,6 +98,17 @@ describe("the shared CI read golden contract", () => {
           input,
         );
         normalized = response ? { status: 200, ...response } : { status: 404 };
+      } else {
+        const open = ciLiveOpen(
+          vector.request.run_id,
+          vector.request.job_id,
+          vector.request.last_event_id,
+          { ...(vector.mutation === "prune-live-log" ? { segments: [] } : {}) },
+        );
+        normalized = {
+          status: open.status,
+          ...("events" in open ? { events: open.events } : {}),
+        };
       }
 
       expect(normalized, vector.id).toEqual(vector.expected);

@@ -246,6 +246,95 @@ export interface RawEdgeResponse {
   body: ReadableStream<Uint8Array>;
 }
 
+export interface EventStreamRequestOptions extends GatewayRequestOptions {
+  /** Exact opaque SSE cursor supplied by the browser-facing consumer after local acknowledgement. */
+  lastEventId?: string;
+}
+
+/**
+ * Open an authenticated Edge event stream through the same one-refresh/one-retry session lifecycle
+ * as JSON and raw reads. The timeout bounds only connection establishment; once response headers
+ * arrive, the caller's abort signal owns the intentionally long-lived body.
+ */
+export async function edgeGetEventStream(
+  path: string,
+  options: EventStreamRequestOptions = {},
+): Promise<Response> {
+  const initialSession = await getSessionRecord();
+  const token = initialSession?.token;
+  if (!token) throw new Unauthorized("no session token (not authenticated)");
+
+  const doFetch = async (accessToken: string): Promise<Response> => {
+    const connect = new AbortController();
+    const timeoutMs = options.timeoutMs ?? DEFAULT_EDGE_REQUEST_TIMEOUT_MS;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError("edge request timeout must be a positive finite number");
+    }
+    const timer = setTimeout(() => {
+      connect.abort(new DOMException("edge stream connection timed out", "TimeoutError"));
+    }, timeoutMs);
+    const signal = options.signal
+      ? AbortSignal.any([connect.signal, options.signal])
+      : connect.signal;
+    try {
+      return await fetch(`${edgeOrigin()}${path}`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          "x-myelin-token-scheme": initialSession.scheme,
+          accept: "text/event-stream",
+          ...(options.lastEventId === undefined
+            ? {}
+            : { "last-event-id": options.lastEventId }),
+        },
+        redirect: "error",
+        signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  let response = await doFetch(token);
+  if (response.status !== 401) return response;
+  await response.body?.cancel().catch(() => undefined);
+
+  const current = await getSessionRecord();
+  let fresh: string | null = null;
+  if (current?.refreshToken) {
+    const refresh = await fetch(`${edgeOrigin()}/v1/auth/refresh`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${current.refreshToken}`,
+        "x-myelin-token-scheme": "refresh",
+      },
+      redirect: "error",
+      signal: gatewayRequestSignal({ signal: options.signal, timeoutMs: options.timeoutMs }),
+    });
+    if (refresh.status === 200) {
+      const candidate = refreshAccessToken(
+        await readLimitedText(refresh, 64 * 1024),
+        current.token,
+      );
+      if (candidate && (await updateSessionToken(candidate))) fresh = candidate;
+    } else {
+      await refresh.body?.cancel().catch(() => undefined);
+    }
+  }
+  if (!fresh) {
+    await clearCurrentSession();
+    throw new Unauthorized("session refresh failed");
+  }
+
+  response = await doFetch(fresh);
+  if (response.status === 401) {
+    await response.body?.cancel().catch(() => undefined);
+    await clearCurrentSession();
+    throw new Unauthorized("still unauthorized after one refresh");
+  }
+  return response;
+}
+
 export async function edgeGetRaw(
   path: string,
   options?: GatewayRequestOptions,

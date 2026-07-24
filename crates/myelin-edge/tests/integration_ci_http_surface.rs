@@ -44,6 +44,7 @@ const SCHEME: &str = "agent";
 const GOLDEN_NEWEST_RUN: &str = "91000000-0000-4000-8000-000000000001";
 const GOLDEN_OLDER_RUN: &str = "91000000-0000-4000-8000-000000000002";
 const GOLDEN_FAILED_JOB: &str = "92000000-0000-4000-8000-000000000001";
+const GOLDEN_LIVE_JOB: &str = "92000000-0000-4000-8000-000000000002";
 
 static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -260,7 +261,13 @@ async fn insert_segment(
     .expect("insert tenant-scoped CI log segment");
 }
 
-async fn insert_golden_ci_surface(app: &PgPool, blob_ref: String, log_len: i64) {
+async fn insert_golden_ci_surface(
+    app: &PgPool,
+    blob_ref: String,
+    log_len: i64,
+    live_blob_ref: String,
+    live_log_len: i64,
+) {
     with_tenant_tx(app, TENANT, REGION, move |conn| {
         Box::pin(async move {
             sqlx::query(
@@ -296,15 +303,20 @@ async fn insert_golden_ci_surface(app: &PgPool, blob_ref: String, log_len: i64) 
                 "INSERT INTO ci_job (
                    tenant_id, region, job_id, run_id, stage, name, needs, matrix_key,
                    spec_ref, state, attempt, result_summary
-                 ) VALUES (
+                ) VALUES (
                    $1, $2, $3::uuid, $4::uuid, 'test', 'contract', '{}', NULL,
                    'cas:golden-job', 'failed', 1, '{\"message\":\"contract failed\"}'::jsonb
+                 ), (
+                   $1, $2, $5::uuid, $6::uuid, 'test', 'live-contract', '{}', NULL,
+                   'cas:golden-live-job', 'running', 1, NULL
                  )",
             )
             .bind(TENANT)
             .bind(REGION)
             .bind(GOLDEN_FAILED_JOB)
             .bind(GOLDEN_NEWEST_RUN)
+            .bind(GOLDEN_LIVE_JOB)
+            .bind(GOLDEN_OLDER_RUN)
             .execute(&mut *conn)
             .await
             .map_err(|error| PgError::Query(error.to_string()))?;
@@ -312,7 +324,9 @@ async fn insert_golden_ci_surface(app: &PgPool, blob_ref: String, log_len: i64) 
                 "INSERT INTO log_segment (
                    tenant_id, region, run_id, job_id, segment_seq, blob_ref,
                    byte_start, byte_end, pii_key_ref
-                 ) VALUES ($1, $2, $3::uuid, $4::uuid, 0, $5, 0, $6, 'tenant:golden')",
+                ) VALUES
+                  ($1, $2, $3::uuid, $4::uuid, 0, $5, 0, $6, 'tenant:golden'),
+                  ($1, $2, $7::uuid, $8::uuid, 0, $9, 0, $10, 'tenant:golden-live')",
             )
             .bind(TENANT)
             .bind(REGION)
@@ -320,6 +334,10 @@ async fn insert_golden_ci_surface(app: &PgPool, blob_ref: String, log_len: i64) 
             .bind(GOLDEN_FAILED_JOB)
             .bind(blob_ref)
             .bind(log_len)
+            .bind(GOLDEN_OLDER_RUN)
+            .bind(GOLDEN_LIVE_JOB)
+            .bind(live_blob_ref)
+            .bind(live_log_len)
             .execute(&mut *conn)
             .await
             .map_err(|error| PgError::Query(error.to_string()))?;
@@ -983,7 +1001,19 @@ async fn production_ci_reads_match_the_shared_dev_edge_golden_vectors() {
         .put(&TenantId(TENANT.into()), log)
         .expect("store golden archived log")
         .to_multihash_string();
-    insert_golden_ci_surface(&app, blob_ref, log.len() as i64).await;
+    let live_log = b"boot\n";
+    let live_blob_ref = blobs
+        .put(&TenantId(TENANT.into()), live_log)
+        .expect("store golden live log")
+        .to_multihash_string();
+    insert_golden_ci_surface(
+        &app,
+        blob_ref,
+        log.len() as i64,
+        live_blob_ref,
+        live_log.len() as i64,
+    )
+    .await;
 
     let root = std::env::temp_dir().join(format!("{schema}_git"));
     let repo_dir = root.join(TENANT).join(REGION);
@@ -1002,6 +1032,20 @@ async fn production_ci_reads_match_the_shared_dev_edge_golden_vectors() {
         let request = &vector["request"];
         if vector["mutation"].as_str() == Some("add-visible-repo") {
             std::fs::create_dir_all(repo_dir.join("z.git")).expect("add golden visible repository");
+        }
+        if vector["mutation"].as_str() == Some("prune-live-log") {
+            sqlx::query(
+                "DELETE FROM log_segment
+                 WHERE tenant_id = $1 AND region = $2
+                   AND run_id = $3::uuid AND job_id = $4::uuid",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(GOLDEN_OLDER_RUN)
+            .bind(GOLDEN_LIVE_JOB)
+            .execute(&admin)
+            .await
+            .expect("prune golden live-log cursor authority");
         }
         if endpoint == "visibility" {
             let visible = request["visible_repo_refs"]
@@ -1028,6 +1072,55 @@ async fn production_ci_reads_match_the_shared_dev_edge_golden_vectors() {
                 .unwrap_or_else(|| panic!("missing cursor from {source}"))
                 .as_str()
         });
+
+        if endpoint == "live" {
+            let path = format!(
+                "/v1/ci/runs/{}/jobs/{}/log/live",
+                request["run_id"].as_str().expect("live run id"),
+                request["job_id"].as_str().expect("live job id")
+            );
+            let extra_headers = request["last_event_id"]
+                .as_str()
+                .map(|value| vec![("Last-Event-ID".into(), value.to_string())])
+                .unwrap_or_default();
+            let response = get_query_headers(&gateway, &token, &path, "", extra_headers);
+            let status = response.status();
+            let mut normalized = serde_json::Map::new();
+            normalized.insert("status".into(), serde_json::json!(status));
+            if status == 200 {
+                let expected_events = vector["expected"]["events"]
+                    .as_array()
+                    .expect("golden live events");
+                let mut receiver = match response {
+                    myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+                    myelin_edge::EdgeResponse::Bytes { .. } => {
+                        panic!("golden live vector {id} returned bytes")
+                    }
+                };
+                let mut events = Vec::with_capacity(expected_events.len());
+                for _ in expected_events {
+                    let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                        .await
+                        .unwrap_or_else(|_| panic!("golden live vector {id} event deadline"))
+                        .unwrap_or_else(|error| {
+                            panic!("golden live vector {id} receive failed: {error}")
+                        });
+                    events.push(serde_json::json!({
+                        "event": event.event,
+                        "id": event.id,
+                        "data": serde_json::from_str::<serde_json::Value>(&event.data)
+                            .expect("golden live event JSON"),
+                    }));
+                }
+                normalized.insert("events".into(), serde_json::Value::Array(events));
+            }
+            assert_eq!(
+                serde_json::Value::Object(normalized),
+                vector["expected"],
+                "golden vector {id}"
+            );
+            continue;
+        }
 
         let response = match endpoint {
             "runs" => {

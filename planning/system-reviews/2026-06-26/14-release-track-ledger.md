@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification; CT-005f1 adds the repository-authorized durable SSE resume consumer; CT-005f2 persists bounded byte-exact output during execution on both production backends and closes retry/supersession recovery without resurrection. Still required: authenticated web/CLI live-tail consumption and composed CI-D11 sever/resume, the live founder push→CI→surfaced-check/log pass, then CT-007.** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification; CT-005f1 adds the repository-authorized durable SSE resume consumer; CT-005f2 persists bounded byte-exact output during execution on both production backends and closes retry/supersession recovery without resurrection; CT-005f3 adds the authenticated web live consumer and executes shared resume vectors through the actual dev and production implementations. Still required: authenticated CLI live-tail consumption and composed CI-D11 sever/resume, the live founder push→CI→surfaced-check/log pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1464,8 +1464,9 @@ run/job/step detail, and bounded archived byte ranges through server-only gatewa
 separate empty, invalid, absent-or-denied, stale-cursor, projection-unavailable, and log-unavailable
 states without exposing raw Edge errors. A visibility-stale 409 restarts with a cursor-free document
 load; archived bytes remain selectable and byte-addressed even when a range begins inside UTF-8.
-The surface explicitly says live updates are not available and does not present the process-local
-`LiveTail` as a production SSE source.
+At the CT-005c boundary the surface explicitly said live updates were not available and did not
+present the process-local `LiveTail` as a production SSE source. CT-005f3 later replaces that
+historical floor with the durable Edge SSE consumer.
 
 The browser mock is now a mechanically gated second implementation. Committed request/response
 vectors execute against both the production Rust Edge integration and the dev Edge, including a
@@ -1491,7 +1492,7 @@ Mechanical payoff: frontend contracts in the permanent coverage gate = 1→2; CI
 transparent CI cursors admitted by the dev implementation = 0; live-tail claims without a
 cross-service resume transport = 0.
 
-**Honest remaining R4.2 floors:** complete CT-005's cross-service live-log SSE; start
+**Honest remaining R4.2 floors at the CT-005c boundary:** complete CT-005's cross-service live-log SSE; start
 the three CI services and production Edge against the founder cell; push a real Myelin commit; and
 observe the exact head's required check settle green with archived/live output through the verifier
 and browser. Only after the complete surface and founder pass may CT-007 remove GitHub Actions. No
@@ -1784,15 +1785,63 @@ failures emitted as ordinary terminal verdicts = 0; concurrent append positions 
 superseded jobs returned to claimable state = 0; cancelled-recovery candidates loaded per page
 >64 = 0; poison candidates blocking later tenants in the page = 0.
 
-**Honest remaining CT-005 floor:** add authenticated web and CLI live-tail consumption over the
-existing Edge SSE route and run CI-D11 sever/resume through the composed production services. Then
-the founder must perform a real Myelin push and observe its exact-head required check settle with
-archived and live output through the verifier and browser. CT-007 and the four-week R4 exit clock
-remain closed until that evidence exists.
-
 L3 CT-005f2 footprint: **38 files, +4,888 / -534 lines** for incremental sandbox output,
 durable append/retry accounting, supersession/reaper closure, least-privilege lifecycle gates,
 real-runtime and live-PostgreSQL proofs, and ledgers.
+
+**CT-005f3 authenticated web live-consumer increment (2026-07-24; CLI live UX and CI-D11 remain
+open).** The run-detail surface now shows bounded recent live output beside its complete archived
+range reader. Its same-origin proxy accepts no browser credential: it uses only the encrypted server
+session, validates the exact run/job/cursor grammar, preserves Edge status codes, and performs at
+most one access-token refresh plus one retry while retaining the exact `Last-Event-ID`. A failed
+refresh or second 401 clears the session. The long-lived response is streamed after headers; only
+the caller owns its lifetime.
+
+The browser deliberately uses fetch-based SSE so 409 remains observable. It first probes and
+decodes a bounded durable archive snapshot, tolerating a writer that advances during acquisition,
+then opens at the captured cursor and reads every later pointer range from the integrity-checked
+archive before acknowledging that cursor. Callbacks are serial, cursor/scope/range coordinates are
+strict and monotone, frames are capped at 16 KiB, and malformed/truncated/discontinuous streams
+cancel their body and fail closed. Initial acquisition and transient disconnects retry with bounded
+backoff. A retention-stale 409 cancels the stream, reloads the durable archive, clears the cursor
+only after that read succeeds, then subscribes fresh. The recent live window is capped at 256 KiB;
+the durable archive remains the complete-output authority.
+
+Mock honesty is now executable rather than conventional. The actual dev Edge server and its
+contract test call the same `ciLiveOpen` state machine, while the production Rust Gateway executes
+the same committed golden cases: fresh current-head ready, explicit replay, terminal ready plus
+complete, ahead-of-head 400, and pruned-cursor 409. The shared vectors therefore gate both
+implementations through `contract-coverage.toml`. The strengthened browser suite proves the
+previously missing tree next-page click and visibility-stale list-cursor reload, and the live flow
+forces a reconnect access 401, exactly one refresh, one durable append, stale resume 409, archive
+reload, successful resume, and terminal completion.
+
+Mechanical evidence: frontend lint and typecheck pass; 485 unit tests pass with the ordinary eight
+Valkey integration skips; the production web build passes; all eight isolated Chromium CI flows
+pass. Both production Edge CI integrations pass against the shared vectors, targeted rustfmt is
+clean, and warnings-denied all-target/all-feature Edge clippy passes. The full architecture-lint
+fixture matrix passes with 762 source files and zero real-workspace violations; shrink-only
+erosion/dependency budgets and frontend-aware contract coverage pass (99 rows, 83 covered, 16
+deferred, two shared frontend contracts, zero false claims); diff check is clean. Independent
+adversarial review first held three MEDIUM findings—snapshot quiescence, missing session refresh,
+and convention-only/ahead-cursor mock drift—then confirmed all closed with no new HIGH or MEDIUM
+finding. The reviewer independently reran 32 targeted frontend tests, typecheck, diff check, all
+eight CI browser flows on dedicated ports, and a fresh live-flow rerun.
+
+Mechanical payoff: web consumers of the durable live transport = 0→1; shared live-resume golden
+branches = 0→5; browser reconnect refreshes proven end to end = 0→1; stale live cursors silently
+continued = 0; recent unbounded live-log buffers = 0; actual dev server paths bypassing the shared
+live contract state machine = 1→0.
+
+L3 CT-005f3 footprint: **17 files, +1,468 / -96 lines** for the authenticated browser transport,
+strict bounded stream consumer, shared live vectors, executable dev/production parity, browser
+failure-path coverage, the fail-closed wire-output reconciliation, and ledgers.
+
+**Honest remaining CT-005 floor:** add authenticated CLI live-tail consumption over the existing
+Edge SSE route and run CI-D11 sever/resume through the composed production services. Then the
+founder must perform a real Myelin push and observe its exact-head required check settle with
+archived and live output through the verifier and browser. CT-007 and the four-week R4 exit clock
+remain closed until that evidence exists.
 
 ## R5–R6
 
