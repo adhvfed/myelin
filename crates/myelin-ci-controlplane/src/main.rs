@@ -287,16 +287,18 @@ async fn main() {
     // the serve runtime (minimal-impact wiring — a bounded background task coordinated with the
     // signal-driven lifecycle, NOT a new AppSpec schema field). The `job_queue` table it sweeps is created
     // by the full `ci_controlplane_migrations` the `serve(AppSpec)` below applies at boot; the reaper
-    // delays its first sweep one interval so that boot-migrate has completed. The reaper is SAFE — it
-    // only re-queues expired leases (`leased`→`queued`); it launches NO untrusted code (binding the
-    // runner + starting the pipeline body on the sandbox executor is CT-004c.2). The claim path is
-    // dormant unless the explicit runner-host activation below is requested.
+    // delays its first sweep one interval so that boot-migrate has completed. It re-queues only work
+    // whose Flow/CI owner remains active; an expired launched job under a cancelled owner is instead
+    // terminalized through durable operational accounting. It launches NO untrusted code. The claim
+    // path is dormant unless the explicit runner-host activation below is requested.
     let region_queue_store = scheduler_provider.region_queue_store();
+    let operational_ledger = myelin_storage::DurableCostLedger::new(provider.clone());
     let reaper = myelin_ci_controlplane::JobQueueReaper::new(
         region_queue_store.clone(),
         provider.config().region.clone(),
         std::time::Duration::from_secs(15),
-    );
+    )
+    .with_cancelled_accounting(provider.db_pool().clone(), operational_ledger);
     let reaper_task = tokio::spawn(reaper.run_until_shutdown(shutdown_tx.subscribe()));
     // CT-004 — compose the per-tenant `ci_run`-poll STARTER lane behind the SAME `MYELIN_CI_RUNNER`
     // activation seam the runner uses. `ci_run_starter_factory` builds the REAL, production-callable

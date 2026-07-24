@@ -5,7 +5,7 @@
 //! [`FirehoseSink`](myelin_ci_sandbox::FirehoseSink) seam — a trait in the LOWER `ci-sandbox` crate
 //! (the runner cannot depend on this crate's [`LogPipeline`](crate::LogPipeline)). This module is the
 //! HIGHER-crate impl that CAN name both: [`LogPipelineSink`] implements `FirehoseSink` by driving a
-//! real `LogPipeline` (redact → firehose live-tail → seal T2 segment → `(job, step, byte-range)`
+//! real `LogPipeline` (boundary-redacted bytes → seal T2 segment → `(job, step, byte-range)`
 //! index → coalesced `ci.log.available` pointer). See
 //! `planning/system-reviews/2026-07-17-ct004f-log-pipeline-scoping.md`.
 //!
@@ -19,17 +19,15 @@
 //!   least-privilege runner holds only opaque `SecretRef`s. So this sink constructs the pipeline with
 //!   an EMPTY [`SecretRedactor`] (defence-in-depth over already-redacted bytes) — it NEVER pulls
 //!   secret plaintext into the control plane.
-//! - **F4 — frame→line impedance.** `ship_frame` ships whole streams as `&[u8]`; `LogPipeline`
-//!   `ship_line`s `&str` lines. This adapter does `from_utf8_lossy(frame).lines()` → `ship_line`,
-//!   under a single stable step id ([`SINGLE_STEP_ID`] — one command per job today; a multi-step job
-//!   would carry a real step id).
+//! - **F4 — byte-exact frames.** Sandbox read boundaries are not text or line boundaries. The
+//!   adapter sends already boundary-redacted bytes to `LogPipeline::ship_frame` unchanged, under one
+//!   stable step id ([`SINGLE_STEP_ID`] — one command per job today).
 //!
 //! ## What is DB-free here (sub-step 3) vs live (sub-step 4)
 //! The frame→seal→row mapping is DB-free (the pipeline core seals to a [`BlobStore`], which a test
-//! drives with an in-memory `Arc<FsBlobStore>`). On [`finish`](LogPipelineSink), the sealed
-//! `log_segment`/`log_anchor` rows + the drained `ci.log.available` pointers are handed to an injected
-//! [`LogPersist`] — a recording stub in tests; the live impl (a tenant-scoped FORCE-RLS `log_segment`/
-//! `log_anchor` write + an outbox pointer emit) is **CT-004f sub-step 4**.
+//! drives with an in-memory `Arc<FsBlobStore>`). Every frame hands its newly sealed
+//! `log_segment`/running-anchor rows + `ci.log.available` pointers to an injected [`LogPersist`];
+//! `finish` persists the terminal anchor.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -49,16 +47,15 @@ use crate::log_pipeline::{
 pub const SINGLE_STEP_ID: &str = "0";
 
 /// Maximum sealed-segment size the production runner can legitimately produce. An open segment is
-/// strictly below the seal threshold before one more line is appended. A captured frame is bounded
-/// by [`myelin_ci_sandbox::SANDBOX_CAPTURE_BOUND`], but invalid UTF-8 can expand threefold when the
-/// frame-to-line adapter replaces each invalid byte with U+FFFD before appending the whole line.
-/// The archived-log reader shares this producer-derived ceiling rather than guessing independently.
+/// strictly below the seal threshold before one bounded backend frame is appended. New frames remain
+/// byte-exact; the three-times frame allowance preserves readability of segments emitted by the
+/// earlier lossy-UTF-8 adapter during a rolling upgrade.
 pub const PRODUCTION_LOG_SEGMENT_MAX_BYTES: usize =
     SealThreshold::DEFAULT_SEAL_AT_BYTES as usize + 3 * myelin_ci_sandbox::SANDBOX_CAPTURE_BOUND;
 
-/// **The sealed index + drained pointers for one finished `(tenant, run, job)`** — what
+/// **One incremental or terminal log-index checkpoint for `(tenant, run, job)`** — what
 /// [`LogPersist`] durably writes. References-not-payloads: the `segments` name content addresses in
-/// the CAS (never log bytes), the `anchors` name byte ranges, the `pointers` are the coalesced
+/// the CAS (never log bytes), the `anchors` name byte ranges, and `pointers` are the coalesced
 /// `ci.log.available` facts that ride the outbox.
 #[derive(Debug, Clone)]
 pub struct FlushedJobLogs {
@@ -74,16 +71,37 @@ pub struct FlushedJobLogs {
     pub pointers: Vec<LogAvailablePointer>,
 }
 
-/// **The durable-write seam a finished job's log index flushes through (CT-004f sub-step 4 fills it).**
-/// The DB-free adapter (sub-step 3) drives the pipeline to sealed rows + pointers and hands them here;
-/// the live impl writes `log_segment`/`log_anchor` on a tenant-scoped FORCE-RLS tx and emits the
-/// pointers via the outbox (durable, `no-raw-publish` green). A recording stub proves the mapping in
-/// tests.
+/// Durable append position recovered before a retried execution emits its first new frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogResume {
+    /// The next `log_segment.segment_seq`.
+    pub next_segment_seq: i32,
+    /// The first byte offset of the retry's next frame.
+    pub next_byte_offset: i64,
+    /// The stable start of the existing step anchor.
+    pub step_byte_start: i64,
+}
+
+/// **The durable-write seam each incremental/terminal log checkpoint flushes through.** The DB-free
+/// adapter drives the pipeline to newly sealed rows + pointers and hands them here; the live impl
+/// writes `log_segment`/`log_anchor` on a tenant-scoped FORCE-RLS tx and emits the pointers via the
+/// outbox (durable, `no-raw-publish` green).
 pub trait LogPersist: Send + Sync {
-    /// Persist the sealed index + emit the pointers for a finished `(tenant, run, job)`. Returns the
-    /// durable-write error so the sink can surface it (a lost log index is diagnosable, never a silent
-    /// swallow) — the fail-loud-vs-best-effort policy for a persist failure mid-run is settled in
-    /// sub-step 4 (the runner's job already ran; only the log index is at stake).
+    /// Recover the append-only durable head for a retried job. Recording/test implementations start
+    /// empty by default; the production store overrides this with an exact tenant/region read.
+    fn resume(
+        &self,
+        _tenant: &TenantId,
+        _region: &Region,
+        _run_id: &str,
+        _job_id: &str,
+    ) -> Result<LogResume, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(LogResume::default())
+    }
+
+    /// Persist newly sealed index rows + emit their pointers. A mid-run error is returned through the
+    /// firehose and fails the runner cycle before terminal reporting; output is never silently
+    /// acknowledged without its durable resume authority.
     fn persist(
         &self,
         tenant: &TenantId,
@@ -95,6 +113,16 @@ pub trait LogPersist: Send + Sync {
 /// on the recorded flushes; a composition root sharing one writer) while the sink owns a clone.
 /// Mirrors `impl BlobStore for Arc<B>`.
 impl<T: LogPersist> LogPersist for std::sync::Arc<T> {
+    fn resume(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        run_id: &str,
+        job_id: &str,
+    ) -> Result<LogResume, Box<dyn std::error::Error + Send + Sync>> {
+        (**self).resume(tenant, region, run_id, job_id)
+    }
+
     fn persist(
         &self,
         tenant: &TenantId,
@@ -107,7 +135,8 @@ impl<T: LogPersist> LogPersist for std::sync::Arc<T> {
 /// **The real [`FirehoseSink`] — drives a per-`(tenant, run, job)` [`LogPipeline`] (CT-004f).** Holds
 /// the runner's single `region` + a cheaply-clonable `blobs` handle (`S3BlobStore` in production, an
 /// `Arc<FsBlobStore>` in tests) + the injected [`LogPersist`]. `ship_frame` opens/extends the job's
-/// pipeline; `finish` closes the step, seals, and flushes the index through `LogPersist`.
+/// pipeline; each frame is sealed and persisted before acknowledgment, while `finish` closes the
+/// step and persists its terminal anchor.
 pub struct LogPipelineSink<S: BlobStore + Clone, P: LogPersist> {
     /// The cell's region (the residency pin every pipeline is constructed with — a runner serves ONE
     /// region, so this is construction-time, not on the seam).
@@ -144,40 +173,116 @@ impl<S: BlobStore + Clone, P: LogPersist> LogPipelineSink<S, P> {
 }
 
 impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P> {
-    fn ship_frame(&self, run_id: &str, job_id: &str, tenant: &TenantId, frame: &[u8]) {
-        let key = Self::key(tenant, run_id, job_id);
-        let mut map = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        // Open the job's pipeline lazily (per-tenant CAS keyspace + residency pin). EMPTY redactor:
-        // redaction is a BOUNDARY responsibility (F3) — these frames are already redacted; the
-        // pipeline redactor is defence-in-depth, and this control-plane process never holds the
-        // plaintext needles a real redactor would need.
-        let pipe = map.entry(key).or_insert_with(|| {
-            LogPipeline::new(
-                tenant.clone(),
-                self.region.clone(),
-                self.blobs.clone(),
-                SecretRedactor::for_job(std::iter::empty::<String>()),
-            )
-        });
-        // F4: a frame is a captured byte chunk; the pipeline is line-oriented. Lossy-decode (log bytes
-        // may be non-UTF8) and ship each line. `str::lines()` yields the final line even without a
-        // trailing newline. A cross-region write cannot occur (the pipeline's region == self.region),
-        // so `ship_line` never errs here.
-        let text = String::from_utf8_lossy(frame);
-        let coord = LogCoord::new(run_id, job_id, SINGLE_STEP_ID);
-        for line in text.lines() {
-            let _ = pipe.ship_line(&coord, line);
+    fn ship_frame(
+        &self,
+        run_id: &str,
+        job_id: &str,
+        tenant: &TenantId,
+        frame: &[u8],
+    ) -> Result<(), String> {
+        if frame.is_empty() {
+            return Ok(());
         }
+        let key = Self::key(tenant, run_id, job_id);
+        let needs_resume = !self
+            .pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&key);
+        let resume = if needs_resume {
+            self.persist
+                .resume(tenant, &self.region, run_id, job_id)
+                .map_err(|error| {
+                    format!("recover durable log head for run={run_id} job={job_id}: {error}")
+                })?
+        } else {
+            LogResume::default()
+        };
+        let flushed = {
+            let mut map = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            // Open lazily with an empty defence-in-depth redactor: the sandbox callback has already
+            // applied the authoritative boundary plan.
+            let pipe = map.entry(key.clone()).or_insert_with(|| {
+                let mut pipeline = LogPipeline::new(
+                    tenant.clone(),
+                    self.region.clone(),
+                    self.blobs.clone(),
+                    SecretRedactor::for_job(std::iter::empty::<String>()),
+                );
+                pipeline.resume_stream(
+                    &LogCoord::new(run_id, job_id, SINGLE_STEP_ID),
+                    resume.step_byte_start,
+                    resume.next_byte_offset,
+                    resume.next_segment_seq,
+                );
+                pipeline
+            });
+            let coord = LogCoord::new(run_id, job_id, SINGLE_STEP_ID);
+            pipe.ship_frame(&coord, frame)
+                .map_err(|error| error.to_string())?;
+            // Force a seal at the bounded backend frame so Edge can observe the segment while the
+            // command is still executing; the open buffer never exceeds one callback.
+            pipe.seal_open_segment(&coord)
+                .map_err(|error| error.to_string())?;
+            FlushedJobLogs {
+                run_id: run_id.to_string(),
+                job_id: job_id.to_string(),
+                segments: pipe.drain_segment_rows(),
+                anchors: pipe.anchor_rows().into_iter().cloned().collect(),
+                pointers: pipe.drain_pointers(),
+            }
+        };
+        if let Err(error) = self.persist.persist(tenant, flushed) {
+            self.pipelines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            return Err(format!(
+                "persist incremental log checkpoint for run={run_id} job={job_id}: {error}"
+            ));
+        }
+        Ok(())
     }
 
-    fn finish(&self, run_id: &str, job_id: &str, tenant: &TenantId, passed: bool) {
+    fn finish(
+        &self,
+        run_id: &str,
+        job_id: &str,
+        tenant: &TenantId,
+        passed: bool,
+    ) -> Result<(), String> {
         let key = Self::key(tenant, run_id, job_id);
-        // Remove the pipeline: a re-delivered `finish` finds nothing → no double seal (idempotent).
-        let mut pipe = {
+        // Remove the active pipeline. If this is a retry that produced no new output, recover the
+        // durable head so its prior running anchor can still be closed. A repeated finish performs
+        // only an idempotent anchor upsert—never another segment seal.
+        let existing = {
             let mut map = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-            match map.remove(&key) {
-                Some(p) => p,
-                None => return,
+            map.remove(&key)
+        };
+        let mut pipe = match existing {
+            Some(pipe) => pipe,
+            None => {
+                let resume = self
+                    .persist
+                    .resume(tenant, &self.region, run_id, job_id)
+                    .map_err(|error| {
+                        format!(
+                            "recover durable log head for terminal run={run_id} job={job_id}: {error}"
+                        )
+                    })?;
+                let mut pipeline = LogPipeline::new(
+                    tenant.clone(),
+                    self.region.clone(),
+                    self.blobs.clone(),
+                    SecretRedactor::for_job(std::iter::empty::<String>()),
+                );
+                pipeline.resume_stream(
+                    &LogCoord::new(run_id, job_id, SINGLE_STEP_ID),
+                    resume.step_byte_start,
+                    resume.next_byte_offset,
+                    resume.next_segment_seq,
+                );
+                pipeline
             }
         };
         let coord = LogCoord::new(run_id, job_id, SINGLE_STEP_ID);
@@ -188,24 +293,20 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
         } else {
             AnchorStatus::Failed
         };
-        let _ = pipe.close_step(&coord, status);
-        let _ = pipe.flush_job(run_id, job_id, SINGLE_STEP_ID);
+        pipe.close_step(&coord, status)
+            .map_err(|error| error.to_string())?;
+        pipe.flush_job(run_id, job_id, SINGLE_STEP_ID)
+            .map_err(|error| error.to_string())?;
         let flushed = FlushedJobLogs {
             run_id: run_id.to_string(),
             job_id: job_id.to_string(),
-            segments: pipe.segment_rows().to_vec(),
+            segments: pipe.drain_segment_rows(),
             anchors: pipe.anchor_rows().into_iter().cloned().collect(),
             pointers: pipe.drain_pointers(),
         };
-        if let Err(e) = self.persist.persist(tenant, flushed) {
-            // Surface, never silently swallow: a lost log index is diagnosable. The job itself already
-            // ran (the terminal report is independent); the fail-loud-vs-best-effort policy for a
-            // persist failure is settled in sub-step 4 when the live writer lands.
-            eprintln!(
-                "log_sink: persist failed for run={run_id} job={job_id} (log index may be \
-                 incomplete): {e}"
-            );
-        }
+        self.persist
+            .persist(tenant, flushed)
+            .map_err(|error| format!("persist terminal log checkpoint: {error}"))
     }
 }
 
@@ -235,6 +336,17 @@ mod tests {
         }
     }
 
+    struct FailingPersist;
+    impl LogPersist for FailingPersist {
+        fn persist(
+            &self,
+            _tenant: &TenantId,
+            _flushed: FlushedJobLogs,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err(std::io::Error::other("injected durable log failure").into())
+        }
+    }
+
     fn sink() -> LogPipelineSink<Arc<FsBlobStore>, Arc<RecordingPersist>> {
         LogPipelineSink::new(
             Region::new("eu-west"),
@@ -252,16 +364,22 @@ mod tests {
             persist.clone(),
         );
         let tenant = TenantId::from_token("tnt-1");
-        s.ship_frame("run-1", "job-1", &tenant, b"line one\nline two\n");
-        s.ship_frame("run-1", "job-1", &tenant, b"stderr blip\n");
-        // Before finish: nothing has been flushed (finish is the terminal seal).
-        assert_eq!(persist.flushed.lock().unwrap().len(), 0);
+        s.ship_frame("run-1", "job-1", &tenant, b"line one\nline two\n")
+            .expect("first incremental checkpoint");
+        s.ship_frame("run-1", "job-1", &tenant, b"stderr blip\n")
+            .expect("second incremental checkpoint");
+        assert_eq!(
+            persist.flushed.lock().unwrap().len(),
+            2,
+            "each frame is durable before terminal finish"
+        );
 
-        s.finish("run-1", "job-1", &tenant, true);
+        s.finish("run-1", "job-1", &tenant, true)
+            .expect("terminal checkpoint");
 
         let flushed = persist.flushed.lock().unwrap();
-        assert_eq!(flushed.len(), 1, "one job flushed");
-        let (tid, job) = &flushed[0];
+        assert_eq!(flushed.len(), 3, "two live checkpoints plus terminal");
+        let (tid, job) = &flushed[2];
         assert_eq!(tid, "tnt-1");
         assert_eq!(job.run_id, "run-1");
         assert_eq!(job.job_id, "job-1");
@@ -270,58 +388,89 @@ mod tests {
         let anchor = &job.anchors[0];
         assert_eq!(anchor.status, AnchorStatus::Passed);
         assert_eq!(anchor.step_id, SINGLE_STEP_ID);
-        assert!(anchor.byte_end.is_some(), "a finished step's anchor is closed");
-        // The output sealed to at least one content-addressed segment + a durable pointer.
-        assert!(!job.segments.is_empty(), "output sealed to a segment");
         assert!(
-            job.segments.iter().all(|s| s.blob_ref.is_some()),
+            anchor.byte_end.is_some(),
+            "a finished step's anchor is closed"
+        );
+        // Output segments and pointers were already persisted by the two live checkpoints.
+        let live_segments: Vec<_> = flushed[..2]
+            .iter()
+            .flat_map(|(_, checkpoint)| checkpoint.segments.iter())
+            .collect();
+        assert_eq!(live_segments.len(), 2);
+        assert!(
+            live_segments.iter().all(|s| s.blob_ref.is_some()),
             "every sealed segment names a CAS blob"
         );
-        assert!(!job.pointers.is_empty(), "a ci.log.available pointer was emitted");
+        assert!(
+            flushed[..2]
+                .iter()
+                .all(|(_, checkpoint)| !checkpoint.pointers.is_empty()),
+            "each live segment emitted a durable pointer"
+        );
     }
 
     #[test]
-    fn worst_case_non_utf8_capture_remains_readable_under_the_shared_production_ceiling() {
+    fn binary_frames_remain_byte_exact_across_read_boundaries() {
         let blobs = Arc::new(FsBlobStore::new());
         let persist = Arc::new(RecordingPersist::default());
         let sink = LogPipelineSink::new(Region::new("eu-west"), blobs.clone(), persist.clone());
         let tenant = TenantId::from_token("tnt-invalid-utf8");
-        let almost_full = vec![b'a'; SealThreshold::DEFAULT_SEAL_AT_BYTES as usize - 1];
-        sink.ship_frame("run-invalid", "job-invalid", &tenant, &almost_full);
-        let invalid = vec![0xff; myelin_ci_sandbox::SANDBOX_CAPTURE_BOUND];
-        sink.ship_frame("run-invalid", "job-invalid", &tenant, &invalid);
-        sink.finish("run-invalid", "job-invalid", &tenant, true);
+        let first = b"line one\nsplit-\xf0\x9f".to_vec();
+        let second = b"\x98\x80\nraw-\xff\x00-tail\n".to_vec();
+        sink.ship_frame("run-invalid", "job-invalid", &tenant, &first)
+            .expect("first binary frame");
+        sink.ship_frame("run-invalid", "job-invalid", &tenant, &second)
+            .expect("second binary frame");
 
         let flushed = persist.flushed.lock().unwrap();
-        let segment = flushed[0]
-            .1
-            .segments
-            .iter()
-            .max_by_key(|segment| segment.byte_end)
-            .expect("worst-case frame seals a segment");
-        let byte_len = usize::try_from(segment.byte_end - segment.byte_start).unwrap();
-        assert!(
-            byte_len > 2 * SealThreshold::DEFAULT_SEAL_AT_BYTES as usize,
-            "the regression fixture exceeds the old guessed reader ceiling"
+        assert_eq!(flushed.len(), 2);
+        let mut archived = Vec::new();
+        for (_, checkpoint) in flushed.iter() {
+            let segment = checkpoint.segments.first().expect("one segment per frame");
+            let hash = ContentHash::parse(segment.blob_ref.as_deref().expect("sealed blob ref"))
+                .expect("canonical content address");
+            archived.extend(
+                blobs
+                    .get_bounded(&tenant, &hash, PRODUCTION_LOG_SEGMENT_MAX_BYTES)
+                    .expect("bounded archived segment"),
+            );
+        }
+        let mut expected = first;
+        expected.extend(second);
+        assert_eq!(archived, expected, "no UTF-8 expansion or newline loss");
+    }
+
+    #[test]
+    fn incremental_persist_failure_is_loud_and_drops_in_memory_state() {
+        let sink = LogPipelineSink::new(
+            Region::new("eu-west"),
+            Arc::new(FsBlobStore::new()),
+            FailingPersist,
         );
-        assert!(byte_len <= PRODUCTION_LOG_SEGMENT_MAX_BYTES);
-        let hash = ContentHash::parse(segment.blob_ref.as_deref().expect("sealed blob ref"))
-            .expect("canonical content address");
-        let bytes = blobs
-            .get_bounded(&tenant, &hash, PRODUCTION_LOG_SEGMENT_MAX_BYTES)
-            .expect("every legitimately produced segment is readable at the shared ceiling");
-        assert_eq!(bytes.len(), byte_len);
+        let tenant = TenantId::from_token("tnt-fail");
+        let error = sink
+            .ship_frame("run-fail", "job-fail", &tenant, b"must be durable\n")
+            .expect_err("an unpersisted frame is never acknowledged");
+        assert!(error.contains("incremental log checkpoint"));
+        assert!(
+            sink.pipelines.lock().unwrap().is_empty(),
+            "failed jobs do not leak a stale open pipeline into a retry"
+        );
     }
 
     #[test]
     fn finish_is_idempotent_no_double_seal() {
         let s = sink();
         let tenant = TenantId::from_token("tnt-1");
-        s.ship_frame("run-1", "job-1", &tenant, b"hello\n");
-        s.finish("run-1", "job-1", &tenant, true);
+        s.ship_frame("run-1", "job-1", &tenant, b"hello\n")
+            .expect("live checkpoint");
+        s.finish("run-1", "job-1", &tenant, true)
+            .expect("terminal checkpoint");
         // A re-delivered terminal report calls finish AGAIN — the pipeline is already removed, so this
         // is a no-op (no panic, no second flush). Proven by the pipelines map being empty.
-        s.finish("run-1", "job-1", &tenant, true);
+        s.finish("run-1", "job-1", &tenant, true)
+            .expect("idempotent terminal retry");
         assert!(
             s.pipelines.lock().unwrap().is_empty(),
             "no lingering pipeline after finish"
@@ -337,10 +486,15 @@ mod tests {
             persist.clone(),
         );
         let tenant = TenantId::from_token("tnt-1");
-        s.ship_frame("run-9", "job-9", &tenant, b"boom\n");
-        s.finish("run-9", "job-9", &tenant, false);
+        s.ship_frame("run-9", "job-9", &tenant, b"boom\n")
+            .expect("live checkpoint");
+        s.finish("run-9", "job-9", &tenant, false)
+            .expect("terminal checkpoint");
         let flushed = persist.flushed.lock().unwrap();
-        assert_eq!(flushed[0].1.anchors[0].status, AnchorStatus::Failed);
+        assert_eq!(
+            flushed.last().unwrap().1.anchors[0].status,
+            AnchorStatus::Failed
+        );
     }
 
     #[test]
@@ -354,13 +508,21 @@ mod tests {
         let a = TenantId::from_token("tnt-a");
         let b = TenantId::from_token("tnt-b");
         // SAME run/job ids across DIFFERENT tenants must not collide (the key is tenant-scoped).
-        s.ship_frame("run-1", "job-1", &a, b"tenant a line\n");
-        s.ship_frame("run-1", "job-1", &b, b"tenant b line\n");
-        assert_eq!(s.pipelines.lock().unwrap().len(), 2, "one pipeline per tenant");
-        s.finish("run-1", "job-1", &a, true);
-        s.finish("run-1", "job-1", &b, true);
+        s.ship_frame("run-1", "job-1", &a, b"tenant a line\n")
+            .expect("tenant a live checkpoint");
+        s.ship_frame("run-1", "job-1", &b, b"tenant b line\n")
+            .expect("tenant b live checkpoint");
+        assert_eq!(
+            s.pipelines.lock().unwrap().len(),
+            2,
+            "one pipeline per tenant"
+        );
+        s.finish("run-1", "job-1", &a, true)
+            .expect("tenant a terminal checkpoint");
+        s.finish("run-1", "job-1", &b, true)
+            .expect("tenant b terminal checkpoint");
         let flushed = persist.flushed.lock().unwrap();
-        assert_eq!(flushed.len(), 2);
+        assert_eq!(flushed.len(), 4);
         let tenants: Vec<&str> = flushed.iter().map(|(t, _)| t.as_str()).collect();
         assert!(tenants.contains(&"tnt-a") && tenants.contains(&"tnt-b"));
     }

@@ -62,7 +62,9 @@ impl RedactionPlan {
     /// The empty plan — "there are no CI-managed secret needles to mask for this job." The ONLY plan
     /// produced today (nothing injects secrets). A no-op mask.
     pub fn none() -> RedactionPlan {
-        RedactionPlan { needles: Vec::new() }
+        RedactionPlan {
+            needles: Vec::new(),
+        }
     }
 
     /// **The per-job plan seam CI-1 secret injection must populate.** TODAY the platform injects no
@@ -130,7 +132,10 @@ mod tests {
     fn empty_plan_is_identity() {
         let plan = RedactionPlan::none();
         assert!(plan.is_empty());
-        assert_eq!(plan.redact(b"nothing to mask here"), b"nothing to mask here");
+        assert_eq!(
+            plan.redact(b"nothing to mask here"),
+            b"nothing to mask here"
+        );
     }
 
     #[test]

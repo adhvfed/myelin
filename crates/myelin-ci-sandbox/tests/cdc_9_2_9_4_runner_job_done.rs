@@ -103,6 +103,7 @@ impl SandboxBackend for NoopBackend {
                 guest_id: "g".into(),
             },
             result,
+            output_complete: true,
         })
     }
     fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {

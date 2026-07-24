@@ -1,9 +1,10 @@
 //! # `job_queue_region` — CT-004c.1: the REGION-scoped, CROSS-TENANT scheduler claim + reaper
 //!
 //! **This file is a NAMED, LOUD `tenant-predicate` exclusion (see `myelin-lints` `EXCLUDED_SUBSTRINGS`).**
-//! The scheduler pull-lease claim (arch 02 §2.1, [`crate::scheduler::CLAIM_QUERY`]) and the
-//! dead-runner reaper ([`crate::scheduler::REAP_QUERY`]) are CROSS-TENANT BY DESIGN: a hosted runner
-//! claims the next eligible job across ALL tenants in its region, and the DRR fairness
+//! The scheduler pull-lease claim (arch 02 §2.1, [`crate::scheduler::CLAIM_QUERY`]), active-job
+//! dead-runner reaper ([`crate::scheduler::REAP_QUERY`]), and bounded cancelled-launch discovery
+//! are CROSS-TENANT BY DESIGN: a hosted runner claims the next eligible job across ALL tenants in
+//! its region, and the DRR fairness
 //! (`fair_deficit.deficit DESC`) is explicitly cross-tenant ("prevents one tenant's matrix from
 //! starving every OTHER tenant", arch 02 §2.2). These queries filter by `region` only and carry NO
 //! `tenant_id` predicate — so the `tenant-predicate` IDOR fingerprint (`sqlx::query` without a
@@ -11,11 +12,11 @@
 //! `myelin-storage/src/placement_durable.rs` (the cell-placement registry: "which cell homes tenant
 //! X?" for any X). The `region` column is the ROUTING/RESIDENCY key here, not an RLS predicate.
 //!
-//! **The tenant-store queries stay FULLY linted.** Only the two cross-tenant SERVICE queries live in
+//! **The tenant-store queries stay FULLY linted.** Only cross-tenant SERVICE queries live in
 //! this excluded file; the PER-TENANT ops (`enqueue`/`cancel_superseded`/`complete`/`heartbeat`) stay
 //! in [`crate::job_queue_store`] (NOT excluded), each binding `tenant_id` through the MR-022
 //! `with_tenant_tx` convention — so the tenant-predicate lint reads the IDOR guard on every one. This
-//! is a SCOPED exclusion of the two genuinely-cross-tenant reads, never a whole-store waiver.
+//! is a SCOPED exclusion of genuinely cross-tenant routing/recovery reads, never a whole-store waiver.
 //!
 //! **Residency + no bleed (in-band).** Both queries run under [`with_region_tx`]: acquire → BEGIN →
 //! set the `region` GUC transaction-scoped (residency pin, in-band — the same posture the
@@ -25,7 +26,8 @@
 //! **Dedicated capability boundary.** [`CiRegionQueueStore`] must be constructed over the constrained
 //! region-scheduler pool. PostgreSQL admits rows only when the authenticated `session_user` mapping,
 //! the row region, and this transaction's region GUC agree while the tenant GUC is empty. The type
-//! exposes only claim/reap; tenant writes remain impossible through this capability surface.
+//! exposes only claim/reap/recovery discovery; tenant writes remain impossible through this
+//! capability surface.
 //!
 //! @residency-cell-pinned:file — the region is pinned in-band on every op via the transaction-scoped
 //! `myelin.region` GUC (there is no region-less pool construction in this file; the pool is injected).
@@ -45,11 +47,26 @@ use crate::scheduler::{Lane, CLAIM_QUERY, REAP_QUERY};
 /// Region-wide scheduler capability over its dedicated constrained PostgreSQL pool. This type is
 /// intentionally separate from [`crate::CiJobQueueStore`]: a tenant application pool can enqueue,
 /// heartbeat, complete, and cancel, but cannot express claim/reap in the Rust API; the scheduler pool
-/// can claim/reap and exposes no tenant mutation verbs.
+/// can claim/reap/discover cancelled recovery candidates and exposes no tenant mutation verbs.
 #[derive(Clone)]
 pub struct CiRegionQueueStore {
     pool: PgPool,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AbandonedCancelledJob {
+    pub tenant_id: String,
+    pub wf_run_id: String,
+    pub job_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AbandonedCancelledCursor {
+    pub tenant_id: String,
+    pub job_id: String,
+}
+
+pub(crate) const MAX_ABANDONED_CANCELLED_RECOVERY_BATCH: i64 = 64;
 
 impl CiRegionQueueStore {
     /// Bind the dedicated, startup-probed region-scheduler pool.
@@ -77,9 +94,20 @@ impl CiRegionQueueStore {
         .await
     }
 
-    /// Re-queue expired leases across tenants in the mapped region.
+    /// Re-queue expired leases whose authoritative Flow and CI owners remain active.
     pub async fn reap(&self, region: &str) -> Result<u64, JobQueueStoreError> {
         reap_region_scoped(&self.pool, region).await
+    }
+
+    /// Discover at most one bounded keyset page of identities for exact-tenant cancelled-launch
+    /// reconciliation. The caller rotates the cursor across sweeps so a persistent poison row
+    /// cannot monopolize the region.
+    pub(crate) async fn abandoned_cancelled(
+        &self,
+        region: &str,
+        after: Option<&AbandonedCancelledCursor>,
+    ) -> Result<Vec<AbandonedCancelledJob>, JobQueueStoreError> {
+        abandoned_cancelled_region_scoped(&self.pool, region, after).await
     }
 
     /// Refuse runner activation while an old non-terminal row lacks completion stage authority.
@@ -89,6 +117,58 @@ impl CiRegionQueueStore {
     ) -> Result<i64, JobQueueStoreError> {
         count_non_terminal_null_stage_jobs_region_scoped(&self.pool, region).await
     }
+}
+
+async fn abandoned_cancelled_region_scoped(
+    pool: &PgPool,
+    region: &str,
+    after: Option<&AbandonedCancelledCursor>,
+) -> Result<Vec<AbandonedCancelledJob>, JobQueueStoreError> {
+    let region_owned = region.to_owned();
+    let after_tenant = after.map(|cursor| cursor.tenant_id.clone());
+    let after_job = after
+        .map(|cursor| Uuid::parse_str(&cursor.job_id))
+        .transpose()
+        .map_err(|_| JobQueueStoreError::CorruptRow("invalid cancelled-recovery cursor".into()))?;
+    let rows = with_region_tx(pool, region, move |conn| {
+        Box::pin(async move {
+            sqlx::query(
+                "SELECT q.tenant_id, q.run_id::text AS wf_run_id, q.job_id::text AS job_id
+                 FROM job_queue q
+                 JOIN workflow_run w
+                   ON w.tenant_id = q.tenant_id AND w.region = q.region
+                  AND w.run_id = q.run_id::text
+                 JOIN ci_run c
+                   ON c.tenant_id = q.tenant_id AND c.region = q.region
+                  AND c.wf_run_id = q.run_id
+                 WHERE q.region = $1 AND q.state = 'running' AND q.lease_expires < now()
+                   AND w.state = 'terminated' AND c.state = 'cancelled'
+                   AND (
+                     $2::text IS NULL
+                     OR q.tenant_id > $2
+                     OR (q.tenant_id = $2 AND q.job_id > $3::uuid)
+                   )
+                 ORDER BY q.tenant_id, q.job_id
+                 LIMIT $4",
+            )
+            .bind(&region_owned)
+            .bind(after_tenant)
+            .bind(after_job)
+            .bind(MAX_ABANDONED_CANCELLED_RECOVERY_BATCH)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))
+        })
+    })
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| AbandonedCancelledJob {
+            tenant_id: row.get("tenant_id"),
+            wf_run_id: row.get("wf_run_id"),
+            job_id: row.get("job_id"),
+        })
+        .collect())
 }
 
 /// **The pull-lease claim raw execution (arch 02 §2.1; [`CLAIM_QUERY`]) — region-scoped, cross-tenant.**
@@ -132,8 +212,9 @@ pub(crate) async fn claim_region_scoped(
 }
 
 /// **The dead-runner reaper raw execution (arch 02 §2.1; [`REAP_QUERY`]) — region-scoped, cross-tenant.**
-/// Runs [`REAP_QUERY`] under [`with_region_tx`], re-queuing every expired lease in the region in place
-/// (no INSERT → 0 duplicate enqueues). Returns the count re-queued.
+/// Runs [`REAP_QUERY`] under [`with_region_tx`], re-queuing every expired lease with an active
+/// Flow/CI owner in place (no INSERT → 0 duplicate enqueues). Cancelled owners are excluded and
+/// handled through exact-tenant accounting reconciliation. Returns the count re-queued.
 pub(crate) async fn reap_region_scoped(
     pool: &PgPool,
     region: &str,
@@ -177,7 +258,7 @@ pub(crate) async fn count_non_terminal_null_stage_jobs_region_scoped(
     .await
 }
 
-/// **The REGION-scoped transaction seam (the cross-tenant claim/reap path).** Acquire → BEGIN → set
+/// **The REGION-scoped transaction seam (the cross-tenant scheduler path).** Acquire → BEGIN → set
 /// the `region` GUC transaction-scoped (residency pin, in-band) + clear the tenant GUC → run `op` →
 /// COMMIT (the GUC discarded on commit — no bleed). Mirrors `myelin_storage::with_tenant_tx`'s
 /// mechanism but for a region-wide, cross-tenant SERVICE read.

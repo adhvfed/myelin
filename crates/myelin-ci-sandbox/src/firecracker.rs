@@ -41,13 +41,14 @@ use crate::hardening::{
 use crate::launch_gate::SandboxCommand;
 use crate::redaction::RedactionPlan;
 use crate::{
-    drain_capped, JobSpec, LaunchPermit, ResourceUsage, RunnerHooks, SandboxBackend, SandboxHandle,
-    SandboxLaunch, SandboxResult, SANDBOX_CAPTURE_BOUND,
+    drain_capped, JobSpec, LaunchPermit, ResourceUsage, RunnerHooks, SandboxBackend,
+    SandboxCancellation, SandboxHandle, SandboxLaunch, SandboxOutputSink, SandboxOutputStream,
+    SandboxResult, SANDBOX_CAPTURE_BOUND,
 };
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Env var naming the guest kernel (`vmlinux`); defaults to the staged boot-proven asset so dev↔prod
@@ -88,8 +89,8 @@ pub const BOOT_ARGS_BASE: &str = "console=ttyS0 reboot=k panic=1 pci=off i8042.n
 //      land as DATA inside the b64 blob (decoded once, never re-parsed as a marker).
 //   2. **a per-boot 256-bit NONCE** — every marker is suffixed with a fresh random nonce the HOST
 //      generated for THIS boot ([`boot_nonce`]); the parser only accepts lines bearing the exact
-//      nonce. The runner reaps all descendants (`kill -KILL -1`) BEFORE emitting the trusted markers
-//      and the host takes the LAST nonce-bearing exit line.
+//      nonce. The runner reaps every non-root descendant before closing the trusted stream and the
+//      host takes the LAST nonce-bearing exit line.
 //
 // NOTE (residual / future trust-tier): untrusted exec runs NON-ROOT, which is the boundary that
 // makes the forge structurally impossible. A future "root-in-guest CI" trust-tier (where the
@@ -101,6 +102,8 @@ const MARK_STDOUT_BEGIN: &str = "__MYELIN_STDOUT_B64_BEGIN__";
 const MARK_STDOUT_END: &str = "__MYELIN_STDOUT_B64_END__";
 const MARK_STDERR_BEGIN: &str = "__MYELIN_STDERR_B64_BEGIN__";
 const MARK_STDERR_END: &str = "__MYELIN_STDERR_B64_END__";
+const MARK_STREAM_CHUNK: &str = "__MYELIN_STREAM_B64__";
+const MARK_STREAM_END: &str = "__MYELIN_STREAM_END__";
 const MARK_EXIT: &str = "__MYELIN_EXIT__";
 
 /// Host-side cap on the buffered serial console (CT-002c). Unlike gVisor's two separate pipes, the
@@ -394,6 +397,8 @@ pub struct GuestRun {
     pub cfg_path: PathBuf,
     /// The captured command result (exit / timeout / usage / bounded streams).
     pub result: SandboxResult,
+    /// A post-spawn transport/cancellation failure. Usage is still settled before launch refuses.
+    pub run_error: Option<String>,
 }
 
 /// The host-side VMM-process abstraction. The REAL impl ([`SpawnedVmm`]) shells out to the
@@ -489,6 +494,7 @@ impl FirecrackerBackend {
             child,
             cfg_path,
             result,
+            run_error,
         } = run(spec, &profile, launch_permit).map_err(FcError::Vmm)?;
 
         let guest_id = format!("fc-{}", spec.idem_token.0);
@@ -499,11 +505,17 @@ impl FirecrackerBackend {
 
         // #1b settle — release the unused reserve on completion (never interrupt in-flight), now
         // settling against the result's REAL measured usage (CT-002a).
-        hooks.settle_completed(spec, &reserve, result.usage)?;
+        if let Err(error) = hooks.settle_completed(spec, &reserve, result.usage) {
+            let _ = self.kill(&SandboxHandle {
+                guest_id: guest_id.clone(),
+            });
+            return Err(error.into());
+        }
 
         Ok(SandboxLaunch {
             handle: SandboxHandle { guest_id },
             result,
+            output_complete: run_error.is_none(),
         })
     }
 }
@@ -516,18 +528,34 @@ impl FirecrackerBackend {
 ///    ([`build_command_runner_script`]) that exports `spec.env`, runs `spec.command` under the
 ///    hardened in-guest posture (caps-dropped + no-new-privs AND dropped to a NON-ROOT uid via
 ///    `setpriv` so the payload cannot write the root-only console — the structural forge boundary),
-///    captures its stdout/stderr to tmpfs, and prints them base64-framed + the real exit code —
-///    every marker nonce-suffixed (the non-root boundary makes the forge impossible; nonce is DiD).
+///    redirects stdout/stderr into root-owned FIFO relays that emit bounded base64 frames while the
+///    command runs, followed by the real exit code; every marker is nonce-suffixed.
 /// 2. Stage the script on a block-boundary-padded host file (the 2nd virtio drive) and write the
 ///    two-drive machine config ([`FcMachineConfig::command_runner_json`]) — read-only root, NIC iff
 ///    egress is non-default-deny, vcpu/mem/pids from the derived profile.
 /// 3. Boot with a wall-clock timeout = `spec.limits.timeout_secs` ([`spawn_and_capture`]); on expiry
 ///    the whole guest is killed (`timed_out=true`, `exit_code=None`).
-/// 4. Parse the serial console for the nonce-framed exit + base64 streams ([`build_result_from_console`]).
+/// 4. Parse the serial console online for bounded stream frames + the nonce-framed exit.
 fn run_production_guest(
     spec: &JobSpec,
     profile: &HardeningProfile,
     launch_permit: LaunchPermit,
+) -> Result<GuestRun, String> {
+    run_production_guest_streaming(
+        spec,
+        profile,
+        launch_permit,
+        None,
+        SandboxCancellation::new(),
+    )
+}
+
+fn run_production_guest_streaming(
+    spec: &JobSpec,
+    profile: &HardeningProfile,
+    launch_permit: LaunchPermit,
+    output: Option<Arc<dyn SandboxOutputSink>>,
+    cancellation: SandboxCancellation,
 ) -> Result<GuestRun, String> {
     let nonce = boot_nonce()?;
     let script = build_command_runner_script(spec, &nonce);
@@ -544,7 +572,19 @@ fn run_production_guest(
     };
 
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
-    let (child, outcome) = match spawn_and_capture(&cfg_path, Some(timeout), Some(launch_permit)) {
+    let redaction = RedactionPlan::for_job(spec);
+    let command_capture = CommandStreamSpec {
+        nonce: nonce.clone(),
+        output,
+        redaction: redaction.clone(),
+    };
+    let (child, outcome) = match spawn_and_capture(
+        &cfg_path,
+        Some(timeout),
+        Some(launch_permit),
+        Some(command_capture),
+        Some(cancellation),
+    ) {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(&script_drive);
@@ -555,11 +595,12 @@ fn run_production_guest(
     // The script drive has been fully read by the guest; remove it now (the guest is gone).
     let _ = std::fs::remove_file(&script_drive);
 
-    let result = build_result_from_console(&outcome, &nonce, &cfg, &RedactionPlan::for_job(spec));
+    let result = build_result_from_console(&outcome, &nonce, &cfg, &redaction);
     Ok(GuestRun {
         child: Box::new(child),
         cfg_path,
         result,
+        run_error: outcome.stream_error,
     })
 }
 
@@ -622,8 +663,8 @@ fn sh_squote(s: &str) -> String {
 /// dropped + no-new-privs AND **dropped to a NON-ROOT uid/gid (65534)** via `setpriv`, so the
 /// payload physically cannot open the root-only serial console and therefore cannot inject ANY
 /// console line. The payload's stdout/stderr are redirected (by root, BEFORE setpriv drops privs) to
-/// tmpfs files whose already-open fds the non-root argv inherits; init then reaps descendants and
-/// prints the captured streams base64-framed + the real exit code, each marker nonce-suffixed.
+/// FIFO fds whose root-owned relays emit bounded base64 frames during execution; init then reaps
+/// non-root descendants and prints the real exit code, each marker nonce-suffixed.
 /// The non-root boundary is the PRIMARY (structural) forge guarantee; base64 + nonce + reap are
 /// defence in depth (see the marker consts above).
 ///
@@ -657,9 +698,9 @@ mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
 mount -t tmpfs tmpfs /run 2>/dev/null
 # CT-003a (SI-017): a SIZE-BOUNDED writable scratch tmpfs (sized from spec.limits.disk_bytes, the
-# profile's scratch quota) at /run/scratch — a SEPARATE mount from /run (which holds the trusted
-# capture files /run/myelin.{{out,err}}), so a workload disk fill hits ENOSPC at the quota WITHOUT
-# starving the capture or the trusted markers. mode=1777 so the NON-ROOT payload can write it. (The
+# profile's scratch quota) at /run/scratch — a SEPARATE mount from /run (which holds trusted relay
+# FIFOs and locks), so a workload disk fill hits ENOSPC at the quota WITHOUT starving the relays or
+# trusted markers. mode=1777 so the NON-ROOT payload can write it. (The
 # whole-guest RAM bounds everything else — the microVM keeps the HOST safe regardless; this makes the
 # in-guest disk quota the enforcer for the workload's scratch.)
 mkdir -p /run/scratch 2>/dev/null
@@ -669,31 +710,73 @@ N='{nonce}'
 # nonce-framed markers below. The untrusted argv runs NON-ROOT (--reuid/--regid 65534 =
 # nobody/nogroup, numeric so no /etc/passwd lookup, --clear-groups drops supplementary gids), so
 # /dev/console + /dev/ttyS0 (root-only crw-------) are UNOPENABLE by the payload — it physically
-# cannot inject ANY console line (forged or otherwise) even knowing the nonce. The redirect of the
-# payload's stdout/stderr to /run is performed HERE, by root, in the subshell BEFORE setpriv drops
-# privileges, so the non-root argv inherits those already-open fds and capture still works.
+# cannot inject ANY console line (forged or otherwise) even knowing the nonce. Root-owned relays read
+# the payload's already-open FIFO fds, frame bounded binary chunks, and write the console while the
+# command runs.
 # CT-003a (SI-017): apply RLIMIT_NPROC = spec.limits.pids_max IN-GUEST via `ulimit -u` in the runner
 # subshell BEFORE setpriv drops to the non-root uid — rlimits inherit across setpriv/exec, so the
 # untrusted payload (uid 65534) and ALL its descendants are capped at the pids ceiling. A fork bomb is
 # REFUSED at the ceiling (fork() → EAGAIN) instead of growing until the guest OOM-dies, so the guest
 # SURVIVES and the rest of the run (e.g. the disk-fill probe) still executes. The ceiling counts
 # per-real-uid; root init/runner processes (uid 0) are unaffected.
-{exports}( exec </dev/null >/run/myelin.out 2>/run/myelin.err
+mkfifo /run/myelin.stdout /run/myelin.stderr
+mkdir -p /sys/fs/cgroup
+if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then
+  mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null
+fi
+PAYLOAD_CGROUP=/sys/fs/cgroup/myelin-payload
+mkdir "$PAYLOAD_CGROUP" 2>/dev/null
+# cgroup.kill is the atomic descendant teardown boundary. A one-pass /proc scan is raceable: a
+# churning payload can fork after the PID list is expanded and retain a FIFO writer forever.
+[ -w "$PAYLOAD_CGROUP/cgroup.procs" ] && [ -w "$PAYLOAD_CGROUP/cgroup.kill" ] || {{
+  printf '%s\n' "myelin: payload cgroup unavailable" >/dev/console
+  reboot -f
+}}
+relay_stream() {{
+  TAG="$1"
+  FIFO="$2"
+  exec 7<"$FIFO"
+  while true; do
+    FRAME="$(dd bs=3072 count=1 <&7 2>/dev/null | base64 -w0)"
+    [ -n "$FRAME" ] || break
+    # Each relay opens its own lock fd, so stdout/stderr frames are complete console lines and cannot
+    # interleave. The base64 payload is bounded to 4096 ASCII bytes per frame.
+    exec 9>/run/myelin.console.lock
+    flock -x 9
+    printf '%s:%s:%s:%s\n' "{stream_chunk}" "$N" "$TAG" "$FRAME"
+    flock -u 9
+    exec 9>&-
+  done
+  exec 9>/run/myelin.console.lock
+  flock -x 9
+  printf '%s:%s:%s\n' "{stream_end}" "$N" "$TAG"
+  flock -u 9
+  exec 9>&-
+}}
+relay_stream o /run/myelin.stdout &
+OUT_RELAY=$!
+relay_stream e /run/myelin.stderr &
+ERR_RELAY=$!
+
+mkfifo /run/myelin.start
+{exports}( read -r START </run/myelin.start
 ulimit -u {pids_max} 2>/dev/null
-setpriv --reuid 65534 --regid 65534 --clear-groups \
-        --no-new-privs --bounding-set -all --inh-caps -all --ambient-caps -all {argv} )
+exec </dev/null >/run/myelin.stdout 2>/run/myelin.stderr
+exec setpriv --reuid 65534 --regid 65534 --clear-groups \
+        --no-new-privs --bounding-set -all --inh-caps -all --ambient-caps -all {argv} ) &
+COMMAND_PID=$!
+echo "$COMMAND_PID" >"$PAYLOAD_CGROUP/cgroup.procs"
+printf '%s\n' go >/run/myelin.start
+wait "$COMMAND_PID"
 CODE=$?
-# Reap any descendants the untrusted command spawned BEFORE emitting the trusted nonce-framed
-# markers. The structural guarantee is above (the payload is non-root and cannot write the console);
-# the reap + taking the LAST nonce-exit line + the unpredictable nonce are DEFENCE IN DEPTH, not the
-# primary guarantee.
-kill -KILL -1 2>/dev/null
-printf '%s:%s\n' "{so_b}" "$N"
-base64 /run/myelin.out 2>/dev/null
-printf '%s:%s\n' "{so_e}" "$N"
-printf '%s:%s\n' "{se_b}" "$N"
-base64 /run/myelin.err 2>/dev/null
-printf '%s:%s\n' "{se_e}" "$N"
+
+# Atomically kill every process in the payload cgroup, including session-escaped and concurrently
+# forking descendants. Root-owned relays are outside this cgroup, so they drain remaining pipe bytes
+# and then observe EOF.
+echo 1 >"$PAYLOAD_CGROUP/cgroup.kill"
+wait "$OUT_RELAY"
+wait "$ERR_RELAY"
+rmdir "$PAYLOAD_CGROUP" 2>/dev/null
 printf '%s:%s:%s\n' "{ex}" "$N" "$CODE"
 sync
 reboot -f
@@ -703,10 +786,8 @@ reboot -f
         argv = argv,
         disk_bytes = spec.limits.disk_bytes,
         pids_max = spec.limits.pids_max,
-        so_b = MARK_STDOUT_BEGIN,
-        so_e = MARK_STDOUT_END,
-        se_b = MARK_STDERR_BEGIN,
-        se_e = MARK_STDERR_END,
+        stream_chunk = MARK_STREAM_CHUNK,
+        stream_end = MARK_STREAM_END,
         ex = MARK_EXIT,
     )
 }
@@ -741,6 +822,18 @@ impl SandboxBackend for FirecrackerBackend {
     /// the unified sandbox, not a bypass of it).
     fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
         self.launch_with(spec, hooks, run_production_guest)
+    }
+
+    fn launch_streaming(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        output: Arc<dyn SandboxOutputSink>,
+        cancellation: SandboxCancellation,
+    ) -> Result<SandboxLaunch, Self::Error> {
+        self.launch_with(spec, hooks, move |spec, profile, permit| {
+            run_production_guest_streaming(spec, profile, permit, Some(output), cancellation)
+        })
     }
 
     /// Whole-guest kill on teardown (arch 01 §2): destroy the guest VMM and clean its config. The
@@ -798,6 +891,28 @@ struct CaptureOutcome {
     /// Host-side CPU-seconds the VMM process consumed (utime+stime from `/proc/<pid>/stat`, sampled
     /// just before exit), if readable — a REAL measurement, not a fabricated figure.
     cpu_seconds: Option<u64>,
+    /// Online parse of the trusted command-runner frames. `None` for boot/drill captures that do not
+    /// run the production command protocol.
+    command: Option<CommandCapture>,
+    /// Callback/read/cancellation failure observed after the VMM started. The caller still receives
+    /// measured usage so reservation settlement cannot be stranded.
+    stream_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct CommandStreamSpec {
+    nonce: String,
+    output: Option<Arc<dyn SandboxOutputSink>>,
+    redaction: RedactionPlan,
+}
+
+#[derive(Default)]
+struct CommandCapture {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: Option<i32>,
+    stdout_ended: bool,
+    stderr_ended: bool,
 }
 
 /// Read the firecracker VMM process's cumulative CPU time (utime+stime) from `/proc/<pid>/stat`,
@@ -814,6 +929,204 @@ fn read_proc_cpu_seconds(pid: u32) -> Option<u64> {
     Some((utime + stime) / 100)
 }
 
+/// Drain the Firecracker serial console while parsing the trusted root relay's bounded output
+/// frames online. The raw console remains head-bounded for diagnostics, while the full decoded
+/// stream is forwarded chunk-by-chunk and only a bounded head is retained in `SandboxResult`.
+///
+/// The untrusted payload cannot write the console (uid 65534 versus root-only console devices).
+/// Every accepted line additionally carries this boot's nonce and base64 framing. A callback or
+/// protocol error is remembered while the pipe continues draining so teardown cannot deadlock.
+fn drain_command_console<R: Read>(
+    mut reader: R,
+    console_limit: usize,
+    spec: &CommandStreamSpec,
+) -> (Vec<u8>, Option<CommandCapture>, Option<String>) {
+    const MAX_PROTOCOL_LINE: usize = 8 * 1024;
+    const MAX_DECODED_FRAME: usize = 3072;
+
+    let mut console_head = Vec::new();
+    let mut capture = CommandCapture::default();
+    let mut line = Vec::new();
+    let mut dropping_oversized_line = false;
+    let mut first_error = None;
+    let mut chunk = [0u8; 64 * 1024];
+
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if console_head.len() < console_limit {
+                    let take = (console_limit - console_head.len()).min(n);
+                    console_head.extend_from_slice(&chunk[..take]);
+                }
+                for byte in &chunk[..n] {
+                    if *byte == b'\n' {
+                        if !dropping_oversized_line {
+                            process_command_console_line(
+                                &line,
+                                spec,
+                                &mut capture,
+                                &mut first_error,
+                                MAX_DECODED_FRAME,
+                            );
+                        }
+                        line.clear();
+                        dropping_oversized_line = false;
+                    } else if !dropping_oversized_line {
+                        if line.len() >= MAX_PROTOCOL_LINE {
+                            first_error.get_or_insert_with(|| {
+                                "firecracker command protocol line exceeds bound".to_string()
+                            });
+                            line.clear();
+                            dropping_oversized_line = true;
+                        } else {
+                            line.push(*byte);
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                first_error.get_or_insert_with(|| format!("read firecracker console: {error}"));
+                break;
+            }
+        }
+    }
+
+    (console_head, Some(capture), first_error)
+}
+
+fn process_command_console_line(
+    raw_line: &[u8],
+    spec: &CommandStreamSpec,
+    capture: &mut CommandCapture,
+    first_error: &mut Option<String>,
+    max_decoded_frame: usize,
+) {
+    let line = String::from_utf8_lossy(raw_line);
+    let line = line.trim_end_matches('\r');
+    let chunk_prefix = format!("{MARK_STREAM_CHUNK}:{}:", spec.nonce);
+    if let Some(rest) = line.strip_prefix(&chunk_prefix) {
+        let Some((tag, encoded)) = rest.split_once(':') else {
+            first_error.get_or_insert_with(|| "malformed firecracker stream frame".to_string());
+            return;
+        };
+        let stream = match tag {
+            "o" => SandboxOutputStream::Stdout,
+            "e" => SandboxOutputStream::Stderr,
+            _ => {
+                first_error
+                    .get_or_insert_with(|| "unknown firecracker stream frame tag".to_string());
+                return;
+            }
+        };
+        let decoded = match b64_decode_strict(encoded) {
+            Ok(decoded) if decoded.len() <= max_decoded_frame => decoded,
+            Ok(_) => {
+                first_error
+                    .get_or_insert_with(|| "firecracker stream frame exceeds bound".to_string());
+                return;
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+                return;
+            }
+        };
+        let redacted = spec.redaction.redact(&decoded);
+        let head = match stream {
+            SandboxOutputStream::Stdout => &mut capture.stdout,
+            SandboxOutputStream::Stderr => &mut capture.stderr,
+        };
+        if head.len() < SANDBOX_CAPTURE_BOUND {
+            let take = (SANDBOX_CAPTURE_BOUND - head.len()).min(redacted.len());
+            head.extend_from_slice(&redacted[..take]);
+        }
+        if let Some(output) = &spec.output {
+            if first_error.is_none() {
+                if let Err(error) = output.emit(stream, &redacted) {
+                    *first_error = Some(error);
+                }
+            }
+        }
+        return;
+    }
+
+    let end_prefix = format!("{MARK_STREAM_END}:{}:", spec.nonce);
+    if let Some(tag) = line.strip_prefix(&end_prefix) {
+        match tag {
+            "o" => capture.stdout_ended = true,
+            "e" => capture.stderr_ended = true,
+            _ => {
+                first_error.get_or_insert_with(|| "unknown firecracker stream end tag".to_string());
+            }
+        }
+        return;
+    }
+
+    let exit_prefix = format!("{MARK_EXIT}:{}:", spec.nonce);
+    if let Some(code) = line.strip_prefix(&exit_prefix) {
+        match code.parse::<i32>() {
+            Ok(code) => capture.exit_code = Some(code),
+            Err(_) => {
+                first_error.get_or_insert_with(|| "invalid firecracker exit frame".to_string());
+            }
+        }
+    }
+}
+
+fn b64_decode_strict(input: &str) -> Result<Vec<u8>, String> {
+    fn val(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = input.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return Err("non-canonical firecracker stream base64".to_string());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (group_index, group) in bytes.chunks_exact(4).enumerate() {
+        let last = group_index + 1 == bytes.len() / 4;
+        let pad = match (group[2], group[3]) {
+            (b'=', b'=') => 2,
+            (_, b'=') => 1,
+            (_, _) => 0,
+        };
+        if (!last && pad != 0) || group[0] == b'=' || group[1] == b'=' {
+            return Err("invalid firecracker stream base64 padding".to_string());
+        }
+        let a = val(group[0])
+            .ok_or_else(|| "invalid firecracker stream base64 alphabet".to_string())?;
+        let b = val(group[1])
+            .ok_or_else(|| "invalid firecracker stream base64 alphabet".to_string())?;
+        let c = if pad == 2 {
+            0
+        } else {
+            val(group[2]).ok_or_else(|| "invalid firecracker stream base64 alphabet".to_string())?
+        };
+        let d = if pad >= 1 {
+            0
+        } else {
+            val(group[3]).ok_or_else(|| "invalid firecracker stream base64 alphabet".to_string())?
+        };
+        let word = (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6) | u32::from(d);
+        out.push((word >> 16) as u8);
+        if pad < 2 {
+            out.push((word >> 8) as u8);
+        }
+        if pad == 0 {
+            out.push(word as u8);
+        }
+    }
+    Ok(out)
+}
+
 /// Spawn the REAL Firecracker VMM (`firecracker --no-api --config-file <cfg>`) — THE one legitimate
 /// VMM-spawn site (the `no-host-exec` named exclusion; this is the mechanism that CREATES the
 /// isolation boundary, not a bypass of it) — drain its serial console without deadlocking (the
@@ -825,6 +1138,8 @@ fn spawn_and_capture(
     cfg_path: &Path,
     timeout: Option<Duration>,
     launch_permit: Option<LaunchPermit>,
+    command_stream: Option<CommandStreamSpec>,
+    cancellation: Option<SandboxCancellation>,
 ) -> Result<(SpawnedVmm, CaptureOutcome), String> {
     let watchdog_timeout = if launch_permit.is_some() {
         timeout
@@ -861,10 +1176,14 @@ fn spawn_and_capture(
     // CT-002c: cap each drained stream at CONSOLE_CAPTURE_BOUND (head capture) and DISCARD the rest to
     // EOF — bounds host memory under a runaway guest while still draining the pipe so the guest never
     // blocks on a full pipe (no deadlock that would defeat the timeout).
-    let th_out = std::thread::spawn(move || drain_capped(&mut out, CONSOLE_CAPTURE_BOUND).0);
+    let th_out = std::thread::spawn(move || match command_stream {
+        Some(spec) => drain_command_console(&mut out, CONSOLE_CAPTURE_BOUND, &spec),
+        None => (drain_capped(&mut out, CONSOLE_CAPTURE_BOUND).0, None, None),
+    });
     let th_err = std::thread::spawn(move || drain_capped(&mut err, CONSOLE_CAPTURE_BOUND).0);
 
     let timed_out;
+    let cancelled;
     let mut last_cpu: Option<u64> = None;
     let exit = loop {
         if let Some(status) = child
@@ -872,16 +1191,27 @@ fn spawn_and_capture(
             .map_err(|e| format!("wait firecracker: {e}"))?
         {
             timed_out = child.watchdog_deadline_expired();
+            cancelled = false;
             break status.code();
         }
         if let Some(c) = read_proc_cpu_seconds(pid) {
             last_cpu = Some(c);
+        }
+        if cancellation
+            .as_ref()
+            .is_some_and(SandboxCancellation::is_cancelled)
+        {
+            child.kill_and_wait();
+            timed_out = false;
+            cancelled = true;
+            break None;
         }
         if let Some(t) = timeout {
             if start.elapsed() >= t {
                 // Wall-clock ceiling hit: whole-guest-kill the VMM and reap it.
                 child.kill_and_wait();
                 timed_out = true;
+                cancelled = false;
                 break None;
             }
         }
@@ -892,7 +1222,8 @@ fn spawn_and_capture(
     // The child has exited/been-killed ⇒ the pipes hit EOF ⇒ the drain threads finish.
     let out_result = th_out.join();
     let err_result = th_err.join();
-    let out_buf = out_result.map_err(|_| "firecracker stdout drain thread panicked".to_string())?;
+    let (out_buf, command, output_error) =
+        out_result.map_err(|_| "firecracker stdout drain thread panicked".to_string())?;
     let err_buf = err_result.map_err(|_| "firecracker stderr drain thread panicked".to_string())?;
     let mut console = String::from_utf8_lossy(&out_buf).into_owned();
     console.push_str(&String::from_utf8_lossy(&err_buf));
@@ -905,6 +1236,10 @@ fn spawn_and_capture(
             console,
             wall,
             cpu_seconds: last_cpu,
+            command,
+            stream_error: output_error.or_else(|| {
+                cancelled.then(|| "sandbox execution cancelled by durable log consumer".into())
+            }),
         },
     ))
 }
@@ -914,7 +1249,7 @@ fn spawn_and_capture(
 /// `tests/hardened_boot_selftest.rs` + `tests/escape_drill_test.rs`. Delegates to [`spawn_and_capture`]
 /// (the single VMM-spawn mechanism) so the boot path does not fork.
 pub fn boot_and_capture(cfg_path: &Path) -> Result<(i32, String), String> {
-    let (_child, outcome) = spawn_and_capture(cfg_path, None, None)?;
+    let (_child, outcome) = spawn_and_capture(cfg_path, None, None, None, None)?;
     Ok((outcome.exit.unwrap_or(-1), outcome.console))
 }
 
@@ -930,27 +1265,34 @@ fn build_result_from_console(
     cfg: &FcMachineConfig,
     redaction: &RedactionPlan,
 ) -> SandboxResult {
-    // BOUNDARY REDACTION (CT-004f sub-step 1): mask the job's CI-managed secret needles in the captured
-    // console streams before they populate `SandboxResult` (a required argument — no capture path can
-    // forward un-redacted bytes; empty today, populated by CI-1 injection — see `crate::redaction`).
-    let stdout = redaction.redact(&capture_stream(
-        &o.console,
-        MARK_STDOUT_BEGIN,
-        MARK_STDOUT_END,
-        nonce,
-    ));
-    let stderr = redaction.redact(&capture_stream(
-        &o.console,
-        MARK_STDERR_BEGIN,
-        MARK_STDERR_END,
-        nonce,
-    ));
-    // A timed-out guest was killed mid-flight ⇒ no trustworthy exit code (do NOT fabricate one).
-    let exit_code = if o.timed_out {
-        None
-    } else {
-        parse_exit(&o.console, nonce)
+    // Production command runs are parsed and boundary-redacted online as each trusted root-relay
+    // frame arrives. The legacy whole-console framing remains only for focused parser fixtures.
+    let (stdout, stderr, streamed_exit) = match &o.command {
+        Some(command) => (
+            command.stdout.clone(),
+            command.stderr.clone(),
+            (command.stdout_ended && command.stderr_ended)
+                .then_some(command.exit_code)
+                .flatten(),
+        ),
+        None => (
+            redaction.redact(&capture_stream(
+                &o.console,
+                MARK_STDOUT_BEGIN,
+                MARK_STDOUT_END,
+                nonce,
+            )),
+            redaction.redact(&capture_stream(
+                &o.console,
+                MARK_STDERR_BEGIN,
+                MARK_STDERR_END,
+                nonce,
+            )),
+            parse_exit(&o.console, nonce),
+        ),
     };
+    // A timed-out guest was killed mid-flight ⇒ no trustworthy exit code (do NOT fabricate one).
+    let exit_code = if o.timed_out { None } else { streamed_exit };
 
     // Real wall-clock-derived metering (resource-seconds, arch §8). cpu_seconds prefers the measured
     // host CPU of the VMM process (utime+stime); when that sampled to 0 (a sub-second boot) we fall
@@ -1139,6 +1481,18 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
+    #[derive(Default)]
+    struct RecordingOutput {
+        frames: StdMutex<Vec<(SandboxOutputStream, Vec<u8>)>>,
+    }
+
+    impl SandboxOutputSink for RecordingOutput {
+        fn emit(&self, stream: SandboxOutputStream, frame: &[u8]) -> Result<(), String> {
+            self.frames.lock().unwrap().push((stream, frame.to_vec()));
+            Ok(())
+        }
+    }
+
     /// Derive a profile for `allow` and RECORD the applied egress ruleset (R0.1) so a NIC-bearing
     /// config can be built in-test without a real `nft` — mirrors what the launch path does after
     /// `enforce_egress` succeeds. Requires the allowlist to be enforceable (IP literals).
@@ -1283,6 +1637,7 @@ mod tests {
                 cpu_seconds: 2, // 2000 millis ⇒ 2 vcpu
                 mem_byte_seconds: 512 * 1024 * 1024,
             }),
+            run_error: None,
         }
     }
 
@@ -1368,6 +1723,39 @@ mod tests {
         assert!(
             !hook_settled.load(Ordering::SeqCst),
             "reporter-owned completion must not settle through the hook"
+        );
+    }
+
+    #[test]
+    fn settlement_failure_unconditionally_kills_and_forgets_the_guest() {
+        let backend = FirecrackerBackend::new();
+        let killed = Arc::new(AtomicBool::new(false));
+        let killed_at_run = killed.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _handle, _usage| {
+                Err(crate::HookError("injected settlement failure".into()))
+            }),
+            Box::new(|_spec| Ok(())),
+            Box::new(|_spec| Ok(())),
+        );
+
+        let result = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _profile, permit| {
+            permit
+                .commit_and_release()
+                .map_err(|error| error.to_string())?;
+            Ok(fake_run(killed_at_run))
+        });
+
+        assert!(matches!(result, Err(FcError::Hook(_))));
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "a settlement error cannot leave the VMM alive"
+        );
+        assert!(
+            backend.live.lock().unwrap().is_empty(),
+            "an error without a returned handle cannot retain an unreachable live-map entry"
         );
     }
 
@@ -1603,12 +1991,14 @@ mod tests {
             "argv still runs under caps-dropped + no-new-privs (the §5.3 posture)"
         );
         assert!(script.contains("'sh' '-c' 'echo hi'"), "argv single-quoted");
-        // The streams are base64-framed and the exit is nonce-tagged.
+        // The streams are bounded, base64-framed while the command runs and the exit is nonce-tagged.
         assert!(script.contains("__MYELIN_EXIT__"));
+        assert!(script.contains("__MYELIN_STREAM_B64__"));
+        assert!(script.contains("dd bs=3072 count=1"));
         assert!(script.contains("N='NONCE123'"));
         assert!(
-            script.contains("kill -KILL -1"),
-            "descendants reaped pre-markers"
+            script.contains("echo 1 >\"$PAYLOAD_CGROUP/cgroup.kill\""),
+            "the payload cgroup atomically reaps all descendants without killing trusted relays"
         );
     }
 
@@ -1629,6 +2019,54 @@ mod tests {
         // encode raw with the std alphabet to feed back (hand-rolled small encoder for the test)
         let enc = test_b64_encode(&raw);
         assert_eq!(b64_decode(&enc), raw);
+    }
+
+    #[test]
+    fn online_command_console_parser_delivers_bounded_frames_and_tracks_completion() {
+        let nonce = "nonce-live";
+        let console = format!(
+            "kernel noise\r\n\
+             {chunk}:{nonce}:o:{}\r\n\
+             {chunk}:wrong:o:{}\r\n\
+             {chunk}:{nonce}:e:{}\r\n\
+             {end}:{nonce}:o\r\n\
+             {end}:{nonce}:e\r\n\
+             {exit}:{nonce}:7\r\n",
+            test_b64_encode(b"hello\n"),
+            test_b64_encode(b"ignored"),
+            test_b64_encode(&[0xff, 0x00, b'\n']),
+            chunk = MARK_STREAM_CHUNK,
+            end = MARK_STREAM_END,
+            exit = MARK_EXIT,
+        );
+        let output = Arc::new(RecordingOutput::default());
+        let spec = CommandStreamSpec {
+            nonce: nonce.into(),
+            output: Some(output.clone()),
+            redaction: RedactionPlan::none(),
+        };
+
+        let (head, parsed, error) =
+            drain_command_console(std::io::Cursor::new(console.as_bytes()), 12, &spec);
+        assert_eq!(error, None);
+        assert_eq!(
+            head.len(),
+            12,
+            "raw diagnostic console remains head-bounded"
+        );
+        let parsed = parsed.expect("command capture");
+        assert_eq!(parsed.stdout, b"hello\n");
+        assert_eq!(parsed.stderr, [0xff, 0x00, b'\n']);
+        assert_eq!(parsed.exit_code, Some(7));
+        assert!(parsed.stdout_ended && parsed.stderr_ended);
+        assert_eq!(
+            output.frames.lock().unwrap().as_slice(),
+            &[
+                (SandboxOutputStream::Stdout, b"hello\n".to_vec()),
+                (SandboxOutputStream::Stderr, vec![0xff, 0x00, b'\n']),
+            ],
+            "wrong-nonce frames never reach the callback"
+        );
     }
 
     /// A tiny std-base64 ENCODER, test-only, to round-trip against [`b64_decode`].
@@ -1733,6 +2171,8 @@ mod tests {
             console: framed_console("n", b"partial", b"", 0),
             wall: Duration::from_secs(2),
             cpu_seconds: Some(1),
+            command: None,
+            stream_error: None,
         };
         let s = spec(vec![]);
         let profile = HardeningProfile::derive(&s);

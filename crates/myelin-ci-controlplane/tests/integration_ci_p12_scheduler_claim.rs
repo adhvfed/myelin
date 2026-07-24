@@ -25,8 +25,9 @@
 
 use myelin_ci_controlplane::{
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, CREATE_JOB_QUEUE_DDL,
-    CREATE_JOB_QUEUE_INDEXES_DDL, REAP_QUERY,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    REAP_QUERY,
 };
 
 fn app_url() -> String {
@@ -197,6 +198,11 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         .execute(&admin)
         .await
         .expect("apply the job_queue claim-time ALTER");
+    let alter = ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL.replace("job_queue", &tbl);
+    sqlx::query(&alter)
+        .execute(&admin)
+        .await
+        .expect("apply the job_queue retryable-attempt ALTER");
     // The indexes (rewritten to the suffixed table; CONCURRENTLY needs its own tx outside a pool tx —
     // a fresh empty table makes a plain index create lock-free, so drop CONCURRENTLY for the test DDL).
     for (name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
@@ -216,7 +222,7 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
     // The live CLAIM/REAP/CANCEL queries reference `job_queue` / `fair_deficit` by name; point them at
     // the suffixed table (and a suffixed fair_deficit so the LEFT JOIN resolves).
     let fair = format!("fair_deficit_p355_{suffix}");
-    sqlx::query(&format!(
+    sqlx::raw_sql(&format!(
         "CREATE TABLE IF NOT EXISTS {fair} (tenant_id text NOT NULL, region text NOT NULL, \
          fair_key text NOT NULL, deficit bigint NOT NULL DEFAULT 0, \
          PRIMARY KEY (tenant_id, region, fair_key))"
@@ -224,10 +230,26 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
     .execute(&admin)
     .await
     .expect("create the suffixed fair_deficit");
+    let workflows = format!("workflow_run_p355_{suffix}");
+    let runs = format!("ci_run_p355_{suffix}");
+    sqlx::raw_sql(&format!(
+        "CREATE VIEW {workflows} AS
+           SELECT tenant_id, region, run_id::text AS run_id, 'running'::text AS state FROM {tbl};
+         CREATE VIEW {runs} AS
+           SELECT tenant_id, region, run_id AS wf_run_id, 'running'::text AS state FROM {tbl};"
+    ))
+    .execute(&admin)
+    .await
+    .expect("create active-lifecycle views for the isolated scheduler fixture");
     let claim_sql = CLAIM_QUERY
         .replace("job_queue", &tbl)
-        .replace("fair_deficit", &fair);
-    let reap_sql = REAP_QUERY.replace("job_queue", &tbl);
+        .replace("fair_deficit", &fair)
+        .replace("workflow_run", &workflows)
+        .replace("ci_run", &runs);
+    let reap_sql = REAP_QUERY
+        .replace("job_queue", &tbl)
+        .replace("workflow_run", &workflows)
+        .replace("ci_run", &runs);
     let cancel_sql = CANCEL_SUPERSEDED_QUERY.replace("job_queue", &tbl);
 
     let mut conn = admin.acquire().await.unwrap();

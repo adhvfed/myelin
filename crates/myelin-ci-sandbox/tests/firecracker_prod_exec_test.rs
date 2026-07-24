@@ -33,11 +33,27 @@ use myelin_ci_sandbox::firecracker::{
 };
 use myelin_ci_sandbox::{
     EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ReserveHandle,
-    ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, TrustTier, WorkspaceSpec,
-    SANDBOX_CAPTURE_BOUND,
+    ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, SandboxCancellation,
+    SandboxOutputSink, SandboxOutputStream, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+#[derive(Default)]
+struct LiveOutput {
+    frames: Mutex<Vec<(SandboxOutputStream, Vec<u8>)>>,
+    arrived: Condvar,
+}
+
+impl SandboxOutputSink for LiveOutput {
+    fn emit(&self, stream: SandboxOutputStream, frame: &[u8]) -> Result<(), String> {
+        self.frames.lock().unwrap().push((stream, frame.to_vec()));
+        self.arrived.notify_all();
+        Ok(())
+    }
+}
 
 /// KVM + firecracker + staged-asset availability (the same preconditions the hardened-boot self-test
 /// gates on). Returns `false` ⇒ graceful skip (unless `MYELIN_REQUIRE_KVM=1`, which makes it a panic).
@@ -122,6 +138,19 @@ fn ok_hooks() -> RunnerHooks {
     )
 }
 
+fn settling_hooks(settlements: Arc<AtomicUsize>) -> RunnerHooks {
+    RunnerHooks::new(
+        myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+        Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+        Box::new(move |_spec, _handle, _usage| {
+            settlements.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }),
+        Box::new(|_token| Ok(())),
+        Box::new(|_spec| Ok(())),
+    )
+}
+
 #[test]
 fn real_microvm_runs_command_and_captures_exit_stdout_stderr() {
     if skip_or_panic("fc-prod-exec exit7") {
@@ -178,6 +207,152 @@ fn real_microvm_runs_command_and_captures_exit_stdout_stderr() {
     backend
         .kill(&launch.handle)
         .expect("kill is idempotent on an already-gone guest");
+}
+
+#[test]
+fn real_microvm_delivers_output_before_the_command_exits() {
+    if skip_or_panic("fc-prod-exec live-output") {
+        return;
+    }
+    let backend = FirecrackerBackend::new();
+    let spec = spec_running(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "printf live-before; sleep 2; printf live-after".into(),
+        ],
+        60,
+    );
+    let output = Arc::new(LiveOutput::default());
+
+    let launch = std::thread::scope(|scope| {
+        let output_for_launch = output.clone();
+        let hooks = ok_hooks();
+        let backend_ref = &backend;
+        let spec_ref = &spec;
+        let running = scope.spawn(move || {
+            backend_ref.launch_streaming(
+                spec_ref,
+                &hooks,
+                output_for_launch,
+                SandboxCancellation::new(),
+            )
+        });
+
+        let frames = output.frames.lock().unwrap();
+        let (frames, wait) = output
+            .arrived
+            .wait_timeout_while(frames, Duration::from_secs(20), |frames| frames.is_empty())
+            .unwrap();
+        assert!(!wait.timed_out(), "first microVM output frame arrives");
+        assert!(
+            !running.is_finished(),
+            "the first callback is observable while the guest command is still sleeping"
+        );
+        drop(frames);
+        running
+            .join()
+            .expect("launch thread")
+            .expect("real Firecracker launch")
+    });
+
+    let stdout: Vec<u8> = output
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(stream, _)| *stream == SandboxOutputStream::Stdout)
+        .flat_map(|(_, frame)| frame.iter().copied())
+        .collect();
+    assert_eq!(stdout, b"live-beforelive-after");
+    backend.kill(&launch.handle).expect("teardown");
+}
+
+#[test]
+fn real_microvm_cancels_live_after_log_failure_and_returns_measured_failure() {
+    if skip_or_panic("fc-prod-exec live-output-cancel") {
+        return;
+    }
+    let backend = FirecrackerBackend::new();
+    let spec = spec_running(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "printf before-cancel; sleep 30; printf too-late".into(),
+        ],
+        60,
+    );
+    let output = Arc::new(LiveOutput::default());
+    let cancellation = SandboxCancellation::new();
+    let settlements = Arc::new(AtomicUsize::new(0));
+    let started = Instant::now();
+
+    let launch = std::thread::scope(|scope| {
+        let hooks = settling_hooks(settlements.clone());
+        let output_for_launch = output.clone();
+        let cancellation_for_launch = cancellation.clone();
+        let backend_for_launch = &backend;
+        let running = scope.spawn(move || {
+            backend_for_launch.launch_streaming(
+                &spec,
+                &hooks,
+                output_for_launch,
+                cancellation_for_launch,
+            )
+        });
+        let frames = output.frames.lock().unwrap();
+        let (frames, wait) = output
+            .arrived
+            .wait_timeout_while(frames, Duration::from_secs(20), |frames| frames.is_empty())
+            .unwrap();
+        assert!(!wait.timed_out(), "the pre-cancel frame arrives");
+        drop(frames);
+        cancellation.cancel();
+        running
+            .join()
+            .expect("launch thread")
+            .expect("cancelled durable output retains the measured result")
+    });
+
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "whole-guest cancellation is prompt, not the 30s command sleep"
+    );
+    assert!(!launch.output_complete);
+    assert!(!launch.result.passed());
+    assert_eq!(
+        settlements.load(Ordering::SeqCst),
+        1,
+        "the acquired reservation settles measured usage once on cancellation"
+    );
+    backend.kill(&launch.handle).expect("teardown");
+}
+
+#[test]
+fn real_microvm_atomically_reaps_a_session_escaped_forking_descendant() {
+    if skip_or_panic("fc-prod-exec payload-cgroup-kill") {
+        return;
+    }
+    let backend = FirecrackerBackend::new();
+    let spec = spec_running(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "setsid sh -c 'while :; do sleep 1 & done' >/dev/null 2>&1 & printf leader-done".into(),
+        ],
+        20,
+    );
+
+    let launch = backend
+        .launch(&spec, &ok_hooks())
+        .expect("the payload cgroup tears down every descendant after the leader exits");
+    assert_eq!(launch.result.exit_code, Some(0));
+    assert!(
+        !launch.result.timed_out,
+        "a session-escaped process retaining the FIFO writer is killed atomically, not at timeout"
+    );
+    assert_eq!(launch.result.stdout, b"leader-done");
+    backend.kill(&launch.handle).expect("teardown");
 }
 
 /// CT-002c host-side memory-DoS regression (REAL kernel). An untrusted workload emits 2 MiB of stdout

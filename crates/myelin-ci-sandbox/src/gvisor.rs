@@ -39,14 +39,15 @@ use crate::redaction::RedactionPlan;
 use crate::{
     drain_capped, EgressPolicy, HookError, IdemToken, ImageRef, JobKind, JobSpec, LaunchPermit,
     MeterTarget, ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend,
-    SandboxHandle, SandboxLaunch, SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
+    SandboxCancellation, SandboxHandle, SandboxLaunch, SandboxOutputSink, SandboxOutputStream,
+    SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Env var naming the `runsc` binary; defaults to `runsc` on `PATH`.
@@ -157,6 +158,7 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
             stdin: None,
             stdout_mode: StdoutMode::CappedHead,
             cancellation: &NEVER_CANCELLED,
+            output: None,
         },
         None,
     );
@@ -635,6 +637,8 @@ pub struct ContainerRun {
     pub bundle_dir: PathBuf,
     /// The captured command result (exit / timeout / usage / bounded streams).
     pub result: SandboxResult,
+    /// A post-spawn transport/cancellation failure. Usage is still settled before launch refuses.
+    pub run_error: Option<String>,
 }
 
 impl GvisorBackend {
@@ -690,6 +694,7 @@ impl GvisorBackend {
             child,
             bundle_dir,
             result,
+            run_error,
         } = run(spec, &cfg, launch_permit).map_err(GvisorError::Runtime)?;
 
         let guest_id = format!("runsc-{}", spec.idem_token.0);
@@ -699,11 +704,17 @@ impl GvisorBackend {
             .insert(guest_id.clone(), RunscProc { child, bundle_dir });
 
         // Settle against the result's REAL measured usage (CT-002b) — never interrupt in-flight.
-        hooks.settle_completed(spec, &reserve, result.usage)?;
+        if let Err(error) = hooks.settle_completed(spec, &reserve, result.usage) {
+            let _ = self.kill(&SandboxHandle {
+                guest_id: guest_id.clone(),
+            });
+            return Err(error.into());
+        }
 
         Ok(SandboxLaunch {
             handle: SandboxHandle { guest_id },
             result,
+            output_complete: run_error.is_none(),
         })
     }
 }
@@ -717,6 +728,18 @@ impl SandboxBackend for GvisorBackend {
     /// the unified sandbox, not a bypass of it).
     fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
         self.launch_with(spec, hooks, run_production_container)
+    }
+
+    fn launch_streaming(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        output: Arc<dyn SandboxOutputSink>,
+        cancellation: SandboxCancellation,
+    ) -> Result<SandboxLaunch, Self::Error> {
+        self.launch_with(spec, hooks, move |spec, cfg, permit| {
+            run_production_container_streaming(spec, cfg, permit, Some(output), cancellation)
+        })
     }
 
     /// Whole-container kill on teardown: best-effort destroy the container + remove its bundle temp
@@ -764,6 +787,16 @@ fn run_production_container(
     cfg: &OciConfig,
     launch_permit: LaunchPermit,
 ) -> Result<ContainerRun, String> {
+    run_production_container_streaming(spec, cfg, launch_permit, None, SandboxCancellation::new())
+}
+
+fn run_production_container_streaming(
+    spec: &JobSpec,
+    cfg: &OciConfig,
+    launch_permit: LaunchPermit,
+    output: Option<Arc<dyn SandboxOutputSink>>,
+    cancellation: SandboxCancellation,
+) -> Result<ContainerRun, String> {
     let bin = runsc_bin();
     let rootfs = resolved_gvisor_rootfs();
     // Honest fail-closed: a runtime/start precondition failure surfaces as an error (never a
@@ -778,6 +811,7 @@ fn run_production_container(
     let container_id = format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
 
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
+    let redaction = RedactionPlan::for_job(spec);
     let outcome = match run_and_capture(
         &bin,
         &bundle_dir,
@@ -787,7 +821,11 @@ fn run_production_container(
         RunCaptureOptions {
             stdin: None, // CI/agent jobs receive no stdin (the git-wire path supplies the body).
             stdout_mode: StdoutMode::CappedHead,
-            cancellation: &NEVER_CANCELLED,
+            cancellation: cancellation.as_atomic(),
+            output: output.map(|sink| StreamingOutput {
+                sink,
+                redaction: redaction.clone(),
+            }),
         },
         Some(launch_permit),
     ) {
@@ -803,11 +841,12 @@ fn run_production_container(
     // usually self-deletes on a clean exit, but the timeout path leaves it for us to reap).
     delete_container(&bin, &container_id);
 
-    let result = build_result(spec, &outcome, &RedactionPlan::for_job(spec));
+    let result = build_result(spec, &outcome, &redaction);
     Ok(ContainerRun {
         child: Box::new(SpawnedRunsc { bin, container_id }),
         bundle_dir,
         result,
+        run_error: outcome.stream_error,
     })
 }
 
@@ -897,6 +936,8 @@ struct RunscOutcome {
     wall: Duration,
     /// Host-side CPU-seconds of the `runsc` process (utime+stime from `/proc`), if readable.
     cpu_seconds: Option<u64>,
+    /// Callback/read/cancellation failure observed after the container started.
+    stream_error: Option<String>,
 }
 
 /// Spawn the REAL `runsc` container (`runsc --rootless --network=none run -bundle <dir> <cid>`) — THE
@@ -919,7 +960,9 @@ fn run_and_capture(
         stdin,
         stdout_mode,
         cancellation,
+        output,
     } = options;
+    let has_streaming_output = output.is_some();
     // CT-003b (SI-017): establish the OUT-OF-BAND memory cgroup BEFORE spawning runsc and FAIL
     // CLOSED if it cannot be established (rootless runsc would otherwise run the workload's anonymous
     // memory UNBOUNDED — a host-DoS escape). The cgroup is torn down on every path (its `Drop`).
@@ -1002,12 +1045,36 @@ fn run_and_capture(
     //     (the bytes land on disk, not in a growing Vec). Over the generous cap ⇒ `truncated` (the wire
     //     seam then REFUSES loudly — never a silently-truncated pack). Both keep reading past the bound
     //     so the container never blocks on a full pipe (no deadlock that would defeat the timeout).
-    let th_out = std::thread::spawn(move || match stdout_mode {
-        StdoutMode::CappedHead => drain_capped(&mut out, SANDBOX_CAPTURE_BOUND),
-        StdoutMode::StreamToFile { bound } => drain_to_temp_file(&mut out, bound),
+    let stdout_output = output.clone();
+    let th_out = std::thread::spawn(move || match (stdout_mode, stdout_output) {
+        (StdoutMode::CappedHead, Some(output)) => drain_capped_streaming(
+            &mut out,
+            SANDBOX_CAPTURE_BOUND,
+            SandboxOutputStream::Stdout,
+            &output,
+        ),
+        (StdoutMode::CappedHead, None) => {
+            let (head, truncated) = drain_capped(&mut out, SANDBOX_CAPTURE_BOUND);
+            (head, truncated, None)
+        }
+        (StdoutMode::StreamToFile { bound }, _) => {
+            let (head, truncated) = drain_to_temp_file(&mut out, bound);
+            (head, truncated, None)
+        }
     });
     // stderr is ALWAYS the 256 KiB head bound — it is error text folded into a message, never payload.
-    let th_err = std::thread::spawn(move || drain_capped(&mut err, SANDBOX_CAPTURE_BOUND).0);
+    let th_err = std::thread::spawn(move || match output {
+        Some(output) => {
+            let (head, _, error) = drain_capped_streaming(
+                &mut err,
+                SANDBOX_CAPTURE_BOUND,
+                SandboxOutputStream::Stderr,
+                &output,
+            );
+            (head, error)
+        }
+        None => (drain_capped(&mut err, SANDBOX_CAPTURE_BOUND).0, None),
+    });
 
     let timed_out;
     let mut last_cpu: Option<u64> = None;
@@ -1044,9 +1111,10 @@ fn run_and_capture(
     // EPIPE'd — either way `write_all` returned). Join so no thread outlives the run.
     let stdin_result = stdin_th.map(std::thread::JoinHandle::join);
 
-    let (stdout, stdout_truncated) =
+    let (stdout, stdout_truncated, stdout_error) =
         stdout_result.map_err(|_| "runsc stdout drain thread panicked".to_string())?;
-    let stderr = stderr_result.map_err(|_| "runsc stderr drain thread panicked".to_string())?;
+    let (stderr, stderr_error) =
+        stderr_result.map_err(|_| "runsc stderr drain thread panicked".to_string())?;
     if let Some(write_result) = stdin_result {
         let write_result =
             write_result.map_err(|_| "runsc stdin writer thread panicked".to_string())?;
@@ -1070,6 +1138,10 @@ fn run_and_capture(
         stderr,
         wall,
         cpu_seconds: last_cpu,
+        stream_error: stdout_error.or(stderr_error).or_else(|| {
+            (has_streaming_output && cancellation.load(Ordering::Acquire))
+                .then(|| "sandbox execution cancelled by durable log consumer".into())
+        }),
     })
 }
 
@@ -1089,6 +1161,61 @@ struct RunCaptureOptions<'a> {
     stdin: Option<Vec<u8>>,
     stdout_mode: StdoutMode,
     cancellation: &'a AtomicBool,
+    output: Option<StreamingOutput>,
+}
+
+#[derive(Clone)]
+struct StreamingOutput {
+    sink: Arc<dyn SandboxOutputSink>,
+    redaction: RedactionPlan,
+}
+
+/// Drain a complete guest stream while retaining only its bounded diagnostic head and forwarding
+/// every bounded chunk to the durable-output callback.
+///
+/// A callback failure is remembered, but the pipe is still drained to EOF so the guest cannot
+/// deadlock behind a full pipe and defeat timeout/teardown. Redaction is applied before the callback.
+/// Today every plan is empty because secret injection is absent; CI-1 owns the already-documented
+/// cross-chunk streaming masker obligation when it introduces real needles.
+fn drain_capped_streaming<R: Read>(
+    mut reader: R,
+    limit: usize,
+    stream: SandboxOutputStream,
+    output: &StreamingOutput,
+) -> (Vec<u8>, bool, Option<String>) {
+    let mut head = Vec::new();
+    let mut truncated = false;
+    let mut first_output_error = None;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if head.len() < limit {
+                    let take = (limit - head.len()).min(n);
+                    head.extend_from_slice(&chunk[..take]);
+                    truncated |= take < n;
+                } else {
+                    truncated = true;
+                }
+                if first_output_error.is_none() {
+                    let redacted = output.redaction.redact(&chunk[..n]);
+                    if let Err(error) = output.sink.emit(stream, &redacted) {
+                        first_output_error = Some(error);
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                truncated = true;
+                if first_output_error.is_none() {
+                    first_output_error = Some(format!("read guest output: {error}"));
+                }
+                break;
+            }
+        }
+    }
+    (head, truncated, first_output_error)
 }
 
 /// **Drain a child stream straight to a host TEMP FILE under a generous byte cap (the git-wire path,
@@ -1968,6 +2095,7 @@ impl GvisorBackend {
                 child,
                 bundle_dir,
                 result,
+                run_error,
             },
             stdout_truncated,
         ) = run_git_wire_container(&job, &cfg, spec.stdin.clone(), &rootfs, cancellation)
@@ -1991,11 +2119,22 @@ impl GvisorBackend {
             .insert(guest_id.clone(), RunscProc { child, bundle_dir });
 
         // Settle against the REAL measured usage (never interrupt in-flight).
-        hooks.settle_completed(&job, &reserve, result.usage)?;
+        if let Err(error) = hooks.settle_completed(&job, &reserve, result.usage) {
+            let _ = self.kill(&SandboxHandle {
+                guest_id: guest_id.clone(),
+            });
+            return Err(error.into());
+        }
+
+        if let Some(error) = run_error {
+            let _ = self.kill(&SandboxHandle { guest_id });
+            return Err(WireError::Runtime(error));
+        }
 
         Ok(SandboxLaunch {
             handle: SandboxHandle { guest_id },
             result,
+            output_complete: true,
         })
     }
 }
@@ -2043,6 +2182,7 @@ fn run_git_wire_container(
             stdin: Some(stdin),
             stdout_mode: StdoutMode::StreamToFile { bound: wire_cap },
             cancellation,
+            output: None,
         },
         None,
     ) {
@@ -2068,6 +2208,7 @@ fn run_git_wire_container(
             child: Box::new(SpawnedRunsc { bin, container_id }),
             bundle_dir,
             result,
+            run_error: outcome.stream_error,
         },
         stdout_truncated,
     ))
@@ -2091,10 +2232,50 @@ fn stage_git_wire_bundle(cfg: &OciConfig) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::{CompletionSettlementOwner, ReserveHandle, RunTokenCredential};
+
+    #[derive(Default)]
+    struct RecordingOutput {
+        bytes: Mutex<Vec<u8>>,
+    }
+
+    impl SandboxOutputSink for RecordingOutput {
+        fn emit(&self, _stream: SandboxOutputStream, frame: &[u8]) -> Result<(), String> {
+            self.bytes.lock().unwrap().extend_from_slice(frame);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn streaming_drain_keeps_only_the_head_but_delivers_the_complete_byte_stream() {
+        let input: Vec<u8> = (0..(3 * 64 * 1024 + 17))
+            .map(|offset| (offset % 251) as u8)
+            .collect();
+        let sink = Arc::new(RecordingOutput::default());
+        let output = StreamingOutput {
+            sink: sink.clone(),
+            redaction: RedactionPlan::none(),
+        };
+
+        let (head, truncated, error) = drain_capped_streaming(
+            std::io::Cursor::new(&input),
+            1024,
+            SandboxOutputStream::Stdout,
+            &output,
+        );
+
+        assert_eq!(error, None);
+        assert!(truncated);
+        assert_eq!(head, input[..1024]);
+        assert_eq!(
+            *sink.bytes.lock().unwrap(),
+            input,
+            "bytes beyond the diagnostic capture cap still reach durable output"
+        );
+    }
 
     #[test]
     fn runner_host_preflight_refuses_a_non_absolute_runtime_before_intake() {
@@ -2151,6 +2332,7 @@ mod tests {
             stderr: stderr.to_vec(),
             wall: Duration::from_secs(1),
             cpu_seconds: Some(1),
+            stream_error: None,
         }
     }
 
@@ -2201,6 +2383,7 @@ mod tests {
                 cpu_seconds: 1,
                 mem_byte_seconds: 1,
             }),
+            run_error: None,
         }
     }
 
@@ -2554,6 +2737,33 @@ mod tests {
         assert!(
             !hook_settled.load(Ordering::SeqCst),
             "reporter-owned completion must not settle through the hook"
+        );
+    }
+
+    #[test]
+    fn settlement_failure_unconditionally_kills_and_forgets_the_container() {
+        let backend = GvisorBackend::new();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _handle, _usage| {
+                Err(crate::HookError("injected settlement failure".into()))
+            }),
+            Box::new(|_spec| Ok(())),
+            Box::new(|_spec| Ok(())),
+        );
+
+        let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, permit| {
+            permit
+                .commit_and_release()
+                .map_err(|error| error.to_string())?;
+            Ok(fake_run())
+        });
+
+        assert!(matches!(result, Err(GvisorError::Hook(_))));
+        assert!(
+            backend.live.lock().unwrap().is_empty(),
+            "an error without a returned handle cannot retain an unreachable live-map entry"
         );
     }
 

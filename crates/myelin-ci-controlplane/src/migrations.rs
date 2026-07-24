@@ -199,6 +199,16 @@ pub const CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID: &str =
 /// Additive CT-005 run-list keyset index. Appended after every previously applied migration.
 pub const CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID: &str =
     "ci_0018d_ci_run_surface_repo_created";
+/// Additive retry-attempt usage accrual for measured infrastructure failures. Appended after every
+/// previously applied migration; the byte-frozen `job_queue` create and claim migrations remain
+/// unchanged.
+pub const CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID: &str = "ci_0018e_job_queue_retry_attempts";
+/// Additive partial index for the claim/reap lifecycle conjunction.
+pub const CI_RUN_ACTIVE_WORKFLOW_INDEX_MIGRATION_ID: &str = "ci_0018f_ci_run_active_workflow";
+/// Additive, column-minimal grant for joining a queue row to its owning CI run. The earlier
+/// discovery grant is already applied and remains byte-frozen.
+pub const CI_SCHEDULER_CI_RUN_WORKFLOW_ID_GRANT_MIGRATION_ID: &str =
+    "ci_0018g_scheduler_ci_run_workflow_id_grant";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -684,6 +694,12 @@ pub const ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL: &str = "ALTER TABLE job_queue \
 ADD COLUMN IF NOT EXISTS claim_started_at timestamptz, \
 ADD COLUMN IF NOT EXISTS claim_expires_at timestamptz";
 
+/// Accumulate exact, immutable failed-attempt receipts on the durable queue row until a later
+/// terminal generation settles their aggregate usage. A constant empty-object default is an
+/// expand-only metadata change on supported PostgreSQL and keeps existing hot rows readable.
+pub const ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL: &str = "ALTER TABLE job_queue \
+ADD COLUMN IF NOT EXISTS retry_attempts jsonb NOT NULL DEFAULT '{}'::jsonb";
+
 /// **The immutable forward-only grant for the original claim epoch.**
 /// The `ci_0016_region_scheduler_rls` boundary grants `UPDATE (state, lease_owner, lease_expires)` (that
 /// applied migration stays byte-frozen). The claim now also bumps `lease_epoch`, so the least-privilege
@@ -885,6 +901,18 @@ CREATE POLICY myelin_ci_scheduler_ci_run_discovery_guard ON ci_run
   );
 GRANT SELECT (tenant_id, region, state, created_at, run_id) ON ci_run
   TO myelin_ci_region_scheduler";
+
+/// Admit only the workflow identity needed for claim/reap lifecycle validation. The scheduler
+/// already holds SELECT on the tenant, region, state, and public run identity; this additive grant
+/// does not expose definitions, repository metadata, trigger provenance, or mutation.
+pub const GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL: &str =
+    "GRANT SELECT (wf_run_id) ON ci_run TO myelin_ci_region_scheduler";
+
+/// Keep the claim/reap active-owner check point-addressable inside one tenant and residency cell.
+pub const CREATE_CI_RUN_ACTIVE_WORKFLOW_INDEX_DDL: &str =
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+ci_run_active_workflow ON ci_run (tenant_id, region, wf_run_id) \
+WHERE state = 'running'";
 
 /// Non-blocking partial index for oldest-queued-run discovery in one residency cell.
 pub const CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
@@ -1101,6 +1129,21 @@ pub fn ci_controlplane_migrations() -> Migrations {
         CREATE_CI_RUN_SURFACE_REPO_CREATED_INDEX_DDL,
         CI_RUN_TABLE,
     ));
+    migrations.push(Migration::plain_on(
+        CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID,
+        ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+        JOB_QUEUE_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_ACTIVE_WORKFLOW_INDEX_MIGRATION_ID,
+        CREATE_CI_RUN_ACTIVE_WORKFLOW_INDEX_DDL,
+        CI_RUN_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_SCHEDULER_CI_RUN_WORKFLOW_ID_GRANT_MIGRATION_ID,
+        GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL,
+        CI_RUN_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -1309,8 +1352,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            40,
-            "18 table/RLS + 3 ci_run ALTERs + 7 concurrent-index + 1 index-validation + 3 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 2 scheduler ci_run discovery grants"
+            43,
+            "18 table/RLS + 3 ci_run ALTERs + 8 concurrent-index + 1 index-validation + 4 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 3 scheduler ci_run/workflow discovery grants"
         );
         for m in &migrations.0 {
             assert!(
@@ -1348,6 +1391,8 @@ mod tests {
                 assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL);
             } else if m.id == CI_JOB_QUEUE_CLAIM_TIME_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL);
+            } else if m.id == CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL);
             } else if m.id == CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_LEASE_EPOCH_DDL);
             } else if m.id == CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID {
@@ -1358,6 +1403,8 @@ mod tests {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL);
             } else if m.id == CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CI_WORKFLOW_DISCOVERY_DDL);
+            } else if m.id == CI_SCHEDULER_CI_RUN_WORKFLOW_ID_GRANT_MIGRATION_ID {
+                assert_eq!(m.ddl, GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL);
             } else if m.id == CI_REGION_SCHEDULER_RLS_MIGRATION_ID {
                 assert_eq!(m.ddl, CREATE_CI_REGION_SCHEDULER_RLS_DDL);
             } else {
@@ -1390,8 +1437,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            40,
-            "the runner applied all 18 table/RLS, 3 ci_run ALTERs, 7 concurrent-index, 1 index-validation, 3 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, and 2 scheduler ci_run discovery grants"
+            43,
+            "the runner applied all 18 table/RLS, 3 ci_run ALTERs, 8 concurrent-index, 1 index-validation, 4 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, and 3 scheduler ci_run/workflow discovery grants"
         );
         assert_eq!(
             runner.applied()[0],
@@ -1403,7 +1450,8 @@ mod tests {
     #[test]
     fn region_scheduler_boundary_is_additive_restrictive_and_least_privilege() {
         let migrations = ci_controlplane_migrations();
-        // The workflow-route grant remains byte-identical; CT-005 appends its new index after it.
+        // Previously applied discovery/index migrations remain byte-identical. New capabilities
+        // are appended under fresh ids.
         let workflow_discovery = migrations
             .0
             .iter()
@@ -1420,8 +1468,9 @@ mod tests {
         );
         let run_surface_index = migrations
             .0
-            .last()
-            .expect("the CT-005 run-surface index is appended");
+            .iter()
+            .find(|migration| migration.id == CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID)
+            .expect("the CT-005 run-surface index remains present");
         assert_eq!(
             run_surface_index.id,
             CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID
@@ -1431,6 +1480,44 @@ mod tests {
             run_surface_index.ddl,
             CREATE_CI_RUN_SURFACE_REPO_CREATED_INDEX_DDL
         );
+        let retry_attempts = migrations
+            .0
+            .iter()
+            .find(|migration| migration.id == CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID)
+            .expect("the retry-attempt accrual column remains present");
+        assert_eq!(retry_attempts.id, CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID);
+        assert_eq!(retry_attempts.table, Some(JOB_QUEUE_TABLE));
+        assert_eq!(retry_attempts.ddl, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL);
+        let workflow_id_grant = migrations
+            .0
+            .last()
+            .expect("the workflow-identity grant is appended under a fresh id");
+        assert_eq!(
+            workflow_id_grant.id,
+            CI_SCHEDULER_CI_RUN_WORKFLOW_ID_GRANT_MIGRATION_ID
+        );
+        assert_eq!(workflow_id_grant.table, Some(CI_RUN_TABLE));
+        assert_eq!(
+            workflow_id_grant.ddl,
+            GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL
+        );
+        let active_workflow_index = migrations
+            .0
+            .iter()
+            .find(|migration| migration.id == CI_RUN_ACTIVE_WORKFLOW_INDEX_MIGRATION_ID)
+            .expect("the active CI workflow lookup is indexed");
+        assert_eq!(active_workflow_index.table, Some(CI_RUN_TABLE));
+        assert_eq!(
+            active_workflow_index.ddl,
+            CREATE_CI_RUN_ACTIVE_WORKFLOW_INDEX_DDL
+        );
+        for required in [
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ci_run_active_workflow",
+            "ON ci_run (tenant_id, region, wf_run_id)",
+            "WHERE state = 'running'",
+        ] {
+            assert!(active_workflow_index.ddl.contains(required));
+        }
         let discovery = migrations
             .0
             .iter()

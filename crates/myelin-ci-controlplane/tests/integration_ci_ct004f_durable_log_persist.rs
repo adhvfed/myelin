@@ -23,13 +23,13 @@
 #![cfg(feature = "integration")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use myelin_ci_controlplane::{
     ci_controlplane_migrations, log_pipeline::AnchorStatus, log_pipeline::CoalesceBudget,
-    log_pipeline::LogCoord, log_pipeline::LogPipeline, log_pipeline::SealThreshold,
-    log_pipeline::SecretRedactor, DurableLogPersist, FlushedJobLogs, LogPipelineSink, LogPersist,
-    SINGLE_STEP_ID,
+    log_pipeline::LogAnchorRow, log_pipeline::LogCoord, log_pipeline::LogPipeline,
+    log_pipeline::SealThreshold, log_pipeline::SecretRedactor, DurableLogPersist, FlushedJobLogs,
+    LogPersist, LogPipelineSink, SINGLE_STEP_ID,
 };
 use myelin_ci_sandbox::FirehoseSink;
 use myelin_events::OUTBOX_MIGRATION;
@@ -90,6 +90,34 @@ fn uid(name: &str) -> String {
     sqlx::types::Uuid::from_bytes(bytes).to_string()
 }
 
+struct SynchronizedResumePersist {
+    inner: DurableLogPersist,
+    both_resumed: Arc<Barrier>,
+}
+
+impl LogPersist for SynchronizedResumePersist {
+    fn resume(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        run_id: &str,
+        job_id: &str,
+    ) -> Result<myelin_ci_controlplane::log_sink::LogResume, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let head = self.inner.resume(tenant, region, run_id, job_id)?;
+        self.both_resumed.wait();
+        Ok(head)
+    }
+
+    fn persist(
+        &self,
+        tenant: &TenantId,
+        flushed: FlushedJobLogs,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.persist(tenant, flushed)
+    }
+}
+
 /// Fresh per-pid schema + the REAL CI durable migrations (log_segment/log_anchor with FORCE-RLS) +
 /// grants so the RLS-enforced app role can exercise the tenant-scoped write.
 async fn setup_schema(admin: &sqlx::PgPool, schema: &str) {
@@ -126,9 +154,7 @@ async fn setup_schema(admin: &sqlx::PgPool, schema: &str) {
         .await
         .expect("grant schema usage to app");
     admin
-        .execute(
-            format!("GRANT ALL ON ALL TABLES IN SCHEMA {schema} TO myelin_app").as_str(),
-        )
+        .execute(format!("GRANT ALL ON ALL TABLES IN SCHEMA {schema} TO myelin_app").as_str())
         .await
         .expect("grant table access to app");
 }
@@ -152,12 +178,14 @@ async fn read_back(
     job: &str,
 ) -> (i64, String, Option<i64>, i64) {
     let mut conn = app.acquire().await.unwrap();
-    sqlx::query("SELECT set_config('myelin.tenant_id', $1, false), set_config('myelin.region', $2, false)")
-        .bind(tenant)
-        .bind(region)
-        .execute(&mut *conn)
-        .await
-        .unwrap();
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, false), set_config('myelin.region', $2, false)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
     let seg_count: i64 = sqlx::query(
         "SELECT COUNT(*) AS c FROM log_segment WHERE run_id = $1::uuid AND job_id = $2::uuid",
     )
@@ -224,28 +252,326 @@ async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
     let rt = tokio::runtime::Handle::current();
     let (run_c, job_c, tenant_c, region_c) =
         (run.clone(), job.clone(), tenant.clone(), region.clone());
-    std::thread::spawn(move || {
+    let (live_tx, live_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    let runner = std::thread::spawn(move || {
         let persist = DurableLogPersist::with_pg(app_for_thread, rt);
         let sink = LogPipelineSink::new(region_c, Arc::new(FsBlobStore::new()), persist);
-        // Ship the job's output + finish (the runner's live path). `finish` seals + closes the anchor
-        // `passed` and persists the index through `with_tenant_tx`.
-        sink.ship_frame(&run_c, &job_c, &tenant_c, b"compiling crate\nrunning tests\nall green\n");
-        sink.finish(&run_c, &job_c, &tenant_c, true);
-    })
-    .join()
-    .expect("the runner thread joins");
+        // Ship one frame, then deliberately hold the command open. The test reads PostgreSQL before
+        // allowing finish, proving this is a during-execution durable checkpoint rather than merely
+        // a different post-exit call order.
+        sink.ship_frame(
+            &run_c,
+            &job_c,
+            &tenant_c,
+            b"compiling crate\nrunning tests\nall green\n",
+        )
+        .expect("incremental checkpoint persists before finish");
+        live_tx.send(()).unwrap();
+        finish_rx.recv().unwrap();
+        sink.finish(&run_c, &job_c, &tenant_c, true)
+            .expect("terminal anchor persists");
+    });
+
+    live_rx.recv().expect("live checkpoint committed");
+    let (live_segments, live_status, live_byte_end, live_dangling) =
+        read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
+    assert_eq!(live_segments, 1, "one segment is visible before finish");
+    assert_eq!(live_status, "running");
+    assert_eq!(
+        live_byte_end, None,
+        "the job has not reached terminal finish"
+    );
+    assert_eq!(live_dangling, 0);
+    assert_eq!(
+        outbox_count(&app, &run, &job).await,
+        1,
+        "the live pointer co-committed with the segment"
+    );
+    finish_tx.send(()).unwrap();
+    runner.join().expect("the runner thread joins");
 
     let (seg_count, status, byte_end, dangling) =
         read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
-    assert!(seg_count >= 1, "at least one sealed segment landed (got {seg_count})");
+    assert!(
+        seg_count >= 1,
+        "at least one sealed segment landed (got {seg_count})"
+    );
     assert_eq!(status, "passed", "the step anchor closed as passed");
-    assert!(byte_end.is_some(), "the finished step's anchor is closed (byte_end set)");
-    assert_eq!(dangling, 0, "0 dangling anchors — every anchor's span is within the sealed bytes");
+    assert!(
+        byte_end.is_some(),
+        "the finished step's anchor is closed (byte_end set)"
+    );
+    assert_eq!(
+        dangling, 0,
+        "0 dangling anchors — every anchor's span is within the sealed bytes"
+    );
     // Sub-step 4b: the ci.log.available pointer co-committed to the outbox on the SAME tx.
     assert!(
         outbox_count(&app, &run, &job).await >= 1,
         "a ci.log.available pointer landed in the outbox (co-committed with the index)"
     );
+    cleanup_schema(admin, app, &schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retried_sink_appends_after_the_committed_live_prefix() {
+    let schema = schema_name();
+    let admin = pool(&admin_url(), &schema).await;
+    setup_schema(&admin, &schema).await;
+    let app = pool(&app_url(), &schema).await;
+
+    let tenant = TenantId::from_token("acme-ct004f-resume");
+    let region = Region::new("fr-par");
+    let run = uid("ct004f-resume-run");
+    let job = uid("ct004f-resume-job");
+    let app_for_thread = app.clone();
+    let rt = tokio::runtime::Handle::current();
+    let blobs = Arc::new(FsBlobStore::new());
+    let (tenant_c, region_c, run_c, job_c) =
+        (tenant.clone(), region.clone(), run.clone(), job.clone());
+
+    std::thread::spawn(move || {
+        let first = LogPipelineSink::new(
+            region_c.clone(),
+            blobs.clone(),
+            DurableLogPersist::with_pg(app_for_thread.clone(), rt.clone()),
+        );
+        first
+            .ship_frame(&run_c, &job_c, &tenant_c, b"attempt-one\n")
+            .expect("first attempt commits its live prefix");
+        drop(first); // injected runner loss before terminal finish
+
+        let retry = LogPipelineSink::new(
+            region_c,
+            blobs,
+            DurableLogPersist::with_pg(app_for_thread, rt),
+        );
+        retry
+            .ship_frame(&run_c, &job_c, &tenant_c, b"attempt-two\n")
+            .expect("retry recovers and appends after the durable head");
+        retry
+            .finish(&run_c, &job_c, &tenant_c, true)
+            .expect("retry reaches terminal");
+    })
+    .join()
+    .expect("retry runner thread joins");
+
+    let mut conn = app.acquire().await.unwrap();
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, false), \
+                set_config('myelin.region', $2, false)",
+    )
+    .bind(tenant.as_str())
+    .bind(region.as_str())
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let rows = sqlx::query(
+        "SELECT segment_seq, byte_start, byte_end FROM log_segment \
+         WHERE run_id = $1::uuid AND job_id = $2::uuid ORDER BY segment_seq",
+    )
+    .bind(&run)
+    .bind(&job)
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    let coordinates: Vec<(i32, i64, i64)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get("segment_seq"),
+                row.get("byte_start"),
+                row.get("byte_end"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        coordinates,
+        vec![(0, 0, 12), (1, 12, 24)],
+        "retry appends without overwriting or opening a byte/sequence gap"
+    );
+    drop(conn);
+    let (_, status, byte_end, dangling) =
+        read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
+    assert_eq!(status, "passed");
+    assert_eq!(byte_end, Some(24));
+    assert_eq!(dangling, 0);
+    cleanup_schema(admin, app, &schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_retries_cannot_overwrite_the_same_committed_append_position() {
+    let schema = schema_name();
+    let admin = pool(&admin_url(), &schema).await;
+    setup_schema(&admin, &schema).await;
+    let app = pool(&app_url(), &schema).await;
+
+    let tenant = TenantId::from_token("acme-ct004f-concurrent-resume");
+    let region = Region::new("fr-par");
+    let run = uid("ct004f-concurrent-resume-run");
+    let job = uid("ct004f-concurrent-resume-job");
+    let rt = tokio::runtime::Handle::current();
+    let blobs = Arc::new(FsBlobStore::new());
+    let prefix = b"prefix\n";
+
+    {
+        let app = app.clone();
+        let tenant = tenant.clone();
+        let region = region.clone();
+        let run = run.clone();
+        let job = job.clone();
+        let blobs = blobs.clone();
+        let rt = rt.clone();
+        std::thread::spawn(move || {
+            let sink = LogPipelineSink::new(region, blobs, DurableLogPersist::with_pg(app, rt));
+            sink.ship_frame(&run, &job, &tenant, prefix)
+                .expect("the common prefix commits");
+        })
+        .join()
+        .expect("prefix writer joins");
+    }
+
+    let both_resumed = Arc::new(Barrier::new(2));
+    let attempts = [
+        ("alpha", b"alpha\n".as_slice()),
+        ("beta-long", b"beta-long\n".as_slice()),
+    ];
+    let handles: Vec<_> = attempts
+        .into_iter()
+        .map(|(name, bytes)| {
+            let app = app.clone();
+            let tenant = tenant.clone();
+            let region = region.clone();
+            let run = run.clone();
+            let job = job.clone();
+            let blobs = blobs.clone();
+            let rt = rt.clone();
+            let both_resumed = both_resumed.clone();
+            std::thread::spawn(move || {
+                let sink = LogPipelineSink::new(
+                    region,
+                    blobs,
+                    SynchronizedResumePersist {
+                        inner: DurableLogPersist::with_pg(app, rt),
+                        both_resumed,
+                    },
+                );
+                (
+                    name,
+                    bytes.len() as i64,
+                    sink.ship_frame(&run, &job, &tenant, bytes),
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("concurrent writer joins"))
+        .collect();
+    let winners: Vec<_> = results
+        .iter()
+        .filter(|(_, _, result)| result.is_ok())
+        .collect();
+    let losers: Vec<_> = results
+        .iter()
+        .filter(|(_, _, result)| result.is_err())
+        .collect();
+    assert_eq!(winners.len(), 1, "exactly one stale candidate may append");
+    assert_eq!(losers.len(), 1, "the competing stale candidate is refused");
+    assert!(
+        losers[0]
+            .2
+            .as_ref()
+            .unwrap_err()
+            .contains("immutable committed segment"),
+        "the refusal names immutable-prefix divergence: {:?}",
+        losers[0].2
+    );
+
+    let mut conn = app.acquire().await.unwrap();
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, false), \
+                set_config('myelin.region', $2, false)",
+    )
+    .bind(tenant.as_str())
+    .bind(region.as_str())
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let rows = sqlx::query(
+        "SELECT segment_seq, byte_start, byte_end FROM log_segment \
+         WHERE run_id = $1::uuid AND job_id = $2::uuid ORDER BY segment_seq",
+    )
+    .bind(&run)
+    .bind(&job)
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "the losing retry created no third segment");
+    assert_eq!(rows[0].get::<i32, _>("segment_seq"), 0);
+    assert_eq!(rows[0].get::<i64, _>("byte_start"), 0);
+    assert_eq!(rows[0].get::<i64, _>("byte_end"), prefix.len() as i64);
+    assert_eq!(rows[1].get::<i32, _>("segment_seq"), 1);
+    assert_eq!(rows[1].get::<i64, _>("byte_start"), prefix.len() as i64);
+    assert_eq!(
+        rows[1].get::<i64, _>("byte_end"),
+        prefix.len() as i64 + winners[0].1,
+        "the committed winner remains authoritative; the later loser cannot overwrite it"
+    );
+    drop(conn);
+
+    let app_for_finish = app.clone();
+    let tenant_for_finish = tenant.clone();
+    let region_for_finish = region.clone();
+    let run_for_finish = run.clone();
+    let job_for_finish = job.clone();
+    std::thread::spawn(move || {
+        let sink = LogPipelineSink::new(
+            region_for_finish,
+            blobs,
+            DurableLogPersist::with_pg(app_for_finish, rt),
+        );
+        sink.finish(&run_for_finish, &job_for_finish, &tenant_for_finish, true)
+            .expect("the serialized winner can close the terminal anchor");
+    })
+    .join()
+    .expect("terminal writer joins");
+
+    let stale = FlushedJobLogs {
+        run_id: run.clone(),
+        job_id: job.clone(),
+        segments: vec![],
+        anchors: vec![LogAnchorRow {
+            tenant_id: tenant.as_str().to_string(),
+            region: region.as_str().to_string(),
+            run_id: run.clone(),
+            job_id: job.clone(),
+            step_id: SINGLE_STEP_ID.into(),
+            byte_start: 0,
+            byte_end: None,
+            status: AnchorStatus::Running,
+        }],
+        pointers: vec![],
+    };
+    let app_for_stale = app.clone();
+    let tenant_for_stale = tenant.clone();
+    let rt_for_stale = tokio::runtime::Handle::current();
+    let stale_error = std::thread::spawn(move || {
+        DurableLogPersist::with_pg(app_for_stale, rt_for_stale)
+            .persist(&tenant_for_stale, stale)
+            .expect_err("a stale running checkpoint cannot regress a terminal anchor")
+            .to_string()
+    })
+    .join()
+    .expect("stale writer joins");
+    assert!(
+        stale_error.contains("immutable terminal checkpoint"),
+        "{stale_error}"
+    );
+    let (_, status, _, _) = read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
+    assert_eq!(status, "passed", "terminal anchor state is monotone");
+
     cleanup_schema(admin, app, &schema).await;
 }
 
@@ -269,7 +595,10 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
             FsBlobStore::new(),
             SecretRedactor::default(),
         )
-        .with_thresholds(CoalesceBudget::default(), SealThreshold { seal_at_bytes: 8 });
+        .with_thresholds(
+            CoalesceBudget::default(),
+            SealThreshold { seal_at_bytes: 8 },
+        );
         let coord = LogCoord::new(&run, &job, SINGLE_STEP_ID);
         for _ in 0..5 {
             p.ship_line(&coord, "0123456789").expect("ship");
@@ -284,7 +613,10 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
             pointers: p.drain_pointers(),
         }
     };
-    assert!(flushed.segments.len() >= 2, "multiple segments to exercise the PK");
+    assert!(
+        flushed.segments.len() >= 2,
+        "multiple segments to exercise the PK"
+    );
 
     let app_for_thread = app.clone();
     let rt = tokio::runtime::Handle::current();
@@ -295,7 +627,9 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
     std::thread::spawn(move || {
         let persist = DurableLogPersist::with_pg(app_for_thread, rt);
         persist.persist(&t1, f1).expect("first persist");
-        persist.persist(&t2, f2).expect("re-delivered persist (idempotent)");
+        persist
+            .persist(&t2, f2)
+            .expect("re-delivered persist (idempotent)");
     })
     .join()
     .expect("the persist thread joins");
@@ -316,7 +650,10 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
         flushed.pointers.len(),
         "re-delivery did NOT duplicate ci.log.available outbox rows"
     );
-    assert!(!flushed.pointers.is_empty(), "the flush produced at least one pointer");
+    assert!(
+        !flushed.pointers.is_empty(),
+        "the flush produced at least one pointer"
+    );
     cleanup_schema(admin, app, &schema).await;
 }
 
@@ -346,8 +683,12 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
             SecretRedactor::default(),
         )
         .with_thresholds(
-            CoalesceBudget { bytes_per_pointer: 10 },
-            SealThreshold { seal_at_bytes: 1_000_000 },
+            CoalesceBudget {
+                bytes_per_pointer: 10,
+            },
+            SealThreshold {
+                seal_at_bytes: 1_000_000,
+            },
         );
         let coord = LogCoord::new(&run, &job, SINGLE_STEP_ID);
         for _ in 0..4 {
@@ -375,7 +716,9 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
     let (t1, f1) = (tenant.clone(), flushed);
     std::thread::spawn(move || {
         let persist = DurableLogPersist::with_pg(app_for_thread, rt);
-        persist.persist(&t1, f1).expect("persist the coalesce-only index");
+        persist
+            .persist(&t1, f1)
+            .expect("persist the coalesce-only index");
     })
     .join()
     .expect("the persist thread joins");
@@ -388,7 +731,10 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
     );
     let (_seg, status, byte_end, _dangling) =
         read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
-    assert_eq!(status, "passed", "the anchor closed even with no sealed segment");
+    assert_eq!(
+        status, "passed",
+        "the anchor closed even with no sealed segment"
+    );
     assert!(byte_end.is_some());
     cleanup_schema(admin, app, &schema).await;
 }

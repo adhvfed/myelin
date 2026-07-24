@@ -86,7 +86,8 @@
 //! feature). `cargo build --workspace` + the default `cargo test` stay DB-free AND VM-free.
 
 use crate::{
-    CompletionSettlementOwner, JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxLaunch,
+    CompletionSettlementOwner, JobSpec, ResourceUsage, RunnerHooks, SandboxBackend,
+    SandboxCancellation, SandboxLaunch, SandboxOutputSink, SandboxOutputStream,
 };
 use myelin_flow::{
     DurableExecutor, ExecutorError, RunId, SignalOutcome, SignalSpec, JOB_DONE_SIGNAL,
@@ -94,7 +95,7 @@ use myelin_flow::{
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc::SyncSender, Arc, Mutex};
 
 // =================================================================================================
 // The lease/heartbeat handshake (runner side) — REUSES the FOR UPDATE SKIP LOCKED + heartbeat
@@ -414,10 +415,9 @@ impl LeaseStore for JobLeaseStore {
 // =================================================================================================
 
 /// **The firehose frame sink the runner streams to (the CI-P20 live-log seam).** The runner ships
-/// each captured stdout/stderr chunk as a frame keyed by `(run, job)` within a `tenant` (arch 02
-/// §7.1), then calls [`finish`](FirehoseSink::finish) once the job's output is complete so the sink
-/// can seal + index + emit the `ci.log.available` pointer. The live tail rides the resume-cursor
-/// protocol and sealed segments flush to the T2 log tier with the `(job, step, byte-range)` index.
+/// each boundary-redacted stdout/stderr chunk as a frame keyed by `(run, job)` within a `tenant`
+/// (arch 02 §7.1), then calls [`finish`](FirehoseSink::finish) once output is complete. Each frame is
+/// durably sealed/indexed before acknowledgment; finish closes the terminal step anchor.
 ///
 /// **Cycle-safe seam (CT-004f F1/F2):** this trait lives in `ci-sandbox` (the LOWER crate — the
 /// runner cannot depend on `ci-controlplane`'s `LogPipeline`). The real
@@ -432,16 +432,29 @@ impl LeaseStore for JobLeaseStore {
 /// defence-in-depth. See `planning/system-reviews/2026-07-17-ct004f-log-pipeline-scoping.md`.
 pub trait FirehoseSink {
     /// Ship one firehose frame (a captured stdout/stderr chunk) for `(run_id, job_id)` within
-    /// `tenant`. The STUB counts; the real sink appends to the open segment + publishes the live tail.
-    fn ship_frame(&self, run_id: &str, job_id: &str, tenant: &TenantId, frame: &[u8]);
+    /// `tenant`. The STUB counts; the real sink persists an incremental durable checkpoint. An error
+    /// fails the runner cycle before terminal reporting.
+    fn ship_frame(
+        &self,
+        run_id: &str,
+        job_id: &str,
+        tenant: &TenantId,
+        frame: &[u8],
+    ) -> Result<(), String>;
     /// The job's output is complete — CLOSE the step anchor with the job's verdict (`passed`), seal
-    /// the open segment, flush the `(job, step, byte-range)` index, and emit the coalesced
-    /// `ci.log.available` pointer. `passed` becomes the anchor status (`passed`/`failed`) the
+    /// any trailing segment, and persist the terminal `(job, step, byte-range)` anchor. `passed`
+    /// becomes the anchor status (`passed`/`failed`) the
     /// jump-to-failure deep-link reads (a single-command job = one step, so the job verdict IS the
     /// step verdict). The STUB is a no-op; the real sink drives `LogPipeline::flush_job` + drains
     /// pointers to the outbox. Idempotent (a re-delivered terminal report calls this again → no
-    /// double seal).
-    fn finish(&self, run_id: &str, job_id: &str, tenant: &TenantId, passed: bool);
+    /// double seal). A persistence error prevents `job.done`.
+    fn finish(
+        &self,
+        run_id: &str,
+        job_id: &str,
+        tenant: &TenantId,
+        passed: bool,
+    ) -> Result<(), String>;
 }
 
 /// A counting [`FirehoseSink`] stub — the test floor. Counts frames shipped so a test can assert the
@@ -469,11 +482,43 @@ impl CountingFirehose {
 }
 
 impl FirehoseSink for CountingFirehose {
-    fn ship_frame(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, _frame: &[u8]) {
+    fn ship_frame(
+        &self,
+        _run_id: &str,
+        _job_id: &str,
+        _tenant: &TenantId,
+        _frame: &[u8],
+    ) -> Result<(), String> {
         *self.count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Ok(())
     }
-    fn finish(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, _passed: bool) {
+    fn finish(
+        &self,
+        _run_id: &str,
+        _job_id: &str,
+        _tenant: &TenantId,
+        _passed: bool,
+    ) -> Result<(), String> {
         *self.finished.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Ok(())
+    }
+}
+
+/// The owned, backend-thread-safe half of the runner's bounded output channel.
+///
+/// A production backend may have one drain thread per guest stream. Both feed this fixed-capacity
+/// channel; one scoped runner thread serializes frames into the per-job durable sink. Blocking here
+/// is deliberate lossless backpressure: memory remains bounded and a slow durable writer cannot
+/// make the drain silently discard output.
+struct OutputChannelSink {
+    tx: SyncSender<Vec<u8>>,
+}
+
+impl SandboxOutputSink for OutputChannelSink {
+    fn emit(&self, _stream: SandboxOutputStream, frame: &[u8]) -> Result<(), String> {
+        self.tx
+            .send(frame.to_vec())
+            .map_err(|_| "runner durable log consumer stopped".to_string())
     }
 }
 
@@ -511,6 +556,35 @@ pub struct CompletionClaim {
     pub claim_nonce: String,
 }
 
+/// A measured sandbox attempt that must be retried without emitting `job.done`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryableAttemptFailure {
+    /// Machine-readable infrastructure cause. The first production cause is output persistence:
+    /// accepting an ordinary command verdict without its durable logs would be dishonest.
+    pub cause: RetryableAttemptCause,
+    /// Actual resource usage measured before the attempt was cancelled and reaped.
+    pub usage: ResourceUsage,
+}
+
+/// Closed vocabulary for retryable infrastructure failures at the runner/reporter boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryableAttemptCause {
+    /// An incremental frame or terminal log anchor did not become durable.
+    OutputPersistence,
+}
+
+/// Durable outcome of recording a retryable measured attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryableAttemptOutcome {
+    /// The exact running claim was accounted and returned to the queue.
+    Requeued,
+    /// Supersession won first, so the measured attempt was accounted and terminalized without
+    /// emitting `job.done` or returning obsolete work to the queue.
+    Cancelled,
+    /// An acknowledgement-lost retry reproduced the already-recorded attempt exactly.
+    ExactReplay,
+}
+
 /// **The terminal-report sink — the runner ECHOES `job.done` through it (the ONE signal path).** A
 /// thin seam so the runner depends on an abstraction, with the production impl
 /// ([`EngineTerminalReporter`]) routing onto the ENGINE's [`DurableExecutor::signal`] — there is NO
@@ -537,6 +611,15 @@ pub trait TerminalReporter {
         claim: &CompletionClaim,
         report: &TerminalReport,
     ) -> Result<SignalOutcome, ExecutorError>;
+
+    /// Account a measured infrastructure-failed attempt and make its exact claim retryable without
+    /// emitting `job.done`. A production implementation must durably bind the claim generation,
+    /// usage, and cause; an acknowledgement-lost replay must be exact-idempotent.
+    fn report_retryable_attempt(
+        &self,
+        claim: &CompletionClaim,
+        failure: &RetryableAttemptFailure,
+    ) -> Result<RetryableAttemptOutcome, ExecutorError>;
 }
 
 /// **The production terminal reporter — `job.done` onto the ENGINE's [`DurableExecutor::signal`]
@@ -590,6 +673,16 @@ impl<E: DurableExecutor> TerminalReporter for EngineTerminalReporter<E> {
             payload_key_ref: None,
         })
     }
+
+    fn report_retryable_attempt(
+        &self,
+        _claim: &CompletionClaim,
+        _failure: &RetryableAttemptFailure,
+    ) -> Result<RetryableAttemptOutcome, ExecutorError> {
+        Err(ExecutorError::InvalidInput(
+            "retryable measured CI attempts require a claim-aware durable reporter".into(),
+        ))
+    }
 }
 
 // =================================================================================================
@@ -636,6 +729,12 @@ pub enum RunnerError {
     },
     /// The terminal report failed (a `job.done` to a phantom run — surfaced, never dropped).
     ReportFailed(ExecutorError),
+    /// A measured infrastructure failure was durably accounted and its exact claim requeued. The
+    /// lane surfaces the incident loudly, but no `job.done` verdict was emitted.
+    RetryableAttemptRecorded {
+        /// The job whose attempt must be claimed again.
+        job_id: String,
+    },
     /// Hook and reporter composition disagree about who commits successful settlement. Refused
     /// before a queue claim, guest launch, or reservation mutation.
     SettlementOwnerMismatch {
@@ -655,6 +754,10 @@ impl std::fmt::Display for RunnerError {
                  re-queued it; this runner must not report terminal)"
             ),
             RunnerError::ReportFailed(e) => write!(f, "terminal job.done report failed: {e}"),
+            RunnerError::RetryableAttemptRecorded { job_id } => write!(
+                f,
+                "retryable measured attempt recorded for job {job_id}; no terminal verdict emitted"
+            ),
             RunnerError::SettlementOwnerMismatch { hooks, reporter } => write!(
                 f,
                 "terminal settlement owner mismatch: hooks={hooks:?}, reporter={reporter:?}"
@@ -753,19 +856,24 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
     /// 2. **Heartbeat** to confirm the lease is still held BEFORE launching (a runner that stalled
     ///    between claim and launch must not run a job another worker reclaimed). A refused heartbeat
     ///    is `Err(LeaseLost)` — the reaper (CI-P12) re-queued it.
-    /// 3. **Launch → run → collect** the sandbox via [`SandboxBackend::launch`] (CI-P1/CI-P2),
-    ///    driving the four-guarantee hooks. `launch` BLOCKS for the in-line compute job and returns a
+    /// 3. **Launch → stream → collect** the sandbox via [`SandboxBackend::launch_streaming`]
+    ///    (CI-P1/CI-P2), driving the four-guarantee hooks. The call BLOCKS for the in-line compute job
+    ///    while production backends deliver boundary-redacted frames through a fixed-capacity
+    ///    channel into the durable sink. It returns a
     ///    [`SandboxLaunch`] carrying the command's [`SandboxResult`](crate::SandboxResult)
-    ///    (exit/timeout/usage/captured-streams). The runner ships the captured `stdout`/`stderr`
-    ///    through the firehose as redacted frames (CI-P20 stub sink), then **kills** the guest on
-    ///    teardown (one-job-per-sandbox, ephemeral). A launch failure is `Err(LaunchFailed)`
-    ///    fail-closed (no terminal report — the dispatch activity retries the job, §OQ-F).
+    ///    (exit/timeout/usage/bounded diagnostic captures), then **kills** the guest on teardown
+    ///    (one-job-per-sandbox, ephemeral). A launch refusal before a measured result is
+    ///    `Err(LaunchFailed)` (no terminal report — the dispatch activity retries, §OQ-F). Once a
+    ///    measured attempt exists, a durable-log failure is durably accrued and the exact claim is
+    ///    requeued without emitting `job.done`, so its usage is never lost under reporter-owned
+    ///    accounting.
     /// 4. **DERIVE + report terminal.** The runner DERIVES the [`TerminalReport`] from the result
     ///    (`passed = result.exit_code == Some(0) && !result.timed_out`; result refs are canonical
     ///    references-not-payloads, NEVER the captured bytes) and delivers `job.done` ECHOING the spec's
-    ///    `idem_token` through the
-    ///    engine signal path (the exactly-once wake), then **settles** the lease. The [`RunOutcome`]
-    ///    carries the derived report + the delivery's idempotency outcome.
+    ///    `idem_token` through the engine signal path (the exactly-once wake), then **settles** the
+    ///    lease. A live-output or terminal-anchor persistence failure takes the separate retryable
+    ///    attempt transaction described above; only output-complete attempts can reach this terminal
+    ///    path. The [`RunOutcome`] carries the derived report + the delivery's idempotency outcome.
     ///
     /// `now` is the runner's clock (epoch seconds). The terminal report is no longer an input
     /// (RESHAPE-001 / CT-001): the runner derives it from the [`SandboxResult`](crate::SandboxResult)
@@ -810,36 +918,88 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
         }
 
         // ── Step 3: LAUNCH → RUN → COLLECT via the unified backend (CI-P1/CI-P2). The four-guarantee
-        // hooks fire inside launch (reserve/attribute/isolation-floor → settle); a refusal fails the
-        // launch CLOSED — no terminal report, the dispatch activity retries (§OQ-F). The runner does
-        // NOT reimplement the sandbox; it drives the seam. `launch` BLOCKS for the in-line compute job
-        // and returns the command's result (RESHAPE-001 / CT-001).
-        let SandboxLaunch { handle, result } = self
-            .backend
-            .launch(&job.spec, &self.hooks)
-            .map_err(|e| RunnerError::LaunchFailed(e.to_string()))?;
+        // hooks fire inside launch (reserve/attribute/isolation-floor → settle); a refusal before a
+        // measured result fails the launch CLOSED — no terminal report, the dispatch activity retries
+        // (§OQ-F). Once a measured attempt exists, output persistence failure goes through the
+        // reporter's distinct retryable-attempt transaction: usage is retained, the exact claim is
+        // requeued, and no `job.done` is emitted. The runner does NOT reimplement the sandbox; it
+        // drives the seam. `launch` BLOCKS for the in-line compute job and returns the command's result
+        // (RESHAPE-001 / CT-001).
+        // A fixed-capacity channel decouples the backend's stdout/stderr drain threads from the
+        // synchronous durable writer without admitting unbounded host memory. One scoped consumer
+        // serializes both streams into the job log. Production backends call `emit` while the command
+        // is running; the trait's default adapter preserves existing test doubles by emitting their
+        // bounded result after launch.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+        let output_run_id = job.run_id.clone();
+        let output_job_id = job.job_id.clone();
+        let output_tenant = job.tenant.clone();
+        let launch_result = std::thread::scope(|scope| {
+            let output: Arc<dyn SandboxOutputSink> = Arc::new(OutputChannelSink { tx });
+            let cancellation = SandboxCancellation::new();
+            let backend_cancellation = cancellation.clone();
+            let backend = self.backend;
+            let hooks = &self.hooks;
+            let spec = &job.spec;
+            let launch_thread = scope
+                .spawn(move || backend.launch_streaming(spec, hooks, output, backend_cancellation));
+            let consumed = (|| -> Result<(), String> {
+                while let Ok(frame) = rx.recv() {
+                    self.firehose.ship_frame(
+                        &output_run_id,
+                        &output_job_id,
+                        &output_tenant,
+                        &frame,
+                    )?;
+                }
+                Ok(())
+            })();
+            if consumed.is_err() {
+                cancellation.cancel();
+            }
+            // On a sink failure, disconnect before joining so a backend drain blocked on bounded
+            // backpressure wakes while the watchdog promptly kills/reaps the live guest.
+            drop(rx);
+            let launch = launch_thread.join().map_err(|_| {
+                RunnerError::LaunchFailed("sandbox launch thread panicked".to_string())
+            })?;
+            match (launch, consumed) {
+                (Ok(launch), Ok(())) => Ok((launch, None)),
+                (Ok(launch), Err(error)) => {
+                    Ok((launch, Some(format!("durable log stream failed: {error}"))))
+                }
+                (Err(error), _) => Err(RunnerError::LaunchFailed(error.to_string())),
+            }
+        })?;
+        let (launch, stream_failure) = launch_result;
+        let SandboxLaunch {
+            handle,
+            result,
+            output_complete: backend_output_complete,
+        } = launch;
 
-        // Stream the captured guest stdout/stderr through the firehose as redacted frames (CI-P20
-        // STUB sink). references-not-payloads at the SIGNAL boundary: the raw bytes go to the firehose
-        // (→ the `ci.log.available` pointer), NEVER into the `job.done` engine signal payload. We ship
-        // a frame per non-empty stream; the full pipeline (byte-range index, resume cursor) is CI-P20.
-        if !result.stdout.is_empty() {
-            self.firehose
-                .ship_frame(&job.run_id, &job.job_id, &job.tenant, &result.stdout);
-        }
-        if !result.stderr.is_empty() {
-            self.firehose
-                .ship_frame(&job.run_id, &job.job_id, &job.tenant, &result.stderr);
-        }
+        // references-not-payloads at the SIGNAL boundary: raw bytes went only through the firehose
+        // (→ durable `ci.log.available` pointers), never into the `job.done` engine signal payload.
         // The job's output is complete — CLOSE the step anchor with the derived verdict, seal the
         // open segment, flush the (job, step, byte-range) index, and emit the `ci.log.available`
         // pointer (the real sink; a no-op in the counting stub). `passed` is derived here (a clean
         // exit that did not time out) — the SAME value the terminal report carries below. Called
         // BEFORE the terminal report so the pointer the report references is durably backed.
         // Idempotent — a re-delivered report path does not re-seal.
-        let passed = result.passed();
-        self.firehose
-            .finish(&job.run_id, &job.job_id, &job.tenant, passed);
+        let command_passed = result.passed();
+        let mut output_failure = stream_failure;
+        if !backend_output_complete && output_failure.is_none() {
+            output_failure = Some("sandbox output delivery did not complete".into());
+        }
+        if output_failure.is_none() {
+            if let Err(error) =
+                self.firehose
+                    .finish(&job.run_id, &job.job_id, &job.tenant, command_passed)
+            {
+                output_failure = Some(format!("durable log finish failed: {error}"));
+            }
+        }
+        let output_complete = output_failure.is_none();
         // Re-heartbeat (a long job renews its lease so it does not lapse mid-run).
         self.leases.heartbeat(
             &self.worker_id,
@@ -854,12 +1014,34 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
             .kill(&handle)
             .map_err(|e| RunnerError::LaunchFailed(e.to_string()))?;
 
+        let claim = CompletionClaim {
+            tenant: job.tenant.clone(),
+            run: RunId(job.run_id.clone()),
+            job_id: job.job_id.clone(),
+            idem_token: job.spec.idem_token.0.clone(),
+            lease_owner: self.worker_id.clone(),
+            lease_epoch: job.lease_epoch,
+            claim_nonce: job.claim_nonce.clone(),
+        };
+        if !output_complete {
+            self.reporter
+                .report_retryable_attempt(
+                    &claim,
+                    &RetryableAttemptFailure {
+                        cause: RetryableAttemptCause::OutputPersistence,
+                        usage: result.usage,
+                    },
+                )
+                .map_err(RunnerError::ReportFailed)?;
+            return Err(RunnerError::RetryableAttemptRecorded { job_id: job.job_id });
+        }
+
         // ── Step 4: DERIVE the terminal report from the command result, then REPORT TERMINAL.
         // `passed` is derived (NOT an input): a clean exit that did not time out. The firehose owns
         // the durable deep log pointer; it is not a canonical scoped ArtifactRef and therefore is not
         // smuggled through the typed verdict. Concrete artifact publishers can add scoped refs later.
         let report = TerminalReport {
-            passed,
+            passed: command_passed,
             timed_out: result.timed_out,
             usage: result.usage,
             result_refs: vec![],
@@ -868,19 +1050,9 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
         // `job.done` ECHOING the spec's idem_token through the ENGINE signal path (the exactly-once
         // wake). The runner can deliver this twice (at-least-once); the engine buffers once; the
         // workflow wakes once. NO second signal path.
-        let run = RunId(job.run_id.clone());
         // The runner carries the CLAIMED row's generation (this worker as lease owner + the epoch the
         // claim bumped) so the reporter's completion CAS proves ownership — a stale reaped worker holds
         // a lower epoch and is refused. Never derived from the result refs.
-        let claim = CompletionClaim {
-            tenant: job.tenant.clone(),
-            run,
-            job_id: job.job_id.clone(),
-            idem_token: job.spec.idem_token.0.clone(),
-            lease_owner: self.worker_id.clone(),
-            lease_epoch: job.lease_epoch,
-            claim_nonce: job.claim_nonce.clone(),
-        };
         let outcome = self
             .reporter
             .report_done(&claim, &report)
@@ -1040,6 +1212,7 @@ mod tests {
                     guest_id: format!("guest-{}", spec.idem_token.0),
                 },
                 result: self.result.clone(),
+                output_complete: true,
             })
         }
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
@@ -1051,6 +1224,7 @@ mod tests {
     struct RecordingTerminalReporter {
         owner: CompletionSettlementOwner,
         reports: AtomicUsize,
+        retry_reports: AtomicUsize,
         settlements: Arc<Mutex<Vec<ResourceUsage>>>,
         fail: bool,
     }
@@ -1060,6 +1234,7 @@ mod tests {
             Self {
                 owner: CompletionSettlementOwner::TerminalReporter,
                 reports: AtomicUsize::new(0),
+                retry_reports: AtomicUsize::new(0),
                 settlements,
                 fail,
             }
@@ -1084,6 +1259,117 @@ mod tests {
             }
             self.settlements.lock().unwrap().push(report.usage);
             Ok(SignalOutcome::Buffered)
+        }
+
+        fn report_retryable_attempt(
+            &self,
+            _claim: &CompletionClaim,
+            failure: &RetryableAttemptFailure,
+        ) -> Result<RetryableAttemptOutcome, ExecutorError> {
+            self.retry_reports.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(ExecutorError::Storage(
+                    "injected retryable-attempt transaction rollback".into(),
+                ));
+            }
+            self.settlements.lock().unwrap().push(failure.usage);
+            Ok(RetryableAttemptOutcome::Requeued)
+        }
+    }
+
+    struct FailingFirehose;
+    impl FirehoseSink for FailingFirehose {
+        fn ship_frame(
+            &self,
+            _run_id: &str,
+            _job_id: &str,
+            _tenant: &TenantId,
+            _frame: &[u8],
+        ) -> Result<(), String> {
+            Err("injected durable log outage".into())
+        }
+
+        fn finish(
+            &self,
+            _run_id: &str,
+            _job_id: &str,
+            _tenant: &TenantId,
+            _passed: bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingStreamingBackend {
+        cancellation_observed: std::sync::atomic::AtomicBool,
+    }
+
+    impl SandboxBackend for BlockingStreamingBackend {
+        type Error = HookError;
+
+        fn launch(
+            &self,
+            _spec: &JobSpec,
+            _hooks: &RunnerHooks,
+        ) -> Result<SandboxLaunch, Self::Error> {
+            Err(HookError(
+                "blocking backend must use launch_streaming".into(),
+            ))
+        }
+
+        fn launch_streaming(
+            &self,
+            spec: &JobSpec,
+            hooks: &RunnerHooks,
+            output: Arc<dyn SandboxOutputSink>,
+            cancellation: SandboxCancellation,
+        ) -> Result<SandboxLaunch, Self::Error> {
+            hooks.enforce_isolation_floor(spec)?;
+            let reserve = hooks.reserve(spec)?;
+            hooks.attribute(spec)?;
+            output
+                .emit(SandboxOutputStream::Stdout, b"live-frame")
+                .map_err(HookError)?;
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !cancellation.is_cancelled() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(HookError(
+                        "runner never cancelled the live backend after sink failure".into(),
+                    ));
+                }
+                std::thread::yield_now();
+            }
+            self.cancellation_observed.store(true, Ordering::SeqCst);
+            hooks.settle_completed(
+                spec,
+                &reserve,
+                ResourceUsage {
+                    cpu_seconds: 1,
+                    mem_byte_seconds: 1,
+                },
+            )?;
+            Ok(SandboxLaunch {
+                handle: SandboxHandle {
+                    guest_id: format!("cancelled-{}", spec.idem_token.0),
+                },
+                result: SandboxResult {
+                    exit_code: None,
+                    timed_out: false,
+                    usage: ResourceUsage {
+                        cpu_seconds: 1,
+                        mem_byte_seconds: 1,
+                    },
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                output_complete: false,
+            })
+        }
+
+        fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
+            Ok(())
         }
     }
 
@@ -1314,6 +1600,131 @@ mod tests {
         assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 1);
     }
 
+    #[test]
+    fn durable_log_failure_kills_the_guest_and_refuses_a_terminal_verdict() {
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-log-fail",
+            "job-log-fail",
+            vec!["linux".into()],
+            ci_spec("idem-log-fail"),
+        ));
+        let backend = RecordingBackend::default();
+        let firehose = FailingFirehose;
+        let reporter_settlements = Arc::new(Mutex::new(Vec::new()));
+        let reporter =
+            RecordingTerminalReporter::reporter_owned(reporter_settlements.clone(), false);
+        let hook_settlements = Arc::new(Mutex::new(Vec::new()));
+        let agent = RunnerAgent::new(
+            "worker-log-fail",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q,
+            &backend,
+            &firehose,
+            &reporter,
+            hooks_with_owner(
+                CompletionSettlementOwner::TerminalReporter,
+                hook_settlements.clone(),
+            ),
+        );
+
+        let error = agent
+            .run_one(1000)
+            .expect_err("output failure is retryable and cannot become job.done");
+        assert_eq!(backend.kills.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            error,
+            RunnerError::RetryableAttemptRecorded { ref job_id }
+                if job_id == "job-log-fail"
+        ));
+        assert_eq!(reporter.reports.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            reporter.retry_reports.load(Ordering::SeqCst),
+            1,
+            "one retryable measured attempt is handed to the claim-aware reporter"
+        );
+        assert!(hook_settlements.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reporter_owned_log_failure_cancels_live_execution_and_accounts_exactly_once() {
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-live-log-fail",
+            "job-live-log-fail",
+            vec!["linux".into()],
+            ci_spec("idem-live-log-fail"),
+        ));
+        let backend = BlockingStreamingBackend::default();
+        let firehose = FailingFirehose;
+        let reporter_settlements = Arc::new(Mutex::new(Vec::new()));
+        let reporter =
+            RecordingTerminalReporter::reporter_owned(reporter_settlements.clone(), false);
+        let hook_settlements = Arc::new(Mutex::new(Vec::new()));
+        let agent = RunnerAgent::new(
+            "worker-live-log-fail",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q,
+            &backend,
+            &firehose,
+            &reporter,
+            hooks_with_owner(
+                CompletionSettlementOwner::TerminalReporter,
+                hook_settlements.clone(),
+            ),
+        );
+
+        let started = std::time::Instant::now();
+        let error = agent
+            .run_one(1000)
+            .expect_err("a failed durable frame is requeued without job.done");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "cancellation is prompt rather than waiting for the command timeout"
+        );
+        assert!(
+            backend.cancellation_observed.load(Ordering::SeqCst),
+            "the live backend watchdog observed the runner cancellation"
+        );
+        assert!(matches!(
+            error,
+            RunnerError::RetryableAttemptRecorded { ref job_id }
+                if job_id == "job-live-log-fail"
+        ));
+        assert_eq!(
+            reporter.reports.load(Ordering::SeqCst),
+            0,
+            "a retryable infrastructure failure cannot emit job.done"
+        );
+        assert_eq!(
+            reporter.retry_reports.load(Ordering::SeqCst),
+            1,
+            "the reporter-owned topology receives one retryable-attempt transaction"
+        );
+        assert_eq!(
+            *reporter_settlements.lock().unwrap(),
+            vec![ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 1,
+            }],
+            "the terminal reporter owns the measured failed-attempt accrual"
+        );
+        assert!(
+            hook_settlements.lock().unwrap().is_empty(),
+            "the backend hook cannot double-settle reporter-owned completion"
+        );
+    }
+
     /// The owner handshake is checked before the queue mutation. A hook-owned backend paired with a
     /// reporter-owned terminal transaction can neither double-settle nor claim work and strand it.
     #[test]
@@ -1366,6 +1777,7 @@ mod tests {
         let hook_reporter = RecordingTerminalReporter {
             owner: CompletionSettlementOwner::Hook,
             reports: AtomicUsize::new(0),
+            retry_reports: AtomicUsize::new(0),
             settlements: reporter_settlements.clone(),
             fail: false,
         };

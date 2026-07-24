@@ -122,10 +122,13 @@ pub use gvisor::{
 
 pub use runner::{
     CompletionClaim, CountingFirehose, EngineTerminalReporter, FirehoseSink, JobLeaseStore,
-    LeaseStore, QueuedJob, RunOutcome, RunnerAgent, RunnerError, TerminalReport, TerminalReporter,
+    LeaseStore, QueuedJob, RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome,
+    RunOutcome, RunnerAgent, RunnerError, TerminalReport, TerminalReporter,
 };
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 // `Region` is the frozen (tenant, region) partition type (contract 12.1 / P-CP-01); the
 // `FleetProvider` trait names it in provision/capacity (arch 01 §2).
@@ -845,6 +848,69 @@ pub struct SandboxLaunch {
     pub handle: SandboxHandle,
     /// The command's result — the runner DERIVES the terminal report from it.
     pub result: SandboxResult,
+    /// Whether every incremental output frame reached the runner-side consumer.
+    ///
+    /// A false value is still a measured, completed attempt: the runner must tear the sandbox down,
+    /// durably accrue the attempt's usage, and requeue the exact claim without emitting `job.done`.
+    /// Treating it as a bare launch error would discard the only value carrying measured usage and
+    /// strand reporter-owned reservations.
+    pub output_complete: bool,
+}
+
+/// Which captured guest stream produced an incremental output frame.
+///
+/// The stream identity stays inside the sandbox/runner seam. The current durable log is one ordered
+/// job stream, so [`FirehoseSink`](crate::FirehoseSink) intentionally coalesces both variants after
+/// the backend has preserved each stream's byte order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxOutputStream {
+    /// The command's standard output.
+    Stdout,
+    /// The command's standard error.
+    Stderr,
+}
+
+/// A bounded incremental-output callback driven by a production sandbox while the command runs.
+///
+/// Implementations must consume or copy `frame` before returning. Production backends invoke this
+/// from their pipe/console drain threads and apply boundary redaction before the callback. Returning
+/// an error makes the launch fail loudly; the backend must still drain/kill/reap its guest so a
+/// failed consumer cannot deadlock or orphan the sandbox.
+pub trait SandboxOutputSink: Send + Sync {
+    /// Consume one ordered frame from `stream`.
+    fn emit(&self, stream: SandboxOutputStream, frame: &[u8]) -> Result<(), String>;
+}
+
+/// Shared cancellation edge from the runner's durable-output consumer to the live sandbox watchdog.
+///
+/// A persistence failure occurs on the runner thread while the backend owns the still-running guest.
+/// This token lets the consumer request whole-guest teardown immediately, without waiting for the
+/// command's ordinary timeout or requiring a handle before `launch_streaming` returns.
+#[derive(Clone, Default)]
+pub struct SandboxCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl SandboxCancellation {
+    /// A fresh, not-cancelled execution token.
+    pub fn new() -> SandboxCancellation {
+        SandboxCancellation::default()
+    }
+
+    /// Request prompt whole-guest teardown. Idempotent.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Whether teardown has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// The atomic flag used by existing backend watchdog loops.
+    pub(crate) fn as_atomic(&self) -> &AtomicBool {
+        self.cancelled.as_ref()
+    }
 }
 
 /// The sandbox backend (arch 01 §2): Firecracker (default) | Gvisor (named 2nd) | SelfHosted
@@ -855,9 +921,9 @@ pub struct SandboxLaunch {
 /// **`ToolHands::exec(Command)` (contract 8.4) IS `launch(JobSpec{ kind: Agent, .. }, hooks)`** —
 /// the same runner, the same hardening, the same drill. The `no-host-exec` lint (P-S10/P-017)
 /// forbids any platform host-exec bypass; ALL execution goes through this seam.
-pub trait SandboxBackend {
+pub trait SandboxBackend: Sync {
     /// The backend's error type.
-    type Error: std::error::Error;
+    type Error: std::error::Error + Send;
 
     /// Launch a job in a fresh, ephemeral, one-job-per-sandbox guest, applying the mandatory
     /// hardening profile (arch 02 §5.3) and wiring the four-guarantee `hooks` (arch 02 §5.2). For an
@@ -867,6 +933,29 @@ pub trait SandboxBackend {
     /// (exit/timeout/usage/captured-streams). The runner DERIVES its terminal report from the
     /// result; it is no longer supplied as an input (RESHAPE-001 / CT-001).
     fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error>;
+
+    /// Launch while delivering boundary-redacted output incrementally during execution.
+    ///
+    /// The default is a compatibility adapter for test doubles and delegated backends: it performs
+    /// the ordinary blocking launch and emits the bounded result captures afterward. It therefore
+    /// does **not** prove during-execution delivery. The production gVisor and Firecracker backends
+    /// override this method at their real pipe/console drain boundaries.
+    fn launch_streaming(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        output: Arc<dyn SandboxOutputSink>,
+        _cancellation: SandboxCancellation,
+    ) -> Result<SandboxLaunch, Self::Error> {
+        let launch = self.launch(spec, hooks)?;
+        if !launch.result.stdout.is_empty() {
+            let _ = output.emit(SandboxOutputStream::Stdout, &launch.result.stdout);
+        }
+        if !launch.result.stderr.is_empty() {
+            let _ = output.emit(SandboxOutputStream::Stderr, &launch.result.stderr);
+        }
+        Ok(launch)
+    }
 
     /// Whole-guest kill on teardown (arch 01 §2): the guest is destroyed, never reused across
     /// tenants/jobs. Idempotent (killing an already-dead guest is a no-op success).
@@ -1674,6 +1763,7 @@ mod tests {
                     guest_id: "noop-guest".into(),
                 },
                 result,
+                output_complete: true,
             })
         }
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {

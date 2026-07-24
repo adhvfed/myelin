@@ -35,8 +35,9 @@ use myelin_ci_controlplane::{
     ci_job_queue_store, ci_region_queue_store_test_support, DurableEnqueue, DurableLeaseAdapter,
     DurableLogPersist, EnqueueOutcome, JobSpecResolver, Lane, LeasedJob, LogPipelineSink,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
-    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
 };
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
@@ -113,6 +114,10 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL)
         .await
         .expect("add persisted job_queue claim times");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL)
+        .await
+        .expect("add retryable-attempt usage accrual");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin.execute(idx.as_str()).await.expect("index");
@@ -121,6 +126,48 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(CREATE_FAIR_DEFICIT_DDL)
         .await
         .expect("create fair_deficit");
+    admin
+        .execute(
+            "CREATE TABLE workflow_run (
+               tenant_id text NOT NULL,
+               region text NOT NULL,
+               run_id text NOT NULL,
+               state text NOT NULL,
+               PRIMARY KEY (tenant_id, run_id)
+             );
+             CREATE TABLE ci_run (
+               tenant_id text NOT NULL,
+               region text NOT NULL,
+               wf_run_id uuid NOT NULL,
+               state text NOT NULL,
+               PRIMARY KEY (tenant_id, wf_run_id)
+             )",
+        )
+        .await
+        .expect("create authoritative lifecycle tables used by claim/reap");
+}
+
+async fn activate_job_owner(admin: &PgPool, job: &DurableEnqueue) {
+    sqlx::query(
+        "INSERT INTO workflow_run (tenant_id, region, run_id, state)
+         VALUES ($1, $2, $3, 'running')",
+    )
+    .bind(&job.tenant_id)
+    .bind(&job.region)
+    .bind(&job.run_id)
+    .execute(admin)
+    .await
+    .expect("insert active Flow owner");
+    sqlx::query(
+        "INSERT INTO ci_run (tenant_id, region, wf_run_id, state)
+         VALUES ($1, $2, $3::uuid, 'running')",
+    )
+    .bind(&job.tenant_id)
+    .bind(&job.region)
+    .bind(&job.run_id)
+    .execute(admin)
+    .await
+    .expect("insert active CI owner");
 }
 
 /// CT-004f capstone: also create the log index tables + the durable outbox in the schema (the live
@@ -236,10 +283,25 @@ struct CapturingFirehose {
     bytes: Arc<Mutex<Vec<u8>>>,
 }
 impl FirehoseSink for CapturingFirehose {
-    fn ship_frame(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, frame: &[u8]) {
+    fn ship_frame(
+        &self,
+        _run_id: &str,
+        _job_id: &str,
+        _tenant: &TenantId,
+        frame: &[u8],
+    ) -> Result<(), String> {
         self.bytes.lock().unwrap().extend_from_slice(frame);
+        Ok(())
     }
-    fn finish(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, _passed: bool) {}
+    fn finish(
+        &self,
+        _run_id: &str,
+        _job_id: &str,
+        _tenant: &TenantId,
+        _passed: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 impl CapturingFirehose {
     fn captured(&self) -> Vec<u8> {
@@ -324,6 +386,7 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
         store.enqueue(&job).await.expect("enqueue"),
         EnqueueOutcome::Inserted
     );
+    activate_job_owner(&admin, &job).await;
 
     // ── the engine executor the job.done wakes (the ONE signal path). Run id == the durable run_id. ──
     let executor = FlowExecutor::new(
@@ -498,6 +561,7 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
         store.enqueue(&job).await.expect("enqueue"),
         EnqueueOutcome::Inserted
     );
+    activate_job_owner(&admin, &job).await;
 
     let executor = FlowExecutor::new(
         Arc::new(FixedMinter(run_uuid.clone())),
@@ -648,6 +712,7 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
         "idem-fork",
     );
     store.enqueue(&fork).await.expect("enqueue fork");
+    activate_job_owner(&admin, &fork).await;
 
     // A trusted-only adapter claim (the exact seam run_one drives) must return None — the fork job is
     // NEVER claimable by a trusted-only runner (the durable predicate, forwarded UNCHANGED).
@@ -740,6 +805,7 @@ async fn region_a_runner_never_claims_region_b_job() {
         "idem-rb",
     );
     store.enqueue(&jb).await.expect("enqueue region-B job");
+    activate_job_owner(&admin, &jb).await;
 
     let resolve: JobSpecResolver = Arc::new(|l: &LeasedJob| {
         panic!(
@@ -799,6 +865,7 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
         "idem-steal",
     );
     store.enqueue(&job).await.expect("enqueue");
+    activate_job_owner(&admin, &job).await;
 
     let resolve: JobSpecResolver =
         Arc::new(|_l: &LeasedJob| Ok(compute_spec(vec!["true".into()], "idem-steal")));

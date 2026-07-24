@@ -30,11 +30,30 @@
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
-    ReserveHandle, ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, TrustTier,
-    WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
+    ReserveHandle, ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend,
+    SandboxCancellation, SandboxOutputSink, SandboxOutputStream, TrustTier, WorkspaceSpec,
+    SANDBOX_CAPTURE_BOUND,
 };
 use std::path::Path;
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+static REAL_RUNSC_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Default)]
+struct LiveOutput {
+    frames: Mutex<Vec<(SandboxOutputStream, Vec<u8>)>>,
+    arrived: Condvar,
+}
+
+impl SandboxOutputSink for LiveOutput {
+    fn emit(&self, stream: SandboxOutputStream, frame: &[u8]) -> Result<(), String> {
+        self.frames.lock().unwrap().push((stream, frame.to_vec()));
+        self.arrived.notify_all();
+        Ok(())
+    }
+}
 
 /// Whether `runsc` resolves on PATH (env override `MYELIN_RUNSC_BIN`).
 fn runsc_bin() -> Option<String> {
@@ -123,6 +142,19 @@ fn ok_hooks() -> RunnerHooks {
     )
 }
 
+fn settling_hooks(settlements: Arc<AtomicUsize>) -> RunnerHooks {
+    RunnerHooks::new(
+        myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+        Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+        Box::new(move |_spec, _handle, _usage| {
+            settlements.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }),
+        Box::new(|_token| Ok(())),
+        Box::new(|_spec| Ok(())),
+    )
+}
+
 /// Count `runsc` containers this test process left behind (id prefix `myelin-prod-<pid>-`). Used to
 /// assert no container leaks after a timeout-kill teardown.
 fn leftover_containers(bin: &str) -> usize {
@@ -143,6 +175,9 @@ fn real_runsc_runs_command_and_captures_exit_stdout_stderr() {
     let Some(_bin) = require_or_skip("gvisor-prod-exec exit7") else {
         return;
     };
+    let _serial = REAL_RUNSC_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let backend = GvisorBackend::new();
     let spec = spec_running(
         vec![
@@ -197,10 +232,138 @@ fn real_runsc_runs_command_and_captures_exit_stdout_stderr() {
 }
 
 #[test]
+fn real_runsc_delivers_output_before_the_command_exits() {
+    let Some(_bin) = require_or_skip("gvisor-prod-exec live-output") else {
+        return;
+    };
+    let _serial = REAL_RUNSC_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let backend = GvisorBackend::new();
+    let spec = spec_running(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "printf live-before; sleep 2; printf live-after".into(),
+        ],
+        60,
+    );
+    let output = Arc::new(LiveOutput::default());
+
+    let launch = std::thread::scope(|scope| {
+        let output_for_launch = output.clone();
+        let hooks = ok_hooks();
+        let backend_ref = &backend;
+        let spec_ref = &spec;
+        let running = scope.spawn(move || {
+            backend_ref.launch_streaming(
+                spec_ref,
+                &hooks,
+                output_for_launch,
+                SandboxCancellation::new(),
+            )
+        });
+
+        let frames = output.frames.lock().unwrap();
+        let (frames, wait) = output
+            .arrived
+            .wait_timeout_while(frames, Duration::from_secs(20), |frames| frames.is_empty())
+            .unwrap();
+        assert!(!wait.timed_out(), "first output frame arrives");
+        assert!(
+            !running.is_finished(),
+            "the first callback is observable while the command is still sleeping"
+        );
+        drop(frames);
+        running
+            .join()
+            .expect("launch thread")
+            .expect("real runsc launch")
+    });
+
+    let stdout: Vec<u8> = output
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(stream, _)| *stream == SandboxOutputStream::Stdout)
+        .flat_map(|(_, frame)| frame.iter().copied())
+        .collect();
+    assert_eq!(stdout, b"live-beforelive-after");
+    backend.kill(&launch.handle).expect("teardown");
+}
+
+#[test]
+fn real_runsc_cancels_live_after_log_failure_and_returns_measured_failure() {
+    let Some(_bin) = require_or_skip("gvisor-prod-exec live-output-cancel") else {
+        return;
+    };
+    let _serial = REAL_RUNSC_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let backend = GvisorBackend::new();
+    let spec = spec_running(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "printf before-cancel; sleep 30; printf too-late".into(),
+        ],
+        60,
+    );
+    let output = Arc::new(LiveOutput::default());
+    let cancellation = SandboxCancellation::new();
+    let settlements = Arc::new(AtomicUsize::new(0));
+    let started = Instant::now();
+
+    let launch = std::thread::scope(|scope| {
+        let hooks = settling_hooks(settlements.clone());
+        let output_for_launch = output.clone();
+        let cancellation_for_launch = cancellation.clone();
+        let backend_for_launch = &backend;
+        let running = scope.spawn(move || {
+            backend_for_launch.launch_streaming(
+                &spec,
+                &hooks,
+                output_for_launch,
+                cancellation_for_launch,
+            )
+        });
+        let frames = output.frames.lock().unwrap();
+        let (frames, wait) = output
+            .arrived
+            .wait_timeout_while(frames, Duration::from_secs(20), |frames| frames.is_empty())
+            .unwrap();
+        assert!(!wait.timed_out(), "the pre-cancel frame arrives");
+        drop(frames);
+        cancellation.cancel();
+        running
+            .join()
+            .expect("launch thread")
+            .expect("cancelled durable output retains the measured result")
+    });
+
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "whole-container cancellation is prompt, not the 30s command sleep"
+    );
+    assert!(!launch.output_complete);
+    assert!(!launch.result.passed());
+    assert_eq!(
+        settlements.load(Ordering::SeqCst),
+        1,
+        "the acquired reservation settles measured usage once on cancellation"
+    );
+    backend.kill(&launch.handle).expect("teardown");
+}
+
+#[test]
 fn real_runsc_runs_untrusted_command_non_root() {
     let Some(_bin) = require_or_skip("gvisor-prod-exec non-root") else {
         return;
     };
+    let _serial = REAL_RUNSC_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let backend = GvisorBackend::new();
     // The untrusted command reports its own uid; the OCI config drops it to 65534 (defense in depth).
     let spec = spec_running(vec!["sh".into(), "-c".into(), "id -u; exit 0".into()], 60);
@@ -238,6 +401,9 @@ fn real_runsc_runaway_stdout_is_capped_without_deadlock() {
     let Some(_bin) = require_or_skip("gvisor-prod-exec runaway-stdout-cap") else {
         return;
     };
+    let _serial = REAL_RUNSC_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let backend = GvisorBackend::new();
     // Emit ~8 MiB of 'x' to stdout, then exit 0 (the pipeline's last command, `tr`, exits 0). dd,
     // /dev/zero and tr are all present in the staged rootfs (used by the escape drill).
@@ -300,6 +466,9 @@ fn real_runsc_command_past_timeout_is_whole_container_killed() {
     let Some(bin) = require_or_skip("gvisor-prod-exec timeout") else {
         return;
     };
+    let _serial = REAL_RUNSC_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let backend = GvisorBackend::new();
     // Sleep 30s with a 2s ceiling — the whole container must be killed at ~2s and reaped.
     let spec = spec_running(vec!["sh".into(), "-c".into(), "sleep 30".into()], 2);
