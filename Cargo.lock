@@ -2668,6 +2668,7 @@ dependencies = [
 name = "myelin-harness"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "blake3",
  "myelin-chat",
  "myelin-identity",

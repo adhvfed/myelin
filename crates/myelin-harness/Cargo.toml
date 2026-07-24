@@ -35,3 +35,4 @@ serde_json.workspace = true
 # tree into the harness binary. (Nothing depends on myelin-harness, so this is not a DAG cycle.)
 [dev-dependencies]
 myelin-chat = { path = "../myelin-chat" }
+base64 = "0.22"

@@ -12,6 +12,9 @@
 #   ./scripts/dogfood.sh verify-check <repo> <pr> <head-oid> [context]
 #                                          read-only proof that an exact PR head surfaced a required
 #                                          settled green context through the production edge
+#   ./scripts/dogfood.sh verify-ci <run> <job> <marker> [evidence-dir]
+#                                          read-only proof that the exact successful/settled run has
+#                                          one byte-exact archived marker matching its live capture
 #   ./scripts/dogfood.sh bootstrap -- <flags>
 #                                          run `edge bootstrap <flags>` over the dogfood env, e.g.
 #                                            ./scripts/dogfood.sh bootstrap -- --tenant acme --principal founder \
@@ -27,6 +30,8 @@
 # It is generated ONCE into a 0600 file and reused; LOSE IT AND YOU LOSE EVERYTHING (all encrypted
 # columns + every minted token stops verifying). Back it up (see docs/dogfood.md).
 set -euo pipefail
+# Never inherit caller xtrace into a script that handles the seal key or an operator credential.
+set +x
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -63,6 +68,53 @@ ensure_seal_key() {
   )
   chmod 600 "${SEAL_KEY_FILE}"
   echo "dogfood: generated a NEW seal key at ${SEAL_KEY_FILE} (0600) — BACK THIS UP (see docs/dogfood.md)" >&2
+}
+
+fail() {
+  echo "dogfood: $*" >&2
+  exit 1
+}
+
+marker_count() {
+  local file="$1" marker="$2" matches
+  matches="$(grep -aFo -- "${marker}" "${file}" || true)"
+  if [[ -z "${matches}" ]]; then
+    echo 0
+  else
+    printf '%s\n' "${matches}" | wc -l | tr -d ' '
+  fi
+}
+
+validate_edge_url() {
+  local url="$1" port=""
+  if [[ "${url}" =~ ^https://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:([0-9]{1,5}))?$ ]]; then
+    port="${BASH_REMATCH[3]:-}"
+  elif [[ "${url}" =~ ^http://(127\.0\.0\.1|\[::1\])(:([0-9]{1,5}))?$ ]]; then
+    port="${BASH_REMATCH[3]:-}"
+  else
+    fail "MYELIN_EDGE_URL must be an HTTPS origin or an HTTP loopback origin without path, userinfo, query, or fragment"
+  fi
+  if [[ -n "${port}" && ( "${port}" -lt 1 || "${port}" -gt 65535 ) ]]; then
+    fail "MYELIN_EDGE_URL has an invalid port"
+  fi
+}
+
+authenticated_get_to_file() {
+  local url="$1" output="$2"
+  local token_scheme="${MYELIN_TOKEN_SCHEME:-agent}"
+  # --disable must be curl's first argument: operator curlrc settings may enable a trace that leaks
+  # the credential. Direct connections also prevent proxy environment variables from receiving it.
+  curl --disable \
+    --fail --silent --show-error \
+    --connect-timeout 10 --max-time 30 --max-filesize 524288 \
+    --proto '=http,https' --proto-redir '=https' --noproxy '*' \
+    --output "${output}" --config - "${url}" <<EOF
+header = "authorization: Bearer ${MYELIN_TOKEN}"
+header = "x-myelin-token-scheme: ${token_scheme}"
+EOF
+  local response_bytes
+  response_bytes="$(wc -c <"${output}" | tr -d ' ')"
+  [[ "${response_bytes}" -le 524288 ]] || fail "Edge response exceeds the 524288-byte acceptance bound"
 }
 
 # Print the eval-able env contract: the dev-stack data-layer env + the edge-only env.
@@ -152,6 +204,11 @@ case "${cmd}" in
       echo "dogfood: MYELIN_TOKEN is required for the read-only verification" >&2
       exit 2
     fi
+    token_re='^v4\.public\.[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+(\|[A-Za-z0-9_-]+)?$'
+    if [[ ! "${MYELIN_TOKEN}" =~ ${token_re} || ! "${MYELIN_TOKEN_SCHEME:-agent}" =~ ^[a-z0-9._-]+$ ]]; then
+      echo "dogfood: token or token scheme has a noncanonical transport shape" >&2
+      exit 2
+    fi
     repo="$1"
     pr_number="$2"
     expected_head="$3"
@@ -161,13 +218,19 @@ case "${cmd}" in
       exit 2
     fi
     edge_url="${MYELIN_EDGE_URL:-http://127.0.0.1:8080}"
+    validate_edge_url "${edge_url}"
     repo_segment="$(jq -rn --arg value "${repo}" '$value | @uri')"
-    pr_json="$(curl --fail --silent --show-error \
-      -H "authorization: Bearer ${MYELIN_TOKEN}" \
-      "${edge_url}/v1/git/repos/${repo_segment}/prs/${pr_number}")"
-    checks_json="$(curl --fail --silent --show-error \
-      -H "authorization: Bearer ${MYELIN_TOKEN}" \
-      "${edge_url}/v1/git/repos/${repo_segment}/prs/${pr_number}/checks")"
+    response_tmp="$(mktemp)"
+    trap 'rm -f "${response_tmp:-}"' EXIT
+    authenticated_get_to_file \
+      "${edge_url}/v1/git/repos/${repo_segment}/prs/${pr_number}" "${response_tmp}"
+    pr_json="$(command cat "${response_tmp}")"
+    authenticated_get_to_file \
+      "${edge_url}/v1/git/repos/${repo_segment}/prs/${pr_number}/checks" "${response_tmp}"
+    checks_json="$(command cat "${response_tmp}")"
+    rm -f "${response_tmp}"
+    response_tmp=""
+    trap - EXIT
     jq -e --arg expected_head "${expected_head}" \
       '.durable == true and .head_oid == $expected_head' \
       <<<"${pr_json}" >/dev/null || {
@@ -190,6 +253,190 @@ case "${cmd}" in
       --arg context "${context}" \
       --argjson gate_admitted "$(jq '.gate_admitted' <<<"${checks_json}")" \
       '{verified:true, repo:$repo, pr:$pr, head_oid:$head_oid, context:$context, gate_admitted:$gate_admitted}'
+    ;;
+  verify-ci)
+    if [[ "$#" -lt 3 || "$#" -gt 4 ]]; then
+      echo "usage: $0 verify-ci <run> <job> <marker> [evidence-dir]" >&2
+      exit 2
+    fi
+    for tool in curl jq base64 sha256sum grep wc mktemp awk cat chmod mkdir rmdir; do
+      command -v "${tool}" >/dev/null 2>&1 || {
+        echo "dogfood: verify-ci requires ${tool}" >&2
+        exit 2
+      }
+    done
+    if [[ -z "${MYELIN_TOKEN:-}" ]]; then
+      echo "dogfood: MYELIN_TOKEN is required for the read-only verification" >&2
+      exit 2
+    fi
+    token_re='^v4\.public\.[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+(\|[A-Za-z0-9_-]+)?$'
+    if [[ ! "${MYELIN_TOKEN}" =~ ${token_re} || ! "${MYELIN_TOKEN_SCHEME:-agent}" =~ ^[a-z0-9._-]+$ ]]; then
+      echo "dogfood: token or token scheme has a noncanonical transport shape" >&2
+      exit 2
+    fi
+    run="$1"
+    job="$2"
+    marker="$3"
+    evidence_dir="${4:-${XDG_STATE_HOME:-$HOME/.local/state}/myelin/acceptance}"
+    uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    if [[ ! "${run}" =~ ${uuid_re} || ! "${job}" =~ ${uuid_re} ]]; then
+      echo "dogfood: run and job must be canonical lowercase UUIDs" >&2
+      exit 2
+    fi
+    if [[ ! "${marker}" =~ ^MYELIN-CI-[0-9a-f]{32}$ ]]; then
+      echo "dogfood: marker must have the unambiguous form MYELIN-CI-<32 lowercase hex characters>" >&2
+      exit 2
+    fi
+    mkdir -p "${evidence_dir}"
+    [[ ! -L "${evidence_dir}" ]] || fail "evidence directory must not be a symbolic link"
+    chmod 700 "${evidence_dir}"
+    umask 077
+    live_file="${evidence_dir}/myelin-ci-live-${run}-${job}.log"
+    detail_file="${evidence_dir}/myelin-ci-run-${run}.json"
+    archive_file="${evidence_dir}/myelin-ci-archive-${run}-${job}.log"
+    summary_file="${evidence_dir}/myelin-ci-acceptance-${run}-${job}.json"
+    [[ -f "${live_file}" && ! -L "${live_file}" ]] ||
+      fail "live capture ${live_file} is absent or is a symbolic link; attach ci watch during the run"
+    for output in "${detail_file}" "${archive_file}" "${summary_file}"; do
+      [[ ! -e "${output}" && ! -L "${output}" ]] ||
+        fail "refusing to overwrite existing or linked evidence ${output}"
+    done
+
+    edge_url="${MYELIN_EDGE_URL:-http://127.0.0.1:8080}"
+    validate_edge_url "${edge_url}"
+    acceptance_page_bytes=262144
+    acceptance_max_archive_bytes=67108864
+    acceptance_max_pages=256
+    temp_dir="$(mktemp -d "${evidence_dir}/.verify-ci.XXXXXX")"
+    chmod 700 "${temp_dir}"
+    response_tmp="${temp_dir}/response.json"
+    page_tmp="${temp_dir}/page.bin"
+    trap 'rm -f "${response_tmp:-}" "${page_tmp:-}"; rmdir "${temp_dir:-}" 2>/dev/null || true' EXIT
+    authenticated_get_to_file "${edge_url}/v1/ci/runs/${run}" "${response_tmp}"
+    detail_json="$(command cat "${response_tmp}")"
+    jq -e --arg run "${run}" --arg job "${job}" '
+      .run.run_id == $run
+      and .run.state == "succeeded"
+      and .run.cost_settled == true
+      and (
+        .run.finished_at
+        | type == "string"
+          and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?Z$")
+      )
+      and ([.jobs[] | select(.job_id == $job and .state == "succeeded")] | length) == 1
+    ' <<<"${detail_json}" >/dev/null ||
+      fail "run/job is not the exact successful, cost-settled terminal pair"
+    set -o noclobber
+    printf '%s\n' "${detail_json}" | jq '.' >"${detail_file}"
+
+    : >"${archive_file}"
+    start=0
+    total_end=""
+    page_count=0
+    while true; do
+      page_count=$((page_count + 1))
+      [[ "${page_count}" -le "${acceptance_max_pages}" ]] ||
+        fail "archive exceeds the ${acceptance_max_pages}-page acceptance bound"
+      authenticated_get_to_file \
+        "${edge_url}/v1/ci/runs/${run}/jobs/${job}/log?start=${start}&limit=${acceptance_page_bytes}" \
+        "${response_tmp}"
+      page_json="$(command cat "${response_tmp}")"
+      jq -e \
+        --arg run "${run}" \
+        --arg job "${job}" \
+        --argjson start "${start}" \
+        --argjson page_limit "${acceptance_page_bytes}" \
+        --argjson max_total "${acceptance_max_archive_bytes}" '
+        .run_id == $run
+        and .job_id == $job
+        and .byte_start == $start
+        and (.byte_end | type == "number" and floor == .)
+        and .byte_end >= $start
+        and .byte_end <= 9007199254740991
+        and (.total_end | type == "number" and floor == .)
+        and .total_end >= .byte_end
+        and .total_end <= $max_total
+        and .byte_end == (
+          if ($start + $page_limit) < .total_end
+          then ($start + $page_limit)
+          else .total_end
+          end
+        )
+        and .encoding == "base64"
+        and (.data | type == "string")
+        and (
+          if .byte_end < .total_end
+          then .next_offset == .byte_end
+          else .next_offset == null
+          end
+        )
+      ' <<<"${page_json}" >/dev/null || fail "archive page is malformed or cross-scope"
+      page_total="$(jq -r '.total_end' <<<"${page_json}")"
+      if [[ -z "${total_end}" ]]; then
+        total_end="${page_total}"
+      elif [[ "${page_total}" != "${total_end}" ]]; then
+        fail "terminal archive total changed during verification"
+      fi
+      byte_end="$(jq -r '.byte_end' <<<"${page_json}")"
+      encoded="$(jq -r '.data' <<<"${page_json}")"
+      printf '%s' "${encoded}" | base64 --decode >| "${page_tmp}" ||
+        fail "archive page is not canonical base64"
+      canonical_encoded="$(base64 --wrap=0 "${page_tmp}")"
+      [[ "${canonical_encoded}" == "${encoded}" ]] ||
+        fail "archive page is not canonical base64"
+      expected_bytes=$((byte_end - start))
+      actual_bytes="$(wc -c <"${page_tmp}" | tr -d ' ')"
+      [[ "${actual_bytes}" == "${expected_bytes}" ]] ||
+        fail "archive page byte count disagrees with its coordinates"
+      command cat "${page_tmp}" >>"${archive_file}"
+      rm -f "${page_tmp}"
+      next_offset="$(jq -r '.next_offset // empty' <<<"${page_json}")"
+      if [[ -z "${next_offset}" ]]; then
+        [[ "${byte_end}" == "${total_end}" ]] ||
+          fail "archive ended before its declared durable total"
+        break
+      fi
+      [[ "${next_offset}" == "${byte_end}" && "${next_offset}" -gt "${start}" ]] ||
+        fail "archive continuation is noncontiguous or non-progressing"
+      start="${next_offset}"
+    done
+
+    live_markers="$(marker_count "${live_file}" "${marker}")"
+    archive_markers="$(marker_count "${archive_file}" "${marker}")"
+    [[ "${live_markers}" == "1" ]] ||
+      fail "live CLI capture must contain the marker exactly once (found ${live_markers})"
+    [[ "${archive_markers}" == "1" ]] ||
+      fail "durable archive must contain the marker exactly once (found ${archive_markers})"
+    archive_bytes="$(wc -c <"${archive_file}" | tr -d ' ')"
+    [[ "${archive_bytes}" == "${total_end}" ]] ||
+      fail "assembled archive length disagrees with the durable total"
+    live_sha="$(sha256sum "${live_file}" | awk '{print $1}')"
+    archive_sha="$(sha256sum "${archive_file}" | awk '{print $1}')"
+    receipt="$(jq -n \
+      --arg run "${run}" \
+      --arg job "${job}" \
+      --arg marker "${marker}" \
+      --argjson archive_bytes "${archive_bytes}" \
+      --arg live_sha256 "${live_sha}" \
+      --arg archive_sha256 "${archive_sha}" \
+      '{
+        verified: true,
+        run_id: $run,
+        job_id: $job,
+        marker: $marker,
+        marker_count: {live: 1, archive: 1},
+        archive_bytes: $archive_bytes,
+        live_sha256: $live_sha256,
+        archive_sha256: $archive_sha256
+      }')"
+    printf '%s\n' "${receipt}" >"${summary_file}"
+    rm -f "${response_tmp}" "${page_tmp}"
+    rmdir "${temp_dir}"
+    response_tmp=""
+    page_tmp=""
+    temp_dir=""
+    trap - EXIT
+    printf '%s\n' "${receipt}"
     ;;
   bootstrap)
     # Everything after an optional `--` is passed straight to `edge bootstrap`.
