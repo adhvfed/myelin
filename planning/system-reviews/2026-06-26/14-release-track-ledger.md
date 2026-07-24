@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification; CT-005f1 adds the repository-authorized durable SSE resume consumer; CT-005f2 persists bounded byte-exact output during execution on both production backends and closes retry/supersession recovery without resurrection; CT-005f3 adds the authenticated web live consumer and executes shared resume vectors through the actual dev and production implementations; CT-005f4 adds the authenticated strict resumable CLI live-tail consumer; CT-005f5 closes the composed production CI-D11 committed-prefix sever/resume drill. Still required: the live founder push→CI→surfaced-check/log pass, then CT-007.** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification; CT-005f1 adds the repository-authorized durable SSE resume consumer; CT-005f2 persists bounded byte-exact output during execution on both production backends and closes retry/supersession recovery without resurrection; CT-005f3 adds the authenticated web live consumer and executes shared resume vectors through the actual dev and production implementations; CT-005f4 adds the authenticated strict resumable CLI live-tail consumer; CT-005f5 closes the composed production CI-D11 committed-prefix sever/resume drill; CT-005f6 makes the founder pass emit a bounded, no-overwrite, checksum-bearing acceptance receipt under compiled adversarial contracts. Still required: the live founder push→CI→surfaced-check/log pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1921,6 +1921,45 @@ pointers/bytes = 0; M4 CI-D11 evidence still pointing only at the process-local 
 
 L3 CT-005f5 footprint: **6 files, +285 / -33 lines** for the composed live-PG/S3 failure-injection drill,
 permanent scorecard evidence, and ledgers.
+
+**CT-005f6 mechanical founder-acceptance verifier (2026-07-24; the live founder act remains
+open).** `scripts/dogfood.sh verify-ci` now independently rereads the exact terminal run and job
+through the production Edge, requires succeeded and cost-settled truth, walks the complete archived
+output under exact 256 KiB page coordinates, and compares one non-self-overlapping
+`MYELIN-CI-<32 lowercase hex>` marker against the earlier CLI live capture. It emits a
+checksum-bearing JSON receipt and a byte-exact assembled archive while refusing every pre-existing
+or linked output; it cannot turn an old capture or partial archive into a new green receipt.
+
+The verifier sends only the real three-or-four-part PASETO capability material, disables inherited
+xtrace and curl configuration, keeps headers out of process arguments, bypasses proxy environment
+variables, and permits cleartext only to exact numeric loopback origins. Every response has a
+connection/total deadline and 512 KiB body ceiling. The terminal archive is capped at 64 MiB and
+256 pages; every non-final page must fill the requested 256 KiB, totals remain stable, continuations
+are exact and progressing, and Base64 must decode and re-encode canonically before its decoded byte
+count can enter the archive.
+
+Mechanical evidence: seven compiled Rust tests execute the real Bash/curl verifier against a bounded
+socket server. They cover a green two-page assembly and receipt plus discontinuous coordinates,
+short non-final pages, noncanonical Base64, cleartext non-loopback credential transport, existing
+evidence, and a dangling evidence symlink. A hostile verbose curlrc proves first-argument
+`--disable`; every case requires the pipe-delimited credential to stay absent from stdout and
+stderr. The full Harness all-target suite and warnings-denied all-target/all-feature Harness clippy
+pass. Architecture lint scans 763 files with zero violations; shrink-only erosion/dependency
+budgets, frontend-aware contract coverage (99 rows, 83 covered, 16 deferred, two shared frontend
+contracts), its red/green fixture matrix, targeted rustfmt, shell syntax, and diff check pass.
+Independent adversarial review caught and closed the initial fake-token grammar, then reported
+**CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding**. The broader workspace all-target/
+all-feature check independently exposed an older Agent Service CDC initializer missing the now-
+required `output_complete` field; that unrelated compile failure remains the immediate next
+releasability repair rather than being hidden inside this row.
+
+Mechanical payoff: founder CI passes producing a machine-checkable receipt = 0→1; verifier response
+or archive paths without an explicit bound = 2→0; credentials admitted to cleartext non-loopback
+transport = 1→0; malformed archive pages accepted by convention = 1→0; prior evidence silently
+overwritten = 1→0.
+
+L3 CT-005f6 footprint: **6 files, +678 / -14 lines** for the bounded founder verifier, compiled
+transport/pagination/filesystem contracts, operator runbook, dependency lock, and ledger.
 
 **Honest remaining CT-005 floor:** the founder must perform a real Myelin push and observe its
 exact-head required check settle with archived and live output through the verifier, browser, and

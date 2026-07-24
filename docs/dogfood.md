@@ -129,17 +129,22 @@ attaches does not prove live usability—push another harmless Myelin commit and
 After completion, prove that the cold path has the same output and that the exact run settled:
 
 ```sh
-myelin --json ci view <run> | tee "$EVIDENCE_DIR/myelin-ci-run-<run>.json"
+myelin --json ci view <run> | tee "$EVIDENCE_DIR/myelin-ci-run-cli-<run>.json"
 myelin ci logs <run> --job <job> --start 0 --limit 262144 \
-  | tee "$EVIDENCE_DIR/myelin-ci-archive-<run>-<job>.log"
+  | tee "$EVIDENCE_DIR/myelin-ci-archive-cli-<run>-<job>.log"
+./scripts/dogfood.sh verify-ci <run> <job> 'MYELIN-CI-<32-random-lowercase-hex>' "$EVIDENCE_DIR"
 ```
 
 Follow any parser-round-trippable `more — run:` command printed by the archive reader until no
-continuation remains. Compare a marker emitted by the pushed job in the live capture, browser, and
-archive; all three must show it once. Preserve the two captures together with the `verify-check` JSON
-and the exact pushed OID. Do not mark the founder pass or start the R4 clock if the run fails, costs
-remain unsettled, the required check is absent/stale, a consumer needed GitHub, or any log surface
-loses/duplicates the marker.
+continuation remains. `verify-ci` independently reads the terminal detail and every bounded archive
+page through the production Edge, refuses a failed or unsettled run, validates exact scope and
+contiguous byte coordinates, assembles the byte-exact archive, and requires the chosen marker exactly
+once in both the earlier CLI live capture and durable archive. The deliberately non-self-overlapping
+marker shape makes that count unambiguous. It refuses to overwrite prior evidence and writes a
+checksum-bearing JSON receipt. Confirm the same marker appeared once in the browser and
+CLI archive too. Preserve that receipt together with the `verify-check` JSON and exact pushed OID. Do
+not mark the founder pass or start the R4 clock if the run fails, costs remain unsettled, the required
+check is absent/stale, a consumer needed GitHub, or any log surface loses/duplicates the marker.
 
 ## 3. Mint an operator token (`edge bootstrap`)
 
