@@ -1,8 +1,9 @@
-//! # `governance` — THE MR-006 BINDING: `mint_run_token → EffectApi::apply`, HITL-gated, audited.
+//! # `governance` — per-run authority plus effect-kind routing.
 //!
 //! This is the load-bearing module of MR-021. The MR-006 shape review is BINDING here: a local Claude
-//! over MCP "routes through **mint_run_token → EffectApi**, NOT a bare human PAT". The
-//! [`GovernedRouter`] is the realisation of that rule — on every `tools/call` it:
+//! over MCP acts under a minted run token, never a bare human PAT. Mutations route through
+//! `EffectApi`; non-side-effecting reads route directly to a permission-checked subsystem adapter,
+//! as required by the frozen ToolDef routing table. [`GovernedRouter`] fronts both routes:
 //!
 //! 1. **mints a per-run attenuated capability token** ([`RunTokenMinter::mint_run_token`], MR-011-real)
 //!    for the calling agent-principal, once per MCP run (the run's life == the session's life), and
@@ -10,22 +11,24 @@
 //! 2. **consults durable revocation** ([`RunTokenMinter::is_live`]) before acting — a revoked /
 //!    expired run token is **Denied**, never routed (MR-011 durable revocation);
 //! 3. **checks every subsystem-declared required capability** against the exact effective grant set
-//!    recorded by the same intersection proof that minted the token; the concrete mutation adapter
+//!    recorded by the same intersection proof that minted the token; every concrete adapter
 //!    independently verifies the signed token and repeats this check at its final boundary;
-//! 4. **HITL-gates** a `requires_approval` tool (the FROZEN flag from git's `agent_tools()`) BEFORE
+//! 4. for mutations, **HITL-gates** a `requires_approval` tool (the FROZEN flag from git's
+//!    `agent_tools()`) BEFORE
 //!    apply — a gated tool with no approval is **withheld** and **does NOT mutate** (the AG-8 leg).
 //!    **R2.4:** the approval is a SERVER-SIDE VERDICT — the withhold opens a `waiting` row in the
 //!    durable verdict store (`agent_hitl_gate`, migration 0054) under an OPAQUE server-issued gate
 //!    id; the re-drive PRESENTS that id and the gate clears ONLY if the store says it is Approved
 //!    for that exact effect by a DISTINCT human principal. The caller-supplied `approval.granted`
 //!    boolean of the 2026-07-06 finding is dead — it is not even parsed;
-//! 5. **routes the effect through `EffectApi::apply_authorized`** (the platform-owned
+//! 5. **routes a mutation through `EffectApi::apply_authorized`** (the platform-owned
 //!    PLAN-THEN-APPLY chokepoint,
 //!    §8.2) under a [`RunCtx`] that carries the run-token `jti` + the principal — NOT a direct
 //!    mutation. `EffectApi` is **brain-agnostic** (identical for the mock runtime, a future hosted
 //!    LLM, and local Claude over MCP — the whole point of plan-then-apply);
-//! 6. **attributes every call** to the run (the jti + the principal + the tool + the outcome) in an
-//!    auditable trail — this is what makes "agent governance real from day one".
+//! 6. records durable mutation governance and returns the run-token jti on every read result. The
+//!    complete content-addressed tool-call/result transcript remains owned by the Agent trace row;
+//!    this transport does not fabricate that still-separate runtime artifact.
 //!
 //! ## Durable composition and transaction boundary
 //! The production binary injects the durable Git effect adapter and PostgreSQL-backed identity,
@@ -102,6 +105,34 @@ pub enum CallOutcome {
     /// Application may have happened, but the post-apply audit observation did not durably commit.
     /// The process must stop after returning this honest outcome; retry safety is unknown.
     Indeterminate { reason: String, jti: String },
+}
+
+/// Authority returned for a non-side-effecting direct read after the same lazy mint, durable
+/// revocation consult, and declared-capability binding used by mutations. Reads do not create a
+/// `proposed_effect` row or route through `EffectApi`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadAuthorization {
+    run_token: RunToken,
+    tool: String,
+    required_caps: Vec<String>,
+}
+
+impl ReadAuthorization {
+    pub fn jti(&self) -> &str {
+        &self.run_token.jti
+    }
+
+    pub fn run_token(&self) -> &RunToken {
+        &self.run_token
+    }
+
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    pub fn required_caps(&self) -> &[String] {
+        &self.required_caps
+    }
 }
 
 impl CallOutcome {
@@ -302,10 +333,10 @@ pub trait GateApproverPolicy: Send + Sync {
     ) -> Result<Vec<PrincipalId>, String>;
 }
 
-/// **THE GOVERNANCE ROUTER** — the MR-006 chokepoint for MCP `tools/call`. Holds the per-run token
-/// minter, the run identity, and the injected `EffectApi` body. Routes every call through
-/// `mint_run_token → (revocation consult) → (HITL gate) → EffectApi::apply`, attributing each to the
-/// run. NEVER a bare PAT; NEVER a direct mutation.
+/// The shared authority chokepoint for MCP `tools/call`. It mints and consults the per-run token for
+/// every ToolDef route. Mutation callers continue through HITL and the injected `EffectApi`; read
+/// callers receive a [`ReadAuthorization`] that the concrete subsystem adapter re-verifies at its
+/// final boundary. Never a bare PAT and never a direct mutation.
 pub struct GovernedRouter {
     minter: RunTokenMinter,
     principal: RunPrincipal,
@@ -439,6 +470,73 @@ impl GovernedRouter {
         Ok(token)
     }
 
+    /// Authorize a direct, permission-checked read under this session's exact run token.
+    ///
+    /// This deliberately stops before HITL and `EffectApi`: the shared ToolDef routing contract
+    /// sends `effect_kind=read, side_effecting=false` straight to the subsystem read API. The
+    /// concrete adapter still performs object-level authorization against the exact run/repository.
+    pub fn authorize_read(
+        &self,
+        tool: &RegisteredTool,
+        now: &Timestamp,
+    ) -> Result<ReadAuthorization, CallOutcome> {
+        if tool.effect_kind() != myelin_agent::EffectKind::Read || tool.side_effecting() {
+            return Err(CallOutcome::Denied {
+                reason: format!(
+                    "tool `{}` is not a non-side-effecting direct read",
+                    tool.name()
+                ),
+                jti: "<unminted>".into(),
+            });
+        }
+        self.authorize_declared_tool(tool, now)
+            .map(|run_token| ReadAuthorization {
+                run_token,
+                tool: tool.name().to_string(),
+                required_caps: tool
+                    .required_caps()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            })
+            .map_err(|(reason, jti)| CallOutcome::Denied { reason, jti })
+    }
+
+    /// Shared steps 1–3 for every governed route: lazy run-token mint, durable liveness, then exact
+    /// ToolDef capability binding. Object authorization belongs to the destination adapter.
+    fn authorize_declared_tool(
+        &self,
+        tool: &RegisteredTool,
+        now: &Timestamp,
+    ) -> Result<RunToken, (String, String)> {
+        let token = self
+            .ensure_run_token(now)
+            .map_err(|reason| (reason, "<unminted>".into()))?;
+        let jti = token.jti.clone();
+        if !self.minter.is_live(&self.principal.scope, &token, now) {
+            return Err((
+                "run token is revoked or expired (MR-011 durable revocation) — denied".into(),
+                jti,
+            ));
+        }
+        let missing = {
+            let state = self.state.borrow();
+            tool.required_caps()
+                .into_iter()
+                .find(|cap| !state.effective_grants.contains(*cap))
+        };
+        if let Some(cap) = missing {
+            return Err((
+                format!(
+                    "tool `{}` requires capability `{cap}` outside the exact minted delegation intersection",
+                    tool.name()
+                ),
+                jti,
+            ));
+        }
+        Ok(token)
+    }
+
     /// **Route one governed `tools/call`** (the MR-006 binding, in order, fail-closed):
     /// mint → revocation consult → HITL gate → `EffectApi::apply` → audit.
     ///
@@ -469,59 +567,15 @@ impl GovernedRouter {
                 )
             }
         };
-        // (1) MINT the per-run attenuated token (NOT a bare PAT). A refusal is a loud Denied.
-        let token = match self.ensure_run_token(now) {
-            Ok(t) => t,
-            // No token was minted ⇒ attribute the deny to the (would-be) run, jti unknown.
-            Err(reason) => {
-                return self.record(
-                    tool.name(),
-                    CallOutcome::Denied {
-                        reason,
-                        jti: "<unminted>".into(),
-                    },
-                    now,
-                )
+        // (1–3) MINT, durable liveness, and the exact subsystem-declared capability binding. The
+        // same helper fronts direct reads; only the route after this point differs.
+        let token = match self.authorize_declared_tool(tool, now) {
+            Ok(token) => token,
+            Err((reason, jti)) => {
+                return self.record(tool.name(), CallOutcome::Denied { reason, jti }, now)
             }
         };
         let jti = token.jti.clone();
-
-        // (2) DURABLE REVOCATION CONSULT — a revoked/expired run token is denied, never routed.
-        if !self.minter.is_live(&self.principal.scope, &token, now) {
-            return self.record(
-                tool.name(),
-                CallOutcome::Denied {
-                    reason: "run token is revoked or expired (MR-011 durable revocation) — denied"
-                        .into(),
-                    jti,
-                },
-                now,
-            );
-        }
-
-        // (3) DECLARED CAPABILITY BINDING — the registered tool's subsystem-owned caps must all be
-        //     inside the exact effective intersection recorded by THIS token's mint proof. This is
-        //     an early fail-closed decision; the mutation adapter independently verifies the signed
-        //     token and resolves/rechecks the same declaration again at its final boundary.
-        let missing = {
-            let state = self.state.borrow();
-            tool.required_caps()
-                .iter()
-                .find(|cap| !state.effective_grants.contains(**cap))
-                .copied()
-        };
-        if let Some(cap) = missing {
-            return self.record(
-                tool.name(),
-                CallOutcome::Denied {
-                    reason: format!(
-                        "tool `{}` requires capability `{cap}` outside the exact minted delegation intersection",
-                        tool.name()
-                    ),
-                    jti,
-                }, now,
-            );
-        }
 
         // (4) HITL GATE (BEFORE apply) — a frozen `requires_approval` tool is withheld unless the
         //     SERVER-SIDE verdict store holds an `approved` gate for THIS exact effect, decided by

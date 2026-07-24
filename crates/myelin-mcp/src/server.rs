@@ -19,13 +19,15 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::governance::{CallOutcome, GovernedRouter};
+use crate::governance::{CallOutcome, GovernedRouter, ReadAuthorization};
 use crate::protocol::{
     error_response, parse_request, success, RpcError, GOVERNANCE_NOT_WIRED, INVALID_PARAMS,
     INVALID_REQUEST, METHOD_NOT_FOUND,
 };
 use crate::registry::ToolRegistry;
+use myelin_agent::EffectKind;
 use myelin_events::Timestamp;
+use myelin_identity::Principal;
 
 /// The MCP protocol version this server advertises (the MCP revision string).
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -38,12 +40,33 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// tests can supply a fixed instant without freezing a long-lived production process in time.
 pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
-/// The MCP server — the tool registry + an OPTIONAL governance router. With a router wired,
-/// `tools/call` routes through `mint_run_token → EffectApi::apply`; without one, the protocol +
-/// catalogue (`initialize` / `tools/list`) are fully live and `tools/call` is honestly "not wired".
+/// Error returned by a direct subsystem read adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirectReadError {
+    InvalidInput(String),
+    Denied,
+    NotFound,
+    Unavailable,
+}
+
+/// Direct read boundary injected by the production composition root. The server supplies the exact
+/// agent principal from the governed run; implementations must perform object-level authorization.
+pub trait DirectReadExecutor: Send + Sync {
+    fn execute(
+        &self,
+        principal: &Principal,
+        authority: &ReadAuthorization,
+        tool: &str,
+        arguments: &Value,
+    ) -> Result<Value, DirectReadError>;
+}
+
+/// The MCP server — the registry plus optional governed mutation/direct-read adapters. Without a
+/// router, the protocol catalogue is live and calls honestly refuse as not wired.
 pub struct McpServer {
     registry: ToolRegistry,
     router: Option<GovernedRouter>,
+    read_executor: Option<Arc<dyn DirectReadExecutor>>,
     /// The clock each governed call mints/consults under. Production uses a wall clock; tests can
     /// inject a deterministic clock.
     clock: Clock,
@@ -55,6 +78,7 @@ impl McpServer {
         McpServer {
             registry: ToolRegistry::with_git(),
             router: None,
+            read_executor: None,
             clock: Arc::new(system_now),
         }
     }
@@ -73,6 +97,36 @@ impl McpServer {
         McpServer {
             registry,
             router: Some(router),
+            read_executor: None,
+            clock,
+        }
+    }
+
+    /// A production server with both governed mutations and direct permission-checked reads.
+    pub fn with_router_and_reads(
+        registry: ToolRegistry,
+        router: GovernedRouter,
+        read_executor: Arc<dyn DirectReadExecutor>,
+    ) -> McpServer {
+        McpServer::with_router_reads_and_clock(
+            registry,
+            router,
+            read_executor,
+            Arc::new(system_now),
+        )
+    }
+
+    /// Testable form of [`McpServer::with_router_and_reads`] with a dynamic injected clock.
+    pub fn with_router_reads_and_clock(
+        registry: ToolRegistry,
+        router: GovernedRouter,
+        read_executor: Arc<dyn DirectReadExecutor>,
+        clock: Clock,
+    ) -> McpServer {
+        McpServer {
+            registry,
+            router: Some(router),
+            read_executor: Some(read_executor),
             clock,
         }
     }
@@ -195,10 +249,10 @@ impl McpServer {
         let router = self.router.as_ref().ok_or_else(|| {
             RpcError::new(
                 GOVERNANCE_NOT_WIRED,
-                "governed routing not wired into this server instance: a tools/call mints a per-run \
-                 token and routes through EffectApi::apply (MR-006); the minter + the EffectApi body \
-                 are injected by the composition root (myelin-agent-service) — not the standalone \
-                 protocol shell. See the governed_routing integration test for the end-to-end path.",
+                "governed routing not wired into this server instance: a tools/call must act under \
+                 a per-run token and then follow its ToolDef route; the minter and execution \
+                 adapters are injected by the production composition root, not the catalogue-only \
+                 protocol shell.",
             )
         })?;
         if router.is_fatal() {
@@ -206,6 +260,31 @@ impl McpServer {
                 GOVERNANCE_NOT_WIRED,
                 "governed session is terminal after an indeterminate mutation outcome",
             ));
+        }
+
+        match tool.effect_kind() {
+            EffectKind::Read => {
+                let executor = self.read_executor.as_ref().ok_or_else(|| {
+                    RpcError::new(
+                        GOVERNANCE_NOT_WIRED,
+                        "direct read routing is not wired into this server instance",
+                    )
+                })?;
+                let authorization = match router.authorize_read(&tool, &(self.clock)()) {
+                    Ok(authorization) => authorization,
+                    Err(outcome) => return Ok(call_result_json(name, &outcome)),
+                };
+                let result =
+                    executor.execute(&router.principal().agent, &authorization, name, &args);
+                return Ok(read_result_json(name, authorization.jti(), result));
+            }
+            EffectKind::Compute => {
+                return Err(RpcError::new(
+                    GOVERNANCE_NOT_WIRED,
+                    "sandbox compute routing is not wired into this MCP server",
+                ))
+            }
+            EffectKind::Mutate | EffectKind::External => {}
         }
 
         // HITL (R2.4): a re-drive after a human approved the card PRESENTS the server-issued
@@ -235,13 +314,7 @@ impl McpServer {
                 )
             })?;
 
-        let outcome = router.call(
-            &tool,
-            &args,
-            idempotency_key,
-            &now,
-            presented_gate_id,
-        );
+        let outcome = router.call(&tool, &args, idempotency_key, &now, presented_gate_id);
         Ok(call_result_json(name, &outcome))
     }
 
@@ -344,6 +417,42 @@ fn call_result_json(tool: &str, outcome: &CallOutcome) -> Value {
             meta["reason"] = json!(reason);
             meta["fatal"] = json!(true);
         }
+    }
+    json!({
+        "content": [ { "type": "text", "text": text } ],
+        "isError": is_error,
+        "_meta": meta
+    })
+}
+
+fn read_result_json(tool: &str, jti: &str, result: Result<Value, DirectReadError>) -> Value {
+    let (text, is_error, reason) = match result {
+        Ok(value) => (
+            serde_json::to_string(&value)
+                .unwrap_or_else(|_| "{\"error\":\"serialization refused\"}".into()),
+            false,
+            None,
+        ),
+        Err(DirectReadError::InvalidInput(reason)) => (
+            format!("`{tool}` refused invalid input: {reason}"),
+            true,
+            Some("invalid_input"),
+        ),
+        Err(DirectReadError::Denied) => (format!("`{tool}` was denied."), true, Some("denied")),
+        Err(DirectReadError::NotFound) => (
+            format!("`{tool}` did not find a visible CI run."),
+            true,
+            Some("not_found"),
+        ),
+        Err(DirectReadError::Unavailable) => (
+            format!("`{tool}` is temporarily unavailable."),
+            true,
+            Some("unavailable"),
+        ),
+    };
+    let mut meta = json!({ "runToken": jti, "tool": tool });
+    if let Some(reason) = reason {
+        meta["reason"] = json!(reason);
     }
     json!({
         "content": [ { "type": "text", "text": text } ],

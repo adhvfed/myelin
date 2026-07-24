@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI. Still required: honest cross-service live-log SSE, MCP, the live founder push→CI→surfaced-check/log pass, then CT-007.** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification. Still required: honest cross-service live-log SSE, the live founder push→CI→surfaced-check/log pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1491,7 +1491,7 @@ Mechanical payoff: frontend contracts in the permanent coverage gate = 1→2; CI
 transparent CI cursors admitted by the dev implementation = 0; live-tail claims without a
 cross-service resume transport = 0.
 
-**Honest remaining R4.2 floors:** complete CT-005's cross-service live-log SSE and MCP surface; start
+**Honest remaining R4.2 floors:** complete CT-005's cross-service live-log SSE; start
 the three CI services and production Edge against the founder cell; push a real Myelin commit; and
 observe the exact head's required check settle green with archived/live output through the verifier
 and browser. Only after the complete surface and founder pass may CT-007 remove GitHub Actions. No
@@ -1632,6 +1632,57 @@ removed, and the CI-owned grammar now rejects structurally impossible cursor fra
 
 L3 CT-005d footprint: **12 files, +1,798 / -25 lines** for the CI-owned grammar, thin CLI mapping,
 strict request-bound response decoder, compiled contract proof, human renderer, and ledgers.
+
+**CT-005e durable MCP-read increment (2026-07-24; live tail and founder acceptance remain open).**
+CI Controlplane now owns the exact external grammar for `read_run` and `read_log` in its shared
+`ToolDef` catalogue and marks only those two production-backed operations `exposed_over_mcp`.
+MCP projects their schema, `run.view` capability, read effect kind, non-side-effecting declaration,
+and non-HITL default verbatim. Every other CI tool remains absent. Git's older
+`AgentToolDef` catalogue is isolated behind an explicit compatibility adapter rather than becoming
+a model for new subsystem registrations, and malformed or duplicate shared definitions refuse
+registry construction.
+
+The server routes on `ToolDef.effect_kind`: non-side-effecting reads do not require a caller
+idempotency key and do not create a mutation-shaped `proposed_effect`; Git mutations retain their
+server-side HITL, caller-stable idempotency, durable governance audit, and `EffectApi` route.
+Before a read, the router lazily mints the session's attenuated per-run token, consults durable S7,
+and binds every exact ToolDef capability. The concrete CI adapter then independently verifies the
+signed token and caveats, AgentRun purpose and positive durable delegation snapshot, carrier JTI,
+exact agent subject and tenant/region scope, current S7 liveness, and signed `run.view` immediately
+before object access. The response carries the run-token JTI. A complete content-addressed
+tool-call/result transcript remains owned by the Agent trace runtime and is not fabricated by this
+transport increment.
+
+Both MCP reads call the same extracted `DurableCiReadApi` used by authenticated Edge HTTP. That API
+resolves the run's canonical parent repository, applies Git's exact Pull decision, preserves
+denied/absent 404 equivalence, and reuses the existing repeatable-read detail and bounded,
+content-addressed, re-hash-on-read archived-log materialization. MCP accepts no tenant or region
+argument. Production boot now applies Flow and CI Controlplane migrations, verifies the exact CI
+keyset index shape, admits the CI ReBAC fragment, derives bootstrap capabilities from the real
+production registry so `run.view` is legal, and injects the same cryptographic verifier and durable
+revocation store into the Git mutation and CI read final boundaries.
+
+Mechanical evidence: the full DB-free MCP suite passes (21 library, 5 binary, 1 shared ToolDef CDC,
+4 governed Git effects, 2 governance-audit, 21 governed-routing, and stdio coverage). A live
+PostgreSQL proof composes the real `GovernedRouter → CiDirectReadExecutor → RunTokenAuthorizer →
+DurableCiReadApi`: a deliberately different final-boundary S7 denies, while the shared store admits
+the signed token and returns the exact repository-authorized durable run plus its JTI. Both live
+Edge CI integrations pass, including shared dev-edge golden parity, direct/HTTP payload equality,
+and denied/absent behavior. Warnings-denied all-target/all-feature MCP clippy, contract coverage
+(99 rows, 83 covered, 16 deferred, two frontend contracts, zero false claims), architecture lint
+(762 files, zero violations), shrink-only erosion/dependency budgets, targeted rustfmt, and diff
+check are green. The convention-only production bootstrap source test was deleted because comments
+could satisfy it; executable composition and live integration proofs now carry that signal.
+Independent adversarial review's only MEDIUM was the missing composed final-boundary proof; the live
+negative/positive test closes it, with no implementation HIGH found.
+
+Mechanical payoff: shared CI ToolDefs honestly projected into MCP = 0→2; unimplemented CI tools
+advertised = 0; CI reads forced through mutation idempotency/`EffectApi` = 0; final-boundary signed
+token verifications per successful read = 1; newly retained self-fulfilling source tests = 0.
+
+L3 CT-005e footprint: **22 files, +1,519 / -335 lines** for shared definitions and registration,
+effect-kind routing, the durable read adapter, production composition, executable proofs, deletion
+of the source-string test, and ledgers.
 
 ## R5–R6
 

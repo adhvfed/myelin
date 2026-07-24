@@ -45,8 +45,9 @@ use myelin_tenancy::{Region, TenantId};
 
 use myelin_mcp::governance::{mcp_effect_key, SkeletonEffectApi};
 use myelin_mcp::{
-    AuditPhase, CallOutcome, GateApproverPolicy, GovernanceAudit, GovernanceAuditRecord,
-    GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal, ToolRegistry,
+    AuditPhase, CallOutcome, DirectReadError, DirectReadExecutor, GateApproverPolicy,
+    GovernanceAudit, GovernanceAuditRecord, GovernedRouter, McpServer, OutboxGovernanceAudit,
+    ReadAuthorization, RunPrincipal, ToolRegistry,
 };
 use myelin_storage::hitl_gate_durable::{GateDecideError, GateRecord, GateState, HitlVerdictStore};
 
@@ -268,6 +269,41 @@ fn governed_server() -> McpServer {
     McpServer::with_router_and_clock(ToolRegistry::with_git(), governed_router(), Arc::new(now))
 }
 
+struct RecordingReadExecutor {
+    calls: AtomicUsize,
+}
+
+impl DirectReadExecutor for RecordingReadExecutor {
+    fn execute(
+        &self,
+        principal: &Principal,
+        authority: &ReadAuthorization,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value, DirectReadError> {
+        assert_eq!(principal.principal_id.0, "agent:claude");
+        assert_eq!(principal.tenant.0, "acme");
+        assert_eq!(principal.region.0, "eu-west");
+        assert_eq!(authority.tool(), tool);
+        assert_eq!(authority.required_caps(), ["run.view"]);
+        assert!(!authority.jti().is_empty());
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!({
+            "tool": tool,
+            "run_id": arguments["run_id"],
+        }))
+    }
+}
+
+fn ci_read_router(grants: &[&str]) -> GovernedRouter {
+    governed_router_with_input(DelegationInput {
+        agent_policy: Authority::of(grants.iter().copied()),
+        delegation: Authority::of(grants.iter().copied()),
+        tenant_policy: Authority::of(grants.iter().copied()),
+        trigger_actor_held: Authority::of(grants.iter().copied()),
+    })
+}
+
 #[test]
 fn declared_caps_fail_closed_for_missing_and_attenuated_delegation() {
     let registry = ToolRegistry::with_git();
@@ -347,6 +383,129 @@ fn handshake_and_tools_list_over_the_running_protocol() {
         .find(|t| t["name"] == "git.submit_review")
         .unwrap();
     assert_eq!(review["annotations"]["requiresApproval"], false);
+}
+
+#[test]
+fn ci_read_projects_shared_schema_and_routes_directly_without_idempotency() {
+    let recorder = Arc::new(RecordingReadExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let registry = ToolRegistry::with_git_and_ci_reads().unwrap();
+    let server = McpServer::with_router_reads_and_clock(
+        registry,
+        ci_read_router(&["run.view"]),
+        recorder.clone(),
+        Arc::new(now),
+    );
+
+    let listed = drive(
+        &server,
+        &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#],
+    );
+    let read_run = listed[0]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "ci.read_run")
+        .unwrap();
+    assert_eq!(read_run["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        read_run["inputSchema"],
+        serde_json::from_str::<serde_json::Value>(
+            &myelin_ci_controlplane::ci_tool_def("read_run").input_schema
+        )
+        .unwrap()
+    );
+
+    // No idempotency metadata: reads are not mutation-shaped.
+    let response = drive(
+        &server,
+        &[
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ci.read_run","arguments":{"run_id":"01234567-89ab-cdef-0123-456789abcdef"}}}"#,
+        ],
+    );
+    assert_eq!(response[0]["result"]["isError"], false);
+    let body: serde_json::Value = serde_json::from_str(
+        response[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["tool"], "ci.read_run");
+    assert_eq!(recorder.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        response[0]["result"]["_meta"]["runToken"]
+            .as_str()
+            .is_some_and(|jti| !jti.is_empty()),
+        "direct read is attributed to the exact minted run token"
+    );
+
+    let mutation_without_key = drive(
+        &server,
+        &[
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"git.open_pr","arguments":{"repo":"alpha"}}}"#,
+        ],
+    );
+    assert_eq!(mutation_without_key[0]["error"]["code"], -32602);
+}
+
+#[test]
+fn ci_read_capability_and_revocation_deny_before_the_adapter() {
+    let denied_recorder = Arc::new(RecordingReadExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let denied = McpServer::with_router_reads_and_clock(
+        ToolRegistry::with_git_and_ci_reads().unwrap(),
+        ci_read_router(&["repo.push"]),
+        denied_recorder.clone(),
+        Arc::new(now),
+    );
+    let response = drive(
+        &denied,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ci.read_run","arguments":{"run_id":"01234567-89ab-cdef-0123-456789abcdef"}}}"#,
+        ],
+    );
+    assert_eq!(response[0]["result"]["isError"], true);
+    assert!(response[0]["result"]["_meta"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("run.view"));
+    assert_eq!(denied_recorder.calls.load(Ordering::SeqCst), 0);
+
+    let revoked_recorder = Arc::new(RecordingReadExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let revoked = McpServer::with_router_reads_and_clock(
+        ToolRegistry::with_git_and_ci_reads().unwrap(),
+        ci_read_router(&["run.view"]),
+        revoked_recorder.clone(),
+        Arc::new(now),
+    );
+    let first = drive(
+        &revoked,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ci.read_run","arguments":{"run_id":"01234567-89ab-cdef-0123-456789abcdef"}}}"#,
+        ],
+    );
+    assert_eq!(first[0]["result"]["isError"], false);
+    let router = revoked.router().unwrap();
+    let token = router.current_token().unwrap();
+    router
+        .minter()
+        .teardown(&router.principal().scope, &token, &now());
+    let second = drive(
+        &revoked,
+        &[
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ci.read_run","arguments":{"run_id":"01234567-89ab-cdef-0123-456789abcdef"}}}"#,
+        ],
+    );
+    assert_eq!(second[0]["result"]["isError"], true);
+    assert!(second[0]["result"]["_meta"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("revoked"));
+    assert_eq!(revoked_recorder.calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

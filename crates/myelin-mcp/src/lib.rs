@@ -10,13 +10,11 @@
 //! - **Protocol** ([`protocol`]) — hand-built JSON-RPC 2.0 framing (newline-delimited JSON over
 //!   stdio). There is no MCP/rmcp crate in `Cargo.lock`, so it is built on `serde_json` (minimal-deps
 //!   ethos). Total over malformed input (a bad line → a JSON-RPC error, never a panic).
-//! - **Registry** ([`registry`]) — the tool-registration framework. The catalogue is a thin
-//!   projection of each subsystem's OWN `agent_tools()` (git first). A NEW git tool in
-//!   [`myelin_git::api::agent_tools`] flows to the MCP server with NO re-declaration.
-//! - **Governance** ([`governance`]) — THE MR-006 BINDING. Every `tools/call` routes through
-//!   `mint_run_token → EffectApi::apply` under a per-run [`myelin_agent::RunCtx`] (the platform-owned
-//!   plan-then-apply chokepoint), HITL-gated where `requires_approval`, audited/attributed to the run.
-//!   NEVER a bare human PAT; NEVER a direct mutation.
+//! - **Registry** ([`registry`]) — a direct projection of shared [`myelin_agent::ToolDef`] values;
+//!   Git's older catalogue stays behind an explicit compatibility adapter.
+//! - **Governance** ([`governance`]) — every `tools/call` acts under a minted run token. Reads go
+//!   directly to a permission-checked subsystem API; mutations go through
+//!   [`myelin_agent::EffectApi`] and HITL where declared. Never a bare human PAT or direct mutation.
 //!
 //! ## Production composition
 //! The binary composes the protocol and registry with cryptographically authenticated trigger
@@ -31,14 +29,17 @@
 //! depends back on it. It is NOT a node in the eleven-crate library DAG modelled by
 //! `myelin_substrate::crate_graph` (substrate_is_root() / identity_is_sink() are unaffected).
 
+pub mod ci_read;
 pub mod governance;
 pub mod protocol;
 pub mod registry;
 pub mod server;
 
+pub use ci_read::CiDirectReadExecutor;
 pub use governance::{
     git_merge_repo_from_effect_key, AuditPhase, CallOutcome, GateApproverPolicy, GovernanceAudit,
-    GovernanceAuditRecord, GovernedRouter, OutboxGovernanceAudit, RunPrincipal, SkeletonEffectApi,
+    GovernanceAuditRecord, GovernedRouter, OutboxGovernanceAudit, ReadAuthorization, RunPrincipal,
+    SkeletonEffectApi,
 };
 pub use registry::{RegisteredTool, ToolRegistry};
-pub use server::{Clock, McpServer, MAX_FRAME_BYTES};
+pub use server::{Clock, DirectReadError, DirectReadExecutor, McpServer, MAX_FRAME_BYTES};

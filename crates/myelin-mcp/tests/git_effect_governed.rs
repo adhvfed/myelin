@@ -31,10 +31,8 @@ use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 
 #[cfg(feature = "integration")]
-use myelin_edge::recover_placed_git_at_boot;
-use myelin_edge::{
-    DenyAllRepos, DurableGitBackend, GitDatabaseProviders, GitEffectApi, GrantBackedRepos,
-};
+use myelin_edge::{recover_placed_git_at_boot, GitDatabaseProviders};
+use myelin_edge::{DenyAllRepos, DurableGitBackend, GitEffectApi, GrantBackedRepos};
 use myelin_mcp::{
     GateApproverPolicy, GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal,
     ToolRegistry,

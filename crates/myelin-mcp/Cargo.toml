@@ -9,9 +9,9 @@ publish = false
 # (Claude Code on the operator's machine) drives Myelin through as native MCP tools — under the SAME
 # governance a human is. It is the near-term answer to "agents, but not hosted yet": agent
 # GOVERNANCE (who/what did what, with what authority) is real from day one, even though agent
-# HOSTING (the real LlmAgentRuntime) stays deferred. The MR-006 binding: every `tools/call` routes
-# through `mint_run_token → EffectApi::apply` (the platform-owned governance chokepoint), NOT a bare
-# human PAT and NOT a direct mutation.
+# HOSTING (the real LlmAgentRuntime) stays deferred. Every call acts under a minted per-run token:
+# reads route to a permission-checked subsystem API; mutations route through EffectApi. Never a bare
+# human PAT or a direct mutation.
 #
 # A LEAF BINARY (like myelin-cli / myelin-edge): it depends on the subsystem tool catalogue
 # (myelin-git `api::agent_tools`), the agent-fabric governance contract (myelin-agent `EffectApi` /
@@ -34,11 +34,11 @@ path = "src/main.rs"
 # convention). The MCP surface is a thin projection of this catalogue.
 myelin-git = { path = "../myelin-git" }
 
-# REUSE the agent-fabric governance contract surface (the BRAIN-AGNOSTIC chokepoint): `EffectApi`
-# (PLAN-THEN-APPLY, §8.2) + `RunCtx` / `ProposedEffect` / `EffectResult`. The MCP server routes every
-# tool's effect through `EffectApi::apply` under a per-run `RunCtx` — it never re-implements the
-# pipeline and never mutates directly. The concrete `EffectApi` body (the eight-step PlanThenApply)
-# is injected by the composition root (myelin-agent-service); here we route through the trait.
+# REUSE the agent-fabric governance contract surface (the BRAIN-AGNOSTIC mutation chokepoint):
+# `EffectApi` (PLAN-THEN-APPLY, §8.2) + `RunCtx` / `ProposedEffect` / `EffectResult`. MCP mutations
+# route through `EffectApi::apply` under a per-run `RunCtx`; read ToolDefs route directly to a
+# permission-checked subsystem adapter under the same run token. The concrete bodies are injected
+# by the composition root.
 myelin-agent = { path = "../myelin-agent" }
 
 # REUSE the per-run attenuated token minter (`RunTokenMinter::mint_run_token`, MR-011-real): a
@@ -58,6 +58,12 @@ myelin-events = { path = "../myelin-events" }
 # The shared production Git mutation adapter and durable filesystem backend. MCP is a leaf binary;
 # myelin-edge does not depend on myelin-mcp, so this promotion is acyclic.
 myelin-edge = { path = "../myelin-edge" }
+# CI owns the shared ToolDefs projected into MCP and the durable run-store authority consumed by
+# the permission-checked Edge read adapter. Only `ci.read_run` / `ci.read_log` opt into MCP.
+myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
+# Fresh MCP deployments apply CI's Flow prerequisite before the CI schema, matching Edge's
+# production composition rather than assuming another deployable migrated first.
+myelin-flow = { path = "../myelin-flow" }
 myelin-config = { workspace = true }
 myelin-substrate = { path = "../myelin-substrate" }
 

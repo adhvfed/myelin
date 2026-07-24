@@ -147,21 +147,34 @@ pub fn ci_required_caps(tool: &str) -> Vec<String> {
 /// `required_caps`. The `requires_approval` is SEEDED from the frozen table — never hand-set — so a
 /// def cannot silently un-gate a consequential action.
 pub fn ci_tool_def(tool: &str) -> ToolDef {
+    let (input_schema, exposed_over_mcp) = match tool {
+        "read_run" => (
+            r#"{"type":"object","required":["run_id"],"properties":{"run_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}},"additionalProperties":false}"#,
+            true,
+        ),
+        "read_log" => (
+            r#"{"type":"object","required":["run_id","job_id"],"properties":{"run_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"job_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"start":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":262144}},"additionalProperties":false}"#,
+            true,
+        ),
+        _ => (r#"{"type":"object"}"#, false),
+    };
     ToolDef {
         name: ToolName(tool.to_string()),
         subsystem: CI_SUBSYSTEM.to_string(),
         version: CI_TOOL_VERSION,
-        // The agent-native triage hook reads the structured ci.run.failed payload (which step / which
-        // test / log excerpt — the E2E-2 flagship input, CI-P34); the per-tool input schema is the
-        // minimal id carrier here (the full schema is the emit follow-on).
-        input_schema: r#"{"type":"object"}"#.to_string(),
+        // The two externally projected reads carry their exact bounded wire grammar here so MCP is
+        // mechanically the same ToolDef projection as the internal agent loop. The remaining
+        // internal-only tools retain their existing opaque object carrier until their owning rows
+        // land an execution adapter.
+        input_schema: input_schema.to_string(),
         required_caps: ci_required_caps(tool),
         effect_kind: ci_effect_kind(tool),
         side_effecting: ci_side_effecting(tool),
         // SEEDED from the frozen X-6 table (deploy/secret/rollback/approve = yes; the rest = no).
         requires_approval: ci_requires_approval_default(tool),
-        // Not MCP-exposed at v1 (the external MCP endpoint is the post-M5 follow-on, AG-P25).
-        exposed_over_mcp: false,
+        // CT-005 exposes only the two durable triage reads. Every mutation and every read without a
+        // production adapter remains absent rather than becoming a catalogue-only promise.
+        exposed_over_mcp,
     }
 }
 

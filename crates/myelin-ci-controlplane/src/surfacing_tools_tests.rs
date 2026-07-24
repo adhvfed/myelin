@@ -128,7 +128,11 @@ fn tool_def_seeds_the_frozen_x6_gating() {
         );
         assert_eq!(def.subsystem, "ci");
         assert_eq!(def.version, CI_TOOL_VERSION);
-        assert!(!def.exposed_over_mcp, "not MCP-exposed at v1");
+        assert_eq!(
+            def.exposed_over_mcp,
+            matches!(*tool, "read_run" | "read_log"),
+            "only the two durable permission-checked reads are MCP-exposed"
+        );
     }
 }
 
