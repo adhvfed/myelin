@@ -13,7 +13,8 @@
 use std::sync::Arc;
 
 use myelin_ci_sandbox::{
-    CompletionClaim, CompletionSettlementOwner, TerminalReport, TerminalReporter,
+    CompletionClaim, CompletionSettlementOwner, RetryableAttemptFailure, RetryableAttemptOutcome,
+    TerminalReport, TerminalReporter,
 };
 use myelin_flow::{ExecutorError, SignalOutcome};
 use myelin_tenancy::{Region, TenantId};
@@ -109,6 +110,34 @@ impl TerminalReporter for CiPipelineReporterRouter {
             ));
         }
         reporter.report_done(claim, report)
+    }
+
+    fn report_retryable_attempt(
+        &self,
+        claim: &CompletionClaim,
+        failure: &RetryableAttemptFailure,
+    ) -> Result<RetryableAttemptOutcome, ExecutorError> {
+        if claim.tenant.0.trim().is_empty() {
+            return Err(ExecutorError::InvalidInput(
+                "ci.pipeline retryable attempt refused: claimed tenant is empty".into(),
+            ));
+        }
+        let reporter = (self.factory)(&claim.tenant, &self.region).map_err(|_| {
+            ExecutorError::InvalidInput(
+                "ci.pipeline retryable attempt refused: exact-tenant reporter is unavailable"
+                    .into(),
+            )
+        })?;
+        if reporter.tenant() != &claim.tenant
+            || reporter.region() != self.region.0
+            || reporter.completion_settlement_owner() != self.completion_settlement_owner()
+        {
+            return Err(ExecutorError::InvalidInput(
+                "ci.pipeline retryable attempt refused: reporter scope or accounting owner mismatch"
+                    .into(),
+            ));
+        }
+        reporter.report_retryable_attempt(claim, failure)
     }
 }
 

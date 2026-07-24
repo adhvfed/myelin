@@ -121,6 +121,42 @@ async fn insert_queued_run(
     .expect("insert queued run discovery fixture");
 }
 
+async fn insert_active_job_owner(admin: &PgPool, tenant: &str, region: &str, ordinal: u16) {
+    let wf_run_id = format!("10000000-0000-0000-0000-{ordinal:012}");
+    let ci_run_id = format!("40000000-0000-0000-0000-{ordinal:012}");
+    sqlx::query(
+        "INSERT INTO ci_run (
+           tenant_id, region, run_id, project_id, pipeline_id, wf_run_id,
+           definition_snapshot, trigger_kind, trust_tier, state, correlation_id
+         ) VALUES (
+           $1, $2, $3::uuid, '22222222-2222-2222-2222-222222222222'::uuid,
+           '33333333-3333-3333-3333-333333333333'::uuid, $4::uuid,
+           'myelin://ci/scheduler-active-owner', 'push', 'trusted', 'running', $3
+         )",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(&ci_run_id)
+    .bind(&wf_run_id)
+    .execute(admin)
+    .await
+    .expect("insert active CI owner for scheduler fixture");
+    sqlx::query(
+        "INSERT INTO workflow_run (
+           tenant_id, region, run_id, wf_type, wf_version, input, state, correlation_id,
+           depth, partition
+         ) VALUES (
+           $1, $2, $3, 'ci.pipeline', 1, '[]'::jsonb, 'running', $3, 0, 0
+         )",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(&wf_run_id)
+    .execute(admin)
+    .await
+    .expect("insert active Flow owner for scheduler fixture");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe() {
     let app_url = configured_url("DATABASE_URL", APP_DEFAULT);
@@ -160,10 +196,10 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         .await
         .expect("connect constrained app pool");
     let tenant_store = ci_job_queue_store(app.clone());
-    for fixture in [
-        job(&tenant_a, FR_PAR, &proof_label, 101),
-        job(&tenant_b, FR_PAR, &proof_label, 102),
-        job(&tenant_other_region, DE_FRA, &proof_label, 103),
+    for (fixture, ordinal) in [
+        (job(&tenant_a, FR_PAR, &proof_label, 101), 101),
+        (job(&tenant_b, FR_PAR, &proof_label, 102), 102),
+        (job(&tenant_other_region, DE_FRA, &proof_label, 103), 103),
     ] {
         assert_eq!(
             tenant_store
@@ -172,6 +208,7 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
                 .expect("tenant enqueue"),
             EnqueueOutcome::Inserted
         );
+        insert_active_job_owner(&admin, &fixture.tenant_id, &fixture.region, ordinal).await;
     }
     insert_queued_run(&admin, &tenant_a, FR_PAR, 201, "2001-01-01T00:00:00Z").await;
     insert_queued_run(&admin, &tenant_b, FR_PAR, 202, "2000-01-01T00:00:00Z").await;
@@ -400,14 +437,15 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         .await
         .expect("terminalize tenant B fixture"));
 
-    for fixture in [
-        job(&tenant_a, FR_PAR, &proof_label, 104),
-        job(&tenant_b, FR_PAR, &proof_label, 105),
+    for (fixture, ordinal) in [
+        (job(&tenant_a, FR_PAR, &proof_label, 104), 104),
+        (job(&tenant_b, FR_PAR, &proof_label, 105), 105),
     ] {
         tenant_store
             .enqueue(&fixture)
             .await
             .expect("enqueue concurrent fixture");
+        insert_active_job_owner(&admin, &fixture.tenant_id, &fixture.region, ordinal).await;
     }
     let claim_a = region_store.clone();
     let claim_b = region_store.clone();

@@ -28,10 +28,10 @@
 
 use myelin_ci_controlplane::{
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, BUMP_CHECK_ATTEMPT_SQL, CLAIM_QUERY,
-    CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL, CREATE_CI_JOB_DDL, CREATE_CI_RUN_DDL,
-    CREATE_JOB_QUEUE_DDL, CREATE_LOG_ANCHOR_DDL, INSERT_COST_EVENT_QUERY, REAP_QUERY,
-    SELECT_COST_EVENTS_FOR_RUN_QUERY, UPSERT_LOG_ANCHOR_QUERY,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    BUMP_CHECK_ATTEMPT_SQL, CLAIM_QUERY, CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL,
+    CREATE_CI_JOB_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL, CREATE_LOG_ANCHOR_DDL,
+    INSERT_COST_EVENT_QUERY, REAP_QUERY, SELECT_COST_EVENTS_FOR_RUN_QUERY, UPSERT_LOG_ANCHOR_QUERY,
 };
 use sqlx::types::Uuid;
 use sqlx::{PgPool, Row};
@@ -100,16 +100,16 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
     let suffix = std::process::id();
     let tbl = format!("job_queue_ct004_{suffix}");
     let fair = format!("fair_deficit_ct004_{suffix}");
+    let workflow = format!("workflow_run_ct004_{suffix}");
+    let ci_run = format!("ci_run_owner_ct004_{suffix}");
 
     let p1 = reopen().await;
-    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
-        .execute(&p1)
-        .await
-        .ok();
-    sqlx::query(&format!("DROP TABLE IF EXISTS {fair}"))
-        .execute(&p1)
-        .await
-        .ok();
+    for table in [&tbl, &fair, &workflow, &ci_run] {
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(&p1)
+            .await
+            .ok();
+    }
     let create = CREATE_JOB_QUEUE_DDL.replace("EXISTS job_queue (", &format!("EXISTS {tbl} ("));
     sqlx::query(&create)
         .execute(&p1)
@@ -131,7 +131,12 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
         .execute(&p1)
         .await
         .expect("apply job_queue claim-time columns");
-    sqlx::query(&format!(
+    let alter = ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL.replace("job_queue", &tbl);
+    sqlx::query(&alter)
+        .execute(&p1)
+        .await
+        .expect("apply job_queue retryable-attempt accrual");
+    sqlx::raw_sql(&format!(
         "CREATE TABLE IF NOT EXISTS {fair} (tenant_id text NOT NULL, region text NOT NULL, \
          fair_key text NOT NULL, deficit bigint NOT NULL DEFAULT 0, \
          PRIMARY KEY (tenant_id, region, fair_key))"
@@ -139,6 +144,19 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
     .execute(&p1)
     .await
     .expect("apply fair_deficit");
+    sqlx::raw_sql(&format!(
+        "CREATE TABLE {workflow} (
+           tenant_id text NOT NULL, region text NOT NULL, run_id text NOT NULL, state text NOT NULL,
+           PRIMARY KEY (tenant_id, run_id)
+         );
+         CREATE TABLE {ci_run} (
+           tenant_id text NOT NULL, region text NOT NULL, wf_run_id uuid NOT NULL, state text NOT NULL,
+           PRIMARY KEY (tenant_id, wf_run_id)
+         )"
+    ))
+    .execute(&p1)
+    .await
+    .expect("apply authoritative lifecycle tables");
 
     // Seed two eligible queued jobs: `kept` (claimed + committed) and `ghost` (claimed in an aborted tx).
     let enqueue = |job: &str, run: &str, idem: &str, ago: i64| -> String {
@@ -159,10 +177,27 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
         .execute(&p1)
         .await
         .unwrap();
+    sqlx::raw_sql(&format!(
+        "INSERT INTO {workflow} (tenant_id, region, run_id, state) VALUES
+           ('acme', 'fr-par', '{}', 'running'),
+           ('acme', 'fr-par', '{}', 'running');
+         INSERT INTO {ci_run} (tenant_id, region, wf_run_id, state) VALUES
+           ('acme', 'fr-par', '{}', 'running'),
+           ('acme', 'fr-par', '{}', 'running')",
+        uid("run-kept"),
+        uid("run-ghost"),
+        uid("run-kept"),
+        uid("run-ghost")
+    ))
+    .execute(&p1)
+    .await
+    .expect("seed active Flow and CI owners");
 
     let claim_sql = CLAIM_QUERY
         .replace("job_queue", &tbl)
-        .replace("fair_deficit", &fair);
+        .replace("fair_deficit", &fair)
+        .replace("workflow_run", &workflow)
+        .replace("ci_run", &ci_run);
     let bind_claim = |owner: &str| {
         claim_sql
             .replacen("$1", "'fr-par'", 1)
@@ -251,6 +286,8 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
     let reaped = sqlx::query(
         &REAP_QUERY
             .replace("job_queue", &tbl)
+            .replace("workflow_run", &workflow)
+            .replace("ci_run", &ci_run)
             .replacen("$1", "'fr-par'", 1),
     )
     .fetch_all(&p2)
@@ -275,14 +312,12 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
         "reclaimed → queued"
     );
 
-    sqlx::query(&format!("DROP TABLE {tbl}"))
-        .execute(&p2)
-        .await
-        .ok();
-    sqlx::query(&format!("DROP TABLE {fair}"))
-        .execute(&p2)
-        .await
-        .ok();
+    for table in [&tbl, &fair, &workflow, &ci_run] {
+        sqlx::query(&format!("DROP TABLE {table}"))
+            .execute(&p2)
+            .await
+            .ok();
+    }
     println!(
         "[CT-004] PASS scheduler: committed lease survives kill-9/reopen (leased,worker-kept); \
          uncommitted claim → 0 ghost (ghost stays queued); reaper reclaims expired lease after reopen → queued"
@@ -579,7 +614,9 @@ async fn log_anchor_persists_across_kill9() {
         .await
         .expect("apply log_anchor DDL");
 
-    let upsert = UPSERT_LOG_ANCHOR_QUERY.replace("INTO log_anchor", &format!("INTO {tbl}"));
+    let upsert = UPSERT_LOG_ANCHOR_QUERY
+        .replace("INTO log_anchor", &format!("INTO {tbl}"))
+        .replace("log_anchor.", &format!("{tbl}."));
     // Open the anchor (running) and commit it.
     sqlx::query(&upsert)
         .bind("acme")

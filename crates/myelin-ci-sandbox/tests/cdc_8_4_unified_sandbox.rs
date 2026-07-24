@@ -104,6 +104,7 @@ impl SandboxBackend for RunnerSeam {
                 guest_id: "guest-1".into(),
             },
             result,
+            output_complete: true,
         })
     }
 

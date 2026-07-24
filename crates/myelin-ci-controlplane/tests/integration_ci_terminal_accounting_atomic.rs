@@ -13,12 +13,14 @@ use myelin_ci_controlplane::{
     CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiPipelineReporter,
     CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert,
     CiRunStoreError, CiRunTerminalState, DurableCiJobAccounting, DurableCiRunFinalizer,
-    DurableLeaseAdapter, GrantedCiJobV1, ManifestBoundCiJobTokenAuthority, PricedCiJobUsage,
+    DurableEnqueue, DurableLeaseAdapter, GrantedCiJobV1, JobQueueReaper, Lane,
+    ManifestBoundCiJobTokenAuthority, PgCiRunSupersession, PricedCiJobUsage,
     CI_RUNNER_LEASE_TTL_SECS, LINUX_SMALL_V1_RUNNER_LABELS, TIER_P_OPERATIONAL_PRICING_REVISION,
 };
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    CompletionClaim, CompletionSettlementOwner, CountingFirehose, ResourceUsage, RunnerAgent,
+    CompletionClaim, CompletionSettlementOwner, CountingFirehose, ResourceUsage,
+    RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome, RunnerAgent,
     TerminalReport, TerminalReporter, TrustTier,
 };
 use myelin_config::MyelinConfig;
@@ -252,9 +254,21 @@ async fn drive_clock(pool: &PgPool) -> (i64, String) {
     .unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure() {
-    let schema = format!("ci_accounting_{}", std::process::id());
+async fn run_reporter_scenario(
+    supersession_wins_first: bool,
+    runner_abandoned: bool,
+    retry_then_supersession: bool,
+) {
+    let suffix = if runner_abandoned {
+        "cancel_abandoned"
+    } else if supersession_wins_first {
+        "cancel_reported"
+    } else if retry_then_supersession {
+        "retry_cancelled"
+    } else {
+        "retry_first"
+    };
+    let schema = format!("ci_accounting_{}_{}", std::process::id(), suffix);
     let bootstrap = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&admin_url())
@@ -306,7 +320,7 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
          ) ON {schema}.job_queue FROM myelin_ci_region_scheduler;
          REVOKE SELECT ON {schema}.fair_deficit FROM myelin_ci_region_scheduler;
          REVOKE SELECT (
-           tenant_id, region, state, created_at, run_id
+           tenant_id, region, state, created_at, run_id, wf_run_id
          ) ON {schema}.ci_run FROM myelin_ci_region_scheduler;
          REVOKE SELECT (
            tenant_id, region, run_id, wf_type, state, partition, created_at
@@ -340,7 +354,7 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
             trust_tier: "trusted".into(),
             state: "queued".into(),
             correlation_id: "accounting-live".into(),
-            cause_event_id: None,
+            cause_event_id: Some("trigger-accounting-live".into()),
             cause_depth: 0,
             caused_by: None,
             repo_ref: Some(format!("myelin://{}/git/repo/core", tenant.0)),
@@ -358,23 +372,24 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     let manifest_store =
         CiDriveManifestStore::new(pool.clone(), tenant.clone(), region.clone()).unwrap();
     let production_definition = ci_manifest_pipeline_definition();
-    let manifest_digest = manifest_store
-        .insert(&manifest(
-            &tenant.0,
-            &region.0,
-            wf_run,
-            ci_run,
-            job,
-            skipped_job,
-            production_definition.code_hash(),
-        ))
-        .await
-        .unwrap();
+    let mut drive_manifest = manifest(
+        &tenant.0,
+        &region.0,
+        wf_run,
+        ci_run,
+        job,
+        skipped_job,
+        production_definition.code_hash(),
+    );
+    if supersession_wins_first || retry_then_supersession {
+        drive_manifest.jobs.truncate(1);
+        drive_manifest.check_attempts.remove("package");
+    }
+    let manifest_digest = manifest_store.insert(&drive_manifest).await.unwrap();
 
     sqlx::query(
         "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
-         VALUES ($1, $2, $3, 100, 'inflight'),
-                ($1, $2, 'reserve:skipped-live', 40, 'reserved')",
+         VALUES ($1, $2, $3, 100, 'inflight')",
     )
     .bind(&tenant.0)
     .bind(&region.0)
@@ -382,6 +397,17 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     .execute(&pool)
     .await
     .unwrap();
+    if !supersession_wins_first && !retry_then_supersession {
+        sqlx::query(
+            "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
+             VALUES ($1, $2, 'reserve:skipped-live', 40, 'reserved')",
+        )
+        .bind(&tenant.0)
+        .bind(&region.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
 
     let principal = Principal::new(
         tenant.clone(),
@@ -575,6 +601,416 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
             .unwrap();
     assert_eq!(first_state, "running");
 
+    let retryable = RetryableAttemptFailure {
+        cause: RetryableAttemptCause::OutputPersistence,
+        usage: report.usage,
+    };
+    if supersession_wins_first {
+        sqlx::query(
+            "UPDATE workflow_run
+             SET state = 'terminated', cancel_reason = 'superseded-by-newer-pr-head'
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+        )
+        .bind(&tenant.0)
+        .bind(&region.0)
+        .bind(wf_run)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE ci_run
+             SET state = 'cancelled', cost_settled = false, finished_at = clock_timestamp(),
+                 cause_event_id = 'trigger-cancel', correlation_id = 'cancel-correlation'
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid",
+        )
+        .bind(&tenant.0)
+        .bind(&region.0)
+        .bind(ci_run)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE job_queue SET lease_expires = statement_timestamp() - interval '1 second'
+             WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+        )
+        .bind(&tenant.0)
+        .bind(&region.0)
+        .bind(job)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            region_store.reap(&region.0).await.unwrap(),
+            0,
+            "the generic dead-runner reaper never resurrects a terminated workflow"
+        );
+        assert!(
+            region_store
+                .claim(
+                    &region.0,
+                    &runner_labels,
+                    &[TrustTier::Trusted],
+                    "obsolete-before-report",
+                    CI_RUNNER_LEASE_TTL_SECS as u64,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "a cancelled run is unclaimable even before late accounting closes"
+        );
+        if runner_abandoned {
+            let poison_tenant = "aaa-poison";
+            let poison_wf = "01111111-1111-8111-8111-111111111111";
+            let poison_ci = "02222222-2222-8222-8222-222222222222";
+            let poison_job = "03333333-3333-8333-8333-333333333333";
+            sqlx::query(
+                "INSERT INTO workflow_run (
+                   tenant_id, region, run_id, wf_type, wf_version, input, state, correlation_id,
+                   depth, partition, idem_key
+                 ) VALUES (
+                   $1, $2, $3, 'ci.pipeline', 1, '[]'::jsonb, 'terminated', $3, 0, 0,
+                   'poison-cancelled-recovery'
+                 )",
+            )
+            .bind(poison_tenant)
+            .bind(&region.0)
+            .bind(poison_wf)
+            .execute(&pool)
+            .await
+            .unwrap();
+            ci_runs
+                .insert_ci_run(&CiRunInsert {
+                    tenant_id: poison_tenant.into(),
+                    region: region.0.clone(),
+                    run_id: poison_ci.into(),
+                    project_id: "05555555-5555-8555-8555-555555555555".into(),
+                    pipeline_id: "06666666-6666-8666-8666-666666666666".into(),
+                    wf_run_id: poison_wf.into(),
+                    definition_snapshot: format!("blake3:{}", "f".repeat(64)),
+                    trigger_kind: "push".into(),
+                    concurrency_group: None,
+                    pr_head_generation: None,
+                    trust_tier: "trusted".into(),
+                    state: "queued".into(),
+                    correlation_id: "poison-cancelled-recovery".into(),
+                    cause_event_id: Some("trigger-poison-cancelled-recovery".into()),
+                    cause_depth: 0,
+                    caused_by: None,
+                    repo_ref: Some(format!("myelin://{poison_tenant}/git/repo/core")),
+                    commit_oid: Some("badc0de".into()),
+                    triggered_by: None,
+                })
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE ci_run
+                 SET state = 'cancelled', finished_at = clock_timestamp()
+                 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid",
+            )
+            .bind(poison_tenant)
+            .bind(&region.0)
+            .bind(poison_ci)
+            .execute(&pool)
+            .await
+            .unwrap();
+            ci_job_queue_store(pool.clone())
+                .enqueue(&DurableEnqueue {
+                    tenant_id: poison_tenant.into(),
+                    region: region.0.clone(),
+                    job_id: poison_job.into(),
+                    run_id: poison_wf.into(),
+                    lane: Lane::Interactive,
+                    labels: runner_labels.clone(),
+                    trust_tier: TrustTier::Trusted,
+                    concurrency_group: None,
+                    fair_key: poison_tenant.into(),
+                    idem_token: "poison-cancelled-recovery".into(),
+                    stage: "build".into(),
+                })
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE job_queue
+                 SET state = 'running', lease_owner = 'dead-poison-runner',
+                     lease_expires = statement_timestamp() - interval '1 second',
+                     lease_epoch = 1, claim_nonce = $4::uuid,
+                     claim_started_at = statement_timestamp() - interval '2 seconds',
+                     claim_expires_at = statement_timestamp() - interval '1 second'
+                 WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+            )
+            .bind(poison_tenant)
+            .bind(&region.0)
+            .bind(poison_job)
+            .bind("04444444-4444-8444-8444-444444444444")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let reaper = JobQueueReaper::new(
+                region_store.clone(),
+                region.0.clone(),
+                std::time::Duration::from_secs(1),
+            )
+            .with_cancelled_accounting(pool.clone(), ledger.clone());
+            let recovery_error = reaper
+                .reap_once()
+                .await
+                .expect_err("the poison candidate is surfaced after the healthy candidate runs");
+            let rendered = recovery_error.to_string();
+            assert!(
+                rendered.contains("1 cancelled recovery candidate(s) failed")
+                    && rendered.contains("after 1 row(s) were recovered"),
+                "the bounded sweep reports the isolated poison failure and committed progress: \
+                 {rendered}"
+            );
+            assert_eq!(
+                counts(&pool, job, wf_run).await,
+                (1, 2, 0, "terminal".into())
+            );
+            let poison_state: String = sqlx::query_scalar(
+                "SELECT state FROM job_queue WHERE tenant_id = $1 AND job_id = $2::uuid",
+            )
+            .bind(poison_tenant)
+            .bind(poison_job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                poison_state, "running",
+                "the corrupt first candidate rolls back without blocking the later tenant"
+            );
+            let accounting: (bool, i64, i64) = sqlx::query_as(
+                "SELECT skipped, cpu_seconds, mem_byte_seconds
+                 FROM ci_job_accounting WHERE job_id = $1::uuid",
+            )
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                accounting,
+                (false, 60, 60 * 1_073_741_824),
+                "unknown crash usage is conservatively closed at immutable manifest ceilings"
+            );
+            let run_closed: bool = sqlx::query_scalar(
+                "SELECT cost_settled FROM ci_run WHERE tenant_id = $1 AND run_id = $2::uuid",
+            )
+            .bind(&tenant.0)
+            .bind(ci_run)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(run_closed);
+            drop(pool);
+            bootstrap
+                .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                .await
+                .unwrap();
+            return;
+        }
+        assert_eq!(
+            production_reporter
+                .report_retryable_attempt(&claim, &retryable)
+                .unwrap(),
+            RetryableAttemptOutcome::Cancelled,
+            "a supersession that wins the Flow lock terminalizes and settles the measured attempt"
+        );
+        assert_eq!(
+            counts(&pool, job, wf_run).await,
+            (1, 2, 0, "terminal".into()),
+            "the late measured attempt emits no job.done and cannot become claimable again"
+        );
+        let accounting: (bool, i64, i64) = sqlx::query_as(
+            "SELECT skipped, cpu_seconds, mem_byte_seconds
+             FROM ci_job_accounting WHERE job_id = $1::uuid",
+        )
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            accounting,
+            (
+                false,
+                i64::try_from(retryable.usage.cpu_seconds).unwrap(),
+                i64::try_from(retryable.usage.mem_byte_seconds).unwrap()
+            )
+        );
+        let run_closed: bool = sqlx::query_scalar(
+            "SELECT cost_settled FROM ci_run WHERE tenant_id = $1 AND run_id = $2::uuid",
+        )
+        .bind(&tenant.0)
+        .bind(ci_run)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(run_closed, "the cancelled one-job run is cost-closed");
+        assert!(
+            region_store
+                .claim(
+                    &region.0,
+                    &runner_labels,
+                    &[TrustTier::Trusted],
+                    "obsolete-probe",
+                    CI_RUNNER_LEASE_TTL_SECS as u64,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "superseded measured work is never runnable again"
+        );
+        assert_eq!(
+            production_reporter
+                .report_retryable_attempt(&claim, &retryable)
+                .unwrap(),
+            RetryableAttemptOutcome::ExactReplay
+        );
+        assert_eq!(
+            counts(&pool, job, wf_run).await,
+            (1, 2, 0, "terminal".into())
+        );
+        drop(pool);
+        bootstrap
+            .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+            .await
+            .unwrap();
+        return;
+    }
+    assert_eq!(
+        production_reporter
+            .report_retryable_attempt(&claim, &retryable)
+            .unwrap(),
+        RetryableAttemptOutcome::Requeued,
+        "a measured log-durability failure accrues usage and requeues the exact generation"
+    );
+    assert_eq!(
+        production_reporter
+            .report_retryable_attempt(&claim, &retryable)
+            .unwrap(),
+        RetryableAttemptOutcome::ExactReplay,
+        "acknowledgement loss cannot double-accrue a failed attempt"
+    );
+    let mut divergent_retry = retryable;
+    divergent_retry.usage.cpu_seconds += 1;
+    assert!(
+        production_reporter
+            .report_retryable_attempt(&claim, &divergent_retry)
+            .is_err(),
+        "the same generation cannot replay with divergent usage"
+    );
+    assert_eq!(
+        counts(&pool, job, wf_run).await,
+        (0, 0, 0, "queued".into()),
+        "retryable attempt accounting emits no job.done and no terminal money event"
+    );
+    let accrued_count: i64 = sqlx::query_scalar(
+        "SELECT (retry_attempts->>'attempts')::bigint
+         FROM job_queue WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+    )
+    .bind(&tenant.0)
+    .bind(&region.0)
+    .bind(job)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(accrued_count, 1);
+    if retry_then_supersession {
+        let supersession = PgCiRunSupersession::new(
+            pool.clone(),
+            ledger.clone(),
+            tenant.clone(),
+            region.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        supersession
+            .cancel_running_for_test(ci_run, wf_run)
+            .await
+            .expect("the real supersession transaction cancels the retry-queued run");
+        assert_eq!(
+            counts(&pool, job, wf_run).await,
+            (1, 2, 0, "terminal".into()),
+            "real supersession settles accrued usage without job.done"
+        );
+        let accounting: (bool, i64, i64) = sqlx::query_as(
+            "SELECT skipped, cpu_seconds, mem_byte_seconds
+             FROM ci_job_accounting WHERE job_id = $1::uuid",
+        )
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            accounting,
+            (
+                false,
+                i64::try_from(retryable.usage.cpu_seconds).unwrap(),
+                i64::try_from(retryable.usage.mem_byte_seconds).unwrap()
+            )
+        );
+        assert!(region_store
+            .claim(
+                &region.0,
+                &runner_labels,
+                &[TrustTier::Trusted],
+                "obsolete-retry-probe",
+                CI_RUNNER_LEASE_TTL_SECS as u64,
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            production_reporter
+                .report_retryable_attempt(&claim, &retryable)
+                .unwrap(),
+            RetryableAttemptOutcome::ExactReplay
+        );
+        drop(pool);
+        bootstrap
+            .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+            .await
+            .unwrap();
+        return;
+    }
+
+    let second_lease = region_store
+        .claim(
+            &region.0,
+            &runner_labels,
+            &[TrustTier::Trusted],
+            owner,
+            CI_RUNNER_LEASE_TTL_SECS as u64,
+        )
+        .await
+        .unwrap()
+        .expect("the retryable failure is immediately claimable as a fresh generation");
+    assert_eq!(second_lease.lease_epoch, 2);
+    let second_spec = resolver(&second_lease).expect("the retry generation mints fresh authority");
+    let second_hooks = ci_runner_hooks(
+        provider.clone(),
+        identity.launch_authorizer(),
+        tokio::runtime::Handle::current(),
+    );
+    assert_eq!(
+        second_hooks.reserve(&second_spec).unwrap().0,
+        OPERATIONAL_RESERVE_HANDLE,
+        "the in-flight operational reservation spans retry generations"
+    );
+    second_hooks
+        .acquire_launch_permit(&second_spec)
+        .unwrap()
+        .commit_and_release()
+        .expect("the retry generation crosses the exact production launch CAS");
+    let claim = CompletionClaim {
+        tenant: tenant.clone(),
+        run: RunId(wf_run.into()),
+        job_id: job.into(),
+        idem_token: idem.clone(),
+        lease_owner: owner.into(),
+        lease_epoch: second_lease.lease_epoch,
+        claim_nonce: second_lease.claim_nonce.clone(),
+    };
+
     let finalization = CiRunFinalization {
         tenant_id: tenant.0.clone(),
         region: region.0.clone(),
@@ -695,7 +1131,7 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     assert_eq!(
         counts(&pool, job, wf_run).await,
         stale_shape,
-        "the reaped epoch-1 completion cannot mutate accounting or signal state"
+        "the reaped epoch-2 completion cannot mutate accounting or signal state"
     );
     let leases = DurableLeaseAdapter::new(
         region_store,
@@ -739,7 +1175,7 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         !recovered.report.passed && !recovered.report.timed_out,
         "the real /bin/false guest result, not a caller verdict, drives failure"
     );
-    assert_eq!(recovered.lease_epoch, 2);
+    assert_eq!(recovered.lease_epoch, 3);
     assert_eq!(firehose.jobs_finished(), 1);
     let recovered_claim = CompletionClaim {
         tenant: tenant.clone(),
@@ -774,11 +1210,12 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     let accounted_memory = accounting.get::<i64, _>("mem_byte_seconds");
     assert_eq!(
         accounted_cpu,
-        i64::try_from(recovered.report.usage.cpu_seconds).unwrap()
+        i64::try_from(recovered.report.usage.cpu_seconds + retryable.usage.cpu_seconds).unwrap()
     );
     assert_eq!(
         accounted_memory,
-        i64::try_from(recovered.report.usage.mem_byte_seconds).unwrap()
+        i64::try_from(recovered.report.usage.mem_byte_seconds + retryable.usage.mem_byte_seconds)
+            .unwrap()
     );
     assert_eq!(
         accounting.get::<String, _>("pricing_revision"),
@@ -937,4 +1374,12 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_and_supersession_are_safe_in_both_commit_orders() {
+    run_reporter_scenario(false, false, false).await;
+    run_reporter_scenario(false, false, true).await;
+    run_reporter_scenario(true, false, false).await;
+    run_reporter_scenario(true, true, false).await;
 }

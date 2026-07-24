@@ -42,9 +42,9 @@ use myelin_ci_controlplane::{
     CiJobTokenIssuer, CiJobTokenRequest, DurableCiJobLaunchTemplate, DurableEnqueue,
     DurableLeaseAdapter, EnqueueOutcome, Lane, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CI_RUNNER_LEASE_TTL_SECS, CREATE_CI_JOB_SPEC_DDL,
-    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
-    MAX_JOB_TIMEOUT_SECS,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    CI_RUNNER_LEASE_TTL_SECS, CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL,
+    CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, MAX_JOB_TIMEOUT_SECS,
 };
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
@@ -115,6 +115,10 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL)
         .await
         .expect("add persisted job_queue claim times");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL)
+        .await
+        .expect("add retryable-attempt usage accrual");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin.execute(idx.as_str()).await.expect("index");
@@ -132,6 +136,33 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_CI_JOB_SPEC_ADD_STAGE_DDL)
         .await
         .expect("add ci_job_spec.stage");
+    // The production claim is eligible only while both authoritative lifecycle owners are active.
+    // Keep those joins real in this focused schema so trust/resolve assertions cannot pass merely
+    // because every queue row is lifecycle-ineligible.
+    admin
+        .execute(
+            "CREATE TABLE workflow_run (
+               tenant_id text NOT NULL,
+               region text NOT NULL,
+               run_id text NOT NULL,
+               state text NOT NULL,
+               PRIMARY KEY (tenant_id, run_id)
+             )",
+        )
+        .await
+        .expect("create authoritative Flow lifecycle table");
+    admin
+        .execute(
+            "CREATE TABLE ci_run (
+               tenant_id text NOT NULL,
+               region text NOT NULL,
+               wf_run_id uuid NOT NULL,
+               state text NOT NULL,
+               PRIMARY KEY (tenant_id, wf_run_id)
+             )",
+        )
+        .await
+        .expect("create authoritative CI lifecycle table");
 }
 
 async fn drop_schema(admin: &PgPool, schema: &str) {
@@ -186,6 +217,29 @@ fn enq(
     }
 }
 
+async fn activate_job_owner(admin: &PgPool, queued: &DurableEnqueue) {
+    sqlx::query(
+        "INSERT INTO workflow_run (tenant_id, region, run_id, state)
+         VALUES ($1, $2, $3, 'running')",
+    )
+    .bind(&queued.tenant_id)
+    .bind(&queued.region)
+    .bind(&queued.run_id)
+    .execute(admin)
+    .await
+    .expect("seed the active Flow owner");
+    sqlx::query(
+        "INSERT INTO ci_run (tenant_id, region, wf_run_id, state)
+         VALUES ($1, $2, $3::uuid, 'running')",
+    )
+    .bind(&queued.tenant_id)
+    .bind(&queued.region)
+    .bind(&queued.run_id)
+    .execute(admin)
+    .await
+    .expect("seed the active CI owner");
+}
+
 // ─────────────────────────────── runsc gating (mirrors CT-004c.2) ─────────────────────────────────
 
 fn runsc_present() -> bool {
@@ -223,10 +277,25 @@ struct CapturingFirehose {
     bytes: Arc<Mutex<Vec<u8>>>,
 }
 impl FirehoseSink for CapturingFirehose {
-    fn ship_frame(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, frame: &[u8]) {
+    fn ship_frame(
+        &self,
+        _run_id: &str,
+        _job_id: &str,
+        _tenant: &TenantId,
+        frame: &[u8],
+    ) -> Result<(), String> {
         self.bytes.lock().unwrap().extend_from_slice(frame);
+        Ok(())
     }
-    fn finish(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, _passed: bool) {}
+    fn finish(
+        &self,
+        _run_id: &str,
+        _job_id: &str,
+        _tenant: &TenantId,
+        _passed: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 impl CapturingFirehose {
     fn captured(&self) -> Vec<u8> {
@@ -357,6 +426,7 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
         "a fresh job_queue row"
     );
     assert!(outcome.spec_inserted, "a fresh ci_job_spec row");
+    activate_job_owner(&admin, &terms).await;
 
     // ── the durable job_queue row carries the SPEC's trust_tier + the run's region (fed, not defaulted). ──
     let (jq_trust, jq_region, jq_state): (String, String, String) =
@@ -692,6 +762,7 @@ async fn trusted_runner_never_executes_a_dispatched_untrusted_fork() {
         .co_persist_dispatch(&terms, &fork_spec, "build")
         .await
         .expect("dispatch the fork stage");
+    activate_job_owner(&admin, &terms).await;
 
     // A trusted-only runner, using the REAL durable resolver, drives the exact run_one claim seam.
     let resolver = durable_spec_resolver_test_support(
@@ -759,6 +830,7 @@ async fn a_leased_row_without_a_spec_resolves_fail_closed() {
         "nospec-idem",
     );
     queue.enqueue(&bare).await.expect("enqueue a bare row");
+    activate_job_owner(&admin, &bare).await;
 
     // The real resolver over the (empty) spec store must FAIL CLOSED for this leased row.
     let missing = specs

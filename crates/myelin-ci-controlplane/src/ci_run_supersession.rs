@@ -16,7 +16,7 @@ use myelin_events::{
     CorrelationId, DataRole, EmitContext, EventDraft, EventId, EventType, MonotonicMinter,
     PersistedEventCause, Timestamp, Visibility,
 };
-use myelin_flow::{CancelOnConnOutcome, MinorUnits, PgFlowExecutor, RunId};
+use myelin_flow::{CancelOnConnOutcome, PgFlowExecutor, RunId};
 use myelin_identity::{
     DataRole as IdentityDataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
 };
@@ -26,12 +26,13 @@ use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
 
 use crate::ci_pipeline_driver::{
-    priced_cost_rows, validate_reservation_pricing_policy, TIER_P_OPERATIONAL_PRICING_REVISION,
-    TIER_P_OPERATIONAL_RESERVATION_PREFIX,
+    close_cancelled_run_if_accounted, decode_retry_attempt_usage, priced_cost_rows,
+    validate_reservation_pricing_policy, DurableCiJobAccounting,
+    TIER_P_OPERATIONAL_PRICING_REVISION, TIER_P_OPERATIONAL_RESERVATION_PREFIX,
 };
 use crate::{
     CiCostEventStore, CiDriveManifestStore, CiJobAccountingPricer, CiJobAccountingRecord,
-    CiJobAccountingStore, CostEventRow, CostKind, Meter, TierPOperationalCiJobPricer,
+    CiJobAccountingStore, Meter, TierPOperationalCiJobPricer,
 };
 
 const SUPERSEDED_REASON: &str = "superseded-by-newer-pr-head";
@@ -55,6 +56,7 @@ struct ActivePrRun {
 struct QueueLifecycle {
     state: String,
     completion_receipt: Option<String>,
+    retry_usage: Option<ResourceUsage>,
 }
 
 #[derive(Debug)]
@@ -109,6 +111,7 @@ impl std::error::Error for CiRunSupersessionError {}
 /// Exact-tenant run-level supersession authority.
 #[derive(Clone)]
 pub struct PgCiRunSupersession {
+    pool: sqlx::PgPool,
     tenant: TenantId,
     region: Region,
     scope: TenantScope,
@@ -142,6 +145,7 @@ impl PgCiRunSupersession {
         let manifest = CiDriveManifestStore::new(pool.clone(), tenant.clone(), region.clone())
             .map_err(|_| CiRunSupersessionError::Manifest)?;
         Ok(Self {
+            pool: pool.clone(),
             tenant: tenant.clone(),
             region: region.clone(),
             scope,
@@ -296,6 +300,30 @@ impl PgCiRunSupersession {
         Ok(cancelled)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn cancel_running_for_test(
+        &self,
+        ci_run_id: &str,
+        wf_run_id: &str,
+    ) -> Result<(), CiRunSupersessionError> {
+        let authority = self.clone();
+        let peer = ActivePrRun {
+            run_id: ci_run_id.to_owned(),
+            wf_run_id: wf_run_id.to_owned(),
+            state: "running".into(),
+            generation: Some(1),
+        };
+        myelin_storage::with_tenant_tx_error(
+            &self.pool,
+            &self.tenant.0,
+            &self.region.0,
+            move |conn| {
+                Box::pin(async move { authority.cancel_running_on_conn(conn, &peer).await })
+            },
+        )
+        .await
+    }
+
     /// Every retained generation is durable high-water authority, including terminal runs. A
     /// delayed lower generation must never become current merely because the newer run finished.
     async fn generation_peers(
@@ -391,7 +419,7 @@ impl PgCiRunSupersession {
             .await
             .map_err(|_| CiRunSupersessionError::Workflow)?;
         let queue_rows = sqlx::query(
-            "SELECT job_id::text AS job_id, state, completion_receipt \
+            "SELECT job_id::text AS job_id, state, completion_receipt, retry_attempts \
              FROM job_queue \
              WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid \
              ORDER BY job_id FOR UPDATE",
@@ -405,6 +433,12 @@ impl PgCiRunSupersession {
         let mut queued = BTreeMap::new();
         for row in queue_rows {
             let job_id: String = row.get("job_id");
+            let retry_usage =
+                decode_retry_attempt_usage(row.get("retry_attempts")).map_err(|_| {
+                    CiRunSupersessionError::CorruptState(
+                        "job queue carries malformed retry-attempt accrual",
+                    )
+                })?;
             if !manifest_jobs.contains(job_id.as_str())
                 || queued
                     .insert(
@@ -412,6 +446,7 @@ impl PgCiRunSupersession {
                         QueueLifecycle {
                             state: row.get("state"),
                             completion_receipt: row.get("completion_receipt"),
+                            retry_usage,
                         },
                     )
                     .is_some()
@@ -451,6 +486,9 @@ impl PgCiRunSupersession {
             {
                 Some("running") => unsettled_launched += 1,
                 Some("queued" | "leased") => {
+                    let retry_usage = queued
+                        .get(job.job_id.as_str())
+                        .and_then(|lifecycle| lifecycle.retry_usage);
                     let updated = sqlx::query(
                         "UPDATE job_queue \
                          SET state = 'terminal', lease_owner = NULL, lease_expires = NULL \
@@ -470,9 +508,31 @@ impl PgCiRunSupersession {
                             "pre-launch cancellation lost its locked queue authority",
                         ));
                     }
-                    self.settle_cancelled_job(conn, &manifest, job).await?;
+                    self.settle_cancelled_job(
+                        conn,
+                        &manifest,
+                        job,
+                        retry_usage.unwrap_or(ResourceUsage {
+                            cpu_seconds: 0,
+                            mem_byte_seconds: 0,
+                        }),
+                        retry_usage.is_none(),
+                    )
+                    .await?;
                 }
-                None => self.settle_cancelled_job(conn, &manifest, job).await?,
+                None => {
+                    self.settle_cancelled_job(
+                        conn,
+                        &manifest,
+                        job,
+                        ResourceUsage {
+                            cpu_seconds: 0,
+                            mem_byte_seconds: 0,
+                        },
+                        true,
+                    )
+                    .await?
+                }
                 Some("terminal") => {
                     return Err(CiRunSupersessionError::CorruptState(
                         "terminal queue job lacks immutable accounting",
@@ -582,6 +642,8 @@ impl PgCiRunSupersession {
                         &peer.wf_run_id,
                         &job.job_id,
                         &job.reserve_handle,
+                        existing.usage,
+                        existing.skipped,
                     ) =>
             {
                 existing.usage
@@ -641,6 +703,8 @@ impl PgCiRunSupersession {
         conn: &mut sqlx::PgConnection,
         manifest: &crate::CiDriveManifestV1,
         job: &crate::GrantedCiJobV1,
+        usage: ResourceUsage,
+        skipped: bool,
     ) -> Result<(), CiRunSupersessionError> {
         if !job
             .reserve_handle
@@ -648,10 +712,6 @@ impl PgCiRunSupersession {
         {
             return Err(CiRunSupersessionError::Settlement);
         }
-        let usage = ResourceUsage {
-            cpu_seconds: 0,
-            mem_byte_seconds: 0,
-        };
         let priced = TierPOperationalCiJobPricer
             .price(usage)
             .map_err(|_| CiRunSupersessionError::Pricing)?;
@@ -679,28 +739,14 @@ impl PgCiRunSupersession {
             )
             .await
             .map_err(|_| CiRunSupersessionError::Settlement)?;
-        let rows = vec![
-            CostEventRow {
-                tenant: self.tenant.clone(),
-                run_id: manifest.ci_run_id.clone(),
-                job_id: job.job_id.clone(),
-                meter: Meter::CpuSeconds,
-                amount: 0,
-                wholesale: priced.cpu_wholesale,
-                markup: priced.cpu_markup,
-                kind: CostKind::Ci,
-            },
-            CostEventRow {
-                tenant: self.tenant.clone(),
-                run_id: manifest.ci_run_id.clone(),
-                job_id: job.job_id.clone(),
-                meter: Meter::MemGbSeconds,
-                amount: 0,
-                wholesale: priced.memory_wholesale,
-                markup: priced.memory_markup,
-                kind: CostKind::Ci,
-            },
-        ];
+        let rows = priced_cost_rows(
+            &self.tenant,
+            &manifest.ci_run_id,
+            &job.job_id,
+            usage,
+            &priced,
+        )
+        .map_err(|_| CiRunSupersessionError::Pricing)?;
         self.costs
             .settle_in_tx(conn, &self.scope, &rows)
             .await
@@ -717,10 +763,10 @@ impl PgCiRunSupersession {
                     reserve_handle: job.reserve_handle.clone(),
                     passed: false,
                     timed_out: false,
-                    skipped: true,
+                    skipped,
                     usage,
                     pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
-                    billed: MinorUnits::ZERO,
+                    billed: settled.billed_total,
                     refunded: settled.refunded,
                     completion_receipt: superseded_receipt(
                         &self.scope,
@@ -728,12 +774,179 @@ impl PgCiRunSupersession {
                         &manifest.wf_run_id,
                         &job.job_id,
                         &job.reserve_handle,
+                        usage,
+                        skipped,
                     ),
                 },
             )
             .await
             .map_err(|_| CiRunSupersessionError::Accounting)?;
         Ok(())
+    }
+
+    /// Reconcile one cancelled launched job whose execution lease expired before its runner could
+    /// report measured usage. The immutable manifest ceiling is charged conservatively: this is an
+    /// operational-capacity safety bookend, never commercial billing.
+    pub async fn reconcile_abandoned_job(
+        &self,
+        wf_run_id: &str,
+        job_id: &str,
+    ) -> Result<bool, CiRunSupersessionError> {
+        let wf_run_id = wf_run_id.to_owned();
+        let job_id = job_id.to_owned();
+        let authority = self.clone();
+        myelin_storage::with_tenant_tx_error(
+            &self.pool,
+            &self.tenant.0,
+            &self.region.0,
+            move |conn| {
+                Box::pin(async move {
+                    authority
+                        .reconcile_abandoned_job_on_conn(conn, &wf_run_id, &job_id)
+                        .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn reconcile_abandoned_job_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        wf_run_id: &str,
+        job_id: &str,
+    ) -> Result<bool, CiRunSupersessionError> {
+        let job_uuid = sqlx::types::Uuid::parse_str(job_id)
+            .map_err(|_| CiRunSupersessionError::CorruptState("abandoned job id is invalid"))?;
+        let flow_state: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM workflow_run
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3 FOR UPDATE",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(wf_run_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|_| CiRunSupersessionError::Database("lock abandoned workflow"))?;
+        if flow_state.as_deref() != Some("terminated") {
+            return Ok(false);
+        }
+        let ci_state: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM ci_run
+             WHERE tenant_id = $1 AND region = $2 AND wf_run_id = $3::uuid",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(wf_run_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|_| CiRunSupersessionError::Database("read abandoned CI run"))?;
+        if ci_state.as_deref() != Some("cancelled") {
+            return Ok(false);
+        }
+        let retry_attempts: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT retry_attempts FROM job_queue
+             WHERE tenant_id = $1 AND region = $2 AND job_id = $3
+               AND run_id = $4::uuid AND state = 'running' AND lease_expires < now()
+               AND pg_try_advisory_xact_lock(
+                 hashtextextended(
+                   jsonb_build_array(
+                     tenant_id::text, region::text, job_id::text,
+                     lease_epoch::text, claim_nonce::text
+                   )::text,
+                   0
+                 )
+               )
+             FOR UPDATE",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(job_uuid)
+        .bind(wf_run_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|_| CiRunSupersessionError::Database("lock abandoned queue generation"))?;
+        let Some(retry_attempts) = retry_attempts else {
+            return Ok(false);
+        };
+        let prior_usage = decode_retry_attempt_usage(retry_attempts).map_err(|_| {
+            CiRunSupersessionError::CorruptState("abandoned job retry accrual is malformed")
+        })?;
+        let (manifest, _) = self
+            .manifest
+            .load_by_wf_run_on_conn(conn, wf_run_id)
+            .await
+            .map_err(|_| CiRunSupersessionError::Manifest)?
+            .ok_or(CiRunSupersessionError::Manifest)?;
+        let job = manifest
+            .jobs
+            .iter()
+            .find(|job| job.job_id == job_id)
+            .ok_or(CiRunSupersessionError::CorruptState(
+                "abandoned job is absent from its immutable manifest",
+            ))?;
+        let timeout = u64::from(job.limits.timeout_secs);
+        let cpu_millis = u64::from(job.limits.cpu_millis);
+        let attempt_usage = ResourceUsage {
+            cpu_seconds: cpu_millis
+                .checked_mul(timeout)
+                .and_then(|value| value.checked_add(999))
+                .map(|value| value / 1_000)
+                .ok_or(CiRunSupersessionError::Pricing)?,
+            mem_byte_seconds: job
+                .limits
+                .mem_bytes
+                .checked_mul(timeout)
+                .ok_or(CiRunSupersessionError::Pricing)?,
+        };
+        let usage = ResourceUsage {
+            cpu_seconds: attempt_usage
+                .cpu_seconds
+                .checked_add(prior_usage.map_or(0, |usage| usage.cpu_seconds))
+                .ok_or(CiRunSupersessionError::Pricing)?,
+            mem_byte_seconds: attempt_usage
+                .mem_byte_seconds
+                .checked_add(prior_usage.map_or(0, |usage| usage.mem_byte_seconds))
+                .ok_or(CiRunSupersessionError::Pricing)?,
+        };
+        let updated = sqlx::query(
+            "UPDATE job_queue
+             SET state = 'terminal', lease_owner = NULL, lease_expires = NULL, claim_nonce = NULL
+             WHERE tenant_id = $1 AND region = $2 AND job_id = $3
+               AND run_id = $4::uuid AND state = 'running'",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(job_uuid)
+        .bind(wf_run_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|_| CiRunSupersessionError::Database("terminalize abandoned job"))?;
+        if updated.rows_affected() != 1 {
+            return Err(CiRunSupersessionError::CorruptState(
+                "abandoned job lost its locked queue generation",
+            ));
+        }
+        self.settle_cancelled_job(conn, &manifest, job, usage, false)
+            .await?;
+        let accounting = DurableCiJobAccounting::new(
+            self.scope.clone(),
+            self.manifest.clone(),
+            self.ledger.clone(),
+            self.costs.clone(),
+            self.accounting.clone(),
+            Arc::new(TierPOperationalCiJobPricer),
+        );
+        close_cancelled_run_if_accounted(conn, &accounting, wf_run_id)
+            .await
+            .map_err(|_| CiRunSupersessionError::Accounting)?;
+        Ok(true)
+    }
+}
+
+impl From<myelin_storage::PgError> for CiRunSupersessionError {
+    fn from(_: myelin_storage::PgError) -> Self {
+        Self::Database("tenant-scoped transaction")
     }
 }
 
@@ -1021,9 +1234,11 @@ pub(crate) fn superseded_receipt(
     wf_run_id: &str,
     job_id: &str,
     reserve_handle: &str,
+    usage: ResourceUsage,
+    skipped: bool,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"myelin.ci.superseded-accounting.v1\0");
+    hasher.update(b"myelin.ci.superseded-accounting.v2\0");
     for field in [
         scope.tenant().as_str(),
         scope.region().as_str(),
@@ -1035,6 +1250,9 @@ pub(crate) fn superseded_receipt(
         hasher.update(&(field.len() as u64).to_be_bytes());
         hasher.update(field.as_bytes());
     }
+    hasher.update(&usage.cpu_seconds.to_be_bytes());
+    hasher.update(&usage.mem_byte_seconds.to_be_bytes());
+    hasher.update(&[u8::from(skipped)]);
     format!("v3:{}", hasher.finalize().to_hex())
 }
 

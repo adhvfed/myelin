@@ -255,6 +255,7 @@ struct SchedulerProbe {
     run_select_state: bool,
     run_select_created_at: bool,
     run_select_run_id: bool,
+    run_select_wf_run_id: bool,
     workflow_select_tenant: bool,
     workflow_select_region: bool,
     workflow_select_run_id: bool,
@@ -357,6 +358,7 @@ fn validate_probe_before_mapping(
         && scheduler.run_select_state
         && scheduler.run_select_created_at
         && scheduler.run_select_run_id
+        && scheduler.run_select_wf_run_id
         && scheduler.workflow_select_tenant
         && scheduler.workflow_select_region
         && scheduler.workflow_select_run_id
@@ -468,6 +470,7 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'state', 'SELECT') AS run_select_state,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'created_at', 'SELECT') AS run_select_created_at,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'run_id', 'SELECT') AS run_select_run_id,
+                pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'wf_run_id', 'SELECT') AS run_select_wf_run_id,
                 pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'tenant_id', 'SELECT') AS workflow_select_tenant,
                 pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'region', 'SELECT') AS workflow_select_region,
                 pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'run_id', 'SELECT') AS workflow_select_run_id,
@@ -518,7 +521,7 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                        AND run_column.attnum > 0
                        AND NOT run_column.attisdropped
                        AND run_column.attname NOT IN (
-                         'tenant_id', 'region', 'state', 'created_at', 'run_id'
+                         'tenant_id', 'region', 'state', 'created_at', 'run_id', 'wf_run_id'
                        )
                        AND pg_catalog.has_column_privilege(
                          session_user, run_column.attrelid, run_column.attnum, 'SELECT'
@@ -660,6 +663,7 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
         run_select_state: row.get("run_select_state"),
         run_select_created_at: row.get("run_select_created_at"),
         run_select_run_id: row.get("run_select_run_id"),
+        run_select_wf_run_id: row.get("run_select_wf_run_id"),
         workflow_select_tenant: row.get("workflow_select_tenant"),
         workflow_select_region: row.get("workflow_select_region"),
         workflow_select_run_id: row.get("workflow_select_run_id"),

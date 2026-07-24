@@ -17,9 +17,9 @@ use myelin_ci_controlplane::{
     ManifestBoundCiJobTokenAuthority, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
     ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
     ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CI_PIPELINE_WF_TYPE,
-    CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL,
-    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
+    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, CI_PIPELINE_WF_TYPE, CREATE_CI_DRIVE_MANIFEST_DDL,
+    CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
 };
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
@@ -27,9 +27,10 @@ use myelin_ci_sandbox::{
     ResourceLimits, RunTokenCredential, SandboxBackend, SecretRef, TrustTier, WorkspaceSpec,
 };
 use myelin_config::MyelinConfig;
+use myelin_flow::migrations::migrations as flow_migrations;
 use myelin_storage::{
     cell_root_durable_migrations, identity_durable_migrations, reserve_settle_durable_migrations,
-    PgMigrator, SealKey, SubstrateProvider,
+    HotTables, PgMigrator, SealKey, SubstrateProvider,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
@@ -369,6 +370,13 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     PgMigrator::apply(&admin, &reserve_settle_durable_migrations())
         .await
         .expect("apply the durable reservation schema");
+    PgMigrator::apply_validated(
+        &admin,
+        &flow_migrations(),
+        &HotTables::declare(["workflow_run"]),
+    )
+    .await
+    .expect("apply the authoritative durable Flow schema");
     sqlx::raw_sql(&format!(
         "{CREATE_CI_RUN_DDL};
          {ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL};
@@ -382,6 +390,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
          {ALTER_JOB_QUEUE_ADD_COMPLETION_DDL};
          {ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL};
          {ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL};
+         {ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL};
          SELECT myelin_make_tenant_scoped('job_queue');
          {CREATE_CI_JOB_SPEC_DDL};
          {ALTER_CI_JOB_SPEC_ADD_STAGE_DDL};
@@ -420,6 +429,20 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .execute(&mut *parent)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO workflow_run
+           (tenant_id, region, run_id, wf_type, wf_version, input, state, cursor,
+            correlation_id, depth, partition)
+         VALUES ($1, $2, $3, $4, 1, '[]'::jsonb, 'waiting', 0,
+                 'manifest-live', 0, 0)",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.wf_run_id)
+    .bind(CI_PIPELINE_WF_TYPE)
+    .execute(&mut *parent)
+    .await
+    .expect("seed the active authoritative Flow owner");
     sqlx::query(
         "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
          VALUES ($1, $2, $3, 1200, 'reserved'),

@@ -26,8 +26,10 @@ their shared `ToolDef`s into MCP and routes them through the same permission-che
 under a per-run token re-verified at the final read boundary. Cross-service resumable live tail
 now has its CT-005f consumer/resume half: production Edge tails the durable T3 segment sequence
 through repository-authorized SSE with strict `Last-Event-ID`, retention-gap refusal, and bounded
-pointer-only frames. The producer still persists captured output only after sandbox exit, so honest
-during-execution output remains open.
+pointer-only frames. CT-005f2 now supplies the producer half: both production sandbox backends emit
+bounded byte-exact frames while the command is still running, and the runner acknowledges each frame
+only after durable segment persistence. Authenticated web/CLI live consumption, the production-path
+CI-D11 sever/resume drill, and the founder acceptance pass remain open.
 CT-007 is still unopened; GitHub Actions must not be
 removed before the founder acceptance pass and the complete CT-005 surface are genuinely usable.
 
@@ -136,6 +138,23 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   checkpoint, post-subscribe append across the service boundary, live Pull revocation, terminal
   completion, reconnect, hidden/absent equivalence, partial/full retention staleness, and
   within-/cross-batch gap refusal through the actual second poll.
+- **CT-005f2 — bounded incremental production persistence:** `SandboxBackend` now accepts one
+  output sink and cancellation signal. gVisor drains stdout/stderr into byte-exact 64 KiB frames;
+  Firecracker emits nonce-qualified base64 serial frames so payload bytes cannot forge the control
+  stream. Both real backends prove a durable frame arrives before command exit, preserve exact
+  binary bytes, keep only the bounded capture head in memory, and cancel the complete runtime group
+  when persistence fails. The runner uses an eight-frame synchronous channel and one serial durable
+  consumer: each frame reaches `LogPipelineSink` before acknowledgement, so a fast producer cannot
+  outrun durable storage. PostgreSQL append positions serialize on the exact stream generation and
+  replay immutably without overlapping offsets or anchors.
+  A durability failure after launch is an infrastructure retryable attempt, never an ordinary job
+  verdict. Measured usage accrues in fixed-size durable queue state and is folded into the eventual
+  terminal settlement exactly once. Supersession and retry serialize on Flow authority; claim and
+  generic reap require active Flow/CI owners, so cancelled work cannot resurrect. An expired
+  cancelled launch is instead reconciled under its exact tenant and queue generation using the
+  immutable manifest resource ceiling. Cancelled recovery is a rotating keyset page of at most 64
+  candidates, isolates poison rows, and reports accumulated failures only after later candidates
+  have been attempted.
 
 **Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
 services. It is not an honest production SSE resume source. SSE remains open until a real
@@ -144,11 +163,11 @@ The live founder push→settled check→surfaced archived/live log pass and CT-0
 CT-005e closes the prior MCP floor without inventing live output: its two reads are exact durable
 run/detail and archived-log operations, and the complete content-addressed Agent tool transcript
 remains an Agent-runtime trace artifact rather than a claim made by the stdio transport.
-CT-005f1 closes the cross-service consumer/resume half without overstating production: the runner's
-current `SandboxBackend::launch` returns captured stdout/stderr only after the command exits, and
-`DurableLogPersist` seals it at finish. CT-005f2 must persist bounded segments incrementally while
-both gVisor and Firecracker commands are still running; only then may the web/CLI consumers and
-CI-D11 call the output genuinely live.
+CT-005f1 and CT-005f2 close the durable consumer/resume and producer-persistence halves without
+overstating the remaining surface. The real gVisor and Firecracker paths now persist bounded output
+while commands execute. The web and CLI still need authenticated live-tail UX over the existing Edge
+route, and CI-D11 must sever and resume the composed production path across service boundaries. The
+live founder push→settled check→surfaced archived/live log pass and CT-007 also remain open.
 
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod

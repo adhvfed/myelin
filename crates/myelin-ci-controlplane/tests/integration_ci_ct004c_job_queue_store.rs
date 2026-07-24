@@ -39,8 +39,9 @@ use myelin_ci_controlplane::{
     ci_job_queue_store, ci_region_queue_store_test_support, make_tenant_scoped_ddl,
     CiJobLaunchClaim, CiJobQueueStore, DurableEnqueue, EnqueueOutcome, Lane,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
-    CREATE_JOB_QUEUE_INDEXES_DDL, INSERT_JOB_QUEUE_QUERY,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    INSERT_JOB_QUEUE_QUERY,
 };
 use myelin_ci_sandbox::TrustTier;
 use sqlx::types::Uuid;
@@ -144,9 +145,12 @@ fn job(
     }
 }
 
-/// Build the isolated `job_queue` + `fair_deficit` tables (the claim's LEFT JOIN needs `fair_deficit`)
-/// in the per-pid schema, FORCE-RLS via the platform helper. Indexes are applied with `CONCURRENTLY`
-/// stripped (a fresh empty table takes no meaningful lock; CONCURRENTLY cannot run in the implicit tx).
+/// Build the isolated queue, fairness, and authoritative lifecycle tables in the per-pid schema.
+/// Claim/reap must see a real active Flow + CI owner; the minimal lifecycle tables keep that
+/// production predicate load-bearing without importing unrelated schema into this focused store
+/// test. Queue/fairness tables are FORCE-RLS via the platform helper. Indexes are applied with
+/// `CONCURRENTLY` stripped (a fresh empty table takes no meaningful lock; CONCURRENTLY cannot run in
+/// the implicit transaction).
 async fn create_schema(admin: &PgPool, schema: &str) {
     admin
         .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
@@ -172,6 +176,10 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL)
         .await
         .expect("add persisted job_queue claim times");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL)
+        .await
+        .expect("add retryable-attempt usage accrual");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin
@@ -191,6 +199,30 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(make_tenant_scoped_ddl("fair_deficit").as_str())
         .await
         .expect("FORCE-RLS fair_deficit");
+    admin
+        .execute(
+            "CREATE TABLE workflow_run (
+               tenant_id text NOT NULL,
+               region text NOT NULL,
+               run_id text NOT NULL,
+               state text NOT NULL,
+               PRIMARY KEY (tenant_id, run_id)
+             )",
+        )
+        .await
+        .expect("create authoritative Flow lifecycle table");
+    admin
+        .execute(
+            "CREATE TABLE ci_run (
+               tenant_id text NOT NULL,
+               region text NOT NULL,
+               wf_run_id uuid NOT NULL,
+               state text NOT NULL,
+               PRIMARY KEY (tenant_id, wf_run_id)
+             )",
+        )
+        .await
+        .expect("create authoritative CI lifecycle table");
     // Let the non-superuser app role reach the per-pid schema's tables (case 7). Default privileges
     // only cover schema `public`; grant explicitly for this custom schema.
     admin
@@ -204,6 +236,29 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         )
         .await
         .expect("grant table DML to app role");
+}
+
+async fn activate_job_owner(admin: &PgPool, queued: &DurableEnqueue) {
+    sqlx::query(
+        "INSERT INTO workflow_run (tenant_id, region, run_id, state)
+         VALUES ($1, $2, $3, 'running')",
+    )
+    .bind(&queued.tenant_id)
+    .bind(&queued.region)
+    .bind(&queued.run_id)
+    .execute(admin)
+    .await
+    .expect("seed the active Flow owner");
+    sqlx::query(
+        "INSERT INTO ci_run (tenant_id, region, wf_run_id, state)
+         VALUES ($1, $2, $3::uuid, 'running')",
+    )
+    .bind(&queued.tenant_id)
+    .bind(&queued.region)
+    .bind(&queued.run_id)
+    .execute(admin)
+    .await
+    .expect("seed the active CI owner");
 }
 
 #[tokio::test]
@@ -285,6 +340,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
             EnqueueOutcome::Inserted,
             "each distinct idem is inserted"
         );
+        activate_job_owner(&admin, &j).await;
     }
     // Idempotent enqueue: a duplicate idem is a no-op (jq_idem unique).
     let dup = job(
@@ -390,6 +446,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         ),
     ] {
         store.enqueue(&j).await.expect("enqueue cc");
+        activate_job_owner(&admin, &j).await;
     }
     let s_a = region_store.clone();
     let s_b = region_store.clone();
@@ -577,6 +634,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         .enqueue(&race_old)
         .await
         .expect("enqueue launch race old");
+    activate_job_owner(&admin, &race_old).await;
     let race_lease = region_store
         .claim(
             region,
@@ -713,6 +771,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         "idem-launch-reap",
     );
     store.enqueue(&reap_job).await.expect("enqueue launch reap");
+    activate_job_owner(&admin, &reap_job).await;
     let reap_lease = region_store
         .claim(
             region,

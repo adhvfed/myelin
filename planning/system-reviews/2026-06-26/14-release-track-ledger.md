@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification; CT-005f1 adds the repository-authorized durable SSE resume consumer. Still required: incremental runner-side persistence during execution on both production backends, live web/CLI consumption and CI-D11, the live founder push→CI→surfaced-check/log pass, then CT-007.** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification; CT-005f1 adds the repository-authorized durable SSE resume consumer; CT-005f2 persists bounded byte-exact output during execution on both production backends and closes retry/supersession recovery without resurrection. Still required: authenticated web/CLI live-tail consumption and composed CI-D11 sever/resume, the live founder push→CI→surfaced-check/log pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1727,6 +1727,72 @@ increment; the founder acceptance pass and CT-007 remain closed.
 
 L3 CT-005f1 footprint: **8 files, +1,004 / -32 lines** for the durable resume store, Edge SSE
 consumer, continuing-authorization/integrity proofs, contract registration, and ledgers.
+
+**CT-005f2 bounded incremental producer increment (2026-07-24; live web/CLI UX and CI-D11 remain
+open).** The shared sandbox seam now carries an output sink and cancellation signal without
+duplicating backend-specific persistence. The production runner owns one fixed eight-frame
+synchronous channel and a serial durable consumer. gVisor drains real stdout/stderr as byte-exact
+64 KiB frames; Firecracker's command runner writes nonce-qualified base64 frames to the serial
+console so guest bytes cannot forge an exit or stream boundary. Both backends retain only the
+bounded capture head while delivering the complete byte stream, and both real-runtime tests require
+the first output to arrive before command exit. Firecracker now places the payload in its own
+cgroup-v2 subtree and uses `cgroup.kill`; gVisor's watchdog likewise kills descendants that escape
+the immediate runtime process group.
+
+`LogPipelineSink` persists each emitted frame before the runner acknowledges it. The durable
+PostgreSQL append path serializes the exact tenant/run/job stream with a transaction advisory lock,
+reloads its committed tail, and permits only immutable exact replay, contiguous append, and monotone
+anchors. Binary bytes remain byte exact; no UTF-8 or line boundary is introduced. A persistence
+fault cancels the live runtime and marks `SandboxLaunch.output_complete=false`. It can no longer
+become an ordinary `job.done`: the production reporter records a retryable infrastructure attempt
+with measured usage, and fixed-size `job_queue.retry_attempts` accrual is folded into the later
+terminal accounting exactly once. Malformed accrual is a storage failure, not user input.
+
+Retry and PR supersession serialize on the exact Flow row. Claim and generic lease reap now require
+the owning workflow to remain running/waiting and the corresponding CI run to remain running, backed
+by a new partial concurrent `ci_run (tenant_id, region, wf_run_id)` index and a fresh
+column-minimal scheduler grant. A cancelled launched generation can therefore never be requeued or
+claimed. If its runner disappears, the production reaper discovers at most 64 cancelled candidates
+through a rotating keyset page, revalidates each under an exact-tenant transaction plus generation
+advisory/row lock, terminalizes the queue row, and closes operational settlement using the immutable
+manifest ceiling. Candidate failures are isolated: a permanent poison row rolls back and is
+reported only after later tenants in the page have committed.
+
+The live PostgreSQL proof exercises a normal retry followed by terminal reporting, retry-before-real
+supersession, supersession-before-late-reporter, supersession with an abandoned runner, and a
+lexicographically first corrupt tenant followed by a healthy tenant. It proves no resurrection,
+exact retry replay, measured or conservative usage closure, one immutable accounting row, two cost
+rows, zero terminal signal for cancelled work, and healthy progress despite the poison row. Durable
+log integration proves concurrent retries cannot overwrite the same append position and a restarted
+sink continues after the committed live prefix. The constrained production scheduler-role proof
+executes the new lifecycle joins under its mapped-region RLS and least-privilege probe.
+
+Mechanical evidence: 448 Controlplane and 145 Sandbox unit tests pass; the focused live PostgreSQL
+suite passes (5 durable-log cases plus scheduler, constrained-role, terminal-accounting, and
+pipeline-starter integrations); the real durable-runner integration passes 5/5; real Firecracker
+passes 8/8 and real gVisor passes 6/6 with hard capability requirements. All-target/all-feature
+compilation, warnings-denied clippy, the full lint fixture suite, architecture lint (762 files,
+zero violations), shrink-only erosion/dependency budgets, frontend-aware contract coverage
+(99 rows, 83 covered, 16 deferred, two frontend contracts, zero false claims), targeted rustfmt,
+and diff check are green. Independent adversarial review found and closed concurrent append,
+descendant teardown, cancellation, accounting-ownership, settlement cleanup, retry/supersession
+ordering, resurrection, and poison-row recovery-liveness defects; final review reports
+**CONFIRMED-SOUND with no remaining HIGH or MEDIUM finding**.
+
+Mechanical payoff: production backends persisting output before exit = 0→2; output-persistence
+failures emitted as ordinary terminal verdicts = 0; concurrent append positions overwritten = 0;
+superseded jobs returned to claimable state = 0; cancelled-recovery candidates loaded per page
+>64 = 0; poison candidates blocking later tenants in the page = 0.
+
+**Honest remaining CT-005 floor:** add authenticated web and CLI live-tail consumption over the
+existing Edge SSE route and run CI-D11 sever/resume through the composed production services. Then
+the founder must perform a real Myelin push and observe its exact-head required check settle with
+archived and live output through the verifier and browser. CT-007 and the four-week R4 exit clock
+remain closed until that evidence exists.
+
+L3 CT-005f2 footprint: **38 files, +4,888 / -534 lines** for incremental sandbox output,
+durable append/retry accounting, supersession/reaper closure, least-privilege lifecycle gates,
+real-runtime and live-PostgreSQL proofs, and ledgers.
 
 ## R5–R6
 

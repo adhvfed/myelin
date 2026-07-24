@@ -28,11 +28,12 @@
 //!   CI-P13 — here the claim ORDERS on the term, see the floor);
 //! - then **`enqueued_at ASC`** (oldest first within an equal key).
 //!
-//! On claim the row is leased: `lease_owner` / `lease_expires` set, `state='leased'`. The
-//! **dead-runner reaper** sweeps expired leases → re-queues their jobs (`state='queued'`,
-//! `lease_owner`/`lease_expires` cleared), which makes the run's `SCHEDULE_AND_RUN_JOB` activity
-//! retry idempotently — the enqueue is idempotent on `idem_token` via the `jq_idem` unique, so the
-//! re-dispatch is ONE row, never a duplicate.
+//! On claim the row is leased: `lease_owner` / `lease_expires` set, `state='leased'`. Both claim and
+//! the **dead-runner reaper** require the owning Flow workflow and CI run to remain active. The
+//! reaper re-queues expired active jobs (`state='queued'`, lease fields cleared), which makes the
+//! run's `SCHEDULE_AND_RUN_JOB` activity retry idempotently. An expired launched job whose workflow
+//! is already cancelled is deliberately excluded and reconciled to terminal accounting by the
+//! production reaper driver rather than resurrected.
 //!
 //! ## Concurrency groups (arch 02 §2.3)
 //! - `deploy:prod` is a **serialization key** (the `jq_serialize` partial unique index — at most one
@@ -47,10 +48,11 @@
 //!   `NOT EXISTS`, the reaper sweep). The REAL apply against the dev-stack Postgres (a real claim
 //!   under concurrency, the serialize index, the reaper re-queue) is
 //!   `tests/integration_ci_p12_scheduler_claim.rs` behind the `integration` cargo feature;
-//! - a **deterministic in-memory model** ([`SchedulerState`]) that implements the IDENTICAL predicate
-//!   semantics — so the unit + drill tests (the claim predicates, the reaper re-queue idempotency, the
-//!   serialize + cancel-superseded) are deterministic and DB-free, while the live test proves the SQL
-//!   carries the same semantics. The two are the same algorithm; neither is a mock of the other.
+//! - a **deterministic in-memory model** ([`SchedulerState`]) for queue-local predicate semantics —
+//!   label/trust/residency/lane ordering, re-queue idempotency, serialization, and supersession. The
+//!   durable Flow/CI lifecycle conjunction is SQL-owned and pinned by source assertions plus live
+//!   PostgreSQL tests because a queue-only model cannot honestly represent those authoritative
+//!   tables.
 //!
 //! ## Floors named (VISION §3 / the prompt DoD)
 //! - the **DRR fair-share** advance/replenish over `fair_key` + the **priority lanes** detail +
@@ -97,6 +99,20 @@ WITH eligible AS (
     ON f.tenant_id = q.tenant_id AND f.region = q.region AND f.fair_key = q.fair_key
   WHERE q.state = 'queued'
     AND q.region = $1
+    AND EXISTS (
+      SELECT 1 FROM workflow_run w
+      WHERE w.tenant_id = q.tenant_id
+        AND w.region = q.region
+        AND w.run_id = q.run_id::text
+        AND w.state IN ('running', 'waiting')
+    )
+    AND EXISTS (
+      SELECT 1 FROM ci_run c
+      WHERE c.tenant_id = q.tenant_id
+        AND c.region = q.region
+        AND c.wf_run_id = q.run_id
+        AND c.state = 'running'
+    )
     AND q.labels <@ $2
     AND q.trust_tier = ANY($3)
     AND (
@@ -145,12 +161,12 @@ WHERE tenant_id = $1
   AND job_id <> $4
 RETURNING job_id";
 
-/// **The dead-runner reaper (arch 02 §2.1) — sweep expired leases → re-queue.** A runner that died
-/// mid-lease or after the final launch fence leaves a `leased`/`running` row whose `lease_expires`
-/// has passed; the reaper moves it back to
-/// `queued` (clearing the lease) so it is claimable again. The re-queue is idempotent (the same row
-/// returns to `queued`); the run's `SCHEDULE_AND_RUN_JOB` activity re-dispatch is ONE row (the
-/// `jq_idem` unique on `(tenant_id, idem_token)` rejects a duplicate enqueue). Bind: `$1 region`.
+/// **The dead-runner reaper (arch 02 §2.1) — sweep expired active leases → re-queue.** A runner that
+/// died while both the owning Flow workflow and CI run remain active leaves a `leased`/`running` row
+/// whose `lease_expires` has passed; the reaper moves it back to `queued` so it is claimable again.
+/// Cancelled/terminated owners are excluded so generic lease recovery cannot resurrect superseded
+/// work; the production driver reconciles an expired launched row through terminal accounting
+/// instead. Active re-queue is idempotent, and `jq_idem` rejects duplicate enqueue. Bind: `$1 region`.
 pub const REAP_QUERY: &str = "\
 WITH candidates AS MATERIALIZED (
   SELECT tenant_id, region, job_id, state, lease_epoch, claim_nonce
@@ -158,6 +174,20 @@ WITH candidates AS MATERIALIZED (
   WHERE region = $1
     AND state IN ('leased', 'running')
     AND lease_expires < now()
+    AND EXISTS (
+      SELECT 1 FROM workflow_run w
+      WHERE w.tenant_id = job_queue.tenant_id
+        AND w.region = job_queue.region
+        AND w.run_id = job_queue.run_id::text
+        AND w.state IN ('running', 'waiting')
+    )
+    AND EXISTS (
+      SELECT 1 FROM ci_run c
+      WHERE c.tenant_id = job_queue.tenant_id
+        AND c.region = job_queue.region
+        AND c.wf_run_id = job_queue.run_id
+        AND c.state = 'running'
+    )
   FOR UPDATE SKIP LOCKED
 ),
 expired AS (
@@ -1194,12 +1224,25 @@ mod tests {
             CLAIM_QUERY.contains("SET state = 'leased'"),
             "on claim → leased"
         );
+        for active_owner in [
+            "w.state IN ('running', 'waiting')",
+            "c.state = 'running'",
+            "c.wf_run_id = q.run_id",
+        ] {
+            assert!(
+                CLAIM_QUERY.contains(active_owner),
+                "claim refuses a queue row without active owner predicate `{active_owner}`"
+            );
+        }
         // The reaper SQL re-queues an expired lease in place (no INSERT → 0 duplicate enqueues).
         assert!(
             REAP_QUERY.contains("SET state = 'queued'")
                 && REAP_QUERY.contains("lease_expires < now()")
                 && REAP_QUERY.contains("FOR UPDATE SKIP LOCKED")
                 && REAP_QUERY.contains("pg_try_advisory_xact_lock")
+                && REAP_QUERY.contains("w.state IN ('running', 'waiting')")
+                && REAP_QUERY.contains("c.state = 'running'")
+                && REAP_QUERY.contains("c.wf_run_id = job_queue.run_id")
                 && REAP_QUERY
                     .trim_start()
                     .starts_with("WITH candidates AS MATERIALIZED"),

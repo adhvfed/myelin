@@ -639,14 +639,23 @@ mod tests {
         // CT-003b: the anon-memory hog prints its ATTEMPT sentinel BEFORE the END marker (so the
         // corpus completes even when the contained hog kills the prober mid-alloc) and the oversized
         // allocation step comes AFTER it.
-        let attempt = script.find(&format!("{MEMHOG_ID} ATTEMPT")).expect("memhog ATTEMPT sentinel");
+        let attempt = script
+            .find(&format!("{MEMHOG_ID} ATTEMPT"))
+            .expect("memhog ATTEMPT sentinel");
         let end = script.find(END_MARKER).expect("END marker");
-        assert!(attempt < end, "the memhog ATTEMPT sentinel must precede the END marker");
+        assert!(
+            attempt < end,
+            "the memhog ATTEMPT sentinel must precede the END marker"
+        );
         // The hog is a pure-shell doubling allocator that HOLDS the anon memory in the shell process
         // itself (16·2^26 ≈ 1 GiB) — no command-substitution child whose death could falsely report
         // an empty "held=0" escape. It exceeds every current spec's mem_bytes (256 MiB).
         assert!(script.contains(r#"S="$S$S""#) && script.contains("while [ $n -lt 26 ]"));
-        assert_eq!(MEMHOG_BYTES, 16 * (1u64 << 26), "the ATTEMPT byte count matches the allocator");
+        assert_eq!(
+            MEMHOG_BYTES,
+            16 * (1u64 << 26),
+            "the ATTEMPT byte count matches the allocator"
+        );
     }
 
     #[test]
@@ -803,7 +812,10 @@ mod tests {
         let report = parse_console(&s);
         assert_eq!(*outcome_for(&report, MEMHOG_ID), AttackOutcome::Escaped);
         assert_eq!(report.escapes(), 1);
-        assert!(!report.is_green(), "a held anon-hog (the memory bound failed) ⇒ RED");
+        assert!(
+            !report.is_green(),
+            "a held anon-hog (the memory bound failed) ⇒ RED"
+        );
     }
 
     #[test]

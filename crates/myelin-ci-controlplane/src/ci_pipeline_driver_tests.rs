@@ -496,3 +496,49 @@ fn tier_p_reservation_structurally_requires_its_exact_operational_settlement_pol
         "non-Tier-P reservation authorities retain their own revisioned policy"
     );
 }
+
+#[test]
+fn retry_attempt_accrual_is_fixed_size_and_projects_exact_usage() {
+    let accrual = serde_json::json!({
+        "version": 1,
+        "attempts": 3,
+        "cpu_seconds": 17,
+        "mem_byte_seconds": 23,
+        "last": {
+            "lease_epoch": 3,
+            "claim_nonce": "11111111-1111-1111-1111-111111111111",
+            "lease_owner": "runner-1",
+            "cause": "output_persistence",
+            "cpu_seconds": 5,
+            "mem_byte_seconds": 7,
+            "receipt": format!("retry-v1:{}", "a".repeat(64)),
+        }
+    });
+    assert_eq!(
+        decode_retry_attempt_usage(accrual),
+        Ok(Some(ResourceUsage {
+            cpu_seconds: 17,
+            mem_byte_seconds: 23,
+        }))
+    );
+    assert_eq!(decode_retry_attempt_usage(serde_json::json!({})), Ok(None));
+    let corrupt = decode_retry_attempts(serde_json::json!({
+        "version": 1,
+        "attempts": 4,
+        "cpu_seconds": 17,
+        "mem_byte_seconds": 23,
+        "last": {
+            "lease_epoch": 3,
+            "claim_nonce": "11111111-1111-1111-1111-111111111111",
+            "lease_owner": "runner-1",
+            "cause": "output_persistence",
+            "cpu_seconds": 5,
+            "mem_byte_seconds": 7,
+            "receipt": format!("retry-v1:{}", "a".repeat(64)),
+        }
+    }));
+    assert!(
+        matches!(corrupt, Err(CompletionTxError::RetryCorrupt)),
+        "an impossible attempt count is corrupt state, never zero usage"
+    );
+}

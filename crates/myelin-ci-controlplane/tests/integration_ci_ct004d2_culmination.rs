@@ -40,8 +40,9 @@ use myelin_ci_controlplane::{
     ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
     ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL,
-    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL,
 };
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
@@ -165,6 +166,10 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL)
         .await
         .expect("add persisted job_queue claim times");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL)
+        .await
+        .expect("add retryable-attempt usage accrual");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin.execute(idx.as_str()).await.expect("index");
@@ -245,10 +250,25 @@ struct CapturingFirehose {
     bytes: Arc<Mutex<Vec<u8>>>,
 }
 impl FirehoseSink for CapturingFirehose {
-    fn ship_frame(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, frame: &[u8]) {
+    fn ship_frame(
+        &self,
+        _run_id: &str,
+        _job_id: &str,
+        _tenant: &TenantId,
+        frame: &[u8],
+    ) -> Result<(), String> {
         self.bytes.lock().unwrap().extend_from_slice(frame);
+        Ok(())
     }
-    fn finish(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, _passed: bool) {}
+    fn finish(
+        &self,
+        _run_id: &str,
+        _job_id: &str,
+        _tenant: &TenantId,
+        _passed: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 impl CapturingFirehose {
     fn captured(&self) -> Vec<u8> {
@@ -508,6 +528,25 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         RunId(wf_run_uuid.clone()),
         "the run's id == the pre-minted wf_run_id"
     );
+    // This culmination test begins at the production starter's durable output but constructs the
+    // worker directly so it can pin the one-stage body. Mirror the starter's queued -> running
+    // transition explicitly; the dedicated starter integration proves the transition and workflow
+    // start are one transaction. Leaving this row queued would make the production claim correctly
+    // refuse the otherwise-active workflow and turn every downstream assertion into a false proof.
+    let activated: u64 = sqlx::query(
+        "UPDATE ci_run SET state = 'running'
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
+           AND wf_run_id = $4::uuid AND state = 'queued'",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(&run_uuid)
+    .bind(&wf_run_uuid)
+    .execute(&admin)
+    .await
+    .expect("represent the production starter's active ci_run output")
+    .rows_affected();
+    assert_eq!(activated, 1, "exactly the armed CI run becomes active");
 
     // ── DRIVE #1: PgFlowWorker dispatches the stage durably and parks. ──
     let now = now_secs();

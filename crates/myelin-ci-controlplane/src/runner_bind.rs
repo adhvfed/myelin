@@ -488,6 +488,15 @@ impl CiRunnerLoop {
                         return CiRunnerLoopExit::Shutdown;
                     }
                 }
+                Err(e @ RunnerError::RetryableAttemptRecorded { .. }) => {
+                    // The claim-aware reporter already accrued measured usage and returned the
+                    // exact generation to `queued` without emitting job.done. Back off before
+                    // reclaiming so a persistent log outage cannot hot-loop paid execution.
+                    eprintln!("ci-runner[{worker_id}]: {e}");
+                    if runner_sleep_until_shutdown(&mut shutdown, error_backoff) {
+                        return CiRunnerLoopExit::Shutdown;
+                    }
+                }
                 Err(e @ RunnerError::ReportFailed(_)) => {
                     eprintln!(
                         "ci-runner[{worker_id}]: terminal report FAILED; stopping host intake so the \

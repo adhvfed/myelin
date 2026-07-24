@@ -21,7 +21,7 @@
 //!     liveness must not check deps; readiness gates on the DB pool + the declared critical deps
 //!     (arch 00 §4: DB + broker + authz + at-least-one-healthy-runner-pool);
 //!   - runs the **complete forward-only data-model migrations** ([`migrations::ci_controlplane_migrations`]):
-//!     all seventeen CI Control-Plane tables (`ci_run`, immutable `ci_drive_manifest`, `ci_job`,
+//!     all eighteen CI Control-Plane tables (`ci_run`, immutable `ci_drive_manifest`, `ci_job`,
 //!     `check_attempt`, `job_queue` +
 //!     its three claim indexes, `fair_deficit`, `runner`, `log_segment`, `log_anchor`, `artifact`,
 //!     `cache_entry`, `environment`, `deployment`, `secret_binding`, `cost_event`, immutable
@@ -648,14 +648,14 @@ pub use migrations::{
     ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
     ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ARTIFACT_TABLE, CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE,
-    CI_COST_EVENT_TABLE, CI_DRIVE_MANIFEST_TABLE, CI_DURABLE_WRITER_IDS,
-    CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID, CI_JOB_ACCOUNTING_TABLE,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, ARTIFACT_TABLE,
+    CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DRIVE_MANIFEST_TABLE,
+    CI_DURABLE_WRITER_IDS, CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID, CI_JOB_ACCOUNTING_TABLE,
     CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_JOB_QUEUE_CLAIM_TIME_MIGRATION_ID,
-    CI_JOB_QUEUE_COMPLETION_MIGRATION_ID, CI_JOB_RUN_LEDGER_INDEX,
-    CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID, CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID,
-    CI_JOB_SPEC_STAGE_MIGRATION_ID, CI_JOB_SPEC_TABLE, CI_JOB_TABLE,
-    CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
+    CI_JOB_QUEUE_COMPLETION_MIGRATION_ID, CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID,
+    CI_JOB_RUN_LEDGER_INDEX, CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID,
+    CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID, CI_JOB_SPEC_STAGE_MIGRATION_ID, CI_JOB_SPEC_TABLE,
+    CI_JOB_TABLE, CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
     CI_RUN_CHECK_ATTEMPT_TABLE, CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
     CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID, CI_RUN_QUEUED_REGION_INDEX,
     CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID, CI_RUN_SURFACE_REPO_CREATED_INDEX,
@@ -732,7 +732,7 @@ fn controlplane_critical() -> CriticalDependencies {
 ///
 /// `config` is the validated, env-first config (§3.2; `Config::from_env()` lands with the driver,
 /// P-S15 — the shell boots over the validated default today). The complete forward-only data-model
-/// migrations create all seventeen control-plane tables `(tenant, region)`-first + RLS-on; the four
+/// migrations create all eighteen control-plane tables `(tenant, region)`-first + RLS-on; the five
 /// hot tables are declared; `broker` / `authz` / `runner_pool` are declared critical. No consumers
 /// are registered here — the scheduler/check-emitter behaviour is the per-table follow-ons (named in
 /// [`migrations`]); the dedup consumer is the Trigger & Dispatch shell.
@@ -1069,8 +1069,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            40,
-            "all 18 tables, three ci_run forward ALTERs, 7 concurrent indexes, the ledger validator, 3 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, and both ci_run discovery grants are present"
+            43,
+            "all 18 tables, three ci_run forward ALTERs, 8 concurrent indexes, the ledger validator, 4 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, and 3 ci_run/workflow discovery grants are present"
         );
         assert!(
             spec.consumers.is_empty(),

@@ -382,26 +382,45 @@ impl AnchorStatus {
     }
 }
 
-/// The `log_segment` INSERT (bind-param SQL — the row write the live stack uses; the schema is
-/// applied by CI-P6). `$1 tenant_id`, `$2 region`, `$3 run_id`, `$4 job_id`, `$5 segment_seq`,
-/// `$6 blob_ref`, `$7 byte_start`, `$8 byte_end`, `$9 pii_key_ref`. `region` is the cell's
-/// (harness-threaded) — the [`LogWritePin`] guard asserts `region == cell.region` BEFORE this runs.
+/// The immutable `log_segment` INSERT (bind-param SQL — the row write the live stack uses; the schema
+/// is applied by CI-P6). `$1 tenant_id`, `$2 region`, `$3 run_id`, `$4 job_id`, `$5 segment_seq`,
+/// `$6 blob_ref`, `$7 byte_start`, `$8 byte_end`, `$9 pii_key_ref`. An exact re-delivery is accepted,
+/// but a conflicting row at the same sequence affects zero rows so the durable writer can reject it
+/// rather than overwrite an already committed prefix. `region` is the cell's (harness-threaded) —
+/// the [`LogWritePin`] guard asserts `region == cell.region` BEFORE this runs.
 pub const INSERT_LOG_SEGMENT_QUERY: &str = "\
 INSERT INTO log_segment
   (tenant_id, region, run_id, job_id, segment_seq, blob_ref, byte_start, byte_end, pii_key_ref)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (tenant_id, run_id, job_id, segment_seq) DO UPDATE
-  SET blob_ref = EXCLUDED.blob_ref, byte_end = EXCLUDED.byte_end";
+  SET blob_ref = log_segment.blob_ref
+  WHERE log_segment.region = EXCLUDED.region
+    AND log_segment.blob_ref IS NOT DISTINCT FROM EXCLUDED.blob_ref
+    AND log_segment.byte_start = EXCLUDED.byte_start
+    AND log_segment.byte_end = EXCLUDED.byte_end
+    AND log_segment.pii_key_ref = EXCLUDED.pii_key_ref";
 
 /// The `log_anchor` UPSERT (bind-param SQL — the anchor write; idempotent on the PK so a re-seal or a
 /// status transition updates in place). `$1 tenant_id`, `$2 region`, `$3 run_id`, `$4 job_id`,
-/// `$5 step_id`, `$6 byte_start`, `$7 byte_end`, `$8 status`. `region` is the cell's (harness-threaded).
+/// `$5 step_id`, `$6 byte_start`, `$7 byte_end`, `$8 status`. A running anchor may remain running or
+/// advance once to a terminal state; a terminal anchor accepts only an exact re-delivery and can
+/// never regress. The durable writer treats a zero-row conflict as a loud divergence. `region` is
+/// the cell's (harness-threaded).
 pub const UPSERT_LOG_ANCHOR_QUERY: &str = "\
 INSERT INTO log_anchor
   (tenant_id, region, run_id, job_id, step_id, byte_start, byte_end, status)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (tenant_id, run_id, job_id, step_id) DO UPDATE
-  SET byte_end = EXCLUDED.byte_end, status = EXCLUDED.status";
+  SET byte_end = EXCLUDED.byte_end, status = EXCLUDED.status
+  WHERE log_anchor.region = EXCLUDED.region
+    AND log_anchor.byte_start = EXCLUDED.byte_start
+    AND (
+      (log_anchor.status = 'running' AND log_anchor.byte_end IS NULL)
+      OR (
+        log_anchor.status = EXCLUDED.status
+        AND log_anchor.byte_end IS NOT DISTINCT FROM EXCLUDED.byte_end
+      )
+    )";
 
 // =================================================================================================
 // 4. The coalescing thresholds (ADR-04.5 — the durable bus must NOT carry one event per log line).
@@ -627,6 +646,48 @@ impl<B: BlobStore> LogPipeline<B> {
         self
     }
 
+    /// Seed an unopened stream from its last durably committed segment.
+    ///
+    /// A runner crash can occur after incremental checkpoints but before terminal reporting. The
+    /// reclaimed job appends after that durable prefix instead of reusing sequence zero or byte zero.
+    /// Callers validate the recovered coordinates at the storage boundary.
+    pub fn resume_stream(
+        &mut self,
+        coord: &LogCoord,
+        step_byte_start: i64,
+        next_byte_offset: i64,
+        next_segment_seq: i32,
+    ) {
+        self.streams.insert(
+            (coord.run_id.clone(), coord.job_id.clone()),
+            StreamState {
+                next_offset: next_byte_offset,
+                open_segment: Vec::new(),
+                open_segment_start: next_byte_offset,
+                next_segment_seq,
+                bytes_since_pointer: 0,
+                last_pointer_offset: next_byte_offset,
+            },
+        );
+        self.anchor_rows.insert(
+            (
+                coord.run_id.clone(),
+                coord.job_id.clone(),
+                coord.step_id.clone(),
+            ),
+            LogAnchorRow {
+                tenant_id: self.tenant.as_str().to_string(),
+                region: self.region.as_str().to_string(),
+                run_id: coord.run_id.clone(),
+                job_id: coord.job_id.clone(),
+                step_id: coord.step_id.clone(),
+                byte_start: step_byte_start,
+                byte_end: None,
+                status: AnchorStatus::Running,
+            },
+        );
+    }
+
     /// **`ship_line(coord, line)` (arch §7.1 — the four-step pipeline).** Redact the line (in-flight
     /// masking, defence-in-depth), publish it to the firehose (the LIVE TAIL — never the durable
     /// bus), append it to the open segment (sealing if full → a T2 blob + a `log_segment` row + a
@@ -639,7 +700,34 @@ impl<B: BlobStore> LogPipeline<B> {
     pub fn ship_line(&mut self, coord: &LogCoord, line: &str) -> Result<u64, CrossRegionLogWrite> {
         // (1) Redact — in-flight masking, defence-in-depth (NOT the boundary).
         let redacted = self.redactor.redact(line);
-        let bytes = redacted.as_bytes();
+        self.ship_redacted_bytes(coord, redacted.as_bytes())
+    }
+
+    /// Ship one already boundary-redacted byte frame without UTF-8 decoding or line splitting.
+    ///
+    /// Production sandbox drains are byte streams: a read boundary may split UTF-8, a line, or an
+    /// arbitrary binary sequence. Converting each read independently with `from_utf8_lossy().lines()`
+    /// changes the archive and can drop newlines. The sandbox boundary owns the authoritative binary
+    /// redaction plan; this pipeline's redactor is empty defence-in-depth on that path, so the exact
+    /// bytes are appended and indexed unchanged.
+    pub fn ship_frame(
+        &mut self,
+        coord: &LogCoord,
+        frame: &[u8],
+    ) -> Result<u64, CrossRegionLogWrite> {
+        debug_assert!(
+            self.redactor.is_empty(),
+            "boundary-redacted frames require the empty defence-in-depth redactor"
+        );
+        self.ship_redacted_bytes(coord, frame)
+    }
+
+    /// Common append/index body after the caller has applied the appropriate redaction boundary.
+    fn ship_redacted_bytes(
+        &mut self,
+        coord: &LogCoord,
+        bytes: &[u8],
+    ) -> Result<u64, CrossRegionLogWrite> {
         let len = bytes.len() as i64;
 
         // (2) Firehose publish — the LIVE TAIL (the resume-cursor viewer is CI-P21). The frame is the
@@ -933,6 +1021,15 @@ impl<B: BlobStore> LogPipeline<B> {
     /// The buffered sealed `log_segment` rows (the caller flushes them to the DB — the index write).
     pub fn segment_rows(&self) -> &[LogSegmentRow] {
         &self.segment_rows
+    }
+
+    /// Drain newly sealed segment rows after an incremental persistence checkpoint.
+    ///
+    /// Segment sequence and byte cursors remain in [`StreamState`], so draining the write buffer
+    /// does not reset ordering. This prevents an incremental sink from re-writing an ever-growing
+    /// prefix on every frame.
+    pub fn drain_segment_rows(&mut self) -> Vec<LogSegmentRow> {
+        std::mem::take(&mut self.segment_rows)
     }
 
     /// The buffered `log_anchor` rows (the caller flushes them to the DB — the index write).

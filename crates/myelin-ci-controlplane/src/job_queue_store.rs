@@ -747,10 +747,12 @@ impl CiJobQueueStore {
 
 /// **The dead-runner reaper loop (arch 02 §2.1) — the lease-driven periodic driver.** A bounded
 /// background task the ci-controlplane `main` spawns onto the serve runtime (minimal-impact wiring —
-/// no new `AppSpec` field): every `interval` it calls [`crate::CiRegionQueueStore::reap`] for the cell region,
-/// re-queuing expired leases so a dead runner's job becomes claimable again. This is the SAME
-/// lease-driven periodic shape as `WorkflowEngine::tick` (a lease sweep on a timer). The reaper is
-/// SAFE: it only moves expired `leased`/`running` rows back to `queued`; it launches nothing.
+/// no new `AppSpec` field). Every `interval` it re-queues expired leases whose Flow/CI owners remain
+/// active. When configured with cancelled accounting, it also terminalizes a bounded, rotating
+/// keyset page of expired launched jobs whose owners are already cancelled, using their immutable
+/// manifest ceiling so superseded work is never made claimable again. Candidate failures are
+/// isolated and reported after the rest of the page, so one corrupt tenant cannot block later
+/// tenants. The reaper launches nothing.
 ///
 /// The loop is resilient by design (a reaper that dies on one transient DB blip is worse than one
 /// that retries): a reap error is logged LOUDLY (never a silent drop — the typed error is surfaced to
@@ -760,6 +762,8 @@ pub struct JobQueueReaper {
     store: crate::CiRegionQueueStore,
     region: String,
     interval: Duration,
+    cancelled_accounting: Option<(sqlx::PgPool, myelin_storage::DurableCostLedger)>,
+    cancelled_cursor: std::sync::Mutex<Option<crate::job_queue_region::AbandonedCancelledCursor>>,
 }
 
 impl JobQueueReaper {
@@ -775,7 +779,20 @@ impl JobQueueReaper {
             store,
             region: region.into(),
             interval,
+            cancelled_accounting: None,
+            cancelled_cursor: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Attach the tenant-scoped durable settlement path for expired launched jobs whose owners have
+    /// already terminated. Production always configures this; queue-only tests may omit it.
+    pub fn with_cancelled_accounting(
+        mut self,
+        pool: sqlx::PgPool,
+        ledger: myelin_storage::DurableCostLedger,
+    ) -> Self {
+        self.cancelled_accounting = Some((pool, ledger));
+        self
     }
 
     /// The cell region this reaper sweeps.
@@ -788,11 +805,74 @@ impl JobQueueReaper {
         self.interval
     }
 
-    /// **One reap sweep** — re-queue every expired lease in the region; returns the count re-queued.
-    /// Exposed so a test/drill can drive a single deterministic sweep (the loop just calls this on a
-    /// timer).
+    /// **One recovery sweep** — re-queue expired active leases and reconcile one bounded, rotating
+    /// page of expired cancelled launches. Returns the total rows changed, or reports accumulated
+    /// candidate failures only after all other candidates in the page were attempted.
     pub async fn reap_once(&self) -> Result<u64, JobQueueStoreError> {
-        self.store.reap(&self.region).await
+        let mut changed = self.store.reap(&self.region).await?;
+        let Some((pool, ledger)) = &self.cancelled_accounting else {
+            return Ok(changed);
+        };
+        let after = self
+            .cancelled_cursor
+            .lock()
+            .map_err(|_| JobQueueStoreError::Db("cancelled-recovery cursor lock poisoned".into()))?
+            .clone();
+        let mut candidates = self
+            .store
+            .abandoned_cancelled(&self.region, after.as_ref())
+            .await?;
+        if candidates.is_empty() && after.is_some() {
+            candidates = self.store.abandoned_cancelled(&self.region, None).await?;
+        }
+        let next_cursor =
+            candidates.last().map(
+                |candidate| crate::job_queue_region::AbandonedCancelledCursor {
+                    tenant_id: candidate.tenant_id.clone(),
+                    job_id: candidate.job_id.clone(),
+                },
+            );
+        *self.cancelled_cursor.lock().map_err(|_| {
+            JobQueueStoreError::Db("cancelled-recovery cursor lock poisoned".into())
+        })? = next_cursor;
+
+        let mut failures = 0_u64;
+        let mut first_failure = None;
+        for candidate in candidates {
+            let authority = match crate::PgCiRunSupersession::new(
+                pool.clone(),
+                ledger.clone(),
+                myelin_tenancy::TenantId(candidate.tenant_id),
+                myelin_tenancy::Region(self.region.clone()),
+                tokio::runtime::Handle::current(),
+            ) {
+                Ok(authority) => authority,
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    first_failure.get_or_insert_with(|| error.to_string());
+                    continue;
+                }
+            };
+            match authority
+                .reconcile_abandoned_job(&candidate.wf_run_id, &candidate.job_id)
+                .await
+            {
+                Ok(true) => changed = changed.saturating_add(1),
+                Ok(false) => {}
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    first_failure.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+        if failures > 0 {
+            return Err(JobQueueStoreError::Db(format!(
+                "{failures} cancelled recovery candidate(s) failed after {changed} row(s) were \
+                 recovered; first failure: {}",
+                first_failure.unwrap_or_else(|| "unknown reconciliation failure".into())
+            )));
+        }
+        Ok(changed)
     }
 
     /// Legacy forever-loop driver retained for deterministic callers. Production uses
@@ -804,8 +884,8 @@ impl JobQueueReaper {
                 Ok(0) => {}
                 Ok(n) => {
                     eprintln!(
-                        "ci-controlplane reaper: re-queued {n} expired lease(s) in region \
-                         `{}` (dead-runner recovery)",
+                        "ci-controlplane reaper: recovered {n} expired lease(s) in region \
+                         `{}` (active requeue or cancelled settlement)",
                         self.region
                     );
                 }
@@ -841,8 +921,8 @@ impl JobQueueReaper {
                         Ok(0) => {}
                         Ok(n) => {
                             eprintln!(
-                                "ci-controlplane reaper: re-queued {n} expired lease(s) in region \
-                                 `{}` (dead-runner recovery)",
+                                "ci-controlplane reaper: recovered {n} expired lease(s) in region \
+                                 `{}` (active requeue or cancelled settlement)",
                                 self.region
                             );
                         }
@@ -940,6 +1020,9 @@ mod tests {
         assert!(CLAIM_QUERY.contains("claim_started_at = statement_timestamp()"));
         assert!(CLAIM_QUERY
             .contains("claim_expires_at = statement_timestamp() + ($5 || ' seconds')::interval"));
+        assert!(CLAIM_QUERY.contains("w.state IN ('running', 'waiting')"));
+        assert!(CLAIM_QUERY.contains("c.state = 'running'"));
+        assert!(CLAIM_QUERY.contains("c.wf_run_id = q.run_id"));
         // Mint authority reloads the exact persisted claim and treats legacy/null expiry as dead.
         assert!(LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY.contains("$4::uuid"));
         assert!(LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY.contains("FOR UPDATE"));
@@ -966,6 +1049,9 @@ mod tests {
             .starts_with("WITH candidates AS MATERIALIZED"));
         assert!(REAP_QUERY.contains("FOR UPDATE SKIP LOCKED"));
         assert!(REAP_QUERY.contains("pg_try_advisory_xact_lock"));
+        assert!(REAP_QUERY.contains("w.state IN ('running', 'waiting')"));
+        assert!(REAP_QUERY.contains("c.state = 'running'"));
+        assert!(REAP_QUERY.contains("c.wf_run_id = job_queue.run_id"));
         // CANCEL: four binds ($1..$4), keeping the new head.
         assert!(CANCEL_SUPERSEDED_QUERY.contains("$4") && !CANCEL_SUPERSEDED_QUERY.contains("$5"));
         assert!(CANCEL_SUPERSEDED_QUERY.contains("job_id <> $4"));

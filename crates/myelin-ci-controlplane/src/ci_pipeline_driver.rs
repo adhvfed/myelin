@@ -53,7 +53,8 @@ use std::sync::Mutex;
 
 use myelin_ci_sandbox::{
     CompletionClaim, CompletionSettlementOwner, IdemToken, JobSpec as SandboxJobSpec,
-    ResourceUsage, TerminalReport, TerminalReporter,
+    ResourceUsage, RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome,
+    TerminalReport, TerminalReporter,
 };
 #[cfg(any(test, feature = "test-support"))]
 use myelin_ci_sandbox::{
@@ -72,6 +73,7 @@ use myelin_storage::{
 #[cfg(any(test, feature = "test-support"))]
 use myelin_tenancy::Region;
 use myelin_tenancy::TenantId;
+use serde::{Deserialize, Serialize};
 use sqlx::types::Uuid;
 use sqlx::Row;
 
@@ -450,6 +452,124 @@ fn completion_receipt(input: CompletionReceiptInput<'_>) -> String {
     format!("v3:{}", hasher.finalize().to_hex())
 }
 
+const RETRY_ATTEMPT_RECORD_VERSION: u8 = 1;
+const OUTPUT_PERSISTENCE_CAUSE: &str = "output_persistence";
+
+/// Last immutable measured-attempt receipt retained beside fixed-size cumulative usage on
+/// `job_queue` until a later terminal generation settles the aggregate. The JSON object is PII-free
+/// and constant-size across arbitrarily many retries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetryAttemptRecord {
+    lease_epoch: i64,
+    claim_nonce: String,
+    lease_owner: String,
+    cause: String,
+    cpu_seconds: u64,
+    mem_byte_seconds: u64,
+    receipt: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetryAttemptAccrual {
+    version: u8,
+    attempts: u64,
+    cpu_seconds: u64,
+    mem_byte_seconds: u64,
+    last: RetryAttemptRecord,
+}
+
+fn retry_attempt_receipt(
+    claim: &CompletionClaim,
+    region: &str,
+    failure: &RetryableAttemptFailure,
+) -> String {
+    let cause = match failure.cause {
+        RetryableAttemptCause::OutputPersistence => OUTPUT_PERSISTENCE_CAUSE,
+    };
+    let key = blake3::derive_key(
+        "myelin.ci.retry-attempt-receipt.v1",
+        claim.claim_nonce.as_bytes(),
+    );
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    for frame in [
+        claim.tenant.0.as_bytes(),
+        region.as_bytes(),
+        claim.run.0.as_bytes(),
+        claim.job_id.as_bytes(),
+        claim.idem_token.as_bytes(),
+        claim.lease_owner.as_bytes(),
+        &claim.lease_epoch.to_be_bytes(),
+        claim.claim_nonce.as_bytes(),
+        cause.as_bytes(),
+        &failure.usage.cpu_seconds.to_be_bytes(),
+        &failure.usage.mem_byte_seconds.to_be_bytes(),
+    ] {
+        hasher.update(&(frame.len() as u64).to_be_bytes());
+        hasher.update(frame);
+    }
+    format!("retry-v1:{}", hasher.finalize().to_hex())
+}
+
+fn decode_retry_attempts(
+    value: serde_json::Value,
+) -> Result<Option<RetryAttemptAccrual>, CompletionTxError> {
+    if value.as_object().is_some_and(serde_json::Map::is_empty)
+        || value.as_array().is_some_and(Vec::is_empty)
+    {
+        return Ok(None);
+    }
+    let accrual: RetryAttemptAccrual =
+        serde_json::from_value(value).map_err(|_| CompletionTxError::RetryCorrupt)?;
+    let valid = accrual.version == RETRY_ATTEMPT_RECORD_VERSION
+        && accrual.attempts > 0
+        && accrual.last.lease_epoch > 0
+        && accrual.attempts <= accrual.last.lease_epoch as u64
+        && Uuid::parse_str(&accrual.last.claim_nonce).is_ok()
+        && !accrual.last.lease_owner.is_empty()
+        && accrual.last.cause == OUTPUT_PERSISTENCE_CAUSE
+        && accrual.last.receipt.starts_with("retry-v1:")
+        && accrual.last.receipt.len() == "retry-v1:".len() + 64;
+    if valid {
+        Ok(Some(accrual))
+    } else {
+        Err(CompletionTxError::RetryCorrupt)
+    }
+}
+
+pub(crate) fn decode_retry_attempt_usage(
+    value: serde_json::Value,
+) -> Result<Option<ResourceUsage>, ()> {
+    decode_retry_attempts(value)
+        .map(|attempts| {
+            attempts.map(|attempts| ResourceUsage {
+                cpu_seconds: attempts.cpu_seconds,
+                mem_byte_seconds: attempts.mem_byte_seconds,
+            })
+        })
+        .map_err(|_| ())
+}
+
+fn aggregate_usage(
+    attempts: Option<&RetryAttemptAccrual>,
+    current: ResourceUsage,
+) -> Result<ResourceUsage, CompletionTxError> {
+    let Some(attempts) = attempts else {
+        return Ok(current);
+    };
+    Ok(ResourceUsage {
+        cpu_seconds: current
+            .cpu_seconds
+            .checked_add(attempts.cpu_seconds)
+            .ok_or(CompletionTxError::Refused)?,
+        mem_byte_seconds: current
+            .mem_byte_seconds
+            .checked_add(attempts.mem_byte_seconds)
+            .ok_or(CompletionTxError::Refused)?,
+    })
+}
+
 /// Immutable-pricing output for the two raw resource dimensions a sandbox reports. There is no
 /// built-in or permissive production price: an adapter must name the pricing revision and provide
 /// the wholesale/markup split for both CPU and memory.
@@ -604,7 +724,7 @@ struct TerminalAccountingInput<'a> {
 }
 
 #[derive(Debug)]
-enum CompletionTxError {
+pub(crate) enum CompletionTxError {
     Scope(PgError),
     Spec(CiJobSpecStoreError),
     Manifest,
@@ -614,6 +734,8 @@ enum CompletionTxError {
     Accounting(CiJobAccountingError),
     CancelledClosure,
     Signal(ExecutorError),
+    RetryStore,
+    RetryCorrupt,
     Refused,
 }
 
@@ -621,6 +743,146 @@ impl From<PgError> for CompletionTxError {
     fn from(error: PgError) -> Self {
         Self::Scope(error)
     }
+}
+
+async fn record_retryable_attempt_on_conn(
+    conn: &mut sqlx::PgConnection,
+    region: &str,
+    claim: &CompletionClaim,
+    failure: &RetryableAttemptFailure,
+    requeue: bool,
+) -> Result<RetryableAttemptOutcome, CompletionTxError> {
+    let job_id = Uuid::parse_str(&claim.job_id).map_err(|_| CompletionTxError::Refused)?;
+    let row = sqlx::query(
+        "SELECT run_id::text AS run_id, idem_token, state, lease_owner, lease_epoch,
+                claim_nonce::text AS claim_nonce, completion_receipt, retry_attempts
+         FROM job_queue
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3
+         FOR UPDATE",
+    )
+    .bind(&claim.tenant.0)
+    .bind(region)
+    .bind(job_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|_| CompletionTxError::RetryStore)?
+    .ok_or(CompletionTxError::Refused)?;
+    let durable_run: String = row.get("run_id");
+    let durable_idem: String = row.get("idem_token");
+    let state: String = row.get("state");
+    let lease_owner: Option<String> = row.get("lease_owner");
+    let lease_epoch: i64 = row.get("lease_epoch");
+    let claim_nonce: Option<String> = row.get("claim_nonce");
+    let completion_receipt: Option<String> = row.get("completion_receipt");
+    let retry_attempts: serde_json::Value = row.get("retry_attempts");
+    let attempts = decode_retry_attempts(retry_attempts.clone())?;
+    let receipt = retry_attempt_receipt(claim, region, failure);
+    let expected = RetryAttemptRecord {
+        lease_epoch: claim.lease_epoch,
+        claim_nonce: claim.claim_nonce.clone(),
+        lease_owner: claim.lease_owner.clone(),
+        cause: OUTPUT_PERSISTENCE_CAUSE.into(),
+        cpu_seconds: failure.usage.cpu_seconds,
+        mem_byte_seconds: failure.usage.mem_byte_seconds,
+        receipt,
+    };
+
+    if let Some(recorded) = attempts
+        .as_ref()
+        .filter(|attempts| attempts.last.lease_epoch == claim.lease_epoch)
+    {
+        return if recorded.last == expected {
+            Ok(RetryableAttemptOutcome::ExactReplay)
+        } else {
+            Err(CompletionTxError::Refused)
+        };
+    }
+    let exact_live_generation = durable_run == claim.run.0
+        && durable_idem == claim.idem_token
+        && state == "running"
+        && lease_owner.as_deref() == Some(claim.lease_owner.as_str())
+        && lease_epoch == claim.lease_epoch
+        && claim_nonce.as_deref() == Some(claim.claim_nonce.as_str())
+        && completion_receipt.is_none();
+    if !exact_live_generation
+        || attempts
+            .as_ref()
+            .is_some_and(|prior| prior.last.lease_epoch >= claim.lease_epoch)
+    {
+        return Err(CompletionTxError::Refused);
+    }
+    let prior_attempts = attempts.as_ref().map_or(0, |prior| prior.attempts);
+    let prior_cpu = attempts.as_ref().map_or(0, |prior| prior.cpu_seconds);
+    let prior_memory = attempts.as_ref().map_or(0, |prior| prior.mem_byte_seconds);
+    let encoded = serde_json::to_value(RetryAttemptAccrual {
+        version: RETRY_ATTEMPT_RECORD_VERSION,
+        attempts: prior_attempts
+            .checked_add(1)
+            .ok_or(CompletionTxError::Refused)?,
+        cpu_seconds: prior_cpu
+            .checked_add(failure.usage.cpu_seconds)
+            .ok_or(CompletionTxError::Refused)?,
+        mem_byte_seconds: prior_memory
+            .checked_add(failure.usage.mem_byte_seconds)
+            .ok_or(CompletionTxError::Refused)?,
+        last: expected,
+    })
+    .map_err(|_| CompletionTxError::Refused)?;
+    let next_state = if requeue { "queued" } else { "terminal" };
+    let updated = sqlx::query(
+        "UPDATE job_queue
+         SET retry_attempts = $10, state = $11, lease_owner = NULL, lease_expires = NULL,
+             claim_nonce = NULL
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3 AND run_id = $4::uuid
+           AND idem_token = $5 AND state = 'running' AND lease_owner = $6
+           AND lease_epoch = $7 AND claim_nonce = $8::uuid AND completion_receipt IS NULL
+           AND retry_attempts = $9
+         RETURNING job_id",
+    )
+    .bind(&claim.tenant.0)
+    .bind(region)
+    .bind(job_id)
+    .bind(&claim.run.0)
+    .bind(&claim.idem_token)
+    .bind(&claim.lease_owner)
+    .bind(claim.lease_epoch)
+    .bind(&claim.claim_nonce)
+    .bind(retry_attempts)
+    .bind(encoded)
+    .bind(next_state)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|_| CompletionTxError::RetryStore)?;
+    if updated.is_some() {
+        Ok(if requeue {
+            RetryableAttemptOutcome::Requeued
+        } else {
+            RetryableAttemptOutcome::Cancelled
+        })
+    } else {
+        Err(CompletionTxError::Refused)
+    }
+}
+
+async fn retry_attempts_for_terminal_on_conn(
+    conn: &mut sqlx::PgConnection,
+    tenant: &TenantId,
+    region: &str,
+    job_id: Uuid,
+) -> Result<Option<RetryAttemptAccrual>, CompletionTxError> {
+    let value: serde_json::Value = sqlx::query_scalar(
+        "SELECT retry_attempts FROM job_queue
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3
+         FOR UPDATE",
+    )
+    .bind(&tenant.0)
+    .bind(region)
+    .bind(job_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|_| CompletionTxError::RetryStore)?
+    .ok_or(CompletionTxError::Refused)?;
+    decode_retry_attempts(value)
 }
 
 async fn co_commit_terminal_accounting(
@@ -729,7 +991,7 @@ async fn co_commit_terminal_accounting(
     Ok(())
 }
 
-async fn close_cancelled_run_if_accounted(
+pub(crate) async fn close_cancelled_run_if_accounted(
     conn: &mut sqlx::PgConnection,
     accounting: &DurableCiJobAccounting,
     wf_run_id: &str,
@@ -1016,21 +1278,6 @@ impl TerminalReporter for CiPipelineReporter {
                             identity,
                         )
                         .map_err(|_| CompletionTxError::Refused)?;
-                        let receipt = completion_receipt(CompletionReceiptInput {
-                            tenant: &TenantId(tenant_owned.clone()),
-                            region: &region_owned,
-                            run: &run_owned,
-                            job_id: &job_owned,
-                            idem_token: &idem_owned,
-                            stage: &stage,
-                            passed: report_owned.passed,
-                            timed_out: report_owned.timed_out,
-                            usage: report_owned.usage,
-                            result_refs: &report_owned.result_refs,
-                            lease_owner: &owner_owned,
-                            lease_epoch,
-                            claim_nonce: &nonce_owned,
-                        });
                         // Lock Flow before the scheduler/accounting rows. Run supersession uses the
                         // same order, so a canceller cannot hold a queue row while waiting for Flow
                         // as this reporter holds Flow while waiting for that queue row.
@@ -1049,6 +1296,31 @@ impl TerminalReporter for CiPipelineReporter {
                             .signal_typed_on_conn(conn, signal.clone())
                             .await
                             .map_err(CompletionTxError::Signal)?;
+                        let attempts = retry_attempts_for_terminal_on_conn(
+                            conn,
+                            &TenantId(tenant_owned.clone()),
+                            &region_owned,
+                            job_uuid,
+                        )
+                        .await?;
+                        let mut accounted_report = report_owned.clone();
+                        accounted_report.usage =
+                            aggregate_usage(attempts.as_ref(), report_owned.usage)?;
+                        let receipt = completion_receipt(CompletionReceiptInput {
+                            tenant: &TenantId(tenant_owned.clone()),
+                            region: &region_owned,
+                            run: &run_owned,
+                            job_id: &job_owned,
+                            idem_token: &idem_owned,
+                            stage: &stage,
+                            passed: accounted_report.passed,
+                            timed_out: accounted_report.timed_out,
+                            usage: accounted_report.usage,
+                            result_refs: &accounted_report.result_refs,
+                            lease_owner: &owner_owned,
+                            lease_epoch,
+                            claim_nonce: &nonce_owned,
+                        });
                         let claim = CiJobQueueStore::consume_claim_on_conn(
                             conn,
                             ClaimConsumeSpec {
@@ -1075,7 +1347,7 @@ impl TerminalReporter for CiPipelineReporter {
                                         wf_run: &run_owned,
                                         job_id: &job_owned,
                                         reserve_handle: &reserve_handle,
-                                        report: &report_owned,
+                                        report: &accounted_report,
                                         receipt: &receipt,
                                         replay: claim == ClaimConsumeOutcome::AlreadyConsumed,
                                     },
@@ -1136,6 +1408,16 @@ impl TerminalReporter for CiPipelineReporter {
                 ))
             }
             Err(CompletionTxError::Signal(error)) => return Err(error),
+            Err(CompletionTxError::RetryStore) => {
+                return Err(ExecutorError::Storage(
+                    "durable retry-attempt store failed".into(),
+                ))
+            }
+            Err(CompletionTxError::RetryCorrupt) => {
+                return Err(ExecutorError::Storage(
+                    "durable retry-attempt state is corrupt".into(),
+                ))
+            }
             Err(CompletionTxError::Scope(error)) => {
                 return Err(ExecutorError::Storage(format!(
                     "atomic completion transaction failed: {error}"
@@ -1153,6 +1435,189 @@ impl TerminalReporter for CiPipelineReporter {
         #[cfg(not(any(test, feature = "test-support")))]
         let _ = signal;
         Ok(outcome)
+    }
+
+    fn report_retryable_attempt(
+        &self,
+        claim: &CompletionClaim,
+        failure: &RetryableAttemptFailure,
+    ) -> Result<RetryableAttemptOutcome, ExecutorError> {
+        if claim.tenant != self.tenant {
+            return Err(ExecutorError::InvalidInput(
+                "ci.pipeline retryable attempt refused: reporter tenant mismatch".into(),
+            ));
+        }
+        let job_uuid = Uuid::parse_str(&claim.job_id).map_err(|_| {
+            ExecutorError::InvalidInput("invalid job_id UUID in retryable attempt".into())
+        })?;
+        Uuid::parse_str(&claim.claim_nonce).map_err(|_| {
+            ExecutorError::InvalidInput("invalid claim_nonce UUID in retryable attempt".into())
+        })?;
+        let tenant_owned = self.tenant.0.clone();
+        let region_owned = self.region.clone();
+        let claim_owned = claim.clone();
+        let failure_owned = *failure;
+        let spec_store = self.spec_store.clone();
+        let accounting = self.accounting.clone();
+        let durable = bridge(
+            &self.rt,
+            with_tenant_tx_error(
+                self.queue_store.pool(),
+                &self.tenant.0,
+                &self.region,
+                move |conn| {
+                    Box::pin(async move {
+                        let flow_state: String = sqlx::query_scalar(
+                            "SELECT state FROM workflow_run
+                             WHERE tenant_id = $1 AND region = $2 AND run_id = $3
+                             FOR UPDATE",
+                        )
+                        .bind(&tenant_owned)
+                        .bind(&region_owned)
+                        .bind(&claim_owned.run.0)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|_| CompletionTxError::RetryStore)?
+                        .ok_or(CompletionTxError::Refused)?;
+                        let requeue = matches!(flow_state.as_str(), "running" | "waiting");
+                        let cancelled_ci_run = if !requeue {
+                            if flow_state != "terminated" {
+                                return Err(CompletionTxError::Refused);
+                            }
+                            let ci_run: Option<(String, String)> = sqlx::query_as(
+                                "SELECT run_id::text, state FROM ci_run
+                                 WHERE tenant_id = $1 AND region = $2 AND wf_run_id = $3::uuid",
+                            )
+                            .bind(&tenant_owned)
+                            .bind(&region_owned)
+                            .bind(&claim_owned.run.0)
+                            .fetch_optional(&mut *conn)
+                            .await
+                            .map_err(|_| CompletionTxError::RetryStore)?;
+                            let (ci_run_id, ci_state) = ci_run.ok_or(CompletionTxError::Refused)?;
+                            if ci_state != "cancelled" {
+                                return Err(CompletionTxError::Refused);
+                            }
+                            Some(ci_run_id)
+                        } else {
+                            None
+                        };
+                        let identity = spec_store
+                            .get_dispatch_identity_on_conn(
+                                conn,
+                                &tenant_owned,
+                                job_uuid,
+                                &claim_owned.job_id,
+                            )
+                            .await
+                            .map_err(CompletionTxError::Spec)?;
+                        let reserve_handle = identity
+                            .as_ref()
+                            .map(|identity| identity.reserve_handle.clone())
+                            .ok_or(CompletionTxError::Refused)?;
+                        verify_claimed_identity(
+                            &TenantId(tenant_owned.clone()),
+                            &claim_owned.tenant,
+                            &claim_owned.run.0,
+                            &claim_owned.job_id,
+                            &claim_owned.idem_token,
+                            identity,
+                        )
+                        .map_err(|_| CompletionTxError::Refused)?;
+                        let outcome = record_retryable_attempt_on_conn(
+                            conn,
+                            &region_owned,
+                            &claim_owned,
+                            &failure_owned,
+                            requeue,
+                        )
+                        .await?;
+                        if !requeue {
+                            let attempts = retry_attempts_for_terminal_on_conn(
+                                conn,
+                                &TenantId(tenant_owned.clone()),
+                                &region_owned,
+                                job_uuid,
+                            )
+                            .await?
+                            .ok_or(CompletionTxError::RetryCorrupt)?;
+                            let report = TerminalReport {
+                                passed: false,
+                                timed_out: false,
+                                usage: ResourceUsage {
+                                    cpu_seconds: attempts.cpu_seconds,
+                                    mem_byte_seconds: attempts.mem_byte_seconds,
+                                },
+                                result_refs: Vec::new(),
+                            };
+                            match &accounting {
+                                ReporterAccounting::Durable(accounting) => {
+                                    let receipt = crate::ci_run_supersession::superseded_receipt(
+                                        &accounting.scope,
+                                        cancelled_ci_run
+                                            .as_deref()
+                                            .ok_or(CompletionTxError::Refused)?,
+                                        &claim_owned.run.0,
+                                        &claim_owned.job_id,
+                                        &reserve_handle,
+                                        report.usage,
+                                        false,
+                                    );
+                                    co_commit_terminal_accounting(
+                                        conn,
+                                        accounting,
+                                        TerminalAccountingInput {
+                                            tenant: &TenantId(tenant_owned.clone()),
+                                            wf_run: &claim_owned.run,
+                                            job_id: &claim_owned.job_id,
+                                            reserve_handle: &reserve_handle,
+                                            report: &report,
+                                            receipt: &receipt,
+                                            replay: outcome == RetryableAttemptOutcome::ExactReplay,
+                                        },
+                                    )
+                                    .await?;
+                                    close_cancelled_run_if_accounted(
+                                        conn,
+                                        accounting,
+                                        &claim_owned.run.0,
+                                    )
+                                    .await?;
+                                }
+                                #[cfg(any(test, feature = "test-support"))]
+                                ReporterAccounting::TestBypass => {
+                                    return Err(CompletionTxError::Refused);
+                                }
+                            }
+                        }
+                        Ok(outcome)
+                    })
+                },
+            ),
+        );
+        match durable {
+            Ok(outcome) => Ok(outcome),
+            Err(CompletionTxError::Refused) => Err(ExecutorError::InvalidInput(format!(
+                "ci.pipeline retryable attempt refused (unverified, stale, or divergent claim): \
+                 job `{}` owner `{}` epoch `{}`",
+                claim.job_id, claim.lease_owner, claim.lease_epoch
+            ))),
+            Err(CompletionTxError::Spec(error)) => Err(ExecutorError::Storage(format!(
+                "durable retryable-attempt dispatch read refused: {error}"
+            ))),
+            Err(CompletionTxError::Scope(error)) => Err(ExecutorError::Storage(format!(
+                "atomic retryable-attempt transaction failed: {error}"
+            ))),
+            Err(CompletionTxError::RetryStore) => Err(ExecutorError::Storage(
+                "durable retry-attempt store failed".into(),
+            )),
+            Err(CompletionTxError::RetryCorrupt) => Err(ExecutorError::Storage(
+                "durable retry-attempt state is corrupt".into(),
+            )),
+            Err(_) => Err(ExecutorError::Storage(
+                "retryable-attempt transaction reached an invalid accounting path".into(),
+            )),
+        }
     }
 }
 
