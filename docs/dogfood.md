@@ -108,6 +108,39 @@ repository ruleset's required set and Git's settled, trusted green projection. I
 reports the full merge-gate verdict; the verdict may remain false until the separate review threshold
 is satisfied.
 
+Capture the CI surface evidence from that same run; do not substitute a fixture or a different head.
+While the pushed job is still running, discover its server-issued identifiers and attach both
+consumers before it finishes:
+
+```sh
+set -o pipefail
+EVIDENCE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/myelin/acceptance"
+mkdir -p "$EVIDENCE_DIR"
+myelin --json ci list --status running --limit 20
+myelin ci view <run>
+myelin ci watch <run> --job <job> | tee "$EVIDENCE_DIR/myelin-ci-live-<run>-<job>.log"
+```
+
+At the same time, open `/ci/runs/<run>` in the authenticated web app and observe the bounded recent
+live output advance to completion. The run and job identifiers must come from the durable list/detail
+responses; do not precompute or copy them from PostgreSQL. A job that finishes before either consumer
+attaches does not prove live usability—push another harmless Myelin commit and repeat.
+
+After completion, prove that the cold path has the same output and that the exact run settled:
+
+```sh
+myelin --json ci view <run> | tee "$EVIDENCE_DIR/myelin-ci-run-<run>.json"
+myelin ci logs <run> --job <job> --start 0 --limit 262144 \
+  | tee "$EVIDENCE_DIR/myelin-ci-archive-<run>-<job>.log"
+```
+
+Follow any parser-round-trippable `more — run:` command printed by the archive reader until no
+continuation remains. Compare a marker emitted by the pushed job in the live capture, browser, and
+archive; all three must show it once. Preserve the two captures together with the `verify-check` JSON
+and the exact pushed OID. Do not mark the founder pass or start the R4 clock if the run fails, costs
+remain unsettled, the required check is absent/stale, a consumer needed GitHub, or any log surface
+loses/duplicates the marker.
+
 ## 3. Mint an operator token (`edge bootstrap`)
 
 ```sh
