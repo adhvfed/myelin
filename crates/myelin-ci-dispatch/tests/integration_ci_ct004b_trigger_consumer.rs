@@ -2,9 +2,9 @@
 //! the H1 (peer-review #7 re-prosecution) TRUE co-commit + LIVELOCK-CLOSED proofs, PLUS the CT-004d.2
 //! chunk 4 PRODUCTION durable `ci_run` writer (`CoCommitReserveStore`) proofs.**
 //!
-//! Live-PG proofs (all in an isolated per-pid schema, `myelin_admin` = BYPASSRLS so the reserve
-//! exercises the FORCE-RLS `ci_run` shape; the app-role RLS block is proven separately in
-//! `myelin-ci-controlplane`'s `integration_ci_ct004d2_ci_run_store`):
+//! Live-PG proofs use isolated per-pid schemas. Most fault-injection cases use the migration owner;
+//! the production authority case runs the complete reserve and replay through `myelin_app` with
+//! `ci_run_check_attempt` restricted to `SELECT, INSERT`, matching the immutable live grant.
 //!
 //! The production `CoCommitReserveStore` co-commits `ci_run`, monotonic `check_attempt`, canonical
 //! reserve events, and the trigger dedup mark through `CiRunStore::co_commit_reserve`. A rollback
@@ -94,6 +94,23 @@ async fn reopen(schema: &str) -> PgPool {
         .connect(&admin_url())
         .await
         .expect("reconnect to dev Postgres (is the stack up? eval \"$(scripts/dev-stack.sh env)\")")
+}
+
+async fn reopen_app(schema: &str) -> PgPool {
+    let schema = schema.to_string();
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .after_connect(move |conn, _meta| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                conn.execute(format!("SET search_path TO {schema}, public").as_str())
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&app_url())
+        .await
+        .expect("connect the constrained runtime role to dev Postgres")
 }
 
 /// Stand up the isolated schema + the shared CI tables (ci_run etc.) + consumer_dedup + a reserve
@@ -1000,6 +1017,91 @@ async fn production_crash_rolls_back_run_attempt_events_and_mark_then_reconverge
         .await
         .ok();
     println!("[chunk4/2] PASS production co-commit crash: run+attempt+events+mark roll back together; redelivery commits the complete bundle exactly once.");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_reserve_and_replay_need_no_update_grant_on_immutable_attempts() {
+    let schema = schema_name(uniq());
+    let admin = setup_schema(&schema, OUTBOX_MIGRATION).await;
+    sqlx::raw_sql(&format!(
+        "GRANT USAGE ON SCHEMA {schema} TO myelin_app;
+         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} TO myelin_app;
+         REVOKE UPDATE, DELETE ON {schema}.ci_run_check_attempt FROM myelin_app;"
+    ))
+    .execute(&admin)
+    .await
+    .expect("install the production-shaped runtime grants");
+
+    let can_select: bool =
+        sqlx::query_scalar("SELECT has_table_privilege('myelin_app', $1, 'SELECT')")
+            .bind(format!("{schema}.ci_run_check_attempt"))
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    let can_update: bool =
+        sqlx::query_scalar("SELECT has_table_privilege('myelin_app', $1, 'UPDATE')")
+            .bind(format!("{schema}.ci_run_check_attempt"))
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert!(can_select);
+    assert!(
+        !can_update,
+        "the immutable attempt authority stays non-updatable"
+    );
+
+    let app = reopen_app(&schema).await;
+    let rt = tokio::runtime::Handle::current();
+    let ledger = DedupLedger::durable(
+        Arc::new(DurableDedupBacking::new(app.clone(), rt.clone())) as Arc<dyn DurableDedup>
+    );
+    let store = CoCommitReserveStore::new(
+        ci_run_store_factory(app.clone()),
+        Arc::new(UlidMinter::new()),
+        rt,
+    );
+    let cname = ConsumerName("ci-dispatch.trigger".into());
+    let tenant = TenantId("acme".into());
+    let region = Region("fr-par".into());
+    let event = push_envelope(
+        "ev-runtime-immutable-attempt",
+        "web",
+        "1234567890abcdef1234567890abcdef12345678",
+    );
+    let armed = armed_for(&event, "web", "1234567890abcdef1234567890abcdef12345678");
+
+    for event_id in [
+        EventId("ev-runtime-immutable-attempt".into()),
+        EventId("ev-runtime-immutable-attempt-replay".into()),
+    ] {
+        tokio::task::block_in_place(|| {
+            let (mut cotx, fresh) = ledger.begin_co_commit(&cname, &event_id, &tenant, &region);
+            assert!(fresh);
+            {
+                let conn = cotx.connection().expect("co-commit connection");
+                let mut tx = HandlerTx::with_connection(conn);
+                store
+                    .persist(&armed, &mut tx)
+                    .expect("reserve/replay under SELECT+INSERT attempt authority");
+            }
+            cotx.commit().expect("commit the production-shaped reserve");
+        });
+    }
+
+    let issued: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM ci_run_check_attempt")
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    assert_eq!(
+        issued, 2,
+        "one immutable authority per configured check context"
+    );
+
+    app.close().await;
+    admin
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .ok();
 }
 
 // =================================================================================================
