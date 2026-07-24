@@ -2060,8 +2060,12 @@ move because five scanner/redaction test blobs contained the scanner's own compl
 sentinels. The tests now assemble those same bytes at runtime, preserving every redaction and
 reject-before-promote assertion while making the source blobs hostable. A permanent test derives the
 production default patterns and scans every tracked file, preventing this self-rejection from
-returning. The full-tree disposable probe must pass before preparing the equivalent unpushed founder
-branch; the actual Myelin source push/PR remains the user's act and R4.1 stays open until it lands.
+returning. A rebuilt snapshot then passed the production wire into the authorized disposable
+repository at `bae43d6c3d9b497bcba64e7eee54357363911a8e`; its tree
+`962bef9beaada21d727087403eedafc779ea7d30` exactly matches local source commit `f3e51112`, and the
+short-lived credential is durably revoked. This authorizes preparing the equivalent local founder
+branch, not pushing it. The actual Myelin source push/PR remains the user's act and R4.1 stays open
+until it lands.
 
 **CT-007 handoff floor (pre-registered; phase still closed).** Code wins over a tempting literal
 interpretation of “cut over”: `.myelin/ci.toml` currently proves only the push/runner/log/check
