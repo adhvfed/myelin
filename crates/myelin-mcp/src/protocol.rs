@@ -28,8 +28,8 @@ pub const INVALID_PARAMS: i64 = -32602;
 /// `-32603` — an internal JSON-RPC error.
 pub const INTERNAL_ERROR: i64 = -32603;
 /// `-32004` — APP: governed routing is not wired into this server instance (no `GovernedRouter`).
-/// The standalone binary returns this for `tools/call` — the per-run minter + the `EffectApi`
-/// chokepoint are injected by the composition root (myelin-agent-service), never constructed here.
+/// The catalogue-only shell returns this for `tools/call`; the per-run minter and effect-kind
+/// execution adapters are injected by the production composition root.
 pub const GOVERNANCE_NOT_WIRED: i64 = -32004;
 
 /// A parsed JSON-RPC request (or notification). `id` is `Null` for a notification (no response is

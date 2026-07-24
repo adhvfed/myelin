@@ -1,177 +1,339 @@
-//! # `registry` — the tool-registration framework (REUSE `agent_tools()`, don't re-declare).
+//! MCP projection of subsystem-owned tool definitions.
 //!
-//! The headline of MR-021's framework half: the MCP server's tool catalogue is a **thin projection**
-//! of each subsystem's OWN `agent_tools()` (the frozen MCP tool shape — name + `requires_approval` +
-//! the already-built handler). A subsystem's tool SET is **never re-declared here** — it is sourced
-//! verbatim from the subsystem crate, so a NEW git tool added to [`myelin_git::api::agent_tools`]
-//! flows to `tools/list` (and is callable via `tools/call`) with **no change to this crate**.
-//!
-//! ## How a subsystem adds MCP tools (the plug-in convention — mirrors the MR-014 edge + MR-020 CLI)
-//! The MR-014 edge convention is "a subsystem adds ONLY its routes + handlers; the gateway owns
-//! auth/scope/error". The MR-020 CLI mirror is "a subsystem exposes its command grammar; the shell
-//! owns auth/render". The MCP mirror is:
-//!   1. **Catalogue** — the subsystem exposes `agent_tools() -> Vec<AgentToolDef>` (its frozen tool
-//!      names + `requires_approval` defaults + handlers). Git ships [`myelin_git::api::agent_tools`].
-//!   2. **Register** — the server calls [`ToolRegistry::register_subsystem`] with that catalogue. The
-//!      framework keys each tool by its `name` and projects it into the MCP `tools/list` shape.
-//!   3. **Route** — `tools/call` resolves the name back to its [`RegisteredTool`] and routes its
-//!      effect through the ONE governance chokepoint (see [`crate::governance`]).
-//!
-//! Adding a subsystem is steps 1+2 only — the protocol, the governance routing, the audit, and the
-//! HITL gate are owned ONCE by the server (this crate), for everyone.
+//! New surfaces register the shared [`myelin_agent::ToolDef`] directly and only definitions marked
+//! `exposed_over_mcp` enter the external catalogue. Git's older [`myelin_git::api::AgentToolDef`]
+//! catalogue remains behind an explicit compatibility adapter until its producer registration is
+//! moved to the shared type; CI does not copy that legacy model.
 
+use myelin_agent::{EffectKind, ToolDef};
 use myelin_git::api::AgentToolDef;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
-/// One tool registered into the MCP catalogue — the subsystem token, the frozen [`AgentToolDef`]
-/// (its name + `requires_approval` + handler, sourced VERBATIM from the subsystem's `agent_tools()`),
-/// kept exactly as the subsystem declared it. No field is re-declared here.
+/// The source retained for one registered definition.
+#[derive(Clone, Debug)]
+enum ToolSource {
+    /// The frozen shared catalogue shape (contract 8.1).
+    Shared(ToolDef),
+    /// Git's pre-contract MCP catalogue. Kept explicit so no new subsystem can accidentally copy it.
+    LegacyGit {
+        subsystem: &'static str,
+        def: AgentToolDef,
+    },
+}
+
+/// One tool registered into the MCP catalogue.
 #[derive(Clone, Debug)]
 pub struct RegisteredTool {
-    /// The contributing subsystem (`"git"`, …) — the event-bus token, for attribution + the
-    /// `(subsystem, name)` key.
-    pub subsystem: &'static str,
-    /// The frozen tool definition from the subsystem's `agent_tools()` (REUSED, not forked).
-    pub def: AgentToolDef,
+    mcp_name: String,
+    source: ToolSource,
 }
 
 impl RegisteredTool {
-    /// The MCP tool name (the catalogue key — e.g. `"git.merge"`). The subsystem owns it.
-    pub fn name(&self) -> &'static str {
-        self.def.name
+    /// The externally visible, subsystem-qualified MCP name.
+    pub fn name(&self) -> &str {
+        &self.mcp_name
     }
 
-    /// Whether the tool is HITL-gated by default — the FROZEN `requires_approval` flag from the
-    /// subsystem's `agent_tools()` (git: `git.merge = true`, everything else `false`). This is the
-    /// flag the governance router gates on BEFORE `EffectApi::apply` (the MR-006 HITL leg).
+    /// Whether the subsystem's frozen default requires a server-side HITL verdict.
     pub fn requires_approval(&self) -> bool {
-        self.def.requires_approval
+        match &self.source {
+            ToolSource::Shared(def) => def.requires_approval,
+            ToolSource::LegacyGit { def, .. } => def.requires_approval,
+        }
     }
 
-    /// The subsystem-declared capabilities this tool requires from the exact minted run token.
-    pub fn required_caps(&self) -> &[&str] {
-        self.def.required_caps
+    /// The capabilities required from the exact minted run-token intersection.
+    pub fn required_caps(&self) -> Vec<&str> {
+        match &self.source {
+            ToolSource::Shared(def) => def.required_caps.iter().map(String::as_str).collect(),
+            ToolSource::LegacyGit { def, .. } => def.required_caps.to_vec(),
+        }
     }
 
-    /// Project this tool into the MCP `tools/list` entry shape. The `inputSchema` is a permissive
-    /// object schema here (the rich per-tool JSON Schema is the `myelin_agent::ToolDef.input_schema`
-    /// seam, seeded in the agent-fabric catalogue — AG-P8; the MCP surface projects the names +
-    /// frozen `requires_approval` from `agent_tools()` today). `annotations.requiresApproval`
-    /// surfaces the frozen HITL default so the calling Claude knows a confirm is coming.
+    /// The routing discriminator owned by the shared ToolDef contract.
+    pub fn effect_kind(&self) -> EffectKind {
+        match &self.source {
+            ToolSource::Shared(def) => def.effect_kind,
+            // Every tool in the currently live legacy Git MCP catalogue is a platform mutation.
+            ToolSource::LegacyGit { .. } => EffectKind::Mutate,
+        }
+    }
+
+    /// Whether the definition declares an external/platform side effect.
+    pub fn side_effecting(&self) -> bool {
+        match &self.source {
+            ToolSource::Shared(def) => def.side_effecting,
+            ToolSource::LegacyGit { .. } => true,
+        }
+    }
+
+    /// Project the subsystem-owned input schema and governance annotations into MCP.
     pub fn to_mcp_json(&self) -> Value {
+        let (description, input_schema) = match &self.source {
+            ToolSource::Shared(def) => {
+                let route = match def.effect_kind {
+                    EffectKind::Read => "direct permission-checked subsystem read",
+                    EffectKind::Compute => "governed sandbox computation",
+                    EffectKind::Mutate | EffectKind::External => {
+                        "governed EffectApi plan-then-apply"
+                    }
+                };
+                (
+                    format!(
+                        "{} tool `{}` v{}; routes through {route}.{}",
+                        def.subsystem,
+                        self.name(),
+                        def.version,
+                        if def.requires_approval {
+                            " Requires HITL approval before apply."
+                        } else {
+                            ""
+                        }
+                    ),
+                    serde_json::from_str(&def.input_schema)
+                        .expect("shared ToolDef schemas are validated at registration"),
+                )
+            }
+            ToolSource::LegacyGit { subsystem, def } => (
+                format!(
+                    "{subsystem} tool `{}` (handler: {:?}). Routes through mint_run_token -> \
+                     EffectApi::apply under the same governance a human is.{}",
+                    self.name(),
+                    def.handler,
+                    if def.requires_approval {
+                        " Requires HITL approval before apply."
+                    } else {
+                        ""
+                    }
+                ),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "repo": { "type": "string", "description": "the repository slug (tenant is from the token, never here)" },
+                        "number": { "type": "integer", "description": "the PR number, when the tool acts on a PR" }
+                    },
+                    "additionalProperties": true
+                }),
+            ),
+        };
         json!({
             "name": self.name(),
-            "description": format!(
-                "{} tool `{}` (handler: {:?}). Routes through mint_run_token -> EffectApi::apply \
-                 under the same governance a human is.{}",
-                self.subsystem,
-                self.name(),
-                self.def.handler,
-                if self.requires_approval() { " Requires HITL approval before apply." } else { "" }
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "repo": { "type": "string", "description": "the repository slug (tenant is from the token, never here)" },
-                    "number": { "type": "integer", "description": "the PR number, when the tool acts on a PR" }
-                },
-                "additionalProperties": true
-            },
+            "description": description,
+            "inputSchema": input_schema,
             "annotations": {
-                "requiresApproval": self.requires_approval()
+                "requiresApproval": self.requires_approval(),
+                "readOnlyHint": self.effect_kind() == EffectKind::Read,
             }
         })
     }
 }
 
-/// **The MCP tool registry** — the framework that holds the registered tools (sourced from the
-/// subsystems' `agent_tools()`) and serves `tools/list` + resolves `tools/call`.
+/// A fail-loud catalogue registration error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegistryError {
+    InvalidDefinition(String),
+    DuplicateName(String),
+}
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegistryError::InvalidDefinition(reason) => write!(f, "{reason}"),
+            RegistryError::DuplicateName(name) => {
+                write!(f, "duplicate MCP tool name `{name}`")
+            }
+        }
+    }
+}
+
+/// The MCP tool registry.
 #[derive(Clone, Debug, Default)]
 pub struct ToolRegistry {
     tools: Vec<RegisteredTool>,
 }
 
 impl ToolRegistry {
-    /// An empty registry.
     pub fn new() -> ToolRegistry {
         ToolRegistry { tools: Vec::new() }
     }
 
-    /// **Register a subsystem's tools** by providing its `(subsystem, agent_tools())` — the plug-in
-    /// step. Each [`AgentToolDef`] is kept VERBATIM (no re-declaration). A new tool in the
-    /// subsystem's `agent_tools()` is registered automatically the next time the server starts.
-    pub fn register_subsystem(&mut self, subsystem: &'static str, defs: Vec<AgentToolDef>) {
-        for def in defs {
-            self.tools.push(RegisteredTool { subsystem, def });
+    /// Register Git's existing external catalogue through its isolated compatibility adapter.
+    pub fn register_legacy_git(&mut self) -> Result<(), RegistryError> {
+        for def in myelin_git::api::agent_tools() {
+            self.push(RegisteredTool {
+                mcp_name: def.name.to_string(),
+                source: ToolSource::LegacyGit {
+                    subsystem: "git",
+                    def,
+                },
+            })?;
         }
+        Ok(())
     }
 
-    /// Build a registry pre-loaded with git's frozen `agent_tools()` (the first registered subsystem
-    /// — MR-021 plugs git first, the same order MR-015/MR-020 plugged git into the edge/CLI).
+    /// Register the externally exposed subset of a subsystem's shared ToolDefs.
+    pub fn register_tool_defs(
+        &mut self,
+        defs: impl IntoIterator<Item = ToolDef>,
+    ) -> Result<(), RegistryError> {
+        for def in defs.into_iter().filter(|def| def.exposed_over_mcp) {
+            validate_shared_def(&def)?;
+            let mcp_name = format!("{}.{}", def.subsystem, def.name.0);
+            self.push(RegisteredTool {
+                mcp_name,
+                source: ToolSource::Shared(def),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, tool: RegisteredTool) -> Result<(), RegistryError> {
+        if self
+            .tools
+            .iter()
+            .any(|existing| existing.name() == tool.name())
+        {
+            return Err(RegistryError::DuplicateName(tool.name().to_string()));
+        }
+        self.tools.push(tool);
+        Ok(())
+    }
+
+    /// Build the historical Git-only registry.
     pub fn with_git() -> ToolRegistry {
-        let mut r = ToolRegistry::new();
-        r.register_subsystem("git", myelin_git::api::agent_tools());
-        r
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_legacy_git()
+            .expect("the frozen Git catalogue has unique names");
+        registry
     }
 
-    /// The registered tools (for `tools/list`).
+    /// Build the production registry with Git mutations plus CI's two honest durable reads.
+    pub fn with_git_and_ci_reads() -> Result<ToolRegistry, RegistryError> {
+        let mut registry = ToolRegistry::with_git();
+        registry.register_tool_defs(myelin_ci_controlplane::ci_tool_defs())?;
+        Ok(registry)
+    }
+
     pub fn tools(&self) -> &[RegisteredTool] {
         &self.tools
     }
 
-    /// Resolve a tool by its MCP name (for `tools/call`). `None` ⇒ an unknown tool (the server
-    /// returns an Invalid-params JSON-RPC error, never a panic / a faked call).
     pub fn resolve(&self, name: &str) -> Option<&RegisteredTool> {
-        self.tools.iter().find(|t| t.name() == name)
+        self.tools.iter().find(|tool| tool.name() == name)
     }
 
-    /// The `tools/list` result body: the projected MCP tool entries.
     pub fn list_result(&self) -> Value {
         json!({ "tools": self.tools.iter().map(RegisteredTool::to_mcp_json).collect::<Vec<_>>() })
     }
+}
+
+fn validate_shared_def(def: &ToolDef) -> Result<(), RegistryError> {
+    let name = format!("{}.{}", def.subsystem, def.name.0);
+    if def.subsystem.is_empty()
+        || def.name.0.is_empty()
+        || def.subsystem.contains('.')
+        || def.name.0.contains('.')
+    {
+        return Err(RegistryError::InvalidDefinition(format!(
+            "shared ToolDef `{name}` has a non-canonical catalogue key"
+        )));
+    }
+    let schema: Value = serde_json::from_str(&def.input_schema).map_err(|_| {
+        RegistryError::InvalidDefinition(format!(
+            "shared ToolDef `{name}` has invalid JSON input_schema"
+        ))
+    })?;
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        return Err(RegistryError::InvalidDefinition(format!(
+            "shared ToolDef `{name}` input_schema must describe an object"
+        )));
+    }
+    let unique_caps = def.required_caps.iter().collect::<HashSet<_>>();
+    if def.required_caps.is_empty()
+        || unique_caps.len() != def.required_caps.len()
+        || def.required_caps.iter().any(|cap| cap.is_empty())
+    {
+        return Err(RegistryError::InvalidDefinition(format!(
+            "shared ToolDef `{name}` must declare non-empty unique required_caps"
+        )));
+    }
+    match def.effect_kind {
+        EffectKind::Read if def.side_effecting || def.requires_approval => {
+            return Err(RegistryError::InvalidDefinition(format!(
+                "shared read ToolDef `{name}` must be non-side-effecting and non-gated"
+            )))
+        }
+        EffectKind::Mutate | EffectKind::External if !def.side_effecting => {
+            return Err(RegistryError::InvalidDefinition(format!(
+                "shared side-effect ToolDef `{name}` must declare side_effecting"
+            )))
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// **REUSE proof:** every tool git's `agent_tools()` declares is exposed by the registry with NO
-    /// re-declaration — a rename/add in `api.rs` flows here automatically.
     #[test]
-    fn registry_reuses_git_agent_tools_verbatim() {
-        let reg = ToolRegistry::with_git();
-        let names: Vec<&str> = reg.tools().iter().map(|t| t.name()).collect();
-        let git_names: Vec<&str> =
-            myelin_git::api::agent_tools().iter().map(|d| d.name).collect();
-        assert_eq!(names, git_names, "the registry is a verbatim projection of agent_tools()");
-        assert!(names.contains(&"git.merge"));
-        assert!(names.contains(&"git.submit_review"));
-        assert_eq!(reg.resolve("git.merge").unwrap().required_caps(), &["pull_request.merge"]);
-        assert_eq!(reg.resolve("git.open_pr").unwrap().required_caps(), &["repo.push"]);
+    fn legacy_git_catalogue_remains_verbatim() {
+        let registry = ToolRegistry::with_git();
+        let names = registry
+            .tools()
+            .iter()
+            .map(RegisteredTool::name)
+            .collect::<Vec<_>>();
+        let expected = myelin_git::api::agent_tools()
+            .iter()
+            .map(|def| def.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected);
+        assert!(registry.resolve("git.merge").unwrap().requires_approval());
         assert_eq!(
-            reg.resolve("git.submit_review").unwrap().required_caps(),
-            &["pull_request.review"]
+            registry.resolve("git.open_pr").unwrap().required_caps(),
+            ["repo.push"]
         );
     }
 
-    /// The FROZEN `requires_approval` defaults flow through: git.merge is HITL-gated, open_pr is not.
     #[test]
-    fn frozen_requires_approval_flows_through() {
-        let reg = ToolRegistry::with_git();
-        assert!(reg.resolve("git.merge").unwrap().requires_approval(), "git.merge is HITL-gated");
-        assert!(!reg.resolve("git.open_pr").unwrap().requires_approval(), "open_pr is not");
+    fn ci_projection_is_exact_and_only_exposes_implemented_reads() {
+        let registry = ToolRegistry::with_git_and_ci_reads().unwrap();
+        let read_run = registry.resolve("ci.read_run").expect("read_run exposed");
+        let read_log = registry.resolve("ci.read_log").expect("read_log exposed");
+        assert_eq!(read_run.effect_kind(), EffectKind::Read);
+        assert!(!read_run.side_effecting());
+        assert_eq!(read_run.required_caps(), ["run.view"]);
+        assert_eq!(
+            read_run.to_mcp_json()["inputSchema"],
+            serde_json::from_str::<Value>(
+                &myelin_ci_controlplane::ci_tool_def("read_run").input_schema
+            )
+            .unwrap()
+        );
+        assert!(read_log.to_mcp_json()["inputSchema"]["properties"]["limit"]["maximum"] == 262_144);
+        assert!(registry.resolve("ci.run").is_none());
+        assert!(registry.resolve("ci.validate").is_none());
     }
 
-    /// `tools/list` projects the MCP shape incl. the `requiresApproval` annotation; an unknown tool
-    /// resolves to None (no panic, no fake).
     #[test]
-    fn list_result_projects_mcp_shape_and_unknown_resolves_none() {
-        let reg = ToolRegistry::with_git();
-        let list = reg.list_result();
-        let tools = list["tools"].as_array().unwrap();
-        assert!(!tools.is_empty());
-        let merge = tools.iter().find(|t| t["name"] == "git.merge").unwrap();
-        assert_eq!(merge["annotations"]["requiresApproval"], json!(true));
-        assert!(reg.resolve("git.nonexistent").is_none());
+    fn shared_registration_rejects_malformed_or_duplicate_contracts() {
+        let mut registry = ToolRegistry::new();
+        let mut def = myelin_ci_controlplane::ci_tool_def("read_run");
+        def.input_schema = "not json".into();
+        assert!(matches!(
+            registry.register_tool_defs([def]),
+            Err(RegistryError::InvalidDefinition(_))
+        ));
+
+        let def = myelin_ci_controlplane::ci_tool_def("read_run");
+        registry.register_tool_defs([def.clone()]).unwrap();
+        assert_eq!(
+            registry.register_tool_defs([def]),
+            Err(RegistryError::DuplicateName("ci.read_run".into()))
+        );
     }
 }

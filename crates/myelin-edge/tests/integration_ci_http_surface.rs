@@ -6,7 +6,8 @@ use myelin_ci_controlplane::surfacing_store::canonical_visible_repo_refs;
 use myelin_ci_controlplane::{ci_controlplane_migrations, CiRunStore};
 use myelin_edge::repo_authz::GrantBackedRepos;
 use myelin_edge::{
-    register_ci, AuthenticatedActionPolicy, DurableGitBackend, EdgeRequest, Gateway,
+    register_ci, AuthenticatedActionPolicy, DurableCiReadApi, DurableGitBackend, EdgeError,
+    EdgeRequest, Gateway,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
@@ -291,7 +292,7 @@ fn authenticated_gateway(
     app: PgPool,
     git_root: &std::path::Path,
     blobs: Arc<dyn BlobStore + Send + Sync>,
-) -> (Gateway, CellTokenAuthority) {
+) -> (Gateway, CellTokenAuthority, DurableCiReadApi, Principal) {
     let cell = CellTokenAuthority::from_seed(&[17; 32], &[19; 32]).expect("cell authority");
     let principals = PrincipalStore::new(Arc::new(KmsEngine::new()));
     principals
@@ -329,6 +330,20 @@ fn authenticated_gateway(
     let git = Arc::new(
         DurableGitBackend::rooted_inmem_for_test(git_root).with_repo_authorizer(Arc::new(authz)),
     );
+    let viewer = Principal::new(
+        TenantId(TENANT.into()),
+        Region(REGION.into()),
+        PrincipalId("svc:viewer".into()),
+        PrincipalKind::Service,
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    );
+    let direct = DurableCiReadApi::new(
+        CiRunStore::with_pg(app.clone()),
+        git.clone(),
+        blobs.clone(),
+        tokio::runtime::Handle::current(),
+    );
     let builder = Gateway::builder(authn, human, Arc::new(AuthenticatedActionPolicy::mounted()));
     let builder = register_ci(
         builder,
@@ -341,7 +356,7 @@ fn authenticated_gateway(
         blobs,
         tokio::runtime::Handle::current(),
     );
-    (builder.build(), cell)
+    (builder.build(), cell, direct, viewer)
 }
 
 fn mint(cell: &CellTokenAuthority) -> String {
@@ -441,7 +456,7 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
     let repo_dir = root.join(TENANT).join(REGION);
     std::fs::create_dir_all(repo_dir.join("alpha.git")).expect("create visible repo");
     std::fs::create_dir_all(repo_dir.join("hidden.git")).expect("create hidden repo");
-    let (gateway, cell) = authenticated_gateway(app.clone(), &root, blobs);
+    let (gateway, cell, direct, viewer) = authenticated_gateway(app.clone(), &root, blobs);
     let token = mint(&cell);
 
     let list = get(&gateway, &token, "/v1/ci/runs");
@@ -461,6 +476,13 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
         visible.json_body().expect("visible detail JSON")["run"]["run_id"],
         VISIBLE_RUN
     );
+    assert_eq!(
+        direct
+            .read_run(&viewer, VISIBLE_RUN)
+            .expect("direct visible run"),
+        visible.json_body().expect("HTTP visible detail JSON"),
+        "HTTP and agent/MCP use the same permission-checked durable read adapter"
+    );
 
     let hidden = get(&gateway, &token, &format!("/v1/ci/runs/{HIDDEN_RUN}"));
     let absent = get(&gateway, &token, &format!("/v1/ci/runs/{ABSENT_RUN}"));
@@ -471,6 +493,10 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
         absent.json_body(),
         "denied and absent detail are the same public response"
     );
+    assert!(matches!(
+        direct.read_run(&viewer, HIDDEN_RUN),
+        Err(EdgeError::NotFound(_))
+    ));
 
     let log = get_query(
         &gateway,
@@ -490,6 +516,13 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
             .decode(log_body["data"].as_str().expect("base64 log bytes"))
             .expect("decode log bytes"),
         b"ha\nbet"
+    );
+    assert_eq!(
+        direct
+            .read_log(&viewer, VISIBLE_RUN, VISIBLE_JOB, 3, 6)
+            .expect("direct visible log"),
+        log_body,
+        "HTTP and agent/MCP share exact archived-log materialization"
     );
 
     let absent_job = get(
@@ -565,7 +598,7 @@ async fn production_ci_reads_match_the_shared_dev_edge_golden_vectors() {
         std::fs::create_dir_all(repo_dir.join(format!("{repo}.git")))
             .expect("create golden visible repo");
     }
-    let (gateway, cell) = authenticated_gateway(app.clone(), &root, blobs);
+    let (gateway, cell, _direct, _viewer) = authenticated_gateway(app.clone(), &root, blobs);
     let token = mint(&cell);
     let mut cursors = BTreeMap::<String, String>::new();
 

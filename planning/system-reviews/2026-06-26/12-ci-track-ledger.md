@@ -21,7 +21,10 @@ gate. CT-005d adds the thin authenticated CLI list/view/archive client over thos
 and executes the shared response vectors through the compiled binary. Its request-bound success
 decoder rejects malformed list/detail/log bodies before either human or JSON rendering while
 preserving the production beyond-end empty-range contract. It deliberately does not call the
-process-local `LiveTail` an SSE transport: cross-service resumable live tail and MCP remain open.
+process-local `LiveTail` an SSE transport. CT-005e projects CI's two implemented durable reads from
+their shared `ToolDef`s into MCP and routes them through the same permission-checked Edge/CI adapter,
+under a per-run token re-verified at the final read boundary. Cross-service resumable live tail
+remains open.
 CT-007 is still unopened; GitHub Actions must not be
 removed before the founder acceptance pass and the complete CT-005 surface are genuinely usable.
 
@@ -105,15 +108,23 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   filter/limit and canonical cursor frame, detail run/DAG/step integrity and bounded enums/times,
   and log run/job/range/base64/byte length must agree. The production-valid empty response for a
   start beyond `total_end` remains accepted and never invents a continuation.
+- **CT-005e — durable MCP reads:** `ci.read_run` and `ci.read_log` are the only CI ToolDefs marked
+  `exposed_over_mcp`; MCP projects their exact subsystem-owned schemas, `run.view` requirement,
+  read effect kind, non-side-effecting posture, and non-HITL default. Reads lazily mint and consult
+  the session run token, bind the exact declared capability, bypass mutation idempotency and
+  `EffectApi`, then re-verify the signed token, subject, tenant/region scope, durable S7 liveness,
+  and capability at the concrete adapter immediately before the shared durable Edge/CI read.
+  Parent visibility remains Git Pull; denied and absent objects remain indistinguishable; archived
+  logs retain the same bounded content-addressed integrity path. Git's older catalogue stays behind
+  an explicit compatibility adapter, while every unimplemented CI tool remains absent.
 
 **Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
 services. It is not an honest production SSE resume source. SSE remains open until a real
 cross-service bounded resume transport exists; CT-005b/CT-005c claim archived cold-path reads only.
-MCP, the live founder push→settled check→surfaced log pass, and CT-007 also remain open. MCP is a
-separate increment: its current production registry/router is Git-mutation-specific, while the
-frozen agent contract routes reads directly rather than through `EffectApi`; CI reads must gain a
-real permission-checked read adapter and the shared `ToolDef` projection, not a mutation-shaped
-shortcut.
+The live founder push→settled check→surfaced archived/live log pass and CT-007 also remain open.
+CT-005e closes the prior MCP floor without inventing live output: its two reads are exact durable
+run/detail and archived-log operations, and the complete content-addressed Agent tool transcript
+remains an Agent-runtime trace artifact rather than a claim made by the stdio transport.
 
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod

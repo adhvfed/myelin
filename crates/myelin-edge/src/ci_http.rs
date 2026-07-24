@@ -18,6 +18,7 @@ use myelin_ci_controlplane::surfacing_store::{
     CiJobSurface, CiLogArchive, CiLogRangeRequest, CiRunPageRequest, CiRunStateFilter,
     CiRunSummary, CiRunSurfaceError, CiStepSurface, CI_LOG_RANGE_DEFAULT, CI_RUN_PAGE_DEFAULT,
 };
+use myelin_identity::Principal;
 use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
 use serde_json::{json, Value};
@@ -26,14 +27,30 @@ use std::sync::Arc;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
 #[derive(Clone)]
-struct DurableCiHttpApi {
+pub struct DurableCiReadApi {
     runs: CiRunStore,
     git: Arc<DurableGitBackend>,
     blobs: Arc<dyn BlobStore + Send + Sync>,
     runtime: Handle,
 }
 
-impl DurableCiHttpApi {
+impl DurableCiReadApi {
+    /// Bind the durable CI stores to Git's exact repository Pull authority. Both authenticated HTTP
+    /// and direct agent/MCP reads call these same methods.
+    pub fn new(
+        runs: CiRunStore,
+        git: Arc<DurableGitBackend>,
+        blobs: Arc<dyn BlobStore + Send + Sync>,
+        runtime: Handle,
+    ) -> Self {
+        Self {
+            runs,
+            git,
+            blobs,
+            runtime,
+        }
+    }
+
     fn drive<F, T>(&self, future: F) -> Result<T, CiRunSurfaceError>
     where
         F: Future<Output = Result<T, CiRunSurfaceError>>,
@@ -62,6 +79,76 @@ impl DurableCiHttpApi {
             )),
             Err(_) => self.runtime.block_on(future),
         }
+    }
+
+    /// Read one exact run after resolving and authorizing its canonical parent repository.
+    pub fn read_run(&self, principal: &Principal, run_id: &str) -> Result<Value, EdgeError> {
+        if !canonical_uuid(run_id) {
+            return Err(EdgeError::BadRequest(
+                "CI run id must be a canonical UUID".into(),
+            ));
+        }
+        let tenant = principal.tenant.as_str();
+        let region = principal.region.as_str();
+        let repo_ref = authorized_repo_ref(self, principal, run_id)?;
+        let detail = self
+            .drive(self.runs.get_surface_run(tenant, region, run_id, &repo_ref))
+            .map_err(map_surface_error)?
+            .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))?;
+        Ok(json!({
+            "run": run_json(&detail.run),
+            "jobs": detail.jobs.iter().map(job_json).collect::<Vec<_>>(),
+            "steps": detail.steps.iter().map(step_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Read one bounded archived job-log range under the same run/repository authorization.
+    pub fn read_log(
+        &self,
+        principal: &Principal,
+        run_id: &str,
+        job_id: &str,
+        start: i64,
+        limit: u32,
+    ) -> Result<Value, EdgeError> {
+        if !canonical_uuid(run_id) {
+            return Err(EdgeError::BadRequest(
+                "CI run id must be a canonical UUID".into(),
+            ));
+        }
+        if !canonical_uuid(job_id) {
+            return Err(EdgeError::BadRequest(
+                "CI job id must be a canonical UUID".into(),
+            ));
+        }
+        let request = CiLogRangeRequest::new(start, limit).map_err(map_surface_error)?;
+        let tenant = principal.tenant.as_str();
+        let region = principal.region.as_str();
+        let repo_ref = authorized_repo_ref(self, principal, run_id)?;
+        let archive = self
+            .drive(
+                self.runs
+                    .get_surface_log_archive(tenant, region, run_id, job_id, &repo_ref, request),
+            )
+            .map_err(map_surface_error)?
+            .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))?;
+        let total_end = archive.total_end;
+        let (byte_end, bytes) = materialize_log_archive(
+            self.blobs.as_ref(),
+            &TenantId(tenant.to_string()),
+            request,
+            archive,
+        )?;
+        Ok(json!({
+            "run_id": run_id,
+            "job_id": job_id,
+            "byte_start": request.start,
+            "byte_end": byte_end,
+            "total_end": total_end,
+            "next_offset": if byte_end < total_end { Some(byte_end) } else { None },
+            "encoding": "base64",
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }))
     }
 }
 
@@ -294,12 +381,12 @@ fn step_json(step: &CiStepSurface) -> Value {
 }
 
 fn authorized_repo_ref(
-    api: &DurableCiHttpApi,
-    ctx: &HandlerCtx<'_>,
+    api: &DurableCiReadApi,
+    principal: &Principal,
     run_id: &str,
 ) -> Result<String, EdgeError> {
-    let tenant = ctx.principal.tenant.as_str();
-    let region = ctx.principal.region.as_str();
+    let tenant = principal.tenant.as_str();
+    let region = principal.region.as_str();
     let record = api
         .drive_run(api.runs.get_ci_run(tenant, region, run_id))
         .map_err(map_run_error)?
@@ -309,7 +396,7 @@ fn authorized_repo_ref(
         .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))?;
     let repo_slug = repo_slug_from_ref(tenant, &repo_ref)
         .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))?;
-    if !api.git.may_view_ci_repo(ctx.principal, repo_slug) {
+    if !api.git.may_view_ci_repo(principal, repo_slug) {
         return Err(EdgeError::NotFound("CI run not found".into()));
     }
     Ok(repo_ref)
@@ -406,7 +493,7 @@ fn materialize_log_archive(
 }
 
 struct CiRunListHandler {
-    api: DurableCiHttpApi,
+    api: DurableCiReadApi,
 }
 
 impl Handler for CiRunListHandler {
@@ -447,7 +534,7 @@ impl Handler for CiRunListHandler {
 }
 
 struct CiRunViewHandler {
-    api: DurableCiHttpApi,
+    api: DurableCiReadApi,
 }
 
 impl Handler for CiRunViewHandler {
@@ -458,31 +545,13 @@ impl Handler for CiRunViewHandler {
             ));
         }
         let run_id = run_param(ctx)?;
-        let tenant = ctx.principal.tenant.as_str();
-        let region = ctx.principal.region.as_str();
-        let repo_ref = authorized_repo_ref(&self.api, ctx, run_id)?;
-        let detail = self
-            .api
-            .drive(
-                self.api
-                    .runs
-                    .get_surface_run(tenant, region, run_id, &repo_ref),
-            )
-            .map_err(map_surface_error)?
-            .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))?;
-        Ok(no_store(EdgeResponse::json(
-            200,
-            &json!({
-                "run": run_json(&detail.run),
-                "jobs": detail.jobs.iter().map(job_json).collect::<Vec<_>>(),
-                "steps": detail.steps.iter().map(step_json).collect::<Vec<_>>(),
-            }),
-        )))
+        let value = self.api.read_run(ctx.principal, run_id)?;
+        Ok(no_store(EdgeResponse::json(200, &value)))
     }
 }
 
 struct CiLogArchiveHandler {
-    api: DurableCiHttpApi,
+    api: DurableCiReadApi,
 }
 
 impl Handler for CiLogArchiveHandler {
@@ -495,38 +564,10 @@ impl Handler for CiLogArchiveHandler {
         let request = parse_log_query(&ctx.request.query)?;
         let run_id = run_param(ctx)?;
         let job_id = job_param(ctx)?;
-        let tenant = ctx.principal.tenant.as_str();
-        let region = ctx.principal.region.as_str();
-        let repo_ref = authorized_repo_ref(&self.api, ctx, run_id)?;
-        let archive = self
-            .api
-            .drive(
-                self.api
-                    .runs
-                    .get_surface_log_archive(tenant, region, run_id, job_id, &repo_ref, request),
-            )
-            .map_err(map_surface_error)?
-            .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))?;
-        let total_end = archive.total_end;
-        let (byte_end, bytes) = materialize_log_archive(
-            self.api.blobs.as_ref(),
-            &TenantId(tenant.to_string()),
-            request,
-            archive,
-        )?;
-        Ok(no_store(EdgeResponse::json(
-            200,
-            &json!({
-                "run_id": run_id,
-                "job_id": job_id,
-                "byte_start": request.start,
-                "byte_end": byte_end,
-                "total_end": total_end,
-                "next_offset": if byte_end < total_end { Some(byte_end) } else { None },
-                "encoding": "base64",
-                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-            }),
-        )))
+        let value =
+            self.api
+                .read_log(ctx.principal, run_id, job_id, request.start, request.limit)?;
+        Ok(no_store(EdgeResponse::json(200, &value)))
     }
 }
 
@@ -537,12 +578,7 @@ pub fn register_ci(
     blobs: Arc<dyn BlobStore + Send + Sync>,
     runtime: Handle,
 ) -> GatewayBuilder {
-    let api = DurableCiHttpApi {
-        runs,
-        git,
-        blobs,
-        runtime,
-    };
+    let api = DurableCiReadApi::new(runs, git, blobs, runtime);
     builder
         .route(
             Method::Get,

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use myelin_config::Mode;
 use myelin_edge::repo_authz::RepoPermission;
 use myelin_edge::{
-    recover_placed_git_at_boot, CheckBackedRepoAuthorizer, DurableGitBackend, GitDatabaseProviders,
-    GitEffectApi, RepoAuthorizer, TupleRepoBootstrap,
+    recover_placed_git_at_boot, CheckBackedRepoAuthorizer, DurableCiReadApi, DurableGitBackend,
+    GitDatabaseProviders, GitEffectApi, RepoAuthorizer, TupleRepoBootstrap,
 };
 use myelin_events::{IdMinter, OutboxStore, Timestamp, UlidMinter};
 use myelin_git::core::RepoLoc;
@@ -28,9 +28,9 @@ use myelin_identity_service::{
     RevocationStore, StoreBackedCheck,
 };
 use myelin_mcp::{
-    git_merge_repo_from_effect_key, AuditPhase, GateApproverPolicy, GovernanceAudit,
-    GovernanceAuditRecord, GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal,
-    ToolRegistry, MAX_FRAME_BYTES,
+    git_merge_repo_from_effect_key, AuditPhase, CiDirectReadExecutor, GateApproverPolicy,
+    GovernanceAudit, GovernanceAuditRecord, GovernedRouter, McpServer, OutboxGovernanceAudit,
+    RunPrincipal, ToolRegistry, MAX_FRAME_BYTES,
 };
 use myelin_storage::hitl_gate_durable::HitlVerdictStore;
 use myelin_storage::{
@@ -225,6 +225,20 @@ async fn compose_core() -> Result<Core, String> {
         .await
         .map_err(|error| format!("Git PR lifecycle migration failed: {error}"))?;
     bootstrap
+        .migrate(
+            &myelin_flow::migrations::migrations(),
+            &HotTables::declare(["workflow_run"]),
+        )
+        .await
+        .map_err(|error| format!("CI Flow prerequisite migration failed: {error}"))?;
+    bootstrap
+        .migrate(
+            &myelin_ci_controlplane::ci_controlplane_migrations(),
+            &myelin_ci_controlplane::ci_controlplane_hot_tables(),
+        )
+        .await
+        .map_err(|error| format!("CI run-surface migration failed: {error}"))?;
+    bootstrap
         .verify_index_ready("git_pr_head_repo_idx")
         .await
         .map_err(|error| format!("Git PR provenance index is not ready: {error}"))?;
@@ -232,6 +246,10 @@ async fn compose_core() -> Result<Core, String> {
         .verify_index_ready("git_pr_command_operation_scope_uidx")
         .await
         .map_err(|error| format!("Git PR operation-scope index is not ready: {error}"))?;
+    bootstrap
+        .verify_index_ready_exact(myelin_ci_controlplane::CI_RUN_SURFACE_INDEX_READINESS)
+        .await
+        .map_err(|error| format!("CI run-list keyset index is not ready: {error}"))?;
     let provider = bootstrap
         .into_runtime()
         .await
@@ -449,6 +467,11 @@ async fn serve(core: Core) -> Result<(), String> {
             return Err(format!("Git ReBAC fragment refused to admit: {reason}"));
         }
     }
+    for result in check.admit_ci_fragment() {
+        if let FragmentAdmit::Rejected { reason } = result {
+            return Err(format!("CI ReBAC fragment refused to admit: {reason}"));
+        }
+    }
     let thresholds = Thresholds::load_canonical()
         .map_err(|error| format!("canonical thresholds refused: {error}"))?;
     let repo_authz = Arc::new(
@@ -501,6 +524,15 @@ async fn serve(core: Core) -> Result<(), String> {
         Arc::new(PasetoCapabilityVerifier::new(core.cell.trust_anchor())),
         check.revocations().clone(),
     ));
+    let ci_reads = Arc::new(CiDirectReadExecutor::new(
+        DurableCiReadApi::new(
+            myelin_ci_controlplane::CiRunStore::with_pg(core.provider.db_pool().clone()),
+            backend.clone(),
+            Arc::from(core.provider.blob_store(core.handle.clone())),
+            core.handle.clone(),
+        ),
+        boundary.clone(),
+    ));
     let effect = GitEffectApi::new(
         backend,
         trigger_identity.scope.tenant().0.clone(),
@@ -541,7 +573,9 @@ async fn serve(core: Core) -> Result<(), String> {
         approver_policy,
         Arc::new(OutboxGovernanceAudit::new(outbox, minter)),
     );
-    run_stdio_signal_aware(McpServer::with_router(ToolRegistry::with_git(), router)).await
+    let registry = ToolRegistry::with_git_and_ci_reads()
+        .map_err(|error| format!("MCP tool registry refused: {error}"))?;
+    run_stdio_signal_aware(McpServer::with_router_and_reads(registry, router, ci_reads)).await
 }
 
 fn configured_human_approvers(
@@ -1113,10 +1147,13 @@ fn validate_bootstrap_semantics(parsed: &BootstrapArgs) -> Result<(), String> {
     if !(60..=86_400).contains(&parsed.ttl_secs) {
         return Err("--ttl-secs must be within 60..=86400".into());
     }
-    let mut allowed: std::collections::BTreeSet<&str> = myelin_git::api::agent_tools()
-        .into_iter()
-        .flat_map(|tool| tool.required_caps.iter().copied())
-        .collect();
+    let registry = ToolRegistry::with_git_and_ci_reads()
+        .map_err(|error| format!("MCP tool registry refused: {error}"))?;
+    let mut allowed = registry
+        .tools()
+        .iter()
+        .flat_map(|tool| tool.required_caps().into_iter())
+        .collect::<std::collections::BTreeSet<_>>();
     allowed.insert(MCP_HITL_DECIDE_CAP);
     if parsed.capabilities.is_empty()
         || parsed
@@ -1227,6 +1264,14 @@ mod tests {
         .unwrap();
         assert_eq!(valid.principal, "human:operator");
         assert_eq!(valid.capabilities.len(), 2);
+        assert!(parse_bootstrap_args(&args(&[
+            "--principal",
+            "human:operator",
+            "--cap",
+            "run.view",
+            "--ack-db-seal-operator-trust",
+        ]))
+        .is_ok());
         for invalid in [
             args(&["--principal", "p"]),
             args(&[

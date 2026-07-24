@@ -108,7 +108,7 @@ pub use catalogue::{
     page_envelope, Handler, HandlerCtx, Method, Page, API_VERSION, DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
 };
-pub use ci_http::register_ci;
+pub use ci_http::{register_ci, DurableCiReadApi};
 pub use error::{map_authz_error, EdgeError};
 pub use gateway::{
     sse_scope_for_resource, sse_scope_for_tenant, AuthProvider, AuthPublicConfig, Gateway,

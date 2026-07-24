@@ -2005,6 +2005,10 @@ cdc = [
     # privileged/run-pipeline consumer defs; CI-P26 completes the read/run/lifecycle/rollback rows so the
     # frozen X-6 table is whole. ToolHands::exec is ABSENT (the runner itself, X-6 / 05 §HP-5).
     "crates/myelin-agent-service/tests/cdc_8_1_ci_x6_tooldefs.rs",
+    # R4.2 / CT-005 MCP increment: CI's two production-backed triage reads opt into MCP through
+    # their shared ToolDefs. The CDC pins the exact schema/cap/effect/side-effect/gate/exposure fields
+    # against the MCP projection and proves unimplemented CI tools remain absent.
+    "crates/myelin-mcp/tests/cdc_8_1_ci_read_projection.rs",
     # ISS-P23 / P-390 (M4): the FULL Issues ToolDef catalogue slice — arch 03 §8's COMPLETE catalogue
     # (create/update/comment/link/estimate/reorder/assign/close + forecast/triage/sla_draft/transition,
     # 12 tools) registered into the ONE ToolSurface, with required_caps from the FROZEN Issues ReBAC
