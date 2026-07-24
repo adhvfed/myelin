@@ -138,8 +138,11 @@ export default function CiRunDetail() {
                                     readOnly
                                     aria-label="Archived job output"
                                     data-testid="ci-archived-log"
-                                    value={range.text.length > 0 ? range.text : "No archived bytes in this range."}
-                                  />
+                                  >
+                                    {range.text.length > 0
+                                      ? range.text
+                                      : "No archived bytes in this range."}
+                                  </textarea>
                                   <nav aria-label="Archived log ranges" class="ci-pagination">
                                     <Show when={range.byte_start > 0}>
                                       <A href={logHref(view.run.run_id, range.job_id, 0)}>
