@@ -21,6 +21,7 @@ pub const CI_RUN_CURSOR_PREFIX: &str = "cr1_";
 pub const CI_LOG_RANGE_DEFAULT: u32 = 64 * 1024;
 pub const CI_LOG_RANGE_MAX: u32 = 256 * 1024;
 pub const CI_LOG_SEGMENT_REF_MAX: usize = 256;
+pub const CI_LOG_TAIL_BATCH_MAX: usize = 64;
 
 const CURSOR_TIMESTAMP_BYTES: usize = 27;
 const CURSOR_UUID_BYTES: usize = 16;
@@ -157,6 +158,68 @@ WHERE run.tenant_id = $1
   AND segment.byte_start < $7
 ORDER BY segment.byte_start ASC, segment.segment_seq ASC
 LIMIT $8";
+
+pub const SELECT_CI_LOG_TAIL_HEAD_QUERY: &str = "\
+SELECT
+  job.state,
+  floor.segment_seq AS floor_sequence,
+  head.segment_seq AS head_sequence,
+  COALESCE(head.byte_end, 0) AS total_end
+FROM ci_run run
+JOIN ci_job job
+  ON job.tenant_id = run.tenant_id
+ AND job.region = run.region
+ AND job.run_id = run.run_id
+LEFT JOIN LATERAL (
+  SELECT segment.segment_seq
+  FROM log_segment segment
+  WHERE segment.tenant_id = job.tenant_id
+    AND segment.region = job.region
+    AND segment.run_id = job.run_id
+    AND segment.job_id = job.job_id
+    AND segment.blob_ref IS NOT NULL
+  ORDER BY segment.segment_seq ASC
+  LIMIT 1
+) floor ON TRUE
+LEFT JOIN LATERAL (
+  SELECT segment.segment_seq, segment.byte_end
+  FROM log_segment segment
+  WHERE segment.tenant_id = job.tenant_id
+    AND segment.region = job.region
+    AND segment.run_id = job.run_id
+    AND segment.job_id = job.job_id
+    AND segment.blob_ref IS NOT NULL
+  ORDER BY segment.segment_seq DESC
+  LIMIT 1
+) head ON TRUE
+WHERE run.tenant_id = $1
+  AND run.region = $2
+  AND run.run_id = $3::uuid
+  AND run.repo_ref = $4
+  AND job.job_id = $5::uuid";
+
+pub const SELECT_CI_LOG_TAIL_SEGMENTS_QUERY: &str = "\
+SELECT segment.segment_seq, segment.byte_start, segment.byte_end
+FROM log_segment segment
+WHERE segment.tenant_id = $1
+  AND segment.region = $2
+  AND segment.run_id = $3::uuid
+  AND segment.job_id = $4::uuid
+  AND segment.blob_ref IS NOT NULL
+  AND segment.segment_seq >= $5
+ORDER BY segment.segment_seq ASC
+LIMIT $6";
+
+pub const SELECT_CI_LOG_TAIL_PREDECESSOR_QUERY: &str = "\
+SELECT segment.byte_end
+FROM log_segment segment
+WHERE segment.tenant_id = $1
+  AND segment.region = $2
+  AND segment.run_id = $3::uuid
+  AND segment.job_id = $4::uuid
+  AND segment.blob_ref IS NOT NULL
+  AND segment.segment_seq = $5
+LIMIT 1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiRunStateFilter {
@@ -314,6 +377,23 @@ pub struct CiLogSegmentRef {
 pub struct CiLogArchive {
     pub total_end: i64,
     pub segments: Vec<CiLogSegmentRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiLogTailSegmentRef {
+    /// Public resume cursor. `log_segment.segment_seq` is zero-based; the wire cursor is one-based
+    /// so `0` remains the canonical "before the first frame" sentinel.
+    pub cursor: u64,
+    pub byte_start: i64,
+    pub byte_end: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiLogTailBatch {
+    pub resume_from: u64,
+    pub segments: Vec<CiLogTailSegmentRef>,
+    pub total_end: i64,
+    pub terminal: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -584,6 +664,200 @@ impl CiRunStore {
         Ok(Some(CiLogArchive {
             total_end,
             segments,
+        }))
+    }
+
+    /// Read one bounded resume batch from the durable T3 log archive. The caller supplies the
+    /// already-authorized canonical parent repository. `None` starts at the current durable head;
+    /// `Some(0)` means "before the first segment". Every returned cursor is the stored zero-based
+    /// `segment_seq + 1`.
+    pub async fn get_surface_log_tail(
+        &self,
+        tenant_id: &str,
+        region: &str,
+        run_id: &str,
+        job_id: &str,
+        expected_repo_ref: &str,
+        last_cursor: Option<u64>,
+    ) -> Result<Option<CiLogTailBatch>, CiRunSurfaceError> {
+        let run_id = canonical_uuid("run id", run_id)?;
+        let job_id = canonical_uuid("job id", job_id)?;
+        if expected_repo_ref.is_empty() || expected_repo_ref.len() > 1_024 {
+            return Err(CiRunSurfaceError::BadInput(
+                "expected repository ref must be non-empty and bounded".into(),
+            ));
+        }
+        if last_cursor.is_some_and(|cursor| i64::try_from(cursor).is_err()) {
+            return Err(CiRunSurfaceError::BadInput(
+                "CI log resume cursor is malformed".into(),
+            ));
+        }
+        let tenant_id_owned = tenant_id.to_string();
+        let region_owned = region.to_string();
+        let repo = expected_repo_ref.to_string();
+        let query_run = run_id.clone();
+        let query_job = job_id.clone();
+        let fetch_limit =
+            i64::try_from(CI_LOG_TAIL_BATCH_MAX).expect("CI log tail batch bound fits i64");
+        let has_explicit_cursor = last_cursor.is_some();
+        let result = with_tenant_repeatable_read_tx(self.pool(), tenant_id, region, move |conn| {
+            Box::pin(async move {
+                let head = sqlx::query(SELECT_CI_LOG_TAIL_HEAD_QUERY)
+                    .bind(&tenant_id_owned)
+                    .bind(&region_owned)
+                    .bind(&query_run)
+                    .bind(&repo)
+                    .bind(&query_job)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|error| PgError::Query(error.to_string()))?;
+                let Some(head) = head else {
+                    return Ok(None);
+                };
+                let state: String = head.get("state");
+                let floor_sequence: Option<i32> = head.get("floor_sequence");
+                let head_sequence: Option<i32> = head.get("head_sequence");
+                let total_end: i64 = head.get("total_end");
+                if floor_sequence.is_some_and(|sequence| sequence < 0)
+                    || head_sequence.is_some_and(|sequence| sequence < 0)
+                    || total_end < 0
+                {
+                    return Err(PgError::Query(
+                        "CI log archive contains an invalid tail coordinate".into(),
+                    ));
+                }
+                let floor_cursor = floor_sequence.map(|sequence| {
+                    u64::try_from(sequence)
+                        .expect("non-negative")
+                        .saturating_add(1)
+                });
+                let head_cursor = head_sequence.map(|sequence| {
+                    u64::try_from(sequence)
+                        .expect("non-negative")
+                        .saturating_add(1)
+                });
+                let resume_from = last_cursor.unwrap_or_else(|| head_cursor.unwrap_or(0));
+                let cursor_in_window = floor_cursor
+                    .is_none_or(|floor| resume_from.saturating_add(1) >= floor)
+                    && head_cursor.is_none_or(|head| resume_from <= head)
+                    && (head_cursor.is_some() || resume_from == 0);
+                let rows = if cursor_in_window {
+                    sqlx::query(SELECT_CI_LOG_TAIL_SEGMENTS_QUERY)
+                        .bind(&tenant_id_owned)
+                        .bind(&region_owned)
+                        .bind(&query_run)
+                        .bind(&query_job)
+                        .bind(i64::try_from(resume_from).expect("validated resume cursor"))
+                        .bind(fetch_limit)
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(|error| PgError::Query(error.to_string()))?
+                } else {
+                    Vec::new()
+                };
+                let predecessor_byte_end: Option<i64> = if cursor_in_window && resume_from > 0 {
+                    sqlx::query_scalar(SELECT_CI_LOG_TAIL_PREDECESSOR_QUERY)
+                        .bind(&tenant_id_owned)
+                        .bind(&region_owned)
+                        .bind(&query_run)
+                        .bind(&query_job)
+                        .bind(i64::try_from(resume_from - 1).expect("validated predecessor cursor"))
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|error| PgError::Query(error.to_string()))?
+                } else {
+                    None
+                };
+                Ok(Some((
+                    state,
+                    floor_cursor,
+                    head_cursor,
+                    total_end,
+                    resume_from,
+                    predecessor_byte_end,
+                    rows,
+                )))
+            })
+        })
+        .await?;
+        let Some((
+            state,
+            floor_cursor,
+            head_cursor,
+            total_end,
+            resume_from,
+            predecessor_byte_end,
+            rows,
+        )) = result
+        else {
+            return Ok(None);
+        };
+        if floor_cursor.is_some_and(|floor| resume_from.saturating_add(1) < floor) {
+            return Err(CiRunSurfaceError::CursorStale);
+        }
+        if head_cursor.is_none() && has_explicit_cursor {
+            return Err(CiRunSurfaceError::CursorStale);
+        }
+        if head_cursor.is_some_and(|head| resume_from > head) {
+            return Err(CiRunSurfaceError::BadInput(
+                "CI log resume cursor is ahead of the durable stream".into(),
+            ));
+        }
+        if resume_from > 0
+            && predecessor_byte_end.is_none()
+            && floor_cursor != resume_from.checked_add(1)
+        {
+            return Err(CiRunSurfaceError::Storage(
+                "CI log archive is missing the resume predecessor".into(),
+            ));
+        }
+        let mut segments = Vec::with_capacity(rows.len());
+        let mut expected_cursor = resume_from.checked_add(1).ok_or_else(|| {
+            CiRunSurfaceError::Storage("CI log resume cursor cannot advance".into())
+        })?;
+        let mut previous_byte_end = predecessor_byte_end;
+        for row in rows {
+            let sequence: i32 = row.get("segment_seq");
+            let cursor = u64::try_from(sequence)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| {
+                    CiRunSurfaceError::Storage(
+                        "CI log archive contains an invalid segment sequence".into(),
+                    )
+                })?;
+            let byte_start: i64 = row.get("byte_start");
+            let byte_end: i64 = row.get("byte_end");
+            if cursor != expected_cursor
+                || byte_start < 0
+                || byte_end <= byte_start
+                || previous_byte_end.is_some_and(|previous| byte_start != previous)
+            {
+                return Err(CiRunSurfaceError::Storage(
+                    "CI log archive contains a discontinuous tail".into(),
+                ));
+            }
+            segments.push(CiLogTailSegmentRef {
+                cursor,
+                byte_start,
+                byte_end,
+            });
+            expected_cursor = cursor.checked_add(1).ok_or_else(|| {
+                CiRunSurfaceError::Storage("CI log resume cursor cannot advance".into())
+            })?;
+            previous_byte_end = Some(byte_end);
+        }
+        let batch_head = segments
+            .last()
+            .map_or(resume_from, |segment| segment.cursor);
+        Ok(Some(CiLogTailBatch {
+            resume_from,
+            segments,
+            total_end,
+            terminal: matches!(
+                state.as_str(),
+                "succeeded" | "failed" | "cancelled" | "reaped"
+            ) && head_cursor.is_none_or(|head| batch_head >= head),
         }))
     }
 }

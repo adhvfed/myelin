@@ -11,12 +11,14 @@ use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_durable::DurableGitBackend;
 use crate::request::EdgeResponse;
+use crate::sse::{SseEvent, SseSubscription};
 use crate::Method;
 use base64::Engine as _;
 use myelin_ci_controlplane::ci_run_store::{CiRunStore, CiRunStoreError};
 use myelin_ci_controlplane::surfacing_store::{
-    CiJobSurface, CiLogArchive, CiLogRangeRequest, CiRunPageRequest, CiRunStateFilter,
-    CiRunSummary, CiRunSurfaceError, CiStepSurface, CI_LOG_RANGE_DEFAULT, CI_RUN_PAGE_DEFAULT,
+    CiJobSurface, CiLogArchive, CiLogRangeRequest, CiLogTailBatch, CiRunPageRequest,
+    CiRunStateFilter, CiRunSummary, CiRunSurfaceError, CiStepSurface, CI_LOG_RANGE_DEFAULT,
+    CI_LOG_TAIL_BATCH_MAX, CI_RUN_PAGE_DEFAULT,
 };
 use myelin_identity::Principal;
 use myelin_storage::{BlobStore, ContentHash};
@@ -24,7 +26,11 @@ use myelin_tenancy::TenantId;
 use serde_json::{json, Value};
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::{Handle, RuntimeFlavor};
+
+const CI_LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const CI_LOG_TAIL_CHANNEL_CAPACITY: usize = CI_LOG_TAIL_BATCH_MAX * 2 + 2;
 
 #[derive(Clone)]
 pub struct DurableCiReadApi {
@@ -150,6 +156,141 @@ impl DurableCiReadApi {
             "data": base64::engine::general_purpose::STANDARD.encode(bytes),
         }))
     }
+
+    /// Open a cross-service durable log tail. The T3 `log_segment.segment_seq` is the resume
+    /// authority; SSE carries only byte-range pointers, and clients resolve bytes through
+    /// [`Self::read_log`] so the existing content-addressed integrity checks remain the one reader.
+    pub fn open_log_tail(
+        &self,
+        principal: &Principal,
+        run_id: &str,
+        job_id: &str,
+        last_cursor: Option<u64>,
+    ) -> Result<SseSubscription, EdgeError> {
+        if !canonical_uuid(run_id) {
+            return Err(EdgeError::BadRequest(
+                "CI run id must be a canonical UUID".into(),
+            ));
+        }
+        if !canonical_uuid(job_id) {
+            return Err(EdgeError::BadRequest(
+                "CI job id must be a canonical UUID".into(),
+            ));
+        }
+        let repo_ref = authorized_repo_ref(self, principal, run_id)?;
+        let first = self
+            .drive(self.runs.get_surface_log_tail(
+                principal.tenant.as_str(),
+                principal.region.as_str(),
+                run_id,
+                job_id,
+                &repo_ref,
+                last_cursor,
+            ))
+            .map_err(map_tail_error)?
+            .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))?;
+
+        let (sender, subscription) = SseSubscription::bounded_channel(CI_LOG_TAIL_CHANNEL_CAPACITY);
+        let api = self.clone();
+        let principal = principal.clone();
+        let run_id = run_id.to_string();
+        let job_id = job_id.to_string();
+        let emit_checkpoint = last_cursor.is_none();
+        self.runtime.spawn(async move {
+            let mut cursor = first.resume_from;
+            let mut poll_immediately = first.segments.len() == CI_LOG_TAIL_BATCH_MAX;
+            if emit_checkpoint
+                && sender
+                    .send(SseEvent {
+                        event: Some("ci.log.ready".into()),
+                        id: Some(cursor.to_string()),
+                        data: json!({
+                            "run_id": run_id,
+                            "job_id": job_id,
+                            "byte_end": first.total_end,
+                        })
+                        .to_string(),
+                    })
+                    .is_err()
+            {
+                return;
+            }
+            if emit_tail_batch(&sender, &run_id, &job_id, &mut cursor, first) {
+                return;
+            }
+            loop {
+                if !poll_immediately {
+                    tokio::time::sleep(CI_LOG_TAIL_POLL_INTERVAL).await;
+                }
+                // Object permission is live, not a one-time subscription grant. A revoked Pull
+                // relation closes silently, preserving the denied/absent oracle posture.
+                let Ok(repo_ref) = authorized_repo_ref(&api, &principal, &run_id) else {
+                    return;
+                };
+                let batch = api.drive(api.runs.get_surface_log_tail(
+                    principal.tenant.as_str(),
+                    principal.region.as_str(),
+                    &run_id,
+                    &job_id,
+                    &repo_ref,
+                    Some(cursor),
+                ));
+                let Ok(Some(batch)) = batch else {
+                    return;
+                };
+                poll_immediately = batch.segments.len() == CI_LOG_TAIL_BATCH_MAX;
+                if emit_tail_batch(&sender, &run_id, &job_id, &mut cursor, batch) {
+                    return;
+                }
+            }
+        });
+        Ok(subscription)
+    }
+}
+
+fn emit_tail_batch(
+    sender: &tokio::sync::broadcast::Sender<SseEvent>,
+    run_id: &str,
+    job_id: &str,
+    cursor: &mut u64,
+    batch: CiLogTailBatch,
+) -> bool {
+    let terminal = batch.terminal;
+    let terminal_byte_end = batch.total_end;
+    for segment in batch.segments {
+        if segment.cursor <= *cursor
+            || sender
+                .send(SseEvent {
+                    event: Some("ci.log.appended".into()),
+                    id: Some(segment.cursor.to_string()),
+                    data: json!({
+                        "run_id": run_id,
+                        "job_id": job_id,
+                        "byte_start": segment.byte_start,
+                        "byte_end": segment.byte_end,
+                    })
+                    .to_string(),
+                })
+                .is_err()
+        {
+            return true;
+        }
+        *cursor = segment.cursor;
+    }
+    if terminal {
+        let _ = sender.send(SseEvent {
+            event: Some("ci.log.complete".into()),
+            id: (*cursor > 0).then(|| (*cursor).to_string()),
+            data: json!({
+                "run_id": run_id,
+                "job_id": job_id,
+                "byte_end": terminal_byte_end,
+            })
+            .to_string(),
+        });
+        return true;
+    }
+    false
 }
 
 fn map_surface_error(error: CiRunSurfaceError) -> EdgeError {
@@ -161,6 +302,15 @@ fn map_surface_error(error: CiRunSurfaceError) -> EdgeError {
         CiRunSurfaceError::Storage(_) => {
             EdgeError::Unavailable("CI run data is temporarily unavailable".into())
         }
+    }
+}
+
+fn map_tail_error(error: CiRunSurfaceError) -> EdgeError {
+    match error {
+        CiRunSurfaceError::CursorStale => EdgeError::Conflict(
+            "CI log resume cursor is outside retention; reload the archived log".into(),
+        ),
+        other => map_surface_error(other),
     }
 }
 
@@ -290,6 +440,26 @@ fn parse_log_query(query: &str) -> Result<CiLogRangeRequest, EdgeError> {
     }
     CiLogRangeRequest::new(start.unwrap_or(0), limit.unwrap_or(CI_LOG_RANGE_DEFAULT))
         .map_err(map_surface_error)
+}
+
+fn parse_log_tail_cursor(ctx: &HandlerCtx<'_>) -> Result<Option<u64>, EdgeError> {
+    if !ctx.request.query.is_empty() {
+        return Err(EdgeError::BadRequest(
+            "CI live log tail accepts no query parameters".into(),
+        ));
+    }
+    let Some(value) = ctx.request.header("last-event-id") else {
+        return Ok(None);
+    };
+    let cursor = value.parse::<u64>().map_err(|_| {
+        EdgeError::BadRequest("CI log Last-Event-ID must be a canonical integer".into())
+    })?;
+    if value != cursor.to_string() {
+        return Err(EdgeError::BadRequest(
+            "CI log Last-Event-ID must be a canonical integer".into(),
+        ));
+    }
+    Ok(Some(cursor))
 }
 
 fn run_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
@@ -554,6 +724,30 @@ struct CiLogArchiveHandler {
     api: DurableCiReadApi,
 }
 
+struct CiLogTailHandler {
+    api: DurableCiReadApi,
+}
+
+impl Handler for CiLogTailHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if ctx.request.method != "GET" {
+            return Err(EdgeError::BadRequest(
+                "CI live log tail requires GET".into(),
+            ));
+        }
+        let cursor = parse_log_tail_cursor(ctx)?;
+        let run_id = run_param(ctx)?;
+        let job_id = job_param(ctx)?;
+        let subscription = self
+            .api
+            .open_log_tail(ctx.principal, run_id, job_id, cursor)?;
+        Ok(EdgeResponse::sse(
+            subscription,
+            ctx.identity.capability().expires_at_unix,
+        ))
+    }
+}
+
 impl Handler for CiLogArchiveHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         if !ctx.request.body.is_empty() {
@@ -596,7 +790,13 @@ pub fn register_ci(
             Method::Get,
             "/v1/ci/runs/{run}/jobs/{job}/log",
             "ci.run.log.read",
-            Arc::new(CiLogArchiveHandler { api }),
+            Arc::new(CiLogArchiveHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Get,
+            "/v1/ci/runs/{run}/jobs/{job}/log/live",
+            "ci.run.log.watch",
+            Arc::new(CiLogTailHandler { api }),
         )
 }
 

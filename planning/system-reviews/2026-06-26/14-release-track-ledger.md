@@ -458,7 +458,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification. Still required: honest cross-service live-log SSE, the live founder push→CI→surfaced-check/log pass, then CT-007.** |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a serves repository-authorized durable run list/detail reads; CT-005b serves bounded integrity-checked archived log ranges; CT-005c surfaces those durable reads in the authenticated web UI through a Rust/dev-edge shared golden contract; CT-005d exposes the same durable reads through the thin authenticated CLI; CT-005e projects the two implemented durable reads into MCP under final-boundary run-token verification; CT-005f1 adds the repository-authorized durable SSE resume consumer. Still required: incremental runner-side persistence during execution on both production backends, live web/CLI consumption and CI-D11, the live founder push→CI→surfaced-check/log pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
@@ -1683,6 +1683,50 @@ token verifications per successful read = 1; newly retained self-fulfilling sour
 L3 CT-005e footprint: **22 files, +1,519 / -335 lines** for shared definitions and registration,
 effect-kind routing, the durable read adapter, production composition, executable proofs, deletion
 of the source-string test, and ledgers.
+
+**CT-005f1 durable SSE resume-consumer increment (2026-07-24; producer streaming and consumer UX
+remain open).** Production Edge now mounts authenticated
+`GET /v1/ci/runs/{run}/jobs/{job}/log/live`. The verified principal supplies tenant and region; Edge
+resolves the run's canonical parent repository and applies Git's exact Pull decision before opening
+the stream, then repeats that decision every 250 ms poll so a revoked relation closes the stream.
+Denied parents and absent runs/jobs retain the same 404 response at open. The mounted action requires
+`run.view` for ordinary viewer purposes and remains unavailable to CI-job credentials.
+
+The cross-service resume authority is the durable T3 archive rather than the process-local
+`Firehose`: each zero-based `log_segment.segment_seq` maps to a one-based SSE event id. An omitted
+`Last-Event-ID` starts at the current durable head without historical backfill and immediately emits
+an ID-bearing checkpoint, so a disconnect before the first append still has an exact resume point;
+an explicit canonical cursor returns only later segments. A partially pruned retention prefix
+returns 409 and directs the caller to reload the archived log; because an empty retained set cannot
+distinguish never-written from fully-pruned history without a tombstone, every explicit cursor
+(including `0`) is conservatively stale there, while a no-header subscription remains available.
+Internal sequence gaps, invalid byte coordinates, and discontinuous ranges—including the boundary
+between 64-row batches—fail unavailable rather than advancing a cursor across missing output. Reads
+are repeatable-read and work-bounded: two index-oriented first/last probes establish floor/head, one
+point lookup anchors the predecessor byte end, and at most 64 following pointers are selected per
+poll. Terminal completion is emitted only after the returned batch reaches the durable head. The
+per-connection channel is bounded; a lagging consumer is disconnected and must resume. Frames carry
+only `run_id`, `job_id`, `byte_start`, and `byte_end`; content addresses and bytes remain behind
+CT-005b's bounded re-hash-on-read archive route.
+
+The live PostgreSQL production-handler proof executes explicit-cursor backfill, an omitted-header
+current-head checkpoint, a segment committed after subscription by another service, live parent-Pull
+revocation before a subsequent append, terminal completion, strict reconnect without duplication,
+hidden-parent/absent equivalence, partial and full retention-stale 409, and both internal and
+cross-batch gap refusal after consuming the first 64 real SSE events. That file is now a named
+provider/consumer leg for contract 3.5's resume protocol and 11.8's T3 log tier; the permanent
+contract-coverage scanner is green.
+
+**Code-wins remaining floor:** this increment makes the consumer and resume transport mechanically
+honest, but current runners still receive captured stdout/stderr only after
+`SandboxBackend::launch` returns and persist segments from `DurableLogPersist::finish`. Therefore it
+does not claim output streams while a command is executing. CT-005f2 must introduce bounded
+incremental persistence on both gVisor and Firecracker production execution paths. The authenticated
+web and CLI live consumers plus a production-path CI-D11 sever/resume proof follow that producer
+increment; the founder acceptance pass and CT-007 remain closed.
+
+L3 CT-005f1 footprint: **8 files, +1,004 / -32 lines** for the durable resume store, Edge SSE
+consumer, continuing-authorization/integrity proofs, contract registration, and ledgers.
 
 ## R5–R6
 

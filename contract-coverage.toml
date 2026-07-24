@@ -528,6 +528,11 @@ cdc = [
     # resync_required -> a range-read of the sealed segments (the durable archive, never lost). The
     # CI-D11 drill (drills_ci_p21_live_tail.rs) proves 0 lost lines + the bounded-scope rejection.
     "crates/myelin-ci-controlplane/tests/cdc_live_tail_3_5_11_8.rs",
+    # CT-005f cross-service leg: the durable T3 sequence is the provider; production Edge is the
+    # repository-authorized SSE consumer. The live PostgreSQL proof pins an ID-bearing current-head
+    # checkpoint, strict resume, post-subscribe append, live Pull revocation, stale/full retention,
+    # and within-/cross-batch discontinuity refusal.
+    "crates/myelin-edge/tests/integration_ci_http_surface.rs",
     # CONSUMER leg — Issues' real-time board sync (ISS-P30 / P-397) rides this SAME frozen protocol:
     # `myelin_issues::BoardSync` subscribes/resumes on the bounded `board:<id>` scope (never `*` — the
     # OQ-J co-designed huge-board case, paginated to the visible window + margin via the substrate's
@@ -3090,6 +3095,7 @@ status = "covered"
 cdc = [
     "crates/myelin-storage/tests/cdc_11_8_firehose_archive.rs",
     "crates/myelin-storage/tests/cdc_11_8_ci_log_index.rs",
+    "crates/myelin-edge/tests/integration_ci_http_surface.rs",
 ]
 
 # ──────────────── §12 Tenancy & control plane (myelin-tenancy) ──────────────────────────────────

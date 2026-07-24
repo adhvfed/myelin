@@ -45,12 +45,20 @@ pub struct SseEvent {
 impl SseEvent {
     /// A bare data-only event.
     pub fn data(data: impl Into<String>) -> SseEvent {
-        SseEvent { event: None, id: None, data: data.into() }
+        SseEvent {
+            event: None,
+            id: None,
+            data: data.into(),
+        }
     }
 
     /// A typed event (`event:` + `data:`).
     pub fn typed(event: impl Into<String>, data: impl Into<String>) -> SseEvent {
-        SseEvent { event: Some(event.into()), id: None, data: data.into() }
+        SseEvent {
+            event: Some(event.into()),
+            id: None,
+            data: data.into(),
+        }
     }
 
     /// Render the SSE wire frame: `event: …\n` (if any), `id: …\n` (if any), one `data: …\n` per
@@ -87,6 +95,16 @@ impl SseSubscription {
     /// Consume into the underlying broadcast receiver (the server adapts it to a streaming body).
     pub fn into_receiver(self) -> broadcast::Receiver<SseEvent> {
         self.rx
+    }
+
+    /// Open one bounded producer/subscriber pair for a subsystem-owned durable tail. The receiver
+    /// exists before the producer is spawned, so an initial replay batch is buffered rather than
+    /// dropped. A lag beyond `capacity` is still surfaced by the server as a disconnect.
+    pub(crate) fn bounded_channel(
+        capacity: usize,
+    ) -> (broadcast::Sender<SseEvent>, SseSubscription) {
+        let (tx, rx) = broadcast::channel(capacity);
+        (tx, SseSubscription { rx })
     }
 }
 
@@ -140,8 +158,15 @@ mod tests {
 
     #[test]
     fn frame_renders_the_eventsource_wire_shape() {
-        let ev = SseEvent { event: Some("notification".into()), id: Some("42".into()), data: "{\"n\":1}".into() };
-        assert_eq!(ev.frame(), "event: notification\nid: 42\ndata: {\"n\":1}\n\n");
+        let ev = SseEvent {
+            event: Some("notification".into()),
+            id: Some("42".into()),
+            data: "{\"n\":1}".into(),
+        };
+        assert_eq!(
+            ev.frame(),
+            "event: notification\nid: 42\ndata: {\"n\":1}\n\n"
+        );
         // multi-line data → one `data:` per line.
         assert_eq!(SseEvent::data("a\nb").frame(), "data: a\ndata: b\n\n");
     }
@@ -156,6 +181,9 @@ mod tests {
         assert_eq!(reached, 1, "only the acme subscriber is on tenant:acme");
         assert_eq!(a.try_recv().unwrap(), SseEvent::data("hi"));
         // A frame to a scope with no subscriber reaches 0 (dropped, ephemeral).
-        assert_eq!(hub.broadcast("edge", "tenant:nobody", SseEvent::data("x")), 0);
+        assert_eq!(
+            hub.broadcast("edge", "tenant:nobody", SseEvent::data("x")),
+            0
+        );
     }
 }
