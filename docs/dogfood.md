@@ -355,13 +355,18 @@ contract.
 
 A fresh repo's default ruleset requires **1 approval**, and Myelin does **not** count an author's approval
 of their own PR (a deliberate policy). A solo founder therefore cannot merge until a second reviewer exists.
-For single-operator dogfood, set the ref's required approvals to 0 (a repo-admin write):
+For single-operator CI dogfood, set the ref's required approvals to 0 while retaining `ci/build` as
+a required context (a repo-admin write):
 
 ```sh
 curl -sS -X POST "$MYELIN_EDGE_URL/v1/git/repos/<repo>/branch-protection" \
   -H "authorization: Bearer $TOKEN" -H "content-type: application/json" \
-  -d '{"rulesets":[{"ref_pattern":"refs/heads/main","required_approvals":0,"required_contexts":[]}]}'
+  -d '{"rulesets":[{"ref_pattern":"refs/heads/main","required_approvals":0,"required_contexts":["ci/build"]}]}'
 ```
+
+Do not replace `required_contexts` with an empty list for the founder acceptance run: that would
+make `verify-check ... build` fail and, more importantly, would leave `main` without the CI gate the
+run is meant to prove.
 
 > Open PRs with an explicit `head_oid` (`git rev-parse <head_ref>`) — a PR opened without it currently
 > cannot be merged. Mirroring an existing GitHub repo's *history* is rejected by the pseudonymous-commit

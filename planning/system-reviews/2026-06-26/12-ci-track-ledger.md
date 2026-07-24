@@ -221,10 +221,13 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   `plan_dispatch`, requires one queued CI `build` context, then reads and decodes the emitted CAS
   snapshot and verifies the exact profile, image, and command. Before intake, `dogfood.sh ci`
   canonical-hashes the staged personal-cell rootfs and refuses activation unless it matches the
-  authored image pin. A focused required-runsc production test also confirms this host executes and
-  captures an ordinary shell command through the real gVisor backend. The immutable release-grade
-  image/provenance mechanism remains explicitly sequenced in P0; this one-cell binding is the honest
-  R4 founder-dogfood bridge.
+  authored image pin. The local founder repository's `refs/heads/main` ruleset has been set through
+  the authenticated production API to require `ci/build`; the operator runbook preserves that
+  context while reducing solo-founder approvals to zero, so `verify-check ... build` cannot be made
+  vacuous by an empty required set. A focused required-runsc production test also confirms this host
+  executes and captures an ordinary shell command through the real gVisor backend. The immutable
+  release-grade image/provenance mechanism remains explicitly sequenced in P0; this one-cell binding
+  is the honest R4 founder-dogfood bridge.
 - **CT-005f8 — composed production push rehearsal:** an authorized disposable repository push runs
   through the real Git wire, elected outbox publisher, Dispatch, coordinated gVisor runner,
   Controlplane, PostgreSQL/S3 log store, Git projection consumer, CLI, and authenticated browser.
