@@ -457,7 +457,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 | Item | What | Status |
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
-| R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
+| R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **FLOW PROVEN; SOURCE MIRROR OPEN.** `82b8fe6` + `0325a22` prove wire/API/browser behavior on a two-commit README lineage, not the plan's full source-tree mirror. The current source must land as one new pseudonymous snapshot atop hosted `main`; importing or rewriting the legacy GitHub identity graph is forbidden. |
 | R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — CT-004's running root, operational reservation/settlement, claim/launch fences, exact-tenant runtime/fan-out, producer-authored PR head ordering, serialized run supersession, opt-in production runner boot, and durable CI→Git check projection are proven. CT-005a–f7 close the durable API/web/CLI/MCP/archive/live-log surface and arm the founder verifier/pipeline. CT-005f8 then pushed an authorized disposable repository through the composed production services, closed the transport/runtime defects that rehearsal exposed, and produced matching live/archive/browser evidence. This proves readiness without substituting a demo repository for the named founder act. Still required: the live Myelin-repository founder push→CI→surfaced-check/log pass, then CT-007.** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
@@ -561,11 +561,13 @@ Continuing the drive PAST the push blockers surfaced the rest of the flow — an
   present — origin/main had both commits + the merged README). Fix: set HEAD→default branch on first push
   (or repo create). FIX NEEDED.
 
-**R4.1 CORE ACCEPTANCE PROVEN (2026-07-16):** against the REAL edge binary — bootstrap→token, repo create,
+**R4.1 CORE FLOW ACCEPTANCE PROVEN (2026-07-16):** against the REAL edge binary — bootstrap→token, repo create,
 `git push main` + feature branch (pseudonymous, over the wire, THROUGH the gVisor sandbox), open PR #2 (with
 head_oid), review, set branch protection (0 approvals), `merge` → main advanced durably (`merged:true`), then
 a real `git clone` back recovered BOTH commits + the merged Vision section. The CLI/API + wire half of the
-R3 exit gate is met on production infra. Remaining: the browser half (Playwright vs the real edge — R3's
+R3 exit gate is met on production infra. This proved the product flow on a two-commit README repository;
+it did not mirror the Myelin source tree and therefore did not by itself close R4.1. Remaining at that
+point: the browser half (Playwright vs the real edge — R3's
 suite already proved it vs the dev-edge contract) and the ergonomics fixes F1/F3/F8/F9 + F5 dogfood.sh wiring.
 
 Burndown: F2 closed (symptom of F5). F4, F5 fixed (`82b8fe6`). F6/F7 = documented workflow (not code). **F1/F3/F8/F9
@@ -581,8 +583,8 @@ against the REAL edge; `/login` rendered the operator-token card from the real `
 server action returned 302 + set the httpOnly `myelin_session` cookie + redirected to `/git/repos`; the authenticated
 repos page rendered the REAL repositories (`dogfood2`, `myelin/myelin`) through the SSR gateway. The one previously
 untested seam (real-edge response shapes → SSR gateway → rendered HTML) is confirmed — no dev-edge/real-edge contract
-drift. **R4.1 is complete: the founder's push/pull/PR flow works on production infra via git CLI, the JSON API, AND
-the browser.** Remaining R4 phases: R4.2 (CT-004 CI reconcile — decomposed above), R4.3 (backup/restore drill on the
+drift. **The R4.1 founder flow works on production infra via git CLI, the JSON API, and the browser; the
+source-tree mirror remains a separate open R4.1 exit condition.** Remaining R4 phases: R4.2 (CT-004 CI reconcile — decomposed above), R4.3 (backup/restore drill on the
 now-real dogfood data), R4.4 (stand up Myelin's own issue tracker to host the burndown that lived here).
 
 **R4.3 DONE + PASSING (2026-07-16):** `scripts/backup-drill.sh run` captures the LIVE dogfood data (a `pg_dump -Fc`
@@ -2047,6 +2049,19 @@ disabled. The short-lived operator credential used for that write has a durable 
 The runbook's solo-operator example now preserves `ci/build` instead of resetting the ruleset to an
 empty CI gate. This is acceptance preflight only: it is not the founder push, a green check, or
 permission for an agent to push the Myelin repository.
+
+**R4.1 source-mirror truth-up (2026-07-24).** A read-only hosted-repository audit found only the
+two historical README commits (`d65f166a`, `b5bcad7d`), while the local source DAG has 1,374 commits.
+A raw `HEAD` push would import legacy real/example identities and correctly fail GIT-1; rewriting
+that history is not an acceptable migration. The authorized disposable-repository probe therefore
+used the intended shape: one new `founder@myelin.noreply` snapshot commit, parented on the hosted
+tip, carrying the exact current tracked source tree. The first probe failed closed before any ref
+move because five scanner/redaction test blobs contained the scanner's own complete credential
+sentinels. The tests now assemble those same bytes at runtime, preserving every redaction and
+reject-before-promote assertion while making the source blobs hostable. A permanent test derives the
+production default patterns and scans every tracked file, preventing this self-rejection from
+returning. The full-tree disposable probe must pass before preparing the equivalent unpushed founder
+branch; the actual Myelin source push/PR remains the user's act and R4.1 stays open until it lands.
 
 **CT-007 handoff floor (pre-registered; phase still closed).** Code wins over a tempting literal
 interpretation of “cut over”: `.myelin/ci.toml` currently proves only the push/runner/log/check

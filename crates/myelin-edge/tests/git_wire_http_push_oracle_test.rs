@@ -380,7 +380,10 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
     // ── 2. a REJECTED push (a planted AWS-key secret) does NOT move the ref + emits NO event ──
     let tip_before_reject = durable_tip(&root, "acme", "widgets", "refs/heads/main");
     let depth_before_reject = backend.outbox().outbox_depth();
-    std::fs::write(work.join("creds.txt"), b"aws_key = AKIAIOSFODNN7EXAMPLE\n").unwrap();
+    // Assemble the planted secret at runtime so this self-hosted scanner oracle does not make its
+    // own source blob unpushable.
+    let planted_secret = [b"aws_key = AK".as_slice(), b"IAIOSFODNN7EXAMPLE\n"].concat();
+    std::fs::write(work.join("creds.txt"), planted_secret).unwrap();
     run_git(&["add", "-A"], Some(&work));
     run_git(
         &[

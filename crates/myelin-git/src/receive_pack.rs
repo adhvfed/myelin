@@ -450,9 +450,9 @@ impl Default for PushPolicy {
             // 50 MiB per object — git's default large-object guard order of magnitude.
             max_object_bytes: 50 * 1024 * 1024,
             secret_patterns: vec![
-                "AKIA".to_string(), // an AWS access-key id prefix
-                "-----BEGIN PRIVATE KEY".to_string(),
-                "-----BEGIN RSA PRIVATE KEY".to_string(),
+                ["AK", "IA"].concat(), // an AWS access-key id prefix
+                ["-----BEGIN ", "PRIVATE KEY"].concat(),
+                ["-----BEGIN RSA ", "PRIVATE KEY"].concat(),
             ],
             protected_needs_human: true,
             // The default policy is tenant-agnostic for the non-pseudonymity rules; `RefStore::receive`
@@ -2220,7 +2220,7 @@ mod tests {
             }],
             quarantine: vec![QuarantineObject {
                 oid: Oid::new("bad"),
-                bytes: b"export AWS_KEY=AKIAIOSFODNN7EXAMPLE".to_vec(),
+                bytes: [b"export AWS_KEY=AK".as_slice(), b"IAIOSFODNN7EXAMPLE"].concat(),
             }],
             pusher: Pusher {
                 pseudonym: "anon-1@acme.noreply".into(),
@@ -2230,7 +2230,7 @@ mod tests {
         match store.receive(&push, &db, CrashPoint::None).unwrap() {
             PushOutcome::Rejected(RejectReason::SecretDetected { oid, pattern }) => {
                 assert_eq!(oid, Oid::new("bad"));
-                assert_eq!(pattern, "AKIA");
+                assert_eq!(pattern, ["AK", "IA"].concat());
             }
             o => panic!("expected SecretDetected, got {o:?}"),
         }
@@ -2244,6 +2244,44 @@ mod tests {
             "the secret object was NOT promoted out of quarantine"
         );
         assert_eq!(outbox.outbox_depth(), 0);
+    }
+
+    /// **The scanner can host its own repository.** Default secret sentinels must be assembled at
+    /// runtime in scanner/redaction tests: leaving a complete sentinel in any tracked source blob
+    /// makes an otherwise honest full-tree Myelin push reject itself before promotion.
+    #[test]
+    fn self_hosting_tree_contains_no_complete_default_secret_sentinel() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("myelin-git is a crate in the workspace");
+        let listed = std::process::Command::new("git")
+            .args(["ls-files", "-z"])
+            .current_dir(root)
+            .output()
+            .expect("git ls-files runs");
+        assert!(
+            listed.status.success(),
+            "git ls-files must enumerate the self-hosted snapshot"
+        );
+
+        let patterns = PushPolicy::default().secret_patterns;
+        for raw_path in listed
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let path = std::str::from_utf8(raw_path).expect("tracked paths are UTF-8");
+            let bytes = std::fs::read(root.join(path)).expect("tracked file remains readable");
+            let contents = String::from_utf8_lossy(&bytes);
+            for pattern in &patterns {
+                assert!(
+                    !contents.contains(pattern),
+                    "tracked source blob `{path}` contains the default secret sentinel `{pattern}` \
+                     and cannot pass Myelin's reject-before-promote wire gate"
+                );
+            }
+        }
     }
 
     /// **Reject: an agent direct-push to a protected ref (`agent_needs_human`).**
