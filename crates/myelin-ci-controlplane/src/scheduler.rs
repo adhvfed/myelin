@@ -224,8 +224,11 @@ RETURNING j.tenant_id, j.job_id";
 /// execution lease covering the admitted runtime while a session advisory lock protects the much
 /// smaller commit→gated-release interval. Bind: `$1 tenant`, `$2 region`, `$3 job`, `$4 workflow
 /// run`, `$5 owner`, `$6 epoch`, `$7 nonce`, `$8 claim start`, `$9 claim expiry`, `$10 execution
-/// lease seconds`.
+/// lease seconds`. The public `ci_job` row crosses to `running` in the SAME statement: if that
+/// surface row is absent, cancelled, or otherwise inconsistent, the CTE returns no row and the
+/// caller rolls the complete launch transaction back rather than executing an invisible job.
 pub const AUTHORIZE_JOB_LAUNCH_QUERY: &str = "\
+WITH launched AS (
 UPDATE job_queue
 SET state = 'running',
     lease_expires = statement_timestamp() + ($10 || ' seconds')::interval
@@ -241,7 +244,16 @@ WHERE tenant_id = $1
   AND EXTRACT(EPOCH FROM claim_expires_at)::bigint = $9
   AND claim_expires_at > statement_timestamp()
   AND completion_receipt IS NULL
-RETURNING job_id";
+RETURNING tenant_id, region, job_id
+)
+UPDATE ci_job AS surface
+SET state = 'running'
+FROM launched
+WHERE surface.tenant_id = launched.tenant_id
+  AND surface.region = launched.region
+  AND surface.job_id = launched.job_id
+  AND surface.state IN ('queued', 'leased')
+RETURNING surface.job_id";
 
 /// **The idempotent enqueue (arch 02 §2.1 / §3.2) — insert ONE schedulable `job_queue` row.** The
 /// durable equivalent of [`SchedulerState::enqueue`]: a job the run's `SCHEDULE_AND_RUN_JOB`

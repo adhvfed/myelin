@@ -86,6 +86,15 @@ impl CheckContext {
             name: name.into(),
         }
     }
+
+    /// Canonical branch-protection token for this typed context. Policy always names the full
+    /// `provider/name` pair; projections and API views must never drop the `ci/` provider prefix.
+    pub fn policy_token(&self) -> String {
+        match self.provider {
+            CheckProvider::Ci => format!("ci/{}", self.name),
+            CheckProvider::External => format!("external/{}", self.name),
+        }
+    }
 }
 
 /// The producer class of a [`CheckContext`] (frozen 5.9): `ci` (Myelin CI) or `external` (a
@@ -308,8 +317,7 @@ impl CheckStatusRow {
 
 /// Production DDL, re-exported from its migration owner to keep the contract declaration and live
 /// schema byte-identical.
-pub const CHECK_STATUS_PROJECTION_DDL: &str =
-    crate::check_status_store::CREATE_CHECK_STATUS_DDL;
+pub const CHECK_STATUS_PROJECTION_DDL: &str = crate::check_status_store::CREATE_CHECK_STATUS_DDL;
 
 // ---------------------------------------------------------------------------
 // 3. The monotonic run_attempt supersession rule (X-1)
@@ -655,6 +663,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn typed_contexts_render_the_full_branch_protection_token() {
+        assert_eq!(CheckContext::ci("build").policy_token(), "ci/build");
+        assert_eq!(CheckContext::ci("test/unit").policy_token(), "ci/test/unit");
+        assert_eq!(
+            CheckContext::external("sonarcloud").policy_token(),
+            "external/sonarcloud"
+        );
+    }
+
     /// Build a decoded CheckStatus fact for a `(commit, context, attempt, state, trust)`.
     fn fact(
         commit: &str,
@@ -972,9 +990,8 @@ mod tests {
     #[test]
     fn projection_ddl_is_keyed_on_commit_oid_and_context() {
         assert!(CHECK_STATUS_PROJECTION_DDL.contains("CREATE TABLE check_status"));
-        assert!(CHECK_STATUS_PROJECTION_DDL.contains(
-            "tenant_id, region, repo_ref, commit_oid, context_provider, context_name"
-        ));
+        assert!(CHECK_STATUS_PROJECTION_DDL
+            .contains("tenant_id, region, repo_ref, commit_oid, context_provider, context_name"));
         assert!(CHECK_STATUS_PROJECTION_DDL.contains("run_attempt"));
         assert!(CHECK_STATUS_PROJECTION_DDL.contains("trust_tier"));
     }

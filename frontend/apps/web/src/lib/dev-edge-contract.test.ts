@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   parseRepoSummaryQuery,
   parsePrCommitsQuery,
+  prDiffCapacityEnvelope,
   prCommitCursorExpiredEnvelope,
   prCommitsEnvelope,
   parseTreeQuery,
@@ -34,6 +35,12 @@ const gitReadGolden = JSON.parse(readFileSync(
     mutation?: "add-ref";
     request: { limit: number; current?: string; ref?: string; path?: string; q?: string };
     expected: Record<string, unknown>;
+  }>;
+  capacity_vectors: Array<{
+    id: string;
+    endpoint: "pr-diff";
+    request: { repo: string; number: number };
+    expected: { status: number; body: Record<string, unknown> };
   }>;
 };
 
@@ -283,6 +290,18 @@ describe("the shared Git read golden contract", () => {
       }
       expect(normalized, vector.id).toEqual(vector.expected);
     }
+  });
+
+  it("pins the bounded PR-diff response consumed by the browser mock", () => {
+    expect(gitReadGolden.capacity_vectors).toHaveLength(1);
+    const vector = gitReadGolden.capacity_vectors[0];
+    expect(vector).toMatchObject({
+      id: "pr-diff-too-large",
+      endpoint: "pr-diff",
+      request: { repo: "myelin", number: 5 },
+      expected: { status: 413 },
+    });
+    expect(prDiffCapacityEnvelope()).toEqual(vector?.expected.body);
   });
 });
 

@@ -115,10 +115,10 @@ export MYELIN_TOKEN="$TOKEN"
 ./scripts/dogfood.sh verify-check <repo> <pr-number> "$(git rev-parse <head-ref>)" build
 ```
 
-The command exits nonzero unless the PR still points at that exact OID and `build` is in both the
-repository ruleset's required set and Git's settled, trusted green projection. Its JSON result also
-reports the full merge-gate verdict; the verdict may remain false until the separate review threshold
-is satisfied.
+The command canonicalizes the short `build` argument to `ci/build` and exits nonzero unless the PR
+still points at that exact OID and that full context is in both the repository ruleset's required set
+and Git's settled, trusted green projection. Its JSON result also reports the full merge-gate
+verdict; the verdict may remain false until the separate review threshold is satisfied.
 
 Capture the CI surface evidence from that same run; do not substitute a fixture or a different head.
 While the pushed job is still running, discover its server-issued identifiers and attach both
@@ -276,7 +276,8 @@ The git smart-HTTP wire accepts the token two ways.
 ignored:**
 
 ```sh
-# clone (create the repo first, e.g. via `myelin git repo create acme/eu-west/widgets` or the JSON API)
+# clone (create the repo first, e.g. via
+# `myelin --idempotency-key repo-create-widgets git repo create acme/eu-west/widgets` or the JSON API)
 git clone http://127.0.0.1:8080/acme/eu-west/widgets.git
 # when prompted (or configure a helper): username = anything, password = <TOKEN>
 
@@ -381,6 +382,16 @@ run is meant to prove.
 > cannot be merged. Mirroring an existing GitHub repo's *history* is rejected by the pseudonymous-commit
 > gate (real emails are not pseudonyms); dogfood new work with a `<handle>@<tenant>.noreply` identity and
 > keep GitHub as the read-only history mirror.
+
+CLI mutations require the global `--idempotency-key`. Choose a PII-free key for the intended
+operation and reuse that exact key if the response is lost; changing the key creates a distinct
+operation. For example:
+
+```sh
+HEAD_OID="$(git rev-parse refs/heads/topic)"
+myelin --idempotency-key "pr-open-topic-$HEAD_OID" git pr open <repo> \
+  --title "Topic" --head-ref refs/heads/topic --head-oid "$HEAD_OID"
+```
 
 ## 7. Revoke a token
 

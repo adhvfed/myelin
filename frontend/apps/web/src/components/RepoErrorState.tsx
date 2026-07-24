@@ -15,7 +15,13 @@ export function errKind(err: unknown): RepoErrorKind {
   const msg = err instanceof Error ? err.message : String(err ?? "");
   if (msg.startsWith(REPO_ERR_PREFIX)) {
     const k = msg.slice(REPO_ERR_PREFIX.length);
-    if (k === "no-access" || k === "not-found" || k === "stale-tree" || k === "error") return k;
+    if (
+      k === "no-access" ||
+      k === "not-found" ||
+      k === "stale-tree" ||
+      k === "diff-too-large" ||
+      k === "error"
+    ) return k;
   }
   return "error";
 }
@@ -48,6 +54,8 @@ export interface RepoErrorStateProps {
   kind: RepoErrorKind;
   /** The repo slug (bare) — drives the not-found copy + the "Repo home" action. */
   repo?: string;
+  /** PR number when the error state can offer the overview as a context-preserving escape hatch. */
+  prNumber?: number;
   /** Retry handler (the ErrorBoundary `reset`) — wired on the retryable `error` kind. */
   onRetry?: () => void;
 }
@@ -73,7 +81,7 @@ export function RepoErrorState(props: RepoErrorStateProps) {
 
 function NotFoundStaleOrError(props: RepoErrorStateProps) {
   return (
-    <Show when={props.kind === "not-found"} fallback={<StaleOrError {...props} />}>
+    <Show when={props.kind === "not-found"} fallback={<DiffCapacityStaleOrError {...props} />}>
       <div role="note" data-testid="repo-error" data-kind="not-found" style={card}>
         <Icon name="search" size={28} title="Not found" />
         <h2 style={{ "font-size": "var(--fs-h3)", margin: "0" }}>We couldn&rsquo;t find that</h2>
@@ -89,6 +97,35 @@ function NotFoundStaleOrError(props: RepoErrorStateProps) {
           <A href="/git/repos" style={btn}>
             <Icon name="nav-code" /> Repositories
           </A>
+        </div>
+      </div>
+    </Show>
+  );
+}
+
+function DiffCapacityStaleOrError(props: RepoErrorStateProps) {
+  return (
+    <Show when={props.kind === "diff-too-large"} fallback={<StaleOrError {...props} />}>
+      <div role="note" data-testid="repo-error" data-kind="diff-too-large" style={card}>
+        <Icon name="nav-code" size={28} title="Diff too large" />
+        <h2 style={{ "font-size": "var(--fs-h3)", margin: "0" }}>
+          This diff is too large for browser review
+        </h2>
+        <p style={{ color: "var(--text-muted)", margin: "0", "max-width": "44ch" }}>
+          The repository is safe. This change exceeds the interactive file limit, so review it from
+          a local checkout or split it into a smaller pull request.
+        </p>
+        <div style={{ display: "flex", gap: "var(--space-2)", "flex-wrap": "wrap", "justify-content": "center" }}>
+          <Show when={props.repo && props.prNumber}>
+            <A href={`/git/repos/${props.repo}/prs/${props.prNumber}`} style={btn}>
+              <Icon name="repo" /> Pull request overview
+            </A>
+          </Show>
+          <Show when={props.repo}>
+            <A href={`/git/repos/${props.repo}`} style={btn}>
+              <Icon name="nav-code" /> Repo home
+            </A>
+          </Show>
         </div>
       </div>
     </Show>

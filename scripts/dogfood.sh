@@ -260,8 +260,14 @@ case "${cmd}" in
     repo="$1"
     pr_number="$2"
     expected_head="$3"
-    context="${4:-build}"
-    if [[ ! "${pr_number}" =~ ^[1-9][0-9]*$ || -z "${repo}" || -z "${expected_head}" || -z "${context}" ]]; then
+    context_arg="${4:-build}"
+    if [[ "${context_arg}" == */* ]]; then
+      context="${context_arg}"
+    else
+      context="ci/${context_arg}"
+    fi
+    if [[ ! "${pr_number}" =~ ^[1-9][0-9]*$ || -z "${repo}" || -z "${expected_head}" ||
+          ! "${context}" =~ ^(ci|external)/[^[:space:]]+$ ]]; then
       echo "dogfood: repo, positive PR number, head OID, and context must be non-empty" >&2
       exit 2
     fi

@@ -2097,6 +2097,46 @@ configured run accounts for all 464 mutants (360 caught, 104 compile-time unviab
 zero timed out). Code wins: the inclusive production ceiling remains unchanged; the missing
 boundary contract is now executable. Mechanical payoff: missed mandatory-core mutants 8→0.
 
+**R4.4 founder Myelin acceptance and dogfood repair (2026-07-24; R4.1 merge remains open).** The
+founder authenticated to the local production cell, pushed
+`r4-1-founder-source-snapshot` at exact OID
+`1550ab91492c79357f78af4160f8aba106f73669`, and opened hosted PR #1. The real push triggered run
+`00152490-3234-593f-ed63-4bb2ac0291ec`, job
+`e1694e63-8c35-8504-b826-0d05822e7e9d`. The run, job, and step settled
+succeeded/passed with cost settled at that exact commit; Git projected trusted attempt-1
+`ci/build`, and the exact-head verifier recorded `gate_admitted=true`. The bounded no-overwrite
+acceptance verifier reread all 76 archived bytes, found marker
+`MYELIN-CI-a005e32fc1bb0c2b64e7d40ac1a01236` exactly once in both the earlier CLI live capture and
+archive, and emitted matching SHA-256
+`93f9208811ed63047e9a41f5b8d2bb7ab343d1dc0354efd246817227649ae250`. Evidence remains in
+`/home/adhv/.local/state/myelin/acceptance`.
+
+The real browser pass was smooth except for PR #1's direct diff route. Production correctly
+returned the bounded 413 envelope because the snapshot exceeds the 1,000-file interactive ceiling,
+but the route serialized that expected capacity refusal as an SSR 500. It now renders a calm
+HTTP-200 capacity state with PR-overview and repository escape links. That 413 response is part of
+the same shared golden artifact executed by the Rust production Edge and dev Edge, and
+`contract-coverage.toml` binds both consumer tests plus Git-browse and PR-diff Chromium proofs.
+The complete 85-flow browser suite passes, including the requested tree next-page click,
+stale-tree 409→reload, and oversized-diff direct-load accessibility checks.
+
+The pass also exposed three backend/operator seams that are repaired in the same bounded increment.
+CLI mutations require and transmit an explicit retry-stable `--idempotency-key`; typed Git check
+contexts now retain their provider prefix through merge policy, projection, API, and
+`verify-check`; and final CI launch moves `job_queue` plus the public `ci_job` to `running` in one
+statement. A live PostgreSQL drill proves dirty-session refusal, cancel/launch serialization,
+public-running co-commit, one-shot replay refusal, and rollback when the public projection is
+missing. Mechanical re-affirmation: 488 frontend tests pass with eight environment skips, all 85
+Chromium flows pass, the complete CLI and acceptance-harness suites pass, the shared real-Edge
+golden test passes, and contract coverage reports 99 rows, 83 covered, 16 named deferrals, two
+frontend contracts, and zero false claims.
+
+**Honest remaining R4 floor:** hosted PR #1 is still open and the source snapshot has not been
+merged into hosted `main`; the founder owns that review/merge. This local repair commit also awaits
+the founder's push. The four-week R4 exit clock has not started: one exact green founder act closes
+the CI acceptance handoff, but it is not four weeks of daily Git/CI use and does not satisfy the
+pre-registered CT-007 workload-parity gate.
+
 **CT-007 handoff floor (pre-registered; phase still closed).** Code wins over a tempting literal
 interpretation of “cut over”: `.myelin/ci.toml` currently proves only the push/runner/log/check
 transport, while `.github/workflows/ci.yml` still carries the real Rust, frontend/browser,

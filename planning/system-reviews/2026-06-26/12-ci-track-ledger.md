@@ -10,8 +10,9 @@ dependency code, so a weak sandbox is a supply-chain hole.
 truth is release ledger 14 §R4.2. CT-004 now includes the opt-in coordinated production runner and the
 durable CI→Git check projection. Attempt numbers are allocated immutably per run/context in the same
 reserve commit as the run, queued outbox rows, and trigger dedup; PipelineStarter consumes rather than
-reallocates them. CT-004 remains in progress until a real founder push produces, settles, and surfaces
-its exact-head check. CT-005 is now **IN PROGRESS**: CT-005a mounts production durable run-list and
+reallocates them. CT-004's live founder handoff is now closed by CT-005f8c below: a real Myelin
+source-snapshot push produced, settled, and surfaced its exact-head trusted check. CT-005 is now
+**DONE**: CT-005a mounts production durable run-list and
 run-detail reads at Edge, prefiltered through the parent Git repository's Pull visibility and backed by
 an opaque scope-bound keyset cursor plus a ready-at-boot index. CT-005b adds byte-exact bounded archived
 log reads over sealed `log_segment` rows and the production content-addressed BlobStore. CT-005c adds
@@ -43,10 +44,11 @@ in the V2 one-job founder pipeline, executes its real file through production Di
 the decoded CAS snapshot, and refuses runner activation unless the staged personal-cell rootfs matches
 the authored digest. CT-005f8 then proves the composed push-to-terminal path with an authorized
 disposable repository and closes the production-only elected-publisher, subject, immutable-read,
-activation, log-route, terminal-job, and SSR-output defects that the rehearsal exposed. The founder
-acceptance pass itself remains open because the counted repository was not Myelin.
-CT-007 is still unopened; GitHub Actions must not be
-removed before the founder acceptance pass and the complete CT-005 surface are genuinely usable.
+activation, log-route, terminal-job, and SSR-output defects that the rehearsal exposed. CT-005f8c
+records the founder's real Myelin source-snapshot push, exact-head trusted check, live/archive marker
+receipt, browser pass, and the dogfood defects repaired before this surface was called usable.
+CT-007 is still unopened; GitHub Actions must not be removed until its pre-registered workload-parity
+gate below is satisfied.
 
 ## Environment (confirmed — this track is testable here)
 Firecracker v1.16.0 + gVisor (`runsc`) on PATH; `/dev/kvm` present. So the production microVM boot + the
@@ -256,11 +258,32 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   to preserve the retained row and require either ceiling at one under the row/envelope size to
   refuse. The complete configured gate accounts for all 464 mutants: 360 caught, 104 compile-time
   unviable, zero missed, and zero timed out. Mechanical payoff: missed mandatory-core mutants 8→0.
+- **CT-005f8c — founder Myelin acceptance and surfaced-state repair:** the founder pushed
+  `r4-1-founder-source-snapshot` at exact OID
+  `1550ab91492c79357f78af4160f8aba106f73669` through the production wire and opened hosted PR #1.
+  Run `00152490-3234-593f-ed63-4bb2ac0291ec`, job
+  `e1694e63-8c35-8504-b826-0d05822e7e9d`, settled succeeded/cost-settled and projected trusted
+  attempt-1 `ci/build` for that exact head. The no-overwrite verifier independently reread 76 bytes,
+  found marker `MYELIN-CI-a005e32fc1bb0c2b64e7d40ac1a01236` exactly once in both the earlier live
+  capture and archive, and emitted matching SHA-256
+  `93f9208811ed63047e9a41f5b8d2bb7ab343d1dc0354efd246817227649ae250`. The exact-head check receipt
+  records `gate_admitted=true`.
 
-**Named CT-005b floor:** `LiveTail`/Firehose is process-local while runners and Edge are separate
-services. It is not an honest production SSE resume source. SSE remains open until a real
-cross-service bounded resume transport exists; CT-005b/CT-005c claim archived cold-path reads only.
-The live founder push→settled check→surfaced archived/live log pass and CT-007 also remain open.
+  The live pass exposed four ordinary dogfood seams and one browser capacity posture. CLI writes
+  now require and transmit an explicit retry-stable `--idempotency-key`; Git's typed check context
+  renders `ci/build` consistently in policy, projection, API, and the verifier; final launch moves
+  the durable queue and public `ci_job` to `running` in one statement and refuses if the public row
+  is absent; and an oversized PR diff is rendered as an HTTP-200 capacity state on direct SSR
+  instead of a route 500. The latter 413 envelope is a shared golden vector executed by the Rust
+  Edge and dev Edge, registered with both browser proofs in `contract-coverage.toml`. The full
+  85-flow Chromium suite passes, including tree next-page, stale-tree 409→reload, and the new
+  oversized-diff direct load.
+
+**Historical CT-005b floor (closed by CT-005f1–f5):** `LiveTail`/Firehose was process-local while
+runners and Edge were separate services, so CT-005b/CT-005c correctly claimed archived cold-path
+reads only. The durable pointer transport, archive-before-ack consumers, and composed sever drill
+closed that floor; CT-005f8c now closes the live founder push→settled check→surfaced archived/live
+log pass. CT-007 remains separately gated on workload parity.
 CT-005e closes the prior MCP floor without inventing live output: its two reads are exact durable
 run/detail and archived-log operations, and the complete content-addressed Agent tool transcript
 remains an Agent-runtime trace artifact rather than a claim made by the stdio transport.
@@ -271,11 +294,10 @@ mechanical rather than conventional. CT-005f4 closes the authenticated CLI consu
 inventing run-wide aggregation: the production resume authority is exact `(run_id, job_id)`, so the
 code requires `--job` even though the frozen plan used the shorthand `ci watch <run>`. CT-005f5
 closes the remaining composed CI-D11 committed-prefix drill without overstating unproven
-commit-unknown or HTTP-wire failure modes. CT-005f6 and CT-005f7 make the remaining founder act
-machine-verifiable and genuinely triggerable without claiming that it already happened. CT-005f8
+commit-unknown or HTTP-wire failure modes. CT-005f6 and CT-005f7 made the founder act
+machine-verifiable and genuinely triggerable without prematurely claiming that it happened. CT-005f8
 proves the same composed path on an authorized disposable repository without relabeling it as the
-founder/Myelin act. The live Myelin-repository founder push→settled check→surfaced archived/live log
-pass and CT-007 remain open.
+founder/Myelin act; CT-005f8c records that later real act. CT-007 remains unopened.
 
 **Pre-registered CT-007 cutover floor (does not open CT-007 early).** The founder marker pipeline is
 an end-to-end transport/surfacing acceptance job, not workload parity with `.github/workflows/ci.yml`.

@@ -112,11 +112,20 @@ pub struct EdgeCall {
     pub query: Option<String>,
     /// The request payload bytes (for a write), if any.
     pub payload: Option<Vec<u8>>,
+    /// Retry-stable caller identity for a mutation. Reads never carry one; writes are refused by
+    /// the client until the top-level shell attaches the explicit global `--idempotency-key`.
+    pub idempotency_key: Option<String>,
 }
 
 impl EdgeCall {
     fn get(path: impl Into<String>) -> EdgeCall {
-        EdgeCall { method: HttpMethod::Get, path: path.into(), query: None, payload: None }
+        EdgeCall {
+            method: HttpMethod::Get,
+            path: path.into(),
+            query: None,
+            payload: None,
+            idempotency_key: None,
+        }
     }
 
     /// A `POST` with a JSON body (the body bytes are the serialized payload). The tenant is NEVER in
@@ -127,7 +136,29 @@ impl EdgeCall {
             path: path.into(),
             query: None,
             payload: Some(payload.to_string().into_bytes()),
+            idempotency_key: None,
         }
+    }
+
+    /// Attach the caller's retry-stable mutation identity. The grammar is byte-identical to the
+    /// production Edge's `PrOperationId`: trimmed, non-empty, at most 128 ASCII-graphic bytes.
+    pub fn with_idempotency_key(mut self, value: &str) -> Result<EdgeCall, CliError> {
+        if self.method != HttpMethod::Post {
+            return Err(CliError::Usage(
+                "--idempotency-key applies only to mutating commands".into(),
+            ));
+        }
+        let value = value.trim();
+        if value.is_empty()
+            || value.len() > 128
+            || !value.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(CliError::Usage(
+                "--idempotency-key must be 1..128 ASCII-graphic bytes with no spaces".into(),
+            ));
+        }
+        self.idempotency_key = Some(value.to_string());
+        Ok(self)
     }
 }
 
@@ -135,7 +166,9 @@ impl EdgeCall {
 /// missing arg is never a panic.
 fn usage_from_git(e: CliParseError) -> CliError {
     let m = match e {
-        CliParseError::Empty => "no git command given (try: repo list | pr view <n> | search code <q>)".to_string(),
+        CliParseError::Empty => {
+            "no git command given (try: repo list | pr view <n> | search code <q>)".to_string()
+        }
         CliParseError::Unknown { token } => format!("unknown git command token `{token}`"),
         CliParseError::MissingArg { what } => format!("missing argument: {what}"),
         CliParseError::DuplicateFlag { flag } => format!("duplicate flag: {flag}"),
@@ -180,6 +213,7 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
                 path: "/v1/git/repos".into(),
                 query: Some(query.finish()),
                 payload: None,
+                idempotency_key: None,
             })
         }
         // GET /v1/git/repos/<repo> → the per-repo home projection (durable on-disk state).
@@ -189,9 +223,9 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             Ok(EdgeCall::get(format!("/v1/git/repos/{repo}/prs/{number}")))
         }
         // GET /v1/git/repos/<repo>/prs/<n>/checks → the X-1 checks projection (the repo-owned ruleset).
-        CliCommand::PrChecks { repo, number } => {
-            Ok(EdgeCall::get(format!("/v1/git/repos/{repo}/prs/{number}/checks")))
-        }
+        CliCommand::PrChecks { repo, number } => Ok(EdgeCall::get(format!(
+            "/v1/git/repos/{repo}/prs/{number}/checks"
+        ))),
         // GET /v1/git/repos/<repo>/prs → every visible PR in one object-guarded repository.
         // GET /v1/git/prs → the cross-repository, leak-free attention list (needs-review by default).
         CliCommand::PrList { repo } => Ok(match repo {
@@ -213,17 +247,27 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
                 path: "/v1/git/search/code".into(),
                 query: Some(query.finish()),
                 payload: None,
+                idempotency_key: None,
             })
         }
 
         // ── Writes (durable GT-003; the tenant is the token's, never the body) ──
         // POST /v1/git/repos {slug} → create a durable bare repo.
-        CliCommand::RepoCreate { slug } => {
-            Ok(EdgeCall::post_json("/v1/git/repos", json!({ "slug": slug })))
-        }
+        CliCommand::RepoCreate { slug } => Ok(EdgeCall::post_json(
+            "/v1/git/repos",
+            json!({ "slug": slug }),
+        )),
         // POST /v1/git/repos/<repo>/prs {base_ref, head_ref, head_oid, draft} → open a PR. The body
         // carries ONLY the proposal (never branch-protection policy or check facts — the GT-003 fix).
-        CliCommand::PrOpen { repo, title, body: body_md, base_ref, head_ref, head_oid, draft } => {
+        CliCommand::PrOpen {
+            repo,
+            title,
+            body: body_md,
+            base_ref,
+            head_ref,
+            head_oid,
+            draft,
+        } => {
             let mut body = json!({ "draft": draft, "title": title });
             if let Some(b) = body_md {
                 body["body"] = json!(b);
@@ -237,10 +281,17 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             if let Some(o) = head_oid {
                 body["head_oid"] = json!(o);
             }
-            Ok(EdgeCall::post_json(format!("/v1/git/repos/{repo}/prs"), body))
+            Ok(EdgeCall::post_json(
+                format!("/v1/git/repos/{repo}/prs"),
+                body,
+            ))
         }
         // POST /v1/git/repos/<repo>/prs/<n>/reviews {verdict} → submit a review.
-        CliCommand::PrReview { repo, number, verdict } => Ok(EdgeCall::post_json(
+        CliCommand::PrReview {
+            repo,
+            number,
+            verdict,
+        } => Ok(EdgeCall::post_json(
             format!("/v1/git/repos/{repo}/prs/{number}/reviews"),
             json!({ "verdict": verdict }),
         )),
@@ -270,7 +321,12 @@ pub fn issues_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
 /// Map a validated Issues command to its tenant-less Edge call.
 pub fn issues_command_to_call(command: &IssuesCliCommand) -> EdgeCall {
     match command {
-        IssuesCliCommand::List { state, key, limit, cursor } => {
+        IssuesCliCommand::List {
+            state,
+            key,
+            limit,
+            cursor,
+        } => {
             let mut query = format!("state={}&limit={limit}", state.as_str());
             if let Some(key) = key {
                 query.push_str("&key=");
@@ -285,6 +341,7 @@ pub fn issues_command_to_call(command: &IssuesCliCommand) -> EdgeCall {
                 path: "/v1/issues".into(),
                 query: Some(query),
                 payload: None,
+                idempotency_key: None,
             }
         }
         IssuesCliCommand::Create {
@@ -329,6 +386,7 @@ pub fn ci_command_to_call(command: &CiCliCommand) -> EdgeCall {
                 path: "/v1/ci/runs".into(),
                 query: Some(query.finish()),
                 payload: None,
+                idempotency_key: None,
             }
         }
         CiCliCommand::View { run_id } => EdgeCall::get(format!("/v1/ci/runs/{run_id}")),
@@ -345,11 +403,12 @@ pub fn ci_command_to_call(command: &CiCliCommand) -> EdgeCall {
                 path: format!("/v1/ci/runs/{run_id}/jobs/{job_id}/log"),
                 query: Some(query.finish()),
                 payload: None,
+                idempotency_key: None,
             }
         }
-        CiCliCommand::Watch { run_id, job_id } => EdgeCall::get(format!(
-            "/v1/ci/runs/{run_id}/jobs/{job_id}/log/live"
-        )),
+        CiCliCommand::Watch { run_id, job_id } => {
+            EdgeCall::get(format!("/v1/ci/runs/{run_id}/jobs/{job_id}/log/live"))
+        }
     }
 }
 
@@ -358,9 +417,9 @@ pub fn ci_command_to_call(command: &CiCliCommand) -> EdgeCall {
 /// route is live; item detail/read mutation remain honest unsupported floors.
 pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     use myelin_notif::cli::CliView;
-    let (verb, rest) = args
-        .split_first()
-        .ok_or_else(|| CliError::Usage("no notif command (try: list [--view <v>] | show <id> | read <id>)".into()))?;
+    let (verb, rest) = args.split_first().ok_or_else(|| {
+        CliError::Usage("no notif command (try: list [--view <v>] | show <id> | read <id>)".into())
+    })?;
     match *verb {
         "list" => {
             let mut view = None;
@@ -369,18 +428,22 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
             let mut index = 0;
             while index < rest.len() {
                 let flag = rest[index];
-                let value = rest.get(index + 1).ok_or_else(|| {
-                    CliError::Usage(format!("`notif list {flag}` needs a value"))
-                })?;
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| CliError::Usage(format!("`notif list {flag}` needs a value")))?;
                 match flag {
                     "--view" if view.is_none() => view = Some(*value),
                     "--limit" if limit.is_none() => limit = Some(*value),
                     "--cursor" if cursor.is_none() => cursor = Some(*value),
                     "--view" | "--limit" | "--cursor" => {
-                        return Err(CliError::Usage(format!("duplicate notif list flag `{flag}`")))
+                        return Err(CliError::Usage(format!(
+                            "duplicate notif list flag `{flag}`"
+                        )))
                     }
                     other => {
-                        return Err(CliError::Usage(format!("unknown notif list flag `{other}`")))
+                        return Err(CliError::Usage(format!(
+                            "unknown notif list flag `{other}`"
+                        )))
                     }
                 }
                 index += 2;
@@ -418,6 +481,7 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
                 path: "/v1/notif/inbox".into(),
                 query: Some(query.finish()),
                 payload: None,
+                idempotency_key: None,
             })
         }
         "show" | "read" => {
@@ -475,10 +539,7 @@ mod tests {
             Some(format!("view=summary&cursor={cursor}").as_str())
         );
 
-        let both = git_dispatch(&[
-            "repo", "list", "--cursor", &cursor, "--limit", "2",
-        ])
-        .unwrap();
+        let both = git_dispatch(&["repo", "list", "--cursor", &cursor, "--limit", "2"]).unwrap();
         assert_eq!(
             both.query.as_deref(),
             Some(format!("view=summary&limit=2&cursor={cursor}").as_str())
@@ -556,9 +617,16 @@ mod tests {
         let create = git_dispatch(&["repo", "create", "alpha"]).unwrap();
         assert_eq!(create.method, HttpMethod::Post);
         assert_eq!(create.path, "/v1/git/repos");
+        assert!(
+            create.idempotency_key.is_none(),
+            "the subsystem mapper cannot invent a retry identity"
+        );
         let body = String::from_utf8(create.payload.clone().unwrap()).unwrap();
         assert!(body.contains("\"slug\":\"alpha\""));
-        assert!(!body.contains("tenant"), "the tenant is never in the body (IDOR floor)");
+        assert!(
+            !body.contains("tenant"),
+            "the tenant is never in the body (IDOR floor)"
+        );
 
         let view = git_dispatch(&["pr", "view", "alpha", "7"]).unwrap();
         assert_eq!(view.method, HttpMethod::Get);
@@ -570,7 +638,38 @@ mod tests {
 
         let review = git_dispatch(&["pr", "review", "alpha", "7", "--approve"]).unwrap();
         assert_eq!(review.path, "/v1/git/repos/alpha/prs/7/reviews");
-        assert!(String::from_utf8(review.payload.unwrap()).unwrap().contains("approve"));
+        assert!(String::from_utf8(review.payload.unwrap())
+            .unwrap()
+            .contains("approve"));
+    }
+
+    #[test]
+    fn mutation_idempotency_keys_are_explicit_and_share_the_edge_grammar() {
+        let call = git_dispatch(&["pr", "merge", "alpha", "7"])
+            .unwrap()
+            .with_idempotency_key(" retry-123 ")
+            .unwrap();
+        assert_eq!(call.idempotency_key.as_deref(), Some("retry-123"));
+
+        for invalid in ["", " ", "contains space", "ø"] {
+            let error = git_dispatch(&["pr", "merge", "alpha", "7"])
+                .unwrap()
+                .with_idempotency_key(invalid)
+                .unwrap_err();
+            assert_eq!(error.code(), 2);
+        }
+        assert!(git_dispatch(&["pr", "merge", "alpha", "7"])
+            .unwrap()
+            .with_idempotency_key(&"x".repeat(129))
+            .is_err());
+        assert_eq!(
+            git_dispatch(&["pr", "view", "alpha", "7"])
+                .unwrap()
+                .with_idempotency_key("read-key")
+                .unwrap_err()
+                .code(),
+            2,
+        );
     }
 
     /// notif REUSES its own view grammar and maps only recipient-neutral page coordinates.
@@ -582,11 +681,27 @@ mod tests {
         .unwrap();
         assert_eq!(call.method, HttpMethod::Get);
         assert_eq!(call.path, "/v1/notif/inbox");
-        assert_eq!(call.query.as_deref(), Some("view=my-work&limit=25&cursor=ni1_abc"));
+        assert_eq!(
+            call.query.as_deref(),
+            Some("view=my-work&limit=25&cursor=ni1_abc")
+        );
         assert!(call.payload.is_none());
-        assert_eq!(notif_dispatch(&["list"]).unwrap().query.as_deref(), Some("view=all"));
-        assert_eq!(notif_dispatch(&["list", "--view", "everything"]).unwrap_err().code(), 2);
-        assert_eq!(notif_dispatch(&["list", "--limit", "0"]).unwrap_err().code(), 2);
+        assert_eq!(
+            notif_dispatch(&["list"]).unwrap().query.as_deref(),
+            Some("view=all")
+        );
+        assert_eq!(
+            notif_dispatch(&["list", "--view", "everything"])
+                .unwrap_err()
+                .code(),
+            2
+        );
+        assert_eq!(
+            notif_dispatch(&["list", "--limit", "0"])
+                .unwrap_err()
+                .code(),
+            2
+        );
         assert_eq!(notif_dispatch(&["list", "--view"]).unwrap_err().code(), 2);
         assert_eq!(notif_dispatch(&["nope"]).unwrap_err().code(), 2);
         assert_eq!(notif_dispatch(&["show", "item-1"]).unwrap_err().code(), 4);
@@ -684,13 +799,7 @@ mod tests {
         let cursor = canonical_ci_cursor();
 
         let list = ci_dispatch(&[
-            "list",
-            "--status",
-            "failed",
-            "--limit",
-            "1",
-            "--cursor",
-            &cursor,
+            "list", "--status", "failed", "--limit", "1", "--cursor", &cursor,
         ])
         .unwrap();
         assert_eq!(list.method, HttpMethod::Get);
@@ -712,10 +821,7 @@ mod tests {
         assert!(log.payload.is_none());
 
         let watch = ci_dispatch(&["watch", run, "--job", job]).unwrap();
-        assert_eq!(
-            watch.path,
-            format!("/v1/ci/runs/{run}/jobs/{job}/log/live")
-        );
+        assert_eq!(watch.path, format!("/v1/ci/runs/{run}/jobs/{job}/log/live"));
         assert!(watch.query.is_none());
         assert!(watch.payload.is_none());
     }
