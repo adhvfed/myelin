@@ -278,12 +278,13 @@ FOR UPDATE";
 
 /// Read every immutable accounting receipt bound to the exact CI/workflow run pair. The finalizer
 /// compares this set with the manifest's complete job set before certifying `cost_settled=true`.
+/// Receipts cannot be updated or deleted, so no row lock is needed (and one would require authority
+/// intentionally absent from the runtime role).
 pub const SELECT_CI_RUN_ACCOUNTING_QUERY: &str = "\
 SELECT job_id::text AS job_id, reserve_handle, passed, timed_out, skipped
 FROM ci_job_accounting
 WHERE tenant_id = $1 AND region = $2 AND ci_run_id = $3::uuid AND wf_run_id = $4::uuid
-ORDER BY job_id
-FOR SHARE";
+ORDER BY job_id";
 
 /// Read an immutable attempt already issued to this run. No row lock is required: the table grants
 /// only `SELECT, INSERT` to the runtime role and rows can never be updated or deleted. Adding
@@ -1616,7 +1617,10 @@ mod tests {
             }
         }
         assert!(LOCK_CI_RUN_FOR_FINALIZE_QUERY.contains("FOR UPDATE"));
-        assert!(SELECT_CI_RUN_ACCOUNTING_QUERY.contains("FOR SHARE"));
+        assert!(
+            !SELECT_CI_RUN_ACCOUNTING_QUERY.contains("FOR "),
+            "immutable accounting reads need only the production SELECT grant"
+        );
         assert!(SELECT_CI_RUN_ACCOUNTING_QUERY.contains("skipped"));
         for guard in [
             "state = 'running'",
