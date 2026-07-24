@@ -285,6 +285,14 @@ WHERE tenant_id = $1 AND region = $2 AND ci_run_id = $3::uuid AND wf_run_id = $4
 ORDER BY job_id
 FOR SHARE";
 
+/// Read an immutable attempt already issued to this run. No row lock is required: the table grants
+/// only `SELECT, INSERT` to the runtime role and rows can never be updated or deleted. Adding
+/// `FOR SHARE` would silently require `UPDATE` privilege and make the production dispatch retry
+/// until its broker budget is exhausted.
+const SELECT_RESERVED_CHECK_ATTEMPT_QUERY: &str = "\
+SELECT repo_ref, commit_oid, run_attempt FROM ci_run_check_attempt
+WHERE tenant_id=$1 AND region=$2 AND run_id=$3 AND context=$4";
+
 /// The sole live terminal transition. It is intentionally a compare-and-set from the fully started
 /// shape; queued, already-mutated, and partially-terminal rows are refused rather than repaired.
 pub const FINALIZE_CI_RUN_QUERY: &str = "\
@@ -1117,17 +1125,16 @@ async fn allocate_reserve_check_attempts(
     let mut attempts = BTreeMap::new();
     for context in contexts {
         if let Some((stored_repo, stored_commit, stored_attempt)) =
-            sqlx::query_as::<_, (String, String, i32)>(
-                "SELECT repo_ref, commit_oid, run_attempt FROM ci_run_check_attempt \
-                 WHERE tenant_id=$1 AND region=$2 AND run_id=$3 AND context=$4 FOR SHARE",
-            )
-            .bind(&row.tenant_id)
-            .bind(&row.region)
-            .bind(run_id)
-            .bind(context)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|error| CiRunStoreError::Db(format!("read reserved check attempt: {error}")))?
+            sqlx::query_as::<_, (String, String, i32)>(SELECT_RESERVED_CHECK_ATTEMPT_QUERY)
+                .bind(&row.tenant_id)
+                .bind(&row.region)
+                .bind(run_id)
+                .bind(context)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|error| {
+                    CiRunStoreError::Db(format!("read reserved check attempt: {error}"))
+                })?
         {
             if stored_repo != repo_ref || stored_commit != commit_oid || stored_attempt <= 0 {
                 return Err(CiRunStoreError::Db(
@@ -1620,6 +1627,20 @@ mod tests {
         }
         assert!(FINALIZE_CI_RUN_QUERY.contains("cost_settled = true"));
         assert!(FINALIZE_CI_RUN_QUERY.contains("finished_at = $6::timestamptz"));
+    }
+
+    #[test]
+    fn immutable_reserved_attempt_reads_do_not_require_update_authority() {
+        assert!(
+            !SELECT_RESERVED_CHECK_ATTEMPT_QUERY.contains("FOR "),
+            "ci_run_check_attempt is immutable and the runtime role intentionally lacks UPDATE"
+        );
+        for predicate in ["tenant_id=$1", "region=$2", "run_id=$3", "context=$4"] {
+            assert!(
+                SELECT_RESERVED_CHECK_ATTEMPT_QUERY.contains(predicate),
+                "immutable replay remains scoped by {predicate}"
+            );
+        }
     }
 
     #[test]
