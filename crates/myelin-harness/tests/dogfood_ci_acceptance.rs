@@ -19,6 +19,7 @@ const JOB: &str = "85000000-0000-4000-8000-000000000021";
 const MARKER: &str = "MYELIN-CI-0123456789abcdef0123456789abcdef";
 const TOKEN: &str = "v4.public.c2lnbmVkLWJvZHk|W10|dGFpbA";
 const PAGE_BYTES: usize = 262_144;
+const HEAD_OID: &str = "0123456789abcdef0123456789abcdef01234567";
 
 #[derive(Clone, Copy)]
 enum Scenario {
@@ -208,6 +209,65 @@ fn spawn_edge(scenario: Scenario) -> (std::net::SocketAddr, thread::JoinHandle<(
     (address, server)
 }
 
+fn spawn_check_edge() -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Edge");
+    listener
+        .set_nonblocking(true)
+        .expect("make mock Edge accept bounded");
+    let address = listener.local_addr().expect("mock Edge address");
+    let server = thread::spawn(move || {
+        for index in 0..2 {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "check verifier did not make expected request {index}"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept check verifier request: {error}"),
+                }
+            };
+            let request = read_request(&mut socket);
+            assert!(
+                request.contains(&format!("authorization: Bearer {TOKEN}")),
+                "check verifier authenticates every read"
+            );
+            assert!(
+                request.contains("x-myelin-token-scheme: agent"),
+                "check verifier sends the configured token scheme"
+            );
+            if index == 0 {
+                assert!(request.starts_with("GET /v1/git/repos/core/prs/1 HTTP/1.1"));
+                send_json(
+                    &mut socket,
+                    json!({
+                        "number": 1,
+                        "head_oid": HEAD_OID,
+                        "durable": true
+                    }),
+                );
+            } else {
+                assert!(request.starts_with("GET /v1/git/repos/core/prs/1/checks HTTP/1.1"));
+                send_json(
+                    &mut socket,
+                    json!({
+                        "required_contexts": ["ci/build"],
+                        "green_contexts": ["ci/build"],
+                        "fork_unendorsed_contexts": [],
+                        "gate_admitted": true,
+                        "durable": true
+                    }),
+                );
+            }
+        }
+    });
+    (address, server)
+}
+
 fn command_for(directory: &Path, edge_url: &str) -> Command {
     let mut command = Command::new("bash");
     command
@@ -259,6 +319,31 @@ fn assert_red_without_receipt(output: &Output, directory: &Path, message: &str) 
         !receipt_path(directory).exists(),
         "a rejected proof cannot produce a green receipt"
     );
+}
+
+#[test]
+fn check_verifier_canonicalizes_the_default_ci_context() {
+    let (address, server) = spawn_check_edge();
+    let output = Command::new("bash")
+        .arg(workspace_root().join("scripts/dogfood.sh"))
+        .args(["verify-check", "core", "1", HEAD_OID, "build"])
+        .env("MYELIN_TOKEN", TOKEN)
+        .env("MYELIN_TOKEN_SCHEME", "agent")
+        .env("MYELIN_EDGE_URL", format!("http://{address}"))
+        .output()
+        .expect("execute surfaced-check verifier");
+    server.join().expect("check verifier completed both reads");
+    assert_token_hidden(&output);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("check verifier emits JSON");
+    assert_eq!(receipt["verified"], true);
+    assert_eq!(receipt["context"], "ci/build");
+    assert_eq!(receipt["head_oid"], HEAD_OID);
 }
 
 #[test]

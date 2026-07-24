@@ -20,7 +20,7 @@ use myelin_edge::{
     register_git_durable, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
 use myelin_git::core::RepoLoc;
-use myelin_git::durable::DurableGitStore;
+use myelin_git::durable::{DurableGitStore, PR_DIFF_MAX_FILES};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
@@ -1431,6 +1431,70 @@ async fn git_read_endpoints_match_the_shared_dev_edge_golden_vectors() {
         }
         assert_eq!(normalized, vector["expected"], "golden vector {id}: {body}");
     }
+
+    // Capacity is an equally important read contract: the dev Edge must return the production
+    // envelope, and the browser must render that bounded refusal rather than assuming every PR can
+    // be materialized interactively. The dev fixture calls this PR #5; the production fixture uses
+    // its freshly allocated #1 while preserving the request/response semantics.
+    let capacity = &golden["capacity_vectors"][0];
+    assert_eq!(capacity["id"], "pr-diff-too-large");
+    assert_eq!(capacity["endpoint"], "pr-diff");
+    assert_eq!(capacity["request"]["repo"], "myelin");
+    assert_eq!(capacity["request"]["number"], 5);
+    let oversized_names = (0..=PR_DIFF_MAX_FILES)
+        .map(|index| format!("file-{index:04}.txt"))
+        .collect::<Vec<_>>();
+    let oversized_entries = oversized_names
+        .iter()
+        .map(|name| (name.as_str(), &blobs[0].1))
+        .collect::<Vec<_>>();
+    let oversized_tree = repo
+        .write_tree(&oversized_entries)
+        .expect("write oversized golden tree");
+    let oversized_head = repo
+        .write_commit(
+            &oversized_tree,
+            &[&commit],
+            "oversized golden snapshot",
+            "psn@acme.noreply",
+            "psn@acme.noreply",
+        )
+        .expect("write oversized golden commit");
+    repo.update_ref_cas(
+        "refs/heads/oversized",
+        None,
+        Some(&oversized_head),
+        "seed oversized golden head",
+        "psn@acme.noreply",
+    )
+    .expect("create oversized golden head");
+    let mut mutation_headers = hdr(&h);
+    mutation_headers.push(("idempotency-key", "golden-pr-diff-too-large"));
+    let (open_status, open_body) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/golden/prs",
+        &mutation_headers,
+        serde_json::to_vec(&serde_json::json!({
+            "title": "Oversized golden diff",
+            "base_ref": "refs/heads/main",
+            "head_ref": "refs/heads/oversized",
+            "head_oid": oversized_head.0,
+        }))
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(open_status, 201, "open oversized golden PR: {open_body}");
+    let (capacity_status, capacity_body) = http(
+        addr,
+        "GET",
+        "/v1/git/repos/golden/prs/1/diff",
+        &hdr(&h),
+        vec![],
+    )
+    .await;
+    assert_eq!(capacity_status, capacity["expected"]["status"]);
+    assert_eq!(capacity_body, capacity["expected"]["body"]);
 
     std::fs::remove_dir_all(&root).ok();
 }

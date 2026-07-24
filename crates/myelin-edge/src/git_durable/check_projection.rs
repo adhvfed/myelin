@@ -1,10 +1,9 @@
 use super::{DurableGitBackend, EnrichedPr, ObjectPromotion};
-use myelin_git::check_status::{
-    CheckContext, CheckProvider, CheckState, CheckStatusRow, GitOid, TrustTier,
-};
+use myelin_git::check_status::{CheckContext, CheckState, CheckStatusRow, GitOid, TrustTier};
 use myelin_git::core::RepoLoc;
 use myelin_git::durable::{DurableError, DurableGitRepo};
 use myelin_git::lifecycle::{BranchProtectionRuleset, ReviewState, ReviewVerdict};
+use myelin_git::merge_gate::MergeGatePolicy;
 use myelin_git::pr_store::{
     effective_ruleset, evaluate_merge, ChecksSummary, PrCrossListRecord, PrRecord,
 };
@@ -351,6 +350,7 @@ impl DurableGitBackend {
     ) -> Result<Value, DurableError> {
         let record = self.record_with_projected_checks(loc, record, principal)?;
         let ruleset = self.prs.effective_ruleset_for(loc, &record.base_ref)?;
+        let required_contexts = canonical_required_context_tokens(&ruleset.required_contexts)?;
         let evaluation = evaluate_merge(&ruleset, &record)
             .map_err(|error| DurableError::Git(error.to_string()))?;
         let has_blocking_review = record.reviews.iter().any(|review| {
@@ -368,7 +368,7 @@ impl DurableGitBackend {
             })
             .count() as u32;
         Ok(json!({
-            "required_contexts": ruleset.required_contexts,
+            "required_contexts": required_contexts,
             "required_approvals": ruleset.required_approvals,
             "green_contexts": record.green_contexts,
             "endorsed_contexts": record.endorsed_contexts,
@@ -379,6 +379,18 @@ impl DurableGitBackend {
             "durable": true,
         }))
     }
+}
+
+fn canonical_required_context_tokens(raw: &[String]) -> Result<Vec<String>, DurableError> {
+    MergeGatePolicy::from_required_contexts(raw)
+        .map(|policy| {
+            policy
+                .required
+                .iter()
+                .map(CheckContext::policy_token)
+                .collect()
+        })
+        .map_err(|error| DurableError::Git(error.to_string()))
 }
 
 pub(super) fn check_facts_from_rows(
@@ -400,10 +412,7 @@ pub(super) fn check_facts_from_rows(
 }
 
 fn check_context_token(context: &CheckContext) -> String {
-    match context.provider {
-        CheckProvider::Ci => context.name.clone(),
-        CheckProvider::External => format!("external/{}", context.name),
-    }
+    context.policy_token()
 }
 
 pub(super) fn overlay_projected_check_rows(record: &mut PrRecord, rows: &[CheckStatusRow]) {
@@ -423,4 +432,59 @@ pub(super) fn overlay_projected_check_rows(record: &mut PrRecord, rows: &[CheckS
     record.green_contexts.dedup();
     record.fork_unendorsed_contexts.sort();
     record.fork_unendorsed_contexts.dedup();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use myelin_git::check_status::{HumanisedRef, Timestamp};
+    use myelin_tenancy::{ArtifactRef, TenantId};
+
+    fn row(context: CheckContext, trust_tier: TrustTier) -> CheckStatusRow {
+        let fact = myelin_git::check_status::CheckStatus {
+            tenant: TenantId("acme".into()),
+            repo: ArtifactRef("myelin://acme/git/repo/core".into()),
+            commit_oid: GitOid("a".repeat(40)),
+            context,
+            state: CheckState::Success,
+            required: true,
+            run: ArtifactRef("myelin://acme/ci/run/1".into()),
+            run_attempt: 1,
+            trust_tier,
+            details_ref: ArtifactRef("myelin://acme/ci/run/1#step-build".into()),
+            summary: HumanisedRef {
+                template_key: "ci.check.success".into(),
+                args: BTreeMap::new(),
+            },
+            started_at: Timestamp("2026-07-24T00:00:00Z".into()),
+            completed_at: Some(Timestamp("2026-07-24T00:00:01Z".into())),
+            cost_settled: true,
+        };
+        CheckStatusRow::from_fact(&fact)
+    }
+
+    #[test]
+    fn projected_check_facts_keep_the_provider_prefix_used_by_policy() {
+        let rows = [
+            row(CheckContext::ci("build"), TrustTier::Trusted),
+            row(CheckContext::external("scan"), TrustTier::UntrustedFork),
+        ];
+        let (green, fork_unendorsed, endorsed) = check_facts_from_rows(&rows);
+        assert_eq!(green, ["ci/build"]);
+        assert_eq!(fork_unendorsed, ["external/scan"]);
+        assert!(endorsed.is_empty());
+    }
+
+    #[test]
+    fn checks_api_canonicalizes_legacy_bare_policy_contexts() {
+        assert_eq!(
+            canonical_required_context_tokens(&[
+                "build".into(),
+                "ci/test/unit".into(),
+                "external/scan".into(),
+            ])
+            .unwrap(),
+            ["ci/build", "ci/test/unit", "external/scan"],
+        );
+    }
 }

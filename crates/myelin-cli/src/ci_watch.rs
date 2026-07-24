@@ -319,6 +319,7 @@ async fn read_archive_range(
         path: format!("/v1/ci/runs/{}/jobs/{}/log", state.run_id, state.job_id),
         query: Some(format!("start={start}&limit={limit}")),
         payload: None,
+        idempotency_key: None,
     };
     execute(config, token, &call).await
 }

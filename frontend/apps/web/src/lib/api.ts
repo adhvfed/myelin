@@ -68,8 +68,21 @@ import {
   type CiRunDetailVM,
   type CiRunsPage,
 } from "./ci-read-response";
+import {
+  mapPrDiffStatusToKind,
+  mapStatusToKind,
+  RepoRouteError,
+  type RepoErrorKind,
+} from "./repo-error";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
+export {
+  REPO_ERR_PREFIX,
+  RepoRouteError,
+  mapPrDiffStatusToKind,
+  mapStatusToKind,
+  type RepoErrorKind,
+} from "./repo-error";
 
 /** A brief commit projection for the latest-commit bar / per-entry activity (R3.4). */
 export interface CommitBriefVM {
@@ -272,6 +285,14 @@ export interface PrDiffVM {
   total_deletions: number;
   page: { next_cursor: string | null; limit: number };
 }
+
+/** Expected bounded-capacity result for a PR diff. It is data rather than an exception so a direct
+ * SSR navigation can render the calm state with HTTP 200 instead of escaping as a route 500. */
+export interface PrDiffCapacityVM {
+  state: "diff-too-large";
+}
+
+export type PrDiffReadVM = PrDiffVM | PrDiffCapacityVM;
 
 /** One changed file in a commit diff (DiffFile::to_json). */
 export interface DiffFileVM {
@@ -491,25 +512,6 @@ export class IssueRouteError extends Error {
   }
 }
 
-/** The dignified error trio (R-21). `no-access` and `not-found` are calm notes; `error` is a
- *  retryable failure. The route maps this to `<RepoErrorState kind>`. */
-export type RepoErrorKind = "no-access" | "not-found" | "stale-tree" | "error";
-
-/** The message-prefix carrying the kind across the server→client boundary (the class fields don't
- *  survive serialization, but the message string does). `<RepoErrorState>` parses this. */
-export const REPO_ERR_PREFIX = "REPO_ERR:";
-
-/** A git-surface route error carrying the mapped `kind` (never the raw edge message — findings 7:
- *  the UI never renders `err.message` as content). */
-export class RepoRouteError extends Error {
-  readonly kind: RepoErrorKind;
-  constructor(kind: RepoErrorKind) {
-    super(`${REPO_ERR_PREFIX}${kind}`);
-    this.name = "RepoRouteError";
-    this.kind = kind;
-  }
-}
-
 export type CiErrorKind = "bad-input" | "not-found" | "stale" | "unavailable" | "error";
 export const CI_ERR_PREFIX = "CI_ERR:";
 
@@ -524,24 +526,18 @@ export class CiRouteError extends Error {
   }
 }
 
-/** Map an edge HTTP status → the dignified error kind. Anti-oracle: policy may make no-access
- *  indistinguishable from not-found (the edge serves the 0-leak 404 on a Pull deny), so a 404 is
- *  `not-found` and a 403 is `no-access`; everything else is the retryable `error`. */
-export function mapStatusToKind(status: number): RepoErrorKind {
-  if (status === 403) return "no-access";
-  if (status === 404) return "not-found";
-  return "error";
-}
-
 /** Run an edge GET through the gateway: a surviving 401 → the `/login` redirect (unchanged); any
  *  other edge failure → a `RepoRouteError` carrying the mapped kind, so every git route renders the
  *  shared `<RepoErrorState>` instead of leaking `err.message`. */
-async function authed<T>(fetcher: () => Promise<T>): Promise<T> {
+async function authed<T>(
+  fetcher: () => Promise<T>,
+  statusKind: (status: number) => RepoErrorKind = mapStatusToKind,
+): Promise<T> {
   try {
     return await fetcher();
   } catch (e) {
     if (isUnauthorized(e)) throw redirect("/login");
-    if (e instanceof GatewayError) throw new RepoRouteError(mapStatusToKind(e.status));
+    if (e instanceof GatewayError) throw new RepoRouteError(statusKind(e.status));
     // A transport/parse failure with no HTTP status is the retryable error kind.
     throw new RepoRouteError("error");
   }
@@ -556,6 +552,20 @@ async function treeAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
       if (e.status === 409) throw new RepoRouteError("stale-tree");
       throw new RepoRouteError(mapStatusToKind(e.status));
     }
+    throw new RepoRouteError("error");
+  }
+}
+
+async function prDiffAuthed<T>(fetcher: () => Promise<T>): Promise<T | PrDiffCapacityVM> {
+  try {
+    return await fetcher();
+  } catch (e) {
+    if (isUnauthorized(e)) throw redirect("/login");
+    if (e instanceof GatewayError) {
+      if (e.status === 413) return { state: "diff-too-large" };
+      throw new RepoRouteError(mapPrDiffStatusToKind(e.status));
+    }
+    if (e instanceof RepoRouteError) throw e;
     throw new RepoRouteError("error");
   }
 }
@@ -908,7 +918,12 @@ export const getPrCommits = query(
 /** The PR three-dot diff (GET /v1/git/repos/{repo}/prs/{n}/diff?cursor=&view=). `Pull`-guarded, 0-leak
  *  (a denial is the same 404 as an absent PR — surfaced as the no-access state, never a leaked path). */
 export const getPrDiff = query(
-  async (input: { repo: string; n: number; cursor?: string; view?: string }): Promise<PrDiffVM> => {
+  async (input: {
+    repo: string;
+    n: number;
+    cursor?: string;
+    view?: string;
+  }): Promise<PrDiffReadVM> => {
     "use server";
     const parsed = parseGitPrDiffInput(input);
     if (!parsed) throw new RepoRouteError("error");
@@ -916,7 +931,7 @@ export const getPrDiff = query(
     if (parsed.cursor) p.set("cursor", parsed.cursor);
     if (parsed.view) p.set("view", parsed.view);
     const q = p.toString();
-    return authed(async () => {
+    return prDiffAuthed(async () => {
       const diff = parsePrDiff(await edgeGet(
         `/v1/git/repos/${seg(parsed.repo)}/prs/${parsed.n}/diff${q ? `?${q}` : ""}`,
       ));

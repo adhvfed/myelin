@@ -223,6 +223,18 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         )
         .await
         .expect("create authoritative CI lifecycle table");
+    admin
+        .execute(
+            "CREATE TABLE ci_job (
+               tenant_id text NOT NULL,
+               region text NOT NULL,
+               job_id uuid NOT NULL,
+               state text NOT NULL,
+               PRIMARY KEY (tenant_id, job_id)
+             )",
+        )
+        .await
+        .expect("create public CI job surface table");
     // Let the non-superuser app role reach the per-pid schema's tables (case 7). Default privileges
     // only cover schema `public`; grant explicitly for this custom schema.
     admin
@@ -259,6 +271,16 @@ async fn activate_job_owner(admin: &PgPool, queued: &DurableEnqueue) {
     .execute(admin)
     .await
     .expect("seed the active CI owner");
+    sqlx::query(
+        "INSERT INTO ci_job (tenant_id, region, job_id, state)
+         VALUES ($1, $2, $3::uuid, 'queued')",
+    )
+    .bind(&queued.tenant_id)
+    .bind(&queued.region)
+    .bind(&queued.job_id)
+    .execute(admin)
+    .await
+    .expect("seed the public CI job surface");
 }
 
 #[tokio::test]
@@ -717,6 +739,16 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         state_after_dirty_session, "leased",
         "dirty session refusal must happen before the launch CAS"
     );
+    let surface_after_dirty_session: String =
+        sqlx::query_scalar("SELECT state FROM ci_job WHERE job_id = $1")
+            .bind(uid("launch-race-old"))
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(
+        surface_after_dirty_session, "queued",
+        "dirty session refusal cannot publish a running job"
+    );
     drop(dirty_store);
     dirty_pool.close().await;
 
@@ -750,12 +782,85 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         .unwrap()
         .get("state");
     assert_eq!(race_state, if launch_won { "running" } else { "terminal" });
+    let race_surface_state: String =
+        sqlx::query_scalar("SELECT state FROM ci_job WHERE job_id = $1")
+            .bind(uid("launch-race-old"))
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(
+        race_surface_state,
+        if launch_won { "running" } else { "queued" },
+        "the public running state co-commits only with the winning launch CAS"
+    );
     assert!(
         !store
             .authorize_launch(&exact)
             .await
             .expect("replayed launch CAS"),
         "the exact launch generation is one-shot"
+    );
+
+    // The launch boundary refuses to advance the durable queue when its public job projection is
+    // missing. The writable CTE is one statement, so returning no projected row rolls the queue
+    // transition back with the transaction.
+    let missing_surface_job = job(
+        "tenantA",
+        region,
+        "launch-no-surface",
+        Lane::Interactive,
+        &["launch-no-surface"],
+        TrustTier::Trusted,
+        None,
+        "idem-launch-no-surface",
+    );
+    store
+        .enqueue(&missing_surface_job)
+        .await
+        .expect("enqueue missing-surface launch");
+    activate_job_owner(&admin, &missing_surface_job).await;
+    sqlx::query("DELETE FROM ci_job WHERE job_id = $1")
+        .bind(uid("launch-no-surface"))
+        .execute(&admin)
+        .await
+        .expect("remove public job projection");
+    let missing_surface_lease = region_store
+        .claim(
+            region,
+            &["launch-no-surface".into()],
+            &trusted_only,
+            "launch-no-surface-runner",
+            60,
+        )
+        .await
+        .expect("claim missing-surface launch")
+        .expect("missing-surface launch is eligible");
+    assert!(
+        !store
+            .authorize_launch(&CiJobLaunchClaim {
+                tenant_id: missing_surface_lease.tenant_id.clone(),
+                region: region.into(),
+                wf_run_id: missing_surface_lease.run_id.to_string(),
+                job_id: missing_surface_lease.job_id.to_string(),
+                lease_owner: missing_surface_lease.lease_owner.clone(),
+                lease_epoch: missing_surface_lease.lease_epoch,
+                claim_nonce: missing_surface_lease.claim_nonce.clone(),
+                claim_started_at_epoch_secs: missing_surface_lease.claim_started_at_epoch_secs,
+                claim_expires_at_epoch_secs: missing_surface_lease.claim_expires_at_epoch_secs,
+            })
+            .await
+            .expect("missing-surface launch authorization"),
+        "launch refuses when the public job projection is absent"
+    );
+    let missing_surface_queue_state: String =
+        sqlx::query_scalar("SELECT state FROM job_queue WHERE job_id = $1")
+            .bind(uid("launch-no-surface"))
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(
+        missing_surface_queue_state, "leased",
+        "a refused public-state transition rolls the durable launch CAS back"
     );
 
     // A runner that dies after the launch fence is still recoverable when its execution lease
@@ -797,6 +902,16 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         })
         .await
         .expect("authorize launch reap"));
+    let launched_surface_state: String =
+        sqlx::query_scalar("SELECT state FROM ci_job WHERE job_id = $1")
+            .bind(uid("launch-reap"))
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(
+        launched_surface_state, "running",
+        "a launched job is visible as running before sandbox output begins"
+    );
     sqlx::query(
         "UPDATE job_queue SET lease_expires = now() - interval '1 second' WHERE job_id = $1",
     )
@@ -923,7 +1038,8 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
          claim NEVER leases untrusted_fork/self_hosted (security seam); concurrent claims take \
          different rows (SKIP LOCKED); reaper re-queues dead leases (0 orphans, 0 dup enqueue) + a \
          heart-beating lease is NOT reaped; cancel and the exact launch-generation CAS serialize \
-         with one winner, CAS replay refuses, and an expired running lease reaps; \
+         with one winner, CAS replay refuses, public running co-commits, a missing public projection \
+         refuses launch without advancing the queue, and an expired running lease reaps; \
          cancel-superseded keeps the latest head; leased row survives kill-9/reopen with no ghost; \
          tenant-scoped enqueue + isolation proven under the NOBYPASSRLS app role"
     );

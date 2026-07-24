@@ -27,6 +27,7 @@ import {
   prThreadsJson,
   resetPrFixtures,
   prDiffJson,
+  prDiffCapacityEnvelope,
   fileLinesJson,
   prCommitsEnvelope,
   prCommitCursorExpiredEnvelope,
@@ -821,7 +822,12 @@ const server = createServer((req, res) => {
     }
     // R3.2 · G-7 — the PR three-dot diff.
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/diff$/))) {
-      const v = prDiffJson(seg(m[1]), Number(m[2]), url.searchParams.get("cursor") ?? undefined);
+      const repo = seg(m[1]);
+      const number = Number(m[2]);
+      if (repo === "myelin" && number === 5) {
+        return send(res, 413, prDiffCapacityEnvelope());
+      }
+      const v = prDiffJson(repo, number, url.searchParams.get("cursor") ?? undefined);
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
     }
     // R3.2 · G-7 N2 — expand-context lines at a blob oid.

@@ -1037,7 +1037,10 @@ mod tests {
         // Final launch is a one-shot exact-generation CAS, including original claim times.
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("$10"));
         assert!(!AUTHORIZE_JOB_LAUNCH_QUERY.contains("$11"));
+        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("WITH launched AS"));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("SET state = 'running'"));
+        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("UPDATE ci_job AS surface"));
+        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("surface.state IN ('queued', 'leased')"));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("lease_expires = statement_timestamp()"));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("state = 'leased'"));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("claim_nonce = $7::uuid"));

@@ -85,5 +85,24 @@
         "next_cursor": null
       }
     }
+  ],
+  "capacity_vectors": [
+    {
+      "id": "pr-diff-too-large",
+      "endpoint": "pr-diff",
+      "request": {
+        "repo": "myelin",
+        "number": 5
+      },
+      "expected": {
+        "status": 413,
+        "body": {
+          "error": {
+            "message": "pull request diff exceeds the interactive file limit",
+            "code": "payload_too_large"
+          }
+        }
+      }
+    }
   ]
 }

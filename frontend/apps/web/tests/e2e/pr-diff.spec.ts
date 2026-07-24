@@ -1,6 +1,7 @@
 import { test, expect, request as pwRequest, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 
+// FRONTEND-CONTRACT: git-read-dev-edge-parity
 const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 
 async function resetPrFixtures() {
@@ -134,6 +135,19 @@ test.describe("R3.2 PR diff / files-changed — real browser", () => {
     await expect(page.getByText("src/paged/file_055.txt").first()).toBeVisible();
     // Page 2 is the last page — no further paging link.
     await expect(page.getByTestId("load-remaining")).toHaveCount(0);
+  });
+
+  test("an oversized PR diff renders a calm capacity state on a direct load", async ({ page }) => {
+    await devLogin(page);
+    const response = await page.goto("/git/repos/myelin/prs/5/diff");
+    expect(response?.status()).toBe(200);
+    const state = page.locator('[data-testid="repo-error"][data-kind="diff-too-large"]');
+    await expect(state).toBeVisible();
+    await expect(state.getByRole("heading", { level: 2 }))
+      .toHaveText("This diff is too large for browser review");
+    await expect(state.getByRole("link", { name: "Pull request overview" }))
+      .toHaveAttribute("href", "/git/repos/myelin/prs/5");
+    await expectNoAxeViolations(page, "oversized PR diff");
   });
 
   test("F7 walks to the next change row", async ({ page }) => {

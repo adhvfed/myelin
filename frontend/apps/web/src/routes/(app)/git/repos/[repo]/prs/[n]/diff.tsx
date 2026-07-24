@@ -73,11 +73,19 @@ export default function PrDiffScreen() {
   // NB: the diff query does NOT depend on `view` — layout (split/unified) is a CLIENT concern; the
   // server is layout-agnostic, so toggling the view never refetches (and never remounts the grid). It
   // DOES depend on `cursor` — a new page is a real refetch keyed by the file cursor.
-  const diff = createAsync(
+  const diffResult = createAsync(
     async () =>
       ready() ? getPrDiff({ repo: repo(), n: n(), cursor: cursor() }) : undefined,
     { deferStream: true },
   );
+  const diffTooLarge = () => {
+    const result = diffResult();
+    return Boolean(result && "state" in result && result.state === "diff-too-large");
+  };
+  const diff = createMemo<PrDiffVM | undefined>(() => {
+    const result = diffResult();
+    return result && !("state" in result) ? result : undefined;
+  });
   const threads = createAsync(
     async () => (ready() ? getPrThreads({ repo: repo(), n: n() }) : undefined),
     { deferStream: true },
@@ -239,7 +247,16 @@ export default function PrDiffScreen() {
         <A href={`/git/repos/${params.repo}/prs/${params.n}`} style={{ color: "var(--text-muted)" }}>#{params.n}</A>
       </nav>
 
-      <ErrorBoundary fallback={(err, retry) => <RepoErrorState kind={errKind(err)} repo={params.repo} onRetry={retry} />}>
+      <ErrorBoundary
+        fallback={(err, retry) => (
+          <RepoErrorState
+            kind={errKind(err)}
+            repo={params.repo}
+            prNumber={n()}
+            onRetry={retry}
+          />
+        )}
+      >
         <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={params.repo} />}>
           {/* The header/tabs render as soon as PrVM resolves (independent regions). */}
           <Suspense fallback={<SkeletonBlock height="4rem" />}>
@@ -254,8 +271,12 @@ export default function PrDiffScreen() {
               </Skeleton>
             }
           >
-            <Show when={diff()} keyed>
-              {(d) => (
+            <Show
+              when={!diffTooLarge()}
+              fallback={<RepoErrorState kind="diff-too-large" repo={repo()} prNumber={n()} />}
+            >
+              <Show when={diff()} keyed>
+                {(d) => (
                 <>
                   {/* Two-dot floor banner — honest when a real merge-base couldn't be computed. */}
                   <Show when={!d.three_dot && d.total_files > 0}>
@@ -353,7 +374,8 @@ export default function PrDiffScreen() {
                     </Show>
                   </Show>
                 </>
-              )}
+                )}
+              </Show>
             </Show>
           </Suspense>
         </Show>

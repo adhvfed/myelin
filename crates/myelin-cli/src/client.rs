@@ -169,6 +169,21 @@ async fn execute_with_limits(
     deadline: Duration,
     max_response_bytes: usize,
 ) -> Result<Value, CliError> {
+    match (call.method, call.idempotency_key.as_deref()) {
+        (crate::dispatch::HttpMethod::Post, None) => {
+            return Err(CliError::Usage(
+                "mutating commands require --idempotency-key <key>; reuse the same key when \
+                 retrying after a lost response"
+                    .into(),
+            ));
+        }
+        (crate::dispatch::HttpMethod::Get, Some(_)) => {
+            return Err(CliError::Usage(
+                "--idempotency-key applies only to mutating commands".into(),
+            ));
+        }
+        _ => {}
+    }
     let target = target(config, call)?;
     let connector = HttpsConnectorBuilder::new()
         // The workspace also carries ring through unrelated consumers. Select this client's
@@ -193,6 +208,9 @@ async fn execute_with_limits(
     let payload = call.payload.clone().unwrap_or_default();
     if call.payload.is_some() {
         builder = builder.header("content-type", "application/json");
+    }
+    if let Some(key) = &call.idempotency_key {
+        builder = builder.header("idempotency-key", key);
     }
     let request = builder
         .body(Full::new(Bytes::from(payload)))
@@ -754,6 +772,7 @@ mod tests {
             path: path.into(),
             query: query.map(str::to_string),
             payload: None,
+            idempotency_key: None,
         }
     }
 
@@ -883,6 +902,60 @@ mod tests {
         assert!(error.to_string().contains("deadline"));
         assert!(!error.to_string().contains("sensitive-token"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn mutations_require_and_transmit_the_exact_retry_stable_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let missing = EdgeCall {
+            method: HttpMethod::Post,
+            path: "/v1/git/repos/core/prs".into(),
+            query: None,
+            payload: Some(b"{}".to_vec()),
+            idempotency_key: None,
+        };
+        let error = execute_with_limits(
+            &cfg("http://127.0.0.1:1"),
+            "sensitive-token",
+            &missing,
+            Duration::from_secs(1),
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), 2);
+        assert!(error.to_string().contains("--idempotency-key"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..read]).to_string()
+        });
+        let keyed = missing
+            .with_idempotency_key("retry-pr-open-123")
+            .expect("valid explicit mutation key");
+        execute_with_limits(
+            &cfg(&format!("http://{address}")),
+            "sensitive-token",
+            &keyed,
+            Duration::from_secs(1),
+            1024,
+        )
+        .await
+        .expect("keyed mutation succeeds");
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(
+            request.contains("\r\nidempotency-key: retry-pr-open-123\r\n"),
+            "the exact caller key reaches the wire"
+        );
     }
 
     #[test]

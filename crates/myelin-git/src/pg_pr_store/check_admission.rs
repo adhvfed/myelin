@@ -1,5 +1,5 @@
 use super::MergeCommandResult;
-use crate::check_status::{CheckProvider, CheckState, CheckStatusRow, TrustTier};
+use crate::check_status::{CheckState, CheckStatusRow, TrustTier};
 use crate::pr_store::{MergeAttempt, PrRecord};
 use crate::receive_pack::{Oid as PushOid, RefName, RejectReason};
 
@@ -42,10 +42,7 @@ pub(super) fn overlay_projected_checks(
         if row.state != CheckState::Success || !row.cost_settled {
             continue;
         }
-        let context = match row.context.provider {
-            CheckProvider::Ci => row.context.name,
-            CheckProvider::External => format!("external/{}", row.context.name),
-        };
+        let context = row.context.policy_token();
         match row.trust_tier {
             TrustTier::Trusted => record.green_contexts.push(context),
             TrustTier::UntrustedFork => record.fork_unendorsed_contexts.push(context),

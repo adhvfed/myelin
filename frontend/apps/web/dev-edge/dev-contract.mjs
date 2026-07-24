@@ -687,6 +687,16 @@ export function prDiffJson(repo, n, cursor) {
   };
 }
 
+/** Production's bounded PR-diff capacity envelope. The shared golden artifact pins these bytes. */
+export function prDiffCapacityEnvelope() {
+  return {
+    error: {
+      message: "pull request diff exceeds the interactive file limit",
+      code: "payload_too_large",
+    },
+  };
+}
+
 /** GET /v1/git/repos/{repo}/file-lines/{oid} → expand-context lines (context, origin " "). */
 export function fileLinesJson(repo, oid, start, end) {
   if (repo !== "myelin" || oid !== BLOB_LIST_FILTER) return null;
@@ -797,6 +807,28 @@ const SEED_PRS = {
       reviews: 0,
       created_at: 1718900000,
       updated_at: 1718900000,
+      commits_count: 1,
+      commits_count_capped: false,
+      durable: true,
+    },
+    checks: { required_contexts: [], required_approvals: 0, green_contexts: [], endorsed_contexts: [], fork_unendorsed_contexts: [], gate_admitted: false, durable: true },
+  },
+  // PR #5 — the production interactive diff ceiling. The route returns the shared golden 413
+  // envelope rather than fabricating a partial diff or crashing the browser route.
+  5: {
+    pr: {
+      number: 5,
+      pr_state: "open",
+      title: "Source snapshot beyond the interactive diff ceiling",
+      body_md: null,
+      base_ref: "refs/heads/main",
+      head_ref: "refs/heads/source-snapshot",
+      head_oid: C2,
+      author: "u_dev_operator@acme.noreply",
+      author_is_agent: false,
+      reviews: 0,
+      created_at: 1718800000,
+      updated_at: 1718800000,
       commits_count: 1,
       commits_count_capped: false,
       durable: true,

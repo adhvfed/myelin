@@ -32,6 +32,10 @@ struct Cli {
     /// The token scheme presented to the edge (default `agent`, or `$MYELIN_TOKEN_SCHEME`).
     #[arg(long, global = true)]
     scheme: Option<String>,
+    /// Retry-stable identity for a mutating call. Reuse the same key when retrying after a lost
+    /// response; reads reject it and writes refuse to run without it.
+    #[arg(long, global = true)]
+    idempotency_key: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -95,6 +99,11 @@ async fn run() -> Result<(), CliError> {
 
     match &cli.command {
         Command::Login => {
+            if cli.idempotency_key.is_some() {
+                return Err(CliError::Usage(
+                    "--idempotency-key applies only to Edge mutation commands".into(),
+                ));
+            }
             // Acquire the token from --token or $MYELIN_TOKEN (the IdP mint is the MR-012 seam).
             let token = cli
                 .token
@@ -117,6 +126,7 @@ async fn run() -> Result<(), CliError> {
                 path: "/v1/whoami".into(),
                 query: None,
                 payload: None,
+                idempotency_key: None,
             };
             run_call(&cli, &getenv, &read_file, call).await
         }
@@ -152,6 +162,26 @@ async fn run_call(
 ) -> Result<(), CliError> {
     let edge = resolve_edge(cli.edge.as_deref(), cli.scheme.as_deref(), getenv);
     let token = resolve_token(cli.token.as_deref(), getenv, read_file)?;
+    let call = match call.method {
+        HttpMethod::Post => {
+            let key = cli.idempotency_key.as_deref().ok_or_else(|| {
+                CliError::Usage(
+                    "mutating commands require --idempotency-key <key>; reuse the same key when \
+                     retrying after a lost response"
+                        .into(),
+                )
+            })?;
+            call.with_idempotency_key(key)?
+        }
+        HttpMethod::Get => {
+            if cli.idempotency_key.is_some() {
+                return Err(CliError::Usage(
+                    "--idempotency-key applies only to mutating commands".into(),
+                ));
+            }
+            call
+        }
+    };
     if call.path.starts_with("/v1/ci/runs/") && call.path.ends_with("/log/live") {
         let stdout = std::io::stdout();
         let mut output = stdout.lock();

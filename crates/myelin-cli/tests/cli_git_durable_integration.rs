@@ -215,7 +215,18 @@ async fn durable_create_open_view_round_trip() {
     let token = mint(&cell, "acme", "jti-rt");
 
     // repo create → exit 0, durable.
-    let (code, out, err) = run_cli(&edge, &token, &["git", "repo", "create", "alpha"]);
+    let (code, out, err) = run_cli(
+        &edge,
+        &token,
+        &[
+            "--idempotency-key",
+            "test-repo-create-alpha",
+            "git",
+            "repo",
+            "create",
+            "alpha",
+        ],
+    );
     assert_eq!(code, 0, "repo create succeeds; stderr={err}");
     assert!(
         out.contains("git.repo.create") || out.contains("alpha"),
@@ -260,6 +271,8 @@ async fn durable_create_open_view_round_trip() {
         &edge,
         &token,
         &[
+            "--idempotency-key",
+            "test-pr-open-alpha",
             "git",
             "pr",
             "open",
@@ -299,7 +312,19 @@ async fn merge_blocked_by_gate_is_a_clean_cli_error() {
     // Create the repo via the CLI, then set repo-owned branch protection requiring a never-green CI
     // context (the merge gate must block). Policy is repo-owned — never author input (the GT-003 fix).
     assert_eq!(
-        run_cli(&edge, &token, &["git", "repo", "create", "alpha"]).0,
+        run_cli(
+            &edge,
+            &token,
+            &[
+                "--idempotency-key",
+                "test-gate-repo-create-alpha",
+                "git",
+                "repo",
+                "create",
+                "alpha",
+            ],
+        )
+        .0,
         0
     );
     be.set_branch_protection(
@@ -320,6 +345,8 @@ async fn merge_blocked_by_gate_is_a_clean_cli_error() {
             &edge,
             &token,
             &[
+                "--idempotency-key",
+                "test-gate-pr-open-alpha",
                 "git",
                 "pr",
                 "open",
@@ -335,7 +362,19 @@ async fn merge_blocked_by_gate_is_a_clean_cli_error() {
     );
 
     // pr merge → the server gate BLOCKS → a clean CLI error (exit 1) naming the reason; never a panic.
-    let (code, stdout, stderr) = run_cli(&edge, &token, &["git", "pr", "merge", "alpha", "1"]);
+    let (code, stdout, stderr) = run_cli(
+        &edge,
+        &token,
+        &[
+            "--idempotency-key",
+            "test-gate-pr-merge-alpha-1",
+            "git",
+            "pr",
+            "merge",
+            "alpha",
+            "1",
+        ],
+    );
     assert_eq!(
         code, 1,
         "a gate-blocked merge is a clean edge error (exit 1); stderr={stderr}"
