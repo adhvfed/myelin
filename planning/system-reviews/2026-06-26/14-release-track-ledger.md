@@ -1966,8 +1966,11 @@ transport/pagination/filesystem contracts, operator runbook, dependency lock, an
 repository now carries the V2 `.myelin/ci.toml` that the production Dispatch consumer already reads
 from the exact pushed OID. Its single `build` job uses the server-owned `linux-small-v1` profile,
 requests the current personal cell's digest-pinned staged rootfs, and prints the acceptance verifier's
-non-self-overlapping marker exactly once. This is intentionally a tiny end-to-end transport/check
-job, not a claim that the one-cell BusyBox rootfs can build the complete workspace.
+non-self-overlapping marker exactly once. A non-marker readiness line followed by a bounded
+120-second observation window makes it possible to attach both required live consumers before the
+marker and terminal event; the compiled real-file contract pins that timing affordance. This is
+intentionally a tiny end-to-end transport/check job, not a claim that the one-cell BusyBox rootfs
+can build the complete workspace.
 
 The checked-in config is now a compiled contract rather than an unparsed runbook example. Dispatch
 reads the real repository file, requires its V2 profile, one `build` context, exact digest pin and

@@ -1,7 +1,9 @@
 # Founder-dogfood pipeline. The single job is intentionally small: it proves the complete
 # push -> dispatch -> sandbox -> durable logs -> check projection path without spending a hosted
-# build. The image digest is the canonical-tree SHA-256 of the staged linux-small-v1 rootfs used by
-# this personal-production cell; P0 replaces this one-cell binding with the release supply-chain.
+# build. Its bounded two-minute observation window is long enough to attach the required CLI and
+# browser live consumers before the marker is emitted. The image digest is the canonical-tree
+# SHA-256 of the staged linux-small-v1 rootfs used by this personal-production cell; P0 replaces
+# this one-cell binding with the release supply-chain.
 schema_version = 2
 on = "push"
 
@@ -11,4 +13,4 @@ profile = "linux-small-v1"
 [[jobs]]
 name = "build"
 image = "myelin.local/linux-small-v1-rootfs@sha256:f9bd3926a7b47e1dd4729e5788d40dc6daf4ce159a91db169ef5bb803e73ec1f"
-command = ["/bin/sh", "-c", "printf '%s\\n' 'MYELIN-CI-a005e32fc1bb0c2b64e7d40ac1a01236'"]
+command = ["/bin/sh", "-c", "printf '%s\\n' 'myelin-ci-acceptance-window-open'; /bin/sleep 120; printf '%s\\n' 'MYELIN-CI-a005e32fc1bb0c2b64e7d40ac1a01236'"]

@@ -214,7 +214,9 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
   receipt. Seven compiled Bash/curl/socket contracts cover the green two-page path plus transport,
   paging, encoding, and no-overwrite refusals with zero credential disclosure.
 - **CT-005f7 — armed founder pipeline:** the real repository now carries a V2 `on = "push"`
-  `linux-small-v1` pipeline with one `build` job that emits the acceptance marker exactly once. Its
+  `linux-small-v1` pipeline with one `build` job that emits the acceptance marker exactly once. The
+  checked-in command first emits a non-marker readiness line and holds a bounded 120-second
+  observation window so the required CLI and browser consumers can attach before terminal output. Its
   compiled contract reads the checked-in file, drives a canonical `git.ref.updated` through
   `plan_dispatch`, requires one queued CI `build` context, then reads and decodes the emitted CAS
   snapshot and verifies the exact profile, image, and command. Before intake, `dogfood.sh ci`

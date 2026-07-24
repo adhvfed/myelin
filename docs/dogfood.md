@@ -137,6 +137,10 @@ At the same time, open `/ci/runs/<run>` in the authenticated web app and observe
 live output advance to completion. The run and job identifiers must come from the durable list/detail
 responses; do not precompute or copy them from PostgreSQL. A job that finishes before either consumer
 attaches does not prove live usability—push another harmless Myelin commit and repeat.
+The checked-in founder pipeline makes this mechanically practical: it first emits
+`myelin-ci-acceptance-window-open`, then waits for a bounded 120 seconds before emitting the unique
+acceptance marker. Discover the server-issued run/job and attach both consumers during that window;
+the delay is acceptance instrumentation, not a substitute for observing live bytes.
 
 After completion, prove that the cold path has the same output and that the exact run settled:
 
