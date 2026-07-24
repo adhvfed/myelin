@@ -1660,6 +1660,13 @@ fn build_drive_manifest_v1(
     Ok(manifest)
 }
 
+/// Read the immutable attempt authority reserved by dispatch. The runtime role deliberately has no
+/// `UPDATE` grant on this table, so a row-locking clause would make production startup fail despite
+/// having sufficient `SELECT` authority.
+const SELECT_RESERVED_CHECK_ATTEMPTS_QUERY: &str = "\
+SELECT context, repo_ref, commit_oid, run_attempt FROM ci_run_check_attempt
+WHERE tenant_id=$1 AND region=$2 AND run_id=$3";
+
 async fn load_reserved_check_attempts(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     record: &CiRunRecord,
@@ -1675,18 +1682,16 @@ async fn load_reserved_check_attempts(
     let run_id = sqlx::types::Uuid::parse_str(&record.run_id).map_err(|error| {
         PgCiStarterError::CorruptRun(format!("locked run id is not a UUID: {error}"))
     })?;
-    let rows: Vec<(String, String, String, i32)> = sqlx::query_as(
-        "SELECT context, repo_ref, commit_oid, run_attempt FROM ci_run_check_attempt \
-         WHERE tenant_id=$1 AND region=$2 AND run_id=$3 FOR SHARE",
-    )
-    .bind(&record.tenant_id)
-    .bind(&record.region)
-    .bind(run_id)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(|error| {
-        PgCiStarterError::Database(format!("read reserved check attempts: {error}"))
-    })?;
+    let rows: Vec<(String, String, String, i32)> =
+        sqlx::query_as(SELECT_RESERVED_CHECK_ATTEMPTS_QUERY)
+            .bind(&record.tenant_id)
+            .bind(&record.region)
+            .bind(run_id)
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(|error| {
+                PgCiStarterError::Database(format!("read reserved check attempts: {error}"))
+            })?;
     let mut attempts = BTreeMap::new();
     for (context, stored_repo, stored_commit, attempt) in rows {
         if stored_repo != repo_ref || stored_commit != commit_oid || !contexts.contains(&context) {
@@ -2522,6 +2527,16 @@ mod tests {
         assert_eq!(
             manifest_check_trust_tier(CiManifestTrustTierV1::UntrustedFork),
             crate::check_emitter::TrustTier::UntrustedFork
+        );
+    }
+}
+#[test]
+fn immutable_attempt_loading_needs_only_the_production_select_grant() {
+    assert!(!SELECT_RESERVED_CHECK_ATTEMPTS_QUERY.contains("FOR "));
+    for predicate in ["tenant_id=$1", "region=$2", "run_id=$3"] {
+        assert!(
+            SELECT_RESERVED_CHECK_ATTEMPTS_QUERY.contains(predicate),
+            "attempt authority remains scoped by {predicate}"
         );
     }
 }
