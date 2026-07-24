@@ -94,6 +94,9 @@ test.describe("CT-005 CI web read surface", () => {
     await expect(page.getByText("Archived bytes 0–18 of 18")).toBeVisible();
     await expect(page.getByTestId("ci-live-log")).toHaveValue("prep\ncafé\nfailed\n");
     await expect(page.getByTestId("ci-live-state")).toContainText("Complete");
+
+    await page.reload();
+    await expect(page.getByTestId("ci-archived-log")).toHaveValue("prep\ncafé\nfailed\n");
     await expectNoAxeViolations(page, "CI archived log");
   });
 
