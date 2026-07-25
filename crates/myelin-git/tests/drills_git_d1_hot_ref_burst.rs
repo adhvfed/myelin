@@ -41,13 +41,13 @@
 
 use myelin_events::relay::{BusTransport, InProcessBus, Relay};
 use myelin_events::{
-    Actor, AggregateKey, CausedBy, EmitContextBase, EventId, IdMinter, MonotonicMinter,
-    OutboxStore, Region, TenantId, Timestamp,
+    Actor, CausedBy, EmitContextBase, EventId, IdMinter, MonotonicMinter, OutboxStore, Region,
+    TenantId, Timestamp,
 };
 use myelin_git::events::GIT_REF_UPDATED;
 use myelin_git::receive_pack::{
-    CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher,
-    RefName, RefStore, RejectReason,
+    CrashPoint, GitRefEventKey, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession,
+    Pusher, RefName, RefStore, RejectReason,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use std::collections::BTreeMap;
@@ -189,7 +189,12 @@ fn run_surge(multiplier: usize) -> (Arc<RefStore>, OutboxStore, SurgeResult) {
 /// the `(multiplier-1) × ROUNDS` losers are all non-fast-forward rejects (0 lost-update).
 #[test]
 fn git_d1_hot_ref_burst_per_ref_order_zero_lost_zero_ghost() {
-    let agg = AggregateKey(format!("{REPO}:{HOT_REF}"));
+    // Derived from the real constructor (not hand-rolled `"{REPO}:{HOT_REF}"`) so this test can
+    // never drift from `GitRefEventKey::aggregate`'s actual `ref:`-prefixed, percent-encoded
+    // format the way three other tests in this crate already had (found + fixed 2026-07-25).
+    let agg = GitRefEventKey::new(REPO, &RefName::new(HOT_REF))
+        .expect("valid canonical ref key")
+        .aggregate();
 
     for multiplier in [1usize, 10, 30] {
         let (store, outbox, result) = run_surge(multiplier);
@@ -240,9 +245,13 @@ fn git_d1_hot_ref_burst_per_ref_order_zero_lost_zero_ghost() {
         //     committed order; delivered set == committed set (0 lost / 0 ghost end-to-end); depth → 0.
         let r = relay(&outbox);
         r.drain_to_empty();
+        let hot_subject = GitRefEventKey::new(REPO, &RefName::new(HOT_REF))
+            .expect("valid canonical ref key")
+            .subject(TENANT)
+            .expect("canonical ref key forms a canonical ArtifactRef");
         let delivered_for_hot: Vec<u64> = r
             .transport()
-            .consume(&format!("myelin://{TENANT}/git/ref/{REPO}:{HOT_REF}"))
+            .consume(&hot_subject.0)
             .iter()
             .map(|e| {
                 e.payload

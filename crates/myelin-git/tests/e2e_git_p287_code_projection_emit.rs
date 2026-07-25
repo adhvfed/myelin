@@ -145,7 +145,7 @@ fn push_code_then_projection_emits_per_changed_blob_incrementally() {
     for id in &emit1.emitted {
         let row = outbox.row(id).unwrap();
         assert_eq!(row.envelope.type_.0, GIT_BLOB_SNAPSHOT);
-        assert_eq!(row.aggregate.0, "core:refs/heads/main");
+        assert_eq!(row.aggregate.0, "ref:core:refs%2Fheads%2Fmain");
     }
 
     // ── Push 2: modify ONE file, add ONE, delete ONE; one file unchanged. ──
