@@ -507,3 +507,92 @@ still reads `migration_state = "capability-smoke"` in `ci-workload-inventory.tom
 wired at the real call site but nothing currently launches naming either registered image outside of
 tests. The 7 pre-existing test failures found during this work remain open and unowned by this
 ledger's gates — a separate issue, flagged here for whoever picks it up next.
+
+**The "7 pre-existing failures" root-caused and fixed (2026-07-25).** Per the user's explicit
+instruction ("flaky tests indicate dragons... the flakiness should excite you") the 7 failures above
+were not left as a footnote — they were investigated to root cause, planned as 5 parallel workstreams,
+built by 5 concurrent agents on disjoint file sets, then independently re-verified end to end
+(including finding and fixing gaps the agents' own reports missed). Two genuinely distinct root causes
+were found, both real, neither a flake in the usual sense:
+
+1. **A systemic missing-teardown gap, not a flake.** 21 integration test files across 8 crates
+   (`myelin-ci-controlplane`, `myelin-storage`, `myelin-ci-dispatch`, `myelin-ci-sandbox`,
+   `myelin-edge`, `myelin-flow`, `myelin-mcp`) create an ad-hoc per-process-id Postgres schema (or, in
+   two files' cases, ad-hoc tables/rows in `public`) but only ever cleaned up at the START of their own
+   NEXT run — never at the end of the current run, and never on a panicking assertion. This let 234
+   orphaned schemas accumulate on this host (confirmed: every single one had a PID in its name; nothing
+   static was among them), some of them reachable broadly enough to trip
+   `dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe`'s real least-privilege
+   check — which then re-contaminated the REAL shared `public.job_queue`/`ci_run` tables with its own
+   stray tenants every time IT failed, which is what the `production_pg_bootstrap_source.rs`
+   "zero pre-existing active work" smoke test was actually tripping over. Fixed: every affected file now
+   wraps its real test body in a `catch_unwind` + unconditional cleanup + `resume_unwind` helper
+   (`tests/common::with_schema_cleanup` in the two crates large enough to warrant a shared module;
+   inlined per-file elsewhere) — cleanup now runs whether the test passes, fails an assertion, or
+   panics. Proven by running every affected file's suite twice in a row with `pg_catalog.pg_namespace`
+   counts checked between runs (stable, not growing) across all 5 agents' independent verification
+   passes, PLUS my own from-scratch full-workspace sweep afterward. One file
+   (`integration_ci_manifest_pipeline.rs`) was missed by the initial file survey (it names its schema
+   helper `pool_on` instead of `admin_pool`/`schema_name`) and was found + fixed in the final review
+   pass.
+2. **A real, previously-latent production bug: crash-then-retry permanently strands a job.**
+   `AUTHORIZE_JOB_LAUNCH_QUERY`'s launch CAS crosses `ci_job.state` to `'running'` in the SAME
+   statement as the `job_queue` launch fence, and requires `surface.state IN ('queued', 'leased')` to
+   do so — but neither the dead-runner reaper (`job_queue_region.rs::reap_region_scoped`) nor the
+   retryable-attempt requeue path (`ci_pipeline_driver.rs::record_retryable_attempt_on_conn`) ever
+   reset `ci_job.state` back to `'queued'` after re-queuing `job_queue`. A job whose launch CAS
+   committed and then crashed (before completing) was reaped/retried at the `job_queue` layer but could
+   NEVER re-win the launch fence — `ci_job.state` stayed stuck at `'running'` forever, permanently
+   stranding the job. This affects the REAL production runner: `main.rs` wires the reaper through
+   `scheduler_provider.region_queue_store()`, the SAME dedicated least-privilege role the boundary test
+   exercises. Fixed with `RESET_REAPED_CI_JOB_SURFACE_QUERY` (reaper) and a mirrored reset (retryable-
+   attempt path), each resetting only the exact jobs just re-queued, only from `'running'` (a terminal
+   DAG fact is never reopened). This surfaced a THIRD, cascading gap: the dedicated scheduler role had
+   NEVER been granted any privilege on `ci_job` at all (a table that didn't exist when that role's
+   grants were last touched) — so the fix above would have failed in real production with "permission
+   denied for table ci_job" the first time it ever reaped a launched job, exactly as the dedicated-role
+   boundary test caught. Fixed with a new forward-only migration
+   (`ci_0018h_scheduler_ci_job_reap_reset_grant`) granting exactly `SELECT (tenant_id, job_id, state)` +
+   `UPDATE (state)` — column-scoped, never a blanket table grant. The first version of this migration
+   granted only `UPDATE (state)` and still failed ("permission denied") because the reset query's OWN
+   `WHERE state = 'running'` filter also needs SELECT on `state` (an UPDATE's WHERE-clause predicate
+   needs SELECT on every column it inspects, not just the column being written) — caught by actually
+   re-running the dedicated-role test after applying the first version, not assumed correct from the
+   DDL alone. Three migration-count assertions (`migrations.rs` ×2, `lib.rs` ×1) were pinned at the old
+   total and needed updating alongside — exactly the kind of load-bearing test this repo's migration
+   discipline is supposed to produce.
+
+**Honest remaining floor from this investigation.** Two failures remain, both understood, neither
+silently swept aside:
+- `boot_time_sigterm_is_latched_before_the_real_runner_host_can_claim` fails not from a bug but from a
+  genuine tension with an EARLIER, deliberate decision: the historical negative-evidence row
+  `myelin`/`5db61d81-...` (R4.2 publisher work, ledger entry above) is intentionally preserved in a
+  `running` state, and this smoke test's own precondition is "zero pre-existing active work." As long
+  as that row is preserved (as instructed), this test will fail its own precondition. Not fixed;
+  flagged, since resolving the tension isn't this investigation's call to make unilaterally.
+- `starter_manifest_drives_dag_across_worker_restarts_and_loader_retry`
+  (`integration_ci_manifest_pipeline.rs`) fails on a genuinely SEPARATE, unrelated bug:
+  `pg_pipeline_starter.rs`'s "manifest check context `build` has no run-scoped allocation ledger" —
+  a different subsystem (check-attempt allocation, not schema teardown or the ci_job reset above).
+  Its schema-teardown gap (found alongside it) is fixed; the underlying CorruptRun bug is NOT — flagged
+  for a dedicated follow-up, not chased further today given how far this investigation had already
+  gone.
+- Two more real, PRE-EXISTING (confirmed independently by two different agents plus my own git-stash
+  comparisons) failures outside today's scope: `myelin-edge`'s
+  `production_sink_and_edge_resume_exactly_after_both_services_are_severed` (a "resolve canonical CI
+  log run: no rows returned" Postgres error, unrelated to schema teardown), and a real cross-crate
+  taxonomy gap found while fixing an unrelated `myelin-edge` test —
+  `myelin_events::taxonomy::SUBSYSTEM_TOKENS` never admits the `"iam"` subsystem token, so every
+  `iam.tuple.written`/`iam.role.granted`/`iam.break_glass.invoked` event the real elected outbox relay
+  processes is permanently quarantined (an `ON DELETE RESTRICT` FK then blocks any cleanup that touches
+  it). This surfaces identically in `myelin-mcp`'s
+  `response_lost_retry_is_exactly_once_for_open_review_and_events`. Both are `myelin-events`/
+  `myelin-storage` contract issues, out of scope for this investigation, worth a dedicated follow-up.
+
+Full re-verification after all fixes (mine, independently, not trusting any agent's self-report):
+`cargo test -p myelin-ci-controlplane --features integration` (610+ passed, exactly the 2 documented
+failures above), `myelin-storage`/`myelin-edge`/`myelin-ci-dispatch`/`myelin-ci-sandbox`/`myelin-flow`
+all fully green except the one pre-existing `myelin-edge` failure and one confirmed-transient
+`myelin-storage` flake (passed cleanly on a clean full-file rerun), `myelin-mcp` green except the
+documented `iam`-taxonomy symptom, and `cargo clippy --workspace --all-targets --features integration
+-- -D warnings` clean across the entire workspace.

@@ -6,6 +6,9 @@
 //! applied migration DDL (the base creates stay byte-frozen).
 #![cfg(feature = "integration")]
 
+mod common;
+
+use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_controlplane_hot_tables, ci_controlplane_migrations,
     CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
@@ -96,6 +99,9 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
     bare.execute(format!("CREATE SCHEMA {schema}").as_str())
         .await
         .expect("create the upgrade schema");
+    let cleanup_bare = bare.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_bare, &schema_for_cleanup, move || async move {
     let pool = pinned_pool(&schema).await;
 
     // CI's recovery-route follow-ons intentionally target Flow's authoritative workflow_run table.
@@ -190,7 +196,12 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
     .expect("a second apply of the full set is an idempotent no-op");
 
     pool.close().await;
-    bare.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .expect("drop the upgrade schema");
+    // NOTE: do NOT close `bare` here — `cleanup_bare` (passed to `with_schema_cleanup` above) is a
+    // `.clone()` of `bare`, sharing the SAME underlying pool. `PgPool::close()` shuts the whole shared
+    // pool down for every clone, which would silently break the wrapper's own post-body `DROP SCHEMA`
+    // (its error is deliberately swallowed by `with_schema_cleanup`, so this failed with no visible
+    // signal — exactly the kind of silent leak this retrofit exists to prevent). Let `bare` drop
+    // normally; the wrapper closes/drops the schema through `cleanup_bare` after this closure returns.
+    })
+    .await;
 }

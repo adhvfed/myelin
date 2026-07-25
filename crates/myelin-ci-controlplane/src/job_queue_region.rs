@@ -211,10 +211,40 @@ pub(crate) async fn claim_region_scoped(
     }
 }
 
+/// BUG FIX (investigation, 2026-07-25): [`REAP_QUERY`] re-queues `job_queue` (running/leased ->
+/// queued) for a dead runner, but never touches the `ci_job` DAG surface `AUTHORIZE_JOB_LAUNCH_QUERY`
+/// also crosses to `running` in the SAME statement as the launch CAS. Without this reset, a job whose
+/// launch CAS committed (`ci_job.state = 'running'`) and then crashed BEFORE completing — the exact
+/// "paused live continuation" scenario `tests/integration_ci_drive_manifest_store.rs`
+/// (`store_replays_exact_bytes_and_refuses_divergent_authority`) proves — is reaped at the `job_queue`
+/// layer (re-queued, freshly re-claimable) but can NEVER re-win the launch fence: `ci_job.state` stays
+/// stuck at `'running'` forever, and `AUTHORIZE_JOB_LAUNCH_QUERY`'s surface-crossing UPDATE requires
+/// `surface.state IN ('queued', 'leased')` (deliberately, per the pinned
+/// `job_queue_store.rs` unit test) — so every subsequent relaunch attempt matches zero rows and the
+/// job is permanently stranded. This is added here — a NEW, separate statement inside
+/// [`reap_region_scoped`] — rather than folded into [`REAP_QUERY`] itself, because
+/// `tests/integration_ci_p12_scheduler_claim.rs` and
+/// `tests/integration_ci_p28_ct004_durability.rs` both run [`REAP_QUERY`]'s literal text directly
+/// (via `.replace("job_queue", ...)`) against isolated synthetic fixtures that have no `ci_job` table
+/// at all; folding the reset into the shared constant would break those tests. Only jobs REAP_QUERY
+/// actually re-queued (the exact-generation set it just committed) are reset, and only from
+/// `'running'` (a job already `'succeeded'`/`'failed'`/`'cancelled'`/`'reaped'` is a terminal DAG
+/// fact and must never be reopened).
+const RESET_REAPED_CI_JOB_SURFACE_QUERY: &str = "\
+UPDATE ci_job
+SET state = 'queued'
+WHERE state = 'running'
+  AND (tenant_id, job_id) IN (
+    SELECT * FROM UNNEST($1::text[], $2::uuid[])
+  )";
+
 /// **The dead-runner reaper raw execution (arch 02 §2.1; [`REAP_QUERY`]) — region-scoped, cross-tenant.**
 /// Runs [`REAP_QUERY`] under [`with_region_tx`], re-queuing every expired lease with an active
 /// Flow/CI owner in place (no INSERT → 0 duplicate enqueues). Cancelled owners are excluded and
-/// handled through exact-tenant accounting reconciliation. Returns the count re-queued.
+/// handled through exact-tenant accounting reconciliation. Also resets the matching `ci_job` DAG
+/// surface row(s) back to `'queued'` for exactly the jobs just re-queued (see
+/// [`RESET_REAPED_CI_JOB_SURFACE_QUERY`]), so a freshly re-claimed generation can win the launch fence
+/// again. Returns the count re-queued.
 pub(crate) async fn reap_region_scoped(
     pool: &PgPool,
     region: &str,
@@ -222,11 +252,23 @@ pub(crate) async fn reap_region_scoped(
     let region_owned = region.to_string();
     let rows = with_region_tx(pool, region, move |conn| {
         Box::pin(async move {
-            sqlx::query(REAP_QUERY)
+            let reaped = sqlx::query(REAP_QUERY)
                 .bind(&region_owned) // $1 region (RESIDENCY, not a tenant predicate)
                 .fetch_all(&mut *conn)
                 .await
-                .map_err(|e| PgError::Query(e.to_string()))
+                .map_err(|e| PgError::Query(e.to_string()))?;
+            if !reaped.is_empty() {
+                let tenant_ids: Vec<String> =
+                    reaped.iter().map(|r| r.get::<String, _>("tenant_id")).collect();
+                let job_ids: Vec<Uuid> = reaped.iter().map(|r| r.get::<Uuid, _>("job_id")).collect();
+                sqlx::query(RESET_REAPED_CI_JOB_SURFACE_QUERY)
+                    .bind(&tenant_ids)
+                    .bind(&job_ids)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| PgError::Query(e.to_string()))?;
+            }
+            Ok(reaped)
         })
     })
     .await?;

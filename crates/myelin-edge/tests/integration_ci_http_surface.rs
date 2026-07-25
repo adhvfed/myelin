@@ -144,6 +144,49 @@ async fn setup_schema(admin: &PgPool, schema: &str) {
         .expect("grant fixture access");
 }
 
+/// A future combinator that catches a panic from the wrapped future without requiring it to be
+/// `Send`/`'static` (unlike `tokio::spawn`) — used only so `with_schema_cleanup` can run its cleanup
+/// even when the test body panics.
+struct CatchUnwind<F> {
+    inner: std::pin::Pin<Box<F>>,
+}
+
+impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.as_mut().poll(cx)))
+        {
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    }
+}
+
+/// Run `body`, then unconditionally drop `schema` from `pool` afterward — success, assertion
+/// failure, or panic all still clean up, unlike the old "only reset at the START of the next run"
+/// pattern that let schemas accumulate indefinitely on this host. A synchronous `Drop` impl can't
+/// safely do async cleanup, so this uses catch_unwind + always-cleanup + resume_unwind instead.
+async fn with_schema_cleanup<Fut>(pool: &PgPool, schema: &str, body: impl FnOnce() -> Fut)
+where
+    Fut: std::future::Future<Output = ()>,
+{
+    let result = CatchUnwind {
+        inner: Box::pin(body()),
+    }
+    .await;
+    let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(pool)
+        .await;
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 async fn insert_run(app: &PgPool, run_id: &str, repo: &str, created_at: &str) {
     let run_id = run_id.to_string();
     let repo_ref = format!("myelin://{TENANT}/git/repo/{repo}");
@@ -508,6 +551,7 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
     let schema = schema_name();
     let admin = pool(&admin_url(), &schema).await;
     setup_schema(&admin, &schema).await;
+    with_schema_cleanup(&admin, &schema, || async {
     let app = pool(&app_url(), &schema).await;
     insert_run(&app, VISIBLE_RUN, "alpha", "2026-07-24T10:00:00Z").await;
     insert_run(&app, HIDDEN_RUN, "hidden", "2026-07-24T11:00:00Z").await;
@@ -977,12 +1021,11 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
     );
 
     app.close().await;
-    admin
-        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .expect("drop isolated schema");
+    })
+    .await;
     admin.close().await;
-    std::fs::remove_dir_all(root).expect("remove isolated git fixture");
+    std::fs::remove_dir_all(std::env::temp_dir().join(format!("{schema}_git")))
+        .expect("remove isolated git fixture");
 }
 
 /// CI-D11 through the composed production services: the runner-owned durable sink and the
@@ -1000,6 +1043,7 @@ async fn production_sink_and_edge_resume_exactly_after_both_services_are_severed
     let schema = schema_name();
     let admin = pool(&admin_url(), &schema).await;
     setup_schema(&admin, &schema).await;
+    with_schema_cleanup(&admin, &schema, || async {
     let app = pool(&app_url(), &schema).await;
     insert_run(&app, RUN, "alpha", "2026-07-24T13:00:00Z").await;
     insert_job_and_segments(&app, RUN, JOB, &[]).await;
@@ -1166,12 +1210,11 @@ async fn production_sink_and_edge_resume_exactly_after_both_services_are_severed
     drop(resumed_rx);
     drop(gateway);
     app.close().await;
-    admin
-        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .expect("drop isolated composed schema");
+    })
+    .await;
     admin.close().await;
-    std::fs::remove_dir_all(root).expect("remove composed git fixture");
+    std::fs::remove_dir_all(std::env::temp_dir().join(format!("{schema}_git")))
+        .expect("remove composed git fixture");
 }
 
 /// FRONTEND-CONTRACT: ci-read-dev-edge-parity
@@ -1189,6 +1232,7 @@ async fn production_ci_reads_match_the_shared_dev_edge_golden_vectors() {
     let schema = schema_name();
     let admin = pool(&admin_url(), &schema).await;
     setup_schema(&admin, &schema).await;
+    with_schema_cleanup(&admin, &schema, || async {
     let app = pool(&app_url(), &schema).await;
     let blobs = Arc::new(FsBlobStore::new());
     let log = "prep\ncafé\nfailed\n".as_bytes();
@@ -1384,10 +1428,9 @@ async fn production_ci_reads_match_the_shared_dev_edge_golden_vectors() {
     }
 
     app.close().await;
-    admin
-        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .expect("drop isolated golden schema");
+    })
+    .await;
     admin.close().await;
-    std::fs::remove_dir_all(root).expect("remove golden git fixture");
+    std::fs::remove_dir_all(std::env::temp_dir().join(format!("{schema}_git")))
+        .expect("remove golden git fixture");
 }

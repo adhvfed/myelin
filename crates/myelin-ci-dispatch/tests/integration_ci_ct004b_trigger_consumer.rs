@@ -137,6 +137,50 @@ async fn setup_schema(schema: &str, reserve_outbox_ddl: &str) -> PgPool {
     p
 }
 
+/// A future combinator that catches a panic from the wrapped future without requiring it to be
+/// `Send`/`'static` (unlike `tokio::spawn`) — used only so `with_schema_cleanup` can run its cleanup
+/// even when the test body panics.
+struct CatchUnwind<F> {
+    inner: std::pin::Pin<Box<F>>,
+}
+
+impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.as_mut().poll(cx)))
+        {
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    }
+}
+
+/// Run `body`, then unconditionally drop `schema` from `pool` afterward — success, assertion
+/// failure, or panic all still clean up, unlike the old "only reset at the START of the next run"
+/// pattern that let schemas accumulate indefinitely on this host (234 orphaned schemas were found
+/// accumulated from months of runs). A synchronous `Drop` impl can't safely do async cleanup, so this
+/// uses catch_unwind + always-cleanup + resume_unwind instead.
+async fn with_schema_cleanup<Fut>(pool: &PgPool, schema: &str, body: impl FnOnce() -> Fut)
+where
+    Fut: std::future::Future<Output = ()>,
+{
+    let result = CatchUnwind {
+        inner: Box::pin(body()),
+    }
+    .await;
+    let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(pool)
+        .await;
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 /// The outbox-shaped mirror the TRUE co-commit reserve store writes the two events into (alongside the
 /// ci_run row, in the co-commit tx). A minimal isolated table so the one-tx co-commit is assertable.
 const CREATE_RESERVE_OUTBOX_DDL: &str = "\
@@ -391,6 +435,7 @@ async fn h1_true_cocommit_ci_run_events_and_mark_in_one_tx_idempotent() {
     let repo = "web";
     let oid = "deadbeefcafe0000000000000000000000000000";
     let p = setup_schema(&schema, CREATE_RESERVE_OUTBOX_DDL).await;
+    with_schema_cleanup(&p, &schema, || async {
     let rt = tokio::runtime::Handle::current();
 
     let reader: Arc<dyn GitConfigReader> = Arc::new(FixtureGitReader {
@@ -477,10 +522,9 @@ async fn h1_true_cocommit_ci_run_events_and_mark_in_one_tx_idempotent() {
         "redelivery added nothing (idempotent)"
     );
 
-    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
     println!("[H1/1] PASS true co-commit: ci_run + 3 events + dedup mark in ONE tx; redelivery deduped (1 run, 3 events).");
+    })
+    .await;
 }
 
 // =================================================================================================
@@ -493,6 +537,7 @@ async fn h1_crash_window_rolls_back_everything_then_reruns() {
     let repo = "web";
     let oid = "cafe00000000000000000000000000000000beef";
     let p = setup_schema(&schema, CREATE_RESERVE_OUTBOX_DDL).await;
+    with_schema_cleanup(&p, &schema, || async {
     let rt = tokio::runtime::Handle::current();
 
     let backing = DurableDedupBacking::new(p.clone(), rt.clone());
@@ -615,10 +660,9 @@ async fn h1_crash_window_rolls_back_everything_then_reruns() {
         "still 3 events"
     );
 
-    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
     println!("[H1/2] PASS crash-window: rollback leaves nothing; redelivery re-runs + commits (1 run, 3 events); further redelivery deduped.");
+    })
+    .await;
 }
 
 // =================================================================================================
@@ -633,6 +677,7 @@ async fn h1_test_fixture_outbox_absorb_closes_the_livelock() {
     let oid = "1234000000000000000000000000000000005678";
     // The real outbox table lives in the schema too.
     let p = setup_schema(&schema, OUTBOX_MIGRATION).await;
+    with_schema_cleanup(&p, &schema, || async {
     let rt = tokio::runtime::Handle::current();
 
     let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(p.clone(), rt.clone())));
@@ -679,10 +724,9 @@ async fn h1_test_fixture_outbox_absorb_closes_the_livelock() {
         "every reserve/start fact preserves the trigger's immediate parent, root, and depth"
     );
 
-    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
     println!("[H1/3] PASS test-fixture absorb: deterministic re-emit remains exactly once.");
+    })
+    .await;
 }
 
 // =================================================================================================
@@ -696,6 +740,7 @@ async fn production_cocommits_run_attempt_events_and_mark() {
     let oid = "aa11bb22cc33000000000000000000000000dd44";
     // The REAL outbox table (OUTBOX_MIGRATION) lives in the schema alongside the ci tables + dedup.
     let p = setup_schema(&schema, OUTBOX_MIGRATION).await;
+    with_schema_cleanup(&p, &schema, || async {
     let rt = tokio::runtime::Handle::current();
 
     let reader: Arc<dyn GitConfigReader> = Arc::new(FixtureGitReader {
@@ -806,10 +851,9 @@ async fn production_cocommits_run_attempt_events_and_mark() {
         "redelivery added nothing (idempotent: 1 run, 3 events)"
     );
 
-    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
     println!("[chunk4/1] PASS production co-commit: run+attempt+events+mark committed once; redelivery deduped.");
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -819,6 +863,7 @@ async fn production_pr_cocommit_persists_canonical_concurrency_identity() {
     let number = 42;
     let oid = "aa11bb22cc33000000000000000000000000dd44";
     let p = setup_schema(&schema, OUTBOX_MIGRATION).await;
+    with_schema_cleanup(&p, &schema, || async {
     let rt = tokio::runtime::Handle::current();
     let reader: Arc<dyn GitConfigReader> = Arc::new(PrFixtureGitReader {
         repo: repo.into(),
@@ -875,10 +920,8 @@ async fn production_pr_cocommit_persists_canonical_concurrency_identity() {
         Some("pr:team/web:42")
     );
     assert_eq!(row.get::<Option<i64>, _>("pr_head_generation"), Some(1));
-
-    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
+    })
+    .await;
 }
 
 // =================================================================================================
@@ -892,6 +935,7 @@ async fn production_crash_rolls_back_run_attempt_events_and_mark_then_reconverge
     let repo = "web";
     let oid = "99ee88ff77000000000000000000000000aa11bb";
     let p = setup_schema(&schema, OUTBOX_MIGRATION).await;
+    with_schema_cleanup(&p, &schema, || async {
     let rt = tokio::runtime::Handle::current();
 
     let backing = DurableDedupBacking::new(p.clone(), rt.clone());
@@ -1013,16 +1057,16 @@ async fn production_crash_rolls_back_run_attempt_events_and_mark_then_reconverge
             .unwrap();
     assert_eq!(run_attempt, 1);
 
-    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
     println!("[chunk4/2] PASS production co-commit crash: run+attempt+events+mark roll back together; redelivery commits the complete bundle exactly once.");
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_reserve_and_replay_need_no_update_grant_on_immutable_attempts() {
     let schema = schema_name(uniq());
     let admin = setup_schema(&schema, OUTBOX_MIGRATION).await;
+    with_schema_cleanup(&admin, &schema, || async {
     sqlx::raw_sql(&format!(
         "GRANT USAGE ON SCHEMA {schema} TO myelin_app;
          GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} TO myelin_app;
@@ -1098,10 +1142,8 @@ async fn production_reserve_and_replay_need_no_update_grant_on_immutable_attempt
     );
 
     app.close().await;
-    admin
-        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
+    })
+    .await;
 }
 
 // =================================================================================================
@@ -1118,6 +1160,7 @@ async fn production_reserve_and_replay_need_no_update_grant_on_immutable_attempt
 async fn finding6_build_dispatch_consumers_registers_the_live_trigger_consumer() {
     let schema = schema_name(uniq());
     let p = setup_schema(&schema, OUTBOX_MIGRATION).await;
+    with_schema_cleanup(&p, &schema, || async {
     let rt = tokio::runtime::Handle::current();
 
     // The durable exactly-once ledger over the schema pool.
@@ -1162,9 +1205,8 @@ async fn finding6_build_dispatch_consumers_registers_the_live_trigger_consumer()
         "finding #6: production main.rs must register exactly ONE ci-dispatch.trigger consumer (was Vec::new())"
     );
 
-    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
     std::fs::remove_dir_all(std::env::temp_dir().join(format!("myelin-ci-finding6-{schema}"))).ok();
     println!("[finding6] PASS: build_dispatch_consumers registers 1 live trigger consumer over real durable backings (no more Vec::new() shell).");
+    })
+    .await;
 }

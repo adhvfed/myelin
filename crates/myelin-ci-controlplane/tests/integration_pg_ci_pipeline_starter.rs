@@ -1,11 +1,14 @@
 //! Live PostgreSQL proof for the exact-cell CI run starter.
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_artifact_ref, ci_job_id_v2, ci_production_runtime_factory_test_support,
     ci_region_run_discovery_test_support, ci_run_ref, ci_run_starter_factory, CiDriveManifestStore,
@@ -1083,6 +1086,9 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     bare.execute(format!("CREATE SCHEMA {schema}").as_str())
         .await
         .expect("create schema");
+    let cleanup_bare = bare.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_bare, &schema_for_cleanup, move || async move {
     let admin = pool_on(&admin_url(), &schema).await;
     PgMigrator::apply(&admin, &foundation_migrations())
         .await
@@ -3587,8 +3593,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .to_string()
         .contains("active workflow selection does not equal pinned version 1"));
     assert_atomic_started(&admin, "tenant_fresh_old_pin", run_old_pin, false, false).await;
-
-    bare.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
+    })
+    .await;
 }

@@ -102,7 +102,17 @@ fn production_edge_mounts_the_repo_authorized_durable_ci_reads() {
     assert!(route.contains("/v1/ci/runs"));
     assert!(route.contains("/v1/ci/runs/{run}"));
     assert!(route.contains("visible_repo_slugs_for_ci(ctx.principal)"));
-    assert!(route.contains("may_view_ci_repo(ctx.principal, repo_slug)"));
+    // `authorized_repo_ref` centralizes the per-run repo authorization check so the run-view,
+    // log-archive, and log-tail (including its poll-loop re-check) call sites share one
+    // enforcement point instead of duplicating it; it takes a `&Principal` rather than the
+    // HTTP `ctx` so the poll loop (which no longer has a `ctx`) can reuse it too.
+    assert!(route.contains("may_view_ci_repo(principal, repo_slug)"));
+    assert!(route.contains("fn authorized_repo_ref("));
+    // Every read entry point must still feed the *authenticated request's* principal
+    // (ctx.principal) into that shared, authorizing helper — never a query-param-derived one.
+    assert!(route.contains("self.api.read_run(ctx.principal, run_id)"));
+    assert!(route.contains(".open_log_tail(ctx.principal, run_id, job_id, cursor)"));
+    assert!(route.contains(".read_log(ctx.principal, run_id, job_id, request.start, request.limit)"));
     assert!(route.contains("ctx.principal.tenant.as_str()"));
     assert!(route.contains("ctx.principal.region.as_str()"));
     assert!(!route.contains("query_param(\"tenant\")"));

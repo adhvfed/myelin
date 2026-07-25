@@ -9,6 +9,7 @@ use myelin_ci_controlplane::{
     CiSchedulerDbConfig, CiSchedulerDbError, CiSchedulerDbProvider, DurableEnqueue, EnqueueOutcome,
     JobQueueReaper, Lane,
 };
+use futures::FutureExt;
 use myelin_ci_sandbox::TrustTier;
 use myelin_storage::{connect_pool_with_reset, PgMigrator};
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
@@ -192,6 +193,17 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
     cleanup_stale_fixtures(&admin).await;
     cleanup(&admin, &tenants).await;
 
+    // BUG FIX (investigation, 2026-07-25): this test's ONLY cleanup used to be the `cleanup(&admin,
+    // &tenants).await` call at the very end of the happy path — so a panicking assertion anywhere in
+    // between (e.g. `CiSchedulerDbProvider::connect(...)` failing with `ExcessPrivileges`, which this
+    // test itself is designed to be ABLE to hit) left every fixture row behind in the REAL shared
+    // `public.job_queue`/`ci_run` tables forever. That is exactly the contamination chain found today:
+    // this test's own stray `scheduler-*` tenants were the rows a separate, unrelated smoke test
+    // (`production_pg_bootstrap_source.rs`'s "zero pre-existing active work" check) tripped over.
+    // Wrapping the rest of the body in catch_unwind + unconditional cleanup + resume_unwind (mirrors
+    // `tests/common::with_schema_cleanup`'s pattern, applied here to targeted-tenant DELETEs instead
+    // of a schema DROP) makes cleanup run whether this test passes, fails an assertion, or panics.
+    let result = std::panic::AssertUnwindSafe(async {
     let app = connect_pool_with_reset(&app_url, FR_PAR, 4)
         .await
         .expect("connect constrained app pool");
@@ -664,6 +676,12 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         Ok(_) => panic!("server mapping must override configured client region"),
     };
     assert_eq!(region_refusal, CiSchedulerDbError::RegionMismatch);
+    })
+    .catch_unwind()
+    .await;
 
     cleanup(&admin, &tenants).await;
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }

@@ -179,6 +179,11 @@ myelin-notif = { path = "../myelin-notif" }
 # nothing in the CI control-plane production DAG pulls `myelin-harness` or `toml` (no cycle).
 myelin-harness = { path = "../myelin-harness" }
 toml.workspace = true
+# Test-hygiene retrofit (panic-safe schema teardown, tests/common/mod.rs): `FutureExt::catch_unwind`
+# is what lets `with_schema_cleanup` intercept a test-body panic mid-`.await`, ALWAYS run the schema
+# DROP, then resume the unwind — a synchronous `Drop` impl cannot safely run that async cleanup. A
+# DEV-DEP ONLY (the shared test helper, NOT the production DAG); no new myelin edge.
+futures = { workspace = true }
 
 [features]
 default = []

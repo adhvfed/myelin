@@ -98,6 +98,49 @@ async fn setup_schema(admin: &PgPool, schema: &str) {
         .expect("grant fixture access");
 }
 
+/// A future combinator that catches a panic from the wrapped future without requiring it to be
+/// `Send`/`'static` (unlike `tokio::spawn`) — used only so `with_schema_cleanup` can run its cleanup
+/// even when the test body panics.
+struct CatchUnwind<F> {
+    inner: std::pin::Pin<Box<F>>,
+}
+
+impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.as_mut().poll(cx)))
+        {
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    }
+}
+
+/// Run `body`, then unconditionally drop `schema` from `pool` afterward — success, assertion
+/// failure, or panic all still clean up, unlike the old "only reset at the START of the next run"
+/// pattern that let schemas accumulate indefinitely on this host. A synchronous `Drop` impl can't
+/// safely do async cleanup, so this uses catch_unwind + always-cleanup + resume_unwind instead.
+async fn with_schema_cleanup<Fut>(pool: &PgPool, schema: &str, body: impl FnOnce() -> Fut)
+where
+    Fut: std::future::Future<Output = ()>,
+{
+    let result = CatchUnwind {
+        inner: Box::pin(body()),
+    }
+    .await;
+    let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(pool)
+        .await;
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 async fn insert_run(app: &PgPool) {
     with_tenant_tx(app, TENANT, REGION, |connection| {
         Box::pin(async move {
@@ -253,6 +296,7 @@ async fn governed_ci_read_reverifies_the_run_token_at_the_durable_boundary() {
         }
     };
     setup_schema(&admin, &schema).await;
+    with_schema_cleanup(&admin, &schema, || async {
     let app = pool(&app_url(), &schema)
         .await
         .expect("connect app role to isolated schema");
@@ -299,9 +343,7 @@ async fn governed_ci_read_reverifies_the_run_token_at_the_durable_boundary() {
         format!("myelin://{TENANT}/git/repo/alpha")
     );
 
-    admin
-        .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
-        .await
-        .expect("drop isolated schema");
     let _ = std::fs::remove_dir_all(git_root);
+    })
+    .await;
 }

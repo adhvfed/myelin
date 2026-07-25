@@ -1,12 +1,15 @@
 //! Live PostgreSQL proof for the canonical, insert-only CI drive-manifest store.
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_job_authorization_context, ci_region_queue_store_test_support,
     ci_runner_cancellation_coordinator, ci_runner_hooks, ci_runner_identity_authorities,
@@ -19,7 +22,8 @@ use myelin_ci_controlplane::{
     ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
     ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, CI_PIPELINE_WF_TYPE, CREATE_CI_DRIVE_MANIFEST_DDL,
-    CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_CI_JOB_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL,
+    CREATE_JOB_QUEUE_DDL,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
@@ -386,6 +390,14 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .await
     .unwrap();
 
+    // A cleanup-dedicated clone of `bare_admin` (a cheap `Arc` handle clone, same underlying
+    // pool — `bare_admin` is never `.close()`d itself, only `admin`/`app` are): `with_schema_cleanup`
+    // unconditionally drops `schema` through it once the test body (success, assertion failure, or
+    // panic) finishes, so the schema never outlives this test regardless of outcome (previously it
+    // was dropped ONLY at the natural end of a passing run).
+    let cleanup_admin = bare_admin.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let admin = pinned_pool(&admin_url(), &schema).await;
     let app = pinned_pool(&app_url(), &schema).await;
     PgMigrator::apply(&admin, &identity_durable_migrations())
@@ -412,6 +424,8 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
          SELECT myelin_make_tenant_scoped('ci_run');
          {CREATE_CI_DRIVE_MANIFEST_DDL};
          SELECT myelin_make_tenant_scoped('ci_drive_manifest');
+         {CREATE_CI_JOB_DDL};
+         SELECT myelin_make_tenant_scoped('ci_job');
          {CREATE_FAIR_DEFICIT_DDL};
          {CREATE_JOB_QUEUE_DDL};
          {ALTER_JOB_QUEUE_ADD_COMPLETION_DDL};
@@ -456,6 +470,31 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .execute(&mut *parent)
     .await
     .unwrap();
+    // BUG FIX (investigation, 2026-07-25): this schema never created its own `ci_job` table.
+    // `AUTHORIZE_JOB_LAUNCH_QUERY` (the launch CAS `runner_hooks.attribute` drives) requires a
+    // matching `ci_job` row to also cross `queued`/`leased` -> `running` in the SAME statement —
+    // without one, `search_path`'s `public` fallback silently resolved every `ci_job` reference to
+    // the SHARED dev database's `public.ci_job` (leftover rows from unrelated runs), which never
+    // has a row for this schema's job ids. The CAS therefore matched zero rows EVERY time (100%
+    // reproducible, not a timing/race artifact). Seed the starter-owned `ci_job` DAG row for each
+    // manifest job here, mirroring `pg_pipeline_starter.rs`'s `materialize_ci_jobs`.
+    for job in &expected.jobs {
+        sqlx::query(
+            "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, spec_ref, \
+             state, attempt) \
+             VALUES ($1, $2, $3::uuid, $4::uuid, $5, $6, '{}'::uuid[], $7, 'queued', 1)",
+        )
+        .bind(&expected.tenant_id)
+        .bind(&expected.region)
+        .bind(&job.job_id)
+        .bind(&expected.ci_run_id)
+        .bind(&job.stage)
+        .bind(&job.name)
+        .bind(&expected.source_snapshot_ref)
+        .execute(&mut *parent)
+        .await
+        .expect("seed the starter-owned ci_job surface row the launch CAS crosses");
+    }
     sqlx::query(
         "INSERT INTO workflow_run
            (tenant_id, region, run_id, wf_type, wf_version, input, state, cursor,
@@ -1236,9 +1275,11 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     drop(provider);
     admin.close().await;
     app.close().await;
-    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&bare_admin)
-        .await
-        .unwrap();
-    bare_admin.close().await;
+    // `with_schema_cleanup` (wrapping this whole body) now owns dropping `schema` unconditionally
+    // through its own `cleanup_admin` handle — it runs after this closure returns, success or panic
+    // alike, so no explicit `DROP SCHEMA`/`bare_admin.close()` is needed here anymore (closing
+    // `bare_admin` itself here would also close `cleanup_admin`, since `PgPool::close()` shuts down
+    // every clone of the same underlying pool, and make that unconditional cleanup a silent no-op).
+    })
+    .await;
 }

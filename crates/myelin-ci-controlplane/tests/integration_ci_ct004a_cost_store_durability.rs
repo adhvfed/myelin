@@ -38,6 +38,9 @@
 //!     --test integration_ci_ct004a_cost_store_durability -- --nocapture
 #![cfg(feature = "integration")]
 
+mod common;
+
+use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_durable_migrations, CiCostEventStore, CiCostStoreError, CostEventRow, CostKind, Meter,
 };
@@ -147,6 +150,12 @@ fn settle_rows(tenant: &TenantId, run: Uuid, job: Uuid) -> Vec<CostEventRow> {
 #[tokio::test]
 async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
     let schema = schema_name();
+    // A cleanup-dedicated pool, independent of the `p1`/`p2` pools the kill-9 drill below drops mid-
+    // test — `with_schema_cleanup` unconditionally drops `schema` through THIS pool when the test body
+    // (success, assertion failure, or panic) finishes.
+    let cleanup_pool = reopen().await;
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_pool, &schema_for_cleanup, move || async move {
     let tenant = TenantId("acme".into());
     let region = "fr-par";
     let scope = verified_scope(&tenant, region);
@@ -311,14 +320,11 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
         "the uncommitted settle left NO ghost cost row (no half-billed run — all-or-nothing)"
     );
 
-    // ── Cleanup: drop the per-pid schema. ──
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&p2)
-        .await
-        .ok();
     println!(
         "[CT-004a] PASS cost_store: committed settle survives kill-9/reopen (2 units, attributed to \
          (run,job), wholesale≠markup, kind=ci); re-delivered settle → 0 rows (double-effect = 0, no \
          double-bill); uncommitted settle-in-tx → 0 ghost rows (all-or-nothing) — proven THROUGH the store"
     );
+    })
+    .await;
 }

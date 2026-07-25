@@ -31,6 +31,8 @@ use myelin_events::{
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::Region;
 
+mod common;
+
 // ---- S3BlobStore: the BlobStore trait, real RustFS ----------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -148,34 +150,45 @@ async fn pg_rebac_tuple_store_reverse_index() {
         .expect("run migrations (outbox + rebac_tuple + RLS)");
 
     let tenant = format!("acme-{}", std::process::id());
-    // alice is reader on doc1 + doc2; bob on doc3 (must not match alice's lookup).
-    store
-        .put_tuple(&tenant, "doc1", "reader", "user:alice")
-        .await
-        .expect("put doc1");
-    store
-        .put_tuple(&tenant, "doc2", "reader", "user:alice")
-        .await
-        .expect("put doc2");
-    store
-        .put_tuple(&tenant, "doc3", "reader", "user:bob")
-        .await
-        .expect("put doc3");
-
-    // The S8 reverse-index lookup, RLS-scoped to this tenant.
-    let objs = store
-        .reverse_index(&tenant, "user:alice", "reader")
-        .await
-        .expect("reverse index");
-    assert_eq!(objs, vec!["doc1".to_string(), "doc2".to_string()]);
-
-    // Cleanup this run's rows (best-effort, via the admin/owner pool).
+    // The admin/owner pool for this run's cleanup — connected here (ahead of the wrapped body
+    // below) so it is available to the cleanup closure regardless of how the body exits.
     let pool = admin_pool(&cfg).await;
-    sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1")
-        .bind(&tenant)
-        .execute(&pool)
-        .await
-        .ok();
+
+    // Wrapped so a mid-test assertion failure or panic still drops this run's seeded rows,
+    // instead of only the happy path reaching the final cleanup below (see tests/common/mod.rs).
+    common::with_cleanup(
+        || async {
+            // alice is reader on doc1 + doc2; bob on doc3 (must not match alice's lookup).
+            store
+                .put_tuple(&tenant, "doc1", "reader", "user:alice")
+                .await
+                .expect("put doc1");
+            store
+                .put_tuple(&tenant, "doc2", "reader", "user:alice")
+                .await
+                .expect("put doc2");
+            store
+                .put_tuple(&tenant, "doc3", "reader", "user:bob")
+                .await
+                .expect("put doc3");
+
+            // The S8 reverse-index lookup, RLS-scoped to this tenant.
+            let objs = store
+                .reverse_index(&tenant, "user:alice", "reader")
+                .await
+                .expect("reverse index");
+            assert_eq!(objs, vec!["doc1".to_string(), "doc2".to_string()]);
+        },
+        || async {
+            // Cleanup this run's rows (best-effort, via the admin/owner pool).
+            sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1")
+                .bind(&tenant)
+                .execute(&pool)
+                .await
+                .ok();
+        },
+    )
+    .await;
 }
 
 // ---- PgStore: the outbox + relay (real FOR UPDATE SKIP LOCKED) drained THROUGH BusTransport --
@@ -223,39 +236,50 @@ async fn pg_outbox_relay_drains_to_bus() {
     let agg = format!("issue:SMOKE-{}", std::process::id());
     let id1 = format!("smoke-out-1-{}", std::process::id());
     let id2 = format!("smoke-out-2-{}", std::process::id());
-
-    // The OLTP-co-located relay (drains the outbox to the BusTransport trait).
-    let relay = store.relay();
-
-    // Enqueue two outbox rows (the envelope stored as JSONB), published_at = NULL.
-    relay
-        .enqueue(&agg, 0, &envelope(&id1, "myelin://acme/issues/A", &agg))
-        .await
-        .expect("enqueue 1");
-    relay
-        .enqueue(&agg, 1, &envelope(&id2, "myelin://acme/issues/B", &agg))
-        .await
-        .expect("enqueue 2");
-
-    // The relay claims unsent rows with FOR UPDATE SKIP LOCKED and publishes them through the
-    // BusTransport trait (here the in-process bus — the drain is real PG; the bus is the trait).
-    let bus = InProcessBus::new();
-    let n = relay.relay_once(&bus, 16).await.expect("relay drain");
-    assert_eq!(n, 2, "the relay must publish both enqueued rows");
-
-    // Both events reached the bus (0 lost), and the outbox is fully drained for this aggregate.
-    assert!(bus.delivered_ids().contains(&EventId(id1.clone())));
-    assert!(bus.delivered_ids().contains(&EventId(id2.clone())));
-
-    // A second drain pass publishes nothing (the rows are marked published_at = now()).
-    let n2 = relay.relay_once(&bus, 16).await.expect("relay drain 2");
-    assert_eq!(n2, 0, "already-published rows are not re-claimed");
-
-    // Cleanup this run's rows.
+    // The admin/owner pool for this run's cleanup — connected here (ahead of the wrapped body
+    // below) so it is available to the cleanup closure regardless of how the body exits.
     let pool = admin_pool(&cfg).await;
-    sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
-        .bind(&agg)
-        .execute(&pool)
-        .await
-        .ok();
+
+    // Wrapped so a mid-test assertion failure or panic still drops this run's outbox rows,
+    // instead of only the happy path reaching the final cleanup below (see tests/common/mod.rs).
+    common::with_cleanup(
+        || async {
+            // The OLTP-co-located relay (drains the outbox to the BusTransport trait).
+            let relay = store.relay();
+
+            // Enqueue two outbox rows (the envelope stored as JSONB), published_at = NULL.
+            relay
+                .enqueue(&agg, 0, &envelope(&id1, "myelin://acme/issues/A", &agg))
+                .await
+                .expect("enqueue 1");
+            relay
+                .enqueue(&agg, 1, &envelope(&id2, "myelin://acme/issues/B", &agg))
+                .await
+                .expect("enqueue 2");
+
+            // The relay claims unsent rows with FOR UPDATE SKIP LOCKED and publishes them through
+            // the BusTransport trait (here the in-process bus — the drain is real PG; the bus is
+            // the trait).
+            let bus = InProcessBus::new();
+            let n = relay.relay_once(&bus, 16).await.expect("relay drain");
+            assert_eq!(n, 2, "the relay must publish both enqueued rows");
+
+            // Both events reached the bus (0 lost), and the outbox is fully drained for this
+            // aggregate.
+            assert!(bus.delivered_ids().contains(&EventId(id1.clone())));
+            assert!(bus.delivered_ids().contains(&EventId(id2.clone())));
+
+            // A second drain pass publishes nothing (the rows are marked published_at = now()).
+            let n2 = relay.relay_once(&bus, 16).await.expect("relay drain 2");
+            assert_eq!(n2, 0, "already-published rows are not re-claimed");
+        },
+        || async {
+            // Cleanup this run's rows. See `common::delete_outbox_for_aggregate` for why this
+            // isn't a bare `DELETE FROM outbox WHERE aggregate = $1`: `outbox_quarantine` FKs to
+            // `outbox` with `ON DELETE RESTRICT`, and a concurrent quarantine sweep on this shared
+            // dev DB (confirmed live) can otherwise leave this run's tagged rows stuck forever.
+            common::delete_outbox_for_aggregate(&pool, &agg).await;
+        },
+    )
+    .await;
 }

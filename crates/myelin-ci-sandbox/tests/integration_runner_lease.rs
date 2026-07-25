@@ -36,6 +36,55 @@ async fn admin_pool() -> sqlx::PgPool {
         .expect("connect as admin to dev Postgres (is the stack up?)")
 }
 
+/// A future combinator that catches a panic from the wrapped future without requiring it to be
+/// `Send`/`'static` (unlike `tokio::spawn`) — used only so `with_tables_cleanup` can run its cleanup
+/// even when the test body panics.
+struct CatchUnwind<F> {
+    inner: std::pin::Pin<Box<F>>,
+}
+
+impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.as_mut().poll(cx)))
+        {
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    }
+}
+
+/// Run `body`, then unconditionally drop the per-pid ad-hoc `tables` from `pool` afterward —
+/// success, assertion failure, or panic all still clean up. This file has no ad-hoc SCHEMA (unlike
+/// its sibling integration tests) — its per-pid isolation is two ad-hoc TABLES
+/// (`job_queue_lease_<pid>` / `wf_signal_runner_<pid>`) that were, before this fix, only ever
+/// cleaned up via `DROP TABLE IF EXISTS ...` at the START of the crate's OWN next run — never on
+/// panic. Same root cause as the schema-leak pattern elsewhere, one level down (tables, not a
+/// schema). A synchronous `Drop` impl can't safely do async cleanup, so this uses catch_unwind +
+/// always-cleanup + resume_unwind instead.
+async fn with_tables_cleanup<Fut>(pool: &sqlx::PgPool, tables: &[&str], body: impl FnOnce() -> Fut)
+where
+    Fut: std::future::Future<Output = ()>,
+{
+    let result = CatchUnwind {
+        inner: Box::pin(body()),
+    }
+    .await;
+    for table in tables {
+        let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(pool)
+            .await;
+    }
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 /// A minimal `job_queue` lease table — the lease columns (`lease_owner`, `lease_expires`) + the
 /// residency/affinity predicates the runner-side claim needs. The FULL `job_queue` (the fairness /
 /// lane / concurrency columns + the jq_claimable/jq_serialize/jq_idem indexes) is CI-P6; here we
@@ -81,6 +130,8 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
         .await
         .expect("the wf_signal DDL applies");
 
+    let tables = [jq.as_str(), sig.as_str()];
+    with_tables_cleanup(&admin, &tables, || async {
     // seed one eligible queued job (fr-par, labels {linux}, trusted) for run R-1, idem_token tok-1.
     sqlx::query(&format!(
         "INSERT INTO {jq} (tenant_id, region, run_id, job_id, labels, trust_tier, idem_token) \
@@ -260,18 +311,12 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
         "the buffered job.done payload is references-not-payloads (the FIRST delivery's; DO NOTHING never overwrote)"
     );
 
-    sqlx::query(&format!("DROP TABLE IF EXISTS {jq}"))
-        .execute(&admin)
-        .await
-        .unwrap();
-    sqlx::query(&format!("DROP TABLE IF EXISTS {sig}"))
-        .execute(&admin)
-        .await
-        .unwrap();
     println!(
         "[2026-06-21] PASS  drill=CI-P3(live-PG)  claim(FOR UPDATE SKIP LOCKED)=worker-1 second-claim=skipped  \
          heartbeat-renew=owner-only(1) foreign=0  expired->reclaim=worker-2  \
          terminal job.done double-deliver->buffer once rows=1 redelivery=no-op (double-effect=0)  \
          (real Postgres job_queue lease + engine wf_signal ON CONFLICT DO NOTHING — runner reuses the one signal path)"
     );
+    })
+    .await;
 }

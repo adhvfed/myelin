@@ -179,3 +179,9 @@ myelin-gdpr-service = { path = "../myelin-gdpr-service" }
 # myelin-control-plane dev-deps above).
 myelin-search = { path = "../myelin-search" }
 myelin-refs-service = { path = "../myelin-refs-service" }
+# Test-hygiene retrofit (panic-safe ad-hoc-table/row teardown, tests/common/mod.rs):
+# `FutureExt::catch_unwind` is what lets `with_cleanup` intercept a test-body panic mid-`.await`,
+# ALWAYS run the test's own cleanup, then resume the unwind — a synchronous `Drop` impl cannot
+# safely run that async cleanup. Same posture as the myelin-ci-controlplane sibling fix. A
+# DEV-DEP ONLY (the shared test helper, NOT the production DAG); no new myelin edge.
+futures = { workspace = true }
