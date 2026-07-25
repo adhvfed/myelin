@@ -675,3 +675,25 @@ myelin-ci-controlplane green (false-bug + allocation-ledger fixes both hold); th
 unrelated to this batch — `relay_once` sweeping unrelated concurrent rows, a pre-existing
 sensitivity, not introduced here). The fifth issue above (`wrong_relay_region`) is the only known
 open item after this batch.
+
+**2026-07-25 (later): the fifth issue (`wrong_relay_region`) closed — NOT by touching the relay's
+validation contract.** Investigated whether `pgrelay.rs`'s claim query should filter by region at
+the SQL level (my first hypothesis). Wrong: `myelin-storage/tests/integration_outbox_quarantine.rs`
+already has a deliberate, existing, previously-reviewed test asserting a wrong-region row is
+quarantined exactly like every other permanent envelope defect — that behavior is intentional, not
+an oversight, and changing it would overturn an already-tested contract on a hunch. The real,
+already-documented root cause is in `myelin-storage/tests/common/mod.rs`'s own doc comment: this
+dev host's `outbox`/`outbox_quarantine` tables are a REAL SHARED resource between the live founder
+dogfood relay process and every test suite, and "genuinely serializing against an independent test
+suite's concurrent writes on a live shared table is a bigger, separate concern than this crate's
+own per-test cleanup" — the established, already-accepted mitigation is bounded-retry cleanup
+(`delete_outbox_for_aggregate`), not SQL-level filtering. `myelin-mcp`'s
+`git_effect_governed.rs` never adopted that pattern — its cleanup did a single un-retried
+`DELETE FROM outbox WHERE envelope->>'tenant'=$1`, which aborts on the `outbox_quarantine` FK the
+instant the live relay wins the race (real, observed: `wrong_relay_region`, since this test's
+`REGION="eu-west"` differs from the live relay's own configured region). Fixed by porting the exact
+same retry pattern (`delete_outbox_for_tenant`: delete matching `outbox_quarantine` rows first,
+then `outbox`, retrying up to 5 times) into this test. Verified: the target test passes, the full
+`myelin-mcp` integration suite (21+5+1+5+2+21+1+1+1 = all green) passes, `cargo clippy -p
+myelin-mcp --all-targets --features integration -- -D warnings` clean. This closes the last open
+item from the 2026-07-25 flaky-test investigation.
