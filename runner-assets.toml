@@ -1,0 +1,58 @@
+# runner-assets.toml — the CT-007 pre-registered cutover-floor GATE 2/4 (digest-pinned runner
+# assets), first slice.
+#
+# planning/system-reviews/2026-06-26/12-ci-track-ledger.md ("Pre-registered CT-007 cutover
+# floor", ~line 311) states gate 2 as:
+#
+#   "digest-pinned one-cell runner assets provide the actual Rust/Node/browser/container
+#   capabilities [the 12 GitHub CI jobs] require without weakening gVisor, egress, or privilege
+#   boundaries."
+#
+# This file is DIFFERENT from `ci-workload-inventory.toml` (gate 1): that file maps GitHub JOBS to
+# CT-007-step OWNERS. This file maps RUNNER ASSETS (staged gVisor rootfs trees carrying a specific
+# capability) to their digest pins. A GitHub job needs one or more runner assets to run under the
+# Myelin-native sandbox; this manifest is the accounting of which assets exist, how they were
+# built, and what their content must hash to.
+#
+# STATUS TODAY (committed 2026-07-25): exactly ONE asset is staged — `linux-rust-v1`, covering only
+# the `build-test-clippy` job's need (`ci-workload-inventory.toml`'s own note on that row: "the
+# base Rust workload every other job's crates depend on existing"). Node (frontend lint/unit/build
+# jobs), a headless browser (the Chromium suite), Docker-in-Docker (the `integration` workflow's
+# live-backend needs), and outbound egress to the RustSec/npm advisory DBs (the `security.yml`
+# jobs) are ALL still missing runner assets — separate, later rows, added by later slices of this
+# same gate. Gate 2 is NOT closed by this file; it is one asset closer.
+#
+# ENFORCEMENT: `crates/myelin-lints/tests/runner_asset_digest_pin.rs` recomputes each row's
+# `canonical_tree_sha256` (via the SAME `tar --sort=name --mtime=@0 --owner=0 --group=0
+# --numeric-owner --format=gnu -C <staged-dir> -cf - . | sha256sum` recipe
+# `scripts/dogfood.sh`'s `verify_ci_rootfs()` uses) against the staged directory named by `env_var`
+# (falling back to each asset's own documented default path), ONLY when that directory actually
+# exists on the current machine — this is a genuine, honest skip on any host without the asset
+# staged (matching this repo's existing runsc/KVM graceful-skip convention), not a silent vacuous
+# pass. `MYELIN_REQUIRE_RUST_ROOTFS_PIN=1` forces a hard failure instead of a skip.
+#
+# THIS IS NOT THE PRODUCTION `linux-small-v1` PROFILE. `.myelin/ci.toml`'s pinned
+# `myelin.local/linux-small-v1-rootfs@sha256:...` (verified by `scripts/dogfood.sh
+# verify-ci-rootfs`) is the founder-dogfood marker-pipeline rootfs — a SEPARATE concern from the
+# per-capability runner assets tracked here. Neither this file nor its enforcement test reads or
+# writes `.myelin/ci.toml`.
+
+[[asset]]
+id = "linux-rust-v1"
+capability = "rust"
+# The GitHub job(s) this asset provides the capability for (ci-workload-inventory.toml job ids).
+covers_job = "build-test-clippy"
+stage_script = "scripts/build-rust-rootfs.sh"
+env_var = "MYELIN_GVISOR_RUST_ROOTFS"
+default_path = "~/.local/share/gvisor-assets/rust-rootfs"
+# The exact official source image `scripts/build-rust-rootfs.sh` pulled + pinned when this row's
+# digest was computed (2026-07-25). Re-staging with FORCE=1 against a different RUST_IMAGE_TAG
+# changes the rootfs content and therefore this row's digest.
+source_image = "rust:1.82-slim-bookworm"
+source_image_digest = "sha256:1111c28d995d06a7863ba6cea3b3dcb87bebe65af8ec5517caaf2c8c26f38010"
+# The canonical-tree content digest of the STAGED rootfs (docker-exported filesystem +
+# usr/local/bin/{rustc,cargo,...} PATH-reachability symlinks — see the script's own header for why
+# the symlinks target the real toolchain binaries, not the rustup proxy hardlinks). Computed
+# 2026-07-25 on the founder dogfood host.
+canonical_tree_sha256 = "6feada1e0ef7b739d71c7f198b03dcaab494f35ea86182dd887d23f5df0c6083"
+note = "Docker-pull + docker-export of an official Debian-slim rust image, NOT a hand-chased host-lib copy (unlike scripts/stage-git-rootfs.sh's git precedent) — the host cargo/rustc pull in dozens of transitive shared libs (libgit2, libssl, libcurl, icu, ...) that would make a hand-staged tree fragile and not a real immutable release artifact. Proven end to end by crates/myelin-ci-sandbox/tests/rust_capable_rootfs_prod_exec_test.rs: a real `runsc` sandbox on the SAME GvisorBackend::launch path every other job uses runs `rustc --version && cargo --version` and asserts non-root uid + no network egress, unchanged hardening."

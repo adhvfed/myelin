@@ -110,9 +110,9 @@ note = "The Myelin self-hosting CI dogfood graph (P-507 / P-S37): the twelve lin
 workflow = "ci.yml"
 job = "build-test-clippy"
 status = "github-only"
-owner = "CT-007 step 2 (one-cell runner asset) — not started"
+owner = "CT-007 step 2 (one-cell runner asset: linux-rust-v1 built + proven 2026-07-25, see runner-assets.toml — not yet wired into a dispatchable CI graph, that is step 3) — in progress"
 myelin_job = ""
-note = "cargo build --workspace --locked, cargo test --workspace --locked, cargo clippy --workspace --all-targets -D warnings. The base Rust workload every other job's crates depend on existing."
+note = "cargo build --workspace --locked, cargo test --workspace --locked, cargo clippy --workspace --all-targets -D warnings. The base Rust workload every other job's crates depend on existing. Its runner-asset capability (a digest-pinned gVisor rootfs with the Rust toolchain) now exists and is proven under a real runsc launch on the exact production hardening path; this row still stays github-only because nothing dispatches this job through Myelin yet."
 
 # ─────────────────────────────── .github/workflows/integration.yml ──────────────────────────────
 
