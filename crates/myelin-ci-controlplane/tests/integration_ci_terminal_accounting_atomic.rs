@@ -1,8 +1,11 @@
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_artifact_ref, ci_controlplane_hot_tables, ci_controlplane_migrations, ci_job_queue_store,
     ci_job_spec_store, ci_manifest_pipeline_definition, ci_production_runtime_factory_test_support,
@@ -306,6 +309,17 @@ async fn run_reporter_scenario(
         .execute(format!("CREATE SCHEMA {schema}").as_str())
         .await
         .unwrap();
+    // A cleanup-dedicated clone of `bootstrap` (a cheap `Arc` handle clone, same underlying pool):
+    // `with_schema_cleanup` unconditionally drops `schema` through it once this scenario's body
+    // (success, an early return, an assertion failure, or a panic) finishes, so the schema never
+    // outlives this call regardless of outcome. The body below still runs its own explicit
+    // `bootstrap.execute("DROP SCHEMA ...")` at each success/early-return exit exactly as before —
+    // those become harmless no-ops (`IF EXISTS`) once this wrapper's own drop has already run, or
+    // simply drop it first on the ordinary paths; only a PANIC before reaching one of them now also
+    // gets cleaned up, which previously leaked the schema.
+    let cleanup_bootstrap = bootstrap.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_bootstrap, &schema_for_cleanup, move || async move {
     let pool = isolated_pool(&schema).await;
     PgMigrator::apply(&pool, &foundation_migrations())
         .await
@@ -1418,6 +1432,8 @@ async fn run_reporter_scenario(
         .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
         .await
         .unwrap();
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

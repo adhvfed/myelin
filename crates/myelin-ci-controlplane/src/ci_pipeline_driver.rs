@@ -852,6 +852,26 @@ async fn record_retryable_attempt_on_conn(
     .fetch_optional(&mut *conn)
     .await
     .map_err(|_| CompletionTxError::RetryStore)?;
+    // BUG FIX (investigation, 2026-07-25): a retryable-attempt requeue moves `job_queue` back to
+    // `queued` here, but historically never touched the `ci_job` DAG surface
+    // `AUTHORIZE_JOB_LAUNCH_QUERY` also crosses to `running` in the SAME statement as the launch
+    // CAS. Without this reset, `ci_job.state` stayed stuck at `'running'` from the FIRST attempt, so
+    // a fresh runner generation claiming the requeued row could never re-win the launch fence
+    // (`surface.state IN ('queued', 'leased')`, deliberately pinned in `job_queue_store.rs`'s unit
+    // tests) — the retry would be permanently stranded. Mirrors the same reset added to the
+    // dead-runner reaper (`job_queue_region.rs::RESET_REAPED_CI_JOB_SURFACE_QUERY`) for the analogous
+    // crash-recovery path.
+    if requeue && updated.is_some() {
+        sqlx::query(
+            "UPDATE ci_job SET state = 'queued' \
+             WHERE tenant_id = $1 AND job_id = $2 AND state = 'running'",
+        )
+        .bind(&claim.tenant.0)
+        .bind(job_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|_| CompletionTxError::RetryStore)?;
+    }
     if updated.is_some() {
         Ok(if requeue {
             RetryableAttemptOutcome::Requeued

@@ -28,6 +28,9 @@
 //!     --test integration_ci_ct004m_cost_event_no_collision -- --nocapture
 #![cfg(feature = "integration")]
 
+mod common;
+
+use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_durable_migrations, verify_ci_cost_event_shape, CiCostEventStore, CiCostStoreError,
     CostEventRow, CostKind, Meter,
@@ -131,6 +134,9 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
     }
 
     let schema = schema_name();
+    let cleanup_pool = pool().await;
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_pool, &schema_for_cleanup, move || async move {
     let tenant = TenantId("acme".into());
     let region = "fr-par";
     let scope = verified_scope(&tenant, region);
@@ -285,13 +291,11 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         }
     }
 
-    // ── Cleanup. ──
-    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
     println!(
         "[CT-004m] PASS no-collision: Storage's cost_event (ord/unit) + CI's ci_cost_event \
          (cost_id/job_id/meter/kind) COEXIST in one shared schema; a CT-004a settle (→ ci_cost_event, \
          0 writes to cost_event) AND a CT-004b ci_run reserve BOTH succeed in the SAME DB"
     );
+    })
+    .await;
 }

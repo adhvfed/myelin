@@ -22,9 +22,12 @@
 //!     --test integration_ci_ct004f_durable_log_persist -- --nocapture
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
+use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_controlplane_migrations, log_pipeline::AnchorStatus, log_pipeline::CoalesceBudget,
     log_pipeline::LogAnchorRow, log_pipeline::LogCoord, log_pipeline::LogPipeline,
@@ -209,15 +212,6 @@ async fn seed_log_route(
     .expect("seed immutable CI log route");
 }
 
-async fn cleanup_schema(admin: sqlx::PgPool, app: sqlx::PgPool, schema: &str) {
-    app.close().await;
-    admin
-        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .expect("drop isolated log-persist schema");
-    admin.close().await;
-}
-
 /// Read back the `(segment_count, anchor_status, anchor_byte_end, dangling)` for a run/job, as the
 /// tenant (RLS: set the GUC on the read connection so the app role can see its own rows).
 async fn read_back(
@@ -285,6 +279,9 @@ async fn outbox_count(app: &sqlx::PgPool, run: &str, job: &str) -> i64 {
 #[tokio::test(flavor = "multi_thread")]
 async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
     let schema = schema_name();
+    let cleanup_admin = pool(&admin_url(), &schema).await;
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let admin = pool(&admin_url(), &schema).await;
     setup_schema(&admin, &schema).await;
     let app = pool(&app_url(), &schema).await;
@@ -367,12 +364,18 @@ async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
         outbox_count(&app, &run, &job).await >= 1,
         "a ci.log.available pointer landed in the outbox (co-committed with the index)"
     );
-    cleanup_schema(admin, app, &schema).await;
+    app.close().await;
+    admin.close().await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn retried_sink_appends_after_the_committed_live_prefix() {
     let schema = schema_name();
+    let cleanup_admin = pool(&admin_url(), &schema).await;
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let admin = pool(&admin_url(), &schema).await;
     setup_schema(&admin, &schema).await;
     let app = pool(&app_url(), &schema).await;
@@ -455,12 +458,18 @@ async fn retried_sink_appends_after_the_committed_live_prefix() {
     assert_eq!(status, "passed");
     assert_eq!(byte_end, Some(24));
     assert_eq!(dangling, 0);
-    cleanup_schema(admin, app, &schema).await;
+    app.close().await;
+    admin.close().await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_retries_cannot_overwrite_the_same_committed_append_position() {
     let schema = schema_name();
+    let cleanup_admin = pool(&admin_url(), &schema).await;
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let admin = pool(&admin_url(), &schema).await;
     setup_schema(&admin, &schema).await;
     let app = pool(&app_url(), &schema).await;
@@ -632,12 +641,18 @@ async fn concurrent_retries_cannot_overwrite_the_same_committed_append_position(
     let (_, status, _, _) = read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
     assert_eq!(status, "passed", "terminal anchor state is monotone");
 
-    cleanup_schema(admin, app, &schema).await;
+    app.close().await;
+    admin.close().await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
     let schema = schema_name();
+    let cleanup_admin = pool(&admin_url(), &schema).await;
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let admin = pool(&admin_url(), &schema).await;
     setup_schema(&admin, &schema).await;
     let app = pool(&app_url(), &schema).await;
@@ -714,7 +729,10 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
         !flushed.pointers.is_empty(),
         "the flush produced at least one pointer"
     );
-    cleanup_schema(admin, app, &schema).await;
+    app.close().await;
+    admin.close().await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -724,6 +742,9 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
     // with NO sealed-segment ref. This path is reachable via the real sink (drain_pointers returns
     // ALL buffered pointers at finish) but was previously unexercised end-to-end (verifier gap).
     let schema = schema_name();
+    let cleanup_admin = pool(&admin_url(), &schema).await;
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let admin = pool(&admin_url(), &schema).await;
     setup_schema(&admin, &schema).await;
     let app = pool(&app_url(), &schema).await;
@@ -796,5 +817,8 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
         "the anchor closed even with no sealed segment"
     );
     assert!(byte_end.is_some());
-    cleanup_schema(admin, app, &schema).await;
+    app.close().await;
+    admin.close().await;
+    })
+    .await;
 }

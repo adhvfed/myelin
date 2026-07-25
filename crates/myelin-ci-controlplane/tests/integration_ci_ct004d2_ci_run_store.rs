@@ -17,6 +17,9 @@
 //!     --test integration_ci_ct004d2_ci_run_store -- --nocapture
 #![cfg(feature = "integration")]
 
+mod common;
+
+use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_run_store_factory, CiRunInsert, CiRunStoreError, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
     ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
@@ -91,6 +94,9 @@ fn run_id(n: u64) -> String {
 async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
     let schema = schema_name();
     let admin = pool_on(&admin_url(), &schema).await;
+    let cleanup_admin = admin.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
 
     // ── Build the schema + the FORCE-RLS ci_run table (the ONE platform tenant-scoping helper), grant
     //    the app role USAGE + table privileges (mirrors integration_ci_p6). ──
@@ -586,9 +592,7 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         "collision rollback removes the co-commit dedup mark"
     );
 
-    admin
-        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
     println!("[chunk4/store] PASS ci_run store: exact replay verification; typed immutable collisions; concurrent winner visibility; RLS conflict hiding; lifecycle/erasure monotonicity; HandlerTx dedup rollback.");
+    })
+    .await;
 }

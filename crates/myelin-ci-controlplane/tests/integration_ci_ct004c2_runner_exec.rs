@@ -28,16 +28,19 @@
 //!     --test integration_ci_ct004c2_runner_exec -- --nocapture
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_region_queue_store_test_support, DurableEnqueue, DurableLeaseAdapter,
     DurableLogPersist, EnqueueOutcome, JobSpecResolver, Lane, LeasedJob, LogPipelineSink,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
     ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
-    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
-    CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
+    CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
@@ -174,6 +177,14 @@ async fn activate_job_owner(admin: &PgPool, job: &DurableEnqueue) {
 /// CT-004f capstone: also create the log index tables + the durable outbox in the schema (the live
 /// `LogPipelineSink`/`DurableLogPersist` seal to `log_segment`/`log_anchor` + emit `ci.log.available`
 /// to the outbox, all unqualified → the pinned `search_path` resolves them here).
+///
+/// Also creates `ci_job_spec`: `DurableLogPersist::resume_async` (the live sink's resume path) joins
+/// `ci_job_spec` to `job_queue` on `(tenant, region, job_id, run_id)` to resolve the log route's
+/// canonical `ci_run_id` — WITHOUT a `ci_job_spec` row for the exact job/run, that join returns no
+/// rows and the real `ship_frame` call fails closed with "no rows returned by a query that expected
+/// to return at least one row" (the bug this file's capstone test hit before this fix; see
+/// `integration_ci_ct004f_durable_log_persist.rs`'s `seed_log_route` for the sibling pattern this
+/// mirrors).
 async fn create_log_tables(admin: &PgPool) {
     for (base, ddl) in [
         ("log_segment", CREATE_LOG_SEGMENT_DDL),
@@ -189,16 +200,33 @@ async fn create_log_tables(admin: &PgPool) {
             .expect("RLS-scope the log index table");
     }
     admin
+        .execute(CREATE_CI_JOB_SPEC_DDL)
+        .await
+        .expect("create ci_job_spec (the durable log-resume route table)");
+    admin
         .execute(OUTBOX_MIGRATION)
         .await
         .expect("create the durable outbox");
 }
 
-async fn drop_schema(admin: &PgPool, schema: &str) {
-    admin
-        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
+/// Seed the `ci_job_spec` row the live log sink's resume join requires: `(tenant, region, job_id,
+/// run_id)` must match the `job_queue` row exactly, and `spec->>'ci_run_id'` must be the SAME run
+/// uuid the rest of the test uses (here, the job_queue row's own `run_id` — this test has no separate
+/// ci_run identity distinct from the workflow run).
+async fn seed_log_route(admin: &PgPool, tenant: &str, region: &str, job_id: Uuid, run_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO ci_job_spec (tenant_id, region, job_id, run_id, idem_token, spec) \
+         VALUES ($1, $2, $3, $4, $5, jsonb_build_object('ci_run_id', $6))",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(job_id)
+    .bind(run_id)
+    .bind(format!("idem-log-route-{job_id}"))
+    .bind(run_id.to_string())
+    .execute(admin)
+    .await
+    .expect("seed the ci_job_spec log route (resume_async's job_queue join target)");
 }
 
 /// A stable uuid from a name (FNV-1a fill) — the durable `uuid` columns require real uuids.
@@ -386,9 +414,12 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
         return;
     }
     let schema = schema_name("e2e");
+    let admin = admin_pool("e2e").await;
+    let cleanup_admin = admin.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let region = "fr-par";
     let tenant = "tenantA";
-    let admin = admin_pool("e2e").await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
     let region_store = ci_region_queue_store_test_support(admin.clone());
@@ -540,11 +571,12 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
         "the lease is completed on terminal (settle)"
     );
 
-    drop_schema(&admin, &schema).await;
     println!(
         "[CT-004c.2] PASS end-to-end: durable claim → REAL runsc guest ran `echo hello-ct004c2` \
          (exit 0) → job.done buffered ONCE (references-not-payloads) → durable lease completed"
     );
+    })
+    .await;
 }
 
 // ═══════════ 1b. CT-004f CAPSTONE — real runsc guest → LIVE log sink → readable from CAS ══════════
@@ -561,11 +593,14 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
     if !require_or_skip("ct004f-capstone") {
         return;
     }
-    const MARKER: &str = "CAPSTONE-LOG-MARKER-9f3a";
     let schema = schema_name("capstone");
+    let admin = admin_pool("capstone").await;
+    let cleanup_admin = admin.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
+    const MARKER: &str = "CAPSTONE-LOG-MARKER-9f3a";
     let region = "fr-par";
     let tenant = "tenantA";
-    let admin = admin_pool("capstone").await;
     create_schema(&admin, &schema).await;
     create_log_tables(&admin).await;
     let store = ci_job_queue_store(admin.clone());
@@ -587,6 +622,7 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
         EnqueueOutcome::Inserted
     );
     activate_job_owner(&admin, &job).await;
+    seed_log_route(&admin, tenant, region, uid("capstone-job"), uid("capstone-run")).await;
 
     let executor = FlowExecutor::new(
         Arc::new(FixedMinter(run_uuid.clone())),
@@ -707,11 +743,12 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
         "the REAL runsc guest's stdout must be readable back from the CAS via the log index. got: {readable:?}"
     );
 
-    drop_schema(&admin, &schema).await;
     println!(
         "[CT-004f] PASS capstone: durable claim → REAL runsc guest ran `echo {MARKER}` → sealed to \
          S3 CAS → log_segment/log_anchor index + ci.log.available outbox → guest stdout readable from CAS"
     );
+    })
+    .await;
 }
 
 // ═════════════════════════════ 2. SECURITY (a): tier filter survives the adapter ═════════════════
@@ -719,9 +756,12 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
     let schema = schema_name("tier");
+    let admin = admin_pool("tier").await;
+    let cleanup_admin = admin.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let region = "fr-par";
     let tenant = "tenantA";
-    let admin = admin_pool("tier").await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
     let region_store = ci_region_queue_store_test_support(admin.clone());
@@ -802,10 +842,11 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
     );
     assert_eq!(ok.unwrap().job_id, uid("fork-job").to_string());
 
-    drop_schema(&admin, &schema).await;
     println!(
         "[CT-004c.2] PASS SECURITY(a): the trust-tier claim predicate survives the durable adapter"
     );
+    })
+    .await;
 }
 
 // ═════════════════════════════ 3. SECURITY (b): region isolation ═════════════════════════════════
@@ -813,8 +854,11 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn region_a_runner_never_claims_region_b_job() {
     let schema = schema_name("region");
-    let tenant = "tenantA";
     let admin = admin_pool("region").await;
+    let cleanup_admin = admin.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
+    let tenant = "tenantA";
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
     let region_store = ci_region_queue_store_test_support(admin.clone());
@@ -864,8 +908,9 @@ async fn region_a_runner_never_claims_region_b_job() {
         .unwrap();
     assert_eq!(state, "queued", "the region-B job stays queued");
 
-    drop_schema(&admin, &schema).await;
     println!("[CT-004c.2] PASS SECURITY(b): region isolation survives the durable adapter");
+    })
+    .await;
 }
 
 // ═════════════════════════════ 4. SECURITY (c): stolen lease → no double-run ══════════════════════
@@ -873,9 +918,12 @@ async fn region_a_runner_never_claims_region_b_job() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stolen_lease_fails_heartbeat_no_double_run() {
     let schema = schema_name("steal");
+    let admin = admin_pool("steal").await;
+    let cleanup_admin = admin.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let region = "fr-par";
     let tenant = "tenantA";
-    let admin = admin_pool("steal").await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
     let region_store = ci_region_queue_store_test_support(admin.clone());
@@ -966,10 +1014,11 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
     );
     assert!(b_held, "the true owner (worker-B) heartbeats its own lease");
 
-    drop_schema(&admin, &schema).await;
     println!(
         "[CT-004c.2] PASS SECURITY(c): a stolen lease fails the heartbeat guard — no double-run"
     );
+    })
+    .await;
 }
 
 // A tiny compile/behaviour anchor so the RunnerError variants the loop matches stay in view.

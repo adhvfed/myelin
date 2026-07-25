@@ -26,10 +26,14 @@
 //!     --test integration_ci_ct004d2_culmination -- --nocapture
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+
+use common::with_schema_cleanup;
 
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support,
@@ -40,7 +44,7 @@ use myelin_ci_controlplane::{
     ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
     ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, CREATE_CI_JOB_DDL,
     CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
     CREATE_JOB_QUEUE_INDEXES_DDL,
 };
@@ -152,6 +156,20 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL)
         .await
         .expect("add ci_run PR ordering authority");
+    // BUG FIX (investigation, 2026-07-25): this per-pid schema never created its own `ci_job`
+    // table. `AUTHORIZE_JOB_LAUNCH_QUERY` (the launch CAS every real claim crosses) requires a
+    // matching `ci_job` row to also cross `queued`/`leased` -> `running` in the SAME statement —
+    // without this table, `search_path`'s `public` fallback silently resolved every `ci_job`
+    // reference to the SHARED dev database's `public.ci_job` (leftover rows from unrelated runs),
+    // which never has a row for this schema's `job_id`. The CAS therefore matched zero rows EVERY
+    // time (100% reproducible, not a timing/race artifact — confirmed by 5/5 identical failures
+    // within ~1.3s each, far under any claim TTL). Creating the real per-schema table here — and
+    // seeding the matching row at dispatch time below — is what a real push's starter
+    // (`pg_pipeline_starter.rs`'s `materialize_ci_jobs`) already does for every run.
+    admin
+        .execute(CREATE_CI_JOB_DDL)
+        .await
+        .expect("create ci_job (the starter-owned DAG surface the launch CAS crosses)");
     admin
         .execute(CREATE_JOB_QUEUE_DDL)
         .await
@@ -453,6 +471,13 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         return;
     }
     let schema = schema_name("e2e");
+    // A cleanup-dedicated pool: `with_schema_cleanup` unconditionally drops `schema` through THIS
+    // pool once the test body (success, assertion failure, or panic) finishes, so the schema never
+    // outlives this test regardless of outcome (previously it was ONLY dropped at the START of this
+    // same test's NEXT run, letting orphaned schemas accumulate on this shared dev Postgres).
+    let cleanup_admin = admin_pool(&schema).await;
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let region = "fr-par";
     let tenant = "tenant-a";
     let admin = admin_pool(&schema).await;
@@ -638,6 +663,36 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         "the executing spec's tier == the gate tier (no widening)"
     );
 
+    // Mirror the starter's `materialize_ci_jobs` (`pg_pipeline_starter.rs`): a real push-triggered
+    // run has its whole `ci_job` DAG row set (state='queued') materialized at arm time, BEFORE any
+    // stage dispatch. This test drives the pipeline directly (see the note above), so it must seed
+    // the single `build` job's `ci_job` row itself — `AUTHORIZE_JOB_LAUNCH_QUERY`'s launch CAS
+    // requires a matching `ci_job` row to cross `queued`/`leased` -> `running` in the SAME
+    // statement, and without it the CAS deterministically matches zero rows (see the `create_schema`
+    // comment for the full diagnosis).
+    let dispatched_job_id: Uuid =
+        sqlx::query_scalar("SELECT job_id FROM job_queue WHERE run_id = $1")
+            .bind(uid("d2-wf-run"))
+            .fetch_one(&admin)
+            .await
+            .expect("the dispatched job_queue row's job_id");
+    // `ci_job.run_id` FKs to `ci_run.run_id` (the CI run id, `run_uuid`) — NOT `job_queue.run_id`
+    // (which is the workflow's `wf_run_id`). The launch CAS itself only matches `ci_job` on
+    // `(tenant_id, region, job_id)`, so only `job_id` must line up with the dispatched row.
+    sqlx::query(
+        "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, spec_ref, \
+         state, attempt) \
+         VALUES ($1, $2, $3, $4::uuid, 'build', 'build', '{}'::uuid[], $5, 'queued', 1)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(dispatched_job_id)
+    .bind(&run_uuid)
+    .bind("blake3:d2snapshot")
+    .execute(&admin)
+    .await
+    .expect("seed the starter-owned ci_job surface row the launch CAS crosses");
+
     // ── The durable-backed runner claims + executes in real runsc. The PostgreSQL-only reporter
     //    consumes the exact claim and inserts job.done atomically; it has no FlowExecutor mirror. ──
     let resolver = durable_spec_resolver_test_support(
@@ -788,6 +843,8 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
          dispatch → REAL runsc guest ran `echo hello-ct004d2-pipeline` (exit 0) → job.done woke the \
          parked run → run COMPLETED → ci.run.succeeded emitted. A push runs a real pipeline."
     );
+    })
+    .await;
 }
 
 /// The engine-minted dispatch `idem_token` for the single build stage (command position 0): the
@@ -875,6 +932,23 @@ async fn arm_and_dispatch(
             .fetch_one(admin)
             .await
             .expect("the dispatched ci_job_spec row");
+    // Mirror the starter's `materialize_ci_jobs` (see the `create_schema`/`a_push_...` comments):
+    // the launch CAS (`AUTHORIZE_JOB_LAUNCH_QUERY`) requires a matching `ci_job` row to cross
+    // `queued`/`leased` -> `running` in the SAME statement. `ci_job.run_id` FKs to `ci_run.run_id`
+    // (`run_uuid`), not the workflow `wf_run_id` `ci_job_spec`/`job_queue` key on.
+    sqlx::query(
+        "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, spec_ref, \
+         state, attempt) \
+         VALUES ($1, $2, $3, $4::uuid, 'build', 'build', '{}'::uuid[], 'blake3:cbcsnapshot', \
+         'queued', 1)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(job_id)
+    .bind(&run_uuid)
+    .execute(admin)
+    .await
+    .expect("seed the starter-owned ci_job surface row the launch CAS crosses");
     (run, job_id.to_string(), idem)
 }
 
@@ -976,6 +1050,11 @@ fn completion_claim(
 async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
     let _test_guard = TEST_LOCK.lock().await;
     let schema = schema_name("claim");
+    // See `a_push_runs_a_real_pipeline_end_to_end`'s cleanup comment: this pool unconditionally
+    // drops `schema` after the test body finishes, however it finishes.
+    let cleanup_admin = admin_pool(&schema).await;
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let region = "fr-par";
     let tenant = "tenantA";
     let admin = admin_pool(&schema).await;
@@ -1232,4 +1311,6 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
     );
 
     drop_schema(&admin, &schema).await;
+    })
+    .await;
 }

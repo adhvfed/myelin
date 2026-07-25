@@ -40,6 +40,8 @@ use myelin_tenancy::{Region, TenantId};
 
 use myelin_harness::load_generator::{LoadGenerator, Multiplier, PrincipalMix, Sink, StormProfile};
 
+mod common;
+
 // ----------------------------------------------------------------------------------------------
 // shared helpers (mirrors stage3_drills.rs — admin role for DDL/seed)
 // ----------------------------------------------------------------------------------------------
@@ -235,62 +237,11 @@ async fn load_10x_containerized_smoke() {
     .execute(&pool)
     .await
     .expect("create load state table");
-
-    // 10× the baseline. base=20 → 200 requests at 10×. A real-but-bounded containerized burst
-    // (the 30× world-scale number is the named floor; 10× is the smoke).
-    let tenants = vec![
-        TenantId(format!("acme-load-{tag}")),
-        TenantId(format!("globex-load-{tag}")),
-    ];
-    let gen = LoadGenerator::new(
-        20,
-        Multiplier::STRESS, // 10×
-        PrincipalMix::balanced(),
-        StormProfile::collab_op_stream(),
-        tenants.clone(),
-    )
-    .expect("non-empty tenant list");
-
-    let mut sink = CollectingSink::default();
-    gen.drive(&mut sink);
-    let total = gen.total_requests() as usize;
-    assert_eq!(
-        sink.issued.len(),
-        total,
-        "the generator issued exactly base*10 requests"
-    );
-    assert_eq!(
-        total, 200,
-        "10× of base=20 is 200 requests (the containerized burst)"
-    );
-
-    // Co-commit ONE outbox event per issued request, in the SAME tx as a domain state change
-    // (emit-iff-committed). The aggregate is per (tenant) so the outbox `seq` is monotonic per
-    // aggregate; we use the global issue order as the unique id.
-    let relay = store.relay();
     let agg = format!("issue:LOAD10X-{tag}");
-    let mut committed: std::collections::HashSet<EventId> = std::collections::HashSet::new();
-    for (i, (tenant, _req_seq)) in sink.issued.iter().enumerate() {
-        let id = format!("load10x-evt-{tag}-{i}");
-        relay
-            .enqueue_with_state(
-                &state_table,
-                &format!("state-{i}"),
-                &agg,
-                i as i64,
-                &envelope(&id, tenant, &agg),
-            )
-            .await
-            .expect("co-commit state + outbox row under load");
-        committed.insert(EventId(id));
-    }
-    assert_eq!(
-        relay.outbox_depth().await.expect("depth") as usize,
-        total,
-        "all {total} load events durably committed + unsent before the drain"
-    );
 
-    // Drain to real NATS JetStream and assert the outbox drains to 0 (no loss under the burst).
+    // The real NATS JetStream bus (durable stream + durable PULL consumer). Connected HERE (ahead
+    // of the wrapped body below, moved up from its original position right before the drain step)
+    // so `bus.purge()` is available to the cleanup closure regardless of how the body exits.
     let stream = format!("MYELIN_LOAD10X_{}", tag.replace('-', "_"));
     let subject_root = format!("myelin_load10x_{}", tag.replace('-', "_"));
     let consumer = format!("{stream}_pull");
@@ -304,69 +255,134 @@ async fn load_10x_containerized_smoke() {
     .expect("connect NATS JetStream bus (is the stack up with -js?)");
     tokio::task::block_in_place(|| bus.purge());
 
-    // Drain in batches until the outbox is empty (a few passes for 200 rows at batch 64).
-    let mut published_total = 0usize;
-    for _ in 0..16 {
-        let n = relay
-            .relay_once(&bus, 64)
-            .await
-            .expect("relay drain pass under load");
-        published_total += n as usize;
-        if relay.outbox_depth().await.expect("depth") == 0 {
-            break;
-        }
-    }
-    assert_eq!(
-        relay.outbox_depth().await.expect("final depth"),
-        0,
-        "the outbox drained to 0 under the 10× containerized load (no loss)"
-    );
-    assert!(
-        published_total >= total,
-        "every committed event was published (>= {total}); got {published_total}"
-    );
+    // Wrapped so a mid-test assertion failure or panic still drops this run's state table +
+    // outbox rows + NATS stream, instead of only the happy path reaching the final cleanup below
+    // (see tests/common/mod.rs).
+    common::with_cleanup(
+        || async {
+            // 10× the baseline. base=20 → 200 requests at 10×. A real-but-bounded containerized
+            // burst (the 30× world-scale number is the named floor; 10× is the smoke).
+            let tenants = vec![
+                TenantId(format!("acme-load-{tag}")),
+                TenantId(format!("globex-load-{tag}")),
+            ];
+            let gen = LoadGenerator::new(
+                20,
+                Multiplier::STRESS, // 10×
+                PrincipalMix::balanced(),
+                StormProfile::collab_op_stream(),
+                tenants.clone(),
+            )
+            .expect("non-empty tenant list");
 
-    // Drain the durable consumer; assert every committed event delivered exactly-once.
-    let mut delivered: std::collections::HashMap<EventId, usize> = std::collections::HashMap::new();
-    for _ in 0..16 {
-        let batch = tokio::task::block_in_place(|| bus.consume(&subject_root));
-        if batch.is_empty() {
-            break;
-        }
-        for env in &batch {
-            *delivered.entry(env.event_id.clone()).or_insert(0) += 1;
-            tokio::task::block_in_place(|| bus.ack(&consumer, &env.event_id));
-        }
-    }
-    let delivered_ids: std::collections::HashSet<EventId> = delivered.keys().cloned().collect();
-    assert_eq!(
-        delivered_ids, committed,
-        "0 lost under 10× load: the delivered set equals exactly the committed set"
-    );
-    for (id, count) in &delivered {
-        assert_eq!(
-            *count, 1,
-            "0 ghost under 10× load: {id:?} delivered exactly once"
-        );
-    }
+            let mut sink = CollectingSink::default();
+            gen.drive(&mut sink);
+            let total = gen.total_requests() as usize;
+            assert_eq!(
+                sink.issued.len(),
+                total,
+                "the generator issued exactly base*10 requests"
+            );
+            assert_eq!(
+                total, 200,
+                "10× of base=20 is 200 requests (the containerized burst)"
+            );
 
-    println!(
-        "[2026-06-19] PASS  smoke=LOAD-10X-CONTAINERIZED  multiplier=10x base=20 issued={total} \
-         committed={total} delivered={total} lost=0 ghost=0 outbox_depth=0  \
-         backend=real-PG+real-NATS-JetStream  tenants={}  FLOOR-STILL-OPEN: the WORLD-SCALE 30x \
-         LOAD drill needs real hardware (multi-node cluster), not a single dev box",
-        tenants.len()
-    );
+            // Co-commit ONE outbox event per issued request, in the SAME tx as a domain state change
+            // (emit-iff-committed). The aggregate is per (tenant) so the outbox `seq` is monotonic
+            // per aggregate; we use the global issue order as the unique id.
+            let relay = store.relay();
+            let mut committed: std::collections::HashSet<EventId> = std::collections::HashSet::new();
+            for (i, (tenant, _req_seq)) in sink.issued.iter().enumerate() {
+                let id = format!("load10x-evt-{tag}-{i}");
+                relay
+                    .enqueue_with_state(
+                        &state_table,
+                        &format!("state-{i}"),
+                        &agg,
+                        i as i64,
+                        &envelope(&id, tenant, &agg),
+                    )
+                    .await
+                    .expect("co-commit state + outbox row under load");
+                committed.insert(EventId(id));
+            }
+            assert_eq!(
+                relay.outbox_depth().await.expect("depth") as usize,
+                total,
+                "all {total} load events durably committed + unsent before the drain"
+            );
 
-    // cleanup
-    sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
-        .bind(&agg)
-        .execute(&pool)
-        .await
-        .ok();
-    sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {state_table}"))
-        .execute(&pool)
-        .await
-        .ok();
-    tokio::task::block_in_place(|| bus.purge());
+            // Drain to real NATS JetStream and assert the outbox drains to 0 (no loss under the
+            // burst).
+            // Drain in batches until the outbox is empty (a few passes for 200 rows at batch 64).
+            let mut published_total = 0usize;
+            for _ in 0..16 {
+                let n = relay
+                    .relay_once(&bus, 64)
+                    .await
+                    .expect("relay drain pass under load");
+                published_total += n as usize;
+                if relay.outbox_depth().await.expect("depth") == 0 {
+                    break;
+                }
+            }
+            assert_eq!(
+                relay.outbox_depth().await.expect("final depth"),
+                0,
+                "the outbox drained to 0 under the 10× containerized load (no loss)"
+            );
+            assert!(
+                published_total >= total,
+                "every committed event was published (>= {total}); got {published_total}"
+            );
+
+            // Drain the durable consumer; assert every committed event delivered exactly-once.
+            let mut delivered: std::collections::HashMap<EventId, usize> =
+                std::collections::HashMap::new();
+            for _ in 0..16 {
+                let batch = tokio::task::block_in_place(|| bus.consume(&subject_root));
+                if batch.is_empty() {
+                    break;
+                }
+                for env in &batch {
+                    *delivered.entry(env.event_id.clone()).or_insert(0) += 1;
+                    tokio::task::block_in_place(|| bus.ack(&consumer, &env.event_id));
+                }
+            }
+            let delivered_ids: std::collections::HashSet<EventId> =
+                delivered.keys().cloned().collect();
+            assert_eq!(
+                delivered_ids, committed,
+                "0 lost under 10× load: the delivered set equals exactly the committed set"
+            );
+            for (id, count) in &delivered {
+                assert_eq!(
+                    *count, 1,
+                    "0 ghost under 10× load: {id:?} delivered exactly once"
+                );
+            }
+
+            println!(
+                "[2026-06-19] PASS  smoke=LOAD-10X-CONTAINERIZED  multiplier=10x base=20 issued={total} \
+                 committed={total} delivered={total} lost=0 ghost=0 outbox_depth=0  \
+                 backend=real-PG+real-NATS-JetStream  tenants={}  FLOOR-STILL-OPEN: the WORLD-SCALE 30x \
+                 LOAD drill needs real hardware (multi-node cluster), not a single dev box",
+                tenants.len()
+            );
+        },
+        || async {
+            // cleanup. See `common::delete_outbox_for_aggregate` for why this isn't a bare
+            // `DELETE FROM outbox WHERE aggregate = $1`: `outbox_quarantine` FKs to `outbox` with
+            // `ON DELETE RESTRICT`, and a concurrent quarantine sweep on this shared dev DB
+            // (confirmed live) can otherwise leave this run's tagged rows stuck forever.
+            common::delete_outbox_for_aggregate(&pool, &agg).await;
+            sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {state_table}"))
+                .execute(&pool)
+                .await
+                .ok();
+            tokio::task::block_in_place(|| bus.purge());
+        },
+    )
+    .await;
 }

@@ -1,8 +1,11 @@
 //! Live CT-005 proof for the durable CI run read authority.
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use common::with_schema_cleanup;
 use myelin_ci_controlplane::surfacing_store::{
     CiLogRangeRequest, CiRunPageRequest, CiRunStateFilter, CiRunSurfaceError,
 };
@@ -200,6 +203,9 @@ async fn insert_detail(app: &PgPool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_list_and_detail_are_visibility_scoped_keyset_and_rls_safe() {
     let schema = schema_name();
+    let cleanup_admin = pool(&admin_url(), &schema).await;
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let admin = pool(&admin_url(), &schema).await;
     setup_schema(&admin, &schema).await;
     let app = pool(&app_url(), &schema).await;
@@ -488,9 +494,7 @@ async fn run_list_and_detail_are_visibility_scoped_keyset_and_rls_safe() {
     );
 
     app.close().await;
-    admin
-        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .expect("drop isolated schema");
     admin.close().await;
+    })
+    .await;
 }

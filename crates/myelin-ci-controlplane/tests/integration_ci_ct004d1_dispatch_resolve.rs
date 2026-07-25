@@ -31,11 +31,14 @@
 //!     --test integration_ci_ct004d1_dispatch_resolve -- --nocapture
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support,
     durable_spec_resolver_test_support, CiJobSpecStoreError, CiJobTokenIssueError,
@@ -164,13 +167,6 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         )
         .await
         .expect("create authoritative CI lifecycle table");
-}
-
-async fn drop_schema(admin: &PgPool, schema: &str) {
-    admin
-        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
 }
 
 /// A stable uuid from a name (FNV-1a fill) — the durable `uuid` columns require real uuids.
@@ -411,9 +407,12 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
         return;
     }
     let schema = schema_name("e2e");
+    let admin = admin_pool("e2e").await;
+    let cleanup_admin = admin.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let region = "fr-par";
     let tenant = "tenantA";
-    let admin = admin_pool("e2e").await;
     create_schema(&admin, &schema).await;
 
     let queue = ci_job_queue_store(admin.clone());
@@ -606,11 +605,12 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
         "the (tenant, job_id) PK collapses the re-persist"
     );
 
-    drop_schema(&admin, &schema).await;
     println!(
         "[CT-004d.1] PASS end-to-end: real dispatch co-persisted job+spec → durable resolver read the \
          EXACT spec → REAL runsc guest ran it → job.done ONCE → lease terminal → re-dispatch idempotent"
     );
+    })
+    .await;
 }
 
 // ═══════════════ 2. THE SECURITY INVARIANT: the gate is fed from the spec, not widened ════════════
@@ -618,9 +618,12 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dispatch_feeds_trust_and_region_from_the_spec_never_widened() {
     let schema = schema_name("feed");
+    let admin = admin_pool("feed").await;
+    let cleanup_admin = admin.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let region = "fr-par";
     let tenant = "tenantA";
-    let admin = admin_pool("feed").await;
     create_schema(&admin, &schema).await;
     let specs = ci_job_spec_store(admin.clone());
 
@@ -688,14 +691,18 @@ async fn dispatch_feeds_trust_and_region_from_the_spec_never_widened() {
         "the refused dispatch wrote NO job_queue row (fail-closed before any write)"
     );
 
-    drop_schema(&admin, &schema).await;
     println!("[CT-004d.1] PASS: the job_queue trust_tier/region are FED from the spec; a widened gate is refused");
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dispatch_replay_requires_exact_queue_and_spec_identity() {
     let schema = schema_name("exact_replay");
     let admin = admin_pool("exact_replay").await;
+    let cleanup_admin = admin.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     create_schema(&admin, &schema).await;
     let store = ci_job_spec_store(admin.clone());
     let idem = "exact-replay-idem";
@@ -756,8 +763,8 @@ async fn dispatch_replay_requires_exact_queue_and_spec_identity() {
         spec,
         "the original executable spec remains authoritative"
     );
-
-    drop_schema(&admin, &schema).await;
+    })
+    .await;
 }
 
 // ═══════════════ 3. SECURITY REGRESSION: the tier gate survives the real dispatch+resolve path ════
@@ -765,9 +772,12 @@ async fn dispatch_replay_requires_exact_queue_and_spec_identity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trusted_runner_never_executes_a_dispatched_untrusted_fork() {
     let schema = schema_name("fork");
+    let admin = admin_pool("fork").await;
+    let cleanup_admin = admin.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let region = "fr-par";
     let tenant = "tenantA";
-    let admin = admin_pool("fork").await;
     create_schema(&admin, &schema).await;
     let queue = ci_job_queue_store(admin.clone());
     let specs = ci_job_spec_store(admin.clone());
@@ -826,10 +836,11 @@ async fn trusted_runner_never_executes_a_dispatched_untrusted_fork() {
         "the untrusted_fork stage stays queued (unclaimed by the trusted-only runner)"
     );
 
-    drop_schema(&admin, &schema).await;
     println!(
         "[CT-004d.1] PASS: the trust-tier gate survives the real dispatch + real resolver path"
     );
+    })
+    .await;
 }
 
 // ═══════════════ 4. FAIL-CLOSED RESOLVE: a leased row with no spec never launches ════════════════
@@ -837,9 +848,12 @@ async fn trusted_runner_never_executes_a_dispatched_untrusted_fork() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_leased_row_without_a_spec_resolves_fail_closed() {
     let schema = schema_name("nospec");
+    let admin = admin_pool("nospec").await;
+    let cleanup_admin = admin.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let region = "fr-par";
     let tenant = "tenantA";
-    let admin = admin_pool("nospec").await;
     create_schema(&admin, &schema).await;
     let queue = ci_job_queue_store(admin.clone());
     let specs = ci_job_spec_store(admin.clone());
@@ -903,8 +917,9 @@ async fn a_leased_row_without_a_spec_resolves_fail_closed() {
         "the unresolved row stays leased (the reaper re-queues it; never launched)"
     );
 
-    drop_schema(&admin, &schema).await;
     println!("[CT-004d.1] PASS: a leased row with no durable spec resolves fail-closed — no launch, reaped");
+    })
+    .await;
 }
 
 // ═══════════════ 5. the wired lease TTL exceeds the max job timeout (the double-run fix) ══════════

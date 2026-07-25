@@ -1123,14 +1123,18 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     assert_eq!(closed_envelope["payload"]["category"], "completed");
 
     // Exact generated-tenant cleanup. Projection state is last because row/tuple deletion triggers
-    // intentionally invalidate it again.
+    // intentionally invalidate it again. `outbox` is handled separately, below, because a live
+    // elected relay (e.g. `myelin-outbox-publisher serve`) sharing this Postgres continuously
+    // quarantines this tenant's own `iam.tuple.written` outbox rows (`iam` is not an admitted Bus
+    // taxonomy subsystem token, so every one of them is permanently rejected —
+    // `myelin_events::taxonomy::SUBSYSTEM_TOKENS`), and `outbox_quarantine_event_id_fkey` is
+    // `ON DELETE RESTRICT`, so a plain `DELETE FROM outbox` can lose a race against the relay.
     for statement in [
         "DELETE FROM issue_authz_binding WHERE tenant_id = $1",
         "DELETE FROM issue WHERE tenant_id = $1",
         "DELETE FROM prefix_counter WHERE tenant_id = $1",
         "DELETE FROM rebac_tuple WHERE tenant_id = $1",
         "DELETE FROM issue_authz_visible WHERE tenant_id = $1",
-        "DELETE FROM outbox WHERE envelope->>'tenant' = $1",
         "DELETE FROM authz_projection_state WHERE tenant_id = $1",
     ] {
         sqlx::query(statement)
@@ -1143,5 +1147,41 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
             .execute(&admin)
             .await
             .unwrap();
+    }
+    delete_tenant_outbox_despite_concurrent_relay_quarantine(&admin, &tenant).await;
+    delete_tenant_outbox_despite_concurrent_relay_quarantine(&admin, &foreign_tenant).await;
+}
+
+/// Delete every `outbox` row for `tenant`, tolerating a concurrently running elected relay (this
+/// dev Postgres has a real `myelin-outbox-publisher serve` polling it) that may quarantine one of
+/// this tenant's own rows between the moment we clear `outbox_quarantine` and the moment we issue
+/// `DELETE FROM outbox`. `outbox_quarantine_event_id_fkey` is `ON DELETE RESTRICT`, so that plain
+/// delete fails whenever the relay wins the race. The relay quarantines each row at most once and
+/// this tenant's row set is finite, so re-clearing quarantine and retrying converges quickly.
+async fn delete_tenant_outbox_despite_concurrent_relay_quarantine(admin: &sqlx::PgPool, tenant: &str) {
+    const ATTEMPTS: u32 = 20;
+    for attempt in 0..ATTEMPTS {
+        sqlx::query(
+            "DELETE FROM outbox_quarantine WHERE event_id IN \
+             (SELECT event_id FROM outbox WHERE envelope->>'tenant' = $1)",
+        )
+        .bind(tenant)
+        .execute(admin)
+        .await
+        .expect("clear this tenant's quarantined outbox rows");
+        match sqlx::query("DELETE FROM outbox WHERE envelope->>'tenant' = $1")
+            .bind(tenant)
+            .execute(admin)
+            .await
+        {
+            Ok(_) => return,
+            Err(sqlx::Error::Database(db_error))
+                if db_error.constraint() == Some("outbox_quarantine_event_id_fkey")
+                    && attempt + 1 < ATTEMPTS =>
+            {
+                continue;
+            }
+            Err(err) => panic!("tenant outbox cleanup failed for {tenant}: {err}"),
+        }
     }
 }

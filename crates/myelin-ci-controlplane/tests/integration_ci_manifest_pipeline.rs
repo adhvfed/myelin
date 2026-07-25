@@ -17,6 +17,7 @@ use myelin_ci_controlplane::{
     CiRunStoreError, CiWorkflowDefinitionPin, PgCiPipelineStarter, PreparedRunPlanV2,
     ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
 };
+use futures::FutureExt;
 use myelin_ci_sandbox::TrustTier;
 use myelin_config::MyelinConfig;
 use myelin_events::{Actor, IdMinter, MonotonicMinter};
@@ -277,6 +278,17 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         .await
         .unwrap();
     let pool = pool_on(&schema).await;
+    // BUG FIX (investigation, 2026-07-25): this test's ONLY cleanup used to be the
+    // `pool.close(); bare.execute(DROP SCHEMA ...)` pair at the very end of the happy path — so a
+    // panicking assertion or `.unwrap()` anywhere in between (this test hit exactly that, via a
+    // genuinely separate `pg_pipeline_starter.rs` "manifest check context has no run-scoped
+    // allocation ledger" bug) left `ci_manifest_dag_<pid>` behind forever, the same class of leak
+    // found and fixed across 21 other files today. Wrapping the body in catch_unwind + unconditional
+    // cleanup + resume_unwind (mirrors `myelin-ci-sandbox`/`myelin-storage`'s sibling fixes) makes
+    // cleanup run whether this test passes, fails an assertion, or panics. `pool.close()` shuts down
+    // the WHOLE pool (not just this handle) for every clone, so it must run AFTER the wrapped body,
+    // never inside it.
+    let result = std::panic::AssertUnwindSafe(async {
     PgMigrator::apply(&pool, &foundation_migrations())
         .await
         .unwrap();
@@ -577,8 +589,21 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         ]
     );
 
+    })
+    .catch_unwind()
+    .await;
+
     pool.close().await;
-    bare.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+    if let Err(error) = bare
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
         .await
-        .unwrap();
+    {
+        eprintln!(
+            "starter_manifest_drives_dag_across_worker_restarts_and_loader_retry: DROP SCHEMA \
+             {schema} CASCADE failed (schema may have leaked): {error}"
+        );
+    }
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }

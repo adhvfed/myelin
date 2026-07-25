@@ -35,6 +35,9 @@
 //!     --test integration_ci_ct004c_job_queue_store -- --nocapture
 #![cfg(feature = "integration")]
 
+mod common;
+
+use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_region_queue_store_test_support, make_tenant_scoped_ddl,
     CiJobLaunchClaim, CiJobQueueStore, DurableEnqueue, EnqueueOutcome, Lane,
@@ -286,6 +289,12 @@ async fn activate_job_owner(admin: &PgPool, queued: &DurableEnqueue) {
 #[tokio::test]
 async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgres() {
     let schema = schema_name();
+    // A cleanup-dedicated pool, independent of `admin`/`admin2` below (the kill-9 drill drops `admin`
+    // mid-test) — `with_schema_cleanup` unconditionally drops `schema` through THIS pool regardless of
+    // how the test body finishes (success, assertion failure, or panic).
+    let cleanup_admin = reopen_admin().await;
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
     let region = "fr-par";
     let admin = reopen_admin().await;
     create_schema(&admin, &schema).await;
@@ -1028,11 +1037,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         "RLS: the OWNING tenant GUC sees its own row (isolation is scope, not a blanket deny)"
     );
 
-    // ── cleanup ──
-    admin2
-        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .ok();
     println!(
         "[CT-004c.1] PASS job_queue store: claim honours residency+affinity+trust+lane; trusted-only \
          claim NEVER leases untrusted_fork/self_hosted (security seam); concurrent claims take \
@@ -1043,4 +1047,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
          cancel-superseded keeps the latest head; leased row survives kill-9/reopen with no ghost; \
          tenant-scoped enqueue + isolation proven under the NOBYPASSRLS app role"
     );
+    })
+    .await;
 }

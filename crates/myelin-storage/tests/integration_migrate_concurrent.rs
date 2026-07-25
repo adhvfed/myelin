@@ -39,6 +39,8 @@ use myelin_storage::PgMigrator;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+mod common;
+
 /// The number of concurrent migrators racing on the SAME database. ≥ 8 per the regression spec; 12
 /// gives the `pg_type` race ample opportunity to fire without the lock.
 const N: usize = 12;
@@ -151,58 +153,66 @@ async fn concurrent_migrate_is_race_safe_and_applied_once() {
     // Start clean (in case a prior aborted run left residue) — the genuine create-concurrently case.
     cleanup(&pool, &ids, &migrations).await;
 
-    // Spawn N tasks that ALL race to apply the SAME set against the SAME database at once. Each task
-    // gets an OWNED `PgPool` clone (Arc-backed → same underlying pool/DB) + an owned `Migrations`
-    // clone, so the migrator's borrow is of locals contained in the spawned future.
-    let mut handles = Vec::with_capacity(N);
-    for _ in 0..N {
-        let pool = pool.clone();
-        let migrations = migrations.clone();
-        handles.push(tokio::spawn(run_one(pool, migrations)));
-    }
+    // Wrapped so a mid-test assertion failure or panic still drops this run's tagged tables +
+    // migration rows, instead of only the happy path reaching the final `cleanup(...)` call below
+    // (see tests/common/mod.rs — the same structural gap the 234-orphaned-schema fix elsewhere in
+    // this repo closes, one level down: tagged tables/rows here, not a whole schema).
+    common::with_cleanup(
+        || async {
+            // Spawn N tasks that ALL race to apply the SAME set against the SAME database at once. Each
+            // task gets an OWNED `PgPool` clone (Arc-backed → same underlying pool/DB) + an owned
+            // `Migrations` clone, so the migrator's borrow is of locals contained in the spawned future.
+            let mut handles = Vec::with_capacity(N);
+            for _ in 0..N {
+                let pool = pool.clone();
+                let migrations = migrations.clone();
+                handles.push(tokio::spawn(run_one(pool, migrations)));
+            }
 
-    // (1) EVERY task returns Ok — no pg_type_typname_nsp_index duplicate-key error (the without-lock
-    //     failure mode). This is the assertion that goes RED if the advisory lock is removed.
-    let mut ok = 0usize;
-    for (i, h) in handles.into_iter().enumerate() {
-        match h.await.expect("migrator task did not panic") {
-            Ok(()) => ok += 1,
-            Err(e) => panic!(
-                "concurrent migrator task {i} FAILED: {e} — this is the pg_type_typname_nsp_index \
-                 race the advisory lock fixes (it fires WITHOUT the lock)"
-            ),
-        }
-    }
-    assert_eq!(ok, N, "all {N} concurrent migrators must return Ok");
+            // (1) EVERY task returns Ok — no pg_type_typname_nsp_index duplicate-key error (the
+            //     without-lock failure mode). This is the assertion that goes RED if the advisory lock
+            //     is removed.
+            let mut ok = 0usize;
+            for (i, h) in handles.into_iter().enumerate() {
+                match h.await.expect("migrator task did not panic") {
+                    Ok(()) => ok += 1,
+                    Err(e) => panic!(
+                        "concurrent migrator task {i} FAILED: {e} — this is the pg_type_typname_nsp_index \
+                         race the advisory lock fixes (it fires WITHOUT the lock)"
+                    ),
+                }
+            }
+            assert_eq!(ok, N, "all {N} concurrent migrators must return Ok");
 
-    // (2) Each migration id appears EXACTLY ONCE in the version table (applied-once, recorded).
-    for id in &ids {
-        let count = PgMigrator::applied_count(&pool, id)
-            .await
-            .expect("count applied migration");
-        assert_eq!(
-            count, 1,
-            "migration id {id} must be recorded EXACTLY once (applied-once), got {count}"
-        );
-    }
+            // (2) Each migration id appears EXACTLY ONCE in the version table (applied-once, recorded).
+            for id in &ids {
+                let count = PgMigrator::applied_count(&pool, id)
+                    .await
+                    .expect("count applied migration");
+                assert_eq!(
+                    count, 1,
+                    "migration id {id} must be recorded EXACTLY once (applied-once), got {count}"
+                );
+            }
 
-    // And every target table genuinely exists (the DDL actually ran, once, under the lock).
-    for m in &migrations.0 {
-        let table = table_name_of(m.ddl).expect("ddl names a table");
-        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-            .bind(table)
-            .fetch_one(&pool)
-            .await
-            .expect("probe table existence");
-        assert!(exists, "table {table} must exist after concurrent migrate");
-    }
+            // And every target table genuinely exists (the DDL actually ran, once, under the lock).
+            for m in &migrations.0 {
+                let table = table_name_of(m.ddl).expect("ddl names a table");
+                let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                    .bind(table)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("probe table existence");
+                assert!(exists, "table {table} must exist after concurrent migrate");
+            }
 
-    println!(
-        "OK: {N} concurrent migrators all returned Ok; {} migrations each applied exactly once \
-         (no pg_type_typname_nsp_index race).",
-        ids.len()
-    );
-
-    // Leave the DB clean.
-    cleanup(&pool, &ids, &migrations).await;
+            println!(
+                "OK: {N} concurrent migrators all returned Ok; {} migrations each applied exactly once \
+                 (no pg_type_typname_nsp_index race).",
+                ids.len()
+            );
+        },
+        || cleanup(&pool, &ids, &migrations),
+    )
+    .await;
 }

@@ -209,6 +209,17 @@ pub const CI_RUN_ACTIVE_WORKFLOW_INDEX_MIGRATION_ID: &str = "ci_0018f_ci_run_act
 /// discovery grant is already applied and remains byte-frozen.
 pub const CI_SCHEDULER_CI_RUN_WORKFLOW_ID_GRANT_MIGRATION_ID: &str =
     "ci_0018g_scheduler_ci_run_workflow_id_grant";
+/// Additive, column-minimal grant letting the dead-runner reaper reset a reaped job's `ci_job` DAG
+/// surface row back to `queued` (investigation, 2026-07-25:
+/// `job_queue_region.rs::RESET_REAPED_CI_JOB_SURFACE_QUERY`, added alongside the fix for jobs
+/// permanently stranded at `ci_job.state = 'running'` after a crash-then-reap). The dedicated,
+/// least-privilege scheduler role never held ANY grant on `ci_job` before this — the real production
+/// reaper runs through this exact role (`main.rs`'s `region_queue_store` is
+/// `scheduler_provider.region_queue_store()`), so without this grant the fix above would have failed
+/// in production with "permission denied for table ci_job" the first time it ever reaped a launched
+/// job, exactly as `tests/integration_ci_region_scheduler_boundary.rs`'s dedicated-role test caught.
+pub const CI_SCHEDULER_CI_JOB_REAP_RESET_GRANT_MIGRATION_ID: &str =
+    "ci_0018h_scheduler_ci_job_reap_reset_grant";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -908,6 +919,19 @@ GRANT SELECT (tenant_id, region, state, created_at, run_id) ON ci_run
 pub const GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL: &str =
     "GRANT SELECT (wf_run_id) ON ci_run TO myelin_ci_region_scheduler";
 
+/// Exactly what [`crate::job_queue_region::RESET_REAPED_CI_JOB_SURFACE_QUERY`] needs and nothing
+/// more: SELECT on the two join-key columns its `WHERE ... IN (SELECT * FROM UNNEST(...))` reads
+/// (`tenant_id`, `job_id`) PLUS the `state` column its OWN `WHERE state = 'running'` filter also
+/// reads (an UPDATE's WHERE-clause predicate needs SELECT on every column it inspects, not just the
+/// column(s) being written — a real gap the first version of this grant missed, caught by actually
+/// re-running the dedicated-role test after applying it, not assumed from the DDL alone), and UPDATE
+/// on `state` for the actual write — never a blanket table grant. Without this, the real production
+/// reaper (which runs through this exact least-privilege role) would fail closed with "permission
+/// denied for table ci_job" the first time it ever reaped a launched job.
+pub const GRANT_SCHEDULER_CI_JOB_REAP_RESET_DDL: &str = "\
+GRANT SELECT (tenant_id, job_id, state) ON ci_job TO myelin_ci_region_scheduler;
+GRANT UPDATE (state) ON ci_job TO myelin_ci_region_scheduler";
+
 /// Keep the claim/reap active-owner check point-addressable inside one tenant and residency cell.
 pub const CREATE_CI_RUN_ACTIVE_WORKFLOW_INDEX_DDL: &str =
     "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
@@ -1144,6 +1168,11 @@ pub fn ci_controlplane_migrations() -> Migrations {
         GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL,
         CI_RUN_TABLE,
     ));
+    migrations.push(Migration::plain_on(
+        CI_SCHEDULER_CI_JOB_REAP_RESET_GRANT_MIGRATION_ID,
+        GRANT_SCHEDULER_CI_JOB_REAP_RESET_DDL,
+        CI_JOB_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -1352,8 +1381,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            43,
-            "18 table/RLS + 3 ci_run ALTERs + 8 concurrent-index + 1 index-validation + 4 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 3 scheduler ci_run/workflow discovery grants"
+            44,
+            "18 table/RLS + 3 ci_run ALTERs + 8 concurrent-index + 1 index-validation + 4 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 3 scheduler ci_run/workflow discovery grants + 1 scheduler ci_job reap-reset grant"
         );
         for m in &migrations.0 {
             assert!(
@@ -1405,6 +1434,8 @@ mod tests {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CI_WORKFLOW_DISCOVERY_DDL);
             } else if m.id == CI_SCHEDULER_CI_RUN_WORKFLOW_ID_GRANT_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL);
+            } else if m.id == CI_SCHEDULER_CI_JOB_REAP_RESET_GRANT_MIGRATION_ID {
+                assert_eq!(m.ddl, GRANT_SCHEDULER_CI_JOB_REAP_RESET_DDL);
             } else if m.id == CI_REGION_SCHEDULER_RLS_MIGRATION_ID {
                 assert_eq!(m.ddl, CREATE_CI_REGION_SCHEDULER_RLS_DDL);
             } else {
@@ -1437,8 +1468,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            43,
-            "the runner applied all 18 table/RLS, 3 ci_run ALTERs, 8 concurrent-index, 1 index-validation, 4 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, and 3 scheduler ci_run/workflow discovery grants"
+            44,
+            "the runner applied all 18 table/RLS, 3 ci_run ALTERs, 8 concurrent-index, 1 index-validation, 4 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, and 1 scheduler ci_job reap-reset grant"
         );
         assert_eq!(
             runner.applied()[0],
@@ -1490,7 +1521,8 @@ mod tests {
         assert_eq!(retry_attempts.ddl, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL);
         let workflow_id_grant = migrations
             .0
-            .last()
+            .iter()
+            .find(|migration| migration.id == CI_SCHEDULER_CI_RUN_WORKFLOW_ID_GRANT_MIGRATION_ID)
             .expect("the workflow-identity grant is appended under a fresh id");
         assert_eq!(
             workflow_id_grant.id,
@@ -1500,6 +1532,19 @@ mod tests {
         assert_eq!(
             workflow_id_grant.ddl,
             GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL
+        );
+        let ci_job_reap_reset_grant = migrations
+            .0
+            .last()
+            .expect("the ci_job reap-reset grant is appended under a fresh id, now last");
+        assert_eq!(
+            ci_job_reap_reset_grant.id,
+            CI_SCHEDULER_CI_JOB_REAP_RESET_GRANT_MIGRATION_ID
+        );
+        assert_eq!(ci_job_reap_reset_grant.table, Some(CI_JOB_TABLE));
+        assert_eq!(
+            ci_job_reap_reset_grant.ddl,
+            GRANT_SCHEDULER_CI_JOB_REAP_RESET_DDL
         );
         let active_workflow_index = migrations
             .0
