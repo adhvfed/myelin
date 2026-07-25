@@ -56,8 +56,8 @@ const SEGMENT_CORPUS: &[&str] = &[
     "a~b",
     "a'b",
     "a\"b",
-    "café",      // non-ascii
-    "emoji😀",   // non-ascii
+    "café",    // non-ascii
+    "emoji😀", // non-ascii
 ];
 
 /// A separate slug corpus (slugs MAY be `/`-namespaced; the per-piece rules then apply).
@@ -127,12 +127,18 @@ fn corpus_exercises_both_accept_and_reject_on_each_validator() {
         .filter(|s| validate_wire_segment("repo", s).is_ok())
         .count();
     let seg_rejects = SEGMENT_CORPUS.len() - seg_accepts;
-    assert!(seg_accepts > 0 && seg_rejects > 0, "segment corpus must exercise both arms");
+    assert!(
+        seg_accepts > 0 && seg_rejects > 0,
+        "segment corpus must exercise both arms"
+    );
 
     let slug_accepts = SLUG_CORPUS
         .iter()
         .filter(|s| validate_wire_repo_slug(s).is_ok())
         .count();
     let slug_rejects = SLUG_CORPUS.len() - slug_accepts;
-    assert!(slug_accepts > 0 && slug_rejects > 0, "slug corpus must exercise both arms");
+    assert!(
+        slug_accepts > 0 && slug_rejects > 0,
+        "slug corpus must exercise both arms"
+    );
 }

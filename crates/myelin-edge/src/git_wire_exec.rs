@@ -349,7 +349,7 @@ impl GitWireExecutor {
                 .map_err(myelin_ci_sandbox::HookError)
         });
         Self {
-            backend: GvisorBackend::new(),
+            backend: GvisorBackend::git_wire_only(),
             root: root.into(),
             limits,
             hooks,

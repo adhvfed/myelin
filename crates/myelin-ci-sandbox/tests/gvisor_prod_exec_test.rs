@@ -27,12 +27,13 @@
 
 #![cfg(feature = "integration")]
 
+use myelin_ci_sandbox::asset_registry::{GvisorAssetRegistry, RootfsAssetBinding};
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
     ReserveHandle, ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend,
     SandboxCancellation, SandboxOutputSink, SandboxOutputStream, TrustTier, WorkspaceSpec,
-    SANDBOX_CAPTURE_BOUND,
+    LINUX_SMALL_V1_ROOTFS_SHA256, SANDBOX_CAPTURE_BOUND,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,6 +41,28 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 static REAL_RUNSC_LOCK: Mutex<()> = Mutex::new(());
+
+/// The real, already-founder-pipeline-pinned `linux-small-v1` image (`.myelin/ci.toml`'s own pin) —
+/// `spec_running`'s image, registered against the SAME base rootfs [`resolved_gvisor_rootfs`]
+/// resolves (env override → `~/.local/share/gvisor-assets/rootfs`). CT-007 gate 2/4 made `spec.image`
+/// the real launch authority, so this test's `GvisorBackend` needs a registry mapping that EXACT
+/// image to a real, digest-matching directory — no fabricated placeholder digest can resolve.
+fn linux_small_v1_image() -> ImageRef {
+    ImageRef::pinned(format!(
+        "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
+    ))
+    .unwrap()
+}
+
+fn test_registry() -> Arc<GvisorAssetRegistry> {
+    Arc::new(
+        GvisorAssetRegistry::from_bindings(vec![RootfsAssetBinding {
+            image: linux_small_v1_image(),
+            rootfs: resolved_gvisor_rootfs(),
+        }])
+        .expect("the base linux-small-v1 rootfs binding verifies"),
+    )
+}
 
 #[derive(Default)]
 struct LiveOutput {
@@ -105,7 +128,7 @@ fn require_or_skip(test: &str) -> Option<String> {
 fn spec_running(command: Vec<String>, timeout_secs: u32) -> JobSpec {
     JobSpec::new(
         JobKind::Ci,
-        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap(),
+        linux_small_v1_image(),
         command,
         vec![],
         vec![],
@@ -178,7 +201,7 @@ fn real_runsc_runs_command_and_captures_exit_stdout_stderr() {
     let _serial = REAL_RUNSC_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     let spec = spec_running(
         vec![
             "sh".into(),
@@ -239,7 +262,7 @@ fn real_runsc_delivers_output_before_the_command_exits() {
     let _serial = REAL_RUNSC_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     let spec = spec_running(
         vec![
             "sh".into(),
@@ -301,7 +324,7 @@ fn real_runsc_cancels_live_after_log_failure_and_returns_measured_failure() {
     let _serial = REAL_RUNSC_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     let spec = spec_running(
         vec![
             "sh".into(),
@@ -364,7 +387,7 @@ fn real_runsc_runs_untrusted_command_non_root() {
     let _serial = REAL_RUNSC_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     // The untrusted command reports its own uid; the OCI config drops it to 65534 (defense in depth).
     let spec = spec_running(vec!["sh".into(), "-c".into(), "id -u; exit 0".into()], 60);
 
@@ -404,7 +427,7 @@ fn real_runsc_runaway_stdout_is_capped_without_deadlock() {
     let _serial = REAL_RUNSC_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     // Emit ~8 MiB of 'x' to stdout, then exit 0 (the pipeline's last command, `tr`, exits 0). dd,
     // /dev/zero and tr are all present in the staged rootfs (used by the escape drill).
     let spec = spec_running(
@@ -469,7 +492,7 @@ fn real_runsc_command_past_timeout_is_whole_container_killed() {
     let _serial = REAL_RUNSC_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     // Sleep 30s with a 2s ceiling — the whole container must be killed at ~2s and reaped.
     let spec = spec_running(vec!["sh".into(), "-c".into(), "sleep 30".into()], 2);
 

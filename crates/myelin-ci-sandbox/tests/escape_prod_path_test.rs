@@ -90,6 +90,7 @@
 
 #![cfg(feature = "integration")]
 
+use myelin_ci_sandbox::asset_registry::{GvisorAssetRegistry, RootfsAssetBinding};
 use myelin_ci_sandbox::escape_corpus::{
     build_corpus_script, parse_console, AttackOutcome, Backend, BackendRun, DrillReport,
     EscapeAttestation,
@@ -101,9 +102,32 @@ use myelin_ci_sandbox::gvisor::{build_gvisor_corpus_script, GvisorBackend};
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
     ReserveHandle, ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, TrustTier,
-    WorkspaceSpec,
+    WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use std::path::Path;
+use std::sync::Arc;
+
+/// The real, already-founder-pipeline-pinned `linux-small-v1` image — `corpus_spec`'s image,
+/// registered against the SAME base rootfs [`resolved_gvisor_rootfs`] resolves. CT-007 gate 2/4 made
+/// `spec.image` the real launch authority for the gVisor backend (Firecracker is unaffected — it has
+/// no image registry). Used by BOTH backends' corpus runs for shape parity; only the gVisor run
+/// actually resolves it through a registry.
+fn linux_small_v1_image() -> ImageRef {
+    ImageRef::pinned(format!(
+        "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
+    ))
+    .unwrap()
+}
+
+fn gvisor_test_registry() -> Arc<GvisorAssetRegistry> {
+    Arc::new(
+        GvisorAssetRegistry::from_bindings(vec![RootfsAssetBinding {
+            image: linux_small_v1_image(),
+            rootfs: resolved_gvisor_rootfs(),
+        }])
+        .expect("the base linux-small-v1 rootfs binding verifies"),
+    )
+}
 
 /// The fork-bomb pids ceiling the corpus is parametrized with (the same value the harness drills use).
 const PIDS_MAX: u32 = 64;
@@ -172,7 +196,7 @@ fn ok_hooks() -> RunnerHooks {
 fn corpus_spec(command: Vec<String>, tag: &str) -> JobSpec {
     JobSpec::new(
         JobKind::Ci,
-        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap(),
+        linux_small_v1_image(),
         command,
         vec![],
         vec![],
@@ -466,7 +490,7 @@ fn gvisor_production_launch_contains_the_corpus_non_root() {
     // expression of the SAME catalogued attacks, sharing the SAME `parse_console`) through the
     // PRODUCTION `launch()` as `spec.command` — NOT `gvisor_drill_config_json` / the drill's
     // `stage_bundle`. The production OCI config runs it NON-ROOT (uid 65534), `--network=none`.
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(gvisor_test_registry());
     let spec = corpus_spec(
         vec![
             "/bin/sh".into(),

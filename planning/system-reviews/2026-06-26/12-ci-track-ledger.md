@@ -441,3 +441,69 @@ digest-keyed asset, real env/cwd propagation, resource sizing proven against a r
 resolved and hash-verified at launch, and the real dispatch path (not a direct `GvisorBackend` call
 from a test) — before starting Node/browser/Docker work for other jobs. This is now the plan of
 record for gate 2's continuation; see the task list in the working session for the ordered steps.
+
+**Vertical-slice step 1 (2026-07-25): `JobSpec.image` is now the real gVisor launch authority.**
+Closes the "digest-pinned claims are disconnected from what actually executes" gap named above: a
+launch used to resolve its rootfs solely from `MYELIN_GVISOR_ROOTFS`, ignoring `spec.image` entirely.
+A new `crates/myelin-ci-sandbox/src/canonical_tar.rs` reimplements, in pure Rust (no host `tar`
+process — the `no-host-exec` lint forbids that from a trusted path), the exact byte stream
+`tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --format=gnu -C <dir> -cf - . |
+sha256sum` produces, discovered and fixed one genuine subtlety along the way (`--sort=name` compares
+BARE per-directory entry names, not full flat-sorted archived path strings — a real Debian rootfs
+containing both `etc/ca-certificates.conf` and `etc/ca-certificates/` in the same parent orders them
+differently under a naive flat sort), and reproduces the exact already-committed digest for BOTH real
+staged assets: `linux-rust-v1` (`6feada1e...`) and, critically, `linux-small-v1`
+(`f9bd3926...`) — the asset the real founder-dogfood pipeline runs today.
+
+A new `GvisorAssetRegistry` (`crates/myelin-ci-sandbox/src/asset_registry.rs`) is an exact-reference,
+sha256-only map from an `ImageRef` to an already-[`VerifiedRootfs`]. `GvisorBackend::new` now requires
+one explicitly (`#[derive(Default)]` removed — no registry-less production backend can be constructed
+by accident); `GvisorBackend::git_wire_only()` is the separate constructor for the git-wire path
+(which keeps its own, different rootfs resolver) and provably refuses ordinary
+`launch`/`launch_streaming`. `myelin-ci-controlplane`'s `production_gvisor_registry()` (the one real
+production call site, `runner_bind.rs`) registers both real assets, reusing the SAME existing
+resolvers (`resolved_gvisor_rootfs`/`resolved_gvisor_rust_rootfs`) production already used — nothing
+about which bytes execute changed, only that `spec.image` is now checked against them.
+
+An independent adversarial review (gpt-5.6-sol) caught a real design flaw before this landed: the
+first version re-verified (re-canonicalized AND re-hashed the whole directory) on EVERY launch,
+before the isolation floor even ran — measured at ~15 seconds against the >800MiB Rust asset, paid on
+every single job launch, with an exhausted-wallet caller able to force the expensive scan repeatedly
+with zero chance of ever launching, and a RED isolation floor not blocking it either. Fixed:
+verification now happens exactly ONCE, at `GvisorAssetRegistry::from_bindings` construction time
+(runner startup) — a runner that cannot verify even one configured asset refuses to start, loudly.
+`resolve` is now an O(1) map lookup against already-verified entries; measured on this host: ~14.9s to
+construct (once), ~298ns average per `resolve()` call afterward. `GvisorBackend::launch_with`'s order
+is now isolation floor → hardening assert → registry lookup → reserve → launch-permit CAS → run →
+settle — matching the Firecracker backend's own mandated ordering; a dedicated test proves the floor
+fires before the (cheap) lookup by using a genuinely unregistered image (a wrong-order implementation
+would refuse via `Image` without the floor hook ever running — the test asserts the floor WAS called).
+
+The same review also caught that the digest existed as six independent hardcoded copies (two Rust
+constants, two TOML fields, two test literals) with nothing tying them together — a source edit could
+leave every test green while production silently diverged. Fixed: a new unconditional
+`crates/myelin-lints/tests/runner_asset_digest_pin.rs` test mechanically asserts the Rust constants
+match `runner-assets.toml`'s and `.myelin/ci.toml`'s real fields (verified this fires RED by
+corrupting one value and confirming the test fails with a clear message, then restoring it
+byte-identical); the duplicate literals in the canonical-tar test were removed in favor of importing
+the real constants.
+
+Independently re-verified by me, twice (once per fix round), reading every file rather than trusting
+either the builder's or the reviewer's summary: full `cargo test -p myelin-ci-sandbox --features
+integration` and `cargo test -p myelin-ci-controlplane --features integration` (every test binary,
+not just new ones), `cargo test -p myelin-lints`, and `cargo clippy --workspace --all-targets
+--features integration -- -D warnings` all clean, with exactly one pre-existing failure class in
+`myelin-ci-controlplane`/`myelin-edge` (7 tests total, all Postgres-integration-shaped) confirmed —
+via `git stash` + rerunning the identical tests against the prior committed code — to be unrelated to
+this work, not a regression. Also found and reverted ~12 files a builder pass had reformatted with
+`cargo fmt` beyond the scope of this change (confirmed via grep that none referenced
+gvisor/registry/asset_registry), keeping the landed diff to what actually matters.
+
+**Honest remaining floor.** This is the FIRST item of the vertical slice, not the whole slice:
+exact-commit checkout mounting, vendored/locked dependencies as their own asset, real env/cwd
+propagation, and resource sizing proven against a real build are all still open — `build-test-clippy`
+still reads `migration_state = "capability-smoke"` in `ci-workload-inventory.toml`, honestly, not
+`capability-proven`. No job dispatches through this registry yet; `production_gvisor_registry()` is
+wired at the real call site but nothing currently launches naming either registered image outside of
+tests. The 7 pre-existing test failures found during this work remain open and unowned by this
+ledger's gates — a separate issue, flagged here for whoever picks it up next.

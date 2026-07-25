@@ -178,7 +178,13 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         "Storage's cost_event does NOT carry CI's projection columns: {storage_cols:?}"
     );
     // CI's ci_cost_event: the run/job-attributed projection (cost_id, job_id, meter, kind).
-    for c in ["cost_id", "job_id", "meter", "kind", "wholesale_minor_units"] {
+    for c in [
+        "cost_id",
+        "job_id",
+        "meter",
+        "kind",
+        "wholesale_minor_units",
+    ] {
         assert!(
             ci_cols.contains(&c.to_string()),
             "CI's ci_cost_event carries `{c}`: {ci_cols:?}"
@@ -265,10 +271,18 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         .expect("create a wrong-shaped ci_cost_event (money-ledger-ish; missing the projection columns)");
     match verify_ci_cost_event_shape(&p).await {
         Err(CiCostStoreError::SchemaShapeMismatch { column, actual, .. }) => {
-            assert_eq!(column, "region", "the first missing required column is surfaced");
-            assert_eq!(actual, "<absent>", "a missing column reads as <absent>, not silently accepted");
+            assert_eq!(
+                column, "region",
+                "the first missing required column is surfaced"
+            );
+            assert_eq!(
+                actual, "<absent>",
+                "a missing column reads as <absent>, not silently accepted"
+            );
         }
-        other => panic!("a wrong-shaped ci_cost_event must FAIL the boot shape assertion, got {other:?}"),
+        other => {
+            panic!("a wrong-shaped ci_cost_event must FAIL the boot shape assertion, got {other:?}")
+        }
     }
 
     // ── Cleanup. ──

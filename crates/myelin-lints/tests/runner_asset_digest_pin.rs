@@ -9,20 +9,37 @@
 //! this test is the mechanical, committed-CI-level equivalent for EVERY row of
 //! `runner-assets.toml` (a distinct manifest — asset id → digest, not GitHub job → owner).
 //!
-//! For each `[[asset]]` row: if the staged directory it names (`env_var`, falling back to
-//! `default_path`) exists on the CURRENT machine, recompute its canonical-tree sha256 with the
-//! EXACT SAME recipe `verify_ci_rootfs()` uses (`tar --sort=name --mtime=@0 --owner=0 --group=0
-//! --numeric-owner --format=gnu -C <dir> -cf - . | sha256sum`) and assert it matches the
-//! committed `canonical_tree_sha256` pin — fail loudly with a clear mismatch message if not. If
-//! the directory is ABSENT (any dev machine or CI runner without this asset staged), this is a
-//! GENUINE, HONEST skip (printed, not silent) — matching this repo's existing runsc/KVM
-//! graceful-skip convention. `MYELIN_REQUIRE_RUST_ROOTFS_PIN=1` forces a hard failure instead of a
-//! skip, for hosts (like the founder dogfood host) where the asset is expected to be staged.
+//! Two checks, in order:
+//! 1. **Manifest-internal consistency (unconditional — no staged directory required):** every row's
+//!    `image` field (the `ImageRef` reference `GvisorAssetRegistry` would register it under) must be
+//!    digest-pinned with the SAME sha256 hex digest as that row's own `canonical_tree_sha256` — a
+//!    row whose `image` digest and `canonical_tree_sha256` disagree could never actually resolve
+//!    through the registry (CT-007 gate 2/4's `GvisorAssetRegistry::from_bindings` would refuse
+//!    it), so this is a real, useful check even on a host with the asset absent.
+//! 2. **Staged-content match (conditional on the asset being staged):** if the staged directory the
+//!    row names (`env_var`, falling back to `default_path`) exists on the CURRENT machine, recompute
+//!    its canonical-tree sha256 with the pure-Rust hasher
+//!    [`myelin_ci_sandbox::canonical_tree_sha256_hex`] — the SAME hasher
+//!    `GvisorAssetRegistry::from_bindings` uses on the real production launch path, reproducing
+//!    EXACTLY the same bytes the `tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner
+//!    --format=gnu -C <dir> -cf - . | sha256sum` shell recipe `verify_ci_rootfs()` uses would produce
+//!    (proven byte-for-byte in `crates/myelin-ci-sandbox/tests/canonical_tar_matches_shell_recipe_test.rs`)
+//!    — and assert it matches the committed `canonical_tree_sha256` pin. If the directory is ABSENT
+//!    (any dev machine or CI runner without this asset staged), this is a GENUINE, HONEST skip
+//!    (printed, not silent) — matching this repo's existing runsc/KVM graceful-skip convention.
+//!    `MYELIN_REQUIRE_RUST_ROOTFS_PIN=1` forces a hard failure instead of a skip, for hosts (like the
+//!    founder dogfood host) where the asset is expected to be staged.
+//!
+//! This test does NOT shell out to a host `tar`/`sha256sum` process (a prior version did) — it calls
+//! the pure-Rust `myelin-ci-sandbox` hasher as a dev-dependency instead, exercising the SAME code
+//! path the production asset registry uses rather than a parallel shell-based reimplementation that
+//! could silently drift from it.
 
+use myelin_ci_sandbox::canonical_tree_sha256_hex;
+use myelin_ci_sandbox::{LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -36,7 +53,6 @@ struct AssetRow {
     capability: String,
     #[allow(dead_code)]
     covers_job: String,
-    #[allow(dead_code)]
     stage_script: String,
     env_var: String,
     default_path: String,
@@ -45,6 +61,7 @@ struct AssetRow {
     #[allow(dead_code)]
     source_image_digest: String,
     canonical_tree_sha256: String,
+    image: String,
     #[allow(dead_code)]
     note: String,
 }
@@ -63,6 +80,26 @@ fn load_real_manifest() -> Manifest {
     toml::from_str(&source).expect("parse runner-assets.toml")
 }
 
+/// A minimal view of `.myelin/ci.toml` — just enough to read the ONE founder-dogfood job's `image`
+/// field, whose embedded digest must match `LINUX_SMALL_V1_ROOTFS_SHA256`.
+#[derive(Debug, Deserialize)]
+struct CiToml {
+    jobs: Vec<CiJobRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CiJobRow {
+    #[allow(dead_code)]
+    name: String,
+    image: String,
+}
+
+fn load_real_ci_toml() -> CiToml {
+    let source =
+        fs::read_to_string(workspace_root().join(".myelin/ci.toml")).expect("read .myelin/ci.toml");
+    toml::from_str(&source).expect("parse .myelin/ci.toml")
+}
+
 /// Resolve an asset row's staged directory: its `env_var` if set, else its documented
 /// `default_path` (expanding a leading `~` against `$HOME`, since these paths are always
 /// `~/.local/share/gvisor-assets/...` in this manifest).
@@ -77,40 +114,16 @@ fn resolve_staged_dir(row: &AssetRow) -> PathBuf {
     PathBuf::from(&row.default_path)
 }
 
-/// Recompute the canonical-tree sha256 of `dir` with the EXACT recipe
-/// `scripts/dogfood.sh`'s `verify_ci_rootfs()` uses, so a mismatch here is provably the same
-/// notion of "digest" an operator would see running that script by hand.
-fn canonical_tree_sha256(dir: &Path) -> String {
-    let mut tar = Command::new("tar")
-        .args([
-            "--sort=name",
-            "--mtime=@0",
-            "--owner=0",
-            "--group=0",
-            "--numeric-owner",
-            "--format=gnu",
-            "-C",
-        ])
-        .arg(dir)
-        .args(["-cf", "-", "."])
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn tar");
-    let tar_stdout = tar.stdout.take().expect("tar stdout piped");
-
-    let sha = Command::new("sha256sum")
-        .stdin(Stdio::from(tar_stdout))
-        .output()
-        .expect("run sha256sum");
-    let tar_status = tar.wait().expect("wait on tar");
-    assert!(tar_status.success(), "tar failed over {dir:?}");
-    assert!(sha.status.success(), "sha256sum failed over {dir:?}");
-    let stdout = String::from_utf8_lossy(&sha.stdout);
-    stdout
-        .split_whitespace()
-        .next()
-        .expect("sha256sum prints a hex digest")
-        .to_string()
+/// Parse the sha256 hex digest out of an `@sha256:<hex>`-pinned `image` reference string. Returns
+/// `None` (never a partial/garbage match) if the reference isn't pinned that way — the caller turns
+/// that into a loud, specific assertion failure rather than a confusing downstream one.
+fn parse_sha256_digest(image: &str) -> Option<&str> {
+    let (_, after_at) = image.rsplit_once('@')?;
+    let (algo, digest) = after_at.split_once(':')?;
+    if algo != "sha256" {
+        return None;
+    }
+    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digest)
 }
 
 /// HARD-FAIL on an absent staged asset iff `MYELIN_REQUIRE_RUST_ROOTFS_PIN=1` (this gate refuses
@@ -138,6 +151,33 @@ fn require_or_skip(row: &AssetRow, dir: &Path) -> bool {
 }
 
 #[test]
+fn every_row_image_digest_matches_its_own_canonical_tree_sha256() {
+    let manifest = load_real_manifest();
+    assert!(
+        !manifest.asset.is_empty(),
+        "runner-assets.toml must contain at least one [[asset]] row"
+    );
+    for row in &manifest.asset {
+        let parsed = parse_sha256_digest(&row.image).unwrap_or_else(|| {
+            panic!(
+                "runner-asset `{}`: `image` (`{}`) must be pinned as `...@sha256:<64-hex>` — a \
+                 GvisorAssetRegistry entry can only ever resolve a sha256-pinned reference today",
+                row.id, row.image
+            )
+        });
+        assert_eq!(
+            parsed, row.canonical_tree_sha256,
+            "runner-asset `{}`: the digest embedded in `image` (`{}`) must equal this row's own \
+             `canonical_tree_sha256` (`{}`) — a registry entry built from this row's `image` and \
+             rootfs path could never verify at from_bindings() construction time otherwise (the digest a real \
+             registry would check the staged directory against would never be the digest the \
+             directory is actually pinned to)",
+            row.id, row.image, row.canonical_tree_sha256
+        );
+    }
+}
+
+#[test]
 fn staged_runner_assets_match_their_committed_digest_pin() {
     let manifest = load_real_manifest();
     assert!(
@@ -155,7 +195,9 @@ fn staged_runner_assets_match_their_committed_digest_pin() {
             row.canonical_tree_sha256
         );
         assert!(
-            row.canonical_tree_sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+            row.canonical_tree_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit()),
             "runner-asset `{}`: canonical_tree_sha256 must be hex, got `{}`",
             row.id,
             row.canonical_tree_sha256
@@ -167,9 +209,16 @@ fn staged_runner_assets_match_their_committed_digest_pin() {
         }
         checked_any = true;
 
-        let actual = canonical_tree_sha256(&dir);
+        let actual = canonical_tree_sha256_hex(&dir).unwrap_or_else(|e| {
+            panic!(
+                "runner-asset `{}`: failed to hash staged directory {}: {e}",
+                row.id,
+                dir.display()
+            )
+        });
         assert_eq!(
-            actual, row.canonical_tree_sha256,
+            actual,
+            row.canonical_tree_sha256,
             "runner-asset `{}` staged at {} has DRIFTED from its committed pin in \
              runner-assets.toml: expected sha256:{}, computed sha256:{}. Either the staged tree \
              was mutated/rebuilt without updating the manifest, or the manifest is stale — re-run \
@@ -190,4 +239,57 @@ fn staged_runner_assets_match_their_committed_digest_pin() {
              skip-detection above if reached"
         );
     }
+}
+
+/// **UNCONDITIONAL (no staged directory required) — the source-file sync check.** Before this test,
+/// `LINUX_RUST_V1_ROOTFS_SHA256`/`LINUX_SMALL_V1_ROOTFS_SHA256` (`gvisor.rs`) duplicated
+/// `runner-assets.toml`'s `canonical_tree_sha256`/`image` fields and `.myelin/ci.toml`'s `image`
+/// field as separate hardcoded literals with NO mechanical link between any of them — a source-file
+/// edit to one could leave every existing test green while production silently refused (or accepted
+/// a wrong) newly-authored image. This asserts:
+///   - `LINUX_RUST_V1_ROOTFS_SHA256` == `runner-assets.toml`'s `linux-rust-v1` row's
+///     `canonical_tree_sha256` == that row's own `image` field's embedded `@sha256:` digest.
+///   - `LINUX_SMALL_V1_ROOTFS_SHA256` == `.myelin/ci.toml`'s (single) job's `image` field's embedded
+///     `@sha256:` digest.
+#[test]
+fn rust_and_small_rootfs_constants_are_mechanically_synced_to_their_toml_sources() {
+    let manifest = load_real_manifest();
+    let rust_row = manifest
+        .asset
+        .iter()
+        .find(|row| row.id == "linux-rust-v1")
+        .expect("runner-assets.toml must have a `linux-rust-v1` row");
+    assert_eq!(
+        LINUX_RUST_V1_ROOTFS_SHA256, rust_row.canonical_tree_sha256,
+        "gvisor.rs's LINUX_RUST_V1_ROOTFS_SHA256 constant has drifted from runner-assets.toml's \
+         `linux-rust-v1` row's `canonical_tree_sha256` — update whichever is stale"
+    );
+    let rust_embedded = parse_sha256_digest(&rust_row.image).unwrap_or_else(|| {
+        panic!(
+            "runner-assets.toml's `linux-rust-v1` row's `image` (`{}`) must be `...@sha256:<64-hex>`",
+            rust_row.image
+        )
+    });
+    assert_eq!(
+        LINUX_RUST_V1_ROOTFS_SHA256, rust_embedded,
+        "gvisor.rs's LINUX_RUST_V1_ROOTFS_SHA256 constant has drifted from the digest embedded in \
+         runner-assets.toml's `linux-rust-v1` row's own `image` field"
+    );
+
+    let ci = load_real_ci_toml();
+    let job = ci
+        .jobs
+        .first()
+        .expect(".myelin/ci.toml must have at least one [[jobs]] row");
+    let small_embedded = parse_sha256_digest(&job.image).unwrap_or_else(|| {
+        panic!(
+            ".myelin/ci.toml's job `image` (`{}`) must be `...@sha256:<64-hex>`",
+            job.image
+        )
+    });
+    assert_eq!(
+        LINUX_SMALL_V1_ROOTFS_SHA256, small_embedded,
+        "gvisor.rs's LINUX_SMALL_V1_ROOTFS_SHA256 constant has drifted from the digest embedded in \
+         .myelin/ci.toml's job `image` field"
+    );
 }

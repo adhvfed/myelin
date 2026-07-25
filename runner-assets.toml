@@ -15,18 +15,23 @@
 # built, and what their content must hash to.
 #
 # STATUS TODAY (committed 2026-07-25; wording corrected 2026-07-25 after a second adversarial
-# review round by gpt-5.6-sol): exactly ONE asset is staged — `linux-rust-v1`, a Rust TOOLCHAIN
-# SMOKE toward the `build-test-clippy` job (`ci-workload-inventory.toml`'s own note on that row).
-# It proves the Rust toolchain executes under the hardened sandbox on the real production hardening
-# path — it does NOT yet "cover the job's need": no exact-commit checkout mount, no vendored/locked
-# dependencies under deny-all egress, no propagated job env, no resources sized against a real
-# build, and `JobSpec.image` is not yet bound to this asset at launch (production still resolves
-# the rootfs from `MYELIN_GVISOR_ROOTFS`, independent of what a job declares — see the ledger's
-# 2026-07-25 correction entry and the vertical-slice plan of record). Node (frontend lint/unit/build
-# jobs), a headless browser (the Chromium suite), Docker-in-Docker (the `integration` workflow's
-# live-backend needs), and outbound egress to the RustSec/npm advisory DBs (the `security.yml`
-# jobs) are ALL still missing runner assets — separate, later rows, added by later slices of this
-# same gate. Gate 2 is NOT closed by this file; it is one toolchain-smoke closer.
+# review round by gpt-5.6-sol; corrected AGAIN 2026-07-25 once the registry slice landed — code wins
+# over docs): exactly ONE asset is staged — `linux-rust-v1`, a Rust TOOLCHAIN SMOKE toward the
+# `build-test-clippy` job (`ci-workload-inventory.toml`'s own note on that row). It proves the Rust
+# toolchain executes under the hardened sandbox on the real production hardening path — it does NOT
+# yet "cover the job's need": no exact-commit checkout mount, no vendored/locked dependencies under
+# deny-all egress, no propagated job env, no resources sized against a real build. `JobSpec.image`
+# IS now the real launch authority (`GvisorBackend::launch_with` resolves + canonical-tree-verifies
+# it against a `GvisorAssetRegistry` BEFORE any resource is reserved — the env-var
+# `MYELIN_GVISOR_ROOTFS`/`MYELIN_GVISOR_RUST_ROOTFS` resolvers remain, but only as the mechanism the
+# registry's own entries are built from, no longer as a fallback authority a job's declared image can
+# bypass); this row's `image` field is registered in the production registry
+# (`myelin-ci-controlplane`'s `production_gvisor_registry()`), but no dispatched job names it yet
+# (still just a toolchain smoke, not wired to `build-test-clippy`'s real dispatch). Node (frontend
+# lint/unit/build jobs), a headless browser (the Chromium suite), Docker-in-Docker (the `integration`
+# workflow's live-backend needs), and outbound egress to the RustSec/npm advisory DBs (the
+# `security.yml` jobs) are ALL still missing runner assets — separate, later rows, added by later
+# slices of this same gate. Gate 2 is NOT closed by this file; it is one toolchain-smoke closer.
 #
 # ENFORCEMENT: `crates/myelin-lints/tests/runner_asset_digest_pin.rs` recomputes each row's
 # `canonical_tree_sha256` (via the SAME `tar --sort=name --mtime=@0 --owner=0 --group=0
@@ -69,4 +74,12 @@ source_image_digest = "sha256:1111c28d995d06a7863ba6cea3b3dcb87bebe65af8ec5517ca
 # chmod 0755 on the temp dir before populating it; the raw `docker export` step itself was
 # independently confirmed byte-for-byte reproducible across separate container creates.
 canonical_tree_sha256 = "6feada1e0ef7b739d71c7f198b03dcaab494f35ea86182dd887d23f5df0c6083"
-note = "Docker-pull + docker-export of an official Debian-slim rust image, NOT a hand-chased host-lib copy (unlike scripts/stage-git-rootfs.sh's git precedent) — the host cargo/rustc pull in dozens of transitive shared libs (libgit2, libssl, libcurl, icu, ...) that would make a hand-staged tree fragile and not a real immutable release artifact. Proven end to end by crates/myelin-ci-sandbox/tests/rust_capable_rootfs_prod_exec_test.rs: a real `runsc` sandbox on the SAME GvisorBackend::launch path every other job uses runs `rustc --version && cargo --version` and asserts non-root uid + no network egress, unchanged hardening."
+# CT-007 gate 2/4 (registry slice, 2026-07-25): the digest-pinned `ImageRef` reference
+# `GvisorAssetRegistry` (crates/myelin-ci-sandbox/src/asset_registry.rs) resolves against this row's
+# staged directory. The digest embedded after `@sha256:` MUST equal `canonical_tree_sha256` above —
+# `crates/myelin-lints/tests/runner_asset_digest_pin.rs` mechanically checks this manifest-internal
+# consistency unconditionally (no staged directory required). This is the row that closes the
+# "JobSpec.image is not yet bound to this asset at launch" gap the STATUS note above used to name —
+# nothing dispatches this image yet, but the registry now carries the binding honestly.
+image = "myelin.local/linux-rust-v1-rootfs@sha256:6feada1e0ef7b739d71c7f198b03dcaab494f35ea86182dd887d23f5df0c6083"
+note = "Docker-pull + docker-export of an official Debian-slim rust image, NOT a hand-chased host-lib copy (unlike scripts/stage-git-rootfs.sh's git precedent) — the host cargo/rustc pull in dozens of transitive shared libs (libgit2, libssl, libcurl, icu, ...) that would make a hand-staged tree fragile and not a real immutable release artifact. Proven end to end by crates/myelin-ci-sandbox/tests/rust_capable_rootfs_prod_exec_test.rs: a real `runsc` sandbox on the SAME GvisorBackend::launch path every other job uses runs `rustc --version && cargo --version` and asserts non-root uid + no network egress, unchanged hardening. As of CT-007 gate 2/4's registry slice, this is a REAL registry entry (myelin-ci-controlplane's production_gvisor_registry()), not just a manifest row — though no dispatched job names this image yet."

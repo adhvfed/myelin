@@ -2428,6 +2428,7 @@ dependencies = [
  "myelin-tenancy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tokio",
  "zeroize",
@@ -2784,6 +2785,7 @@ dependencies = [
 name = "myelin-lints"
 version = "0.0.0"
 dependencies = [
+ "myelin-ci-sandbox",
  "proc-macro2",
  "serde",
  "syn",

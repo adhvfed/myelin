@@ -182,7 +182,10 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
         .settle(&scope, &rows)
         .await
         .expect("the committed settle records the metered units");
-    assert_eq!(affected, 2, "two metered units recorded (cost_events_per_unit == 1 each)");
+    assert_eq!(
+        affected, 2,
+        "two metered units recorded (cost_events_per_unit == 1 each)"
+    );
 
     // ── Money-parity: a RE-DELIVERED settle records EXACTLY ONCE (deterministic cost_id + ON CONFLICT). ──
     let redelivered = store1
@@ -205,9 +208,16 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
         .await
         .expect_err("a divergent re-delivered settle must be refused, never silently dropped");
     match err {
-        CiCostStoreError::AmountDivergence { column, recorded, incoming } => {
+        CiCostStoreError::AmountDivergence {
+            column,
+            recorded,
+            incoming,
+        } => {
             assert_eq!(column, "amount");
-            assert_eq!(recorded, 120, "the FIRST settle's amount is preserved (never overwritten)");
+            assert_eq!(
+                recorded, 120,
+                "the FIRST settle's amount is preserved (never overwritten)"
+            );
             assert_eq!(incoming, 999, "the divergent incoming amount is surfaced");
         }
         other => panic!("expected AmountDivergence, got {other}"),
@@ -217,8 +227,14 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
         .cost_events_for_run(&scope, &run.to_string())
         .await
         .expect("read back after the refused divergent settle");
-    let cpu = after.iter().find(|r| r.meter == Meter::CpuSeconds).expect("the CpuSeconds unit");
-    assert_eq!(cpu.amount, 120, "the divergent settle was refused — the recorded amount is unchanged");
+    let cpu = after
+        .iter()
+        .find(|r| r.meter == Meter::CpuSeconds)
+        .expect("the CpuSeconds unit");
+    assert_eq!(
+        cpu.amount, 120,
+        "the divergent settle was refused — the recorded amount is unchanged"
+    );
 
     // ── UNCOMMITTED settle THROUGH the store: run on a tx, then DROP it without commit. ──
     {
@@ -262,14 +278,22 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
     );
     // Canonical (job_id, meter) order: CpuSeconds ('cpu_seconds') sorts before MemGbSeconds ('mem_gb_seconds').
     assert_eq!(read[0].meter, Meter::CpuSeconds);
-    assert_eq!(read[0].job_id, job.to_string(), "attributed to its (run, job)");
+    assert_eq!(
+        read[0].job_id,
+        job.to_string(),
+        "attributed to its (run, job)"
+    );
     assert_eq!(read[0].wholesale, MinorUnits(100));
     assert_eq!(read[0].markup, MinorUnits(20));
     assert_ne!(
         read[0].wholesale, read[0].markup,
         "wholesale ≠ markup (the two cost columns are distinct, arch 02 §8)"
     );
-    assert_eq!(read[0].kind, CostKind::Ci, "settled kind stays ci after reopen");
+    assert_eq!(
+        read[0].kind,
+        CostKind::Ci,
+        "settled kind stays ci after reopen"
+    );
     assert_eq!(read[1].meter, Meter::MemGbSeconds);
     assert_eq!(read[1].wholesale, MinorUnits(50));
     assert_eq!(read[1].markup, MinorUnits(10));

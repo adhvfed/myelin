@@ -272,7 +272,7 @@ fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
     )
     .expect("locator resolves");
 
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::git_wire_only();
     let launch = backend
         .launch_git_receive_pack(&spec, &ok_hooks())
         .expect("ingest launch runs");

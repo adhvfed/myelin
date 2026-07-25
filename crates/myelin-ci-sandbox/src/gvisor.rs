@@ -405,6 +405,12 @@ pub enum GvisorError {
     Hardening(String),
     /// The `runsc` runtime errored.
     Runtime(String),
+    /// `spec.image` could not be resolved against the [`GvisorAssetRegistry`]'s already-verified
+    /// entries BEFORE any resource was reserved — an unregistered reference (registry construction
+    /// itself refuses an unsupported digest algorithm, an invalid rootfs path, or a canonical-tree
+    /// digest mismatch, so none of those can surface here). Refused in `launch_with` AFTER
+    /// `enforce_isolation_floor`/the hardening assert but BEFORE `reserve`/anything else.
+    Image(String),
 }
 
 impl std::fmt::Display for GvisorError {
@@ -413,6 +419,7 @@ impl std::fmt::Display for GvisorError {
             GvisorError::Hook(e) => write!(f, "gvisor backend: guarantee hook failed: {e}"),
             GvisorError::Hardening(s) => write!(f, "gvisor backend: hardening not enforced: {s}"),
             GvisorError::Runtime(s) => write!(f, "gvisor backend: runsc error: {s}"),
+            GvisorError::Image(s) => write!(f, "gvisor backend: image resolution refused: {s}"),
         }
     }
 }
@@ -422,6 +429,12 @@ impl std::error::Error for GvisorError {}
 impl From<crate::HookError> for GvisorError {
     fn from(e: crate::HookError) -> Self {
         GvisorError::Hook(e)
+    }
+}
+
+impl From<crate::asset_registry::AssetRegistryError> for GvisorError {
+    fn from(e: crate::asset_registry::AssetRegistryError) -> Self {
+        GvisorError::Image(e.to_string())
     }
 }
 
@@ -609,11 +622,22 @@ pub trait RunscChild {
 }
 
 /// The gVisor (`runsc`) second backend — same trait, same hardening, OCI/`runsc` path.
-#[derive(Default)]
+///
+/// **No `Default`, deliberately.** An ordinary (non-git-wire) launch resolves `spec.image` through a
+/// [`GvisorAssetRegistry`](crate::asset_registry::GvisorAssetRegistry) — there is no
+/// registry-less production backend a caller could construct by accident. [`GvisorBackend::new`]
+/// requires one explicitly; [`GvisorBackend::git_wire_only`] is the SEPARATE, loudly-named
+/// constructor for the git-wire receive/upload-pack path (which resolves its OWN rootfs via
+/// [`resolved_gvisor_git_rootfs`] and never consults the registry) and REFUSES ordinary
+/// `launch`/`launch_streaming`.
 pub struct GvisorBackend {
     /// guest_id → the live container's teardown state (its `runsc` child + bundle temp dir). Ephemeral;
     /// one job per container, never reused.
     live: Mutex<std::collections::HashMap<String, RunscProc>>,
+    /// The image→rootfs authority an ordinary launch resolves `spec.image` through. `None` only for
+    /// a [`GvisorBackend::git_wire_only`] backend, which refuses ordinary launch outright (so this
+    /// is never consulted from that path either).
+    registry: Option<Arc<crate::asset_registry::GvisorAssetRegistry>>,
 }
 
 /// A live container's teardown state: the (already-exited/killed) `runsc` child + the bundle temp dir
@@ -642,9 +666,30 @@ pub struct ContainerRun {
 }
 
 impl GvisorBackend {
-    /// A new backend with no live containers.
-    pub fn new() -> GvisorBackend {
-        GvisorBackend::default()
+    /// A new backend with no live containers, resolving every ordinary (non-git-wire) launch's
+    /// `spec.image` through `registry` — the real launch authority (CT-007 gate 2/4). There is no
+    /// argument-less constructor: a registry MUST be supplied explicitly (see
+    /// [`GvisorBackend::git_wire_only`] for the one legitimate case that needs none).
+    pub fn new(registry: Arc<crate::asset_registry::GvisorAssetRegistry>) -> GvisorBackend {
+        GvisorBackend {
+            live: Mutex::new(std::collections::HashMap::new()),
+            registry: Some(registry),
+        }
+    }
+
+    /// A backend for the git-wire receive/upload-pack path ONLY
+    /// ([`launch_git_wire`](Self::launch_git_wire) / [`launch_git_receive_pack`](Self::launch_git_receive_pack)
+    /// and their `_until_cancelled` variants) — that path resolves its OWN rootfs via
+    /// [`resolved_gvisor_git_rootfs`], a separate, pre-existing, deliberately different mechanism
+    /// from ordinary job launch, and never consults an image registry. A backend built this way has
+    /// NO registry at all, so an ordinary [`SandboxBackend::launch`]/[`SandboxBackend::launch_streaming`]
+    /// call REFUSES with [`GvisorError::Image`] — a git-wire-only instance can never accidentally be
+    /// used to launch an ordinary, image-bearing job.
+    pub fn git_wire_only() -> GvisorBackend {
+        GvisorBackend {
+            live: Mutex::new(std::collections::HashMap::new()),
+            registry: None,
+        }
     }
 
     /// Build the OCI config a launch WOULD use for `spec` (the hardened profile derived + the OCI
@@ -656,16 +701,26 @@ impl GvisorBackend {
     }
 
     /// Drive the four-guarantee seam in the mandated order — **isolation floor → hardening assert →
-    /// reserve → final attribution/claim CAS → run → settle** — fail-closed at every step, then hand the captured
-    /// [`SandboxResult`] back behind the redrawn CT-001 seam. The `run` closure does the actual run:
-    /// it stages an OCI bundle from the built [`OciConfig`], runs `runsc run --bundle` (the untrusted
-    /// `spec.command`), captures the real exit/streams/usage and enforces `spec.limits.timeout_secs`,
-    /// and returns a [`ContainerRun`]. The trait `launch` passes [`run_production_container`] (a REAL
-    /// `runsc` container); unit tests pass a closure returning a fake child + a canned result so the
-    /// control flow is testable without a runtime (the injectable-spawn seam — preserved). `run` is
-    /// only invoked AFTER reserve succeeds, so an exhausted wallet / unmet isolation floor
-    /// refuses-to-start and `runsc` never spawns (CT-002b: the result is CONSUMED from the run, never
-    /// hardcoded — reconciles with the Firecracker `launch_with`).
+    /// image resolution (now a cheap, already-verified lookup) → reserve → final attribution/claim
+    /// CAS → run → settle** — fail-closed at every step, then hand the captured [`SandboxResult`]
+    /// back behind the redrawn CT-001 seam. This mirrors the Firecracker backend's own `launch_with`
+    /// ordering exactly, with the image lookup inserted after the hardening assert and before
+    /// reserve. `spec.image` is looked up against the registry's ALREADY-VERIFIED entries (the
+    /// canonical-tree digest work happened ONCE, at [`GvisorAssetRegistry::from_bindings`]
+    /// construction time — see `crate::asset_registry` — never per launch); an unknown image still
+    /// refuses before any resource is reserved or any launch permit is granted (CT-007 gate 2/4), but
+    /// a RED isolation floor now refuses BEFORE the registry is even consulted, so an exhausted-wallet
+    /// caller cannot force a (now-cheap, but still real) lookup with zero chance of ever launching,
+    /// and the floor is honoured even for callers naming an image the registry doesn't know about.
+    /// The `run` closure does the actual run: it stages an OCI bundle from the built [`OciConfig`] +
+    /// the verified rootfs path, runs `runsc run --bundle` (the untrusted `spec.command`), captures
+    /// the real exit/streams/usage and enforces `spec.limits.timeout_secs`, and returns a
+    /// [`ContainerRun`]. The trait `launch` passes [`run_production_container`] (a REAL `runsc`
+    /// container); unit tests pass a closure returning a fake child + a canned result so the control
+    /// flow is testable without a runtime (the injectable-spawn seam — preserved). `run` is only
+    /// invoked AFTER reserve succeeds, so an exhausted wallet / unmet isolation floor refuses-to-start
+    /// and `runsc` never spawns (CT-002b: the result is CONSUMED from the run, never hardcoded —
+    /// reconciles with the Firecracker `launch_with`).
     fn launch_with<F>(
         &self,
         spec: &JobSpec,
@@ -673,11 +728,29 @@ impl GvisorBackend {
         run: F,
     ) -> Result<SandboxLaunch, GvisorError>
     where
-        F: FnOnce(&JobSpec, &OciConfig, LaunchPermit) -> Result<ContainerRun, String>,
+        F: FnOnce(&JobSpec, &OciConfig, LaunchPermit, &Path) -> Result<ContainerRun, String>,
     {
+        // #4 isolation floor FIRST — the hardening profile must hold before any code (including the
+        // registry lookup) runs. Mirrors the Firecracker backend's own ordering.
         hooks.enforce_isolation_floor(spec)?;
         let profile = HardeningProfile::derive(spec);
         profile.assert_enforced().map_err(GvisorError::Hardening)?;
+
+        // CT-007 gate 2/4: resolve `spec.image` against the registry's ALREADY-VERIFIED entries — a
+        // cheap O(1) lookup now (verification happened once, at registry construction). Still BEFORE
+        // reserve/the launch-permit CAS — an unregistered image never reserves or spawns. A
+        // `git_wire_only()` backend has no registry at all and refuses here, so it can never launch
+        // an ordinary image-bearing job.
+        let registry = self.registry.as_ref().ok_or_else(|| {
+            GvisorError::Image(
+                "this GvisorBackend was constructed via GvisorBackend::git_wire_only() (no asset \
+                 registry) and cannot launch an ordinary image-bearing job — construct it via \
+                 GvisorBackend::new(registry) for CI/agent job launch"
+                    .to_string(),
+            )
+        })?;
+        let verified_rootfs = registry.resolve(&spec.image)?;
+
         let reserve = hooks.reserve(spec)?;
         let cfg = OciConfig::from_spec(spec, &profile);
         let launch_permit = match hooks.acquire_launch_permit(spec) {
@@ -695,7 +768,7 @@ impl GvisorBackend {
             bundle_dir,
             result,
             run_error,
-        } = run(spec, &cfg, launch_permit).map_err(GvisorError::Runtime)?;
+        } = run(spec, &cfg, launch_permit, verified_rootfs.path()).map_err(GvisorError::Runtime)?;
 
         let guest_id = format!("runsc-{}", spec.idem_token.0);
         self.live
@@ -727,7 +800,9 @@ impl SandboxBackend for GvisorBackend {
     /// here — the one legitimate runtime-spawn site (the `no-host-exec` named exclusion; this seam IS
     /// the unified sandbox, not a bypass of it).
     fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
-        self.launch_with(spec, hooks, run_production_container)
+        self.launch_with(spec, hooks, |spec, cfg, permit, rootfs| {
+            run_production_container(spec, cfg, permit, rootfs)
+        })
     }
 
     fn launch_streaming(
@@ -737,8 +812,15 @@ impl SandboxBackend for GvisorBackend {
         output: Arc<dyn SandboxOutputSink>,
         cancellation: SandboxCancellation,
     ) -> Result<SandboxLaunch, Self::Error> {
-        self.launch_with(spec, hooks, move |spec, cfg, permit| {
-            run_production_container_streaming(spec, cfg, permit, Some(output), cancellation)
+        self.launch_with(spec, hooks, move |spec, cfg, permit, rootfs| {
+            run_production_container_streaming(
+                spec,
+                cfg,
+                permit,
+                rootfs,
+                Some(output),
+                cancellation,
+            )
         })
     }
 
@@ -768,7 +850,10 @@ impl SandboxBackend for GvisorBackend {
 /// 65534/65534 in the OCI config) — defense in depth; untrusted code is never uid 0 in the sandbox.
 ///
 /// Mechanism (REUSING the proven bundle pattern from `escape_drill_gvisor_test::stage_bundle`):
-/// 1. Stage a temp bundle dir: a `rootfs` symlink → [`resolved_gvisor_rootfs`] + a `config.json` =
+/// 1. Stage a temp bundle dir: a `rootfs` symlink → the caller-supplied, ALREADY-VERIFIED rootfs
+///    path (`GvisorBackend::launch_with` resolved + digest-verified it from `spec.image` against the
+///    [`GvisorAssetRegistry`](crate::asset_registry::GvisorAssetRegistry) BEFORE calling here — CT-007
+///    gate 2/4; this function no longer calls [`resolved_gvisor_rootfs`] itself) + a `config.json` =
 ///    [`OciConfig::to_json`] (read-only root, caps dropped, no-new-privs, seccomp, no netns when
 ///    egress is default-deny, pids ceiling, NON-ROOT user, an advisory `memory.limit`, and a
 ///    size-bounded writable `/tmp` tmpfs from `spec.limits.disk_bytes` — CT-003a: a disk fill hits
@@ -786,28 +871,43 @@ fn run_production_container(
     spec: &JobSpec,
     cfg: &OciConfig,
     launch_permit: LaunchPermit,
+    rootfs: &Path,
 ) -> Result<ContainerRun, String> {
-    run_production_container_streaming(spec, cfg, launch_permit, None, SandboxCancellation::new())
+    run_production_container_streaming(
+        spec,
+        cfg,
+        launch_permit,
+        rootfs,
+        None,
+        SandboxCancellation::new(),
+    )
 }
 
 fn run_production_container_streaming(
     spec: &JobSpec,
     cfg: &OciConfig,
     launch_permit: LaunchPermit,
+    rootfs: &Path,
     output: Option<Arc<dyn SandboxOutputSink>>,
     cancellation: SandboxCancellation,
 ) -> Result<ContainerRun, String> {
     let bin = runsc_bin();
-    let rootfs = resolved_gvisor_rootfs();
-    // Honest fail-closed: a runtime/start precondition failure surfaces as an error (never a
-    // fabricated exit). An absent rootfs cannot produce a valid bundle.
+    // `rootfs` is the ALREADY-VERIFIED path `GvisorBackend::launch_with` resolved from `spec.image`
+    // via the `GvisorAssetRegistry` (CT-007 gate 2/4) — this production run path no longer calls
+    // `resolved_gvisor_rootfs()` itself. That resolver remains the resolution mechanism the
+    // registry's own construction (`GvisorAssetRegistry::from_bindings`, called once by
+    // `production_gvisor_registry()`) uses, plus test scaffolding and the git-wire path's OWN
+    // separate resolver — ordinary per-launch code no longer calls it directly. Honest fail-closed: a
+    // runtime/start precondition failure surfaces as an error (never a fabricated exit). An absent
+    // rootfs cannot produce a valid bundle (defense in depth — construction-time verification already
+    // checked this, but a TOCTOU window between verification and staging is still handled honestly).
     if !rootfs.exists() {
         return Err(format!(
             "staged gVisor rootfs absent: {} (cannot build a valid OCI bundle)",
             rootfs.display()
         ));
     }
-    let bundle_dir = stage_production_bundle(cfg, &rootfs)?;
+    let bundle_dir = stage_production_bundle(cfg, rootfs)?;
     let container_id = format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
 
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
@@ -1390,6 +1490,42 @@ pub fn resolved_gvisor_rootfs() -> std::path::PathBuf {
         .join("share")
         .join("gvisor-assets")
         .join("rootfs")
+}
+
+/// The canonical-tree sha256 of the STAGED base/`linux-small-v1` rootfs [`resolved_gvisor_rootfs`]
+/// resolves by default — the SAME digest `.myelin/ci.toml` already pins for the founder-dogfood
+/// pipeline's `myelin.local/linux-small-v1-rootfs` image (`scripts/dogfood.sh`'s `verify_ci_rootfs`
+/// asserts this on that ONE file; kept here as a single Rust-side source of truth for composition
+/// roots/tests that need to build a real [`crate::asset_registry::GvisorAssetRegistry`] entry for
+/// it, rather than re-typing the hex string at every call site).
+pub const LINUX_SMALL_V1_ROOTFS_SHA256: &str =
+    "f9bd3926a7b47e1dd4729e5788d40dc6daf4ce159a91db169ef5bb803e73ec1f";
+
+/// The canonical-tree sha256 of the STAGED `linux-rust-v1` rootfs [`resolved_gvisor_rust_rootfs`]
+/// resolves by default — the SAME digest committed in `runner-assets.toml`'s `linux-rust-v1` row.
+pub const LINUX_RUST_V1_ROOTFS_SHA256: &str =
+    "6feada1e0ef7b739d71c7f198b03dcaab494f35ea86182dd887d23f5df0c6083";
+
+/// Env var naming the staged Rust-capable gVisor rootfs (mirrors `runner-assets.toml`'s
+/// `linux-rust-v1` row: `env_var = "MYELIN_GVISOR_RUST_ROOTFS"`).
+pub const ENV_GVISOR_RUST_ROOTFS: &str = "MYELIN_GVISOR_RUST_ROOTFS";
+
+/// The resolved Rust-capable rootfs path (env override → `~/.local/share/gvisor-assets/rust-rootfs`,
+/// `runner-assets.toml`'s `linux-rust-v1` row `default_path`). SEPARATE from
+/// [`resolved_gvisor_rootfs`] because this asset carries a real Rust toolchain the plain
+/// busybox-class base rootfs does not; nothing dispatches jobs against it by default today — only
+/// the registry entry the CT-007 gate-2 composition root registers, and the rust-capability
+/// prod-exec self-test.
+pub fn resolved_gvisor_rust_rootfs() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var(ENV_GVISOR_RUST_ROOTFS) {
+        return std::path::PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    std::path::PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("gvisor-assets")
+        .join("rust-rootfs")
 }
 
 /// The name of the in-guest corpus script the OCI bundle runs (placed at the rootfs root). It runs
@@ -2284,13 +2420,48 @@ mod tests {
         assert!(error.contains("MYELIN_RUNSC_BIN must be an absolute path"));
     }
 
+    /// A real, on-disk, empty fixture rootfs — hashed with the SAME pure-Rust
+    /// [`crate::canonical_tar::canonical_tree_sha256_hex`] the registry itself uses — so [`spec`]'s
+    /// image is a GENUINELY verifiable pin, not a fabricated placeholder digest a real registry
+    /// lookup could never match. Shared (same fixed path) across every test in this module — they
+    /// only ever READ it (construction-time hashing happens once, in [`test_registry`]), never
+    /// mutate it, so sharing across parallel test threads within this one process is safe.
+    fn fixture_rootfs_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "myelin-gvisor-unit-test-fixture-rootfs-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// The digest-pinned [`ImageRef`] matching [`fixture_rootfs_dir`]'s REAL current content.
+    fn fixture_image() -> ImageRef {
+        let digest = crate::canonical_tar::canonical_tree_sha256_hex(&fixture_rootfs_dir())
+            .expect("hash the fixture rootfs dir");
+        ImageRef::pinned(format!("test.local/fixture-rootfs@sha256:{digest}")).unwrap()
+    }
+
+    /// A registry mapping [`fixture_image`] to [`fixture_rootfs_dir`] — the registry every unit test
+    /// in this module that calls `launch_with`/`launch` constructs its [`GvisorBackend`] with. These
+    /// tests never run a real `runsc` (they inject a fake `run` closure), so all that matters is that
+    /// construction genuinely verifies (once) before the fake closure runs.
+    fn test_registry() -> Arc<crate::asset_registry::GvisorAssetRegistry> {
+        Arc::new(
+            crate::asset_registry::GvisorAssetRegistry::from_bindings(vec![
+                crate::asset_registry::RootfsAssetBinding {
+                    image: fixture_image(),
+                    rootfs: fixture_rootfs_dir(),
+                },
+            ])
+            .expect("fixture binding verifies"),
+        )
+    }
+
     fn spec(allow: Vec<String>) -> JobSpec {
         JobSpec::new(
             JobKind::Agent,
-            ImageRef::pinned(
-                "r/img@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890",
-            )
-            .unwrap(),
+            fixture_image(),
             vec!["python3".into(), "-c".into(), "print(1)".into()],
             vec![],
             vec![],
@@ -2499,14 +2670,18 @@ mod tests {
     #[test]
     fn gvisor_launch_drives_four_guarantees_on_the_same_trait() {
         // The SAME SandboxBackend trait + the SAME hardening — the named-second backend.
-        let backend = GvisorBackend::new();
+        let backend = GvisorBackend::new(test_registry());
         let launch = backend
-            .launch_with(&spec(vec![]), &ok_hooks(), |_spec, _cfg, permit| {
-                permit
-                    .commit_and_release()
-                    .map_err(|error| error.to_string())?;
-                Ok(fake_run())
-            })
+            .launch_with(
+                &spec(vec![]),
+                &ok_hooks(),
+                |_spec, _cfg, permit, _rootfs| {
+                    permit
+                        .commit_and_release()
+                        .map_err(|error| error.to_string())?;
+                    Ok(fake_run())
+                },
+            )
             .unwrap();
         assert_eq!(launch.handle.guest_id, "runsc-idem-runsc-1");
         // The reshaped seam carries the command result back (CT-001 stub).
@@ -2701,7 +2876,7 @@ mod tests {
 
     #[test]
     fn gvisor_refuses_to_start_on_exhaustion() {
-        let backend = GvisorBackend::new();
+        let backend = GvisorBackend::new(test_registry());
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::Hook,
             Box::new(|_spec| Err(crate::HookError("exhausted".into()))),
@@ -2709,13 +2884,15 @@ mod tests {
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         );
-        let r = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit| Ok(fake_run()));
+        let r = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit, _rootfs| {
+            Ok(fake_run())
+        });
         assert!(matches!(r, Err(GvisorError::Hook(_))));
     }
 
     #[test]
     fn successful_reporter_owned_gvisor_launch_defers_settlement_to_terminal_reporter() {
-        let backend = GvisorBackend::new();
+        let backend = GvisorBackend::new(test_registry());
         let hook_settled = Arc::new(AtomicBool::new(false));
         let hook_settled_at = hook_settled.clone();
         let hooks = RunnerHooks::new(
@@ -2730,7 +2907,7 @@ mod tests {
         );
 
         backend
-            .launch_with(&spec(vec![]), &hooks, |_spec, _cfg, permit| {
+            .launch_with(&spec(vec![]), &hooks, |_spec, _cfg, permit, _rootfs| {
                 permit
                     .commit_and_release()
                     .map_err(|error| error.to_string())?;
@@ -2745,7 +2922,7 @@ mod tests {
 
     #[test]
     fn settlement_failure_unconditionally_kills_and_forgets_the_container() {
-        let backend = GvisorBackend::new();
+        let backend = GvisorBackend::new(test_registry());
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::Hook,
             Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
@@ -2756,7 +2933,7 @@ mod tests {
             Box::new(|_spec| Ok(())),
         );
 
-        let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, permit| {
+        let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, permit, _rootfs| {
             permit
                 .commit_and_release()
                 .map_err(|error| error.to_string())?;
@@ -2772,7 +2949,7 @@ mod tests {
 
     #[test]
     fn gvisor_releases_the_unused_reserve_when_final_attribution_refuses() {
-        let backend = GvisorBackend::new();
+        let backend = GvisorBackend::new(test_registry());
         let settled = Arc::new(Mutex::new(None));
         let settled_at = settled.clone();
         let hooks = RunnerHooks::new(
@@ -2787,10 +2964,14 @@ mod tests {
         );
         let spawned = Arc::new(AtomicBool::new(false));
         let spawned_at = spawned.clone();
-        let result = backend.launch_with(&spec(vec![]), &hooks, move |_spec, _cfg, _permit| {
-            spawned_at.store(true, Ordering::SeqCst);
-            Ok(fake_run())
-        });
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs| {
+                spawned_at.store(true, Ordering::SeqCst);
+                Ok(fake_run())
+            },
+        );
         assert!(matches!(result, Err(GvisorError::Hook(_))));
         assert!(!spawned.load(Ordering::SeqCst));
         assert_eq!(
@@ -2799,6 +2980,164 @@ mod tests {
                 cpu_seconds: 0,
                 mem_byte_seconds: 0,
             })
+        );
+    }
+
+    /// CT-007 gate 2/4 (f, corrected ordering): a RED isolation floor refuses BEFORE the registry
+    /// lookup is ever consulted — proven by using a genuinely UNREGISTERED image (so if the
+    /// (wrong-order) implementation queried the registry first, it would refuse there as
+    /// `GvisorError::Image` WITHOUT the floor hook ever having been called, and `floor_called` would
+    /// read `false`). Asserting `floor_called == true` alongside a `GvisorError::Hook` result is only
+    /// possible if the floor really did run first, despite the image being unresolvable — which also
+    /// means an exhausted-wallet caller cannot force the (now-cheap, but real) registry lookup by
+    /// repeatedly failing the floor.
+    #[test]
+    fn red_isolation_floor_refuses_before_registry_lookup_reserve_or_spawn() {
+        let floor_called = Arc::new(AtomicBool::new(false));
+        let floor_called_at = floor_called.clone();
+        let reserve_called = Arc::new(AtomicBool::new(false));
+        let reserve_called_at = reserve_called.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(move |spec| {
+                reserve_called_at.store(true, Ordering::SeqCst);
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(move |_spec| {
+                floor_called_at.store(true, Ordering::SeqCst);
+                Err(crate::HookError("isolation floor is RED for this test".into()))
+            }),
+        );
+
+        let mut unregistered_spec = spec(vec![]);
+        unregistered_spec.image = ImageRef::pinned(
+            "test.local/genuinely-unregistered@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        )
+        .unwrap();
+        let spawned = Arc::new(AtomicBool::new(false));
+        let spawned_at = spawned.clone();
+        // A fresh, otherwise-empty registry — the spec's image is deliberately NOT registered here,
+        // so a wrong-order (registry-before-floor) implementation would refuse via `Image`, not
+        // `Hook`, and would never call the floor closure at all.
+        let backend = GvisorBackend::new(Arc::new(
+            crate::asset_registry::GvisorAssetRegistry::from_bindings(vec![]).unwrap(),
+        ));
+        let result = backend.launch_with(
+            &unregistered_spec,
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs| {
+                spawned_at.store(true, Ordering::SeqCst);
+                Ok(fake_run())
+            },
+        );
+
+        assert!(
+            matches!(result, Err(GvisorError::Hook(_))),
+            "the isolation floor's own refusal must surface, proving it ran BEFORE the registry \
+             lookup (an unregistered image would otherwise short-circuit as `Image` first): {result:?}"
+        );
+        assert!(
+            floor_called.load(Ordering::SeqCst),
+            "the isolation floor must be consulted even for an unresolvable image"
+        );
+        assert!(
+            !reserve_called.load(Ordering::SeqCst),
+            "no reserve may be attempted"
+        );
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "the run closure must never be invoked"
+        );
+    }
+
+    /// CT-007 gate 2/4 (f, still-correct half): a GREEN isolation floor + an unknown image still
+    /// refuses before `reserve`/the `run` closure — none of them ever fire. This is the part of the
+    /// original ordering test that was already right; it just now runs AFTER the floor instead of
+    /// before it.
+    #[test]
+    fn unknown_image_after_green_floor_refuses_before_reserve_or_spawn() {
+        let floor_called = Arc::new(AtomicBool::new(false));
+        let floor_called_at = floor_called.clone();
+        let reserve_called = Arc::new(AtomicBool::new(false));
+        let reserve_called_at = reserve_called.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(move |spec| {
+                reserve_called_at.store(true, Ordering::SeqCst);
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(move |_spec| {
+                floor_called_at.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        );
+
+        let mut unregistered_spec = spec(vec![]);
+        unregistered_spec.image = ImageRef::pinned(
+            "test.local/genuinely-unregistered@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        )
+        .unwrap();
+        let spawned = Arc::new(AtomicBool::new(false));
+        let spawned_at = spawned.clone();
+        // A fresh, otherwise-empty registry — the fixture image is deliberately NOT registered here.
+        let backend = GvisorBackend::new(Arc::new(
+            crate::asset_registry::GvisorAssetRegistry::from_bindings(vec![]).unwrap(),
+        ));
+        let result = backend.launch_with(
+            &unregistered_spec,
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs| {
+                spawned_at.store(true, Ordering::SeqCst);
+                Ok(fake_run())
+            },
+        );
+
+        assert!(matches!(result, Err(GvisorError::Image(_))));
+        assert!(
+            floor_called.load(Ordering::SeqCst),
+            "the isolation floor must have been consulted (and passed) first"
+        );
+        assert!(
+            !reserve_called.load(Ordering::SeqCst),
+            "no reserve may be attempted"
+        );
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "the run closure must never be invoked"
+        );
+    }
+
+    /// A committed regression pin for `GvisorBackend::git_wire_only()`'s refusal of ordinary launch:
+    /// the behavior existed (see `launch_with`'s `self.registry.as_ref().ok_or_else(...)`) but had no
+    /// test asserting it returns `GvisorError::Image` rather than panicking or hanging.
+    #[test]
+    fn git_wire_only_backend_refuses_ordinary_launch() {
+        let backend = GvisorBackend::git_wire_only();
+        let hooks = ok_hooks();
+        let result = backend.launch(&spec(vec![]), &hooks);
+        assert!(
+            matches!(result, Err(GvisorError::Image(_))),
+            "a git-wire-only backend has no asset registry and must refuse an ordinary launch as \
+             GvisorError::Image, not panic or hang: {result:?}"
+        );
+    }
+
+    /// The same refusal for the streaming entry point.
+    #[test]
+    fn git_wire_only_backend_refuses_ordinary_launch_streaming() {
+        let backend = GvisorBackend::git_wire_only();
+        let hooks = ok_hooks();
+        let output: Arc<dyn SandboxOutputSink> = Arc::new(RecordingOutput::default());
+        let result =
+            backend.launch_streaming(&spec(vec![]), &hooks, output, SandboxCancellation::new());
+        assert!(
+            matches!(result, Err(GvisorError::Image(_))),
+            "a git-wire-only backend must refuse ordinary launch_streaming the same way as launch: \
+             {result:?}"
         );
     }
 
@@ -2825,8 +3164,11 @@ mod tests {
             },
             idem_token: IdemToken("cancel".into()),
         };
-        let result =
-            GvisorBackend::new().launch_git_wire_until_cancelled(&spec, &ok_hooks(), &cancelled);
+        let result = GvisorBackend::git_wire_only().launch_git_wire_until_cancelled(
+            &spec,
+            &ok_hooks(),
+            &cancelled,
+        );
         assert!(
             matches!(result, Err(WireError::Runtime(message)) if message.contains("cancelled by process shutdown"))
         );

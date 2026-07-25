@@ -73,6 +73,12 @@ serde.workspace = true
 serde_json.workspace = true
 zeroize = "1"
 libc = "0.2"
+# The pure-Rust canonical-tree hasher (`canonical_tar.rs`) that `GvisorAssetRegistry::from_bindings`
+# uses to recompute a staged rootfs directory's digest BEFORE any resource is reserved — no host `tar`
+# process may be spawned from that trusted path (the `no-host-exec` architecture lint). `sha2` is
+# ALREADY the workspace's vetted RustCrypto FIPS-180-4 sha256 impl (see the root `Cargo.toml`'s
+# `[workspace.dependencies]` note) — reused here rather than a hand-rolled hash.
+sha2.workspace = true
 
 [features]
 test-support = []

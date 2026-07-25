@@ -21,10 +21,12 @@ use myelin_ci_controlplane::{
     ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, CI_PIPELINE_WF_TYPE, CREATE_CI_DRIVE_MANIFEST_DDL,
     CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
 };
+use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpecTemplate, MeterTarget,
-    ResourceLimits, RunTokenCredential, SandboxBackend, SecretRef, TrustTier, WorkspaceSpec,
+    resolved_gvisor_rootfs, EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpecTemplate,
+    MeterTarget, ResourceLimits, RunTokenCredential, SandboxBackend, SecretRef, TrustTier,
+    WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_config::MyelinConfig;
 use myelin_flow::migrations::migrations as flow_migrations;
@@ -80,6 +82,31 @@ async fn pinned_pool(url: &str, schema: &str) -> PgPool {
 
 fn digest(byte: char) -> String {
     format!("blake3:{}", byte.to_string().repeat(64))
+}
+
+/// The real, already-founder-pipeline-pinned `linux-small-v1` image (`.myelin/ci.toml`'s own pin).
+/// CT-007 gate 2/4 made `spec.image` the real launch authority: ONLY `manifest().jobs[0]` (the
+/// "build" job) ever actually reaches `GvisorBackend::launch` in this file (`jobs[1]`/`jobs[2]` are
+/// exercised only through `RunnerHooks::reserve`/`attribute`/`release_unused` directly, never through
+/// the sandbox backend, so their fabricated placeholder `image` digests are untouched — they never
+/// reach the registry). `jobs[0]`'s image is therefore the one that must be genuinely verifiable.
+fn linux_small_v1_image() -> ImageRef {
+    ImageRef::pinned(format!(
+        "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
+    ))
+    .unwrap()
+}
+
+fn test_registry() -> std::sync::Arc<GvisorAssetRegistry> {
+    std::sync::Arc::new(
+        GvisorAssetRegistry::from_bindings(vec![
+            myelin_ci_sandbox::asset_registry::RootfsAssetBinding {
+                image: linux_small_v1_image(),
+                rootfs: resolved_gvisor_rootfs(),
+            },
+        ])
+        .expect("the base linux-small-v1 rootfs binding verifies"),
+    )
 }
 
 const PROJECT_ID: &str = "44444444-4444-8444-8444-444444444444";
@@ -159,7 +186,7 @@ fn manifest() -> CiDriveManifestV1 {
                 check_context: "build".into(),
                 needs: Vec::new(),
                 matrix_key: BTreeMap::new(),
-                image: format!("registry.example/build@sha256:{}", "d".repeat(64)),
+                image: linux_small_v1_image().reference,
                 command: vec![
                     "/bin/sh".into(),
                     "-c".into(),
@@ -897,7 +924,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
             spawn_signed,
             Some(ci_job_authorization_context(&exact_claim)),
         );
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     let launch = backend
         .launch(&spawn_spec, &runner_hooks)
         .expect("the recovered generation reaches the real production gVisor spawn");
