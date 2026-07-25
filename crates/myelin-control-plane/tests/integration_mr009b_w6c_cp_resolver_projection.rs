@@ -24,6 +24,8 @@
 //! Skips gracefully if the DB is unreachable (like the sibling integration tests).
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::sync::Arc;
 
 use myelin_config::MyelinConfig;
@@ -163,95 +165,113 @@ async fn resolver_registry_projects_from_the_durable_cell_table() {
     let suffix = uniq();
     let cell_b = format!("cell-b-{suffix}");
     let cell_c = format!("cell-c-{suffix}");
+    let bad_ep = format!("cell-bad-{suffix}");
+    let unres = format!("cell-unres-{suffix}");
     let ep_b = format!("cell-b.eu-west.{suffix}.myelin.eu");
     let ep_c = format!("cell-c.eu-west.{suffix}.myelin.eu");
 
-    let backing = DurablePlacementBacking::new(pool.clone());
-    backing
-        .insert_cell(&cell_row(&cell_b, "eu-west", &ep_b))
-        .await
-        .expect("insert cell-b with a durable endpoint");
-    backing
-        .insert_cell(&cell_row(&cell_c, "eu-west", &ep_c))
-        .await
-        .expect("insert cell-c with a durable endpoint");
+    common::with_cleanup(
+        || async {
+            let backing = DurablePlacementBacking::new(pool.clone());
+            backing
+                .insert_cell(&cell_row(&cell_b, "eu-west", &ep_b))
+                .await
+                .expect("insert cell-b with a durable endpoint");
+            backing
+                .insert_cell(&cell_row(&cell_c, "eu-west", &ep_c))
+                .await
+                .expect("insert cell-c with a durable endpoint");
 
-    // (1) PROJECT the registry from the durable cell rows, then resolve through the bridge.
-    let f = factory();
-    let reg = CellResolverRegistry::project_from_durable_cells(&backing, f.as_ref())
-        .await
-        .expect("the projection is built from the durable cell endpoints");
-    let bridge = CrossCellBridge::new(CellId::from_token("cell-a"), reg);
+            // (1) PROJECT the registry from the durable cell rows, then resolve through the bridge.
+            let f = factory();
+            let reg = CellResolverRegistry::project_from_durable_cells(&backing, f.as_ref())
+                .await
+                .expect("the projection is built from the durable cell endpoints");
+            let bridge = CrossCellBridge::new(CellId::from_token("cell-a"), reg);
 
-    let res = bridge.resolve(
-        &pointer("myelin://01J0BETA/issues/issue/7", &cell_b),
-        &ViewerId::from_token("viewer-1"),
-        BridgeMode::Live,
-    );
-    let BridgeResolution::Projection(proj) = res else {
-        panic!("an authorised viewer resolves to a projection through the projected registry");
-    };
-    // The dispatched handle is the RIGHT cell's — it carries cell-b's DURABLE endpoint (proof the
-    // projection mapped `home_cell` → the handle built from that cell's row, not some other cell's).
-    assert_eq!(proj.title, ep_b, "resolved through cell-b's projected handle");
-    assert_eq!(bridge.cross_cell_raw_rows(), 0, "CP-D8 zero holds on the projected arm");
+            let res = bridge.resolve(
+                &pointer("myelin://01J0BETA/issues/issue/7", &cell_b),
+                &ViewerId::from_token("viewer-1"),
+                BridgeMode::Live,
+            );
+            let BridgeResolution::Projection(proj) = res else {
+                panic!("an authorised viewer resolves to a projection through the projected registry");
+            };
+            // The dispatched handle is the RIGHT cell's — it carries cell-b's DURABLE endpoint (proof the
+            // projection mapped `home_cell` → the handle built from that cell's row, not some other cell's).
+            assert_eq!(proj.title, ep_b, "resolved through cell-b's projected handle");
+            assert_eq!(bridge.cross_cell_raw_rows(), 0, "CP-D8 zero holds on the projected arm");
 
-    // An unknown home cell (not in the durable projection) degrades to a Gone tombstone.
-    let ghost = bridge.resolve(
-        &pointer("myelin://01J0GHOST/issues/issue/1", "cell-unknown"),
-        &ViewerId::from_token("viewer-1"),
-        BridgeMode::Live,
-    );
-    assert_eq!(ghost.tombstone_reason(), Some(BridgeTombstoneReason::Gone));
+            // An unknown home cell (not in the durable projection) degrades to a Gone tombstone.
+            let ghost = bridge.resolve(
+                &pointer("myelin://01J0GHOST/issues/issue/1", "cell-unknown"),
+                &ViewerId::from_token("viewer-1"),
+                BridgeMode::Live,
+            );
+            assert_eq!(ghost.tombstone_reason(), Some(BridgeTombstoneReason::Gone));
 
-    // (2) Durable-by-authority: RE-PROJECT over a FRESH pool (new connections) — the registry
-    // reconstructs identically because its authority is the durable rows, not process state.
-    let fresh = SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 2)
-        .await
-        .expect("a fresh pool connects");
-    let fresh_backing = DurablePlacementBacking::new(fresh.db_pool().clone());
-    let reg2 = CellResolverRegistry::project_from_durable_cells(&fresh_backing, f.as_ref())
-        .await
-        .expect("the projection reconstructs over a fresh pool");
-    let bridge2 = CrossCellBridge::new(CellId::from_token("cell-a"), reg2);
-    let BridgeResolution::Projection(proj2) = bridge2.resolve(
-        &pointer("myelin://01J0BETA/issues/issue/9", &cell_c),
-        &ViewerId::from_token("viewer-1"),
-        BridgeMode::Live,
-    ) else {
-        panic!("the fresh-pool projection resolves cell-c");
-    };
-    assert_eq!(proj2.title, ep_c, "the fresh-pool projection is authoritative from the durable rows");
+            // (2) Durable-by-authority: RE-PROJECT over a FRESH pool (new connections) — the registry
+            // reconstructs identically because its authority is the durable rows, not process state.
+            let fresh = SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 2)
+                .await
+                .expect("a fresh pool connects");
+            let fresh_backing = DurablePlacementBacking::new(fresh.db_pool().clone());
+            let reg2 = CellResolverRegistry::project_from_durable_cells(&fresh_backing, f.as_ref())
+                .await
+                .expect("the projection reconstructs over a fresh pool");
+            let bridge2 = CrossCellBridge::new(CellId::from_token("cell-a"), reg2);
+            let BridgeResolution::Projection(proj2) = bridge2.resolve(
+                &pointer("myelin://01J0BETA/issues/issue/9", &cell_c),
+                &ViewerId::from_token("viewer-1"),
+                BridgeMode::Live,
+            ) else {
+                panic!("the fresh-pool projection resolves cell-c");
+            };
+            assert_eq!(proj2.title, ep_c, "the fresh-pool projection is authoritative from the durable rows");
 
-    // (3a) FAIL LOUD on a missing endpoint — never a silent empty registry.
-    let bad_ep = format!("cell-bad-{suffix}");
-    backing
-        .insert_cell(&cell_row(&bad_ep, "eu-west", ""))
-        .await
-        .expect("insert a cell with an EMPTY endpoint");
-    let err = CellResolverRegistry::project_from_durable_cells(&backing, f.as_ref())
-        .await
-        .expect_err("an empty endpoint makes the projection REFUSE (fail loud)");
-    assert!(
-        matches!(err, ProjectionError::MissingEndpoint { .. }),
-        "empty endpoint → MissingEndpoint, got {err}"
-    );
-    cleanup(&pool, &[bad_ep]).await;
+            // (3a) FAIL LOUD on a missing endpoint — never a silent empty registry.
+            backing
+                .insert_cell(&cell_row(&bad_ep, "eu-west", ""))
+                .await
+                .expect("insert a cell with an EMPTY endpoint");
+            let err = CellResolverRegistry::project_from_durable_cells(&backing, f.as_ref())
+                .await
+                .expect_err("an empty endpoint makes the projection REFUSE (fail loud)");
+            assert!(
+                matches!(err, ProjectionError::MissingEndpoint { .. }),
+                "empty endpoint → MissingEndpoint, got {err}"
+            );
+            // Functionally required, not just hygiene: `project_from_durable_cells` scans the WHOLE
+            // `cell` table, so leaving `bad_ep`'s empty endpoint in place would make the NEXT
+            // projection below (3b) fail on `bad_ep` too, before ever reaching `unres` — breaking the
+            // `Unresolvable` assertion. Must run BEFORE (3b), not deferred to the end.
+            cleanup(&pool, std::slice::from_ref(&bad_ep)).await;
 
-    // (3b) FAIL LOUD on an unresolvable endpoint (the factory refuses it).
-    let unres = format!("cell-unres-{suffix}");
-    backing
-        .insert_cell(&cell_row(&unres, "eu-west", "unresolvable"))
-        .await
-        .expect("insert a cell whose endpoint the factory rejects");
-    let err2 = CellResolverRegistry::project_from_durable_cells(&backing, f.as_ref())
-        .await
-        .expect_err("an unresolvable endpoint makes the projection REFUSE (fail loud)");
-    assert!(
-        matches!(err2, ProjectionError::Unresolvable { .. }),
-        "unresolvable endpoint → Unresolvable, got {err2}"
-    );
-    cleanup(&pool, &[unres]).await;
-
-    cleanup(&pool, &[cell_b, cell_c]).await;
+            // (3b) FAIL LOUD on an unresolvable endpoint (the factory refuses it).
+            backing
+                .insert_cell(&cell_row(&unres, "eu-west", "unresolvable"))
+                .await
+                .expect("insert a cell whose endpoint the factory rejects");
+            let err2 = CellResolverRegistry::project_from_durable_cells(&backing, f.as_ref())
+                .await
+                .expect_err("an unresolvable endpoint makes the projection REFUSE (fail loud)");
+            assert!(
+                matches!(err2, ProjectionError::Unresolvable { .. }),
+                "unresolvable endpoint → Unresolvable, got {err2}"
+            );
+            cleanup(&pool, std::slice::from_ref(&unres)).await;
+        },
+        || async {
+            // Outer panic-safety net: unconditionally sweep every row this test could possibly have
+            // created, regardless of which point above panicked (a bare DELETE on a non-existent
+            // cell_id is a no-op, so re-covering bad_ep/unres here even when the in-body cleanups
+            // above already ran is harmless).
+            cleanup(
+                &pool,
+                &[cell_b.clone(), cell_c.clone(), bad_ep.clone(), unres.clone()],
+            )
+            .await;
+        },
+    )
+    .await;
 }

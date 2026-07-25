@@ -126,6 +126,11 @@ myelin-substrate = { path = "../myelin-substrate", features = ["test-support"] }
 # MR-009b W6c-cp — DEV-only: the dev config (`MyelinConfig::dev()`) the live-PG W6c-cp projection
 # integration test connects the pool with. DEV-only — never in the production DAG.
 myelin-config = { path = "../myelin-config" }
+# Panic-safe test teardown (`tests/common::with_cleanup`, the same shape as
+# `myelin-storage/tests/common/mod.rs`): `FutureExt::catch_unwind` lets a test's body run to
+# completion OR panic while its own `cleanup(...)` call still runs unconditionally afterward. DEV-only
+# — never in the production DAG.
+futures = { workspace = true }
 # MR-009b W6c-cp — DEV-only: the live-PG W6c-cp projection integration test cleans up its own throwaway
 # `cell` rows (the control-plane `cell` table is cross-tenant routing infra with no RLS/suffix scope, so
 # `all_cells()` is unscoped) through a direct DELETE. DEV-only — never in the production DAG.
