@@ -409,7 +409,9 @@ impl HardeningProfile {
             seccomp: true,
             pids_max: spec.limits.pids_max,
             zero_swap: true,
-            scratch_quota_bytes: spec.limits.disk_bytes,
+            // The RAM-backed /tmp tmpfs ceiling (NOT the disk-backed ephemeral-workspace quota,
+            // which is spec.limits.disk_bytes — that has no mount wiring yet, a later step).
+            scratch_quota_bytes: spec.limits.tmpfs_bytes,
             ephemeral_one_job: true,
         }
     }
@@ -495,6 +497,7 @@ mod tests {
                 cpu_millis: 1000,
                 mem_bytes: 256 << 20,
                 disk_bytes: 1 << 30,
+                tmpfs_bytes: 1 << 30,
                 pids_max: 128,
                 timeout_secs: 300,
             },

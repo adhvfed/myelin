@@ -251,6 +251,19 @@ fn manifest_dispatch_parts(
             cpu_millis: job.limits.cpu_millis,
             mem_bytes: job.limits.mem_bytes,
             disk_bytes: job.limits.disk_bytes,
+            // NOTE (ResourceLimits split): mirrored from `disk_bytes`, NOT a new independent
+            // default, deliberately. Two reasons: (1) this is exactly the value that sized the
+            // `/tmp` tmpfs before the split, so mirroring it keeps runtime tmpfs sizing
+            // byte-for-byte unchanged; (2) `ci_runner_composition::manifest_matches_template`
+            // asserts `template.limits.disk_bytes == job.limits.disk_bytes` as a fail-closed
+            // dispatch invariant — giving `disk_bytes` here its own independent
+            // ephemeral-workspace default (as the manifest's declared value no longer directly
+            // sizes anything at runtime) would NOT break that invariant, since it only compares
+            // `disk_bytes`. But there is no manifest-carried tmpfs value to source
+            // `tmpfs_bytes` from, so mirroring `job.limits.disk_bytes` is the only
+            // behavior-preserving choice available without a manifest schema change (a later
+            // step, alongside actually wiring up the disk-backed workspace mount).
+            tmpfs_bytes: job.limits.disk_bytes,
             pids_max: job.limits.pids_max,
             timeout_secs: job.limits.timeout_secs,
         },

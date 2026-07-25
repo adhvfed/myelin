@@ -371,8 +371,17 @@ pub struct ResourceLimits {
     pub cpu_millis: u32,
     /// Memory ceiling, bytes.
     pub mem_bytes: u64,
-    /// Scratch-disk quota, bytes.
+    /// The disk-backed EPHEMERAL WORKSPACE quota, bytes — the real host-disk-backed writable
+    /// workspace a job's checkout/build lives in (e.g. `cargo build` output, which can run into
+    /// many GB of `target/`). NOT the RAM-backed `/tmp` scratch tmpfs — see [`Self::tmpfs_bytes`]
+    /// for that. No disk-backed-workspace mount is wired up yet (a later step); this field is the
+    /// type-level home for that quota in advance of the mount implementation.
     pub disk_bytes: u64,
+    /// The RAM-backed `/tmp` scratch tmpfs ceiling, bytes (CT-003a). This bounds gVisor's
+    /// otherwise-unbounded host-RAM-backed `/tmp` tmpfs, so a disk fill hits `ENOSPC` instead of
+    /// consuming host RAM without limit. SHOULD be <= `mem_bytes` (it is carved out of the same
+    /// host RAM the job's memory ceiling bounds) — not enforced yet, that's a later step.
+    pub tmpfs_bytes: u64,
     /// The `pids.max` fork-bomb ceiling (arch 02 §5.3). MUST be > 0.
     pub pids_max: u32,
     /// The wall-clock timeout, seconds. MUST be > 0.
@@ -1483,6 +1492,7 @@ mod tests {
             cpu_millis: 1000,
             mem_bytes: 512 << 20,
             disk_bytes: 1 << 30,
+            tmpfs_bytes: 1 << 30,
             pids_max: 256,
             timeout_secs: 600,
         }

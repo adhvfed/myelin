@@ -18,7 +18,8 @@ use myelin_ci_controlplane::{
     CiRunStoreError, CiRunTerminalState, DurableCiJobAccounting, DurableCiRunFinalizer,
     DurableEnqueue, DurableLeaseAdapter, GrantedCiJobV1, JobQueueReaper, Lane,
     ManifestBoundCiJobTokenAuthority, PgCiRunSupersession, PricedCiJobUsage,
-    CI_RUNNER_LEASE_TTL_SECS, LINUX_SMALL_V1_RUNNER_LABELS, TIER_P_OPERATIONAL_PRICING_REVISION,
+    CI_MANIFEST_PIPELINE_VERSION, CI_RUNNER_LEASE_TTL_SECS, LINUX_SMALL_V1_RUNNER_LABELS,
+    TIER_P_OPERATIONAL_PRICING_REVISION,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
@@ -139,7 +140,7 @@ fn manifest(
         source_plan_schema_version: 2,
         launch_request_digest: digest('b'),
         workflow_type: CI_PIPELINE_WF_TYPE.into(),
-        workflow_definition_version: 1,
+        workflow_definition_version: CI_MANIFEST_PIPELINE_VERSION,
         workflow_code_hash: workflow_code_hash.into(),
         authority_policy_revision: "ci-policy:2026-07-21".into(),
         repo_ref: format!("myelin://{tenant}/git/repo/core"),
@@ -236,7 +237,7 @@ fn manifest(
             trigger_kind: "push".into(),
             trust_tier: "trusted".into(),
             source_snapshot_digest: digest('a'),
-            workflow_definition_version: 1,
+            workflow_definition_version: CI_MANIFEST_PIPELINE_VERSION,
             workflow_code_hash: workflow_code_hash.into(),
             policy_revision: "ci-policy:2026-07-21".into(),
             limits: executable.limits.clone(),

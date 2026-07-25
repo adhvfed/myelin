@@ -2494,6 +2494,7 @@ name = "myelin-control-plane"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "futures",
  "hex",
  "myelin-ci-sandbox",
  "myelin-config",

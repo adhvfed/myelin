@@ -132,7 +132,7 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         has_network: false,
         pids_max: 128,
         mem_bytes: 256 * 1024 * 1024,
-        disk_bytes: 1024 * 1024 * 1024,
+        tmpfs_bytes: 1024 * 1024 * 1024,
         extra_mounts: Vec::new(),
         extra_env: Vec::new(),
         root_path: None,
@@ -229,10 +229,13 @@ pub struct OciConfig {
     /// production run path places the `runsc` process tree into — that is what OOM-kills a memory hog
     /// within the limit and keeps it from consuming host RAM beyond `mem_bytes`.
     mem_bytes: u64,
-    /// The scratch-disk quota (bytes) — the size of the bounded writable `/tmp` tmpfs (CT-003a). gVisor
-    /// would otherwise auto-mount an UNBOUNDED host-RAM-backed tmpfs at `/tmp`; sizing it caps a disk
-    /// fill at ENOSPC (the SI-017 host-DoS escape D2 surfaced through the production `launch()`).
-    disk_bytes: u64,
+    /// The RAM-backed `/tmp` tmpfs ceiling (bytes) (CT-003a). gVisor would otherwise auto-mount an
+    /// UNBOUNDED host-RAM-backed tmpfs at `/tmp`; sizing it caps a disk fill at ENOSPC (the SI-017
+    /// host-DoS escape D2 surfaced through the production `launch()`). Sourced from
+    /// [`ResourceLimits::tmpfs_bytes`](crate::ResourceLimits::tmpfs_bytes), NOT
+    /// `disk_bytes` (that field is the disk-backed ephemeral-workspace quota — unrelated to this
+    /// RAM-backed tmpfs).
+    tmpfs_bytes: u64,
     /// CT-006a (the git wire): EXTRA bind mounts injected into the bundle (host→guest, with a
     /// `readonly` flag). EMPTY for every CI/agent job (so the prod-exec posture is byte-unchanged);
     /// the git-wire launch path populates it with the **read-only bare-repo mount** at
@@ -281,8 +284,8 @@ impl OciConfig {
             has_network: profile.network_device,
             pids_max: profile.pids_max,
             mem_bytes: spec.limits.mem_bytes,
-            // The hardening profile's scratch-disk quota (= `spec.limits.disk_bytes`).
-            disk_bytes: profile.scratch_quota_bytes,
+            // The hardening profile's scratch-tmpfs quota (= `spec.limits.tmpfs_bytes`).
+            tmpfs_bytes: profile.scratch_quota_bytes,
             // No extra bind mounts / env by default — a CI/agent job's posture is byte-unchanged.
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
@@ -341,7 +344,7 @@ impl OciConfig {
         let mut mounts = vec![format!(
             "{{ \"destination\": \"/tmp\", \"type\": \"tmpfs\", \"source\": \"tmpfs\", \
              \"options\": [\"nosuid\", \"nodev\", \"mode=1777\", \"size={}\"] }}",
-            self.disk_bytes
+            self.tmpfs_bytes
         )];
         for m in &self.extra_mounts {
             let src = m.host_source.to_string_lossy();
@@ -2470,6 +2473,7 @@ mod tests {
                 cpu_millis: 1000,
                 mem_bytes: 256 << 20,
                 disk_bytes: 1 << 30,
+                tmpfs_bytes: 1 << 30,
                 pids_max: 64,
                 timeout_secs: 120,
             },
@@ -2652,7 +2656,7 @@ mod tests {
         // the production run path places the runsc tree into (see MemoryCgroup). It also mounts a
         // SIZE-BOUNDED writable `/tmp` tmpfs (sized from the scratch quota) so a disk fill hits
         // ENOSPC instead of an unbounded host-RAM-backed tmpfs. spec()'s limits are mem=256 MiB,
-        // disk=1 GiB.
+        // tmpfs=1 GiB.
         assert!(
             json.contains(&format!("\"limit\": {}", 256u64 << 20)),
             "the OCI config must carry the memory ceiling (linux.resources.memory.limit) from spec.limits.mem_bytes"
@@ -2663,7 +2667,7 @@ mod tests {
         );
         assert!(
             json.contains(&format!("size={}", 1u64 << 30)) && json.contains("mode=1777"),
-            "the /tmp tmpfs must be sized from spec.limits.disk_bytes and writable by the non-root payload"
+            "the /tmp tmpfs must be sized from spec.limits.tmpfs_bytes and writable by the non-root payload"
         );
     }
 
@@ -3155,6 +3159,7 @@ mod tests {
                 cpu_millis: 1,
                 mem_bytes: 1,
                 disk_bytes: 1,
+                tmpfs_bytes: 1,
                 pids_max: 1,
                 timeout_secs: 1,
             },

@@ -210,6 +210,7 @@ fn corpus_spec(command: Vec<String>, tag: &str) -> JobSpec {
             // /run/scratch sized from disk_bytes) makes D2_diskfill hit ENOSPC and report CONTAINED.
             // This is the SI-017 fix: a disk fill is bounded at the quota, not the host's free RAM.
             disk_bytes: 16 * 1024 * 1024,
+            tmpfs_bytes: 16 * 1024 * 1024,
             pids_max: PIDS_MAX,
             timeout_secs: 120,
         },

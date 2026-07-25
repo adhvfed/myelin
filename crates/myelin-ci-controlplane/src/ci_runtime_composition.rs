@@ -27,7 +27,12 @@ use crate::{
 };
 
 /// Version of the production manifest-native `ci.pipeline` definition.
-pub const CI_MANIFEST_PIPELINE_VERSION: i32 = 1;
+///
+/// Bumped 1 -> 2 (2026-07-25): the `ResourceLimits`/`WorkspaceSpec` disk/tmpfs split (CT-007
+/// vertical-slice-step-2 workspace-storage work) touched `ci_manifest_job_runner.rs`'s bytes,
+/// which this pin hashes. Per this function's own doc, any source change must be a deliberate
+/// version bump, never a silent hash update against an already-recorded version.
+pub const CI_MANIFEST_PIPELINE_VERSION: i32 = 2;
 /// Flow drive lease for a tenant/partition worker.
 pub const CI_FLOW_WORKER_LEASE_TTL_SECS: i64 = 60;
 /// Schema version stamped on workflow-body outbox facts.

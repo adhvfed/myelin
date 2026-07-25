@@ -353,6 +353,7 @@ fn compute_spec(command: Vec<String>, trust: TrustTier, idem: &str) -> DurableCi
             cpu_millis: 1000,
             mem_bytes: 256 * 1024 * 1024,
             disk_bytes: 1 << 30,
+            tmpfs_bytes: 1 << 30,
             pids_max: 128,
             timeout_secs: 60,
         },
