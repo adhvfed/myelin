@@ -1,0 +1,143 @@
+# ci-workload-inventory.toml — the CT-007 pre-registered cutover-floor GATE 1/4.
+#
+# planning/system-reviews/2026-06-26/12-ci-track-ledger.md ("Pre-registered CT-007 cutover
+# floor", ~line 302): CT-007 (cut CI over from GitHub Actions onto the hardened sandbox) may begin
+# disabling or removing GitHub Actions jobs only after four gates. Gate 1 is:
+#
+#   "A committed Myelin-native workflow maps every still-required GitHub job to an executable
+#   Myelin job or names a mechanically gated, non-CI owner; an inventory test fails on silent job
+#   loss."
+#
+# This file is that mapping. `crates/myelin-lints/tests/ci_workload_inventory.rs` is the inventory
+# test: it scans every `jobs:` block in `.github/workflows/*.yml` and fails RED if a discovered
+# job has no row here, or if a row here names a job that no longer exists in the workflow files.
+#
+# STATUS TODAY (committed 2026-07-25): the only Myelin-native pipeline that exists at all is the
+# tiny founder-dogfood marker job in `.myelin/ci.toml` — it proves transport/plumbing only, NOT
+# workload parity with any job below. So every row's `status` is honestly `github-only`; NONE are
+# `myelin-native` yet. Marking a row `myelin-native` before a real `.myelin/ci.toml` job exists for
+# it would be exactly the overclaiming doctrine EI-01 §5 forbids ("make violations loud, never
+# silently swallowed" — the inverse failure mode is silently claiming a floor that is not there).
+#
+# STATUS VOCABULARY (the inventory-honesty test `no_inventory_entry_claims_myelin_native_without_
+# naming_its_myelin_job` enforces the contract below — it is not just documentation):
+#   - "github-only"    — GitHub Actions is the only thing that runs this workload today.
+#                        `myelin_job` MUST be empty (there is nothing yet to name).
+#   - "myelin-native"  — a real `.myelin/ci.toml` job now carries this workload. `myelin_job`
+#                        MUST name that job (non-empty) — a later CT-007 step's Definition of Done.
+#
+# `owner` names the CT-007 cutover-plan step accountable for eventually flipping this row — a
+# MECHANICALLY GATED, non-CI owner (the ledger's step numbers, each itself gated by a committed
+# test/scorecard), never a person and never a fabricated Myelin job. The four steps:
+#   1. this inventory (satisfied by this file + its test, committed 2026-07-25)
+#   2. digest-pinned one-cell runner assets providing the Rust/Node/browser/container capability
+#      each job needs, without weakening gVisor/egress/privilege boundaries
+#   3. the complete mapped graph passes on one exact Myelin commit + the permanent mutation gate
+#      has zero missed mutants
+#   4. a second ordinary commit repeats the graph without GitHub execution or manual green
+# None of steps 2-4 have started for any row below.
+#
+# WHEN A LATER STEP SHIPS A REAL MYELIN JOB FOR A ROW: flip its `status` to `myelin-native` and
+# fill in `myelin_job` with the real `.myelin/ci.toml` job name. Do not flip early.
+
+# ─────────────────────────────────── .github/workflows/ci.yml ───────────────────────────────────
+
+[[job]]
+workflow = "ci.yml"
+job = "edge-release-bundle"
+status = "github-only"
+owner = "CT-007 step 2 (one-cell runner asset) — not started"
+myelin_job = ""
+note = "Builds the locked, stripped, checksummed edge release bundle artifact. P0 later promotes this one-cell runner asset into the signed/SBOM release supply-chain floor (ledger 2026-06-26); that later provenance work is not an excuse to drop this job before R4 workload parity exists."
+
+[[job]]
+workflow = "ci.yml"
+job = "frontend"
+status = "github-only"
+owner = "CT-007 step 2 (one-cell runner asset: Node + pinned Chromium + Valkey service) — not started"
+myelin_job = ""
+note = "Frontend workspace lint + unit/server tests against a real Valkey backend + production build + the real-browser Playwright/Chromium product suite."
+
+[[job]]
+workflow = "ci.yml"
+job = "web-container"
+status = "github-only"
+owner = "CT-007 step 2 (one-cell runner asset: Docker-capable) — not started"
+myelin_job = ""
+note = "Builds the digest-pinned production web container image and smokes liveness/readiness/ingress/asset serving/SIGTERM against the hardened runtime user + read-only filesystem + dropped capabilities."
+
+[[job]]
+workflow = "ci.yml"
+job = "architecture-lints"
+status = "github-only"
+owner = "CT-007 step 2 (one-cell runner asset) — not started"
+myelin_job = ""
+note = "L4 plan-row traceability + L3 payoff metrics + the twelve architecture lints (lint-gate) + the L2 erosion budget (erosion-gate) + the myelin-lints fixture/self-test suite. LOUD, no continue-on-error."
+
+[[job]]
+workflow = "ci.yml"
+job = "contract-coverage"
+status = "github-only"
+owner = "CT-007 step 2 (one-cell runner asset) — not started"
+myelin_job = ""
+note = "The contract-coverage meta-gate scanner (P-S21 -> P-037) over the contract-index + this repo's own manifests, plus its red/green self-test."
+
+[[job]]
+workflow = "ci.yml"
+job = "sub-m0-scorecard"
+status = "github-only"
+owner = "CT-007 step 2 (one-cell runner asset) — not started"
+myelin_job = ""
+note = "The SUB-M0 exit-gate scorecard (P-S24 -> P-039): re-runs every required SUB-M0 drill's proof command and the scorecard ratchet meta-test. A permanent gate — later bands must never run over a red M0."
+
+[[job]]
+workflow = "ci.yml"
+job = "id-m1-scorecard"
+status = "github-only"
+owner = "CT-007 step 2 (one-cell runner asset) — not started"
+myelin_job = ""
+note = "The Identity M1->M2 exit-gate scorecard (P-079 / P-ID-21): re-runs every required M1 Identity drill (ID-D1..D8) plus the contract-coverage 4.1-4.11 re-affirm, and the ratchet meta-test."
+
+[[job]]
+workflow = "ci.yml"
+job = "self-hosting-ci"
+status = "github-only"
+owner = "CT-007 step 3 (complete mapped graph passes + zero missed mutants) — not started"
+myelin_job = ""
+note = "The Myelin self-hosting CI dogfood graph (P-507 / P-S37): the twelve lints + contract-coverage scanner + the mandatory-core cargo-mutants mutation gate, run AS Myelin CI over Myelin's own commit, plus the dogfood meta-test. This job is the closest existing thing to CT-007 workload parity, but it still runs entirely under GitHub Actions today — it is not itself evidence of a Myelin-native runner."
+
+[[job]]
+workflow = "ci.yml"
+job = "build-test-clippy"
+status = "github-only"
+owner = "CT-007 step 2 (one-cell runner asset) — not started"
+myelin_job = ""
+note = "cargo build --workspace --locked, cargo test --workspace --locked, cargo clippy --workspace --all-targets -D warnings. The base Rust workload every other job's crates depend on existing."
+
+# ─────────────────────────────── .github/workflows/integration.yml ──────────────────────────────
+
+[[job]]
+workflow = "integration.yml"
+job = "integration"
+status = "github-only"
+owner = "CT-007 step 2 (one-cell runner asset: Docker-in-Docker for Postgres/RustFS/Valkey/NATS) — not started"
+myelin_job = ""
+note = "The integration band-boundary gate over real backends (Postgres/RustFS/Valkey/NATS JetStream): scripts/integration-test.sh brings the stack up, runs `cargo test --features integration`, then the infra scorecard binary. The only workflow needing a live stack + Docker-in-Docker; ci.yml stays DB-free by design."
+
+# ───────────────────────────────── .github/workflows/security.yml ───────────────────────────────
+
+[[job]]
+workflow = "security.yml"
+job = "rustsec"
+status = "github-only"
+owner = "CT-007 step 2 (one-cell runner asset with outbound egress to the RustSec advisory DB) — not started"
+myelin_job = ""
+note = "cargo-audit over Cargo.lock against the RustSec advisory database. Needs network egress to fetch/refresh the advisory DB, which the hardened sandbox's egress boundary must accommodate deliberately, not by default-allow."
+
+[[job]]
+workflow = "security.yml"
+job = "pnpm"
+status = "github-only"
+owner = "CT-007 step 2 (one-cell runner asset with outbound egress to the npm advisory DB) — not started"
+myelin_job = ""
+note = "pnpm audit --audit-level moderate over the frontend lockfile. Same named egress-boundary consideration as rustsec, for the npm advisory database instead of RustSec's."
