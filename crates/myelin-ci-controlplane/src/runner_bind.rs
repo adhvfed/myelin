@@ -51,10 +51,74 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use myelin_ci_sandbox::asset_registry::{GvisorAssetRegistry, RootfsAssetBinding};
 use myelin_ci_sandbox::gvisor::GvisorBackend;
-use myelin_ci_sandbox::{JobSpec, LeaseStore, QueuedJob, RunnerError, RunnerHooks, TrustTier};
+use myelin_ci_sandbox::{
+    resolved_gvisor_rootfs, resolved_gvisor_rust_rootfs, ImageRef, JobSpec, LeaseStore, QueuedJob,
+    RunnerError, RunnerHooks, TrustTier, LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
+};
 use myelin_storage::s3blob::S3BlobStore;
 use myelin_tenancy::{Region, TenantId};
+
+/// **The founder-dogfood pipeline's REAL `GvisorAssetRegistry` (CT-007 gate 2/4).** This is the
+/// single most safety-critical construction in this slice: it is what turns `spec.image` into the
+/// rootfs the REAL production runner loop ([`CiRunnerLoop::run_until_shutdown`]) actually launches
+/// against. Every entry here reuses an EXISTING resolver ([`resolved_gvisor_rootfs`] /
+/// [`resolved_gvisor_rust_rootfs`]) rather than hardcoding a path, so an operator's env-var override
+/// (`MYELIN_GVISOR_ROOTFS` / `MYELIN_GVISOR_RUST_ROOTFS`) still works exactly as it did before this
+/// slice.
+///
+/// **Registered today:**
+/// - `myelin.local/linux-small-v1-rootfs@sha256:<LINUX_SMALL_V1_ROOTFS_SHA256>` → the base rootfs —
+///   the EXACT image `.myelin/ci.toml` already pins for the live founder-dogfood pipeline
+///   (`scripts/dogfood.sh verify-ci-rootfs` independently asserts this same digest against the same
+///   directory by shelling out; this registry entry asserts it again, in-process, at every launch).
+///   Before this change, production resolved the rootfs SOLELY from `MYELIN_GVISOR_ROOTFS`,
+///   completely ignoring whatever image a job declared; this entry is what makes that declaration
+///   the real authority going forward, for the SAME asset that already runs today — nothing about
+///   which bytes execute changes, only that `spec.image` is now checked against them.
+/// - `myelin.local/linux-rust-v1-rootfs@sha256:<LINUX_RUST_V1_ROOTFS_SHA256>` → the Rust-capable
+///   rootfs (`runner-assets.toml`'s `linux-rust-v1` row) — registered for HONESTY (every ordinary,
+///   non-git-wire job rootfs this runner currently launches is covered) even though no dispatched
+///   job names it yet.
+///
+/// **Composition-root placement, not `myelin-ci-sandbox`:** this function lives here (the CI
+/// control-plane's composition root), not in `myelin-ci-sandbox`, because the SPECIFIC bindings
+/// (which images exist, which asset backs the founder pipeline) are a deployment/composition fact —
+/// `.myelin/ci.toml` and `runner-assets.toml` are both repo-root config files this crate's binary is
+/// closer to than the generic sandbox-seam crate is. `myelin-ci-sandbox` supplies the MECHANISM
+/// (`GvisorAssetRegistry`, the resolvers, the digest constants); this crate supplies the ONE real
+/// binding set.
+///
+/// **Verifies for real, at construction, right here** ([`GvisorAssetRegistry::from_bindings`]) — this
+/// is genuine hashing WORK over the staged asset directories (the >800MiB Rust asset takes several
+/// real seconds on this host), done ONCE at runner startup, never per job launch. A runner that
+/// cannot verify its own configured assets refuses to start (`.expect` panics LOUDLY here) rather
+/// than silently limping along and discovering the problem mid-launch.
+pub fn production_gvisor_registry() -> Arc<GvisorAssetRegistry> {
+    Arc::new(
+        GvisorAssetRegistry::from_bindings(vec![
+            RootfsAssetBinding {
+                image: ImageRef::pinned(format!(
+                    "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
+                ))
+                .expect("the founder-pipeline image reference is a well-formed digest pin"),
+                rootfs: resolved_gvisor_rootfs(),
+            },
+            RootfsAssetBinding {
+                image: ImageRef::pinned(format!(
+                    "myelin.local/linux-rust-v1-rootfs@sha256:{LINUX_RUST_V1_ROOTFS_SHA256}"
+                ))
+                .expect("the linux-rust-v1 image reference is a well-formed digest pin"),
+                rootfs: resolved_gvisor_rust_rootfs(),
+            },
+        ])
+        .expect(
+            "production runner assets must verify at startup — a runner that cannot prove its own \
+             configured rootfs assets must refuse to start rather than launch jobs it cannot verify",
+        ),
+    )
+}
 
 use crate::ci_claim_token_issuer::LockedManifestCiJobTokenIssuer;
 use crate::ci_identity_adapter::ci_job_authorization_context;
@@ -424,7 +488,7 @@ impl CiRunnerLoop {
             error_backoff,
         } = self;
 
-        let backend = GvisorBackend::new();
+        let backend = GvisorBackend::new(production_gvisor_registry());
         // CT-004f sub-step 5: the LIVE log sink (was the `CountingFirehose` stub). Built HERE on the
         // dedicated runner thread because the per-job `LogPipeline` is non-Send (its firehose uses Rc);
         // the pool + rt handle are cheap Clones. Captured guest stdout/stderr → redacted at the sandbox
@@ -664,5 +728,60 @@ mod shutdown_tests {
         let (sender, mut receiver) = tokio::sync::watch::channel(false);
         drop(sender);
         assert!(runner_shutdown_requested(&mut receiver));
+    }
+}
+
+/// A direct test for [`production_gvisor_registry`] itself — before this, nothing called it; every
+/// test built its own ad-hoc registry. Both real staged assets (`linux-small-v1`, `linux-rust-v1`)
+/// are present on the founder-dogfood host this was written on, so this is a REAL, non-skipped
+/// assertion here (matching this repo's existing runsc/KVM graceful-skip convention, this test would
+/// need to skip on a host without the assets staged — but per the CT-007 gate 2/4 brief, this host
+/// has both, so it is exercised for real).
+#[cfg(test)]
+mod production_gvisor_registry_tests {
+    use super::*;
+
+    #[test]
+    fn constructs_and_resolves_both_real_images_to_their_expected_paths() {
+        let base_dir = resolved_gvisor_rootfs();
+        let rust_dir = resolved_gvisor_rust_rootfs();
+        if !base_dir.is_dir() || !rust_dir.is_dir() {
+            eprintln!(
+                "constructs_and_resolves_both_real_images_to_their_expected_paths: SKIPPED — the \
+                 staged base rootfs ({}) and/or rust rootfs ({}) are absent on this machine",
+                base_dir.display(),
+                rust_dir.display()
+            );
+            return;
+        }
+
+        let registry = production_gvisor_registry();
+
+        let small_image = ImageRef::pinned(format!(
+            "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
+        ))
+        .unwrap();
+        let rust_image = ImageRef::pinned(format!(
+            "myelin.local/linux-rust-v1-rootfs@sha256:{LINUX_RUST_V1_ROOTFS_SHA256}"
+        ))
+        .unwrap();
+
+        let verified_small = registry
+            .resolve(&small_image)
+            .expect("the production registry must resolve linux-small-v1");
+        let verified_rust = registry
+            .resolve(&rust_image)
+            .expect("the production registry must resolve linux-rust-v1");
+
+        assert_eq!(
+            verified_small.path(),
+            std::fs::canonicalize(&base_dir).unwrap(),
+            "linux-small-v1 must resolve to the SAME canonicalized path resolved_gvisor_rootfs() names"
+        );
+        assert_eq!(
+            verified_rust.path(),
+            std::fs::canonicalize(&rust_dir).unwrap(),
+            "linux-rust-v1 must resolve to the SAME canonicalized path resolved_gvisor_rust_rootfs() names"
+        );
     }
 }

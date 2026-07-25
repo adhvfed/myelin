@@ -39,11 +39,12 @@ use myelin_ci_controlplane::{
     CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
     CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
 };
+use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, FirehoseSink, IdemToken, ImageRef, JobKind, JobSpec,
     LeaseStore, MeterTarget, ReserveHandle, ResourceLimits, RunTokenCredential, RunnerAgent,
-    RunnerError, RunnerHooks, TrustTier, WorkspaceSpec,
+    RunnerError, RunnerHooks, TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::OUTBOX_MIGRATION;
@@ -328,11 +329,33 @@ fn ok_hooks() -> RunnerHooks {
     )
 }
 
+/// The real, already-founder-pipeline-pinned `linux-small-v1` image (`.myelin/ci.toml`'s own pin).
+/// CT-007 gate 2/4 made `spec.image` the real launch authority, so this test's `GvisorBackend` needs
+/// a registry mapping this EXACT image to a real, digest-matching directory.
+fn linux_small_v1_image() -> ImageRef {
+    ImageRef::pinned(format!(
+        "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
+    ))
+    .unwrap()
+}
+
+fn test_registry() -> Arc<GvisorAssetRegistry> {
+    Arc::new(
+        GvisorAssetRegistry::from_bindings(vec![
+            myelin_ci_sandbox::asset_registry::RootfsAssetBinding {
+                image: linux_small_v1_image(),
+                rootfs: resolved_gvisor_rootfs(),
+            },
+        ])
+        .expect("the base linux-small-v1 rootfs binding verifies"),
+    )
+}
+
 /// A real compute `JobSpec` running `command` — the shape a `runsc` guest actually executes.
 fn compute_spec(command: Vec<String>, idem: &str) -> JobSpec {
     JobSpec::new(
         JobKind::Ci,
-        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap(),
+        linux_small_v1_image(),
         command,
         vec![],
         vec![],
@@ -347,7 +370,9 @@ fn compute_spec(command: Vec<String>, idem: &str) -> JobSpec {
         WorkspaceSpec::default(),
         TrustTier::Trusted,
         RunTokenCredential::new("test-bearer", "ct004c2-jti", 300).unwrap(),
-        MeterTarget { reserve_id: "ct004c2-reserve".into() },
+        MeterTarget {
+            reserve_id: "ct004c2-reserve".into(),
+        },
         IdemToken(idem.into()),
     )
     .unwrap()
@@ -428,7 +453,7 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
         resolve,
     );
 
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     let firehose = CapturingFirehose::default();
     let reporter = myelin_ci_sandbox::EngineTerminalReporter::new(executor.clone());
     let agent = RunnerAgent::new(
@@ -592,7 +617,7 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
         tokio::runtime::Handle::current(),
         resolve,
     );
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
 
     // THE PRODUCTION FIREHOSE — the exact sink `CiRunnerLoop` now wires (sub-step 5): the per-job
     // LogPipeline seals to the REAL S3 CAS; DurableLogPersist writes the index + the outbox pointer.

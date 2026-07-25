@@ -59,6 +59,8 @@
 //! (AG-D4 / CI-T1) is CI-P5 (→ P-239); this prompt ships only the **hardened-boot self-test** (the
 //! floor under that drill — proves the runner BOOTS hardened, not that it survives the corpus).
 
+pub mod asset_registry;
+pub mod canonical_tar;
 pub mod escape_corpus;
 pub mod events;
 pub mod firecracker;
@@ -106,6 +108,19 @@ pub use snapshot_pool::{
 pub use gvisor::{
     build_gvisor_corpus_script, gvisor_drill_config_json, resolved_gvisor_rootfs,
     GVISOR_CORPUS_SCRIPT,
+};
+
+// CT-007 gate 2/4 (registry slice): `spec.image` is now the real launch authority for an ordinary
+// (non-git-wire) gVisor launch — `GvisorBackend::new` takes a [`GvisorAssetRegistry`] and
+// `launch_with` resolves + verifies `spec.image` against it BEFORE any resource is reserved. The
+// rust-capable runner asset's own resolver is exported alongside the base/git ones above.
+pub use asset_registry::{
+    AssetRegistryError, GvisorAssetRegistry, RootfsAssetBinding, VerifiedRootfs,
+};
+pub use canonical_tar::canonical_tree_sha256_hex;
+pub use gvisor::{
+    resolved_gvisor_rust_rootfs, ENV_GVISOR_RUST_ROOTFS, LINUX_RUST_V1_ROOTFS_SHA256,
+    LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 
 // CT-006a (GT-006 / SI-013): the SANDBOXED GIT-WIRE capability — canonical `git upload-pack`/
@@ -268,20 +283,27 @@ impl ImageRef {
     /// algorithm is rejected fail-closed — an unrecognized digest algorithm is not a trustworthy pin
     /// (a short/truncated digest like `@sha256:ab` is no longer accepted as "pinned").
     pub fn digest_pinned(&self) -> bool {
-        let Some((_, after_at)) = self.reference.rsplit_once('@') else {
-            return false;
-        };
-        let Some((algo, digest)) = after_at.split_once(':') else {
-            return false;
-        };
-        // The digest must be non-empty, all-hex, AND the exact hex length for the named algorithm.
-        // An unknown algorithm has no known length → reject fail-closed.
-        let Some(expected_hex_len) = Self::digest_hex_len(algo) else {
-            return false;
-        };
-        !digest.is_empty()
+        self.parse_digest().is_some()
+    }
+
+    /// Parse the digest algorithm and hex digest out of an `@<algo>:<hex>`-pinned reference, reusing
+    /// the EXACT SAME strict validation [`digest_pinned`](Self::digest_pinned) enforces (hex length
+    /// matches the named algorithm; an unknown/unrecognized algorithm ⇒ `None`, never a guess).
+    /// `None` for an unpinned or malformed reference. Used by
+    /// [`crate::asset_registry::GvisorAssetRegistry::from_bindings`] to recover the digest a
+    /// registered rootfs must hash to, rather than re-deriving the parsing rule a second time.
+    pub(crate) fn parse_digest(&self) -> Option<(&str, &str)> {
+        let (_, after_at) = self.reference.rsplit_once('@')?;
+        let (algo, digest) = after_at.split_once(':')?;
+        let expected_hex_len = Self::digest_hex_len(algo)?;
+        if !digest.is_empty()
             && digest.len() == expected_hex_len
             && digest.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            Some((algo, digest))
+        } else {
+            None
+        }
     }
 
     /// The exact hex-string length for a known digest algorithm (R0.7-B). `None` for an unknown

@@ -44,11 +44,13 @@ use myelin_ci_controlplane::{
     CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
     CREATE_JOB_QUEUE_INDEXES_DDL,
 };
+use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    resolved_gvisor_rootfs, CompletionClaim, FirehoseSink, HookError, LaunchOwnership,
+    resolved_gvisor_rootfs, CompletionClaim, FirehoseSink, HookError, ImageRef, LaunchOwnership,
     LaunchPermit, ReserveHandle, ResourceUsage, RunTokenAuthorizationContext, RunTokenCredential,
     RunnerAgent, RunnerHooks, TerminalReport, TerminalReporter, TrustTier,
+    LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_events::{Actor, IdMinter, MonotonicMinter, OutboxStore};
 use myelin_flow::{
@@ -326,10 +328,29 @@ fn durable_launch_hooks(queue_store: CiJobQueueStore, rt: tokio::runtime::Handle
     )
 }
 
-// A digest-pinned image (the runner ignores the reference for the staged local rootfs — the same
-// posture the CT-004c.2 real-exec test uses; the guest runs the staged busybox-ish rootfs).
-const PINNED_IMAGE: &str =
-    "registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+// CT-007 gate 2/4: `spec.image` is now the real launch authority — this is the REAL,
+// already-founder-pipeline-pinned `linux-small-v1` image (`.myelin/ci.toml`'s own pin), registered
+// (see `test_registry` below) against the SAME base rootfs the founder pipeline actually runs. This
+// used to be a fabricated placeholder the runner ignored entirely (the exact gap CT-007 gate 2/4
+// closes); it is now a genuinely verifiable pin.
+fn pinned_image() -> ImageRef {
+    ImageRef::pinned(format!(
+        "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
+    ))
+    .unwrap()
+}
+
+fn test_registry() -> std::sync::Arc<GvisorAssetRegistry> {
+    std::sync::Arc::new(
+        GvisorAssetRegistry::from_bindings(vec![
+            myelin_ci_sandbox::asset_registry::RootfsAssetBinding {
+                image: pinned_image(),
+                rootfs: resolved_gvisor_rootfs(),
+            },
+        ])
+        .expect("the pinned rootfs binding verifies"),
+    )
+}
 
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -476,7 +497,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
     // ── Test-only pinned body input; the stage runs `echo` in gVisor. ──
     let stage_target = "pipeline://myelin/self#build";
     let build_spec = fixed_command_spec_builder(
-        PINNED_IMAGE,
+        &pinned_image().reference,
         vec![
             "sh".into(),
             "-c".into(),
@@ -632,7 +653,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         tokio::runtime::Handle::current(),
         resolver,
     );
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     let firehose = CapturingFirehose::default();
     let reporter_minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
     let reporter = CiPipelineReporter::new(
@@ -960,8 +981,8 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
     let admin = admin_pool(&schema).await;
     create_schema(&admin, &schema).await;
     let ci_run_store = ci_run_store_factory(admin.clone());
-    let build_spec =
-        fixed_command_spec_builder(PINNED_IMAGE, vec!["true".into()], 60).expect("pinned image");
+    let build_spec = fixed_command_spec_builder(&pinned_image().reference, vec!["true".into()], 60)
+        .expect("pinned image");
     let driver = CiPipelineDriver::new(
         TenantId(tenant.into()),
         region,

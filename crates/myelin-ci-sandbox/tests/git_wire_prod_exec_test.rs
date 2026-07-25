@@ -316,7 +316,7 @@ fn sandboxed_upload_pack_advertise_refs_lists_the_real_repo() {
     )
     .expect("a well-formed locator resolves");
 
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::git_wire_only();
     let launch = backend
         .launch_git_wire(&spec, &ok_hooks())
         .expect("the sandboxed git advertise-refs must run");
@@ -390,7 +390,7 @@ fn sandboxed_upload_pack_v2_ls_refs_round_trip_with_bounded_stdin() {
     )
     .expect("locator resolves");
 
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::git_wire_only();
     let launch = backend
         .launch_git_wire(&spec, &ok_hooks())
         .expect("the sandboxed protocol-v2 ls-refs must run");
@@ -508,7 +508,7 @@ fn read_only_repo_mount_rejects_an_in_guest_write() {
     )
     .expect("locator resolves");
 
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::git_wire_only();
     let launch = backend
         .launch_git_wire(&spec, &ok_hooks())
         .expect("the run itself completes (the WRITE inside is what must fail)");

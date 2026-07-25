@@ -17,11 +17,12 @@ use myelin_ci_controlplane::{
     ManifestBoundCiJobTokenAuthority, PgCiRunSupersession, PricedCiJobUsage,
     CI_RUNNER_LEASE_TTL_SECS, LINUX_SMALL_V1_RUNNER_LABELS, TIER_P_OPERATIONAL_PRICING_REVISION,
 };
+use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    CompletionClaim, CompletionSettlementOwner, CountingFirehose, ResourceUsage,
-    RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome, RunnerAgent,
-    TerminalReport, TerminalReporter, TrustTier,
+    resolved_gvisor_rootfs, CompletionClaim, CompletionSettlementOwner, CountingFirehose, ImageRef,
+    ResourceUsage, RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome,
+    RunnerAgent, TerminalReport, TerminalReporter, TrustTier, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::{IdMinter, MonotonicMinter};
@@ -40,6 +41,29 @@ use sqlx::{Executor, PgPool, Row};
 
 const OPERATIONAL_RESERVE_HANDLE: &str =
     "ci-reserve:v1:22222222-2222-8222-8222-222222222222:batch:33333333-3333-8333-8333-333333333333:item";
+
+/// The real, already-founder-pipeline-pinned `linux-small-v1` image. CT-007 gate 2/4 made
+/// `spec.image` the real launch authority: only the "build" job (`/bin/false`) in this file's
+/// manifest ever actually reaches `GvisorBackend::launch` (the "package"/`skipped_job` never
+/// launches — its own name says so), so only that job's image must be genuinely verifiable.
+fn linux_small_v1_image() -> ImageRef {
+    ImageRef::pinned(format!(
+        "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
+    ))
+    .unwrap()
+}
+
+fn test_registry() -> std::sync::Arc<GvisorAssetRegistry> {
+    std::sync::Arc::new(
+        GvisorAssetRegistry::from_bindings(vec![
+            myelin_ci_sandbox::asset_registry::RootfsAssetBinding {
+                image: linux_small_v1_image(),
+                rootfs: resolved_gvisor_rootfs(),
+            },
+        ])
+        .expect("the base linux-small-v1 rootfs binding verifies"),
+    )
+}
 
 fn app_url() -> String {
     std::env::var("DATABASE_URL")
@@ -130,7 +154,7 @@ fn manifest(
                 check_context: "build".into(),
                 needs: Vec::new(),
                 matrix_key: BTreeMap::new(),
-                image: format!("registry.example/build@sha256:{}", "d".repeat(64)),
+                image: linux_small_v1_image().reference,
                 command: vec!["/bin/false".into()],
                 env: BTreeMap::new(),
                 secret_handles: BTreeMap::new(),
@@ -1165,7 +1189,7 @@ async fn run_reporter_scenario(
         identity.launch_authorizer(),
         tokio::runtime::Handle::current(),
     );
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     let firehose = CountingFirehose::new();
     let recovered_worker = "runner-recovered";
     let agent = RunnerAgent::new(

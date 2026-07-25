@@ -11,63 +11,76 @@
 //! ## What it proves
 //! [`GvisorBackend::launch`] — the EXACT SAME production launch path every other CI/agent job in
 //! this repo uses, with NO hardening/OCI-config change of any kind — can run a REAL `sh -c 'rustc
-//! --version && cargo --version'` inside a REAL `runsc` (gVisor) sandbox, when pointed (purely via
-//! the [`MYELIN_GVISOR_ROOTFS`] env var `resolved_gvisor_rootfs` already reads) at the Rust-capable
-//! rootfs staged by `scripts/build-rust-rootfs.sh`. Only the rootfs CONTENT differs from the plain
-//! busybox base rootfs; the launch/hardening code path is byte-identical.
+//! --version && cargo --version'` inside a REAL `runsc` (gVisor) sandbox, when `spec.image` is the
+//! REAL `linux-rust-v1` image and the backend's registry maps it to the Rust-capable rootfs staged
+//! by `scripts/build-rust-rootfs.sh`. Only the rootfs CONTENT differs from the plain busybox base
+//! rootfs; the launch/hardening code path is byte-identical.
 //!
 //! This mirrors `tests/gvisor_prod_exec_test.rs` (style, gating, `LiveOutput`-free simple launch,
 //! `REAL_*_LOCK` serialization idiom) — read that file first if editing this one.
 //!
 //! ## Gating (CI without runsc/the staged rust-rootfs still passes; THIS host must really run it)
 //! SKIPPED GRACEFULLY (returns early, NOT failed) when `runsc` is not on PATH OR the Rust-capable
-//! rootfs is not staged (env override [`ENV_RUST_ROOTFS`], default
+//! rootfs is not staged (env override `MYELIN_GVISOR_RUST_ROOTFS`, default
 //! `~/.local/share/gvisor-assets/rust-rootfs`) — so CI/dev machines without this asset stay green.
 //! With `MYELIN_REQUIRE_RUST_ROOTFS=1` (mirroring the existing `MYELIN_REQUIRE_RUNSC`) an absent
 //! capability is a HARD FAILURE (panic), never a vacuous green. Run:
 //! `MYELIN_REQUIRE_RUNSC=1 MYELIN_REQUIRE_RUST_ROOTFS=1 cargo test -p myelin-ci-sandbox --features
 //! integration --test rust_capable_rootfs_prod_exec_test -- --nocapture`.
 //!
-//! ## Why this test sets `MYELIN_GVISOR_ROOTFS` for its own process only
-//! [`resolved_gvisor_rootfs`] already reads `MYELIN_GVISOR_ROOTFS` with NO code change — this test
-//! just points that env var at the Rust-capable rootfs BEFORE calling `launch`. That mutates process
-//! env, which is observed by every thread in THIS test binary (a separate OS process from every
-//! OTHER test binary in the workspace, so other tests/binaries are unaffected) — so all tests in
-//! THIS FILE that touch the env var are serialized against each other via [`REAL_RUST_ROOTFS_LOCK`],
-//! exactly like the existing `REAL_RUNSC_LOCK` idiom in `gvisor_prod_exec_test.rs` serializes tests
-//! sharing host-level `runsc` container-id state.
+//! ## CT-007 gate 2/4: a REAL registry entry, not an env-var override
+//! This test used to point the SHARED `MYELIN_GVISOR_ROOTFS` env var at the Rust-capable rootfs for
+//! its own process before calling `launch` — since production ignored `spec.image` entirely and
+//! always resolved from that one env var, ANY image could be dispatched while this test secretly
+//! rerouted every job (including one declaring an unrelated image) onto the Rust rootfs. That was
+//! exactly the "security theatre" CT-007 gate 2/4 closes: `spec.image` is now the real launch
+//! authority, so this test registers the REAL `linux-rust-v1` image
+//! (`myelin.local/linux-rust-v1-rootfs@sha256:<LINUX_RUST_V1_ROOTFS_SHA256>`, the same pin committed
+//! in `runner-assets.toml`) against [`resolved_gvisor_rust_rootfs`] and calls `launch` directly — no
+//! env-var mutation, no restore-after dance, and an unrelated image genuinely could NOT resolve to
+//! this rootfs.
 
 #![cfg(feature = "integration")]
 
+use myelin_ci_sandbox::asset_registry::{GvisorAssetRegistry, RootfsAssetBinding};
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ReserveHandle,
-    ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, TrustTier, WorkspaceSpec,
+    resolved_gvisor_rust_rootfs, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
+    ReserveHandle, ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, TrustTier,
+    WorkspaceSpec, LINUX_RUST_V1_ROOTFS_SHA256,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-/// Env var naming the staged Rust-capable rootfs (mirrors `build-rust-rootfs.sh`'s own default).
-const ENV_RUST_ROOTFS: &str = "MYELIN_GVISOR_RUST_ROOTFS";
-
-/// Serializes every test in this file that mutates the process-wide `MYELIN_GVISOR_ROOTFS` env var
-/// (read by `resolved_gvisor_rootfs`) around the launch it drives — mirrors the existing
-/// `REAL_RUNSC_LOCK` idiom in `gvisor_prod_exec_test.rs`.
+/// Serializes every test in this file — mirrors the existing `REAL_RUNSC_LOCK` idiom in
+/// `gvisor_prod_exec_test.rs` (shared host-level `runsc` container-id state).
 static REAL_RUST_ROOTFS_LOCK: Mutex<()> = Mutex::new(());
 
-/// The resolved Rust-capable rootfs path (env override `MYELIN_GVISOR_RUST_ROOTFS`, default
-/// `~/.local/share/gvisor-assets/rust-rootfs` — the same default `scripts/build-rust-rootfs.sh`
-/// stages into).
+/// The resolved Rust-capable rootfs path — re-exported from `myelin_ci_sandbox::gvisor` (the SAME
+/// resolver the production registry composition would use); kept as a local alias since the rest of
+/// this file already refers to it as `resolved_rust_rootfs()`.
 fn resolved_rust_rootfs() -> PathBuf {
-    if let Ok(p) = std::env::var(ENV_RUST_ROOTFS) {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("gvisor-assets")
-        .join("rust-rootfs")
+    resolved_gvisor_rust_rootfs()
+}
+
+/// The REAL, `runner-assets.toml`-pinned `linux-rust-v1` image.
+fn linux_rust_v1_image() -> ImageRef {
+    ImageRef::pinned(format!(
+        "myelin.local/linux-rust-v1-rootfs@sha256:{LINUX_RUST_V1_ROOTFS_SHA256}"
+    ))
+    .unwrap()
+}
+
+/// A registry mapping the REAL `linux-rust-v1` image to the REAL staged rust-rootfs directory — the
+/// authority this test's `GvisorBackend` resolves `spec.image` through.
+fn test_registry() -> Arc<GvisorAssetRegistry> {
+    Arc::new(
+        GvisorAssetRegistry::from_bindings(vec![RootfsAssetBinding {
+            image: linux_rust_v1_image(),
+            rootfs: resolved_rust_rootfs(),
+        }])
+        .expect("the linux-rust-v1 rootfs binding verifies"),
+    )
 }
 
 /// Whether `runsc` resolves on PATH (env override `MYELIN_RUNSC_BIN`) — copied from
@@ -127,7 +140,7 @@ fn require_or_skip(test: &str) -> Option<String> {
 fn spec_running(command: Vec<String>, timeout_secs: u32) -> JobSpec {
     JobSpec::new(
         JobKind::Ci,
-        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap(),
+        linux_rust_v1_image(),
         command,
         vec![],
         vec![],
@@ -165,31 +178,14 @@ fn ok_hooks() -> RunnerHooks {
     )
 }
 
-/// Run `command` with `MYELIN_GVISOR_ROOTFS` pointed at the staged Rust-capable rootfs for the
-/// duration of the call, restoring the prior value afterward. Caller must hold
-/// [`REAL_RUST_ROOTFS_LOCK`].
+/// Run `command` against the Rust-capable rootfs via the REAL registry (`test_registry()`) — no env
+/// var mutation, no restore-after dance. `spec.image` names the real `linux-rust-v1` image; the
+/// registry is the only thing that turns that into an actual rootfs.
 fn launch_against_rust_rootfs(
     backend: &GvisorBackend,
     spec: &JobSpec,
 ) -> Result<myelin_ci_sandbox::SandboxLaunch, myelin_ci_sandbox::gvisor::GvisorError> {
-    let rootfs = resolved_rust_rootfs();
-    let previous = std::env::var(myelin_ci_sandbox::gvisor::ENV_GVISOR_ROOTFS).ok();
-    // This crate is edition 2021, where `set_var`/`remove_var` remain plain safe functions (they
-    // only become `unsafe fn` under edition 2024) — matching the existing unwrapped call sites in
-    // this crate (`tests/git_wire_prod_exec_test.rs`) and `myelin-config/src/lib.rs`. Safety in the
-    // multi-threaded sense is handled the same way those call sites handle it: every test in this
-    // file that touches this var holds `REAL_RUST_ROOTFS_LOCK` for the entire
-    // mutate-launch-restore window, so there is no concurrent reader/writer within this process.
-    std::env::set_var(
-        myelin_ci_sandbox::gvisor::ENV_GVISOR_ROOTFS,
-        rootfs.as_os_str(),
-    );
-    let result = backend.launch(spec, &ok_hooks());
-    match &previous {
-        Some(value) => std::env::set_var(myelin_ci_sandbox::gvisor::ENV_GVISOR_ROOTFS, value),
-        None => std::env::remove_var(myelin_ci_sandbox::gvisor::ENV_GVISOR_ROOTFS),
-    }
-    result
+    backend.launch(spec, &ok_hooks())
 }
 
 #[test]
@@ -200,7 +196,7 @@ fn real_runsc_runs_rustc_and_cargo_version_in_rust_rootfs() {
     let _serial = REAL_RUST_ROOTFS_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     let spec = spec_running(
         vec![
             "sh".into(),
@@ -258,7 +254,7 @@ fn real_runsc_runs_rust_toolchain_non_root_and_network_free() {
     let _serial = REAL_RUST_ROOTFS_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     // Mirrors gvisor_prod_exec_test.rs's non-root assertion style: the untrusted command reports
     // its own uid (OCI config drops it to 65534 — defense in depth, unchanged by this rootfs) and
     // proves it has no route out (default-deny egress ⇒ no netns — unchanged by this rootfs); a
@@ -296,4 +292,54 @@ fn real_runsc_runs_rust_toolchain_non_root_and_network_free() {
     );
 
     backend.kill(&launch.handle).expect("teardown");
+}
+
+/// **Issue 1 (the whole point): construction pays the real hashing cost ONCE; `resolve` after that
+/// is cheap.** Before the fix, `GvisorAssetRegistry::resolve_verified` re-canonicalized AND re-hashed
+/// the ENTIRE registered directory on EVERY call — measured ~15s per full rehash of this >800MiB
+/// Rust asset on the founder-dogfood host, paid before the isolation floor even ran on every single
+/// job launch. This test builds the registry (paying the real construction-time verification cost —
+/// timed and printed, not hard-asserted, since it varies by host/disk) against the REAL staged
+/// `linux-rust-v1` asset, then calls the NOW-CHEAP [`myelin_ci_sandbox::asset_registry::GvisorAssetRegistry::resolve`]
+/// 1000 times and asserts the TOTAL time for all 1000 lookups is under 200ms — several orders of
+/// magnitude faster than a single old-style rehash, proving `resolve` is a pure O(1) map lookup with
+/// no I/O or hashing left in it.
+#[test]
+fn resolve_is_cheap_after_construction_pays_the_real_verification_cost_once() {
+    let Some(_bin) = require_or_skip("rust-rootfs-prod-exec resolve-is-cheap") else {
+        return;
+    };
+    let _serial = REAL_RUST_ROOTFS_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+
+    let construct_started = std::time::Instant::now();
+    let registry = GvisorAssetRegistry::from_bindings(vec![RootfsAssetBinding {
+        image: linux_rust_v1_image(),
+        rootfs: resolved_rust_rootfs(),
+    }])
+    .expect("the real staged linux-rust-v1 binding verifies");
+    let construct_elapsed = construct_started.elapsed();
+    eprintln!(
+        "resolve_is_cheap: GvisorAssetRegistry::from_bindings (real construction-time verification \
+         of the >800MiB rust rootfs) took {construct_elapsed:?}"
+    );
+
+    let image = linux_rust_v1_image();
+    let resolve_started = std::time::Instant::now();
+    for _ in 0..1000 {
+        registry.resolve(&image).expect("already-verified lookup");
+    }
+    let resolve_elapsed = resolve_started.elapsed();
+    eprintln!(
+        "resolve_is_cheap: 1000x GvisorAssetRegistry::resolve (cheap O(1) lookup, post-construction) \
+         took {resolve_elapsed:?} total ({:?} avg/call)",
+        resolve_elapsed / 1000
+    );
+
+    assert!(
+        resolve_elapsed < std::time::Duration::from_millis(200),
+        "1000 resolve() calls took {resolve_elapsed:?} — resolve must be a cheap O(1) lookup with \
+         no I/O or hashing, not a rehash of the registered directory"
+    );
 }

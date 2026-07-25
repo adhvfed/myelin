@@ -203,7 +203,8 @@ struct MyelinManifest {
 /// just inside `[[jobs]]` tables, so a `name` field under a different section (or added later
 /// elsewhere in `.myelin/ci.toml`) would have been silently admitted as if it were a real job name.
 fn parse_myelin_job_names(source: &str) -> BTreeSet<String> {
-    let manifest: MyelinManifest = toml::from_str(source).expect("parse .myelin/ci.toml-shaped source");
+    let manifest: MyelinManifest =
+        toml::from_str(source).expect("parse .myelin/ci.toml-shaped source");
     manifest.jobs.into_iter().map(|job| job.name).collect()
 }
 
@@ -495,7 +496,9 @@ fn check_inventory_fails_loudly_on_an_out_of_range_migration_step() {
     }];
     let errors = check_inventory(&discovered, &manifest, &BTreeSet::new());
     assert!(
-        errors.iter().any(|error| error.contains("outside the valid 1-4 range")),
+        errors
+            .iter()
+            .any(|error| error.contains("outside the valid 1-4 range")),
         "must flag the out-of-range step, got: {errors:?}"
     );
 }

@@ -46,11 +46,12 @@ use myelin_ci_controlplane::{
     CI_RUNNER_LEASE_TTL_SECS, CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL,
     CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, MAX_JOB_TIMEOUT_SECS,
 };
+use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, FirehoseSink, IdemToken, ImageRef, JobKind, JobSpec,
     LeaseStore, MeterTarget, ReserveHandle, ResourceLimits, RunTokenCredential, RunnerAgent,
-    RunnerHooks, TrustTier, WorkspaceSpec,
+    RunnerHooks, TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_events::{IdMinter, Ulid};
 use myelin_flow::{
@@ -320,12 +321,34 @@ fn ok_hooks() -> RunnerHooks {
     )
 }
 
+/// The real, already-founder-pipeline-pinned `linux-small-v1` image (`.myelin/ci.toml`'s own pin).
+/// CT-007 gate 2/4 made `spec.image` the real launch authority, so this test's `GvisorBackend` needs
+/// a registry mapping this EXACT image to a real, digest-matching directory.
+fn linux_small_v1_image() -> ImageRef {
+    ImageRef::pinned(format!(
+        "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
+    ))
+    .unwrap()
+}
+
+fn test_registry() -> Arc<GvisorAssetRegistry> {
+    Arc::new(
+        GvisorAssetRegistry::from_bindings(vec![
+            myelin_ci_sandbox::asset_registry::RootfsAssetBinding {
+                image: linux_small_v1_image(),
+                rootfs: resolved_gvisor_rootfs(),
+            },
+        ])
+        .expect("the base linux-small-v1 rootfs binding verifies"),
+    )
+}
+
 /// A real compute `JobSpec` running `command` at `trust`. The spec's `trust_tier` is the truth the
 /// dispatch feeds onto the `job_queue` gate.
 fn compute_spec(command: Vec<String>, trust: TrustTier, idem: &str) -> DurableCiJobLaunchTemplate {
     let resolved = JobSpec::new(
         JobKind::Ci,
-        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap(),
+        linux_small_v1_image(),
         command,
         vec![],
         vec![],
@@ -340,7 +363,9 @@ fn compute_spec(command: Vec<String>, trust: TrustTier, idem: &str) -> DurableCi
         WorkspaceSpec::default(),
         trust,
         RunTokenCredential::new("test-bearer", "ct004d1-jti", 300).unwrap(),
-        MeterTarget { reserve_id: "ct004d1-reserve".into() },
+        MeterTarget {
+            reserve_id: "ct004d1-reserve".into(),
+        },
         IdemToken(idem.into()),
     )
     .unwrap();
@@ -491,7 +516,7 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
         resolver,
     );
 
-    let backend = GvisorBackend::new();
+    let backend = GvisorBackend::new(test_registry());
     let firehose = CapturingFirehose::default();
     let reporter = myelin_ci_sandbox::EngineTerminalReporter::new(executor.clone());
     let agent = RunnerAgent::new(

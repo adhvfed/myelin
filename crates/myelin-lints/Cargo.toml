@@ -27,3 +27,10 @@ syn = { workspace = true, features = ["full", "visit"] }
 toml.workspace = true
 
 [dev-dependencies]
+# Dev-dep ONLY (test-only edge — no production DAG change, same posture as the several test-only
+# cross-crate edges myelin-ci-sandbox itself carries): `tests/runner_asset_digest_pin.rs` recomputes
+# each staged runner asset's canonical-tree digest with the SAME pure-Rust hasher
+# `GvisorAssetRegistry::from_bindings` uses (`myelin_ci_sandbox::canonical_tree_sha256_hex`),
+# rather than shelling out to a host `tar` process from a test (this crate's own scanners already
+# forbid exactly that pattern in PRODUCTION code via the `no-host-exec` lint).
+myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
