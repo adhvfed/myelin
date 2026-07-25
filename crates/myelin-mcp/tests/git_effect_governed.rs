@@ -78,6 +78,7 @@ fn temp_root(tag: &str) -> PathBuf {
 /// times closes the window without pretending to fully serialize against an independent,
 /// concurrently-running production process (a bigger, separate concern than this test's own
 /// cleanup — same reasoning `myelin-storage`'s helper documents).
+#[cfg(feature = "integration")]
 async fn delete_outbox_for_tenant(pool: &sqlx::PgPool, tenant: &str) {
     for _ in 0..5 {
         let _ = sqlx::query(
