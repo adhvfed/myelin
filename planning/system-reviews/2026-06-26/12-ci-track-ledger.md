@@ -321,3 +321,34 @@ later provenance work is not an excuse to delete the current CI before R4 worklo
 The danger concentrates in CT-002/003 (untrusted execution + escape verification). Those get a security
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod
 path (CT-003's guard enforces that). CT-007 (the GitHub-Actions bill killer) is the reward, gated on CT-003.
+
+**CT-007 gate 1/4 closed (2026-07-25): committed workload inventory.** CT-005f8c's real founder
+acceptance act satisfied CT-007's one precondition, so CT-007 is now legitimately openable; this
+closes only its first of four cutover-floor gates, nothing more. `ci-workload-inventory.toml`
+(workspace root) now names all 12 currently-real GitHub jobs — the 9 in `ci.yml`
+(`edge-release-bundle`, `frontend`, `web-container`, `architecture-lints`, `contract-coverage`,
+`sub-m0-scorecard`, `id-m1-scorecard`, `self-hosting-ci`, `build-test-clippy`), the 1 in
+`integration.yml` (`integration`), and the 2 in `security.yml` (`rustsec`, `pnpm`) — with an honest
+`status` (uniformly `github-only`; none is `myelin-native`, since `.myelin/ci.toml` still defines
+only the one trivial founder-dogfood marker job and provides zero workload parity for any of the
+12) and an `owner` naming the accountable cutover-plan step (2, 3, or 4 above). A new
+`crates/myelin-lints/tests/ci_workload_inventory.rs` scans every `jobs:` block in
+`.github/workflows/*.yml` and fails RED in both directions: a real GitHub job with no manifest row,
+or a manifest row naming a job that no longer exists, plus a duplicate-row check and an honesty
+invariant forbidding `myelin_job` from being non-empty unless `status` is actually
+`myelin-native`. An independent adversarial verifier hand-enumerated every job in all three workflow
+files against the manifest (finding the builder's own initial job list was stale — it had missed
+`sub-m0-scorecard`/`id-m1-scorecard`, which the builder itself caught via its own test going RED
+before this landed), confirmed no YAML anchors/matrix strategies/`if:`-guards/reusable-workflow
+calls exist anywhere today for the dumb line-scanning parser to trip on, deleted a real manifest row
+to prove the gate genuinely fails RED (then restored it byte-identical), and confirmed
+`cargo test -p myelin-lints` and `cargo clippy -p myelin-lints --all-targets -- -D warnings` are both
+clean with no other files touched.
+
+**Honest remaining CT-007 floor: gates 2-4 have not started.** No digest-pinned one-cell runner
+asset exists for any of the 12 jobs' Rust/Node/browser/container/Docker-in-Docker/egress needs
+(gate 2); no mapped graph has run on a real Myelin commit end to end, and the permanent mutation
+gate has not been re-proven at zero missed mutants under that graph (gate 3); no second ordinary
+commit has repeated it without GitHub execution (gate 4). GitHub Actions remains fully in force and
+must not be disabled or removed before gate 4 lands. This inventory is scaffolding for that work, not
+a claim that any of it happened.
