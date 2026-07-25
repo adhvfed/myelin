@@ -539,6 +539,7 @@ async fn over_cap_upload_pack_response_errors_cleanly() {
         cpu_millis: 2000,
         mem_bytes: 512 * 1024 * 1024,
         disk_bytes: 8 * 1024 * 1024,
+        tmpfs_bytes: 8 * 1024 * 1024,
         pids_max: 256,
         timeout_secs: 120,
     };

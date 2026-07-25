@@ -380,11 +380,22 @@ impl GitWireExecutor {
 
     /// The serving-tier resource bounds for a wire op (every field non-zero: the `JobSpec` invariants
     /// require `pids_max > 0` and `timeout_secs > 0`).
+    ///
+    /// NOTE (ResourceLimits split): `tmpfs_bytes` mirrors `disk_bytes` here rather than getting an
+    /// independent value, deliberately — `disk_bytes` on THIS spec double-duties as the gVisor
+    /// git-wire `wire_cap` (the `OutputTooLarge` bound on the streamed host-side response capture —
+    /// see `gvisor.rs`'s `run_git_wire_container` / `WIRE_STDOUT_BOUND`), which is unrelated to this
+    /// prompt's mount-plumbing scope and is NOT to be touched here. Bumping `disk_bytes` to a bigger
+    /// dedicated ephemeral-workspace default at this call site would silently widen that unrelated
+    /// wire-response cap — an actual runtime behavior change this pure type-shape step must not make.
+    /// Mirroring keeps both the tmpfs sizing AND the wire cap byte-for-byte unchanged; decoupling them
+    /// is deferred to the follow-up that actually wires up the disk-backed workspace mount.
     pub fn default_limits() -> ResourceLimits {
         ResourceLimits {
             cpu_millis: 2000,
             mem_bytes: 512 * 1024 * 1024,
             disk_bytes: 512 * 1024 * 1024,
+            tmpfs_bytes: 512 * 1024 * 1024,
             pids_max: 256,
             timeout_secs: 120,
         }

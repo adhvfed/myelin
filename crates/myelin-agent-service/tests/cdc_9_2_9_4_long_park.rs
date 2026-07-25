@@ -175,6 +175,7 @@ fn profile() -> LongComputeProfile {
             cpu_millis: 1000,
             mem_bytes: 256 << 20,
             disk_bytes: 1 << 30,
+            tmpfs_bytes: 1 << 30,
             pids_max: 128,
             timeout_secs: 7200,
         },

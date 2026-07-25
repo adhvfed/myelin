@@ -254,6 +254,7 @@ fn limits() -> ResourceLimits {
         cpu_millis: 1000,
         mem_bytes: 256 * 1024 * 1024,
         disk_bytes: 256 * 1024 * 1024,
+        tmpfs_bytes: 256 * 1024 * 1024,
         pids_max: 128,
         timeout_secs: 60,
     }

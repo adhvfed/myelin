@@ -35,6 +35,7 @@ fn full_spec(trust: TrustTier, timeout_secs: u32) -> DurableCiJobLaunchTemplate 
             cpu_millis: 2500,
             mem_bytes: 512 * 1024 * 1024,
             disk_bytes: 4 << 30,
+            tmpfs_bytes: 4 << 30,
             pids_max: 256,
             timeout_secs,
         },

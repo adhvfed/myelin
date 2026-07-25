@@ -261,6 +261,7 @@ fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
             cpu_millis: 2000,
             mem_bytes: 512 << 20,
             disk_bytes: 512 << 20,
+            tmpfs_bytes: 512 << 20,
             pids_max: 256,
             timeout_secs: 120,
         },

@@ -1537,6 +1537,7 @@ mod tests {
                 cpu_millis: 2000,
                 mem_bytes: 512 * 1024 * 1024,
                 disk_bytes: 1 << 30,
+                tmpfs_bytes: 1 << 30,
                 pids_max: 256,
                 timeout_secs: 600,
             },
