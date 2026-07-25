@@ -10,35 +10,61 @@
 #
 # This file is that mapping. `crates/myelin-lints/tests/ci_workload_inventory.rs` is the inventory
 # test: it scans every `jobs:` block in `.github/workflows/*.yml` and fails RED if a discovered
-# job has no row here, or if a row here names a job that no longer exists in the workflow files.
+# job has no row here, if a row here names a job that no longer exists, or if a row's structured
+# fields are internally inconsistent (see SCHEMA below) — including a mechanical check that any
+# `myelin_job` a row names actually exists in `.myelin/ci.toml`, not merely a plausible string.
 #
-# STATUS TODAY (committed 2026-07-25): the only Myelin-native pipeline that exists at all is the
-# tiny founder-dogfood marker job in `.myelin/ci.toml` — it proves transport/plumbing only, NOT
-# workload parity with any job below. So every row's `status` is honestly `github-only`; NONE are
+# 2026-07-25 revision (adversarial review by gpt-5.6-sol): the original schema had a free-text
+# `owner` field the test never actually examined — any string would have passed, including one that
+# silently contradicted this file's own header (an earlier version of this file said "none of steps
+# 2-4 started" in prose while a row's `owner` said "in progress"). `owner` is replaced below by
+# `migration_step` (an integer 1-4) and `migration_state` (a closed, test-enforced enum) so real
+# progress is mechanically checked, not merely narrated.
+#
+# STATUS TODAY (2026-07-25): the only Myelin-native pipeline that exists at all is the tiny
+# founder-dogfood marker job in `.myelin/ci.toml` — it proves transport/plumbing only, NOT workload
+# parity with any job below. So every row's `status` is honestly `github-only`; NONE are
 # `myelin-native` yet. Marking a row `myelin-native` before a real `.myelin/ci.toml` job exists for
 # it would be exactly the overclaiming doctrine EI-01 §5 forbids ("make violations loud, never
 # silently swallowed" — the inverse failure mode is silently claiming a floor that is not there).
 #
-# STATUS VOCABULARY (the inventory-honesty test `no_inventory_entry_claims_myelin_native_without_
-# naming_its_myelin_job` enforces the contract below — it is not just documentation):
-#   - "github-only"    — GitHub Actions is the only thing that runs this workload today.
-#                        `myelin_job` MUST be empty (there is nothing yet to name).
-#   - "myelin-native"  — a real `.myelin/ci.toml` job now carries this workload. `myelin_job`
-#                        MUST name that job (non-empty) — a later CT-007 step's Definition of Done.
+# **CT-007 gate 1 is NOT "closed" by this file — only its inventory subgate is.** An earlier ledger
+# entry called gate 1 "closed"; that overclaimed the ledger's own literal wording ("maps every job
+# to an executable Myelin job OR names a MECHANICALLY GATED non-CI owner"). This file's honest
+# inventory-and-plan is real and enforced, but it does not yet constitute either an executable
+# Myelin job or an enforced non-CI ownership mechanism for any row — see ledger 12's dated entry.
 #
-# `owner` names the CT-007 cutover-plan step accountable for eventually flipping this row — a
-# MECHANICALLY GATED, non-CI owner (the ledger's step numbers, each itself gated by a committed
-# test/scorecard), never a person and never a fabricated Myelin job. The four steps:
-#   1. this inventory (satisfied by this file + its test, committed 2026-07-25)
-#   2. digest-pinned one-cell runner assets providing the Rust/Node/browser/container capability
-#      each job needs, without weakening gVisor/egress/privilege boundaries
-#   3. the complete mapped graph passes on one exact Myelin commit + the permanent mutation gate
-#      has zero missed mutants
-#   4. a second ordinary commit repeats the graph without GitHub execution or manual green
-# None of steps 2-4 have started for any row below.
+# SCHEMA (mechanically enforced by ci_workload_inventory.rs, not just documentation):
+#   status = "github-only"   — GitHub Actions is the only thing that runs this workload today.
+#                              `myelin_job` MUST be empty; `migration_state` MUST NOT be
+#                              "graph-passing"/"cutover-repeated" (those imply real Myelin
+#                              execution, which would mean status should already be `myelin-native`).
+#   status = "myelin-native" — a real `.myelin/ci.toml` job now carries this workload. `myelin_job`
+#                              MUST name that job, and the test verifies it actually exists as a
+#                              `[[jobs]] name = "..."` entry there. `migration_state` MUST be
+#                              "graph-passing" or "cutover-repeated".
+#   migration_step  — which of the ledger's four cutover-floor gates this row is progressing
+#                     through (1-4); see the ledger for what each step requires.
+#   migration_state — one of, in increasing order of real (not planned) progress:
+#     "not-started"        — nothing built for this row's capability yet.
+#     "capability-smoke"    — a runner asset exists and proves the TOOLCHAIN executes under the
+#                             hardened sandbox (e.g. `rustc --version`) — NOT proof the job's full
+#                             observable contract (its real commands, inputs, resources, services)
+#                             is satisfied. Distinguishing this from full capability was itself an
+#                             adversarial-review finding (gpt-5.6-sol, 2026-07-25) against an
+#                             earlier version of this file that conflated the two.
+#     "capability-proven"   — the runner asset genuinely satisfies the job's full observable
+#                             contract (exact commands, env, resources, services) — reserved, not
+#                             yet reached by any row.
+#     "graph-passing"       — the complete mapped graph passes on one exact Myelin commit (ledger
+#                             step 3) — reserved, not yet reached by any row.
+#     "cutover-repeated"    — a second ordinary commit repeated it without GitHub execution or
+#                             manual green (ledger step 4) — reserved, not yet reached by any row.
 #
-# WHEN A LATER STEP SHIPS A REAL MYELIN JOB FOR A ROW: flip its `status` to `myelin-native` and
-# fill in `myelin_job` with the real `.myelin/ci.toml` job name. Do not flip early.
+# WHEN A LATER STEP SHIPS A REAL MYELIN JOB FOR A ROW: flip `status` to `myelin-native`, fill in
+# `myelin_job` with the real `.myelin/ci.toml` job name, and set `migration_state` to
+# "graph-passing" or "cutover-repeated" as appropriate. Do not flip early — the test will refuse an
+# unpaired combination.
 
 # ─────────────────────────────────── .github/workflows/ci.yml ───────────────────────────────────
 
@@ -46,7 +72,8 @@
 workflow = "ci.yml"
 job = "edge-release-bundle"
 status = "github-only"
-owner = "CT-007 step 2 (one-cell runner asset) — not started"
+migration_step = 2
+migration_state = "not-started"
 myelin_job = ""
 note = "Builds the locked, stripped, checksummed edge release bundle artifact. P0 later promotes this one-cell runner asset into the signed/SBOM release supply-chain floor (ledger 2026-06-26); that later provenance work is not an excuse to drop this job before R4 workload parity exists."
 
@@ -54,23 +81,26 @@ note = "Builds the locked, stripped, checksummed edge release bundle artifact. P
 workflow = "ci.yml"
 job = "frontend"
 status = "github-only"
-owner = "CT-007 step 2 (one-cell runner asset: Node + pinned Chromium + Valkey service) — not started"
+migration_step = 2
+migration_state = "not-started"
 myelin_job = ""
-note = "Frontend workspace lint + unit/server tests against a real Valkey backend + production build + the real-browser Playwright/Chromium product suite."
+note = "Frontend workspace lint + unit/server tests against a real Valkey backend + production build + the real-browser Playwright/Chromium product suite. Needs a runner asset with Node + pinned Chromium + a Valkey service."
 
 [[job]]
 workflow = "ci.yml"
 job = "web-container"
 status = "github-only"
-owner = "CT-007 step 2 (one-cell runner asset: Docker-capable) — not started"
+migration_step = 2
+migration_state = "not-started"
 myelin_job = ""
-note = "Builds the digest-pinned production web container image and smokes liveness/readiness/ingress/asset serving/SIGTERM against the hardened runtime user + read-only filesystem + dropped capabilities."
+note = "Builds the digest-pinned production web container image and smokes liveness/readiness/ingress/asset serving/SIGTERM against the hardened runtime user + read-only filesystem + dropped capabilities. Needs a Docker-capable (rootless in-guest builder) runner asset."
 
 [[job]]
 workflow = "ci.yml"
 job = "architecture-lints"
 status = "github-only"
-owner = "CT-007 step 2 (one-cell runner asset) — not started"
+migration_step = 2
+migration_state = "not-started"
 myelin_job = ""
 note = "L4 plan-row traceability + L3 payoff metrics + the twelve architecture lints (lint-gate) + the L2 erosion budget (erosion-gate) + the myelin-lints fixture/self-test suite. LOUD, no continue-on-error."
 
@@ -78,7 +108,8 @@ note = "L4 plan-row traceability + L3 payoff metrics + the twelve architecture l
 workflow = "ci.yml"
 job = "contract-coverage"
 status = "github-only"
-owner = "CT-007 step 2 (one-cell runner asset) — not started"
+migration_step = 2
+migration_state = "not-started"
 myelin_job = ""
 note = "The contract-coverage meta-gate scanner (P-S21 -> P-037) over the contract-index + this repo's own manifests, plus its red/green self-test."
 
@@ -86,7 +117,8 @@ note = "The contract-coverage meta-gate scanner (P-S21 -> P-037) over the contra
 workflow = "ci.yml"
 job = "sub-m0-scorecard"
 status = "github-only"
-owner = "CT-007 step 2 (one-cell runner asset) — not started"
+migration_step = 2
+migration_state = "not-started"
 myelin_job = ""
 note = "The SUB-M0 exit-gate scorecard (P-S24 -> P-039): re-runs every required SUB-M0 drill's proof command and the scorecard ratchet meta-test. A permanent gate — later bands must never run over a red M0."
 
@@ -94,7 +126,8 @@ note = "The SUB-M0 exit-gate scorecard (P-S24 -> P-039): re-runs every required 
 workflow = "ci.yml"
 job = "id-m1-scorecard"
 status = "github-only"
-owner = "CT-007 step 2 (one-cell runner asset) — not started"
+migration_step = 2
+migration_state = "not-started"
 myelin_job = ""
 note = "The Identity M1->M2 exit-gate scorecard (P-079 / P-ID-21): re-runs every required M1 Identity drill (ID-D1..D8) plus the contract-coverage 4.1-4.11 re-affirm, and the ratchet meta-test."
 
@@ -102,7 +135,8 @@ note = "The Identity M1->M2 exit-gate scorecard (P-079 / P-ID-21): re-runs every
 workflow = "ci.yml"
 job = "self-hosting-ci"
 status = "github-only"
-owner = "CT-007 step 3 (complete mapped graph passes + zero missed mutants) — not started"
+migration_step = 3
+migration_state = "not-started"
 myelin_job = ""
 note = "The Myelin self-hosting CI dogfood graph (P-507 / P-S37): the twelve lints + contract-coverage scanner + the mandatory-core cargo-mutants mutation gate, run AS Myelin CI over Myelin's own commit, plus the dogfood meta-test. This job is the closest existing thing to CT-007 workload parity, but it still runs entirely under GitHub Actions today — it is not itself evidence of a Myelin-native runner."
 
@@ -110,9 +144,10 @@ note = "The Myelin self-hosting CI dogfood graph (P-507 / P-S37): the twelve lin
 workflow = "ci.yml"
 job = "build-test-clippy"
 status = "github-only"
-owner = "CT-007 step 2 (one-cell runner asset: linux-rust-v1 built + proven 2026-07-25, see runner-assets.toml — not yet wired into a dispatchable CI graph, that is step 3) — in progress"
+migration_step = 2
+migration_state = "capability-smoke"
 myelin_job = ""
-note = "cargo build --workspace --locked, cargo test --workspace --locked, cargo clippy --workspace --all-targets -D warnings. The base Rust workload every other job's crates depend on existing. Its runner-asset capability (a digest-pinned gVisor rootfs with the Rust toolchain) now exists and is proven under a real runsc launch on the exact production hardening path; this row still stays github-only because nothing dispatches this job through Myelin yet."
+note = "cargo build --workspace --locked, cargo test --workspace --locked, cargo clippy --workspace --all-targets -D warnings. The base Rust workload every other job's crates depend on existing. `linux-rust-v1` (runner-assets.toml) proves the Rust TOOLCHAIN executes under the real hardened gVisor sandbox — it does NOT yet mount an exact-commit checkout, provide vendored/locked dependencies under deny-all egress, propagate the job's env, or size resources for a real workspace build; JobSpec.image is also not yet bound to this asset at launch (a 2026-07-25 gpt-5.6-sol finding). Status stays `github-only` and `migration_state` stays `capability-smoke`, not `capability-proven`, until the real vertical slice (checkout + vendored deps + env + resource sizing + image-digest binding + the real dispatch path) is built and independently verified."
 
 # ─────────────────────────────── .github/workflows/integration.yml ──────────────────────────────
 
@@ -120,9 +155,10 @@ note = "cargo build --workspace --locked, cargo test --workspace --locked, cargo
 workflow = "integration.yml"
 job = "integration"
 status = "github-only"
-owner = "CT-007 step 2 (one-cell runner asset: Docker-in-Docker for Postgres/RustFS/Valkey/NATS) — not started"
+migration_step = 2
+migration_state = "not-started"
 myelin_job = ""
-note = "The integration band-boundary gate over real backends (Postgres/RustFS/Valkey/NATS JetStream): scripts/integration-test.sh brings the stack up, runs `cargo test --features integration`, then the infra scorecard binary. The only workflow needing a live stack + Docker-in-Docker; ci.yml stays DB-free by design."
+note = "The integration band-boundary gate over real backends (Postgres/RustFS/Valkey/NATS JetStream): scripts/integration-test.sh brings the stack up, runs `cargo test --features integration`, then the infra scorecard binary. The only workflow needing a live multi-service stack; ci.yml stays DB-free by design. `crates/myelin-storage/tests/stage4_floor_smokes.rs` also invokes Docker directly, so workload parity needs a rootless Docker-compatible engine inside the runner asset, not just native service daemons (gpt-5.6-sol, 2026-07-25) — see planning discussion on a single ephemeral Firecracker \"job pod\" holding the runner + all service dependencies over guest loopback, so the sandbox's egress-default-deny/no-external-NIC posture stays unchanged."
 
 # ───────────────────────────────── .github/workflows/security.yml ───────────────────────────────
 
@@ -130,14 +166,16 @@ note = "The integration band-boundary gate over real backends (Postgres/RustFS/V
 workflow = "security.yml"
 job = "rustsec"
 status = "github-only"
-owner = "CT-007 step 2 (one-cell runner asset with outbound egress to the RustSec advisory DB) — not started"
+migration_step = 2
+migration_state = "not-started"
 myelin_job = ""
-note = "cargo-audit over Cargo.lock against the RustSec advisory database. Needs network egress to fetch/refresh the advisory DB, which the hardened sandbox's egress boundary must accommodate deliberately, not by default-allow."
+note = "cargo-audit over Cargo.lock against the RustSec advisory database. Needs a LIVE, current advisory DB — cannot be made hermetic/vendored like a build asset. The sandbox's egress allowlist only accepts IP literals today (DNS-rebinding-unsound otherwise); planning direction (gpt-5.6-sol, 2026-07-25) is a narrow purpose-built `rustsec_snapshot` broker (fetch+mount a read-only advisory DB snapshot, run `cargo audit --no-fetch`), not a general resolving forward proxy."
 
 [[job]]
 workflow = "security.yml"
 job = "pnpm"
 status = "github-only"
-owner = "CT-007 step 2 (one-cell runner asset with outbound egress to the npm advisory DB) — not started"
+migration_step = 2
+migration_state = "not-started"
 myelin_job = ""
-note = "pnpm audit --audit-level moderate over the frontend lockfile. Same named egress-boundary consideration as rustsec, for the npm advisory database instead of RustSec's."
+note = "pnpm audit --audit-level moderate over the frontend lockfile. Same live-advisory-DB egress consideration as rustsec (a narrow `npm_bulk_audit` broker, not a general proxy, per gpt-5.6-sol 2026-07-25). Separately, pnpm 10.5.2 (frontend/package.json) may already be broken against this job independent of CT-007: the npm registry retired the legacy audit endpoints pnpm 10.x used in 2026 (pnpm moved to a new bulk-advisory path in 10.33/11.x) — flagged, not yet investigated."
