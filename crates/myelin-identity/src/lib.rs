@@ -22,13 +22,16 @@
 //! the M0 ratchet (EI-01 §5): any drift in a signature here breaks every consumer's build
 //! *now*, never silently.
 //!
-//! **P-ID-01 ships NO service, NO algorithm, and NO event tokens.** The `iam.*` event
+//! **P-ID-01 ships NO service, NO algorithm, and NO event tokens.** The `identity.*` event
 //! tokens + their `EventEnvelope` projections are P-ID-02 (P-023) — see [`iam_events`].
 //!
-//! ## What P-ID-02 (P-023) adds: the `iam.*` tokens + their envelope projections
-//! [`iam_events`] registers the three `iam.*` event tokens (architecture §11.2:
-//! [`iam_events::IAM_TUPLE_WRITTEN`], [`iam_events::IAM_ROLE_GRANTED`],
-//! [`iam_events::IAM_BREAK_GLASS`]) and their `EventEnvelope` projections
+//! ## What P-ID-02 (P-023) adds: the `identity.*` tokens + their envelope projections
+//! [`iam_events`] registers the three `identity.*` event tokens (architecture §11.2 —
+//! prose there spells them `iam.tuple_written`/`iam.role_granted`/`iam.break_glass`; the
+//! canonical, taxonomy-admitted spelling uses the already-canonical §6.2 `identity` subsystem
+//! prefix, see the CORRECTED note in [`iam_events`]):
+//! [`iam_events::IDENTITY_TUPLE_WRITTEN`], [`iam_events::IDENTITY_ROLE_GRANTED`],
+//! [`iam_events::IDENTITY_BREAK_GLASS`]) and their `EventEnvelope` projections
 //! ([`iam_events::IamEventProjection`]) with **opaque-`principal_id`-only attribution** — the
 //! erasable `profile_ref` never enters the immutable envelope, so the GDPR
 //! erasure-vs-immutability split (EI-04 §1) is baked into the shape at M0. It also declares
@@ -36,7 +39,7 @@
 //! projection is expressed as an identity-owned compile-time descriptor (NOT an
 //! `myelin_events::EventEnvelope` import) because identity is a DAG sink — see the
 //! DAG-deviation note in [`iam_events`]. **Floor:** the emit bodies land in M1
-//! (`iam.tuple_written` → P-ID-08); the Bus taxonomy seed validator is EB-02 / P-042.
+//! (`identity.tuple.written` → P-ID-08); the Bus taxonomy seed validator is EB-02 / P-042.
 //!
 //! ## Reconciliation with the P-001 substrate skeleton
 //! P-001 stood up a partial skeleton of this surface (`Principal{id, kind, tenant}`, a
@@ -81,8 +84,8 @@
 pub mod iam_events;
 
 pub use iam_events::{
-    signals, IamEventProjection, IamSubjectRef, IAM_BREAK_GLASS, IAM_EVENT_TOKENS,
-    IAM_ROLE_GRANTED, IAM_TUPLE_WRITTEN,
+    signals, IamEventProjection, IamSubjectRef, IDENTITY_BREAK_GLASS, IDENTITY_EVENT_TOKENS,
+    IDENTITY_ROLE_GRANTED, IDENTITY_TUPLE_WRITTEN,
 };
 
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
@@ -461,7 +464,7 @@ impl FailStaticBound {
 // ===========================================================================
 
 /// A relation tuple `⟨object#relation@subject⟩` (architecture §6). The only emit path is
-/// the outbox (`iam.tuple_written`, P-ID-08); `expires_at` carries per-run agent grants as
+/// the outbox (`identity.tuple.written`, P-ID-08); `expires_at` carries per-run agent grants as
 /// auto-expiring tuples (revoke-on-crash defence in depth).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationTuple {

@@ -56,7 +56,7 @@ fn uniq() -> String {
 }
 
 /// A per-store-unique minter (mirrors `integration_mr007_identity_durable.rs`): the co-committed
-/// `iam.tuple_written` rows need globally-unique event ids across suites sharing the live DB.
+/// `identity.tuple.written` rows need globally-unique event ids across suites sharing the live DB.
 struct UniqueMinter {
     base: String,
     n: std::sync::atomic::AtomicU64,

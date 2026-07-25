@@ -210,7 +210,7 @@ pub struct AuditEntry {
     pub leaf_hash: String,
     /// The minimised actor (the `<pseudonym>@<tenant>.noreply` form + kind + on_behalf_of).
     pub actor: Minimised,
-    /// What the action was — a dotted action token (§6.2 `action`, e.g. `iam.tuple_written`,
+    /// What the action was — a dotted action token (§6.2 `action`, e.g. `identity.tuple.written`,
     /// `agent.effect_applied`). Derived from the event's dotted type; never a payload.
     pub action: String,
     /// What the action targeted — an [`ArtifactRef`] (an id, never content; §6.2 `subject`).
@@ -585,7 +585,7 @@ impl AuditConsumer {
             tenant: ev.tenant.clone(),
             region: ev.region.clone(),
             actor: Minimised::from_principal(&ev.actor.0),
-            // The action is the event's dotted type (e.g. `iam.tuple_written`) — a token, never a
+            // The action is the event's dotted type (e.g. `identity.tuple.written`) — a token, never a
             // payload.
             action: ev.type_.0.clone(),
             // The subject is the event's ArtifactRef (an id, never content; §6.2 `subject`).
@@ -703,8 +703,8 @@ mod tests {
         let ev = action_event(
             "01J-1",
             human("u-1", "acme"),
-            "iam.tuple_written",
-            "myelin://acme/iam/tuple/t1",
+            "identity.tuple.written",
+            "myelin://acme/identity/tuple/t1",
             "01J-root",
             None,
         );
@@ -755,8 +755,8 @@ mod tests {
         let ev = action_event(
             "01J-1",
             human("u-42", "acme"),
-            "iam.tuple_written",
-            "myelin://acme/iam/tuple/t1",
+            "identity.tuple.written",
+            "myelin://acme/identity/tuple/t1",
             "01J-root",
             None,
         );
@@ -783,7 +783,7 @@ mod tests {
             "no email reaches the audit entry"
         );
         // The subject is an ArtifactRef (an id), never content.
-        assert_eq!(e.subject, ArtifactRef("myelin://acme/iam/tuple/t1".into()));
+        assert_eq!(e.subject, ArtifactRef("myelin://acme/identity/tuple/t1".into()));
     }
 
     /// A delegated AGENT acting `on_behalf_of` a human: both the actor AND the on_behalf_of are
@@ -857,8 +857,8 @@ mod tests {
         let ev = action_event(
             "01J-1",
             human("u-1", "acme"),
-            "iam.tuple_written",
-            "myelin://acme/iam/tuple/t1",
+            "identity.tuple.written",
+            "myelin://acme/identity/tuple/t1",
             "01J-root",
             None,
         );
@@ -882,7 +882,7 @@ mod tests {
         c.handle(&action_event(
             "01J-a1",
             human("u", "acme"),
-            "iam.tuple_written",
+            "identity.tuple.written",
             "myelin://acme/x",
             "r1",
             None,
@@ -890,7 +890,7 @@ mod tests {
         c.handle(&action_event(
             "01J-b1",
             human("u", "globex"),
-            "iam.tuple_written",
+            "identity.tuple.written",
             "myelin://globex/x",
             "r2",
             None,
@@ -898,7 +898,7 @@ mod tests {
         c.handle(&action_event(
             "01J-a2",
             human("u", "acme"),
-            "iam.tuple_written",
+            "identity.tuple.written",
             "myelin://acme/y",
             "r3",
             None,
@@ -925,7 +925,7 @@ mod tests {
             c.handle(&action_event(
                 &format!("01J-{i}"),
                 human("u", "acme"),
-                "iam.tuple_written",
+                "identity.tuple.written",
                 &format!("myelin://acme/x/{i}"),
                 "r",
                 None,
@@ -991,7 +991,7 @@ mod tests {
                 actor_kind: "human".into(),
                 on_behalf_of: None,
             },
-            action: "iam.tuple_written".into(),
+            action: "identity.tuple.written".into(),
             subject: ArtifactRef("myelin://acme/x".into()),
             outcome: Outcome::Applied,
             correlation_id: "r".into(),
@@ -1016,7 +1016,7 @@ mod tests {
             c.handle(&action_event(
                 "01J-1",
                 human("u", "acme"),
-                "iam.tuple_written",
+                "identity.tuple.written",
                 "myelin://acme/x",
                 "r",
                 None,
@@ -1024,7 +1024,7 @@ mod tests {
             c.handle(&action_event(
                 "01J-2",
                 human("u", "acme"),
-                "iam.tuple_written",
+                "identity.tuple.written",
                 "myelin://acme/y",
                 "r",
                 None,
@@ -1044,7 +1044,7 @@ mod tests {
         c.handle(&action_event(
             "01J-3",
             human("u", "acme"),
-            "iam.tuple_written",
+            "identity.tuple.written",
             "myelin://acme/z",
             "r",
             None,
@@ -1070,7 +1070,7 @@ mod tests {
         c.handle(&action_event(
             "01J-1",
             human("u", "acme"),
-            "iam.tuple_written",
+            "identity.tuple.written",
             "myelin://acme/x",
             "r",
             None,

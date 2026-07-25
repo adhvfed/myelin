@@ -16,7 +16,7 @@
 //!      for tenant A is invisible to tenant B on a predicate-less read (RLS enforced via
 //!      with_tenant_tx), and no GUC bleeds after the connection is released.
 //!   3. **Outbox co-commit on the tuple write:** a committed durable write emits exactly one
-//!      `iam.tuple_written` event (emit-iff-the-durable-write-succeeded).
+//!      `identity.tuple.written` event (emit-iff-the-durable-write-succeeded).
 //!
 //! KMS/profile boundary (respected): the profile ciphertext persists in PG, but decrypt-across-
 //! PROCESS-restart depends on the durable KMS root (MR-025) — so the fresh-instance reads here SHARE
@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use myelin_config::MyelinConfig;
 use myelin_events::{EventEnvelope, Timestamp};
-use myelin_identity::iam_events::IAM_TUPLE_WRITTEN;
+use myelin_identity::iam_events::IDENTITY_TUPLE_WRITTEN;
 use myelin_identity::{
     DataRole, ObjectId, Precondition, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
     RelName, RelationTuple, TupleDelta, Zookie,
@@ -82,7 +82,7 @@ fn actor() -> Principal {
 }
 
 /// A per-store-UNIQUE, lexically-monotonic id minter for the durable tuple stores. The default
-/// `MonotonicMinter` resets to `0` per store, so every store's first co-committed `iam.tuple_written`
+/// `MonotonicMinter` resets to `0` per store, so every store's first co-committed `identity.tuple.written`
 /// mints the SAME `event_id` — which the global `outbox` `UNIQUE(event_id)` collapses via
 /// `ON CONFLICT DO NOTHING` when suites share the live DB (masking the co-commit). The production
 /// wall-clock+random ULID source (P-S12) is globally unique; this test double reproduces that
@@ -286,9 +286,9 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
     ] {
         let _ = sqlx::query(sql).bind(&tenant).execute(admin.db_pool()).await;
     }
-    // The co-committed iam.tuple_written rows for this tenant (BUS-2 exact now emits into the outbox).
+    // The co-committed identity.tuple.written rows for this tenant (BUS-2 exact now emits into the outbox).
     let _ = sqlx::query("DELETE FROM outbox WHERE aggregate LIKE $1")
-        .bind(format!("iam:tuple:{tenant}:%"))
+        .bind(format!("identity:tuple:{tenant}:%"))
         .execute(admin.db_pool())
         .await;
     println!("OK [1]: principal row + profile ciphertext + tuple edges durable across a fresh instance.");
@@ -403,8 +403,8 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
         "DELETE FROM rebac_tuple WHERE tenant_id = $1 OR tenant_id = $2",
         "DELETE FROM principal WHERE tenant_id = $1 OR tenant_id = $2",
         "DELETE FROM credential_link WHERE tenant_id = $1 OR tenant_id = $2",
-        "DELETE FROM outbox WHERE aggregate LIKE 'iam:tuple:' || $1 || ':%' \
-         OR aggregate LIKE 'iam:tuple:' || $2 || ':%'",
+        "DELETE FROM outbox WHERE aggregate LIKE 'identity:tuple:' || $1 || ':%' \
+         OR aggregate LIKE 'identity:tuple:' || $2 || ':%'",
     ] {
         let _ = sqlx::query(sql)
             .bind(&tenant_a)
@@ -417,7 +417,7 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
 
 // =================================================================================================
 // 3 — Outbox co-commit on the durable tuple write, into the SAME-DB outbox table (BUS-2 exact —
-//     MR-009b W3b.3). A committed write lands EXACTLY one iam.tuple_written row in the co-located
+//     MR-009b W3b.3). A committed write lands EXACTLY one identity.tuple.written row in the co-located
 //     `outbox` table (not a separate in-memory store); an aborted write (failed precondition)
 //     lands NONE — commit/abort together (0 ghost / 0 lost).
 // =================================================================================================
@@ -449,8 +449,8 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
     let tenant = format!("mr007-ob-{suffix}");
     let s = scope(&tenant, &region);
 
-    // The per-object aggregate key the iam.tuple_written draft stamps: `iam:tuple:<tenant>:<object>`.
-    let aggregate = format!("iam:tuple:{tenant}:repo:core");
+    // The per-object aggregate key the identity.tuple.written draft stamps: `identity:tuple:<tenant>:<object>`.
+    let aggregate = format!("identity:tuple:{tenant}:repo:core");
 
     // Count the co-located outbox rows for THIS write's aggregate (RLS-free infra table; read it
     // straight via the admin pool — the outbox carries no tenant column, contract 2.3).
@@ -479,7 +479,7 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
         "no outbox row for this aggregate before the write"
     );
 
-    // (a) A COMMITTED write → EXACTLY one iam.tuple_written row in the SAME-DB outbox table.
+    // (a) A COMMITTED write → EXACTLY one identity.tuple.written row in the SAME-DB outbox table.
     let z = tstore
         .write_tuples(
             &s,
@@ -493,7 +493,7 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
     assert_eq!(
         outbox_count(admin.db_pool(), &aggregate).await,
         1,
-        "a committed durable write co-committed EXACTLY one iam.tuple_written row (BUS-2 exact)"
+        "a committed durable write co-committed EXACTLY one identity.tuple.written row (BUS-2 exact)"
     );
 
     // The row's SHAPE is preserved (consumers cannot tell the durable path apart): same type, the
@@ -506,9 +506,9 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
             .expect("read the co-committed outbox envelope");
     let env: EventEnvelope =
         serde_json::from_value(env_json).expect("the outbox row is a canonical EventEnvelope");
-    assert_eq!(env.type_.0, IAM_TUPLE_WRITTEN, "the co-committed event is iam.tuple.written");
+    assert_eq!(env.type_.0, IDENTITY_TUPLE_WRITTEN, "the co-committed event is identity.tuple.written");
     assert_eq!(env.payload["zookie"], serde_json::json!(z.0), "it carries the write's zookie");
-    assert!(!env.contains_personal_data, "the iam.* event carries no inline PII");
+    assert!(!env.contains_personal_data, "the identity.* event carries no inline PII");
     assert_eq!(
         env.actor.0.principal_id.0, "p:writer",
         "attribution by opaque principal_id only"
@@ -547,7 +547,7 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
         let _ = sqlx::query(sql).bind(bind).execute(admin.db_pool()).await;
     }
     println!(
-        "OK [3]: a committed durable tuple write co-commits EXACTLY one iam.tuple_written row into \
+        "OK [3]: a committed durable tuple write co-commits EXACTLY one identity.tuple.written row into \
          the SAME-DB outbox; an aborted write co-commits none (0 ghost)."
     );
 }

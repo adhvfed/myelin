@@ -582,8 +582,8 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     let bootstrap_event_json: serde_json::Value = sqlx::query_scalar(
         "SELECT envelope FROM outbox WHERE aggregate = $1 AND envelope->>'type_' = $2",
     )
-    .bind(format!("iam:tuple:{tenant}:project:{PROJECT_ID}"))
-    .bind(myelin_identity::IAM_TUPLE_WRITTEN)
+    .bind(format!("identity:tuple:{tenant}:project:{PROJECT_ID}"))
+    .bind(myelin_identity::IDENTITY_TUPLE_WRITTEN)
     .fetch_one(&admin)
     .await
     .unwrap();
@@ -1125,7 +1125,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     // Exact generated-tenant cleanup. Projection state is last because row/tuple deletion triggers
     // intentionally invalidate it again. `outbox` is handled separately, below, because a live
     // elected relay (e.g. `myelin-outbox-publisher serve`) sharing this Postgres continuously
-    // quarantines this tenant's own `iam.tuple.written` outbox rows (`iam` is not an admitted Bus
+    // quarantines this tenant's own `identity.tuple.written` outbox rows (`iam` is not an admitted Bus
     // taxonomy subsystem token, so every one of them is permanently rejected —
     // `myelin_events::taxonomy::SUBSYSTEM_TOKENS`), and `outbox_quarantine_event_id_fkey` is
     // `ON DELETE RESTRICT`, so a plain `DELETE FROM outbox` can lose a race against the relay.

@@ -15,7 +15,7 @@
 //!   driving the membership→write_tuples→zookie→stamp→event flow over the
 //!   [`MembershipTupleWriter`] port — and the [`MembershipGate`] gating reads through `Id.check`.
 //! - the **PROVIDER** is Identity's REAL engine: `TupleStore::write_tuples` (the 4.6 write path that
-//!   advances the zookie + co-commits `iam.tuple_written`) + `StoreBackedCheck` (the 4.2 `check`
+//!   advances the zookie + co-commits `identity.tuple.written`) + `StoreBackedCheck` (the 4.2 `check`
 //!   resolving the admitted Chat fragment's `channel.read = member + parent_project->read` rewrite).
 //!
 //! This proves the freeze CHAT-P8 ships is admissible AND resolves correctly against the LIVE engine
@@ -110,7 +110,7 @@ fn chat_fragment_defs_rich() -> Vec<FragmentDef> {
 /// **The production-shaped `MembershipTupleWriter` binding: it adapts Identity's REAL
 /// `TupleStore::write_tuples` (the scope-carrying 4.6 write path) to the port.** This is the thin
 /// adapter the Chat service wires in production — the membership service calls the port, the port
-/// calls the live engine's write (advancing the zookie + co-committing `iam.tuple_written`). No
+/// calls the live engine's write (advancing the zookie + co-committing `identity.tuple.written`). No
 /// second write language; the port carries the frozen `[TupleDelta]` + `Precondition` → `Zookie`.
 struct LiveTupleWriter {
     store: TupleStore,

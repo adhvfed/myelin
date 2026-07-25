@@ -242,20 +242,20 @@ fn kill9_identity_principal_tuple_and_profile_decrypt_across_restart() {
         read["tuple_present"], true,
         "the ReBAC tuple survived kill-9: {read}"
     );
-    // BUS-2 exact (MR-009b W3b.3): the iam.tuple_written event co-committed into the SAME
+    // BUS-2 exact (MR-009b W3b.3): the identity.tuple.written event co-committed into the SAME
     // rebac_tuple transaction as the tuple write, so it SURVIVED the kill-9 alongside the tuple —
     // both the tuple AND its event are present (0 lost). Because they co-commit atomically, there
     // can be no event without its committed tuple (0 ghost): the crash left either both or neither.
     assert_eq!(
         count_outbox_for_identity_tuple(&run),
         1,
-        "the iam.tuple_written event co-committed with the tuple + survived kill-9 \
+        "the identity.tuple.written event co-committed with the tuple + survived kill-9 \
          (both exist — 0 ghost / 0 lost, the kill-9 shape)"
     );
     cleanup_identity(&run);
     println!(
         "[MR-009] PASS  family=IDENTITY  principal+tuple durable across kill-9; \
-         iam.tuple_written co-committed + survived (0 ghost / 0 lost); \
+         identity.tuple.written co-committed + survived (0 ghost / 0 lost); \
          profile DECRYPTS post-restart under the durable KMS root (MR-025)."
     );
 }
@@ -481,9 +481,9 @@ where
 fn cleanup_identity(run: &str) {
     let tenant = format!("mr009id-{run}");
     let cell = format!("mr009idkms-{run}");
-    // The iam.tuple_written row the durable write co-committed (aggregate-scoped; the outbox has no
+    // The identity.tuple.written row the durable write co-committed (aggregate-scoped; the outbox has no
     // tenant column, contract 2.3).
-    let tuple_aggregate = format!("iam:tuple:mr009id-{run}:repo:core");
+    let tuple_aggregate = format!("identity:tuple:mr009id-{run}:repo:core");
     with_admin_pool(|pool| {
         Box::pin(async move {
             for sql in [
@@ -521,11 +521,11 @@ fn cleanup_revocation(run: &str) {
     });
 }
 
-/// Count this run's iam.tuple_written outbox rows for the identity tuple aggregate — the event the
+/// Count this run's identity.tuple.written outbox rows for the identity tuple aggregate — the event the
 /// durable S3 write co-commits into the SAME rebac_tuple tx (MR-009b W3b.3). Aggregate-scoped, lives
 /// in the test (the outbox is cross-tenant infra with no tenant column, contract 2.3).
 fn count_outbox_for_identity_tuple(run: &str) -> i64 {
-    let aggregate = format!("iam:tuple:mr009id-{run}:repo:core");
+    let aggregate = format!("identity:tuple:mr009id-{run}:repo:core");
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(async {
         let admin = SubstrateProvider::connect(admin_config(), 2)

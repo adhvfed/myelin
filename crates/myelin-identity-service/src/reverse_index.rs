@@ -7,9 +7,9 @@
 //! cross-tenant query path**; derived — rebuildable from S3 by replaying the live consumer), §7.2
 //! (the JOIN target `authz_visible` the consumer's own query planner conjoins against — the big-
 //! result `Filter` path), §8.7 (S8 carries a `revision_watermark` derived from the zookie of the
-//! `iam.tuple_written` event that produced it — the new-enemy guard's index half).
+//! `identity.tuple.written` event that produced it — the new-enemy guard's index half).
 //!
-//! **Contract-index:** rows **2.4** (the `EventHandler` feeding S8 from `iam.tuple_written`), **11.1**
+//! **Contract-index:** rows **2.4** (the `EventHandler` feeding S8 from `identity.tuple.written`), **11.1**
 //! (S8 as a co-located projection store), **10.1** (S8 as a new `PersonalDataHolder` — it references
 //! subjects), **12.1** (`(tenant, region)` + type partition), **1.8** (`reverse_index_lag` telemetry).
 //!
@@ -18,10 +18,10 @@
 //!    partitioned `(tenant, region)` then object-type, per-tenant-only (there is **no cross-tenant
 //!    query path** — every accessor takes a verified [`TenantScope`] and a read for tenant A
 //!    structurally cannot reach tenant B's partition), carrying a per-partition
-//!    [`ReverseIndex::watermark`] (the latest applied `iam.tuple_written` zookie, §8.7), and
+//!    [`ReverseIndex::watermark`] (the latest applied `identity.tuple.written` zookie, §8.7), and
 //!    holder-registered as a **NEW `PersonalDataHolder`** (it references subjects).
 //! 2. **The S8 consumer** ([`ReverseIndexConsumer`]) — the [`myelin_events::EventHandler`] that
-//!    consumes `iam.tuple.written` off the bus (the ONLY feed; reindex-from-source replays the SAME
+//!    consumes `identity.tuple.written` off the bus (the ONLY feed; reindex-from-source replays the SAME
 //!    consumer over S3, no bespoke recovery code), applies each delta to the projection, **advances
 //!    the watermark** to the event's zookie, and exposes [`reverse_index_lag`](ReverseIndexConsumer::lag)
 //!    (the [`signals::REVERSE_INDEX_LAG`] sample). Idempotent on the delta identity (a redelivery is
@@ -29,7 +29,7 @@
 //!    itself idempotent).
 //!
 //! ## The watermark (§8.7 — the index half of the new-enemy guard)
-//! Every applied `iam.tuple_written` carries the write's zookie (`payload["zookie"]`). S8 records the
+//! Every applied `identity.tuple.written` carries the write's zookie (`payload["zookie"]`). S8 records the
 //! **latest** applied zookie per `(tenant, region)` partition as its `revision_watermark`. A
 //! zookie-stamped scan compares its required revision against this watermark: at-or-after → the JOIN
 //! serves; behind → wait-or-fall-back-to-`check`. **This prompt ships the watermark column + its
@@ -54,7 +54,7 @@
 //!   partition, the RLS scope, and the watermark column are byte-for-byte the §2/§8.7 contract.
 
 use myelin_events::{EventEnvelope, EventHandler, HandleOutcome, SubjectPattern};
-use myelin_identity::iam_events::{signals, IAM_TUPLE_WRITTEN};
+use myelin_identity::iam_events::{signals, IDENTITY_TUPLE_WRITTEN};
 use myelin_identity::{ObjectId, ObjectType, PrincipalId, RelName, Zookie};
 use myelin_storage::{OltpStoreHolder, TenantQuery, TenantScope, TenantTable};
 use std::collections::BTreeMap;
@@ -71,7 +71,7 @@ pub const S8_TABLE: &str = "authz_visible";
 /// structurally impossible.
 pub const S8_HOLDER: &str = "identity_authz_reverse_index";
 
-/// The S8 consumer name (the `iam.tuple.written` subscriber — rule 3, a `*`-free whitelist).
+/// The S8 consumer name (the `identity.tuple.written` subscriber — rule 3, a `*`-free whitelist).
 pub const S8_CONSUMER: &str = "s8_reverse_index";
 
 /// One reverse-index row: the `(subject, relation, object_id)` projection of an S3 tuple
@@ -133,7 +133,7 @@ struct Inner {
     /// `(tenant, region, type)` → the projected rows. The OUTER map is the partition (no cross-
     /// tenant query path: a read for tenant A never touches tenant B's partition).
     partitions: BTreeMap<PartKey, Partition>,
-    /// `(tenant, region)` → the latest applied `iam.tuple_written` zookie (the `revision_watermark`,
+    /// `(tenant, region)` → the latest applied `identity.tuple.written` zookie (the `revision_watermark`,
     /// §8.7). Keyed at the `(tenant, region)` grain (the zookie is a per-tenant monotonic revision),
     /// NOT per-type, so a scan of any type in the tenant reads one consistent watermark.
     watermarks: BTreeMap<(String, String), Zookie>,
@@ -142,7 +142,7 @@ struct Inner {
 /// **S8 — the per-tenant authz reverse index (architecture §2; the JOIN target of §7.2).**
 ///
 /// A cloneable handle over shared state. The ONLY feed is [`ReverseIndexConsumer`] consuming
-/// `iam.tuple.written` off the bus (reindex-from-source replays the SAME consumer over S3 — one code
+/// `identity.tuple.written` off the bus (reindex-from-source replays the SAME consumer over S3 — one code
 /// path, no bespoke recovery). Holder-registered (a NEW `PersonalDataHolder` — it references
 /// subjects). Every accessor takes a verified [`TenantScope`]: **no cross-tenant query path**.
 #[derive(Clone)]
@@ -187,7 +187,7 @@ impl ReverseIndex {
         format!("kms://{}/tenant", scope.tenant().0)
     }
 
-    /// **Apply one `iam.tuple_written` delta to the projection + advance the watermark** (the
+    /// **Apply one `identity.tuple.written` delta to the projection + advance the watermark** (the
     /// consumer's per-delta step; factored out so a reindex / a drill can drive it directly). The
     /// `op` is `"add"` / `"remove"`; the apply is idempotent (a re-add is a no-op on the dedup'd
     /// `BTreeSet`, a re-remove of an absent row is a no-op). The watermark advances to `zookie` iff
@@ -313,7 +313,7 @@ impl ReverseIndex {
     }
 
     /// The `revision_watermark` for a `(tenant, region)` partition (§8.7) — the latest applied
-    /// `iam.tuple_written` zookie. The read-side consistency path (compare a scan's required revision
+    /// `identity.tuple.written` zookie. The read-side consistency path (compare a scan's required revision
     /// against this; wait / fall back to per-row `check` if behind) is P-ID-12; here the column +
     /// its monotone advance are shipped. An empty partition reports the genesis (empty) zookie.
     pub fn watermark(&self, scope: &TenantScope) -> Zookie {
@@ -347,15 +347,15 @@ impl ReverseIndex {
     }
 }
 
-/// The S8 subjects whitelist — `iam.tuple.written` ONLY (rule 3: a `*`-free whitelist; an over-broad
+/// The S8 subjects whitelist — `identity.tuple.written` ONLY (rule 3: a `*`-free whitelist; an over-broad
 /// subscription head-of-line-blocks everything). The reverse index is fed by exactly one token.
 static S8_SUBJECTS: &[SubjectPattern] = &[SubjectPattern(String::new())];
 
-/// **The S8 bus consumer (contract 2.4) — the EventHandler feeding S8 from `iam.tuple_written`.**
+/// **The S8 bus consumer (contract 2.4) — the EventHandler feeding S8 from `identity.tuple.written`.**
 ///
 /// Built from the ONE consumer template (architecture §5): `subjects()` is a `*`-free whitelist
-/// (`iam.tuple.written`), `handle` is idempotent (the projection apply is idempotent + the runtime's
-/// `event_id` dedup is the outer guard). Each delivered `iam.tuple_written` event is projected into
+/// (`identity.tuple.written`), `handle` is idempotent (the projection apply is idempotent + the runtime's
+/// `event_id` dedup is the outer guard). Each delivered `identity.tuple.written` event is projected into
 /// S8 ([`ReverseIndex::apply_delta`]) and the watermark advanced to the event's zookie. The live
 /// `reverse_index_lag` ([`ReverseIndexConsumer::lag`]) is the [`signals::REVERSE_INDEX_LAG`] sample:
 /// events delivered but not yet projected (0 in steady state on the synchronous apply path; bumped
@@ -397,7 +397,7 @@ impl ReverseIndexConsumer {
     /// NAME, never a literal, EI-01 §3 observability).
     pub const LAG_SIGNAL: &'static str = signals::REVERSE_INDEX_LAG;
 
-    /// Project ONE `iam.tuple_written` event into S8 + advance the watermark. Factored out of
+    /// Project ONE `identity.tuple.written` event into S8 + advance the watermark. Factored out of
     /// [`EventHandler::handle`] so a reindex-from-source replay / a drill can drive it directly. The
     /// `(tenant, region)` partition is taken from the **envelope** (first-class); the deltas + the
     /// zookie are read off the references-not-payloads payload. Returns `Err(reason)` (a
@@ -425,7 +425,7 @@ impl ReverseIndexConsumer {
             // structurally impossible on the write path (one verified scope stamps both); if one
             // ever appears it is a poison, never a silently mis-partitioned projection.
             return Err(format!(
-                "iam.tuple_written actor tenant {:?} disagrees with envelope tenant {:?}",
+                "identity.tuple.written actor tenant {:?} disagrees with envelope tenant {:?}",
                 ev.actor.0.tenant, ev.tenant
             ));
         }
@@ -436,14 +436,14 @@ impl ReverseIndexConsumer {
             Some(z) if canonical_zookie(z) => Zookie(z.to_string()),
             Some(_) => {
                 return Err(
-                    "iam.tuple_written event carries a non-canonical zookie (expected `zk-` plus 20 decimal digits)"
+                    "identity.tuple.written event carries a non-canonical zookie (expected `zk-` plus 20 decimal digits)"
                         .into(),
                 )
             }
             // A tuple-written event with no zookie is structurally malformed (S3 always stamps one)
             // → a non-retryable poison: never silently project a watermark-less delta.
             None => {
-                return Err("iam.tuple_written event carries no zookie (the S8 watermark)".into())
+                return Err("identity.tuple.written event carries no zookie (the S8 watermark)".into())
             }
         };
 
@@ -455,7 +455,7 @@ impl ReverseIndexConsumer {
             .payload
             .get("deltas")
             .and_then(|d| d.as_array())
-            .ok_or_else(|| "iam.tuple_written event carries no deltas array".to_string())?;
+            .ok_or_else(|| "identity.tuple.written event carries no deltas array".to_string())?;
 
         struct ValidatedDelta<'a> {
             op: &'a str,
@@ -475,7 +475,7 @@ impl ReverseIndexConsumer {
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
-                    format!("iam.tuple_written delta {index} has no non-empty `{field}` string")
+                    format!("identity.tuple.written delta {index} has no non-empty `{field}` string")
                 })
         }
 
@@ -486,7 +486,7 @@ impl ReverseIndexConsumer {
                 let op = required_delta_field(delta, index, "op")?;
                 if !matches!(op, "add" | "remove") {
                     return Err(format!(
-                        "iam.tuple_written delta {index} has unknown operation `{op}`"
+                        "identity.tuple.written delta {index} has unknown operation `{op}`"
                     ));
                 }
                 Ok(ValidatedDelta {
@@ -534,21 +534,21 @@ impl ReverseIndexConsumer {
 }
 
 impl EventHandler for ReverseIndexConsumer {
-    /// The `*`-free subject whitelist (rule 3): `iam.tuple.written` only. The reverse index is fed
+    /// The `*`-free subject whitelist (rule 3): `identity.tuple.written` only. The reverse index is fed
     /// by exactly one token; an over-broad `*` would head-of-line-block the whole index.
     fn subjects(&self) -> &'static [SubjectPattern] {
         S8_SUBJECTS
     }
 
-    /// Project the delivered `iam.tuple_written` event into S8 + advance the watermark (contract
+    /// Project the delivered `identity.tuple.written` event into S8 + advance the watermark (contract
     /// 2.4). Idempotent on the delta identity (a redelivery is a no-op — the projection apply is
-    /// idempotent + the runtime's `event_id` dedup is the outer guard). A non-`iam.tuple.written`
+    /// idempotent + the runtime's `event_id` dedup is the outer guard). A non-`identity.tuple.written`
     /// event is ignored (the whitelist binds only that token; defence-in-depth here too). A
-    /// structurally-malformed `iam.tuple_written` (no zookie) is a non-retryable poison — never a
+    /// structurally-malformed `identity.tuple.written` (no zookie) is a non-retryable poison — never a
     /// silent corruption of the projection.
     fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
-        if ev.type_.0 != IAM_TUPLE_WRITTEN {
-            // Defence-in-depth: the whitelist binds iam.tuple.written, but a mis-delivery is a no-op
+        if ev.type_.0 != IDENTITY_TUPLE_WRITTEN {
+            // Defence-in-depth: the whitelist binds identity.tuple.written, but a mis-delivery is a no-op
             // (never project a foreign event into the authz index).
             return HandleOutcome::Done;
         }
@@ -561,7 +561,7 @@ impl EventHandler for ReverseIndexConsumer {
 
 impl ReverseIndex {
     /// Advance ONLY the `(tenant, region)` watermark (no row projected) — for an empty / userset-only
-    /// `iam.tuple_written` write (a valid revision bump with no direct-grant row). Monotone (an older
+    /// `identity.tuple.written` write (a valid revision bump with no direct-grant row). Monotone (an older
     /// redelivery never moves it backward). Built through a [`TenantQuery`] (the tenant-predicate
     /// floor).
     pub fn advance_watermark_only(&self, scope: &TenantScope, zookie: &Zookie) {
@@ -667,11 +667,11 @@ mod tests {
         z
     }
 
-    /// **S8 ingests `iam.tuple_written` and advances the watermark (the GATE).** A committed S3 write
-    /// emits `iam.tuple_written`; the relay publishes it; the S8 consumer projects it and the
+    /// **S8 ingests `identity.tuple.written` and advances the watermark (the GATE).** A committed S3 write
+    /// emits `identity.tuple.written`; the relay publishes it; the S8 consumer projects it and the
     /// partition watermark advances to the write's zookie.
     #[test]
-    fn s8_ingests_iam_tuple_written_and_advances_watermark() {
+    fn s8_ingests_identity_tuple_written_and_advances_watermark() {
         let outbox = OutboxStore::new();
         let store = TupleStore::new(outbox.clone());
         let index = ReverseIndex::new();
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(
             index.watermark(&s),
             z,
-            "the S8 watermark advances on each iam.tuple_written"
+            "the S8 watermark advances on each identity.tuple.written"
         );
         // The projection holds the (subject, relation, object_id) row.
         assert_eq!(
@@ -919,7 +919,7 @@ mod tests {
         );
     }
 
-    /// **A zookie-less `iam.tuple_written` is a non-retryable poison (never a silent corruption).**
+    /// **A zookie-less `identity.tuple.written` is a non-retryable poison (never a silent corruption).**
     /// A structurally-malformed event (no zookie) returns NonRetryable — the projection is not
     /// mutated and the watermark is not advanced.
     #[test]
@@ -931,13 +931,13 @@ mod tests {
         let consumer = ReverseIndexConsumer::new(index.clone());
         let mut ev = EventEnvelope {
             event_id: EventId("e1".into()),
-            type_: EventType(IAM_TUPLE_WRITTEN.into()),
+            type_: EventType(IDENTITY_TUPLE_WRITTEN.into()),
             schema_ver: 1,
             tenant: TenantId("acme".into()),
             region: Region("eu-west".into()),
             actor: Actor(actor_in("acme")),
-            subject: myelin_events::ArtifactRef("myelin://acme/iam/tuple/repo:core".into()),
-            aggregate: AggregateKey("iam:tuple:acme:repo:core".into()),
+            subject: myelin_events::ArtifactRef("myelin://acme/identity/tuple/repo:core".into()),
+            aggregate: AggregateKey("identity:tuple:acme:repo:core".into()),
             causation_id: None,
             correlation_id: CorrelationId("c1".into()),
             caused_by: None,
@@ -954,7 +954,7 @@ mod tests {
         let outcome = consumer.handle(&ev, &mut myelin_events::HandlerTx::none());
         assert!(
             matches!(outcome, HandleOutcome::NonRetryable(_)),
-            "a zookie-less iam.tuple_written is a non-retryable poison, never a silent corruption"
+            "a zookie-less identity.tuple.written is a non-retryable poison, never a silent corruption"
         );
         // Nothing was projected and the watermark did not advance.
         assert_eq!(index.watermark(&scope("acme")), Zookie(String::new()));
@@ -1002,13 +1002,13 @@ mod tests {
 
         let ev = EventEnvelope {
             event_id: EventId("e-malformed-delta".into()),
-            type_: EventType(IAM_TUPLE_WRITTEN.into()),
+            type_: EventType(IDENTITY_TUPLE_WRITTEN.into()),
             schema_ver: 1,
             tenant: TenantId("acme".into()),
             region: Region("eu-west".into()),
             actor: Actor(actor_in("acme")),
-            subject: myelin_events::ArtifactRef("myelin://acme/iam/tuple/repo:core".into()),
-            aggregate: AggregateKey("iam:tuple:acme:repo:core".into()),
+            subject: myelin_events::ArtifactRef("myelin://acme/identity/tuple/repo:core".into()),
+            aggregate: AggregateKey("identity:tuple:acme:repo:core".into()),
             causation_id: None,
             correlation_id: CorrelationId("c-malformed-delta".into()),
             caused_by: None,

@@ -671,7 +671,7 @@ impl StoreBackedCheck {
     /// [`StoreBackedCheck::new`]/[`StoreBackedCheck::with_index`] are the `test-support`-gated unit-test
     /// entry points.
     ///
-    /// The S3 store's `iam.tuple_written` emit is now BUS-2 exact (MR-009b W3b.3): the durable
+    /// The S3 store's `identity.tuple.written` emit is now BUS-2 exact (MR-009b W3b.3): the durable
     /// [`TupleStore::with_pg`] co-commits the event into the SAME `rebac_tuple` transaction as the
     /// tuple write (`myelin_storage::pgrelay::PgRelay::co_commit_in_tx`), so this composition root no
     /// longer threads a separate `OutboxStore` for tuple-write emission. `kms` is the shared cell
@@ -687,7 +687,7 @@ impl StoreBackedCheck {
         handle: tokio::runtime::Handle,
     ) -> StoreBackedCheck {
         // The durable S3 tuple store (the live `rebac_tuple` edge set) — the production default. Its
-        // iam.tuple_written emit co-commits into the tuple tx (no separate outbox param).
+        // identity.tuple.written emit co-commits into the tuple tx (no separate outbox param).
         let tuples = TupleStore::with_pg(
             myelin_storage::DurableTupleBacking::new(provider.clone()),
             handle.clone(),
