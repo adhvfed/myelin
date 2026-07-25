@@ -34,9 +34,17 @@
 //! Each subsystem owns and COMPLETES its full dotted-name list as a 5-B / M3-M4 deliverable
 //! (**EB-24**), validated against THIS grammar. So [`SEED_EVENT_NAMES`] is the representative
 //! seed, not an exhaustive registry; [`validate`] is the gate every later list is checked by.
-//! The `iam.*` family Identity ships (`iam.tuple.written`, …, `myelin-identity::iam_events`)
-//! is Identity's OWN architecture-§11.2 token set — distinct from the §6.4 Bus seed (which uses
-//! the canonical `identity.*` subsystem prefix); both obey THIS grammar, validated below.
+//! The token set Identity ships (`identity.tuple.written`, `identity.role.granted`,
+//! `identity.break_glass.invoked`, `myelin-identity::iam_events`) uses the already-canonical
+//! `identity.*` §6.2 subsystem prefix — the SAME prefix the §6.4 Bus seed
+//! (`identity.permission.granted`, …) uses. **Corrected cross-crate contract note:** these
+//! tokens were originally minted with an `iam.` prefix, which this grammar has never admitted
+//! (see [`tests::subsystem_token_set_is_the_frozen_canonical_set`] — the exclusion of `iam` is
+//! deliberate, not an oversight); every real `iam.*` outbox row hit
+//! [`TaxonomyError::UnknownSubsystem`] at the elected relay and was permanently quarantined.
+//! `identity` was already the canonical token for this crate's subsystem, so the fix was a
+//! rename to `identity.*`, not a second subsystem token — see
+//! [`tests::identity_tuple_written_and_siblings_are_admitted_by_the_grammar`].
 
 /// The canonical singular **subsystem** tokens (Bus §6.2 — the names anchor, UNCHANGED). The
 /// leading segment of every well-formed event `type` is one of these. CLI aliases (`repo`/`doc`
@@ -155,7 +163,10 @@ pub const SEED_EVENT_NAMES: &[&str] = &[
     // chat (§6.4)
     "chat.message.created",
     "chat.read_state.updated",
-    // identity (§6.4 — the canonical `identity.*` subsystem prefix, distinct from `iam.*`)
+    // identity (§6.4 — the canonical `identity.*` subsystem prefix; Identity's own
+    // `iam_events` token set — `identity.tuple.written`, `identity.role.granted`,
+    // `identity.break_glass.invoked` — uses this SAME canonical prefix, corrected from an
+    // earlier `iam.*` naming that this grammar never admitted, see the module doc)
     "identity.permission.granted",
     "identity.permission.revoked",
     "identity.member.added",
@@ -459,7 +470,9 @@ mod tests {
 
     /// Underscored tokens (`break_glass`, `read_state`, `marked_ready`) are well-formed
     /// (`[a-z][a-z0-9_]*` admits the underscore) — the seed `chat.read_state.updated` and
-    /// `git.pr.marked_ready` pass, and Identity's `iam.break_glass.invoked` obeys the grammar.
+    /// `git.pr.marked_ready` pass, and Identity's `identity.break_glass.invoked` obeys the
+    /// grammar (see [`identity_tuple_written_and_siblings_are_admitted_by_the_grammar`] for
+    /// the full corrected-naming proof).
     #[test]
     fn underscored_tokens_are_well_formed() {
         assert!(token_is_well_formed("break_glass"));
@@ -467,10 +480,38 @@ mod tests {
         assert!(token_is_well_formed("marked_ready"));
         assert!(validate("chat.read_state.updated").is_ok());
         assert!(validate("git.pr.marked_ready").is_ok());
-        // Identity's own §11.2 `iam.*` family obeys THIS grammar (the dotted shape), even though
-        // its `iam` prefix is Identity's architecture-§11.2 set, not the §6.2 canonical subsystem
-        // seed — the GRAMMAR is what EB-02 owns; the per-subsystem LIST is EB-24.
-        assert!(token_is_well_formed("iam"));
+        assert!(validate("identity.break_glass.invoked").is_ok());
+    }
+
+    /// **Regression (cross-crate contract gap, found & fixed post-hoc):** Identity's
+    /// `myelin-identity::iam_events` tokens were originally minted with an `iam.` subsystem
+    /// prefix. `SUBSYSTEM_TOKENS` has never admitted `iam` (see
+    /// [`subsystem_token_set_is_the_frozen_canonical_set`] — the exclusion is deliberate), so
+    /// every real outbox row of that shape hit [`TaxonomyError::UnknownSubsystem`] at the
+    /// elected relay (`myelin-storage::pgrelay::validate_claimed_row`) and was quarantined
+    /// (`outbox_quarantine` has `ON DELETE RESTRICT` back to `outbox`, so the relay has no
+    /// automatic remediation path — an operator must act on the quarantine row directly; this
+    /// rename stops new rows from being poisoned, it does not retroactively repair rows already
+    /// quarantined). `identity` is ALREADY the canonical §6.2 subsystem token for
+    /// this exact subsystem (the crate is `myelin-identity`), so the fix is a rename, not a
+    /// second subsystem token: `iam_events` now emits `identity.tuple.written` /
+    /// `identity.role.granted` / `identity.break_glass.invoked`. This proves each is admitted
+    /// by THIS grammar (the real, load-bearing gate every outbox row is validated against
+    /// before publish) — the concrete evidence that fixes
+    /// `myelin-mcp/tests/git_effect_governed.rs::response_lost_retry_is_exactly_once_for_open_review_and_events`.
+    #[test]
+    fn identity_tuple_written_and_siblings_are_admitted_by_the_grammar() {
+        // Exercise the ACTUAL cross-crate contract — myelin-identity's real token table,
+        // not a copy-pasted literal that could silently drift from what iam_events.rs emits.
+        for tok in myelin_identity::iam_events::IDENTITY_EVENT_TOKENS {
+            assert!(validate(tok).is_ok(), "token `{tok}` must be admitted by this grammar");
+        }
+        // The old, never-admitted spelling is (and must remain) rejected — proving this is a
+        // real fix, not a grammar loosening that would silently re-admit the bug.
+        assert!(matches!(
+            validate("iam.tuple.written"),
+            Err(TaxonomyError::UnknownSubsystem { .. })
+        ));
     }
 
     /// The two new check-seam tokens are registered in the seed table (§6.3) and the

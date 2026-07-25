@@ -6,7 +6,7 @@
 //! zookie, expires_at?}`; `(tenant, region)` then object-id-hash partition; **no cross-tenant
 //! tuple and no cross-tenant query path**; per-run grants are **auto-expiring tuples**
 //! (`expires_at == run life`); authz state changes are **event-sourced** and Id emits
-//! `iam.tuple_written` via the **outbox** — the only emit path; reindex-from-source rebuildable),
+//! `identity.tuple.written` via the **outbox** — the only emit path; reindex-from-source rebuildable),
 //! §8.4 / C10 (the zookie from `write_tuples` is stamped on the object — the new-enemy guard;
 //! the zookie **advances monotonically** and is the revision watermark S8 honours), §2 (the S3
 //! row of the store table).
@@ -26,18 +26,18 @@
 //!    an **atomic** write that (a) honours the precondition (a failed precondition aborts the
 //!    whole write — read-modify-write is not lost), (b) applies the deltas under the store lock,
 //!    (c) returns the **monotonically-advancing zookie** to stamp on the object, and (d) emits
-//!    `iam.tuple_written` **via the outbox** — the ONLY emit path (the `no-raw-publish` lint
+//!    `identity.tuple.written` **via the outbox** — the ONLY emit path (the `no-raw-publish` lint
 //!    forbids any other). The tuple write + the event **co-commit** in ONE
 //!    [`myelin_events::OutboxTransaction`] (emit-iff-committed, BUS-D4): a write that did not
 //!    commit emits nothing, and a committed write always emits.
 //! 3. **The zookie write-half of 4.10** ([`Zookie`]): every `write_tuples` advances the store's
 //!    monotonic revision and returns the new zookie (`page.acl_zookie`, Chat membership). It is
-//!    the S8 watermark carried on the `iam.tuple_written` event.
+//!    the S8 watermark carried on the `identity.tuple.written` event.
 //!
 //! ## The co-commit invariant (the load-bearing security property, mutation-tested mandatory-core)
 //! `write_tuples` opens **one** [`myelin_events::OutboxTransaction`], stages the tuple-state
-//! change AND the `iam.tuple_written` event onto it, and commits **both together**. There is
-//! deliberately **no other emit path**: the `iam.tuple_written` envelope is constructed only by
+//! change AND the `identity.tuple.written` event onto it, and commits **both together**. There is
+//! deliberately **no other emit path**: the `identity.tuple.written` envelope is constructed only by
 //! `OutboxTx::emit` inside that transaction, never by a direct `publish`. So:
 //! - **0 emits without a committed write** — a precondition failure (or any pre-commit abort)
 //!   drops the transaction and writes nothing (no tuple, no event);
@@ -49,11 +49,11 @@
 //! ## Floors named (frozen shape now → bodies in a later prompt)
 //! - **The read-your-writes consistency *read* half (the S8 watermark) is P-ID-12 (P-070).**
 //!   This prompt ships the write-half: `write_tuples` returns the monotonically-advancing zookie
-//!   and stamps it on the `iam.tuple_written` event for S8 to consume. The *read* side that waits
+//!   and stamps it on the `identity.tuple.written` event for S8 to consume. The *read* side that waits
 //!   for / falls back rather than serving stale (the new-enemy guard) is P-ID-12. Named, not
 //!   silently assumed done.
 //! - **The check engine (4.2) is P-ID-09 (P-067); S8 (the authz reverse index) is P-ID-11
-//!   (P-069).** This store is the source the reverse index is fed from (`iam.tuple_written`); it
+//!   (P-069).** This store is the source the reverse index is fed from (`identity.tuple.written`); it
 //!   does NOT evaluate `check` and does NOT materialise the reverse index here.
 //! - **The per-tenant DEK is pinned BY REFERENCE.** The KMS three-level hierarchy is Storage M1
 //!   (P-ST-06 → P-058, which sequences AFTER this prompt); the store declares the per-tenant key
@@ -76,7 +76,7 @@ use myelin_events::MonotonicMinter;
 // SAME `rebac_tuple` tx via the backing (`PgRelay::co_commit_in_tx`) — it needs no `OutboxStore`.
 #[cfg(any(test, feature = "test-support"))]
 use myelin_events::{EmitContextBase, OutboxStore, OutboxTransaction, OutboxTx};
-use myelin_identity::iam_events::IAM_TUPLE_WRITTEN;
+use myelin_identity::iam_events::IDENTITY_TUPLE_WRITTEN;
 use myelin_identity::{DataRole, Precondition, Principal, RelationTuple, TupleDelta, Zookie};
 use myelin_storage::{OltpStoreHolder, TenantQuery, TenantScope, TenantTable};
 use myelin_tenancy::{Region, TenantId};
@@ -226,7 +226,7 @@ struct Inner {
 
 /// The S3 ReBAC tuple store (architecture §6; contract 4.6 + the 4.10 write-half). A cloneable
 /// handle over shared state. The ONLY mutation path is [`TupleStore::write_tuples`], which
-/// co-commits the tuple change + the `iam.tuple_written` event through the outbox.
+/// co-commits the tuple change + the `identity.tuple.written` event through the outbox.
 ///
 /// **No cross-tenant query path:** every accessor takes a verified [`TenantScope`] (minted only
 /// from a verified token, never a path), and a query is built through [`TenantQuery::for_table`]
@@ -244,13 +244,13 @@ pub struct TupleStore {
     revision: Arc<AtomicU64>,
     /// The in-memory test-double's outbox — the emit path for the `Memory` backing ONLY (MR-009b
     /// W3b.3: `test-support`-gated). `write_tuples` (memory arm) stages the tuple change + the
-    /// `iam.tuple_written` event into ONE `OutboxTransaction` on this store. The DURABLE `Pg` backing
-    /// does NOT use it: it co-commits the `iam.tuple_written` row into the SAME `rebac_tuple` PG
+    /// `identity.tuple.written` event into ONE `OutboxTransaction` on this store. The DURABLE `Pg` backing
+    /// does NOT use it: it co-commits the `identity.tuple.written` row into the SAME `rebac_tuple` PG
     /// transaction via the backing (`PgRelay::co_commit_in_tx`) — emit-iff-committed, BUS-2 exact — so
     /// the production `TupleStore` carries no in-memory outbox at all.
     #[cfg(any(test, feature = "test-support"))]
     outbox: OutboxStore,
-    /// The stable id-minter for the emitted `iam.tuple_written` events (the broker-side dedup id).
+    /// The stable id-minter for the emitted `identity.tuple.written` events (the broker-side dedup id).
     minter: Arc<dyn IdMinter>,
     /// The holder this store auto-registers as (the `PersonalDataHolder` seam) — proof the
     /// "every store is a holder" invariant holds for S3 (§1.1, GD-3).
@@ -344,7 +344,7 @@ impl TupleStore {
     /// **Build the S3 store over the REAL durable PG backing (MR-007 / SI-019).** The `rebac_tuple`
     /// edge set persists through the MR-022 [`myelin_storage::SubstrateProvider`] pool +
     /// `with_tenant_tx` convention (RLS-scoped, no GUC bleed). `rt` is the tokio runtime handle the
-    /// sync API drives the async backing on. The `iam.tuple_written` emit + zookie semantics are
+    /// sync API drives the async backing on. The `identity.tuple.written` emit + zookie semantics are
     /// preserved, and made **BUS-2 exact** (MR-009b W3b.3): the event co-commits into the SAME
     /// `rebac_tuple` transaction as the tuple write (`PgRelay::co_commit_in_tx` via the backing), so
     /// there is no separate `OutboxStore` on this path — a crash mid-write leaves either the tuple +
@@ -516,7 +516,7 @@ impl TupleStore {
     /// 2. apply the deltas (add/remove the `object#relation@subject` edges) — per-run grants are
     ///    auto-expiring tuples (`expires_at`);
     /// 3. advance the monotonic revision → the new `zookie` (the 4.10 write-half);
-    /// 4. stage the `iam.tuple_written` event onto the SAME outbox transaction (carrying the
+    /// 4. stage the `identity.tuple.written` event onto the SAME outbox transaction (carrying the
     ///    write's zookie for S8's watermark) and **co-commit** the tuple change + the event.
     ///
     /// `actor` is the writing principal (attributed by **opaque `principal_id` only** on the
@@ -559,7 +559,7 @@ impl TupleStore {
         }
     }
 
-    /// **Derive the `iam.tuple_written` [`EventEnvelope`] the durable Pg write co-commits (MR-009b
+    /// **Derive the `identity.tuple.written` [`EventEnvelope`] the durable Pg write co-commits (MR-009b
     /// W3b.3).** Mints the stable `event_id` from the SAME `minter` and derives causality via the
     /// pure [`derive_envelope`] — byte-for-byte what the memory arm's [`OutboxTransaction::emit`]
     /// produces (same draft, same [`EmitContext`], root cause), so consumers cannot tell the two
@@ -597,7 +597,7 @@ impl TupleStore {
         (aggregate, envelope)
     }
 
-    /// Build the ONE outbox transaction the memory-arm write co-commits (the `iam.tuple_written`
+    /// Build the ONE outbox transaction the memory-arm write co-commits (the `identity.tuple.written`
     /// emit, the ONLY emit path for the test double). Returns the UNCOMMITTED transaction so the
     /// caller commits it at the right moment (emit-iff-committed): after the apply succeeds. The
     /// durable Pg path uses [`Self::derive_tuple_event`] + the backing co-commit instead (MR-009b
@@ -628,7 +628,7 @@ impl TupleStore {
             deltas.len(),
             zookie.0
         ));
-        // The iam.tuple_written event — the event-sourced record S8 consumes, carrying the write's
+        // The identity.tuple.written event — the event-sourced record S8 consumes, carrying the write's
         // zookie watermark. Attribution by OPAQUE principal_id; references-not-payloads; no PII.
         let draft = self.tuple_written_draft(scope, deltas, zookie);
         tx.emit(draft, None)
@@ -696,13 +696,13 @@ impl TupleStore {
             }
         }
 
-        // Co-commit: the state change + the iam.tuple_written event become durable together.
+        // Co-commit: the state change + the identity.tuple.written event become durable together.
         tx.commit().map_err(|e| WriteError::CommitFailed(e.0))?;
         Ok(zookie)
     }
 
     /// **The REAL durable write path (MR-007): the `rebac_tuple` edge set persists through the
-    /// MR-022 `with_tenant_tx` convention, and the `iam.tuple_written` event co-commits
+    /// MR-022 `with_tenant_tx` convention, and the `identity.tuple.written` event co-commits
     /// emit-iff-the-durable-write-succeeded.** The event is staged FIRST (uncommitted); the deltas
     /// are then applied in ONE tenant-scoped DB transaction; only on durable success does the outbox
     /// commit (so a failed durable apply emits NOTHING). The zookie/precondition use the in-process
@@ -738,13 +738,13 @@ impl TupleStore {
         let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
         let zookie = Self::zookie_of(new_rev);
 
-        // Derive the iam.tuple_written envelope at the emit point (mint id + causality) — the SAME
+        // Derive the identity.tuple.written envelope at the emit point (mint id + causality) — the SAME
         // shape the memory arm's `OutboxTransaction::emit` produces, so no consumer can tell the
         // durable path apart.
         let (aggregate, envelope) =
             self.derive_tuple_event(scope, actor, deltas, &zookie, occurred_at);
 
-        // Apply the deltas AND co-commit the iam.tuple_written outbox row in ONE tenant-scoped DB
+        // Apply the deltas AND co-commit the identity.tuple.written outbox row in ONE tenant-scoped DB
         // transaction (BUS-2 emit-iff-committed, EXACT — MR-009b W3b.3): the tuple write + the event
         // become durable together, or neither does. This replaces the former non-atomic
         // "durable apply, then commit into a SEPARATE in-memory OutboxStore" (whose crash window
@@ -810,7 +810,7 @@ impl TupleStore {
             .max_by(|a, b| a.0.cmp(&b.0))
     }
 
-    /// The `iam.tuple_written` [`EventDraft`] (references-not-payloads, opaque-id attribution).
+    /// The `identity.tuple.written` [`EventDraft`] (references-not-payloads, opaque-id attribution).
     /// The subject is the object the write is about (the first delta's object — the aggregate is
     /// the object so per-object ordering holds); the payload carries the object refs + the
     /// write's zookie (the S8 watermark), never any PII.
@@ -829,15 +829,15 @@ impl TupleStore {
             })
             .next()
             .unwrap_or("unknown");
-        // The PII-free subject ArtifactRef for the object (myelin://<tenant>/iam/tuple/<object>).
+        // The PII-free subject ArtifactRef for the object (myelin://<tenant>/identity/tuple/<object>).
         let subject = EvArtifactRef(format!(
-            "myelin://{}/iam/tuple/{}",
+            "myelin://{}/identity/tuple/{}",
             scope.tenant().0,
             object
         ));
         // Per-object ordering: the aggregate is the object, so all tuple-writes about one object
         // are sequenced (the relay drains an aggregate in seq order).
-        let aggregate = AggregateKey(format!("iam:tuple:{}:{}", scope.tenant().0, object));
+        let aggregate = AggregateKey(format!("identity:tuple:{}:{}", scope.tenant().0, object));
         // references-not-payloads: object refs + the zookie watermark, NEVER PII. The deltas are
         // summarised as op + object#relation@subject refs (all opaque references).
         let ops: Vec<serde_json::Value> = deltas
@@ -858,7 +858,7 @@ impl TupleStore {
             })
             .collect();
         EventDraft {
-            type_: EventType(IAM_TUPLE_WRITTEN.to_string()),
+            type_: EventType(IDENTITY_TUPLE_WRITTEN.to_string()),
             subject,
             aggregate,
             payload: serde_json::json!({
@@ -1117,11 +1117,11 @@ mod tests {
     }
 
     /// **The emit is via the OUTBOX only (the no-raw-publish floor): a committed write emits
-    /// `iam.tuple_written`, and the relay publishes exactly that.** This is the GATE: the
-    /// committed write produced one outbox row carrying the `iam.tuple.written` type + the write's
+    /// `identity.tuple.written`, and the relay publishes exactly that.** This is the GATE: the
+    /// committed write produced one outbox row carrying the `identity.tuple.written` type + the write's
     /// zookie, and there is NO other emit path.
     #[test]
-    fn committed_write_emits_iam_tuple_written_via_the_outbox_only() {
+    fn committed_write_emits_identity_tuple_written_via_the_outbox_only() {
         let outbox = OutboxStore::new();
         let store = TupleStore::new(outbox.clone());
         let s = scope("acme");
@@ -1137,13 +1137,13 @@ mod tests {
             )
             .expect("write");
 
-        // Exactly one unsent outbox row (the iam.tuple_written event) — emit-iff-committed.
+        // Exactly one unsent outbox row (the identity.tuple.written event) — emit-iff-committed.
         assert_eq!(
             outbox.outbox_depth(),
             1,
             "the committed write emitted exactly one event"
         );
-        // Drain the relay (what `serve` does) and assert the published event is iam.tuple.written
+        // Drain the relay (what `serve` does) and assert the published event is identity.tuple.written
         // carrying the write's zookie + opaque-id attribution + no PII.
         let bus = InProcessBus::new();
         let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
@@ -1156,12 +1156,12 @@ mod tests {
         );
         let env = &published[0];
         assert_eq!(
-            env.type_.0, IAM_TUPLE_WRITTEN,
-            "the only emit is iam.tuple.written"
+            env.type_.0, IDENTITY_TUPLE_WRITTEN,
+            "the only emit is identity.tuple.written"
         );
         assert!(
             !env.contains_personal_data,
-            "the iam.* event carries no inline PII"
+            "the identity.* event carries no inline PII"
         );
         assert_eq!(
             env.payload["zookie"],
@@ -1419,8 +1419,8 @@ mod tests {
                 let published = bus.consume("");
                 published[0].event_id.clone()
             })
-            .expect("the iam.tuple_written row exists for S8");
-        assert_eq!(row.envelope.type_.0, IAM_TUPLE_WRITTEN);
+            .expect("the identity.tuple.written row exists for S8");
+        assert_eq!(row.envelope.type_.0, IDENTITY_TUPLE_WRITTEN);
         let _ = ConsumerName("s8_reverse_index".into()); // the S8 consumer name (P-ID-11).
     }
 }

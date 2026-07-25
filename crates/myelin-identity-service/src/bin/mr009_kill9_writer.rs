@@ -79,7 +79,7 @@ fn seal_key() -> SealKey {
 }
 
 /// A per-run-UNIQUE, lexically-monotonic id minter for the durable tuple store's co-committed
-/// `iam.tuple_written` event (MR-009b W3b.3). The default `MonotonicMinter` resets to `0` per store,
+/// `identity.tuple.written` event (MR-009b W3b.3). The default `MonotonicMinter` resets to `0` per store,
 /// so every run mints the SAME `event_id` — which the global `outbox` `UNIQUE(event_id)` collapses
 /// via `ON CONFLICT DO NOTHING`, masking the co-commit when suites share the live DB. The production
 /// wall-clock+random ULID source (P-S12) is globally unique; this seeds uniqueness from the run-id so
@@ -293,7 +293,7 @@ async fn identity_family(
         DurablePrincipalBacking::new(app.clone()),
         handle.clone(),
     );
-    // The durable S3 tuple store — its iam.tuple_written emit co-commits into the SAME rebac_tuple
+    // The durable S3 tuple store — its identity.tuple.written emit co-commits into the SAME rebac_tuple
     // tx as the write (MR-009b W3b.3), so no separate OutboxStore is threaded here. A run-seeded
     // minter keeps the co-committed event_id unique across runs sharing the live outbox.
     let tstore = TupleStore::with_pg_minter(

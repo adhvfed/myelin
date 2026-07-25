@@ -1,21 +1,38 @@
-//! # `iam_events` — the `iam.*` event tokens + their `EventEnvelope` projections (P-ID-02 / P-023)
+//! # `iam_events` — the Identity `EventEnvelope` projections (P-ID-02 / P-023)
+//!
+//! **CORRECTED (post-hoc, cross-crate contract fix):** these tokens were originally minted
+//! with an `iam.` subsystem prefix. `myelin-events::taxonomy::SUBSYSTEM_TOKENS` (Bus §6.2,
+//! contract 2.9 — the ONE grammar every event `type` is validated against before the elected
+//! outbox relay will publish it) has never admitted `iam` as a subsystem token, and its own
+//! frozen test (`subsystem_token_set_is_the_frozen_canonical_set`) documents that exclusion as
+//! deliberate. `identity` IS already the canonical §6.2 token for this crate's subsystem — the
+//! crate is literally `myelin-identity` — so `iam.*` was never a second, additional subsystem;
+//! it was simply the wrong prefix for names that should have been `identity.*` from the start.
+//! Emitting `iam.*` meant every real row hit `UnknownSubsystem` at the relay and was
+//! quarantined (`outbox_quarantine` has `ON DELETE RESTRICT` back to `outbox`, so the relay
+//! itself has no remediation path — an operator must act on the quarantine row directly; this
+//! rename stops new rows from being poisoned, it does not retroactively repair the ones already
+//! quarantined). The tokens below now carry the canonical `identity.` prefix; the constant
+//! names keep an `IAM_`-free, `IDENTITY_`-prefixed form to match.
 //!
 //! **Owning architecture doc:**
 //! `planning/05-refined-shared-systems-architecture/identity-and-access.md`
 //! §3 (the opaque `principal_id` / erasable `profile_ref` split — the GDPR
-//! erasure-vs-immutability split), §6 (`iam.tuple_written` is emitted via the **outbox** —
-//! the only emit path), §11.2 (the `iam.*` event set: `iam.tuple_written`,
-//! `iam.role_granted`, `iam.break_glass`).
+//! erasure-vs-immutability split), §6 (`identity.tuple.written` is emitted via the **outbox**
+//! — the only emit path), §11.2 (the token set: `identity.tuple.written`,
+//! `identity.role.granted`, `identity.break_glass.invoked` — architecture prose still spells
+//! these `iam.tuple_written` / `iam.role_granted` / `iam.break_glass`; the dotted, `identity.`
+//! prefixed spelling here is the one that actually passes the Bus §6.1/§6.2 grammar).
 //!
 //! **Hard problem grounded here:** `external-insights/04-hard-problems.md` §1
 //! (erasure-vs-immutability). The event log is immutable + append-only; the workable answer
 //! is to **separate identity from action** — attribute events by a stable **opaque id**
 //! ([`PrincipalId`]) and keep the erasable personal data (name/email/profile, the
 //! `profile_ref`) in a separate record. Erasure then tombstones the *identity*, never the
-//! *fact*. P-ID-02 bakes that split into the envelope shape at M0: an `iam.*` event's
+//! *fact*. P-ID-02 bakes that split into the envelope shape at M0: an `identity.*` event's
 //! attribution carries **opaque `principal_id` only** — the erasable `profile_ref` never
-//! enters the immutable envelope. This makes "an `iam.*` event leaks a name/email into the
-//! immutable log" structurally impossible (the `control-plane-pii-free` lint, wired in
+//! enters the immutable envelope. This makes "an `identity.*` event leaks a name/email into
+//! the immutable log" structurally impossible (the `control-plane-pii-free` lint, wired in
 //! P-ID-03 / P-024, guards it; the compile-time [`tests`] below pin it in-crate).
 //!
 //! ## DAG-deviation note (EI-01 §1, documented) — why the projection is NOT an `EventEnvelope`
@@ -29,25 +46,25 @@
 //! `myelin_events::DataRole`).
 //!
 //! So the **projection** is expressed as an identity-owned, compile-time **descriptor**
-//! ([`IamEventProjection`]) that pins, for each `iam.*` token, *exactly which envelope
+//! ([`IamEventProjection`]) that pins, for each `identity.*` token, *exactly which envelope
 //! fields the emitter sets* — attribution by opaque [`PrincipalId`], the GDPR `data_role`,
 //! and `contains_personal_data = false` — using identity-owned field types. The actual
 //! `EventEnvelope` is constructed at **emit time** by the emit path in the events tier
 //! (`OutboxTx::emit`, the only emit path), reached at **P-ID-08 (M1)** for
-//! `iam.tuple_written`. The descriptor here is the *frozen contract* that emit path
+//! `identity.tuple.written`. The descriptor here is the *frozen contract* that emit path
 //! reconciles against (the projection's field names line up 1:1 with the §2.10 envelope
 //! anchor: `type_`, `actor`, `subject`, `contains_personal_data`, `data_role`).
 //!
 //! ## Floors named (frozen shape now → bodies in a later prompt)
 //! - **NO service, NO emit path.** The bodies that emit these tokens land in M1:
-//!   `iam.tuple_written` → **P-ID-08** (`write_tuples`, via the outbox); `iam.role_granted`
-//!   / `iam.break_glass` → the role-grant / break-glass admin flows (Identity M1).
+//!   `identity.tuple.written` → **P-ID-08** (`write_tuples`, via the outbox);
+//!   `identity.role.granted` / `identity.break_glass.invoked` → the role-grant / break-glass
+//!   admin flows (Identity M1).
 //! - The **taxonomy grammar validator + the seed token table** is the Bus's **EB-02 /
-//!   P-042** deliverable; the `iam.*` constants here are the rows it will admit (the dotted
-//!   `<subsystem>.<artifact_type>.<event_name>` grammar is honoured by construction — see
-//!   [`tests::iam_tokens_obey_the_dotted_grammar`]). Until EB-02 lands, these constants ARE
-//!   the registration (a `&'static str` token table is the M0 carrier; no second token
-//!   language).
+//!   P-042** deliverable; the constants here are rows it admits (the dotted
+//!   `<subsystem>.<artifact_type>.<event_name>` grammar, with the already-canonical
+//!   `identity` §6.2 subsystem token, is honoured by construction — see
+//!   [`tests::identity_tokens_obey_the_dotted_grammar`]).
 //! - The §1.8 telemetry **signal NAMES** Identity owns are declared here as `&'static str`
 //!   constants so later prompts assert against named signals, not literals; the wiring onto
 //!   the metrics-health port is the Identity service shell + the impl prompts (M1).
@@ -56,34 +73,44 @@ use crate::{DataRole, PrincipalId};
 use myelin_tenancy::ArtifactRef;
 
 // ===========================================================================
-// §11.2 — the iam.* event token constants (the registration; dotted grammar)
+// §11.2 — the identity.* event token constants (the registration; dotted grammar)
 // ===========================================================================
 
-/// The `iam.tuple_written` token (architecture §6, §11.2). Emitted via the **outbox** (the
-/// only emit path) whenever a relation tuple is written; **S8** (the authz reverse index)
-/// is its consumer (C2), carrying the write's zookie as the revision watermark. The emit
-/// body is **P-ID-08 (M1)**.
-pub const IAM_TUPLE_WRITTEN: &str = "iam.tuple.written";
+/// The `identity.tuple.written` token (architecture §6, §11.2 — prose there still spells it
+/// `iam.tuple_written`; this is the corrected, taxonomy-admitted spelling, see the module
+/// doc). Emitted via the **outbox** (the only emit path) whenever a relation tuple is
+/// written; **S8** (the authz reverse index) is its consumer (C2), carrying the write's
+/// zookie as the revision watermark. The emit body is **P-ID-08 (M1)**.
+pub const IDENTITY_TUPLE_WRITTEN: &str = "identity.tuple.written";
 
-/// The `iam.role_granted` token (architecture §11.2). Emitted when a principal is granted a
+/// The `identity.role.granted` token (architecture §11.2, prose spells it `iam.role_granted`
+/// — see the module doc for the corrected spelling). Emitted when a principal is granted a
 /// role (an org/team/project membership edge). The emit body is Identity M1.
-pub const IAM_ROLE_GRANTED: &str = "iam.role.granted";
+pub const IDENTITY_ROLE_GRANTED: &str = "identity.role.granted";
 
-/// The `iam.break_glass` token (architecture §11.2). Emitted on a break-glass / emergency
-/// access elevation (audited, time-bounded). The emit body is Identity M1.
-pub const IAM_BREAK_GLASS: &str = "iam.break_glass.invoked";
+/// The `identity.break_glass.invoked` token (architecture §11.2, prose spells it
+/// `iam.break_glass` — see the module doc for the corrected spelling). Emitted on a
+/// break-glass / emergency access elevation (audited, time-bounded). The emit body is
+/// Identity M1.
+pub const IDENTITY_BREAK_GLASS: &str = "identity.break_glass.invoked";
 
-/// The complete set of `iam.*` tokens Identity registers (architecture §11.2). The Bus
-/// taxonomy seed (EB-02 / P-042) admits exactly these rows; the in-crate
-/// [`tests::iam_tokens_obey_the_dotted_grammar`] proves each obeys the
-/// `<subsystem>.<artifact_type>.<event_name>` grammar with the `iam` subsystem prefix.
-pub const IAM_EVENT_TOKENS: &[&str] = &[IAM_TUPLE_WRITTEN, IAM_ROLE_GRANTED, IAM_BREAK_GLASS];
+/// The complete set of tokens Identity registers (architecture §11.2). The Bus taxonomy
+/// grammar validator (EB-02 / P-042) admits exactly these rows (they are not part of the
+/// Bus's `SEED_EVENT_NAMES` table, which is representative, not exhaustive); the in-crate
+/// [`tests::identity_tokens_obey_the_dotted_grammar`] proves each obeys the
+/// `<subsystem>.<artifact_type>.<event_name>` grammar with the already-canonical `identity`
+/// subsystem prefix (Bus §6.2).
+pub const IDENTITY_EVENT_TOKENS: &[&str] = &[
+    IDENTITY_TUPLE_WRITTEN,
+    IDENTITY_ROLE_GRANTED,
+    IDENTITY_BREAK_GLASS,
+];
 
 // ===========================================================================
 // §3 / §11.2 — the EventEnvelope projection descriptor (opaque-id-only attribution)
 // ===========================================================================
 
-/// How an `iam.*` event attributes its actor and subject in the immutable envelope
+/// How an `identity.*` event attributes its actor and subject in the immutable envelope
 /// (architecture §3; EI-04 §1 — the erasure-vs-immutability split).
 ///
 /// **The whole point:** every reference is an **opaque [`PrincipalId`]**, never the erasable
@@ -114,7 +141,7 @@ pub enum IamSubjectRef {
 /// compile/scan proof).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IamEventProjection {
-    /// The dotted event token (one of [`IAM_EVENT_TOKENS`]) — maps to `EventEnvelope.type_`.
+    /// The dotted event token (one of [`IDENTITY_EVENT_TOKENS`]) — maps to `EventEnvelope.type_`.
     pub type_: &'static str,
     /// The acting principal, by **opaque id only** — maps to `EventEnvelope.actor`
     /// (the events tier wraps it in `Actor(Principal)`; only the opaque `principal_id`
@@ -144,8 +171,8 @@ impl IamEventProjection {
         data_role: DataRole,
     ) -> Self {
         debug_assert!(
-            IAM_EVENT_TOKENS.contains(&type_),
-            "iam.* projection built for an unregistered token: {type_}"
+            IDENTITY_EVENT_TOKENS.contains(&type_),
+            "identity.* projection built for an unregistered token: {type_}"
         );
         IamEventProjection {
             type_,
@@ -197,13 +224,13 @@ mod tests {
     use super::*;
     use crate::PrincipalId;
 
-    /// Each `iam.*` token obeys the Bus dotted grammar
-    /// `<subsystem>.<artifact_type>.<event_name>` with the `iam` subsystem prefix (Bus §6;
-    /// the grammar the EB-02 / P-042 taxonomy validator will enforce). Three dotted
-    /// segments, all non-empty, lowercase, prefixed `iam.`.
+    /// Each token obeys the Bus dotted grammar `<subsystem>.<artifact_type>.<event_name>`
+    /// with the already-canonical `identity` §6.2 subsystem prefix (Bus §6; the grammar the
+    /// EB-02 / P-042 taxonomy validator enforces). Three dotted segments, all non-empty,
+    /// lowercase, prefixed `identity.`.
     #[test]
-    fn iam_tokens_obey_the_dotted_grammar() {
-        for tok in IAM_EVENT_TOKENS {
+    fn identity_tokens_obey_the_dotted_grammar() {
+        for tok in IDENTITY_EVENT_TOKENS {
             let parts: Vec<&str> = tok.split('.').collect();
             assert_eq!(
                 parts.len(),
@@ -211,8 +238,8 @@ mod tests {
                 "token `{tok}` must be <subsystem>.<artifact_type>.<event_name>"
             );
             assert_eq!(
-                parts[0], "iam",
-                "token `{tok}` must carry the `iam` subsystem prefix"
+                parts[0], "identity",
+                "token `{tok}` must carry the canonical `identity` subsystem prefix (Bus §6.2)"
             );
             for seg in &parts {
                 assert!(!seg.is_empty(), "token `{tok}` has an empty segment");
@@ -224,10 +251,10 @@ mod tests {
         }
         // The set is exactly the §11.2 three (no drift — adding/removing a token is a
         // contract change every consumer's taxonomy registration must reconcile).
-        assert_eq!(IAM_EVENT_TOKENS.len(), 3);
-        assert!(IAM_EVENT_TOKENS.contains(&IAM_TUPLE_WRITTEN));
-        assert!(IAM_EVENT_TOKENS.contains(&IAM_ROLE_GRANTED));
-        assert!(IAM_EVENT_TOKENS.contains(&IAM_BREAK_GLASS));
+        assert_eq!(IDENTITY_EVENT_TOKENS.len(), 3);
+        assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_TUPLE_WRITTEN));
+        assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_ROLE_GRANTED));
+        assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_BREAK_GLASS));
     }
 
     /// The P-ID-02 gate: each `iam.*` projection carries `actor`/`subject` by **opaque
@@ -238,12 +265,12 @@ mod tests {
         // iam.tuple_written: actor is a principal id; subject is a PII-free ArtifactRef
         // (the object the tuple is about).
         let tw = IamEventProjection::new(
-            IAM_TUPLE_WRITTEN,
+            IDENTITY_TUPLE_WRITTEN,
             PrincipalId("p-admin".into()),
             IamSubjectRef::Object(ArtifactRef("myelin://acme/git/repo/core".into())),
             DataRole::Controller,
         );
-        assert_eq!(tw.type_, IAM_TUPLE_WRITTEN);
+        assert_eq!(tw.type_, IDENTITY_TUPLE_WRITTEN);
         assert_eq!(tw.actor_principal_id, PrincipalId("p-admin".into()));
         assert!(matches!(tw.subject, IamSubjectRef::Object(_)));
         assert!(
@@ -253,23 +280,23 @@ mod tests {
 
         // iam.role_granted: subject is a principal-as-subject (the grantee), opaque id only.
         let rg = IamEventProjection::new(
-            IAM_ROLE_GRANTED,
+            IDENTITY_ROLE_GRANTED,
             PrincipalId("p-admin".into()),
             IamSubjectRef::Principal(PrincipalId("p-grantee".into())),
             DataRole::Controller,
         );
-        assert_eq!(rg.type_, IAM_ROLE_GRANTED);
+        assert_eq!(rg.type_, IDENTITY_ROLE_GRANTED);
         assert!(matches!(rg.subject, IamSubjectRef::Principal(ref id) if id.0 == "p-grantee"));
         assert!(!rg.contains_personal_data);
 
         // iam.break_glass: an emergency elevation, attributed to the invoking principal.
         let bg = IamEventProjection::new(
-            IAM_BREAK_GLASS,
+            IDENTITY_BREAK_GLASS,
             PrincipalId("p-oncall".into()),
             IamSubjectRef::Principal(PrincipalId("p-target".into())),
             DataRole::Controller,
         );
-        assert_eq!(bg.type_, IAM_BREAK_GLASS);
+        assert_eq!(bg.type_, IDENTITY_BREAK_GLASS);
         assert!(!bg.contains_personal_data);
     }
 
@@ -278,7 +305,7 @@ mod tests {
     /// that claims inline PII (the erasure-vs-immutability split is structural, EI-04 §1).
     #[test]
     fn every_iam_projection_is_personal_data_free() {
-        for tok in IAM_EVENT_TOKENS {
+        for tok in IDENTITY_EVENT_TOKENS {
             let p = IamEventProjection::new(
                 tok,
                 PrincipalId("actor".into()),

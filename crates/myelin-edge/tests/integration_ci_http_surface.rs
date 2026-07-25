@@ -410,6 +410,45 @@ async fn insert_golden_ci_surface(
     .expect("insert shared golden CI surface");
 }
 
+/// Seed the `ci_job_spec` (+ `job_queue`) log route that `DurableLogPersist::resume_async` requires:
+/// its `ship_frame`/`finish` resume path joins `ci_job_spec` to `job_queue` on
+/// `(tenant, region, job_id, run_id)` to resolve `spec->>'ci_run_id'`, the canonical run id the
+/// `log_segment` archive is actually keyed on. Without a `ci_job_spec` row for the exact job/run,
+/// that join returns no rows and `resume_async` fails closed with "resolve canonical CI log run: ...
+/// no rows returned by a query that expected to return at least one row" — the same gap fixed in
+/// `integration_ci_ct004c2_runner_exec.rs`'s `seed_log_route` and matching
+/// `integration_ci_ct004f_durable_log_persist.rs`'s helper of the same name. This test has no separate
+/// workflow-run identity, so `run_id` co-keys `job_queue`/`ci_job_spec` AND `spec->>'ci_run_id'`.
+async fn seed_log_route(admin: &PgPool, tenant: &str, region: &str, job_id: &str, run_id: &str) {
+    sqlx::query(
+        "INSERT INTO job_queue \
+         (tenant_id,region,job_id,run_id,lane,labels,trust_tier,fair_key,idem_token,state) \
+         VALUES ($1,$2,$3::uuid,$4::uuid,'batch','{}','trusted',$5,$6,'queued')",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(job_id)
+    .bind(run_id)
+    .bind(format!("fair-{job_id}"))
+    .bind(format!("idem-{job_id}"))
+    .execute(admin)
+    .await
+    .expect("seed job_queue log route");
+    sqlx::query(
+        "INSERT INTO ci_job_spec (tenant_id,region,job_id,run_id,idem_token,spec) \
+         VALUES ($1,$2,$3::uuid,$4::uuid,$5,jsonb_build_object('ci_run_id',$6))",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(job_id)
+    .bind(run_id)
+    .bind(format!("idem-{job_id}"))
+    .bind(run_id)
+    .execute(admin)
+    .await
+    .expect("seed ci_job_spec log route (resume_async's job_queue join target)");
+}
+
 fn admin_scope() -> TenantScope {
     TenantScope::from_verified_token(
         &Principal::stub(
@@ -1047,6 +1086,7 @@ async fn production_sink_and_edge_resume_exactly_after_both_services_are_severed
     let app = pool(&app_url(), &schema).await;
     insert_run(&app, RUN, "alpha", "2026-07-24T13:00:00Z").await;
     insert_job_and_segments(&app, RUN, JOB, &[]).await;
+    seed_log_route(&admin, TENANT, REGION, JOB, RUN).await;
 
     let blobs = S3BlobStore::connect(&MyelinConfig::dev().s3, tokio::runtime::Handle::current());
     let edge_blobs: Arc<dyn BlobStore + Send + Sync> = Arc::new(blobs.clone());

@@ -23,7 +23,7 @@
 //!    at-or-under the measured crossover (so a materialised list is genuinely the cheaper plan), and
 //!    a list AT the cap returns `Ids` while one OVER it returns `Filter`.
 //! 2. **The `reverse_index_lag` freshness SLO** (`authz_index.reverse_index_lag_slo_ms`). Under a
-//!    surge of `iam.tuple_written` events, the lag from event-accept to S8 projection is measured;
+//!    surge of `identity.tuple.written` events, the lag from event-accept to S8 projection is measured;
 //!    the SLO is the bound a zookie-stamped scan tolerates before it must fall back to `check`. The
 //!    drill proves a scan whose required revision is WITHIN the SLO of the watermark serves from S8
 //!    (the fast JOIN path), and a scan one revision BEYOND the watermark falls back to per-row
@@ -315,7 +315,7 @@ fn id32_cardinality_cap_finalised_at_measured_crossover() {
 
 /// **The `reverse_index_lag` freshness-SLO MEASUREMENT (the SCHED tunable-measurement scenario).**
 ///
-/// Under a world-scale surge of `iam.tuple_written` events, the lag from event-accept to S8
+/// Under a world-scale surge of `identity.tuple.written` events, the lag from event-accept to S8
 /// projection is measured (the [`ReverseIndexConsumer`] lag instrumentation — 0 in steady state on
 /// the synchronous apply path; the projection keeps up under the surge). The SLO is the freshness
 /// bound a zookie-stamped scan tolerates before it must fall back to `check`. The drill proves the
@@ -347,7 +347,7 @@ fn id32_reverse_index_lag_slo_finalised_and_fallback_honoured() {
     let index = ReverseIndex::new();
     let consumer = ReverseIndexConsumer::new(index.clone());
 
-    // Drive a world-scale surge of writes (each emits one `iam.tuple_written`) and MEASURE the lag
+    // Drive a world-scale surge of writes (each emits one `identity.tuple.written`) and MEASURE the lag
     // from accept-to-project across the whole surge. The synchronous apply keeps lag at 0 in steady
     // state; the measurement proves the projection keeps up at the surge multiplier (the lag never
     // grows unbounded — the SLO is achievable).

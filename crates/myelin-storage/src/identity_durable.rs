@@ -248,7 +248,7 @@ impl DurableTupleBacking {
         DurableTupleBacking { provider }
     }
 
-    /// **Apply a batch of edge deltas AND co-commit the `iam.tuple_written` outbox row in ONE
+    /// **Apply a batch of edge deltas AND co-commit the `identity.tuple.written` outbox row in ONE
     /// tenant-scoped transaction (BUS-2 emit-iff-committed, made EXACT for the durable S3 spine —
     /// MR-009b W3b.3).** The tuple INSERT/DELETEs and the outbox-row insert
     /// ([`PgRelay::co_commit_in_tx`], the one sanctioned outbox-write site) run in the SAME open
@@ -305,7 +305,7 @@ impl DurableTupleBacking {
                             }
                         }
                     }
-                    // The iam.tuple_written outbox row, in the SAME transaction as the tuple deltas
+                    // The identity.tuple.written outbox row, in the SAME transaction as the tuple deltas
                     // above — both commit or both roll back (emit-iff-committed). The relay owns the
                     // outbox table, so the INSERT lives in PgRelay (the one lint-excluded outbox-write
                     // site), never hand-rolled here.

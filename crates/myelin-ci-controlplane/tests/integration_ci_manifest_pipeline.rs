@@ -9,13 +9,13 @@ use std::sync::Arc;
 
 use myelin_ci_controlplane::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, decode_resolved_ci_manifest,
-    register_durable_ci_manifest_pipeline, run_ci_manifest_pipeline, CiExecutionProfileV1,
-    CiExecutionRequestV1, CiJobLaunchGrantV1, CiJobSpecStore, CiLaunchAuthorityError,
-    CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1, CiManifestDurableJobRunner,
-    CiManifestInputResolver, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
-    CiRunFinalization, CiRunFinalizationOutcome, CiRunFinalizationWrite, CiRunFinalizer,
-    CiRunStoreError, CiWorkflowDefinitionPin, PgCiPipelineStarter, PreparedRunPlanV2,
-    ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
+    register_durable_ci_manifest_pipeline, run_ci_manifest_pipeline, BUMP_CHECK_ATTEMPT_SQL,
+    CiExecutionProfileV1, CiExecutionRequestV1, CiJobLaunchGrantV1, CiJobSpecStore,
+    CiLaunchAuthorityError, CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1,
+    CiManifestDurableJobRunner, CiManifestInputResolver, CiManifestLaneV1, CiManifestLimitsV1,
+    CiManifestSchedulingV1, CiRunFinalization, CiRunFinalizationOutcome, CiRunFinalizationWrite,
+    CiRunFinalizer, CiRunStoreError, CiWorkflowDefinitionPin, PgCiPipelineStarter,
+    PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
 };
 use futures::FutureExt;
 use myelin_ci_sandbox::TrustTier;
@@ -191,6 +191,46 @@ fn definition() -> CiWorkflowDefinitionPin {
     CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap()
 }
 
+/// Seed `ci_run_check_attempt` for every manifest check context, mirroring the allocation
+/// `CiRunStore::co_commit_reserve` performs at real dispatch/reserve time (see
+/// `ci_run_store::allocate_reserve_check_attempts`). Production `PgCiPipelineStarter::run_once`
+/// only ever READS this table (`pg_pipeline_starter::load_reserved_check_attempts`) — it never
+/// allocates it itself, by design, because the runtime role has no `UPDATE` grant on the table and
+/// the allocation is meant to happen exactly once, at dispatch reserve time, before the run is even
+/// queued. This test drives `ci_run` into existence with a raw `INSERT` instead of going through the
+/// dispatch consumer's `co_commit_reserve`, so it must perform this same reservation itself or the
+/// starter correctly refuses to fabricate a manifest with no run-scoped attempt authority.
+async fn reserve_test_check_attempts(pool: &PgPool, run_id: &str, repo_ref: &str, commit_oid: &str) {
+    let run_id = sqlx::types::Uuid::parse_str(run_id).expect("test run UUID");
+    for context in ["build", "package", "test"] {
+        let attempt: i32 = sqlx::query_scalar(BUMP_CHECK_ATTEMPT_SQL)
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(repo_ref)
+            .bind(commit_oid)
+            .bind(context)
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .expect("allocate test check attempt");
+        sqlx::query(
+            "INSERT INTO ci_run_check_attempt \
+             (tenant_id,region,run_id,repo_ref,commit_oid,context,run_attempt) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(run_id)
+        .bind(repo_ref)
+        .bind(commit_oid)
+        .bind(context)
+        .bind(attempt)
+        .execute(pool)
+        .await
+        .expect("persist test run-scoped check attempt");
+    }
+}
+
 fn worker(pool: &PgPool, name: &str) -> PgFlowWorker {
     let scope = PgWorkerScope::new(
         TenantId(TENANT.into()),
@@ -343,6 +383,13 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
     .execute(&pool)
     .await
     .unwrap();
+    reserve_test_check_attempts(
+        &pool,
+        CI_RUN_ID,
+        "myelin://manifest_dag/git/repo/core",
+        "deadbeef",
+    )
+    .await;
     let starter = PgCiPipelineStarter::new_with_authority(
         pool.clone(),
         tokio::runtime::Handle::current(),

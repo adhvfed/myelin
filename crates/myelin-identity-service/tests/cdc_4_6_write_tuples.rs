@@ -6,7 +6,7 @@
 //! that the two sides of the `write_tuples` seam cannot drift apart:
 //!
 //! - the **PROVIDER** ([`TupleStore::write_tuples`]) atomically applies the tuple deltas, advances
-//!   the zookie, and emits `iam.tuple_written` **via the outbox** (the only emit path) carrying the
+//!   the zookie, and emits `identity.tuple.written` **via the outbox** (the only emit path) carrying the
 //!   write's zookie as the S8 watermark — and it returns that zookie to the caller;
 //! - the **CONSUMER** (a role-compile caller — the org→team→project hierarchy compiler that turns a
 //!   role grant into tuple deltas) hands the deltas to `write_tuples` and **stamps the returned
@@ -16,11 +16,11 @@
 //! The provider's promise (the zookie advances monotonically and is carried on the emitted event)
 //! and the consumer's promise (the returned zookie is the object's stamp, readable back) are pinned
 //! here so a change to either side fails this test in the same CI job. The S8 *reverse-index*
-//! consumer of `iam.tuple_written` (the read-half watermark) lands in P-ID-11/P-ID-12; this pair is
+//! consumer of `identity.tuple.written` (the read-half watermark) lands in P-ID-11/P-ID-12; this pair is
 //! the write-side CDC the prompt requires.
 
 use myelin_events::{BusTransport, InProcessBus, OutboxStore, Relay, Timestamp};
-use myelin_identity::iam_events::IAM_TUPLE_WRITTEN;
+use myelin_identity::iam_events::IDENTITY_TUPLE_WRITTEN;
 use myelin_identity::{
     ObjectId, PrincipalId, PrincipalKind, RelName, RelationTuple, TupleDelta, Zookie,
 };
@@ -60,7 +60,7 @@ fn consumer_compiles_role_grant(object: &str, relation: &str, subject: &str) -> 
 
 /// **The 4.6 provider+consumer CDC pair.** The consumer compiles a role grant into deltas, the
 /// provider `write_tuples` applies them atomically + returns the advanced zookie + emits
-/// `iam.tuple_written` via the outbox, and the consumer stamps + reads back exactly that zookie.
+/// `identity.tuple.written` via the outbox, and the consumer stamps + reads back exactly that zookie.
 #[test]
 fn cdc_4_6_write_tuples_provider_emits_consumer_stamps_zookie() {
     let outbox = OutboxStore::new();
@@ -70,7 +70,7 @@ fn cdc_4_6_write_tuples_provider_emits_consumer_stamps_zookie() {
     // CONSUMER compiles the grant → deltas.
     let deltas = consumer_compiles_role_grant("org:acme", "member", "p:alice");
 
-    // PROVIDER write_tuples: atomic apply → advanced zookie → iam.tuple_written via the outbox.
+    // PROVIDER write_tuples: atomic apply → advanced zookie → identity.tuple.written via the outbox.
     let zookie: Zookie = provider
         .write_tuples(
             &s,
@@ -90,7 +90,7 @@ fn cdc_4_6_write_tuples_provider_emits_consumer_stamps_zookie() {
         "the consumer stamps + reads back exactly the provider's zookie"
     );
 
-    // The provider emitted exactly one iam.tuple_written via the OUTBOX (no other emit path). The
+    // The provider emitted exactly one identity.tuple.written via the OUTBOX (no other emit path). The
     // relay (what `serve` runs) publishes it; the event carries the write's zookie for S8.
     assert_eq!(
         outbox.outbox_depth(),
@@ -106,11 +106,11 @@ fn cdc_4_6_write_tuples_provider_emits_consumer_stamps_zookie() {
         1,
         "the relay published exactly the one event"
     );
-    assert_eq!(published[0].type_.0, IAM_TUPLE_WRITTEN);
+    assert_eq!(published[0].type_.0, IDENTITY_TUPLE_WRITTEN);
     assert_eq!(
         published[0].payload["zookie"],
         serde_json::json!(zookie.0),
-        "the emitted iam.tuple_written carries the write's zookie (the S8 watermark)"
+        "the emitted identity.tuple.written carries the write's zookie (the S8 watermark)"
     );
 }
 

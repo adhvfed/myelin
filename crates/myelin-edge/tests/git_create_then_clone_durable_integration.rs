@@ -62,7 +62,7 @@ fn uniq() -> String {
 }
 
 /// A per-store-UNIQUE, lexically-monotonic id minter for the durable bootstrap tuple store. The
-/// default `MonotonicMinter` resets to `0` per store, so a co-committed `iam.tuple_written` could mint
+/// default `MonotonicMinter` resets to `0` per store, so a co-committed `identity.tuple.written` could mint
 /// an `event_id` the global `outbox` `UNIQUE(event_id)` collapses when suites share the live DB. This
 /// double reproduces the production ULID uniqueness via a per-store `base`.
 struct UniqueMinter {
@@ -115,7 +115,7 @@ fn principal(id: &str, tenant: &str, region: &str) -> Principal {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_bootstrap_grant_admits_creator_via_a_separate_check_store() {
     // ── Migrate as the admin role: the reused `rebac_tuple` edge set + RLS, plus the foundation
-    //    `outbox` the tuple write co-commits its `iam.tuple_written` into. ──
+    //    `outbox` the tuple write co-commits its `identity.tuple.written` into. ──
     let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
         Ok(p) => p,
         Err(_) => {
@@ -212,7 +212,7 @@ async fn durable_bootstrap_grant_admits_creator_via_a_separate_check_store() {
         .execute(admin.db_pool())
         .await;
     let _ = sqlx::query("DELETE FROM outbox WHERE aggregate LIKE $1")
-        .bind(format!("iam:tuple:{tenant}:%"))
+        .bind(format!("identity:tuple:{tenant}:%"))
         .execute(admin.db_pool())
         .await;
     println!(

@@ -908,7 +908,7 @@ impl RunTokenMinter {
                 subject: agent_id.clone(),
                 caveat: None,
             });
-            // The grant tuple co-commits with its iam.tuple_written emit; expires_at == run life.
+            // The grant tuple co-commits with its identity.tuple.written emit; expires_at == run life.
             let _ = tuples.write_tuples(
                 scope,
                 agent,

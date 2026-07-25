@@ -190,8 +190,10 @@
 //! contract-coverage manifest flips 2.9 `deferred → covered` naming it. **FLOOR named (EI-01 §1):**
 //! the per-subsystem dotted-name LIST completion is **EB-24** (each subsystem owns its full list in
 //! M3/M4, validated against THIS grammar); EB-02 is the grammar + seed + the new tokens only. The
-//! `iam.*` family Identity already ships (`myelin-identity::iam_events`) is Identity's OWN §11.2
-//! token set (distinct from the §6.4 `identity.*` Bus seed); both obey this grammar.
+//! token set Identity already ships (`myelin-identity::iam_events`) uses the SAME canonical
+//! `identity.*` §6.2 subsystem prefix as the §6.4 Bus seed (corrected from an earlier `iam.*`
+//! naming this grammar never admitted — see `taxonomy`'s module doc and
+//! `taxonomy::tests::identity_tuple_written_and_siblings_are_admitted_by_the_grammar`).
 //!
 //! ## Status (P-091 / EB-14, 2026-06-19) — the cross-cell bridge FRAME pinned from the Bus side
 //! EB-14 ("Pin the cross-cell bridge FRAME — `CrossCellPointer`, designed-not-built") is the

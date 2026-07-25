@@ -677,7 +677,7 @@ mod tests {
         let region = principal.region.clone();
         EventEnvelope {
             event_id: EventId(id.into()),
-            type_: EventType("iam.tuple_written".into()),
+            type_: EventType("identity.tuple.written".into()),
             schema_ver: 1,
             tenant: TenantId(tenant.into()),
             region,

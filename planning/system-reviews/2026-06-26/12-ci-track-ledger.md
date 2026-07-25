@@ -596,3 +596,82 @@ all fully green except the one pre-existing `myelin-edge` failure and one confir
 `myelin-storage` flake (passed cleanly on a clean full-file rerun), `myelin-mcp` green except the
 documented `iam`-taxonomy symptom, and `cargo clippy --workspace --all-targets --features integration
 -- -D warnings` clean across the entire workspace.
+
+**2026-07-25: closing out the four remaining known issues from the investigation above, one agent at
+a time (sequential, not parallel — running multiple agents against this repo's one shared, live
+Postgres was itself found to compound the exact contamination class the investigation above spent
+hours fixing).**
+
+1. **The `boot_time_sigterm_is_latched...` test/historical-data tension — fixed by narrowing the
+   test's query, not touching the preserved row.** `production_pg_bootstrap_source.rs`'s "zero
+   pre-existing active work" precondition now excludes exactly
+   `(tenant_id, run_id) = ('myelin', '5db61d81-6aea-7dd9-b3f1-035abcf56b26')` — the R4.2 negative-
+   evidence row this ledger already says must be preserved — from the `ci_run` active-work count only
+   (never from `job_queue`). The row itself is untouched.
+2. **The `pg_pipeline_starter.rs` allocation-ledger bug — confirmed as a test-fixture gap, not a
+   production bug.** `integration_ci_manifest_pipeline.rs`'s `starter_manifest_drives_dag_...` test
+   never seeded `ci_run_check_attempt` rows for the `build`/`package`/`test` contexts it exercises
+   (only `allocate_reserve_check_attempts`'s own contexts were seeded). Fixed with a
+   `reserve_test_check_attempts()` fixture helper mirroring the existing seeding pattern; no
+   production code changed.
+3. **`myelin-edge`'s pre-existing Postgres resume-error test — fixed with a regression-proof
+   fixture gap, not a production bug.** `integration_ci_http_surface.rs`'s
+   `production_sink_and_edge_resume_exactly_after_both_services_are_severed` failed with "resolve
+   canonical CI log run: no rows returned" because the test never seeded the `job_queue`/`ci_job_spec`
+   rows its own log-resume path needs. Fixed with a `seed_log_route` helper (same shape as
+   `integration_ci_ct004f_durable_log_persist.rs`'s existing one).
+4. **The `iam`/`identity` taxonomy gap — a real cross-crate contract bug, fixed with a rename +
+   regression test, reviewed by Sol (gpt-5.6-sol).** `myelin-identity::iam_events` minted its three
+   event tokens with an `iam.` subsystem prefix; `myelin-events::taxonomy::SUBSYSTEM_TOKENS` has
+   NEVER admitted `iam` (deliberately — `identity` is already the canonical §6.2 token for this exact
+   subsystem, since the crate IS `myelin-identity`). Every real `iam.tuple.written` /
+   `iam.role.granted` / `iam.break_glass.invoked` row the elected outbox relay processed hit
+   `UnknownSubsystem` and was quarantined — permanently, since `outbox_quarantine` has `ON DELETE
+   RESTRICT` back to `outbox` and the relay itself has no remediation path. Fixed by renaming the
+   tokens (and the URN/`AggregateKey` segments, `iam:tuple:…` → `identity:tuple:…`) to the
+   already-canonical `identity.*` prefix across 27 files in 7 crates — NOT by admitting `iam` as a
+   second subsystem token, which would just re-admit the bug under a different grammar rule. Added a
+   grammar regression test (`identity_tuple_written_and_siblings_are_admitted_by_the_grammar`) that
+   iterates the REAL `myelin_identity::iam_events::IDENTITY_EVENT_TOKENS` table through `validate()`
+   (not copy-pasted literals, per Sol's review — a copy would silently drift from what the crate
+   actually emits) and separately proves the old `iam.tuple.written` spelling still correctly fails.
+   Sol's review confirmed the rename direction and the module-doc/debug_assert polish; it also
+   confirmed, unprompted, the deliberate choice to keep the `iam_events` module name and
+   `IamEventProjection`/`IamSubjectRef` types as-is (IAM is a reasonable domain term for the
+   Rust-level API; `identity` is the canonical wire-level namespace — renaming the types would be
+   cosmetic churn, not a contract fix).
+   **Production remediation, not just prevention:** this bug had already quarantined 19 real
+   `iam:tuple:*` rows on this host between 2026-07-24 and 2026-07-25 (their envelope bodies were
+   still intact — quarantine fences a row, it doesn't destroy it). Checked whether this represented a
+   live authz gap before touching anything: `TupleStore::write_tuples` (the only real emit path for
+   this token) is still `AuthzError::NotYetImplemented` in production — so these 19 rows are all
+   pre-M1 bootstrap/dogfood noise, not customer-facing state. Per explicit confirmation that this host
+   has no production tenant yet ("Myelin does not have a prod. 0 risk."), deleted all 19
+   `invalid_event_taxonomy` / `iam:tuple:*` quarantine rows directly; the 2 unrelated
+   `invalid_event_taxonomy` rows (a different, `issue:`-aggregate cause) were left untouched.
+
+**A fifth issue surfaced while re-verifying #4, genuinely separate and NOT yet fixed:**
+`myelin-mcp/tests/git_effect_governed.rs::response_lost_retry_is_exactly_once_for_open_review_and_events`
+still fails post-fix — but now with `wrong_relay_region`, not `invalid_event_taxonomy`, confirming
+the taxonomy fix above is real and complete. The new failure is a test-isolation gap: this test's
+events are tagged `region="eu-west"`, but they're inserted into the SAME shared `outbox` table this
+host's real, long-running `myelin-outbox-publisher serve` process (PID 3577784, running since
+2026-07-24 — the founder's actual dogfood relay) polls continuously. That live process claims the
+test's rows before the test's own cleanup can, sees the region disagree with its own cell's region,
+and quarantines them — so the test's own `DELETE FROM outbox` then hits the `ON DELETE RESTRICT` FK.
+Nothing in the test suite currently stops the live dogfood relay from racing test-inserted rows in
+the shared outbox table. Not fixed today: this predates today's batch, is unrelated to the taxonomy
+bug, and touches how test runs and the real persistent relay process share (or should not share)
+the same table — a scope decision, not a quick fix, and one that shouldn't be made unilaterally
+against a live process a human depends on. Flagged for a dedicated follow-up.
+
+Full re-verification of this batch: `cargo build --workspace --locked` clean; `cargo clippy
+--workspace --all-targets --features integration -- -D warnings` clean; unit tests (`--lib`) green
+across all 7 touched crates (myelin-events 205, myelin-identity 16, myelin-identity-service 387,
+myelin-gdpr-service 333, myelin-storage 470, myelin-edge 217, myelin-chat 305); integration suites
+for myelin-identity-service/myelin-gdpr-service/myelin-chat/myelin-edge fully green;
+myelin-ci-controlplane green (false-bug + allocation-ledger fixes both hold); the one
+`myelin-storage` outbox-relay count flake reconfirmed transient (0 unsent rows, clean on rerun,
+unrelated to this batch — `relay_once` sweeping unrelated concurrent rows, a pre-existing
+sensitivity, not introduced here). The fifth issue above (`wrong_relay_region`) is the only known
+open item after this batch.

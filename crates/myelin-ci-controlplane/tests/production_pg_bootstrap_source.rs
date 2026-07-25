@@ -522,6 +522,19 @@ async fn boot_time_sigterm_is_latched_before_the_real_runner_host_can_claim() {
             .unwrap()
             .as_nanos()
     );
+    // One exact row in `public.ci_run` is a deliberately preserved, permanent exception to
+    // "zero pre-existing active work": tenant_id = 'myelin', run_id =
+    // '5db61d81-6aea-7dd9-b3f1-035abcf56b26', state = 'running'. It was intentionally left
+    // running/unsettled as permanent historical negative evidence by the R4.2
+    // publisher-capability-reconciliation investigation (see
+    // planning/system-reviews/2026-06-26/12-ci-track-ledger.md, ledger entry CT-005f8a and the
+    // "Honest remaining floor" note below it) and must never be relabelled, deleted, or counted.
+    // This is a single named `(tenant_id, run_id)` pair, not a blanket tenant carve-out: any OTHER
+    // active row (including any other row for tenant `myelin`, or any row in `job_queue`) still
+    // fails this precondition as unexpected leftover work.
+    const PRESERVED_NEGATIVE_EVIDENCE_TENANT_ID: &str = "myelin";
+    const PRESERVED_NEGATIVE_EVIDENCE_RUN_ID: &str = "5db61d81-6aea-7dd9-b3f1-035abcf56b26";
+
     let mut job_queue_exists = false;
     for table in ["ci_run", "job_queue"] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
@@ -533,14 +546,28 @@ async fn boot_time_sigterm_is_latched_before_the_real_runner_host_can_claim() {
             job_queue_exists = exists;
         }
         if exists {
-            let active: i64 =
+            let active: i64 = if table == "ci_run" {
+                sqlx::query_scalar(
+                    "SELECT count(*) FROM public.ci_run \
+                     WHERE state IN ('queued', 'leased', 'running') \
+                       AND NOT (tenant_id = $1 AND run_id = $2::uuid)",
+                )
+                .bind(PRESERVED_NEGATIVE_EVIDENCE_TENANT_ID)
+                .bind(PRESERVED_NEGATIVE_EVIDENCE_RUN_ID)
+                .fetch_one(&admin)
+                .await
+                .expect("count active public CI rows, excluding the one preserved historical exception")
+            } else {
                 sqlx::query_scalar(&format!("SELECT count(*) FROM public.{table} WHERE state IN ('queued', 'leased', 'running')"))
                     .fetch_one(&admin)
                     .await
-                    .expect("count active public CI rows");
+                    .expect("count active public CI rows")
+            };
             assert_eq!(
                 active, 0,
-                "the production-root smoke test refuses to execute pre-existing active work"
+                "the production-root smoke test refuses to execute pre-existing active work \
+                 (excluding the one named, permanently-preserved historical negative-evidence \
+                 row tenant_id='myelin'/run_id='5db61d81-6aea-7dd9-b3f1-035abcf56b26' in ci_run)"
             );
         }
     }

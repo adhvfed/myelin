@@ -178,7 +178,7 @@ impl EDiscoveryScope {
 pub struct EDiscoveryRecord {
     /// The audit entry's per-tenant sequence (the Merkle leaf index — the proof is over this leaf).
     pub seq: u64,
-    /// The minimised action token (`iam.tuple_written`, `agent.effect_applied`, … — never a payload).
+    /// The minimised action token (`identity.tuple.written`, `agent.effect_applied`, … — never a payload).
     pub action: String,
     /// The action's subject reference (an opaque id, never content — §6.2).
     pub subject: ArtifactRef,
@@ -417,7 +417,7 @@ mod tests {
         let region = principal.region.clone();
         EventEnvelope {
             event_id: EventId(id.into()),
-            type_: EventType("iam.tuple_written".into()),
+            type_: EventType("identity.tuple.written".into()),
             schema_ver: 1,
             tenant: TenantId(tenant.into()),
             region,

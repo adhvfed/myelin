@@ -8,7 +8,7 @@
 //! The contract-coverage scanner (P-S21) reads BOTH halves of the pair from this file:
 //! - **provider** = an action-taking service emitting an action event via the **outbox** (the
 //!   one sanctioned emit path — no service writes the audit log directly; coverage is a bus
-//!   property). Here a minimal `iam.tuple_written`-shaped emitter stands in for any
+//!   property). Here a minimal `identity.tuple.written`-shaped emitter stands in for any
 //!   action-taking subsystem;
 //! - **consumer** = `myelin_gdpr_service::AuditConsumer`, the infra subscription on the outbox
 //!   that appends each delivered action as one minimised, causality-carried, hash-chained,
@@ -30,7 +30,7 @@ use myelin_tenancy::TenantId;
 use std::sync::Arc;
 
 /// The dotted action token the provider emits (an action-bearing event — any human/agent action).
-const IAM_TUPLE_WRITTEN: &str = "iam.tuple_written";
+const IDENTITY_TUPLE_WRITTEN: &str = "identity.tuple.written";
 
 /// **The provider side (10.6): an action-taking service emits an action event via the outbox.**
 /// This is the ONLY way an action reaches the audit log — there is no direct-write path. The
@@ -52,9 +52,9 @@ fn provider_emits_action(actor: Principal, subject: &str) -> OutboxStore {
     let mut tx = outbox.begin(minter, ctx_base);
     // The action carries a NAME-shaped payload deliberately — the audit entry must never read it.
     let draft = EventDraft {
-        type_: EventType(IAM_TUPLE_WRITTEN.into()),
+        type_: EventType(IDENTITY_TUPLE_WRITTEN.into()),
         subject: ArtifactRef(subject.into()),
-        aggregate: AggregateKey("iam:acme".into()),
+        aggregate: AggregateKey("identity:acme".into()),
         payload: serde_json::json!({ "real_name": "Alice Example", "email": "alice@example.test" }),
         data_role: DataRole::Controller,
         visibility: Visibility::Internal,
@@ -80,7 +80,7 @@ fn cdc_10_6_provider_emits_via_outbox_consumer_appends_minimised_hash_chained_en
     );
 
     // PROVIDER: the action-taking service emits via the outbox (the one emit path).
-    let outbox = provider_emits_action(actor, "myelin://acme/iam/tuple/t1");
+    let outbox = provider_emits_action(actor, "myelin://acme/identity/tuple/t1");
     assert_eq!(
         outbox.outbox_depth(),
         1,
@@ -97,7 +97,7 @@ fn cdc_10_6_provider_emits_via_outbox_consumer_appends_minimised_hash_chained_en
         1,
         "the relay published exactly the one action event"
     );
-    assert_eq!(published[0].type_.0, IAM_TUPLE_WRITTEN);
+    assert_eq!(published[0].type_.0, IDENTITY_TUPLE_WRITTEN);
 
     // CONSUMER: the audit consumer (the outbox subscription) appends the delivered action.
     let audit = AuditConsumer::new();
@@ -124,8 +124,8 @@ fn cdc_10_6_provider_emits_via_outbox_consumer_appends_minimised_hash_chained_en
     );
     assert_eq!(e.actor.actor_kind, "human");
     // The action is the dotted type token; the subject is an ArtifactRef (an id), never content.
-    assert_eq!(e.action, IAM_TUPLE_WRITTEN);
-    assert_eq!(e.subject, ArtifactRef("myelin://acme/iam/tuple/t1".into()));
+    assert_eq!(e.action, IDENTITY_TUPLE_WRITTEN);
+    assert_eq!(e.subject, ArtifactRef("myelin://acme/identity/tuple/t1".into()));
     // Hash-chain link + Merkle leaf both present (the construction the proofs prove over).
     assert!(
         e.prev_hash.starts_with("blake3:"),

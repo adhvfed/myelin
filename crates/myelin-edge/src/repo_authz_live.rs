@@ -61,7 +61,7 @@
 //! fresh repo would be unreachable BY ITS OWN CREATOR (no `admin`/`writer`/`reader` edge exists).
 //! [`TupleRepoBootstrap`] closes the gap: on repo-create through the edge the creator gets
 //! **`repo:<slug>#admin@<principal_id>`** through the ordinary [`TupleStore::write_tuples`] path
-//! (4.6 — the tuple + its `iam.tuple_written` event co-commit atomically). `admin` is the frozen
+//! (4.6 — the tuple + its `identity.tuple.written` event co-commit atomically). `admin` is the frozen
 //! fragment's strongest repo relation: it satisfies `pull`, `push`, `administer`, AND
 //! `protected_push`, so the creator can immediately clone/push/administer.
 //!
@@ -313,7 +313,7 @@ impl RepoBootstrapGrants for NoRepoBootstrap {
 }
 
 /// **The production bootstrap: `repo:<slug>#admin@<creator>` through [`TupleStore::write_tuples`]
-/// (contract 4.6).** The tuple + its `iam.tuple_written` event co-commit atomically (the S3 store's
+/// (contract 4.6).** The tuple + its `identity.tuple.written` event co-commit atomically (the S3 store's
 /// own transaction); the scope/actor are the VERIFIED creator's (tenant-from-token). Must be handed
 /// the SAME tuple store the [`CheckBackedRepoAuthorizer`]'s engine reads (one edge set — the write
 /// is visible to the very next check).
