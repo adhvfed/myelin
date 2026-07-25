@@ -67,6 +67,38 @@ fn temp_root(tag: &str) -> PathBuf {
     p
 }
 
+/// Delete every `outbox` row for `tenant` (and any `outbox_quarantine` row referencing one),
+/// tolerating the SAME documented shared-host race `myelin-storage`'s
+/// `tests/common::delete_outbox_for_aggregate` already covers: this dev DB's `outbox`/
+/// `outbox_quarantine` tables are shared with the real, live founder dogfood outbox-publisher
+/// process, which can claim and quarantine one of this tenant's own event_ids (real reason
+/// observed on this host: `wrong_relay_region` — this test's `REGION` differs from the live
+/// relay's own configured region) in the narrow gap between our own claim and cleanup. A single
+/// delete-quarantine-then-delete-outbox pass can lose that race; retrying a bounded number of
+/// times closes the window without pretending to fully serialize against an independent,
+/// concurrently-running production process (a bigger, separate concern than this test's own
+/// cleanup — same reasoning `myelin-storage`'s helper documents).
+async fn delete_outbox_for_tenant(pool: &sqlx::PgPool, tenant: &str) {
+    for _ in 0..5 {
+        let _ = sqlx::query(
+            "DELETE FROM outbox_quarantine WHERE event_id IN \
+             (SELECT event_id FROM outbox WHERE envelope->>'tenant'=$1)",
+        )
+        .bind(tenant)
+        .execute(pool)
+        .await;
+        if sqlx::query("DELETE FROM outbox WHERE envelope->>'tenant'=$1")
+            .bind(tenant)
+            .execute(pool)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+    panic!("delete_outbox_for_tenant: FK-blocked by outbox_quarantine after 5 retries for tenant {tenant}");
+}
+
 fn agent_principal(id: &str) -> Principal {
     agent_principal_in(id, TENANT, REGION)
 }
@@ -963,11 +995,7 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
         "an active local entry with non-Active canonical placement fails boot loud"
     );
 
-    sqlx::query("DELETE FROM outbox WHERE envelope->>'tenant'=$1")
-        .bind(&live_tenant)
-        .execute(&admin)
-        .await
-        .unwrap();
+    delete_outbox_for_tenant(&admin, &live_tenant).await;
     for table in ["git_pr_command", "git_pr", "git_pr_counter"] {
         for repo_slug in [&slug, &other_slug] {
             sqlx::query(&format!(
