@@ -932,7 +932,7 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
             cell_id: cell_id.clone(),
             region: REGION.into(),
             status: "Active".into(),
-            isolation_kind: "Shared".into(),
+            isolation_kind: "Pool".into(),
             tenants_max: 100,
             write_qps_max: 1000,
             storage_bytes_max: 1_000_000,
@@ -947,7 +947,7 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
             tenant_id: live_tenant.clone(),
             region: REGION.into(),
             home_cell: cell_id.clone(),
-            isolation_tier: "Shared".into(),
+            isolation_tier: "Pool".into(),
             slug: format!("tenant-{suffix}"),
             status: "Active".into(),
             member_cells: vec![cell_id.clone()],
@@ -958,7 +958,7 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
         .upsert_local_tenant(&DurableLocalTenantRow {
             cell_id: cell_id.clone(),
             tenant_id: live_tenant.clone(),
-            isolation_tier: "Shared".into(),
+            isolation_tier: "Pool".into(),
             active: true,
         })
         .await
