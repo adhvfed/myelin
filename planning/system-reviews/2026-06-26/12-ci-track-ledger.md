@@ -697,3 +697,89 @@ then `outbox`, retrying up to 5 times) into this test. Verified: the target test
 `myelin-mcp` integration suite (21+5+1+5+2+21+1+1+1 = all green) passes, `cargo clippy -p
 myelin-mcp --all-targets --features integration -- -D warnings` clean. This closes the last open
 item from the 2026-07-25 flaky-test investigation.
+
+**2026-07-26: production-readiness push begins (`/goal` set: "bring Myelin as far as you can
+towards production readiness").** Assessed the release-track ledger (14): R0/R1/R2/R3 all
+CONFIRMED DONE and verified; R4 is the live edge — the founder's own dogfood push/PR/CI cycle has
+already run real end-to-end, hosted PR #1 is open (merge is explicitly the founder's own act, not
+mine), and the one substantive engineering gate still open is CT-007 (cut CI over from GitHub
+Actions) — 11 of 12 GitHub-job rows in `ci-workload-inventory.toml` are still `not-started`, and
+even the furthest-along (`build-test-clippy`) is only `capability-smoke`. Resumed the pending
+vertical-slice-step-2 design (writable/disk-backed workspace storage) with Sol.
+
+**Sol's step-2 design (concrete, opinionated):** primary mechanism is a per-job **Btrfs subvolume +
+hard qgroup quota**, bind-mounted writable at `/workspace` (this host's `/` is confirmed Btrfs) —
+fits gVisor's OCI-bind-mount model directly, gives fast deterministic per-job deletion; fail the
+runner startup check loud if Btrfs/qgroup support is unavailable, never silently fall back to an
+unbounded directory (a loop-mounted sparse file is the portability fallback, not the primary
+design). Rejected overlayfs (no meaningful lower layer for cargo scratch; gVisor's own `overlay2`
+facility risks making read-only inputs writable if misapplied). Found a real prerequisite gap:
+`runsc --rootless` only maps the caller to container UID 0, it cannot map UID 65534 to a writable
+host identity — the fix is an explicit multi-ID OCI user namespace (`newuidmap`/`newgidmap`), not
+the single-UID `--rootless` shortcut, with the per-job subvolume `chown`'d to the mapped host IDs;
+this becomes part of the hardened host surface and re-runs the production escape corpus. Cargo
+dependencies: a SEPARATE read-only EROFS asset (`cargo vendor --locked --versioned-dirs` baked into
+an immutable, digest-pinned artifact keyed by `Cargo.lock`'s own hash), not baked into the
+`linux-rust-v1` toolchain rootfs — coupling the Rust toolchain to this repo's exact lockfile would
+force a full rootfs rebuild on every dependency bump and make the "reusable Rust capability" asset
+repository-specific. Drift enforced twice: a permanent lint pinning the current `Cargo.lock` hash
+to the asset row, and a runtime hash re-check after exact checkout, before the launch-permit CAS.
+`WorkspaceSpec` gains `storage: WorkspaceStorage` (`None | EphemeralDisk`) and `cargo_deps:
+Option<CargoDependencySet>`; host paths stay OUT of the public/serializable spec entirely (a new
+internal-only `PreparedWorkspace` guard carries them, mirroring the existing run-token-credential
+redaction discipline) — fixed mount destinations, no caller-supplied paths, ever. Launch ordering
+gains one stage (resolve assets → reserve disk capacity + create/quota workspace → exact checkout +
+lock/deps hash match → assert resolved mounts/quota) ahead of the existing launch-permit CAS, with
+a crash-safe cleanup guard and boot-time orphan-subvolume reconciliation (refuse new work if an
+orphan can't be removed — fail-closed on capacity, not fail-open).
+
+**Step 2a landed (commit `4c3f8a1f`):** the pure type/plumbing half of the above — `ResourceLimits`
+now carries `disk_bytes` (the disk-backed ephemeral-workspace quota Sol's design targets — still
+unwired, a later step) separately from the new `tmpfs_bytes` (the existing RAM-backed `/tmp`
+ceiling, rewired to read from the new field with byte-identical runtime behavior). No mount/quota
+logic yet. Full workspace build/test clean, both touched integration crates' suites green,
+`cargo clippy --workspace` and the integration-feature variant both clean. `firecracker.rs` has the
+identical tmpfs/disk conflation, scoped out of this prompt deliberately — flagged for the same fix
+in step 2b.
+
+**Three more dragons found and fixed while verifying this batch (none touch the actual step-2a
+diff's own correctness — found via the standing "never accept a non-mint test environment"
+discipline, same as 2026-07-25's investigation):**
+1. **3 stale test literals hardcoding the pre-hardening `git.ref.updated` aggregate/subject key
+   format** (`"<repo>:<ref>"` instead of the real, already-correctly-tested-elsewhere
+   `"ref:<encoded_repo>:<encoded_ref>"` `GitRefEventKey::aggregate`/`subject` actually produce) —
+   confirmed pre-existing and unrelated via `git stash` before touching anything. Fixed the two
+   simple literal mismatches directly; fixed the third (`drills_git_d1_hot_ref_burst.rs`) by
+   deriving the expected value from the real constructor instead of a second hand-rolled format
+   string, so it cannot drift the same way again (commit `af54940a`).
+2. **`myelin-control-plane` was missed entirely from 2026-07-25's 8-crate/22-file panic-safe-
+   cleanup sweep** — the identical bug (a bare `cleanup(...)` call only at the end of the happy
+   path, skipped by any earlier assertion panic). Confirmed live: 8 orphaned `cellself*`/`cellw*`
+   rows in `public.cell`, one old enough to make a later invocation's own unscoped single-cell
+   lookup pick up a stale prior run's row instead of its own fresh one
+   (`self_host_boots_on_pg_and_routing_survives_restart`). Fixed across both affected files (6 test
+   functions) with the same `with_cleanup(body, cleanup)` pattern already established in
+   `myelin-storage`; verified stable (0 growth) across repeated runs (commit `de481f62`).
+3. **A real cross-crate enum-contract bug, same class as the `iam`/`identity` taxonomy fix**:
+   `myelin-mcp`'s `git_effect_governed.rs` wrote `isolation_kind`/`isolation_tier: "Shared"` into
+   the durable `cell`/`tenant_placement`/`local_tenant` tables — `myelin-control-plane`'s own
+   `IsolationKind` enum has never had a `"Shared"` variant (only `Pool`/`Bridge`/`Dedicated`; `Pool`
+   is explicitly documented as "the shared-pool tier"). Every row this test ever wrote was silently
+   unparseable by `myelin-control-plane`'s own strict registry reader — invisible until that
+   crate's OWN test did a broad scan and hit its `corrupt_row_panic` on one of the 9 leftover rows.
+   Fixed by using the correct canonical spelling; cleaned up the 9 contaminated rows (commit
+   `924a01a9`).
+
+All three were confirmed pre-existing (via `git stash` or direct row inspection) before being
+touched — none were caused by the step-2a diff. Full re-verification after all four commits:
+`cargo build --workspace --locked` clean, `cargo test --workspace --locked` clean, `cargo test`
+with `--features integration` clean across `myelin-ci-sandbox`/`myelin-ci-controlplane`/
+`myelin-agent-service`/`myelin-edge`/`myelin-control-plane`/`myelin-git`/`myelin-mcp`, `cargo
+clippy --workspace --all-targets -- -D warnings` clean, integration-feature clippy clean.
+
+**Still open for CT-007:** step 2b (Btrfs subvolume+qgroup provisioning, the UID-namespace fix, the
+EROFS cargo-vendor asset pipeline, the launch-ordering insert, crash reconciliation) — the bulk of
+Sol's design, not yet built. `firecracker.rs`'s identical tmpfs/disk conflation (flagged, not
+fixed). 11 of 12 `ci-workload-inventory.toml` rows remain `not-started`; the other CI job families
+(frontend+Chromium+Valkey, web-container Docker-in-guest, integration multi-service stack, rustsec
+advisory-DB broker, pnpm) have no runner-asset design started at all yet.
