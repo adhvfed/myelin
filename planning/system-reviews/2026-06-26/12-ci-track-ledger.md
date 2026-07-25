@@ -322,7 +322,8 @@ The danger concentrates in CT-002/003 (untrusted execution + escape verification
 verifier that actively tries to escape the production sandbox; "0 escapes" is only credible THROUGH the prod
 path (CT-003's guard enforces that). CT-007 (the GitHub-Actions bill killer) is the reward, gated on CT-003.
 
-**CT-007 gate 1/4 closed (2026-07-25): committed workload inventory.** CT-005f8c's real founder
+**[SUPERSEDED BY THE CORRECTION FURTHER BELOW — gate 1 is NOT closed; only its inventory subgate
+is] CT-007 gate 1/4 closed (2026-07-25): committed workload inventory.** CT-005f8c's real founder
 acceptance act satisfied CT-007's one precondition, so CT-007 is now legitimately openable; this
 closes only its first of four cutover-floor gates, nothing more. `ci-workload-inventory.toml`
 (workspace root) now names all 12 currently-real GitHub jobs — the 9 in `ci.yml`
@@ -384,3 +385,59 @@ reachable by a direct test harness call, not by the real CI dispatch path). The 
 gate has not been re-proven under any mapped graph; no second ordinary commit has repeated anything
 without GitHub execution (gate 4). GitHub Actions remains fully in force and must not be disabled or
 removed before gate 4 lands.
+
+**Corrections from an independent peer-review round (2026-07-25; reviewer gpt-5.6-sol via a
+persistent Codex CLI session, not this repo's own MR/GT/CT builder/verifier pair).** The "gate 1/4
+closed" and "capability... covering the build-test-clippy job's need" framing above overclaimed.
+Corrected:
+
+- **Gate 1 is NOT closed.** The ledger's own literal gate-1 wording requires mapping every job to
+  "an executable Myelin job OR a mechanically gated non-CI owner." The committed inventory's
+  original free-text `owner` field named a future step number in prose that no test examined — a
+  plan, not an enforced mechanism. Only the inventory-and-honesty SUBGATE is real and enforced;
+  gate 1 itself stays open. `ci-workload-inventory.toml`'s `owner` field is replaced with structured,
+  test-enforced `migration_step`/`migration_state` fields (a closed enum: `not-started` →
+  `capability-smoke` → `capability-proven` → `graph-passing` → `cutover-repeated`), and
+  `crates/myelin-lints/tests/ci_workload_inventory.rs` now mechanically verifies a `myelin-native`
+  row's `myelin_job` actually exists in `.myelin/ci.toml` rather than trusting a plausible string.
+- **The Rust runner asset proves toolchain execution, not the job's capability.**
+  `rust_capable_rootfs_prod_exec_test.rs` only ran `rustc --version && cargo --version` — it never
+  mounted an exact-commit checkout (gVisor's default is an unmounted `/`, no repo), had no vendored
+  dependency cache (so `cargo build --workspace --locked` would have nothing to fetch under
+  deny-all egress), never propagated the job's env (`OciConfig::from_spec` ignores `spec.env`;
+  `crates/myelin-ci-sandbox/src/gvisor.rs`), and sized resources far below a real build's needs.
+  `build-test-clippy`'s row now honestly reads `migration_state = "capability-smoke"`, not
+  `capability-proven`. Separately, the "digest-pinned" claim did not bind to what actually launches:
+  `scripts/build-rust-rootfs.sh` pulled a mutable tag without verifying the resolved digest, and
+  production selects the rootfs from `MYELIN_GVISOR_ROOTFS`, never from `JobSpec.image` — so the
+  image field was disconnected from reality ("security theatre," in the reviewer's words). Fixed in
+  the script (digest-change-before-promotion refusal, `ALLOW_DIGEST_CHANGE=1` override); binding
+  `JobSpec.image` itself to a resolved, hashed asset at launch is the first item of the vertical
+  slice below, not yet done.
+- **`scripts/build-rust-rootfs.sh` hardened against three real safety gaps** found in the same
+  round: (1) it staged directly in place with a bare `rm -rf` before rebuilding — a typo'd
+  `MYELIN_GVISOR_RUST_ROOTFS` override, or a failed build, could destroy an unrelated directory or
+  the last known-good asset with no fallback; (2) the rebuilt digest was never checked against the
+  committed pin before promotion, so a mutable-tag drift or export anomaly could silently replace a
+  trusted asset; (3) an unrestricted override target could still be renamed/deleted outright. Fixed:
+  content now stages into immutable digest-named directories under `<asset>.versions/`, promoted
+  only by an atomic symlink swap (`mv -T`) after the digest is verified to match the committed pin
+  (or `ALLOW_DIGEST_CHANGE=1` is explicitly set); an existing non-symlink path is only ever touched
+  if a sidecar `<asset>.myelin-managed` marker proves this script created it, or
+  `MYELIN_ALLOW_REPLACE_UNMANAGED=1` is set (and even then it is renamed aside, never deleted). All
+  three fixes were exercised for real on this host (forced digest-mismatch refusal, forced override
+  with the env flag, legacy-tree migration) and the real `runsc` prod-exec + digest-pin lint tests
+  reconfirmed green after each change — including one genuine regression the fix itself introduced
+  (`mktemp -d`'s default 0700 mode broke the sandboxed non-root uid's ability to traverse into the
+  rootfs; caught by actually re-running the test, not assumed) and then corrected.
+- **The `pnpm` job may already be broken independent of CT-007:** pnpm 10.5.2
+  (`frontend/package.json`) may be affected by the npm registry's 2026 retirement of the legacy
+  audit endpoints pnpm 10.x used — flagged, not yet investigated; unrelated to this ledger's gates.
+
+**Vertical-slice redirection (2026-07-25).** The reviewer's strongest structural point: stop adding
+capability assets horizontally (one job's toolchain at a time) and instead finish ONE job
+(`build-test-clippy`) end to end — exact-commit checkout, vendored/locked dependencies as their own
+digest-keyed asset, real env/cwd propagation, resource sizing proven against a real build, image
+resolved and hash-verified at launch, and the real dispatch path (not a direct `GvisorBackend` call
+from a test) — before starting Node/browser/Docker work for other jobs. This is now the plan of
+record for gate 2's continuation; see the task list in the working session for the ordered steps.

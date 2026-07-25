@@ -14,13 +14,19 @@
 # Myelin-native sandbox; this manifest is the accounting of which assets exist, how they were
 # built, and what their content must hash to.
 #
-# STATUS TODAY (committed 2026-07-25): exactly ONE asset is staged — `linux-rust-v1`, covering only
-# the `build-test-clippy` job's need (`ci-workload-inventory.toml`'s own note on that row: "the
-# base Rust workload every other job's crates depend on existing"). Node (frontend lint/unit/build
+# STATUS TODAY (committed 2026-07-25; wording corrected 2026-07-25 after a second adversarial
+# review round by gpt-5.6-sol): exactly ONE asset is staged — `linux-rust-v1`, a Rust TOOLCHAIN
+# SMOKE toward the `build-test-clippy` job (`ci-workload-inventory.toml`'s own note on that row).
+# It proves the Rust toolchain executes under the hardened sandbox on the real production hardening
+# path — it does NOT yet "cover the job's need": no exact-commit checkout mount, no vendored/locked
+# dependencies under deny-all egress, no propagated job env, no resources sized against a real
+# build, and `JobSpec.image` is not yet bound to this asset at launch (production still resolves
+# the rootfs from `MYELIN_GVISOR_ROOTFS`, independent of what a job declares — see the ledger's
+# 2026-07-25 correction entry and the vertical-slice plan of record). Node (frontend lint/unit/build
 # jobs), a headless browser (the Chromium suite), Docker-in-Docker (the `integration` workflow's
 # live-backend needs), and outbound egress to the RustSec/npm advisory DBs (the `security.yml`
 # jobs) are ALL still missing runner assets — separate, later rows, added by later slices of this
-# same gate. Gate 2 is NOT closed by this file; it is one asset closer.
+# same gate. Gate 2 is NOT closed by this file; it is one toolchain-smoke closer.
 #
 # ENFORCEMENT: `crates/myelin-lints/tests/runner_asset_digest_pin.rs` recomputes each row's
 # `canonical_tree_sha256` (via the SAME `tar --sort=name --mtime=@0 --owner=0 --group=0
@@ -53,6 +59,14 @@ source_image_digest = "sha256:1111c28d995d06a7863ba6cea3b3dcb87bebe65af8ec5517ca
 # The canonical-tree content digest of the STAGED rootfs (docker-exported filesystem +
 # usr/local/bin/{rustc,cargo,...} PATH-reachability symlinks — see the script's own header for why
 # the symlinks target the real toolchain binaries, not the rustup proxy hardlinks). Computed
-# 2026-07-25 on the founder dogfood host.
+# 2026-07-25 on the founder dogfood host; reconfirmed unchanged 2026-07-25 after the staging-safety
+# rewrite of build-rust-rootfs.sh (atomic build-then-promote instead of rm-rf-then-build). That
+# rewrite briefly produced a DIFFERENT digest (2493dd29...) because `mktemp -d`'s default 0700 mode
+# on the build-temp directory was being promoted straight into the rootfs ROOT's own permissions —
+# the tar recipe hashes mode bits, so 0700 vs 0755 alone changes this digest, and a 0700 root also
+# made the sandboxed non-root uid unable to traverse into the rootfs at all ("permission denied"
+# finding /bin/sh — caught by actually re-running the prod-exec test, not assumed green). Fixed by
+# chmod 0755 on the temp dir before populating it; the raw `docker export` step itself was
+# independently confirmed byte-for-byte reproducible across separate container creates.
 canonical_tree_sha256 = "6feada1e0ef7b739d71c7f198b03dcaab494f35ea86182dd887d23f5df0c6083"
 note = "Docker-pull + docker-export of an official Debian-slim rust image, NOT a hand-chased host-lib copy (unlike scripts/stage-git-rootfs.sh's git precedent) — the host cargo/rustc pull in dozens of transitive shared libs (libgit2, libssl, libcurl, icu, ...) that would make a hand-staged tree fragile and not a real immutable release artifact. Proven end to end by crates/myelin-ci-sandbox/tests/rust_capable_rootfs_prod_exec_test.rs: a real `runsc` sandbox on the SAME GvisorBackend::launch path every other job uses runs `rustc --version && cargo --version` and asserts non-root uid + no network egress, unchanged hardening."
