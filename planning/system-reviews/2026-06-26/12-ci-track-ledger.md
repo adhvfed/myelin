@@ -345,10 +345,42 @@ to prove the gate genuinely fails RED (then restored it byte-identical), and con
 `cargo test -p myelin-lints` and `cargo clippy -p myelin-lints --all-targets -- -D warnings` are both
 clean with no other files touched.
 
-**Honest remaining CT-007 floor: gates 2-4 have not started.** No digest-pinned one-cell runner
-asset exists for any of the 12 jobs' Rust/Node/browser/container/Docker-in-Docker/egress needs
-(gate 2); no mapped graph has run on a real Myelin commit end to end, and the permanent mutation
-gate has not been re-proven at zero missed mutants under that graph (gate 3); no second ordinary
-commit has repeated it without GitHub execution (gate 4). GitHub Actions remains fully in force and
-must not be disabled or removed before gate 4 lands. This inventory is scaffolding for that work, not
-a claim that any of it happened.
+**CT-007 gate 2/4, first slice (2026-07-25): the Rust runner asset, proven under real gVisor.**
+`runner-assets.toml` (workspace root) now tracks `linux-rust-v1` — a digest-pinned gVisor rootfs
+covering only the `build-test-clippy` job's need ("the base Rust workload every other job's crates
+depend on existing"). Built by the new `scripts/build-rust-rootfs.sh`, which deliberately does NOT
+follow `stage-git-rootfs.sh`'s hand-copy-host-binary precedent: the host's system `cargo`/`rustc`
+pull in dozens of transitive shared libs (libgit2, libssl, libcurl, icu, ...) that would make a
+hand-staged tree fragile and not a real immutable artifact. Instead the script pulls the official
+`rust:1.82-slim-bookworm` image (pinned source digest `sha256:1111c28d...`), `docker export`s its
+real filesystem, and symlinks `usr/local/bin/{rustc,cargo,...}` to the real toolchain binaries under
+`usr/local/rustup/toolchains/.../bin` (not the rustup-proxy hardlinks, which depend on env/HOME
+resolution this sandbox does not set up) so they resolve on this repo's hardcoded guest `PATH`
+without touching `OciConfig`/hardening code at all. The staged tree's canonical-tree digest
+(`sha256:6feada1e...`, same recipe as `dogfood.sh verify_ci_rootfs()`) is committed and mechanically
+enforced by a new `crates/myelin-lints/tests/runner_asset_digest_pin.rs`, which skips honestly on any
+machine without the asset staged and hard-fails under `MYELIN_REQUIRE_RUST_ROOTFS_PIN=1`.
+
+A new `crates/myelin-ci-sandbox/tests/rust_capable_rootfs_prod_exec_test.rs` proves the asset for
+real: a genuine `runsc` sandbox on the exact same `GvisorBackend::launch` path every other job uses
+(no new capability, no OCI-config change, no code touched in `hardening.rs`/`escape_corpus.rs`/
+`CiExecutionProfileV1`/dispatch config) runs `rustc --version && cargo --version` and captures a real
+`rustc 1.82.0`/`cargo 1.82.0` banner from inside the guest, plus a second payload proving non-root
+uid `65534` (checked by value, not just exit code) and closed egress (a real `/dev/tcp` connect
+attempt against a live IP:port, contained) hold unchanged. An independent adversarial verifier
+re-ran all of this from scratch, applied harder pressure than the builder's own tests (a root-write
+attempt against `/`, a second distinct network target), confirmed `.myelin/ci.toml` and both existing
+staged rootfs trees (`rootfs`, `git-rootfs`) are untouched (the base rootfs's canonical-tree digest
+still matches its `.myelin/ci.toml` pin exactly), proved the digest-pin gate genuinely fails RED on a
+corrupted pin and the skip path is honest in both directions, and found no issues.
+
+**Honest remaining CT-007 floor.** Gate 2 covers Rust only; Node (the `frontend` job's lint/unit/
+build + pinned-Chromium browser suite), a headless-browser capability, Docker/Docker-in-Docker (the
+`web-container` and `integration` jobs), and outbound egress to the RustSec/npm advisory DBs
+(`rustsec`/`pnpm`) all still have no runner asset — later slices of this same gate. No GitHub job has
+been wired to actually dispatch onto this or any Myelin-native runner asset yet (that is gate 3's
+"complete mapped graph passes on one exact Myelin commit," not this slice — `linux-rust-v1` is proven
+reachable by a direct test harness call, not by the real CI dispatch path). The permanent mutation
+gate has not been re-proven under any mapped graph; no second ordinary commit has repeated anything
+without GitHub execution (gate 4). GitHub Actions remains fully in force and must not be disabled or
+removed before gate 4 lands.
