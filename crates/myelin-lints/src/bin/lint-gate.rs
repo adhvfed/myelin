@@ -279,6 +279,13 @@ const PER_LINT_EXCLUSIONS: &[(LintId, &[&str])] = &[
     // execs the already-selected Firecracker/runsc runtime. Exclude this file from no-host-exec
     // ONLY; every other architecture lint still scans it.
     (NO_HOST_EXEC, &["myelin-ci-sandbox/src/launch_gate.rs"]),
+    // CT-007 vertical-slice step 2b: the disk-backed ephemeral CI workspace provisioner. Its real
+    // `btrfs subvolume`/`qgroup`/`chown` invocations ARE the enforcement mechanism that CREATES
+    // the per-job disk-backed isolation + quota boundary the sandbox's OCI bundle then mounts
+    // read-write — not a bypass of it, exactly analogous to the Firecracker/runsc spawn sites and
+    // the durable launch guard above. Exclude this file from no-host-exec ONLY; every other
+    // architecture lint still scans it. See the module doc in `workspace_storage.rs`.
+    (NO_HOST_EXEC, &["myelin-ci-sandbox/src/workspace_storage.rs"]),
     // The CI stage-verdict seam (`no-raw-ci-verdict`, P-FLOW CI durability). The typed `job.done`
     // verdict (`SignalPayload::CiJobDone` / `signal_typed`) is trusted by the pipeline body as the
     // runner's verified result, so naming/constructing/delivering it is forbidden everywhere EXCEPT the
