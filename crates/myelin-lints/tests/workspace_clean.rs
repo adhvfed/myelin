@@ -83,8 +83,15 @@ fn is_excluded(path: &Path) -> bool {
     EXCLUDED_SUBSTRINGS.iter().any(|ex| s.contains(ex))
 }
 
-const PER_LINT_EXCLUSIONS: &[(LintId, &[&str])] =
-    &[(NO_HOST_EXEC, &["myelin-ci-sandbox/src/launch_gate.rs"])];
+const PER_LINT_EXCLUSIONS: &[(LintId, &[&str])] = &[(
+    NO_HOST_EXEC,
+    &[
+        "myelin-ci-sandbox/src/launch_gate.rs",
+        // CT-007 vertical-slice step 2b — see the matching entry + rationale in
+        // `myelin-lints/src/bin/lint-gate.rs` and the module doc in `workspace_storage.rs`.
+        "myelin-ci-sandbox/src/workspace_storage.rs",
+    ],
+)];
 
 fn is_excluded_for_lint(lint: LintId, path: &Path) -> bool {
     let path = path.to_string_lossy().replace('\\', "/");

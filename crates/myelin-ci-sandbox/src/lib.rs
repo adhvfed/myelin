@@ -73,6 +73,7 @@ pub mod replay;
 pub mod runner;
 pub mod self_hosted;
 pub mod snapshot_pool;
+pub mod workspace_storage;
 
 pub use events::{
     ci_event_tokens, is_durable, register_ci_tokens, CI_DURABLE_TOKENS, CI_FIREHOSE_TOKENS,
