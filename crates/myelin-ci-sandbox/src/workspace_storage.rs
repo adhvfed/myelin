@@ -304,6 +304,19 @@ impl PreparedWorkspace {
     pub fn subvol_id(&self) -> u64 {
         self.subvol_id
     }
+
+    /// CT-007 slice 3: a test-only constructor letting `workspace_manager.rs`'s own tests exercise
+    /// its capacity/active-job-id/admission STATE TRANSITIONS (given an injected create/delete
+    /// outcome) without ever touching real Btrfs — those tests never call `delete_workspace` on
+    /// the fake value this produces, so `minted_from`'s exact accuracy doesn't matter to them.
+    #[cfg(test)]
+    pub(crate) fn for_tests(host_path: PathBuf, subvol_id: u64, minted_from: PathBuf) -> Self {
+        PreparedWorkspace {
+            host_path,
+            subvol_id,
+            minted_from,
+        }
+    }
 }
 
 /// One candidate for orphan reconciliation: a real, verified Btrfs subvolume under the workspace
