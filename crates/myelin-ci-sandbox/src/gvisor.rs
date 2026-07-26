@@ -37,7 +37,10 @@ use crate::hardening::HardeningProfile;
 use crate::launch_gate::{SandboxCommand, SpawnPhase};
 use crate::redaction::RedactionPlan;
 use crate::runner::RetryableAttemptCause;
-use crate::user_namespace::{RunscInvocationMode, UserNamespaceConfig};
+use crate::user_namespace::{
+    RunscInvocationMode, UserNamespaceAllocator, UserNamespaceAllocatorError, UserNamespaceConfig,
+};
+use crate::workspace_manager::{WorkspaceManager, WorkspaceManagerError, WorkspaceStorageMode};
 use crate::{
     drain_capped, CompletionSettlementOwner, EgressPolicy, HookError, IdemToken, ImageRef, JobKind,
     JobSpec, LaunchPermit, MeterTarget, ReserveHandle, ResourceLimits, ResourceUsage,
@@ -1051,6 +1054,78 @@ pub struct GvisorBackend {
     /// a [`GvisorBackend::git_wire_only`] backend, which refuses ordinary launch outright (so this
     /// is never consulted from that path either).
     registry: Option<Arc<crate::asset_registry::GvisorAssetRegistry>>,
+    /// CT-007 slice 3, piece 4: intentionally stored but not yet consulted anywhere — `launch`/
+    /// `launch_with` don't read this yet (that's the later `OciExecutionLayout`/launch-redesign
+    /// piece). `new`/`git_wire_only` always construct `Disabled`; only the not-yet-public
+    /// [`GvisorBackend::try_new`] can construct `Enabled`.
+    #[allow(dead_code)]
+    workspace_integration: WorkspaceIntegration,
+}
+
+/// Backend-level workspace/user-namespace integration — a SINGLE enum, never two independent
+/// `Option` fields: workspace-mount support REQUIRES explicit user-namespace support (the guest's
+/// unprivileged uid is unmapped under plain `--rootless`), so the two are only ever meaningful
+/// together. Do not add a way to enable one without the other — if explicit-userns-without-
+/// workspace ever becomes a legitimate need, add a deliberate third variant then, rather than
+/// letting an invalid combination be constructed and pushing validation to a later layer.
+#[allow(dead_code)]
+enum WorkspaceIntegration {
+    /// The production floor until slice 4: no workspace mount is ever offered, and no
+    /// [`UserNamespaceAllocator`] is even constructed — avoids forcing every existing caller (most
+    /// of which never asked for this) to satisfy its real `/etc/subuid`/`/etc/subgid` hardening
+    /// requirements.
+    Disabled,
+    Enabled {
+        workspace_manager: WorkspaceManager,
+        userns_allocator: UserNamespaceAllocator,
+    },
+}
+
+/// Caller-facing configuration for [`GvisorBackend::try_new`] — mirrors [`WorkspaceIntegration`]'s
+/// shape but as INPUT (paths/params), not already-constructed managers. `pub(crate)` (not yet
+/// `pub`): promoted publicly once `launch_with` actually consumes the integration it configures —
+/// a public constructor accepting `Enabled` today would silently promise behavior no launch path
+/// yet enforces.
+#[allow(dead_code)]
+pub(crate) enum GvisorWorkspaceConfig {
+    Disabled,
+    Enabled {
+        /// Forwarded into `WorkspaceStorageMode::EphemeralDisk { base_dir, host_capacity_bytes }`.
+        base_dir: PathBuf,
+        host_capacity_bytes: u64,
+        /// Forwarded into `UserNamespaceAllocator::try_new`.
+        leases_dir: PathBuf,
+        min_pool_size: u32,
+    },
+}
+
+/// Why [`GvisorBackend::try_new`] failed to construct an `Enabled` [`WorkspaceIntegration`].
+#[derive(Debug)]
+pub(crate) enum GvisorBackendInitError {
+    Workspace(WorkspaceManagerError),
+    UserNamespace(UserNamespaceAllocatorError),
+}
+
+impl std::fmt::Display for GvisorBackendInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GvisorBackendInitError::Workspace(e) => {
+                write!(f, "workspace manager initialization failed: {e}")
+            }
+            GvisorBackendInitError::UserNamespace(e) => {
+                write!(f, "user-namespace allocator initialization failed: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GvisorBackendInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            GvisorBackendInitError::Workspace(e) => Some(e),
+            GvisorBackendInitError::UserNamespace(e) => Some(e),
+        }
+    }
 }
 
 /// A live container's teardown state: the (already-exited/killed) `runsc` child + the bundle temp dir
@@ -1087,6 +1162,7 @@ impl GvisorBackend {
         GvisorBackend {
             live: Mutex::new(std::collections::HashMap::new()),
             registry: Some(registry),
+            workspace_integration: WorkspaceIntegration::Disabled,
         }
     }
 
@@ -1102,7 +1178,98 @@ impl GvisorBackend {
         GvisorBackend {
             live: Mutex::new(std::collections::HashMap::new()),
             registry: None,
+            workspace_integration: WorkspaceIntegration::Disabled,
         }
+    }
+
+    /// CT-007 slice 3, piece 4: the ONLY way to construct a backend with `Enabled` workspace/
+    /// user-namespace integration — `pub(crate)`, not yet `pub`, since no launch path consumes it
+    /// yet. Delegates to [`Self::try_new_with_builders`] with the REAL constructors; see that
+    /// method for the fixed construction-order contract.
+    #[allow(dead_code)]
+    pub(crate) fn try_new(
+        registry: Arc<crate::asset_registry::GvisorAssetRegistry>,
+        workspace_config: GvisorWorkspaceConfig,
+        incident_sink: crate::workspace_manager::IncidentSink,
+    ) -> Result<GvisorBackend, GvisorBackendInitError> {
+        Self::try_new_with_builders(
+            registry,
+            workspace_config,
+            incident_sink,
+            UserNamespaceAllocator::try_new,
+            WorkspaceManager::try_new,
+        )
+    }
+
+    /// The actual construction logic, generic over HOW the allocator/manager are built — a test
+    /// seam (Sol's round-1 review of piece 4): the real [`UserNamespaceAllocator::try_new`] is
+    /// fixed to `/etc/subuid`/`/etc/subgid` with full hardening always enforced, which no ordinary
+    /// dev/CI sandbox host can satisfy (ANY leases_dir such a host can create itself sits under a
+    /// directory it owns or can write to, which the allocator's own ancestor check always refuses —
+    /// the SAME constraint this crate's explicit-userns drill already documents). That made the
+    /// public `try_new`'s own success path — and therefore the `Workspace(_)` error-mapping branch,
+    /// reachable only once userns has ALREADY succeeded — untestable without either weakening
+    /// production strictness or fabricating a fake non-real value of these real manager types. This
+    /// method fixes that: injectable builders still must return the REAL `UserNamespaceAllocator`/
+    /// `WorkspaceManager` types (tests satisfy them via the existing test-relaxed constructors —
+    /// `UserNamespaceAllocator::try_new_for_tests`, `WorkspaceManager::try_new` with
+    /// `WorkspaceStorageMode::Disabled` — never a fabricated stand-in), so this seam changes nothing
+    /// about what a genuine `Enabled` value actually contains.
+    ///
+    /// Fixed construction order: `build_userns` (the mandatory identity authority) FIRST, THEN
+    /// `build_workspace` — `WorkspaceManager::try_new` is not side-effect-free (its boot
+    /// reconciliation deletes orphaned subvolumes), so a misconfigured `/etc/subuid`/`/etc/subgid`
+    /// must refuse before that ever runs. If workspace construction then fails, the
+    /// already-constructed allocator is simply dropped (safely releasing its lock — no lease was
+    /// ever minted from construction alone).
+    fn try_new_with_builders<U, W>(
+        registry: Arc<crate::asset_registry::GvisorAssetRegistry>,
+        workspace_config: GvisorWorkspaceConfig,
+        incident_sink: crate::workspace_manager::IncidentSink,
+        build_userns: U,
+        build_workspace: W,
+    ) -> Result<GvisorBackend, GvisorBackendInitError>
+    where
+        U: FnOnce(
+            PathBuf,
+            u32,
+            crate::workspace_manager::IncidentSink,
+        ) -> Result<UserNamespaceAllocator, UserNamespaceAllocatorError>,
+        W: FnOnce(
+            WorkspaceStorageMode,
+            crate::workspace_manager::IncidentSink,
+        ) -> Result<WorkspaceManager, WorkspaceManagerError>,
+    {
+        let workspace_integration = match workspace_config {
+            GvisorWorkspaceConfig::Disabled => WorkspaceIntegration::Disabled,
+            GvisorWorkspaceConfig::Enabled {
+                base_dir,
+                host_capacity_bytes,
+                leases_dir,
+                min_pool_size,
+            } => {
+                let userns_allocator =
+                    build_userns(leases_dir, min_pool_size, incident_sink.clone())
+                        .map_err(GvisorBackendInitError::UserNamespace)?;
+                let workspace_manager = build_workspace(
+                    WorkspaceStorageMode::EphemeralDisk {
+                        base_dir,
+                        host_capacity_bytes,
+                    },
+                    incident_sink,
+                )
+                .map_err(GvisorBackendInitError::Workspace)?;
+                WorkspaceIntegration::Enabled {
+                    workspace_manager,
+                    userns_allocator,
+                }
+            }
+        };
+        Ok(GvisorBackend {
+            live: Mutex::new(std::collections::HashMap::new()),
+            registry: Some(registry),
+            workspace_integration,
+        })
     }
 
     /// Build the OCI config a launch WOULD use for `spec` (the hardened profile derived + the OCI
@@ -3778,6 +3945,258 @@ mod tests {
             IdemToken("idem-runsc-1".into()),
         )
         .unwrap()
+    }
+
+    // ───────── CT-007 slice 3, piece 4: WorkspaceIntegration / GvisorWorkspaceConfig ─────────
+
+    #[test]
+    fn new_and_git_wire_only_construct_disabled_workspace_integration() {
+        let backend = GvisorBackend::new(test_registry());
+        assert!(matches!(
+            backend.workspace_integration,
+            WorkspaceIntegration::Disabled
+        ));
+        let git_wire_backend = GvisorBackend::git_wire_only();
+        assert!(matches!(
+            git_wire_backend.workspace_integration,
+            WorkspaceIntegration::Disabled
+        ));
+    }
+
+    #[test]
+    fn try_new_with_disabled_config_never_touches_the_filesystem() {
+        let backend = GvisorBackend::try_new(
+            test_registry(),
+            GvisorWorkspaceConfig::Disabled,
+            Arc::new(|_: &str| {}),
+        )
+        .expect("Disabled construction must never fail");
+        assert!(matches!(
+            backend.workspace_integration,
+            WorkspaceIntegration::Disabled
+        ));
+    }
+
+    #[test]
+    fn try_new_with_enabled_config_refuses_before_touching_workspace_when_userns_is_unsafe() {
+        // Any leases_dir this unprivileged test process can create itself sits under a directory
+        // it owns or can write to (its own home dir, or /tmp) — the strict production allocator's
+        // ancestor-not-writable-by-us check refuses EVERY such path, deliberately: a genuinely
+        // hardened leases dir requires a root-provisioned deployment layout, out of scope for an
+        // ordinary unit test (this crate's own explicit-userns drill documents the identical
+        // constraint). This makes the refusal fully deterministic here, which is exactly what this
+        // test wants: proof that workspace reconciliation is never even attempted once userns
+        // construction fails.
+        let base = std::env::temp_dir().join(format!(
+            "myelin-gvisor-try-new-workspace-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let leases_dir = std::env::temp_dir().join(format!(
+            "myelin-gvisor-try-new-leases-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let result = GvisorBackend::try_new(
+            test_registry(),
+            GvisorWorkspaceConfig::Enabled {
+                base_dir: base.clone(),
+                host_capacity_bytes: 1 << 30,
+                leases_dir,
+                min_pool_size: 1,
+            },
+            Arc::new(|_: &str| {}),
+        );
+        match result {
+            Err(GvisorBackendInitError::UserNamespace(_)) => {}
+            Err(other) => panic!("expected a UserNamespace error, got a different error: {other}"),
+            Ok(_) => panic!(
+                "expected a UserNamespace error — a leases dir under this test's own home/tmp \
+                 directory must never be considered safe"
+            ),
+        }
+        assert!(
+            !base.exists(),
+            "workspace reconciliation must never run when userns construction fails first"
+        );
+    }
+
+    /// Sol's round-1 review of piece 4: the public `try_new`'s own success path (and therefore the
+    /// `Workspace(_)` error-mapping branch, reachable only once userns has ALREADY succeeded) is
+    /// untestable end-to-end on an ordinary dev/CI host — the strict production allocator's
+    /// ancestor check always refuses any leases_dir this unprivileged test process can create
+    /// itself, AND `base_dir` here is never a real quota-enforcing Btrfs mount either, so even a
+    /// hypothetical userns success would just trade one failure for another. These tests instead
+    /// exercise `try_new_with_builders` directly, injecting builders that still return the REAL
+    /// `UserNamespaceAllocator`/`WorkspaceManager` types (via their own existing test-relaxed
+    /// constructors) — never a fabricated stand-in — so what `Enabled` actually holds is unchanged.
+    #[test]
+    fn try_new_with_builders_never_calls_workspace_builder_when_userns_fails() {
+        let workspace_builder_called = Arc::new(AtomicBool::new(false));
+        let flag = workspace_builder_called.clone();
+        let result = GvisorBackend::try_new_with_builders(
+            test_registry(),
+            GvisorWorkspaceConfig::Enabled {
+                base_dir: PathBuf::from("/nonexistent-base-for-this-test"),
+                host_capacity_bytes: 1 << 30,
+                leases_dir: PathBuf::from("/nonexistent-leases-for-this-test"),
+                min_pool_size: 1,
+            },
+            Arc::new(|_: &str| {}),
+            |_leases_dir, _min_pool_size, _sink| {
+                Err(UserNamespaceAllocatorError::NoSubordinateEntry {
+                    path: PathBuf::from("/etc/subuid"),
+                    uid: 0,
+                })
+            },
+            move |_mode, _sink| {
+                flag.store(true, Ordering::SeqCst);
+                Err(WorkspaceManagerError::AlreadyLocked {
+                    base_dir: PathBuf::new(),
+                })
+            },
+        );
+        match result {
+            Err(GvisorBackendInitError::UserNamespace(_)) => {}
+            Err(other) => panic!("expected UserNamespace(_), got a different error: {other}"),
+            Ok(_) => panic!("expected UserNamespace(_), got Ok"),
+        }
+        assert!(
+            !workspace_builder_called.load(Ordering::SeqCst),
+            "the workspace builder must never run once the userns builder has failed"
+        );
+    }
+
+    /// Writes a real, valid `subuid`/`subgid`-format file naming the CURRENT effective uid, with
+    /// the given range, so tests never depend on this host's REAL `/etc/subuid`/`/etc/subgid`
+    /// having an entry for this uid (mirroring `user_namespace.rs`'s own test helper of the same
+    /// name/shape — Sol's round-2 review: relying on the real files left these tests conditionally
+    /// skippable on any CI host lacking subordinate-id configuration, exactly the host dependency
+    /// the builder seam exists to remove).
+    fn write_subordinate_file(path: &Path, start: u32, count: u32) {
+        let uid = unsafe { libc::geteuid() };
+        std::fs::write(path, format!("{uid}:{start}:{count}\n")).unwrap();
+    }
+
+    #[test]
+    fn try_new_with_builders_maps_a_workspace_failure_after_userns_succeeds() {
+        let base = std::env::temp_dir().join(format!(
+            "myelin-gvisor-builders-workspace-fails-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let leases_dir = base.join("leases");
+        let subuid = base.join("subuid");
+        let subgid = base.join("subgid");
+        write_subordinate_file(&subuid, 100_000, 8);
+        write_subordinate_file(&subgid, 200_000, 8);
+        let result = GvisorBackend::try_new_with_builders(
+            test_registry(),
+            GvisorWorkspaceConfig::Enabled {
+                base_dir: PathBuf::from("/nonexistent-base-for-this-test"),
+                host_capacity_bytes: 1 << 30,
+                leases_dir: leases_dir.clone(),
+                min_pool_size: 1,
+            },
+            Arc::new(|_: &str| {}),
+            |leases_dir, min_pool_size, sink| {
+                crate::user_namespace::UserNamespaceAllocator::try_new_for_tests(
+                    leases_dir,
+                    &subuid,
+                    &subgid,
+                    min_pool_size,
+                    sink,
+                )
+            },
+            |mode, _sink| {
+                assert!(
+                    matches!(mode, WorkspaceStorageMode::EphemeralDisk { .. }),
+                    "the correct mode must be forwarded to the workspace builder"
+                );
+                Err(WorkspaceManagerError::AlreadyLocked {
+                    base_dir: PathBuf::from("/nonexistent-base-for-this-test"),
+                })
+            },
+        );
+        match result {
+            Err(GvisorBackendInitError::Workspace(_)) => {}
+            Err(other) => panic!("expected Workspace(_), got a different error: {other}"),
+            Ok(_) => panic!("expected Workspace(_), got Ok"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn try_new_with_builders_produces_enabled_holding_both_managers_when_both_succeed() {
+        let base = std::env::temp_dir().join(format!(
+            "myelin-gvisor-builders-both-succeed-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let leases_dir = base.join("leases");
+        let subuid = base.join("subuid");
+        let subgid = base.join("subgid");
+        write_subordinate_file(&subuid, 100_000, 8);
+        write_subordinate_file(&subgid, 200_000, 8);
+        let backend = GvisorBackend::try_new_with_builders(
+            test_registry(),
+            GvisorWorkspaceConfig::Enabled {
+                base_dir: PathBuf::from("/nonexistent-base-for-this-test"),
+                host_capacity_bytes: 1 << 30,
+                leases_dir: leases_dir.clone(),
+                min_pool_size: 1,
+            },
+            Arc::new(|_: &str| {}),
+            |leases_dir, min_pool_size, sink| {
+                crate::user_namespace::UserNamespaceAllocator::try_new_for_tests(
+                    leases_dir,
+                    &subuid,
+                    &subgid,
+                    min_pool_size,
+                    sink,
+                )
+            },
+            // A `WorkspaceManager::Disabled` instance stands in as a genuine, real value of the
+            // right type (mode-forwarding itself is already asserted in the sibling test above) —
+            // never a fabricated non-real value.
+            |_mode, sink| WorkspaceManager::try_new(WorkspaceStorageMode::Disabled, sink),
+        )
+        .expect("both builders must succeed with a real, fixture-backed subordinate range");
+        assert!(matches!(
+            backend.workspace_integration,
+            WorkspaceIntegration::Enabled { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn try_new_with_builders_invokes_neither_builder_when_disabled() {
+        let userns_called = Arc::new(AtomicBool::new(false));
+        let workspace_called = Arc::new(AtomicBool::new(false));
+        let u = userns_called.clone();
+        let w = workspace_called.clone();
+        let backend = GvisorBackend::try_new_with_builders(
+            test_registry(),
+            GvisorWorkspaceConfig::Disabled,
+            Arc::new(|_: &str| {}),
+            move |leases_dir, min_pool_size, sink| {
+                u.store(true, Ordering::SeqCst);
+                UserNamespaceAllocator::try_new(leases_dir, min_pool_size, sink)
+            },
+            move |mode, sink| {
+                w.store(true, Ordering::SeqCst);
+                WorkspaceManager::try_new(mode, sink)
+            },
+        )
+        .expect("Disabled must always succeed");
+        assert!(matches!(
+            backend.workspace_integration,
+            WorkspaceIntegration::Disabled
+        ));
+        assert!(!userns_called.load(Ordering::SeqCst));
+        assert!(!workspace_called.load(Ordering::SeqCst));
     }
 
     fn ok_hooks() -> RunnerHooks {
