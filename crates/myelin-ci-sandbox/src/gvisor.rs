@@ -1489,7 +1489,13 @@ impl GvisorBackend {
         run: F,
     ) -> Result<SandboxLaunch, SandboxLaunchError<GvisorError>>
     where
-        F: FnOnce(&JobSpec, &OciConfig, LaunchPermit, &Path) -> Result<ContainerRun, RunFailure>,
+        F: FnOnce(
+            &JobSpec,
+            &OciConfig,
+            LaunchPermit,
+            &Path,
+            &str,
+        ) -> Result<ContainerRun, RunFailure>,
     {
         // #4 isolation floor FIRST — the hardening profile must hold before any code (including the
         // registry lookup) runs. Mirrors the Firecracker backend's own ordering. Every early refusal
@@ -1523,6 +1529,12 @@ impl GvisorBackend {
             .reserve(spec)
             .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
         let cfg = OciConfig::from_spec(spec, &profile);
+        // CT-007 slice 3, piece 7a: generated HERE, not deep inside the run closure — the future
+        // `Enabled`-workspace path needs this same value before it ever calls `run`, to durably
+        // bind a `UserNamespaceLease` to it ahead of exec (piece 7c). Plain, not yet cryptographic
+        // or claim-derived (see piece 7c's naming-scheme work) — this piece only relocates WHERE
+        // the identifier is minted, not what it's derived from.
+        let container_id = format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
         let launch_permit = match hooks.acquire_launch_permit(spec) {
             Ok(permit) => permit,
             Err(attribute_error) => {
@@ -1552,7 +1564,13 @@ impl GvisorBackend {
             bundle_dir,
             result,
             run_error,
-        } = match run(spec, &cfg, launch_permit, verified_rootfs.path()) {
+        } = match run(
+            spec,
+            &cfg,
+            launch_permit,
+            verified_rootfs.path(),
+            &container_id,
+        ) {
             Ok(container_run) => container_run,
             Err(run_failure) => {
                 return Err(self.dispose_run_failure(spec, hooks, &reserve, run_failure));
@@ -1677,8 +1695,8 @@ impl SandboxBackend for GvisorBackend {
         spec: &JobSpec,
         hooks: &RunnerHooks,
     ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
-        self.launch_with(spec, hooks, |spec, cfg, permit, rootfs| {
-            run_production_container(spec, cfg, permit, rootfs)
+        self.launch_with(spec, hooks, |spec, cfg, permit, rootfs, container_id| {
+            run_production_container(spec, cfg, permit, rootfs, container_id)
         })
     }
 
@@ -1689,16 +1707,21 @@ impl SandboxBackend for GvisorBackend {
         output: Arc<dyn SandboxOutputSink>,
         cancellation: SandboxCancellation,
     ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
-        self.launch_with(spec, hooks, move |spec, cfg, permit, rootfs| {
-            run_production_container_streaming(
-                spec,
-                cfg,
-                permit,
-                rootfs,
-                Some(output),
-                cancellation,
-            )
-        })
+        self.launch_with(
+            spec,
+            hooks,
+            move |spec, cfg, permit, rootfs, container_id| {
+                run_production_container_streaming(
+                    spec,
+                    cfg,
+                    permit,
+                    rootfs,
+                    container_id,
+                    Some(output),
+                    cancellation,
+                )
+            },
+        )
     }
 
     /// Whole-container kill on teardown: best-effort destroy the container + remove its bundle temp
@@ -1749,12 +1772,14 @@ fn run_production_container(
     cfg: &OciConfig,
     launch_permit: LaunchPermit,
     rootfs: &Path,
+    container_id: &str,
 ) -> Result<ContainerRun, RunFailure> {
     run_production_container_streaming(
         spec,
         cfg,
         launch_permit,
         rootfs,
+        container_id,
         None,
         SandboxCancellation::new(),
     )
@@ -1765,6 +1790,7 @@ fn run_production_container_streaming(
     cfg: &OciConfig,
     launch_permit: LaunchPermit,
     rootfs: &Path,
+    container_id: &str,
     output: Option<Arc<dyn SandboxOutputSink>>,
     cancellation: SandboxCancellation,
 ) -> Result<ContainerRun, RunFailure> {
@@ -1786,7 +1812,6 @@ fn run_production_container_streaming(
         )));
     }
     let bundle_dir = stage_production_bundle(cfg, rootfs).map_err(RunFailure::uncommitted)?;
-    let container_id = format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
 
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
     let redaction = RedactionPlan::for_job(spec);
@@ -1794,7 +1819,7 @@ fn run_production_container_streaming(
     let outcome = match run_and_capture(
         bin,
         &bundle_dir,
-        &container_id,
+        container_id,
         timeout,
         spec.limits.mem_bytes,
         RunCaptureOptions {
@@ -1812,20 +1837,20 @@ fn run_production_container_streaming(
         Ok(o) => o,
         Err(e) => {
             // Spawning/waiting failed before a trustworthy result — clean up + surface honestly.
-            delete_container(bin, &container_id, mode);
+            delete_container(bin, container_id, mode);
             let _ = std::fs::remove_dir_all(&bundle_dir);
             return Err(e);
         }
     };
     // The container has exited (or been timeout-killed) — best-effort delete (idempotent; `runsc run`
     // usually self-deletes on a clean exit, but the timeout path leaves it for us to reap).
-    delete_container(bin, &container_id, mode);
+    delete_container(bin, container_id, mode);
 
     let result = build_result(spec, &outcome, &redaction);
     Ok(ContainerRun {
         child: Box::new(SpawnedRunsc {
             bin,
-            container_id,
+            container_id: container_id.to_string(),
             mode,
         }),
         bundle_dir,
@@ -2120,10 +2145,76 @@ fn verify_pinned_explicit_userns_runsc(bin: &Path) -> Result<(), String> {
 struct ResolvedExplicitUsernsPolicy {
     helper_dir: PathBuf,
     runsc_root: PathBuf,
+    /// CT-007 slice 3, piece 7a: `runsc_root`'s own (device, inode), captured at the moment this
+    /// policy was validated — the identity a [`crate::user_namespace::UserNamespaceLease`] binds
+    /// to before `runsc` ever execs in `ExplicitUserNamespace` mode, and the identity a completed
+    /// run's teardown must reconfirm before trusting that the SAME state root is still in play.
+    runsc_root_identity: (u64, u64),
+}
+
+impl ResolvedExplicitUsernsPolicy {
+    /// Re-run the FULL leaf hardening check ([`verify_explicit_userns_runsc_root_leaf`]) against
+    /// `runsc_root` NOW, and confirm the identity it returns still matches what was captured at
+    /// preflight time — a stale-handle consistency check (matching this crate's established
+    /// pattern for `AbsoluteRootfs`/`cgroup_identity`/`classify_identity_check`), not full TOCTOU
+    /// protection: this policy's own `runsc_root`/resolved `runsc` binary were already hardened
+    /// against untrusted REPLACEMENT by [`harden_explicit_userns_runsc_root`]/
+    /// [`harden_explicit_userns_runsc_binary`] at preflight time.
+    ///
+    /// Deliberately re-runs the WHOLE leaf check, not a bare `stat` for `(dev, ino)` alone (Sol's
+    /// round-1 review of piece 7a): the leaf is owned by THIS process's own euid, so its MODE can
+    /// silently drift out from under an unchanged inode (e.g. `chmod 0700 -> 0777` on the exact
+    /// same directory) without dev/ino ever disagreeing — ancestor hardening prevents an untrusted
+    /// same-euid replacement, and identity comparison alone catches a replacement whose identity
+    /// genuinely differs, but neither catches a mode drift on the SAME inode. A bare
+    /// identity check would keep returning `Ok` for a state root that no longer satisfies the
+    /// security posture `verify_explicit_userns_runsc_root_leaf` exists to enforce. Re-running the
+    /// full check makes "the identity still matches" also mean "the hardening still holds" — the
+    /// ONE call this module ever makes to confirm either.
+    ///
+    /// Called immediately before durably binding a lease to this identity, and again during
+    /// checked runtime retirement, so the same value backs both ends of one run's proof.
+    fn revalidated_root_identity(&self) -> Result<(u64, u64), String> {
+        let current = verify_explicit_userns_runsc_root_leaf(&self.runsc_root)?;
+        if current != self.runsc_root_identity {
+            return Err(format!(
+                "{:?} no longer names the same state root this policy was validated against \
+                 (expected identity {:?}, found {current:?})",
+                self.runsc_root, self.runsc_root_identity
+            ));
+        }
+        Ok(current)
+    }
 }
 
 static EXPLICIT_USERNS_POLICY: std::sync::OnceLock<ResolvedExplicitUsernsPolicy> =
     std::sync::OnceLock::new();
+
+/// CT-007 slice 3, piece 7a: the ONE way any future caller obtains a freshly-revalidated
+/// `runsc_root_identity` to bind a lease to — refuses if `ExplicitUserNamespace` mode was never
+/// validated via [`preflight_explicit_userns_policy`], or if the state root no longer matches what
+/// was validated. `pub(crate)`, not yet called by any production path — that's piece 7c.
+#[allow(dead_code)]
+pub(crate) fn revalidated_explicit_userns_root_identity() -> Result<(u64, u64), String> {
+    revalidated_explicit_userns_root_identity_given(EXPLICIT_USERNS_POLICY.get())
+}
+
+/// The actual decision logic behind [`revalidated_explicit_userns_root_identity`], taking the
+/// installed policy as an EXPLICIT `Option` parameter — mirroring
+/// [`apply_runsc_invocation_policy_given`]'s exact same reasoning: reading the real
+/// process-global `OnceLock` directly would make a "no policy installed yet" test
+/// non-deterministic (once ANY test in the same process installs one, it stays installed for
+/// every other test sharing that process).
+fn revalidated_explicit_userns_root_identity_given(
+    policy: Option<&ResolvedExplicitUsernsPolicy>,
+) -> Result<(u64, u64), String> {
+    policy
+        .ok_or_else(|| {
+            "ExplicitUserNamespace mode was never validated via preflight_explicit_userns_policy"
+                .to_string()
+        })?
+        .revalidated_root_identity()
+}
 
 /// Verify `bin` (the runsc binary `ExplicitUserNamespace` mode will execute) cannot be replaced
 /// between THIS preflight and any later `run`/`kill`/`delete` — a real, non-symlinked, root-owned,
@@ -2173,7 +2264,7 @@ fn harden_explicit_userns_runsc_binary(bin: &Path) -> Result<(), String> {
 /// deployment's install step, or a test fixture), exactly mirroring the split
 /// [`crate::user_namespace`]'s own leases-directory hardening now uses between its strict
 /// production path and non-strict test setup.
-fn harden_explicit_userns_runsc_root(dir: &Path) -> Result<(), String> {
+fn harden_explicit_userns_runsc_root(dir: &Path) -> Result<(u64, u64), String> {
     if !dir.is_absolute() {
         return Err(format!("{dir:?} must be an absolute path"));
     }
@@ -2186,8 +2277,16 @@ fn harden_explicit_userns_runsc_root(dir: &Path) -> Result<(), String> {
 /// function so a test can exercise them directly against a fixture whose ANCESTORS are not
 /// necessarily hardened (the full function's own ancestor check would otherwise refuse first
 /// against any fixture a non-privileged test creates under a writable temp directory, proving
-/// nothing about the leaf-specific checks this function targets).
-fn verify_explicit_userns_runsc_root_leaf(dir: &Path) -> Result<(), String> {
+/// nothing about the leaf-specific checks this function targets). Returns the leaf's own
+/// (device, inode) — CT-007 slice 3, piece 7a (Sol's round-1 review): this is the ONE `stat` this
+/// module ever performs against the leaf, so the identity a caller later revalidates against is
+/// GUARANTEED to have come from a check that also confirmed ownership/mode at that exact moment —
+/// a separate, independent `metadata()` call for identity alone could observe dev/ino unchanged
+/// while the leaf's mode had already drifted (e.g. `0700` chmod'd to `0777` — the leaf is owned by
+/// THIS process, so only mode/ownership can drift under us, never a swap; a swap would need a NEW
+/// inode, which dev/ino alone already catches). Re-running this SAME function later — not merely
+/// re-`stat`ing — is what makes "the identity still matches" also mean "the hardening still holds".
+fn verify_explicit_userns_runsc_root_leaf(dir: &Path) -> Result<(u64, u64), String> {
     let meta = std::fs::symlink_metadata(dir).map_err(|e| {
         format!(
             "stat {dir:?}: {e} — the explicit-userns runsc state root must be pre-provisioned; \
@@ -2223,7 +2322,7 @@ fn verify_explicit_userns_runsc_root_leaf(dir: &Path) -> Result<(), String> {
             meta.mode() & 0o777
         ));
     }
-    Ok(())
+    Ok((meta.dev(), meta.ino()))
 }
 
 /// Validate `helper_dir` (via [`preflight_explicit_userns_helpers`]), harden+validate `runsc_root`
@@ -2247,10 +2346,14 @@ pub fn preflight_explicit_userns_policy(
     harden_explicit_userns_runsc_binary(bin)?;
     verify_pinned_explicit_userns_runsc(bin)?;
     preflight_explicit_userns_helpers(helper_dir)?;
-    harden_explicit_userns_runsc_root(runsc_root)?;
+    // The identity comes from THIS SAME hardening check's own `stat` (Sol's round-1 review of
+    // piece 7a) — never a separate, independent `metadata()` call, which could observe dev/ino
+    // alone without re-confirming ownership/mode at that exact moment.
+    let runsc_root_identity = harden_explicit_userns_runsc_root(runsc_root)?;
     let policy = ResolvedExplicitUsernsPolicy {
         helper_dir: helper_dir.to_path_buf(),
         runsc_root: runsc_root.to_path_buf(),
+        runsc_root_identity,
     };
     if EXPLICIT_USERNS_POLICY.set(policy.clone()).is_err() {
         let already = EXPLICIT_USERNS_POLICY
@@ -4848,6 +4951,7 @@ mod tests {
         let policy = ResolvedExplicitUsernsPolicy {
             helper_dir: PathBuf::from("/usr/bin"),
             runsc_root: PathBuf::from("/var/lib/myelin-runsc-explicit-userns"),
+            runsc_root_identity: (0, 0),
         };
         let mut cmd = Command::new("runsc");
         apply_explicit_userns_env(&mut cmd, &policy);
@@ -5283,7 +5387,7 @@ mod tests {
             .launch_with(
                 &spec(vec![]),
                 &ok_hooks(),
-                |_spec, _cfg, permit, _rootfs| {
+                |_spec, _cfg, permit, _rootfs, _container_id| {
                     permit
                         .commit_and_release()
                         .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
@@ -5296,6 +5400,164 @@ mod tests {
         assert_eq!(launch.result.exit_code, Some(0));
         assert!(launch.result.passed());
         backend.kill(&launch.handle).unwrap();
+    }
+
+    /// CT-007 slice 3, piece 7a: `launch_with` (not the run closure) now generates `container_id`
+    /// — this test proves the closure genuinely RECEIVES that same value (not an empty/placeholder
+    /// one), in the expected shape, and that two separate launches never reuse it.
+    #[test]
+    fn launch_with_generates_a_distinct_container_id_the_closure_receives() {
+        let backend = GvisorBackend::new(test_registry());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        for _ in 0..2 {
+            let seen = seen.clone();
+            backend
+                .launch_with(
+                    &spec(vec![]),
+                    &ok_hooks(),
+                    move |_spec, _cfg, permit, _rootfs, container_id| {
+                        seen.lock().unwrap().push(container_id.to_string());
+                        permit
+                            .commit_and_release()
+                            .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
+                        Ok(fake_run())
+                    },
+                )
+                .unwrap();
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for id in seen.iter() {
+            assert!(
+                id.starts_with(&format!("myelin-prod-{}-", std::process::id())),
+                "unexpected container_id shape: {id:?}"
+            );
+        }
+        assert_ne!(
+            seen[0], seen[1],
+            "two separate launches must never reuse the same container_id"
+        );
+    }
+
+    #[test]
+    fn resolved_explicit_userns_policy_revalidates_a_matching_identity() {
+        let dir = std::env::temp_dir().join(format!(
+            "myelin-gvisor-userns-root-identity-ok-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let meta = std::fs::metadata(&dir).unwrap();
+        let identity = (meta.dev(), meta.ino());
+        let policy = ResolvedExplicitUsernsPolicy {
+            helper_dir: PathBuf::from("/usr/bin"),
+            runsc_root: dir.clone(),
+            runsc_root_identity: identity,
+        };
+        assert_eq!(policy.revalidated_root_identity(), Ok(identity));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sol's round-1 review on piece 7a: identity (dev, ino) alone is not enough, because the leaf
+    /// is owned by this process's own euid and its MODE can drift (e.g. `0700` chmod'd to `0777`)
+    /// without the identity ever changing — a replacement whose identity genuinely differs is
+    /// already caught by `resolved_explicit_userns_policy_refuses_a_replaced_root`, but a
+    /// same-inode mode drift would NOT be, if revalidation only compared `(dev, ino)`. Proves
+    /// `revalidated_root_identity` reruns the FULL leaf hardening check, not a bare stat, by
+    /// drifting the mode of the SAME directory (no replacement) and confirming revalidation now
+    /// refuses.
+    #[test]
+    fn resolved_explicit_userns_policy_refuses_a_mode_drift_without_replacement() {
+        let dir = std::env::temp_dir().join(format!(
+            "myelin-gvisor-userns-root-identity-drift-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let meta = std::fs::metadata(&dir).unwrap();
+        let identity = (meta.dev(), meta.ino());
+        let policy = ResolvedExplicitUsernsPolicy {
+            helper_dir: PathBuf::from("/usr/bin"),
+            runsc_root: dir.clone(),
+            runsc_root_identity: identity,
+        };
+        // Drift the mode of the SAME directory — no rmdir/mkdir, so (dev, ino) is unchanged.
+        let mut drifted = std::fs::metadata(&dir).unwrap().permissions();
+        drifted.set_mode(0o777);
+        std::fs::set_permissions(&dir, drifted).unwrap();
+        let result = policy.revalidated_root_identity();
+        let mut restore = std::fs::metadata(&dir).unwrap().permissions();
+        restore.set_mode(0o700);
+        std::fs::set_permissions(&dir, restore).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            result.is_err(),
+            "a same-inode mode drift (0700 -> 0777) must be refused, not just identity-compared: \
+             {result:?}"
+        );
+    }
+
+    /// Sol's design-round note (piece 7): the revalidation accessor must catch a state root that
+    /// no longer names the SAME directory it was validated against — e.g. removed and recreated at
+    /// the identical path (a fresh inode) between preflight and a later bind/teardown attempt.
+    ///
+    /// Sol's round-1 review: `rmdir` + immediate `mkdir` at the same path does not guarantee a
+    /// fresh inode — POSIX permits filesystems to reuse a freed inode number. Instead, rename the
+    /// original directory ASIDE (so it stays alive under a different path) and create the
+    /// replacement fresh at the original path, then assert the two identities actually differ
+    /// before relying on that difference to prove refusal.
+    #[test]
+    fn resolved_explicit_userns_policy_refuses_a_replaced_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "myelin-gvisor-userns-root-identity-replaced-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let moved_aside = std::env::temp_dir().join(format!(
+            "myelin-gvisor-userns-root-identity-replaced-original-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let meta = std::fs::metadata(&dir).unwrap();
+        let original_identity = (meta.dev(), meta.ino());
+        let policy = ResolvedExplicitUsernsPolicy {
+            helper_dir: PathBuf::from("/usr/bin"),
+            runsc_root: dir.clone(),
+            runsc_root_identity: original_identity,
+        };
+        std::fs::rename(&dir, &moved_aside).unwrap(); // original stays alive, just relocated
+        std::fs::create_dir(&dir).unwrap(); // a genuinely fresh directory at the original path
+        let mut fresh_perms = std::fs::metadata(&dir).unwrap().permissions();
+        fresh_perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, fresh_perms).unwrap();
+        let fresh_meta = std::fs::metadata(&dir).unwrap();
+        let fresh_identity = (fresh_meta.dev(), fresh_meta.ino());
+        assert_ne!(
+            original_identity, fresh_identity,
+            "the fixture must produce a genuinely different inode, not rely on chance"
+        );
+        assert!(policy.revalidated_root_identity().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&moved_aside);
+    }
+
+    #[test]
+    fn revalidated_explicit_userns_root_identity_given_refuses_without_a_policy() {
+        let result = revalidated_explicit_userns_root_identity_given(None);
+        assert!(matches!(result, Err(ref reason) if reason.contains("never validated")));
     }
 
     #[test]
@@ -5857,9 +6119,11 @@ mod tests {
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         );
-        let r = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit, _rootfs| {
-            Ok(fake_run())
-        });
+        let r = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, _permit, _rootfs, _container_id| Ok(fake_run()),
+        );
         assert!(matches!(
             r,
             Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))
@@ -5883,12 +6147,16 @@ mod tests {
         );
 
         backend
-            .launch_with(&spec(vec![]), &hooks, |_spec, _cfg, permit, _rootfs| {
-                permit
-                    .commit_and_release()
-                    .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
-                Ok(fake_run())
-            })
+            .launch_with(
+                &spec(vec![]),
+                &hooks,
+                |_spec, _cfg, permit, _rootfs, _container_id| {
+                    permit
+                        .commit_and_release()
+                        .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
+                    Ok(fake_run())
+                },
+            )
             .expect("the sandbox returns measured usage for the reporter transaction");
         assert!(
             !hook_settled.load(Ordering::SeqCst),
@@ -5909,12 +6177,16 @@ mod tests {
             Box::new(|_spec| Ok(())),
         );
 
-        let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, permit, _rootfs| {
-            permit
-                .commit_and_release()
-                .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
-            Ok(fake_run())
-        });
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, permit, _rootfs, _container_id| {
+                permit
+                    .commit_and_release()
+                    .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
+                Ok(fake_run())
+            },
+        );
 
         assert!(matches!(
             result,
@@ -5946,7 +6218,7 @@ mod tests {
         let result = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            move |_spec, _cfg, _permit, _rootfs| {
+            move |_spec, _cfg, _permit, _rootfs, _container_id| {
                 spawned_at.store(true, Ordering::SeqCst);
                 Ok(fake_run())
             },
@@ -5997,9 +6269,13 @@ mod tests {
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         );
-        let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit, _rootfs| {
-            Err(RunFailure::uncommitted("injected uncommitted run failure"))
-        });
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, _permit, _rootfs, _container_id| {
+                Err(RunFailure::uncommitted("injected uncommitted run failure"))
+            },
+        );
         assert!(
             matches!(
                 result,
@@ -6047,11 +6323,15 @@ mod tests {
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         );
-        let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit, _rootfs| {
-            Err(RunFailure::commit_outcome_unknown(
-                "injected commit-outcome-unknown run failure",
-            ))
-        });
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, _permit, _rootfs, _container_id| {
+                Err(RunFailure::commit_outcome_unknown(
+                    "injected commit-outcome-unknown run failure",
+                ))
+            },
+        );
         assert!(
             matches!(
                 result,
@@ -6084,11 +6364,15 @@ mod tests {
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         );
-        let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit, _rootfs| {
-            Err(RunFailure::committed_but_not_executed(
-                "injected committed-but-not-executed run failure",
-            ))
-        });
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, _permit, _rootfs, _container_id| {
+                Err(RunFailure::committed_but_not_executed(
+                    "injected committed-but-not-executed run failure",
+                ))
+            },
+        );
         assert!(
             matches!(
                 result,
@@ -6128,11 +6412,15 @@ mod tests {
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         );
-        let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit, _rootfs| {
-            Err(RunFailure::committed_but_not_executed(
-                "injected committed-but-not-executed run failure",
-            ))
-        });
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, _permit, _rootfs, _container_id| {
+                Err(RunFailure::committed_but_not_executed(
+                    "injected committed-but-not-executed run failure",
+                ))
+            },
+        );
         match result {
             Err(SandboxLaunchError::RetryableAttempt { cause, usage, .. }) => {
                 assert_eq!(cause, RetryableAttemptCause::SandboxInfrastructure);
@@ -6178,7 +6466,7 @@ mod tests {
         let result = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            move |_spec, _cfg, _permit, _rootfs| {
+            move |_spec, _cfg, _permit, _rootfs, _container_id| {
                 Err(RunFailure::executed(
                     "injected executed-phase run failure",
                     fallback_usage,
@@ -6224,7 +6512,7 @@ mod tests {
         let result = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            move |_spec, _cfg, _permit, _rootfs| {
+            move |_spec, _cfg, _permit, _rootfs, _container_id| {
                 Err(RunFailure::executed(
                     "injected executed-phase run failure",
                     fallback_usage,
@@ -6291,7 +6579,7 @@ mod tests {
         let result = backend.launch_with(
             &unregistered_spec,
             &hooks,
-            move |_spec, _cfg, _permit, _rootfs| {
+            move |_spec, _cfg, _permit, _rootfs, _container_id| {
                 spawned_at.store(true, Ordering::SeqCst);
                 Ok(fake_run())
             },
@@ -6354,7 +6642,7 @@ mod tests {
         let result = backend.launch_with(
             &unregistered_spec,
             &hooks,
-            move |_spec, _cfg, _permit, _rootfs| {
+            move |_spec, _cfg, _permit, _rootfs, _container_id| {
                 spawned_at.store(true, Ordering::SeqCst);
                 Ok(fake_run())
             },
