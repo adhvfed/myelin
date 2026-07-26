@@ -672,9 +672,10 @@ fn sh_squote(s: &str) -> String {
 /// `ulimit -u spec.limits.pids_max` (RLIMIT_NPROC) applied in the runner subshell BEFORE `setpriv`,
 /// inherited by the non-root payload + all descendants, so a fork bomb is refused at the ceiling and
 /// the guest survives (rather than OOM-dying); (2) a size-bounded `/run/scratch` tmpfs sized from
-/// `spec.limits.disk_bytes` (the profile's scratch quota), separate from the `/run` capture area, so a
-/// workload disk fill hits ENOSPC at the quota. (The whole-guest RAM bounds everything else — the
-/// microVM keeps the HOST safe regardless.)
+/// `spec.limits.tmpfs_bytes` (the RAM-backed `/tmp`-equivalent ceiling — NOT `disk_bytes`, the
+/// disk-backed ephemeral-workspace quota `myelin-ci-sandbox::workspace_storage` targets, unwired
+/// here), separate from the `/run` capture area, so a workload disk fill hits ENOSPC at the quota.
+/// (The whole-guest RAM bounds everything else — the microVM keeps the HOST safe regardless.)
 fn build_command_runner_script(spec: &JobSpec, nonce: &str) -> String {
     let mut exports = String::new();
     for ev in &spec.env {
@@ -697,14 +698,14 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
 mount -t tmpfs tmpfs /run 2>/dev/null
-# CT-003a (SI-017): a SIZE-BOUNDED writable scratch tmpfs (sized from spec.limits.disk_bytes, the
-# profile's scratch quota) at /run/scratch — a SEPARATE mount from /run (which holds trusted relay
-# FIFOs and locks), so a workload disk fill hits ENOSPC at the quota WITHOUT starving the relays or
-# trusted markers. mode=1777 so the NON-ROOT payload can write it. (The
-# whole-guest RAM bounds everything else — the microVM keeps the HOST safe regardless; this makes the
-# in-guest disk quota the enforcer for the workload's scratch.)
+# CT-003a (SI-017): a SIZE-BOUNDED writable scratch tmpfs (sized from spec.limits.tmpfs_bytes, the
+# RAM-backed /tmp-equivalent ceiling) at /run/scratch — a SEPARATE mount from /run (which holds
+# trusted relay FIFOs and locks), so a workload disk fill hits ENOSPC at the quota WITHOUT
+# starving the relays or trusted markers. mode=1777 so the NON-ROOT payload can write it. (The
+# whole-guest RAM bounds everything else — the microVM keeps the HOST safe regardless; this makes
+# the in-guest tmpfs quota the enforcer for the workload's scratch.)
 mkdir -p /run/scratch 2>/dev/null
-mount -t tmpfs -o size={disk_bytes},mode=1777 tmpfs /run/scratch 2>/dev/null
+mount -t tmpfs -o size={tmpfs_bytes},mode=1777 tmpfs /run/scratch 2>/dev/null
 N='{nonce}'
 # STRUCTURAL forge boundary: init (this script) is PID1/root and is the ONLY writer of the
 # nonce-framed markers below. The untrusted argv runs NON-ROOT (--reuid/--regid 65534 =
@@ -784,7 +785,7 @@ reboot -f
         nonce = nonce,
         exports = exports,
         argv = argv,
-        disk_bytes = spec.limits.disk_bytes,
+        tmpfs_bytes = spec.limits.tmpfs_bytes,
         pids_max = spec.limits.pids_max,
         stream_chunk = MARK_STREAM_CHUNK,
         stream_end = MARK_STREAM_END,
