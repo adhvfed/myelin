@@ -1168,3 +1168,140 @@ prerequisite fix). Agreed sequencing, recorded here before any of it is implemen
    base; the exact pinned runsc passes the explicit-userns workspace drill.
 
 Not started. Slice 1 is the next concrete unit.
+
+## 2026-07-26 — CT-007 slice 1 landed: persistent `WorkspaceManager` + boot reconciliation (Sol, 6 review rounds)
+
+Slice 1 of the agreed 4-slice `workspace_storage.rs` → `gvisor.rs` integration (previous entry,
+above) is complete: a new `crates/myelin-ci-sandbox/src/workspace_manager.rs` module, plus two
+small additions to the existing `workspace_storage.rs` primitive. Deliberately decoupled from
+`GvisorBackend`/`gvisor.rs` for this slice — re-reading Sol's own slice-1 description confirmed the
+manager itself was the ask, not the wiring; an initial attempt to also add a `workspace` field +
+`try_new` + accessor to `GvisorBackend` triggered `dead_code` under `-D warnings` (nothing consumes
+it yet) and was reverted. `gvisor.rs`/`lib.rs` are back to their exact prior committed state except
+for one added `pub mod workspace_manager;` line. Sol confirmed this narrower boundary was the right
+call in round 2 ("The narrower slice is the right boundary"). The `GvisorBackend` wiring itself is
+now deferred to slice 3, where it gets a genuine immediate production consumer (the launch path).
+
+**What `workspace_manager.rs` provides:** one persistent `WorkspaceStorage` owned for the life of
+the `GvisorBackend` process; a process-lifetime exclusive `flock` on `base_dir`'s own directory FD
+(so a second runner process sharing the same base refuses at startup instead of silently
+corrupting the first process's bookkeeping); boot-time orphan reconciliation (deletes every
+subvolume found under the base — at boot NOTHING is active yet, so every discovered subvolume is
+necessarily an orphan from a crashed prior instance) BEFORE admission ever opens; a monotonic
+`WorkspaceAdmission::{Reconciling, Healthy, Poisoned}` state machine that never resets to `Healthy`
+once poisoned; and non-`Clone` `CapacityLease`s bounding AGGREGATE host-disk capacity across
+concurrently-running jobs (a per-job Btrfs qgroup limit alone only bounds one job's own usage, not
+how many jobs run at once).
+
+**Two additions to `workspace_storage.rs`:** `WorkspaceStorage::check_health()` — a genuinely
+read-only re-verification (exclusive ownership + quota-enforcement only; never calls `open()`,
+never `create_dir_all`s anything, unlike `open()` itself); and `probe_qgroup_privilege()` (test-only,
+`pub(crate)`) — a read-only `btrfs qgroup show -r --raw` preflight so tests can detect a missing
+`CAP_SYS_ADMIN` gap WITHOUT ever attempting a real mutating `create_workspace` just to find out (see
+the leaked-subvolume incident below, which is exactly what happens when a mutating attempt's
+cleanup fails for the same missing-privilege reason).
+
+**Design/review process:** consulted with Sol (gpt-5.6-sol, persistent session `myelin-ct007`)
+across 6 rounds total — 2 design rounds before implementation (recorded in the prior ledger entry),
+then 4 adversarial-review rounds on the actual implementation, at the same rigor
+`workspace_storage.rs` itself got. Real bugs found and fixed each round:
+
+- **Round 1 (Sol):** `check_health()` delegated to `WorkspaceStorage::open()`, which itself
+  `create_dir_all`s a missing base — contradicting its own claimed side-effect-free contract, and
+  opened a second throwaway `WorkspaceStorage` instead of re-checking the one already under lock.
+  Admission and capacity bookkeeping lived in two separate mutexes, racing a concurrent poison.
+  `CapacityLease::release` marked itself released BEFORE the capacity update, so a poisoned lock
+  would let `Drop` silently skip both the bookkeeping and the abandonment incident. A capacity
+  underflow was silently absorbed by `saturating_sub`. Every mutex access used `.lock().unwrap()`,
+  contradicting the documented "an internally poisoned mutex also poisons this manager" claim. 5 of
+  7 tests silently skipped in any environment lacking real Btrfs+quota privilege even though the
+  logic they exercised had nothing to do with Btrfs at all.
+- **Round 2 (Sol):** confirmed round 1's fixes and the narrower (no-`GvisorBackend`) slice boundary.
+- **Round 3 (Sol):** `check_health()`'s failure branches invoked the incident sink through a helper
+  that only received `&mut MutexGuard` — a borrow, not an owned guard — so the caller's own lock was
+  still held for the entire sink call despite a comment claiming otherwise; a reentrant sink would
+  have deadlocked. A `CapacityLease` could outlive the manager's own directory lock (the lock lived
+  directly on `WorkspaceManager` while the lease retained only `Arc<SharedState>`; dropping the
+  manager while a lease was outstanding released the flock, letting a second manager falsely lock
+  the same base and reconcile the first manager's still-live workspace as an orphan). Also: an
+  `EphemeralDisk` manager with no open `WorkspaceStorage` was silently treated as healthy (a broken
+  internal invariant); `lock_state()`'s poisoned-mutex recovery emitted no incident, contradicting
+  the `IncidentSink` contract.
+- **Round 4 (Sol):** the locked directory and the opened `WorkspaceStorage` were never proven to be
+  the same inode — `acquire_directory_lock` records identity A from `base_dir` at one instant, but
+  `WorkspaceStorage::open` independently `canonicalize`s `base_dir` a moment later; a symlink
+  retargeted A → B and back to A between those two calls could leave the manager admitting against a
+  `WorkspaceStorage` permanently bound to canonical B while `locked_identity` (and every later
+  `check_health` call) kept reading A, both checks passing independently while the admitted
+  capability protected a DIFFERENT directory than the one the flock actually covers.
+- **Round 5 (Sol):** boot-time orphan deletion is exactly the kind of operation
+  `WorkspaceStorage::check_health`'s own doc warns can leave Btrfs quota inconsistent — the
+  original `open()` call's quota-enforcing check (taken BEFORE any deletion) did not prove quota was
+  still enforcing after reconciliation deleted subvolumes.
+- **Round 6 (Sol):** confirmed the final ordering closes both gaps — **slice 1 cleared to commit.**
+
+**What shipped, mechanically:** `try_new`'s `EphemeralDisk` branch now runs: acquire lock → record
+identity → `WorkspaceStorage::open` → require locked identity (base_dir AND storage's own canonical
+base_dir both match) → `reconcile_orphans_at_boot` → require locked identity again →
+`storage.check_health()` (re-validates quota post-deletion) → require locked identity a third time
+→ only then set `Healthy`. The directory lock (`OwnedFd`) moved off `WorkspaceManager` entirely onto
+`Arc<SharedState>`, which every `CapacityLease` already held — the lock now survives as long as
+EITHER the manager or any outstanding lease is alive, whichever drops last. `check_health()` (the
+periodic path) mirrors the same three-layer discipline: base-dir identity → storage-base-dir
+identity → `storage.check_health()` → a final identity recheck before ever returning `Ok`. Every
+failure path funnels through one `poison_and_report(state: MutexGuard<...>, error)` method that
+takes the guard BY VALUE specifically so it — not the caller — controls when the lock drops before
+the incident sink is invoked.
+
+**Tests:** 21 tests in the two modules combined (14 in `workspace_manager` — 12 always-on via a
+`#[cfg(test)]`-only `new_for_state_tests` constructor that takes the same real directory lock but
+skips real Btrfs, plus 2 privileged real-Btrfs-lifecycle tests; 7 pre-existing in
+`workspace_storage`). Tests added across the review rounds specifically for Sol's findings: a
+reentrant-sink test through `check_health()`'s own failure path (proving no deadlock — the earlier
+`a_panicking_incident_sink_never_escapes_poison` test only exercised `poison()`'s own call path via
+an abandoned lease); a test that drops the manager while a lease is still outstanding and proves a
+second manager still gets `AlreadyLocked`; a pure-function test proving `require_locked_identity`
+catches a storage-base-dir mismatch even when `base_dir` alone still matches. Two nonblocking
+hygiene fixes from round 4: the reentrant-sink test's `Arc` cycle (sink held a strong `Arc` back to
+the slot containing its own manager) fixed via `Weak`; `probe_qgroup_privilege`'s and
+`ephemeral_disk_available`'s doc comments narrowed to state they confirm `CAP_SYS_ADMIN` only, never
+`CAP_CHOWN` (a host could pass the probe and still fail the real lifecycle test at the `chown` step
+— that path is still exercised honestly by the one test that reaches `create_workspace` for real).
+
+**Verification, final round:** `cargo build` (crate + full workspace) clean; `cargo clippy
+--all-targets` with both `--features integration` and `--features integration,test-support`, `-D
+warnings`, clean on both; `rustfmt --check` confined to touched lines only; `myelin-lints`
+`lint-gate` clean (769 files, 0 violations); full `myelin-ci-sandbox` test suite (`--all-targets
+--features integration`): 191 lib tests + all integration test files pass. One pre-existing,
+unrelated failure remains and is NOT chased here (confirmed via `git stash` to fail identically on
+base HEAD, already named in the prior ledger entry):
+`firecracker_production_launch_contains_the_corpus_non_root` — requires real `/dev/kvm` + a staged
+kernel/rootfs + the `firecracker` binary reaching a real guest boot; this session has `/dev/kvm` and
+the binaries present but the corpus's guest stdout comes back empty (`exit=None timed_out=false`),
+an existing Firecracker escape-drill/corpus-routing gap unrelated to gVisor or this workspace-manager
+work.
+
+**Operational debt — two leaked Btrfs subvolumes, still not cleaned up:** while developing this
+slice's own test harness, an early flawed privilege-probe helper (since replaced by the read-only
+`probe_qgroup_privilege` described above) called `create_workspace()` directly and only pattern-matched
+`QuotaLimitFailed`/`OwnershipFailed` on a missing-privilege error — but when the qgroup-limit step
+fails for lacking `CAP_SYS_ADMIN`, the best-effort cleanup delete fails for the SAME reason,
+producing `WorkspaceStorageError::UnrecoverableLeak` instead (a variant that helper didn't handle),
+and two real, small (~8 MiB quota each) Btrfs subvolumes were created and left stuck on this host's
+actual root Btrfs filesystem before the bug was caught:
+
+- `$HOME/.local/state/myelin-workspace-manager-tests-boot-reconcile-*/privilege-probe`
+- `$HOME/.local/state/myelin-workspace-manager-tests-health-check-real-happy-path-*/privilege-probe`
+
+Both need a privileged `btrfs subvolume delete` to remove, which this sandboxed session cannot
+perform (confirmed via `sudo -n true` failing — no passwordless sudo available here). Per Sol's
+explicit guidance, this is acceptable to commit past as long as the exact locations are durably
+recorded and the cleanup remains tracked — which this entry does. **This debt must be verified
+cleaned up (with a privileged session) before slice 4's production-activation drills**, and should
+not be allowed to silently age past that point.
+
+**Still open:** slice 2 (explicit user-namespace subsystem), slice 3 (workspace lifecycle wired into
+`launch_with`, which is also where `GvisorBackend`'s own `workspace_manager` field/accessor finally
+lands), slice 4 (production activation + drills, which must also verify the leaked subvolumes above
+are gone). None of the 4 slices are wired into production yet — `EphemeralDisk` is not constructed
+anywhere outside this module's own tests; `runner_bind.rs` is untouched.

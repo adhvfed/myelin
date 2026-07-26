@@ -73,6 +73,7 @@ pub mod replay;
 pub mod runner;
 pub mod self_hosted;
 pub mod snapshot_pool;
+pub mod workspace_manager;
 pub mod workspace_storage;
 
 pub use events::{

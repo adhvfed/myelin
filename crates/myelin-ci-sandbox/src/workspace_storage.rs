@@ -375,6 +375,25 @@ impl WorkspaceStorage {
         &self.canonical_base
     }
 
+    /// Read-only re-verification that this handle's base directory is STILL exclusively owned by
+    /// this process and STILL fully Btrfs-quota-enforcing — never creates or mutates anything
+    /// (unlike [`Self::open`], which `create_dir_all`s a missing `base_dir` as a matter of
+    /// course). Call periodically: quota can go inconsistent during normal operation (e.g. after a
+    /// large-subvolume deletion elsewhere on the filesystem).
+    ///
+    /// Deliberately does NOT verify this handle's base directory's IDENTITY has not changed
+    /// underneath it (e.g. deleted and recreated, or renamed away and replaced, at the very same
+    /// path) — that requires an independent capability this type does not hold (an exclusive
+    /// directory-FD lock's own cached device/inode, held by the caller). A caller that needs that
+    /// guarantee (the `gvisor.rs` integration's persistent workspace manager) must perform its own
+    /// identity check FIRST and treat this method as the second, complementary layer: "assuming
+    /// the directory at this path is still the one I locked, are its Btrfs preconditions still OK".
+    pub fn check_health(&self) -> Result<(), WorkspaceStorageError> {
+        assert_base_dir_exclusively_owned(&self.canonical_base)?;
+        assert_quota_enforcing(&self.canonical_base)?;
+        Ok(())
+    }
+
     /// Create, quota, verify, and own a fresh per-job Btrfs subvolume at `base_dir/job_id`.
     ///
     /// Ordering: create → read id → quota-limit (by explicit qgroup id against the FS anchor,
@@ -921,6 +940,49 @@ fn run_btrfs(args: &[&OsStr]) -> Result<Output, WorkspaceStorageError> {
             path: PathBuf::new(),
             reason: format!("spawn btrfs {args:?}: {e}"),
         })
+}
+
+/// Read-only privilege preflight for `CAP_SYS_ADMIN`-gated qgroup operations specifically (`qgroup
+/// show -r`, and by extension `qgroup limit`/`subvolume delete`, which need the SAME capability) —
+/// reusable from OTHER modules' tests (e.g. `workspace_manager.rs`) that need to gate a real Btrfs
+/// lifecycle test on privilege WITHOUT ever attempting a real mutating `create_workspace` just to
+/// find out (a mutating attempt whose cleanup ALSO fails for the SAME missing-privilege reason
+/// leaves a genuinely [`WorkspaceStorageError::UnrecoverableLeak`]'d subvolume behind — this probe
+/// cannot do that, it never creates anything). `base_dir` must already be a verified,
+/// quota-enforcing Btrfs directory (i.e. `WorkspaceStorage::open` already succeeded against it) —
+/// this only tells the caller whether privileged qgroup operations will ALSO succeed there.
+///
+/// Deliberately does NOT probe `CAP_CHOWN` (needed separately for `create_workspace`'s ownership
+/// transfer) — a caller that needs BOTH capabilities confirmed cannot rely on this alone (Sol's
+/// review, round 4): this is a `CAP_SYS_ADMIN`-only preflight, not a full privilege check for the
+/// entire `create_workspace` lifecycle.
+// `pub(crate)` (not `pub`), so `test-support` (which exists for OTHER crates to reach into this
+// one) buys nothing here — plain `#[cfg(test)]` is the correct, sole gate for a same-crate-only
+// test helper.
+#[cfg(test)]
+pub(crate) fn probe_qgroup_privilege(base_dir: &Path) -> Result<bool, WorkspaceStorageError> {
+    let probe = run_btrfs(&[
+        OsStr::new("qgroup"),
+        OsStr::new("show"),
+        OsStr::new("-r"),
+        OsStr::new("--raw"),
+        base_dir.as_os_str(),
+    ])?;
+    if probe.status.success() {
+        Ok(true)
+    } else {
+        let stderr = stderr_of(&probe);
+        if stderr.contains("Operation not permitted") {
+            Ok(false)
+        } else {
+            Err(WorkspaceStorageError::Io {
+                path: base_dir.to_path_buf(),
+                reason: format!(
+                    "unexpected qgroup-show probe failure (not a privilege gap): {stderr}"
+                ),
+            })
+        }
+    }
 }
 
 fn stderr_of(output: &Output) -> String {
