@@ -87,7 +87,7 @@
 
 use crate::{
     CompletionSettlementOwner, JobSpec, ResourceUsage, RunnerHooks, SandboxBackend,
-    SandboxCancellation, SandboxLaunch, SandboxOutputSink, SandboxOutputStream,
+    SandboxCancellation, SandboxLaunch, SandboxLaunchError, SandboxOutputSink, SandboxOutputStream,
 };
 use myelin_flow::{
     DurableExecutor, ExecutorError, RunId, SignalOutcome, SignalSpec, JOB_DONE_SIGNAL,
@@ -571,6 +571,37 @@ pub struct RetryableAttemptFailure {
 pub enum RetryableAttemptCause {
     /// An incremental frame or terminal log anchor did not become durable.
     OutputPersistence,
+    /// The sandbox backend's own launch/execution machinery failed AFTER a durable claim on the
+    /// attempt existed (a committed launch permit, or a process that genuinely started executing)
+    /// — never an ordinary guest command failure (a nonzero exit is a normal [`SandboxResult`],
+    /// not this). Covers post-commit failures such as a lost launch-ownership session, or a
+    /// runtime wait/pipe/drain failure after the guest was released to exec. Does NOT cover
+    /// git-wire's over-cap response truncation — that is deterministic for the same request/limit
+    /// and settles synchronously rather than being retried.
+    SandboxInfrastructure,
+}
+
+impl RetryableAttemptCause {
+    /// The stable, storage-durable token for this cause — the ONE place this mapping is defined,
+    /// so a caller can never persist a cause's row via one path and validate it against a
+    /// different, silently-hardcoded token (the bug this method exists to make impossible).
+    pub fn as_storage_token(&self) -> &'static str {
+        match self {
+            RetryableAttemptCause::OutputPersistence => "output_persistence",
+            RetryableAttemptCause::SandboxInfrastructure => "sandbox_infrastructure",
+        }
+    }
+
+    /// Recover a cause from its durable storage token, or `None` for anything else (including a
+    /// token from a future cause an older binary does not yet know about — the caller must treat
+    /// that as corrupt/unrecognized, never silently coerce it to an existing cause).
+    pub fn from_storage_token(token: &str) -> Option<Self> {
+        match token {
+            "output_persistence" => Some(RetryableAttemptCause::OutputPersistence),
+            "sandbox_infrastructure" => Some(RetryableAttemptCause::SandboxInfrastructure),
+            _ => None,
+        }
+    }
 }
 
 /// Durable outcome of recording a retryable measured attempt.
@@ -729,11 +760,24 @@ pub enum RunnerError {
     },
     /// The terminal report failed (a `job.done` to a phantom run — surfaced, never dropped).
     ReportFailed(ExecutorError),
-    /// A measured infrastructure failure was durably accounted and its exact claim requeued. The
-    /// lane surfaces the incident loudly, but no `job.done` verdict was emitted.
+    /// A measured infrastructure failure was durably ACCOUNTED via the reporter's retryable-
+    /// attempt transaction (usage recorded against the exact claim) — not necessarily requeued: a
+    /// concurrent supersession can win first, in which case the reporter accounts it and
+    /// terminalizes without returning the claim to the queue ([`RetryableAttemptOutcome::
+    /// Cancelled`]). Either way, no `job.done` verdict was emitted; the lane surfaces the incident
+    /// loudly.
     RetryableAttemptRecorded {
-        /// The job whose attempt must be claimed again.
+        /// The job whose measured attempt was accounted (see the variant's own doc: the reporter
+        /// may have requeued the exact claim, OR terminalized it via a winning supersession — the
+        /// job is not necessarily reclaimable).
         job_id: String,
+        /// The diagnostic message for the underlying infrastructure failure (durable log outage,
+        /// or the sandbox backend's own `RetryableAttempt` source) — NOT threaded into the durable
+        /// retry-accrual record itself (only `cause` + `usage` are, matching the existing
+        /// output-persistence precedent), but retained here so an operator can distinguish a wait
+        /// failure from an ownership failure from a drain failure, rather than seeing only the
+        /// opaque `cause` enum.
+        message: String,
     },
     /// Hook and reporter composition disagree about who commits successful settlement. Refused
     /// before a queue claim, guest launch, or reservation mutation.
@@ -754,9 +798,10 @@ impl std::fmt::Display for RunnerError {
                  re-queued it; this runner must not report terminal)"
             ),
             RunnerError::ReportFailed(e) => write!(f, "terminal job.done report failed: {e}"),
-            RunnerError::RetryableAttemptRecorded { job_id } => write!(
+            RunnerError::RetryableAttemptRecorded { job_id, message } => write!(
                 f,
-                "retryable measured attempt recorded for job {job_id}; no terminal verdict emitted"
+                "retryable measured attempt recorded for job {job_id}; no terminal verdict \
+                 emitted ({message})"
             ),
             RunnerError::SettlementOwnerMismatch { hooks, reporter } => write!(
                 f,
@@ -930,6 +975,20 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
         // serializes both streams into the job log. Production backends call `emit` while the command
         // is running; the trait's default adapter preserves existing test doubles by emitting their
         // bounded result after launch.
+        // Constructed BEFORE launch (Sol's design): a `RetryableAttempt` surfacing directly from
+        // `launch_streaming` itself (no successful `SandboxLaunch` ever existed — the backend
+        // guarantees full teardown before returning it) still needs this claim's exact identity to
+        // report through, so it must be available inside the launch match below, not just after it.
+        let claim = CompletionClaim {
+            tenant: job.tenant.clone(),
+            run: RunId(job.run_id.clone()),
+            job_id: job.job_id.clone(),
+            idem_token: job.spec.idem_token.0.clone(),
+            lease_owner: self.worker_id.clone(),
+            lease_epoch: job.lease_epoch,
+            claim_nonce: job.claim_nonce.clone(),
+        };
+
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
         let output_run_id = job.run_id.clone();
         let output_job_id = job.job_id.clone();
@@ -968,7 +1027,46 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                 (Ok(launch), Err(error)) => {
                     Ok((launch, Some(format!("durable log stream failed: {error}"))))
                 }
-                (Err(error), _) => Err(RunnerError::LaunchFailed(error.to_string())),
+                // `launch_streaming` itself failed — no `SandboxLaunch`/handle was ever produced.
+                // Dispatch on the EXACT durable-claim phase the backend proved (Sol's design,
+                // closing the leak where every launch failure collapsed into an indistinguishable
+                // `LaunchFailed` — silently discarding a post-commit measured attempt's accounting
+                // whenever completion settlement is reporter-owned, since `settle_completed` is a
+                // documented no-op under that ownership).
+                (Err(error), _) => match error {
+                    SandboxLaunchError::Failed(source) => {
+                        Err(RunnerError::LaunchFailed(source.to_string()))
+                    }
+                    SandboxLaunchError::DurableOutcomeUnknown(source) => {
+                        Err(RunnerError::LaunchFailed(format!(
+                            "durable launch commit outcome UNKNOWN for job {} — neither released \
+                             nor settled; the durable lease/claim reaper must reconcile it: {source}",
+                            claim.job_id,
+                        )))
+                    }
+                    SandboxLaunchError::RetryableAttempt {
+                        source,
+                        cause,
+                        usage,
+                    } => {
+                        // `source`'s message is NOT threaded into the durable retry-accrual record
+                        // itself (only `cause` + `usage` are, matching the existing output-
+                        // persistence precedent) — but it IS retained on `RetryableAttemptRecorded`
+                        // so an operator can distinguish a wait failure from an ownership failure
+                        // from a drain failure, rather than seeing only the opaque `cause` enum.
+                        let message = source.to_string();
+                        self.reporter
+                            .report_retryable_attempt(
+                                &claim,
+                                &RetryableAttemptFailure { cause, usage },
+                            )
+                            .map_err(RunnerError::ReportFailed)?;
+                        Err(RunnerError::RetryableAttemptRecorded {
+                            job_id: claim.job_id.clone(),
+                            message,
+                        })
+                    }
+                },
             }
         })?;
         let (launch, stream_failure) = launch_result;
@@ -1014,16 +1112,10 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
             .kill(&handle)
             .map_err(|e| RunnerError::LaunchFailed(e.to_string()))?;
 
-        let claim = CompletionClaim {
-            tenant: job.tenant.clone(),
-            run: RunId(job.run_id.clone()),
-            job_id: job.job_id.clone(),
-            idem_token: job.spec.idem_token.0.clone(),
-            lease_owner: self.worker_id.clone(),
-            lease_epoch: job.lease_epoch,
-            claim_nonce: job.claim_nonce.clone(),
-        };
         if !output_complete {
+            let message = output_failure
+                .clone()
+                .expect("output_failure is Some whenever !output_complete");
             self.reporter
                 .report_retryable_attempt(
                     &claim,
@@ -1033,7 +1125,10 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                     },
                 )
                 .map_err(RunnerError::ReportFailed)?;
-            return Err(RunnerError::RetryableAttemptRecorded { job_id: job.job_id });
+            return Err(RunnerError::RetryableAttemptRecorded {
+                job_id: job.job_id,
+                message,
+            });
         }
 
         // ── Step 4: DERIVE the terminal report from the command result, then REPORT TERMINAL.
@@ -1166,6 +1261,11 @@ mod tests {
         launches: AtomicUsize,
         kills: AtomicUsize,
         fail_launch: bool,
+        /// When set, `launch` returns this EXACT `SandboxLaunchError` instead of ever driving the
+        /// four-guarantee seam — the direct way to exercise `run_one`'s dispatch on
+        /// `RetryableAttempt`/`DurableOutcomeUnknown`/`Failed` without needing a real gVisor/
+        /// launch-gate failure to construct one.
+        forced_launch_error: Option<SandboxLaunchError<HookError>>,
         /// The command result the seam carries back — the runner DERIVES the terminal report from
         /// it (RESHAPE-001 / CT-001). Defaults to a clean pass with a stub stdout frame.
         result: SandboxResult,
@@ -1176,6 +1276,7 @@ mod tests {
                 launches: AtomicUsize::new(0),
                 kills: AtomicUsize::new(0),
                 fail_launch: false,
+                forced_launch_error: None,
                 result: SandboxResult {
                     exit_code: Some(0),
                     timed_out: false,
@@ -1195,26 +1296,32 @@ mod tests {
             &self,
             spec: &JobSpec,
             hooks: &RunnerHooks,
-        ) -> Result<SandboxLaunch, Self::Error> {
-            if self.fail_launch {
-                return Err(HookError("backend refused".into()));
+        ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+            if let Some(forced) = &self.forced_launch_error {
+                return Err(forced.clone());
             }
-            // Drive the four-guarantee seam exactly as a real backend must (X-6).
-            hooks.enforce_isolation_floor(spec)?;
-            let res = hooks.reserve(spec)?;
-            if let Err(error) = hooks.attribute(spec) {
-                hooks.release_unused(spec, &res)?;
-                return Err(error);
-            }
-            hooks.settle_completed(spec, &res, self.result.usage)?;
-            self.launches.fetch_add(1, Ordering::SeqCst);
-            Ok(SandboxLaunch {
-                handle: SandboxHandle {
-                    guest_id: format!("guest-{}", spec.idem_token.0),
-                },
-                result: self.result.clone(),
-                output_complete: true,
-            })
+            (|| -> Result<SandboxLaunch, HookError> {
+                if self.fail_launch {
+                    return Err(HookError("backend refused".into()));
+                }
+                // Drive the four-guarantee seam exactly as a real backend must (X-6).
+                hooks.enforce_isolation_floor(spec)?;
+                let res = hooks.reserve(spec)?;
+                if let Err(error) = hooks.attribute(spec) {
+                    hooks.release_unused(spec, &res)?;
+                    return Err(error);
+                }
+                hooks.settle_completed(spec, &res, self.result.usage)?;
+                self.launches.fetch_add(1, Ordering::SeqCst);
+                Ok(SandboxLaunch {
+                    handle: SandboxHandle {
+                        guest_id: format!("guest-{}", spec.idem_token.0),
+                    },
+                    result: self.result.clone(),
+                    output_complete: true,
+                })
+            })()
+            .map_err(SandboxLaunchError::Failed)
         }
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
             self.kills.fetch_add(1, Ordering::SeqCst);
@@ -1227,6 +1334,10 @@ mod tests {
         reports: AtomicUsize,
         retry_reports: AtomicUsize,
         settlements: Arc<Mutex<Vec<ResourceUsage>>>,
+        /// The exact `cause` carried by every `report_retryable_attempt` call — kept separate from
+        /// `settlements` (which mixes usage from BOTH `report_done` and `report_retryable_attempt`)
+        /// so a test can assert the precise cause a launch-level `RetryableAttempt` carried through.
+        retry_causes: Arc<Mutex<Vec<RetryableAttemptCause>>>,
         fail: bool,
     }
 
@@ -1237,6 +1348,7 @@ mod tests {
                 reports: AtomicUsize::new(0),
                 retry_reports: AtomicUsize::new(0),
                 settlements,
+                retry_causes: Arc::new(Mutex::new(Vec::new())),
                 fail,
             }
         }
@@ -1274,6 +1386,7 @@ mod tests {
                 ));
             }
             self.settlements.lock().unwrap().push(failure.usage);
+            self.retry_causes.lock().unwrap().push(failure.cause);
             Ok(RetryableAttemptOutcome::Requeued)
         }
     }
@@ -1313,10 +1426,10 @@ mod tests {
             &self,
             _spec: &JobSpec,
             _hooks: &RunnerHooks,
-        ) -> Result<SandboxLaunch, Self::Error> {
-            Err(HookError(
+        ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+            Err(SandboxLaunchError::Failed(HookError(
                 "blocking backend must use launch_streaming".into(),
-            ))
+            )))
         }
 
         fn launch_streaming(
@@ -1325,48 +1438,51 @@ mod tests {
             hooks: &RunnerHooks,
             output: Arc<dyn SandboxOutputSink>,
             cancellation: SandboxCancellation,
-        ) -> Result<SandboxLaunch, Self::Error> {
-            hooks.enforce_isolation_floor(spec)?;
-            let reserve = hooks.reserve(spec)?;
-            hooks.attribute(spec)?;
-            output
-                .emit(SandboxOutputStream::Stdout, b"live-frame")
-                .map_err(HookError)?;
+        ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+            (|| -> Result<SandboxLaunch, HookError> {
+                hooks.enforce_isolation_floor(spec)?;
+                let reserve = hooks.reserve(spec)?;
+                hooks.attribute(spec)?;
+                output
+                    .emit(SandboxOutputStream::Stdout, b"live-frame")
+                    .map_err(HookError)?;
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while !cancellation.is_cancelled() {
-                if std::time::Instant::now() >= deadline {
-                    return Err(HookError(
-                        "runner never cancelled the live backend after sink failure".into(),
-                    ));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !cancellation.is_cancelled() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(HookError(
+                            "runner never cancelled the live backend after sink failure".into(),
+                        ));
+                    }
+                    std::thread::yield_now();
                 }
-                std::thread::yield_now();
-            }
-            self.cancellation_observed.store(true, Ordering::SeqCst);
-            hooks.settle_completed(
-                spec,
-                &reserve,
-                ResourceUsage {
-                    cpu_seconds: 1,
-                    mem_byte_seconds: 1,
-                },
-            )?;
-            Ok(SandboxLaunch {
-                handle: SandboxHandle {
-                    guest_id: format!("cancelled-{}", spec.idem_token.0),
-                },
-                result: SandboxResult {
-                    exit_code: None,
-                    timed_out: false,
-                    usage: ResourceUsage {
+                self.cancellation_observed.store(true, Ordering::SeqCst);
+                hooks.settle_completed(
+                    spec,
+                    &reserve,
+                    ResourceUsage {
                         cpu_seconds: 1,
                         mem_byte_seconds: 1,
                     },
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                },
-                output_complete: false,
-            })
+                )?;
+                Ok(SandboxLaunch {
+                    handle: SandboxHandle {
+                        guest_id: format!("cancelled-{}", spec.idem_token.0),
+                    },
+                    result: SandboxResult {
+                        exit_code: None,
+                        timed_out: false,
+                        usage: ResourceUsage {
+                            cpu_seconds: 1,
+                            mem_byte_seconds: 1,
+                        },
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    },
+                    output_complete: false,
+                })
+            })()
+            .map_err(SandboxLaunchError::Failed)
         }
 
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
@@ -1640,7 +1756,7 @@ mod tests {
         assert_eq!(backend.kills.load(Ordering::SeqCst), 1);
         assert!(matches!(
             error,
-            RunnerError::RetryableAttemptRecorded { ref job_id }
+            RunnerError::RetryableAttemptRecorded { ref job_id, .. }
                 if job_id == "job-log-fail"
         ));
         assert_eq!(reporter.reports.load(Ordering::SeqCst), 0);
@@ -1649,6 +1765,204 @@ mod tests {
             1,
             "one retryable measured attempt is handed to the claim-aware reporter"
         );
+        assert!(hook_settlements.lock().unwrap().is_empty());
+    }
+
+    // ─────────── run_one's dispatch on a launch-level SandboxLaunchError (Sol's review) ───────────
+
+    /// A `RetryableAttempt` surfacing directly from `launch_streaming` itself (no successful
+    /// `SandboxLaunch`/handle ever existed — the backend already tore everything down) must reach
+    /// the reporter's OWN retryable-attempt transaction with the EXACT cause + usage the backend
+    /// carried, emit no `job.done`, and never call the Hook-side settle closure directly (that
+    /// would silently duplicate or bypass the reporter's own durable accounting).
+    #[test]
+    fn run_one_routes_a_launch_level_retryable_attempt_to_the_reporter_with_exact_cause_and_usage()
+    {
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-launch-retry",
+            "job-launch-retry",
+            vec!["linux".into()],
+            ci_spec("idem-launch-retry"),
+        ));
+        let forced_usage = ResourceUsage {
+            cpu_seconds: 9,
+            mem_byte_seconds: 900,
+        };
+        let backend = RecordingBackend {
+            forced_launch_error: Some(SandboxLaunchError::RetryableAttempt {
+                source: HookError("injected sandbox infrastructure failure".into()),
+                cause: RetryableAttemptCause::SandboxInfrastructure,
+                usage: forced_usage,
+            }),
+            ..RecordingBackend::default()
+        };
+        let firehose = CountingFirehose::new();
+        let reporter_settlements = Arc::new(Mutex::new(Vec::new()));
+        let reporter =
+            RecordingTerminalReporter::reporter_owned(reporter_settlements.clone(), false);
+        let hook_settlements = Arc::new(Mutex::new(Vec::new()));
+        let agent = RunnerAgent::new(
+            "worker-launch-retry",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q,
+            &backend,
+            &firehose,
+            &reporter,
+            hooks_with_owner(
+                CompletionSettlementOwner::TerminalReporter,
+                hook_settlements.clone(),
+            ),
+        );
+
+        let error = agent
+            .run_one(1000)
+            .expect_err("a launch-level retryable attempt is never a terminal success");
+        assert!(matches!(
+            error,
+            RunnerError::RetryableAttemptRecorded { ref job_id, ref message }
+                if job_id == "job-launch-retry"
+                    // `HookError`'s own Display prepends "runner hook failed: " to the raw message.
+                    && message == "runner hook failed: injected sandbox infrastructure failure"
+        ));
+        assert_eq!(
+            reporter.reports.load(Ordering::SeqCst),
+            0,
+            "no job.done emitted"
+        );
+        assert_eq!(reporter.retry_reports.load(Ordering::SeqCst), 1);
+        assert_eq!(*reporter_settlements.lock().unwrap(), vec![forced_usage]);
+        assert_eq!(
+            *reporter.retry_causes.lock().unwrap(),
+            vec![RetryableAttemptCause::SandboxInfrastructure]
+        );
+        assert!(
+            hook_settlements.lock().unwrap().is_empty(),
+            "the Hook-side settle closure must never fire directly for a reporter-routed attempt"
+        );
+        assert_eq!(
+            backend.kills.load(Ordering::SeqCst),
+            0,
+            "no SandboxLaunch/handle ever existed to kill — the backend already tore itself down"
+        );
+    }
+
+    /// If the reporter's OWN retryable-attempt transaction fails (e.g. a rolled-back commit), that
+    /// must surface as `ReportFailed` — never silently swallowed, never misreported as an ordinary
+    /// `LaunchFailed` that would suggest no measured attempt happened at all.
+    #[test]
+    fn run_one_surfaces_reporter_failure_as_report_failed_for_a_launch_level_retryable_attempt() {
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-launch-retry-fail",
+            "job-launch-retry-fail",
+            vec!["linux".into()],
+            ci_spec("idem-launch-retry-fail"),
+        ));
+        let backend = RecordingBackend {
+            forced_launch_error: Some(SandboxLaunchError::RetryableAttempt {
+                source: HookError("injected sandbox infrastructure failure".into()),
+                cause: RetryableAttemptCause::SandboxInfrastructure,
+                usage: ResourceUsage {
+                    cpu_seconds: 1,
+                    mem_byte_seconds: 1,
+                },
+            }),
+            ..RecordingBackend::default()
+        };
+        let firehose = CountingFirehose::new();
+        let reporter_settlements = Arc::new(Mutex::new(Vec::new()));
+        // `fail: true` — the reporter's own retryable-attempt transaction rolls back.
+        let reporter = RecordingTerminalReporter::reporter_owned(reporter_settlements, true);
+        let hook_settlements = Arc::new(Mutex::new(Vec::new()));
+        let agent = RunnerAgent::new(
+            "worker-launch-retry-fail",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q,
+            &backend,
+            &firehose,
+            &reporter,
+            hooks_with_owner(
+                CompletionSettlementOwner::TerminalReporter,
+                hook_settlements,
+            ),
+        );
+
+        let error = agent
+            .run_one(1000)
+            .expect_err("a rolled-back retryable-attempt report must surface, not succeed");
+        assert!(
+            matches!(error, RunnerError::ReportFailed(_)),
+            "got {error:?}"
+        );
+    }
+
+    /// `DurableOutcomeUnknown` must never release, settle, or report a retryable attempt — the
+    /// durable commit outcome is genuinely unknown, so guessing either way would misaccount a real
+    /// reservation. It surfaces as a loud `LaunchFailed` naming reconciliation, with NO accounting
+    /// action taken at all.
+    #[test]
+    fn run_one_never_reports_or_settles_a_durable_outcome_unknown_launch_failure() {
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-outcome-unknown",
+            "job-outcome-unknown",
+            vec!["linux".into()],
+            ci_spec("idem-outcome-unknown"),
+        ));
+        let backend = RecordingBackend {
+            forced_launch_error: Some(SandboxLaunchError::DurableOutcomeUnknown(HookError(
+                "injected ambiguous commit outcome".into(),
+            ))),
+            ..RecordingBackend::default()
+        };
+        let firehose = CountingFirehose::new();
+        let reporter_settlements = Arc::new(Mutex::new(Vec::new()));
+        let reporter =
+            RecordingTerminalReporter::reporter_owned(reporter_settlements.clone(), false);
+        let hook_settlements = Arc::new(Mutex::new(Vec::new()));
+        let agent = RunnerAgent::new(
+            "worker-outcome-unknown",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q,
+            &backend,
+            &firehose,
+            &reporter,
+            hooks_with_owner(
+                CompletionSettlementOwner::TerminalReporter,
+                hook_settlements.clone(),
+            ),
+        );
+
+        let error = agent
+            .run_one(1000)
+            .expect_err("an outcome-unknown launch failure is never a terminal success");
+        assert!(
+            matches!(error, RunnerError::LaunchFailed(ref msg) if msg.contains("reconcil")),
+            "expected a loud LaunchFailed naming reconciliation ownership, got {error:?}"
+        );
+        assert_eq!(reporter.reports.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            reporter.retry_reports.load(Ordering::SeqCst),
+            0,
+            "an outcome-unknown failure must never be reported as a retryable attempt"
+        );
+        assert!(reporter_settlements.lock().unwrap().is_empty());
         assert!(hook_settlements.lock().unwrap().is_empty());
     }
 
@@ -1699,7 +2013,7 @@ mod tests {
         );
         assert!(matches!(
             error,
-            RunnerError::RetryableAttemptRecorded { ref job_id }
+            RunnerError::RetryableAttemptRecorded { ref job_id, .. }
                 if job_id == "job-live-log-fail"
         ));
         assert_eq!(
@@ -1780,6 +2094,7 @@ mod tests {
             reports: AtomicUsize::new(0),
             retry_reports: AtomicUsize::new(0),
             settlements: reporter_settlements.clone(),
+            retry_causes: Arc::new(Mutex::new(Vec::new())),
             fail: false,
         };
         let unowned = RunnerAgent::new(

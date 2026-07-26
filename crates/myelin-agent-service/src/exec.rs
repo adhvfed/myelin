@@ -94,9 +94,9 @@
 use crate::escape_gate::AgentExecGate;
 use myelin_agent::{Command, EffectKind, ToolDef, ToolHands, ToolResult};
 use myelin_ci_sandbox::{
-    agent_job, EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
-    ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, SecretRef, SpecError,
-    TrustTier, WorkspaceSpec,
+    agent_job, CompletionSettlementOwner, EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind,
+    JobSpec, MeterTarget, ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend,
+    SandboxLaunchError, SecretRef, SpecError, TrustTier, WorkspaceSpec,
 };
 
 /// The env-var name of the **shared platform token** that MUST be scrubbed from the child env before
@@ -393,6 +393,16 @@ impl<'a, B: SandboxBackend> SandboxToolHands<'a, B> {
     /// production backend's real-kernel escape drill was green (ZERO escapes). No green attestation ⇒
     /// no `SandboxToolHands` ⇒ this method is unreachable.
     pub fn dispatch_compute(&self, job: &SandboxJob) -> Result<ToolResult, ExecError<B::Error>> {
+        // This dispatch is a direct synchronous call (like the git-wire path) — there is no
+        // terminal-reporter/job-queue machinery above it to route a `SandboxLaunchError::
+        // RetryableAttempt` through. Refuse BEFORE reserve/launch if the hooks are reporter-owned:
+        // a `RetryableAttempt` surfacing here would otherwise convert straight into an inert error
+        // string (via `ToolHands::exec`'s `Display`), with NEITHER usage accounted NOR the claim
+        // requeued — the exact silent-accounting-loss class Sol's review caught in the CI runner
+        // and in git-wire, just one seam further out.
+        if self.hooks.completion_settlement_owner() != CompletionSettlementOwner::Hook {
+            return Err(ExecError::SettlementOwnerNotHook);
+        }
         // The whole of execution goes through `launch` — there is no host-exec bypass (1.6). `launch`
         // fires: #4 isolation floor → #2 attribution → #1a reserve (refuse-on-exhaustion) → (guest
         // runs the compute) → #1b settle, in the mandated order (the backend owns the order).
@@ -435,12 +445,24 @@ impl<'a, B: SandboxBackend> SandboxToolHands<'a, B> {
 /// An exec dispatch failure — a fail-closed reserve refusal / token rejection / isolation-floor
 /// miss surfaced from the backend, or a teardown failure. Carries the backend's own error so the
 /// refusal is self-describing and LOUD (never a swallowed pass).
+///
+/// `Launch` carries the full [`SandboxLaunchError`] (not just the backend's bare error) so a
+/// post-commit backend failure stays distinguishable here too — this dispatch path is a direct
+/// synchronous call (like the git-wire path, not the CI runner's async job-queue/reporter
+/// machinery), so a `RetryableAttempt` surfacing here has no `report_retryable_attempt` transaction
+/// to route through; the caller sees it and can act (log/alert) rather than have it silently
+/// collapsed into an indistinguishable bare backend error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecError<E> {
     /// `launch` was refused (a four-guarantee hook said no, or the backend could not start).
-    Launch(E),
+    Launch(SandboxLaunchError<E>),
     /// the whole-guest kill on teardown failed (guarantee #4 — surfaced, not ignored).
     Kill(E),
+    /// Refused BEFORE reserve/launch: this direct synchronous dispatch has no terminal-reporter
+    /// machinery to route a post-commit `SandboxLaunchError::RetryableAttempt` through, so it
+    /// requires `CompletionSettlementOwner::Hook` — a reporter-owned configuration would silently
+    /// lose accounting on exactly the failure class this whole fix exists to close.
+    SettlementOwnerNotHook,
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for ExecError<E> {
@@ -448,6 +470,11 @@ impl<E: std::fmt::Display> std::fmt::Display for ExecError<E> {
         match self {
             ExecError::Launch(e) => write!(f, "sandbox launch refused: {e}"),
             ExecError::Kill(e) => write!(f, "sandbox teardown (whole-guest kill) failed: {e}"),
+            ExecError::SettlementOwnerNotHook => write!(
+                f,
+                "direct sandbox dispatch requires Hook-owned completion settlement (no terminal \
+                 reporter exists on this path to route a retryable attempt through)"
+            ),
         }
     }
 }
@@ -854,30 +881,33 @@ mod tests {
             &self,
             spec: &JobSpec,
             hooks: &RunnerHooks,
-        ) -> Result<SandboxLaunch, Self::Error> {
-            hooks.enforce_isolation_floor(spec)?;
-            self.order.lock().unwrap().push("isolation_floor");
-            let res = hooks.reserve(spec)?;
-            self.order.lock().unwrap().push("reserve");
-            if let Err(error) = hooks.attribute(spec) {
-                hooks.release_unused(spec, &res)?;
-                return Err(error);
-            }
-            self.order.lock().unwrap().push("attribute");
-            // ... the hardened guest runs the compute here; the seam carries the result back ...
-            let result = SandboxResult::stub_ok(ResourceUsage {
-                cpu_seconds: 1,
-                mem_byte_seconds: 1,
-            });
-            hooks.settle_completed(spec, &res, result.usage)?;
-            self.order.lock().unwrap().push("settle");
-            Ok(SandboxLaunch {
-                handle: SandboxHandle {
-                    guest_id: "agent-guest".into(),
-                },
-                result,
-                output_complete: true,
-            })
+        ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+            (|| -> Result<SandboxLaunch, HookError> {
+                hooks.enforce_isolation_floor(spec)?;
+                self.order.lock().unwrap().push("isolation_floor");
+                let res = hooks.reserve(spec)?;
+                self.order.lock().unwrap().push("reserve");
+                if let Err(error) = hooks.attribute(spec) {
+                    hooks.release_unused(spec, &res)?;
+                    return Err(error);
+                }
+                self.order.lock().unwrap().push("attribute");
+                // ... the hardened guest runs the compute here; the seam carries the result back ...
+                let result = SandboxResult::stub_ok(ResourceUsage {
+                    cpu_seconds: 1,
+                    mem_byte_seconds: 1,
+                });
+                hooks.settle_completed(spec, &res, result.usage)?;
+                self.order.lock().unwrap().push("settle");
+                Ok(SandboxLaunch {
+                    handle: SandboxHandle {
+                        guest_id: "agent-guest".into(),
+                    },
+                    result,
+                    output_complete: true,
+                })
+            })()
+            .map_err(SandboxLaunchError::Failed)
         }
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
             self.kills.fetch_add(1, Ordering::SeqCst);
@@ -1007,7 +1037,49 @@ mod tests {
             .build_compute_job(&compute_tool_def(), &Command("sh".into()))
             .unwrap();
         let err = hands.dispatch_compute(&job).unwrap_err();
-        assert!(matches!(err, ExecError::Launch(HookError(_))));
+        assert!(matches!(
+            err,
+            ExecError::Launch(SandboxLaunchError::Failed(HookError(_)))
+        ));
+    }
+
+    /// This direct synchronous dispatch has no terminal reporter above it to route a post-commit
+    /// `SandboxLaunchError::RetryableAttempt` through — reporter-owned hooks must be refused BEFORE
+    /// reserve or launch, never silently accepted only to convert a later retryable attempt into an
+    /// inert, unaccounted error string.
+    #[test]
+    fn dispatch_compute_refuses_reporter_owned_hooks_before_reserve_or_launch() {
+        let reserve_called = Arc::new(AtomicU32::new(0));
+        let reserve_called_at = reserve_called.clone();
+        let backend = RecordingBackend {
+            order: Arc::new(Mutex::new(Vec::new())),
+            kills: Arc::new(AtomicU32::new(0)),
+        };
+        let hooks = RunnerHooks::new(
+            myelin_ci_sandbox::CompletionSettlementOwner::TerminalReporter,
+            Box::new(move |spec| {
+                reserve_called_at.fetch_add(1, Ordering::SeqCst);
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let hands = hands(&backend, hooks);
+        let job = hands
+            .build_compute_job(&compute_tool_def(), &Command("sh".into()))
+            .unwrap();
+        let err = hands.dispatch_compute(&job).unwrap_err();
+        assert!(matches!(err, ExecError::SettlementOwnerNotHook));
+        assert_eq!(
+            reserve_called.load(Ordering::SeqCst),
+            0,
+            "reporter-owned hooks must refuse before reserve is ever called"
+        );
+        assert!(
+            backend.order.lock().unwrap().is_empty(),
+            "the backend's launch must never be driven under reporter-owned hooks here"
+        );
     }
 
     #[test]

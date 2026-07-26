@@ -423,7 +423,7 @@ mod tests {
             &self,
             _spec: &SandboxJobSpec,
             _hooks: &myelin_ci_sandbox::RunnerHooks,
-        ) -> Result<SandboxLaunch, Self::Error> {
+        ) -> Result<SandboxLaunch, myelin_ci_sandbox::SandboxLaunchError<Self::Error>> {
             Ok(SandboxLaunch {
                 handle: SandboxHandle {
                     guest_id: "unused-inline".into(),

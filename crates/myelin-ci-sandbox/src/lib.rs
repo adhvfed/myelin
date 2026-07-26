@@ -945,6 +945,70 @@ impl SandboxCancellation {
     }
 }
 
+/// A [`SandboxBackend::launch`]/[`launch_streaming`](SandboxBackend::launch_streaming) failure,
+/// carrying whatever the backend can honestly prove about whether a durable claim on the attempt
+/// exists — the caller MUST dispatch on this before it can correctly release, settle, or report
+/// (CT-007 vertical-slice: this exists to close a real, pre-existing leak where a launch failure
+/// after the durable launch CAS committed, or after the guest genuinely started executing, was
+/// indistinguishable from an ordinary pre-commit refusal, so the caller's cost reservation for a
+/// real (if failed) attempt was silently never released NOR settled).
+///
+/// Deliberately has **no** blanket `From<E>` impl. A caller must explicitly choose
+/// [`SandboxLaunchError::Failed`] (or one of the other variants) rather than letting `?` silently
+/// reclassify every new backend error as an ordinary pre-commit refusal — the exact failure mode
+/// this type exists to make impossible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxLaunchError<E> {
+    /// No retryable-attempt record is available through this return — either the failure is an
+    /// ordinary pre-commit refusal (isolation floor, hardening, image resolution, cost exhaustion,
+    /// final attribution), or the backend has already performed whatever hook cleanup it supports
+    /// for a genuinely ambiguous/unattemptable case. The caller propagates this as an ordinary
+    /// launch failure; no terminal report, no retryable-attempt record.
+    Failed(E),
+
+    /// A durable running claim existed for this attempt (a committed launch permit, or a process
+    /// that genuinely started executing) and the sandbox has been fully killed/reaped by the time
+    /// this returned. Reporter-owned completion accounting MUST durably record `usage` under
+    /// `cause` and either requeue the exact claim OR terminalize it (a concurrent supersession can
+    /// win first) — settling this any other way (including silently dropping it) reproduces the
+    /// leak this type exists to close.
+    RetryableAttempt {
+        source: E,
+        cause: crate::runner::RetryableAttemptCause,
+        usage: ResourceUsage,
+    },
+
+    /// The durable launch CAS may or may not have committed — the backend cannot honestly tell
+    /// (e.g. the store returned an error but the underlying commit may have already landed and lost
+    /// its acknowledgement). The caller must NOT release, settle, or report a retryable attempt
+    /// under either guess; it must surface this loudly and let durable reconciliation (the existing
+    /// lease/claim reaper) resolve the ambiguity instead.
+    DurableOutcomeUnknown(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for SandboxLaunchError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SandboxLaunchError::Failed(e) => write!(f, "{e}"),
+            SandboxLaunchError::RetryableAttempt { source, cause, .. } => {
+                write!(
+                    f,
+                    "retryable sandbox infrastructure attempt ({}): {source}",
+                    cause.as_storage_token()
+                )
+            }
+            SandboxLaunchError::DurableOutcomeUnknown(e) => {
+                write!(
+                    f,
+                    "durable launch outcome unknown (needs reconciliation): {e}"
+                )
+            }
+        }
+    }
+}
+
+impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for SandboxLaunchError<E> {}
+
 /// The sandbox backend (arch 01 §2): Firecracker (default) | Gvisor (named 2nd) | SelfHosted
 /// (delegated). The **trait SHAPE only** at P-129 — the Firecracker impl is CI-P2 (→ P-237), the
 /// gVisor impl is CI-P28, the self-hosted impl is CI-P4. `launch` carries the [`RunnerHooks`]
@@ -964,7 +1028,11 @@ pub trait SandboxBackend: Sync {
     /// it — idempotent if the guest already exited) AND the command's [`SandboxResult`]
     /// (exit/timeout/usage/captured-streams). The runner DERIVES its terminal report from the
     /// result; it is no longer supplied as an input (RESHAPE-001 / CT-001).
-    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error>;
+    fn launch(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+    ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>>;
 
     /// Launch while delivering boundary-redacted output incrementally during execution.
     ///
@@ -978,7 +1046,7 @@ pub trait SandboxBackend: Sync {
         hooks: &RunnerHooks,
         output: Arc<dyn SandboxOutputSink>,
         _cancellation: SandboxCancellation,
-    ) -> Result<SandboxLaunch, Self::Error> {
+    ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
         let launch = self.launch(spec, hooks)?;
         if !launch.result.stdout.is_empty() {
             let _ = output.emit(SandboxOutputStream::Stdout, &launch.result.stdout);
@@ -1775,29 +1843,32 @@ mod tests {
             &self,
             spec: &JobSpec,
             hooks: &RunnerHooks,
-        ) -> Result<SandboxLaunch, Self::Error> {
-            // Drive the four-guarantee seam exactly as a real backend must:
-            hooks.enforce_isolation_floor(spec)?; // #4 isolation floor
-            let res = hooks.reserve(spec)?; // #1a cost gate (reserve)
-            if let Err(attribute_error) = hooks.attribute(spec) {
-                hooks.release_unused(spec, &res)?;
-                return Err(attribute_error);
-            }
-            // ... the guest would run here (a real backend launches the hardened VM) ...
-            // CT-001: the seam now carries the command result; the metering settle (guarantee #1)
-            // settles against `result.usage`.
-            let result = SandboxResult::stub_ok(ResourceUsage {
-                cpu_seconds: 1,
-                mem_byte_seconds: 1,
-            });
-            hooks.settle_completed(spec, &res, result.usage)?; // #1b settle or explicit reporter deferral
-            Ok(SandboxLaunch {
-                handle: SandboxHandle {
-                    guest_id: "noop-guest".into(),
-                },
-                result,
-                output_complete: true,
-            })
+        ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+            (|| -> Result<SandboxLaunch, HookError> {
+                // Drive the four-guarantee seam exactly as a real backend must:
+                hooks.enforce_isolation_floor(spec)?; // #4 isolation floor
+                let res = hooks.reserve(spec)?; // #1a cost gate (reserve)
+                if let Err(attribute_error) = hooks.attribute(spec) {
+                    hooks.release_unused(spec, &res)?;
+                    return Err(attribute_error);
+                }
+                // ... the guest would run here (a real backend launches the hardened VM) ...
+                // CT-001: the seam now carries the command result; the metering settle (guarantee
+                // #1) settles against `result.usage`.
+                let result = SandboxResult::stub_ok(ResourceUsage {
+                    cpu_seconds: 1,
+                    mem_byte_seconds: 1,
+                });
+                hooks.settle_completed(spec, &res, result.usage)?; // #1b settle or explicit reporter deferral
+                Ok(SandboxLaunch {
+                    handle: SandboxHandle {
+                        guest_id: "noop-guest".into(),
+                    },
+                    result,
+                    output_complete: true,
+                })
+            })()
+            .map_err(SandboxLaunchError::Failed)
         }
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
             Ok(())
@@ -1893,7 +1964,10 @@ mod tests {
             Box::new(|_s| Ok(())),
         );
         let r = backend.launch(&ci_spec(), &hooks);
-        assert_eq!(r.unwrap_err(), HookError("wallet exhausted".into()));
+        assert_eq!(
+            r.unwrap_err(),
+            SandboxLaunchError::Failed(HookError("wallet exhausted".into()))
+        );
     }
 
     #[test]

@@ -946,3 +946,157 @@ manager, a generalized OCI mount abstraction, the pre-existing `ContainerRun` op
 genuine prerequisite, plus the separately-scoped in-guest checkout transport) — not a single
 slice like `workspace_storage.rs` itself was. Not started; checked in with the founder on
 sequencing before touching `gvisor.rs` at all, given its criticality and the size just revealed.
+
+## 2026-07-26 — the pre-existing `ContainerRun` reserve/settle leak: fixed, with Sol (5 review rounds)
+
+The founder's answer to the sequencing check-in above was explicit: **"Have sol help you and go the
+whole way."** This entry covers the FIRST piece of that — the pre-existing `ContainerRun`
+reserve/settle leak flagged above as a genuine prerequisite — landed as its own focused unit before
+starting the larger workspace-storage OCI/UID-namespace body of work.
+
+**The bug, restated precisely:** `launch_with` (gVisor) and `launch_git_command` (the git wire) each
+called `run(...)`/`run_git_wire_container(...)` and, on `Err`, returned the error immediately —
+calling **neither** `hooks.release_unused` **nor** `hooks.settle_completed`. This silently leaked the
+job's cost/capacity reservation on every single run failure, regardless of whether the sandbox had
+actually spawned and consumed real host resources by the time it failed. Live, in the currently-wired
+production launch path — not a staged/unwired module like `workspace_storage.rs`.
+
+**Design (Sol, corrected twice from my own first two proposals):**
+- My first proposal ("settle at zero on any run failure") was wrong: a subsecond failed spawn could
+  legitimately be free, but a job engineered to fail exactly after a real spawn must never be charged
+  zero — a real host-DoS surface. Sol's fix: a phase-tagged failure type distinguishing what was
+  durably true at the moment of failure.
+- My second proposal (3 phases: `Uncommitted` / `CommittedButNotExecuted` / `Executed`, dispatching
+  unconditionally to `release_unused` / `settle_completed(zero)` / `settle_completed(fallback)`) was
+  ALSO wrong, caught on the FIRST full-implementation review round: `settle_completed` is a documented
+  no-op under `CompletionSettlementOwner::TerminalReporter` (production's real setting —
+  `CiPipelineReporter::completion_settlement_owner()` returns it whenever `ReporterAccounting::Durable`
+  is in play). Calling it for a post-commit failure under reporter ownership silently discards the
+  accounting with **no terminal report ever following** — reproducing the exact leak class this fix
+  exists to close, just relocated. Sol's corrected design added a 4th phase and made the dispatch
+  depend on `CompletionSettlementOwner` too:
+
+  | Phase                     | `Hook` owner                        | `TerminalReporter` owner                          |
+  |----------------------------|--------------------------------------|----------------------------------------------------|
+  | `Uncommitted`              | `release_unused`, then `Failed`      | `release_unused`, then `Failed` (owner-independent) |
+  | `CommitOutcomeUnknown`     | `DurableOutcomeUnknown` (neither)     | `DurableOutcomeUnknown` (neither, owner-independent)|
+  | `CommittedButNotExecuted`  | settle zero, then `Failed`           | `RetryableAttempt(SandboxInfrastructure, zero)`     |
+  | `Executed`                 | settle usage, then `Failed`          | `RetryableAttempt(SandboxInfrastructure, usage)`    |
+
+  `CommitOutcomeUnknown` covers a genuinely new case Sol caught: a `permit.commit()` **error** does
+  NOT prove the underlying durable store didn't actually commit (e.g. a Postgres commit whose result
+  never reached the caller) — calling this `Uncommitted` would let a caller release a reservation the
+  store may still consider owned. Neither release nor settle; the existing durable lease/claim reaper
+  reconciles it.
+
+**What shipped (production `myelin-ci-sandbox`/`myelin-ci-controlplane`/`myelin-agent-service` code,
+not staged):**
+- `SandboxLaunchError<E> { Failed(E), RetryableAttempt{source, cause, usage}, DurableOutcomeUnknown(E) }`
+  — the new shared return type for `SandboxBackend::launch`/`launch_streaming`, replacing the bare
+  backend error. Deliberately NO blanket `From<E>` impl (Sol: it would let `?` silently reclassify
+  every new error as an uninformative `Failed`, recreating the exact bug this closes) — every site
+  must explicitly choose a variant.
+- `RetryableAttemptCause` (runner.rs) gained `SandboxInfrastructure` alongside the existing
+  `OutputPersistence`, plus the ONE canonical `as_storage_token()`/`from_storage_token()` mapping.
+  This exposed and fixed a second, independent pre-existing bug Sol caught while reviewing the design:
+  `ci_pipeline_driver.rs`'s `record_retryable_attempt_on_conn` **hardcoded** `OUTPUT_PERSISTENCE_CAUSE`
+  into the persisted record regardless of `failure.cause` — harmless only because there was exactly
+  one cause until now. Fixed at the write site (a small pure `expected_retry_attempt_record()` helper,
+  now unit-tested to prove `SandboxInfrastructure` produces its own cause AND its own distinct receipt
+  hash — a test that would have caught the original bug, unlike decode-only coverage) and generalized
+  `decode_retry_attempts`'s validation from `== OUTPUT_PERSISTENCE_CAUSE` to
+  `RetryableAttemptCause::from_storage_token(...).is_some()`.
+- `launch_gate.rs`: `SpawnPhase` gained `CommitOutcomeUnknown`. `SandboxChild` now carries a mandatory
+  `executed_at: Instant` — captured immediately before `Command::spawn` (unfenced) or immediately
+  before the gate-release write (fenced), fixing a real timing bug caught in round 2 where the
+  timestamp was captured AFTER the write (undercounting real execution time in every fallback
+  computation, the successful `RunscOutcome.wall`, and the timeout-deadline comparison).
+- `gvisor.rs`: `RunFailure` is the 4-variant enum matching the table above (`Executed`'s usage is
+  mandatory, not `Option` — an "executed but no usage computed" state cannot be constructed, though a
+  genuinely-zero usage still could be; `executed_fallback_usage`'s 1-second wall-floor is what
+  actually prevents that in practice). `launch_with`'s post-run dispatch lives in a new
+  `dispose_run_failure` method implementing the exact table. The `try_wait()` polling-loop error path
+  now kills/reaps the child THEN joins the stdout/stderr/stdin drain threads THEN returns (previously
+  an early `?` leaked all three threads on a wait-syscall failure — found during round 2 review).
+
+  Git-wire (`launch_git_command`) had its OWN, structurally different instance of the same bug class,
+  found while implementing the gVisor fix: it called `hooks.attribute(&job)` (commit-and-release
+  attribution) BEFORE ever attempting to spawn, then passed `None` for the launch permit into
+  `run_and_capture` — decoupling the durable commit from the actual OS spawn entirely, so EVERY
+  post-spawn `RunFailure` was structurally mislabeled `Uncommitted` regardless of what actually
+  happened. Fixed by threading the real, retained `LaunchPermit` through
+  (`acquire_launch_permit` → `run_git_wire_container(..., permit)` →
+  `run_and_capture(..., Some(permit))`) so the SAME durable-commit gate the CI/agent path uses also
+  governs the git-wire spawn. Git-wire also now refuses up front (before reserve) if
+  `hooks.completion_settlement_owner() != Hook` — it is a direct synchronous call with no terminal
+  reporter above it to route a `RetryableAttempt` through, so reporter-owned hooks here would silently
+  lose accounting; its own 4-phase dispatch (extracted into a standalone, unit-testable
+  `dispose_git_wire_run_failure`) always settles synchronously, never emitting `RetryableAttempt`. Its
+  over-cap response-truncation path (`OutputTooLarge`, a REAL completed execution — deterministic for
+  the same request/limit, never retryable) now settles `result.usage` synchronously before returning,
+  instead of leaving a completed attempt unsettled.
+- `runner.rs`'s `run_one` (the actual CI-job poll loop): `CompletionClaim` is now constructed BEFORE
+  the launch (needed inside the launch-result dispatch, which a launch-level `RetryableAttempt` can
+  reach with no successful `SandboxLaunch`/handle ever having existed). Dispatches
+  `SandboxLaunchError` into: `Failed` → `RunnerError::LaunchFailed`; `DurableOutcomeUnknown` → a loud
+  `LaunchFailed` naming reconciliation ownership, no report at all; `RetryableAttempt` →
+  `self.reporter.report_retryable_attempt(...)` then `RunnerError::RetryableAttemptRecorded` (now
+  carrying a `message: String` field too, so an operator can distinguish a wait failure from an
+  ownership failure from a drain failure instead of seeing only the opaque `cause` enum — the raw
+  message is still NOT threaded into the durable retry-accrual record itself, matching the existing
+  precedent).
+- `myelin-agent-service`'s `SandboxToolHands::dispatch_compute` (the OTHER direct-synchronous-call
+  site, `ToolHands::exec`'s explicit fallible form) has the exact same "no reporter above it" shape as
+  git-wire — found by Sol on the FIRST full-implementation review, not something I'd considered.
+  Fixed identically: refuses (`ExecError::SettlementOwnerNotHook`) before reserve/launch if hooks
+  aren't Hook-owned; `ExecError::Launch` now carries the full `SandboxLaunchError<E>` instead of a
+  bare backend error.
+- `firecracker.rs` (confirmed dormant/unwired — `runner_bind.rs`, the real production wiring,
+  constructs ONLY `GvisorBackend`): mechanically compatibility-wrapped as `SandboxLaunchError::Failed`
+  (phase-unclassified — this backend doesn't yet make the 4-way distinction, so no retryable-attempt
+  record is available through this return, which is honestly true today). Sol required more than a
+  comment here: `production_pg_bootstrap_source.rs` (the existing source-text-inspection guard suite
+  for controlplane's production wiring) now asserts `runner_bind.rs`'s source never contains
+  `"FirecrackerBackend"`, failing RED the moment anyone wires it in, with a message naming this a
+  production-activation blocker until Firecracker gets gVisor's same phase-aware treatment.
+
+**Review process:** built jointly with Sol (gpt-5.6-sol) across 5 rounds on the full diff (not just
+the design) — matching the rigor already established for `workspace_storage.rs`. Every round found a
+genuine, concrete defect, not style preference: round 1 (design) caught my two wrong zero-usage
+proposals; round 2 (full implementation) caught the reporter-ownership silent-discard bug, the
+git-wire structural mislabeling, the `permit.commit()`-error ambiguity, the timing bug, the
+thread-leak on `try_wait()` error, the missing agent-service parity fix, and the Firecracker
+mechanical-guard gap; round 3 confirmed the fixes and asked for concrete test coverage (added: 6
+gVisor phase×owner dispatch tests, 3 `run_one` dispatch tests via a new `forced_launch_error` fixture
+field, git-wire's 4-phase dispatch + ownership-refusal tests, launch-gate exact-phase assertions, the
+cause-decode/round-trip/write-side-binding tests) plus wording precision fixes; round 4 caught one
+test assertion that didn't account for `HookError`'s own `Display` prefix (fixed) plus 3 more wording
+nits; round 5 confirmed clean with no remaining findings.
+
+**Verified:** `cargo build`/`test`/`clippy -D warnings` clean across the FULL workspace
+(`--all-targets --features integration`), `myelin-lints`'s `no-host-exec` gate at 0 violations
+(768 files scanned), all touched files `rustfmt --check` clean (formatted only the files this diff
+actually touched, not `cargo fmt --all` — confirmed via per-file `--check` first that no unrelated
+pre-existing drift got swept in). Also found and fixed, in scope, one MORE pre-existing bug from
+earlier in this same effort: a doc comment (written during the design phase, before this diff's
+`RunFailure` rewrite) contained the literal source text `` gate.write_all(b"launch\n") `` ABOVE the
+real code, breaking `production_pg_bootstrap_source.rs`'s byte-offset ordering assertion on
+`launch_gate.rs`'s source. Confirmed via `git stash` this was a real, currently-red regression from
+earlier in the session, not a pre-existing failure — fixed by rewording the comment.
+
+**Two pre-existing failures found during full verification, confirmed via `git stash` against the
+base commit to be unrelated to this diff, deliberately left out of scope:**
+1. `firecracker_production_launch_contains_the_corpus_non_root` (myelin-ci-sandbox) — requires real
+   `/dev/kvm` + a staged kernel/rootfs + the `firecracker` binary; fails identically on the base
+   commit. A genuine Firecracker escape-drill/corpus-routing issue, unrelated to gVisor/git-wire.
+2. `chat_p5_co_commit_idempotent_send_and_per_conversation_order` (myelin-chat) — a hardcoded test
+   ULID collides with a leftover row from an earlier run against the shared dev Postgres; fails
+   identically on the base commit. Dev-DB contamination, unrelated to this subsystem.
+
+Neither is chased further here; both are named rather than silently dropped.
+
+**Still open (the original, much larger body of work this was a prerequisite for):** the actual
+`workspace_storage.rs` wiring into `gvisor.rs` — the persistent locked/poisoned `WorkspaceStorage`
+manager, host-disk-capacity accounting in `reserve`, the generalized OCI mount abstraction, and the
+`UserNamespaceLease` subsystem for the UID-65534 mapping problem — none of that has started yet. This
+entry closes exactly the named prerequisite, as its own focused commit.

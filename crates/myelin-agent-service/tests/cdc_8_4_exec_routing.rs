@@ -37,7 +37,7 @@ use myelin_ci_sandbox::{
     parse_console, Backend, BackendRun, EgressPolicy, EnvVar, EscapeAttestation, HookError,
     IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ReserveHandle, ResourceLimits,
     ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch,
-    SandboxResult, SecretRef, TrustTier, CORPUS, CORPUS_VERSION,
+    SandboxLaunchError, SandboxResult, SecretRef, TrustTier, CORPUS, CORPUS_VERSION,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -87,36 +87,44 @@ struct RunnerSeam {
 
 impl SandboxBackend for RunnerSeam {
     type Error = HookError;
-    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
-        hooks.enforce_isolation_floor(spec)?;
-        self.order.lock().unwrap().push("isolation_floor");
-        let mut reserve_spec = spec.clone();
-        if self.reserve_exhausted {
-            reserve_spec.meter_to = MeterTarget {
-                reserve_id: "__exhausted__".into(),
-            };
-        }
-        let res = hooks.reserve(&reserve_spec)?;
-        self.order.lock().unwrap().push("reserve");
-        if let Err(error) = hooks.attribute(spec) {
-            hooks.release_unused(&reserve_spec, &res)?;
-            return Err(error);
-        }
-        self.order.lock().unwrap().push("attribute");
-        // ... the hardened guest runs the (compute) command here; the seam carries the result back ...
-        let result = SandboxResult::stub_ok(ResourceUsage {
-            cpu_seconds: 2,
-            mem_byte_seconds: 4,
-        });
-        hooks.settle_completed(&reserve_spec, &res, result.usage)?;
-        self.order.lock().unwrap().push("settle");
-        Ok(SandboxLaunch {
-            handle: SandboxHandle {
-                guest_id: "fabric-guest".into(),
-            },
-            result,
-            output_complete: true,
-        })
+    fn launch(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+    ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+        (|| -> Result<SandboxLaunch, HookError> {
+            hooks.enforce_isolation_floor(spec)?;
+            self.order.lock().unwrap().push("isolation_floor");
+            let mut reserve_spec = spec.clone();
+            if self.reserve_exhausted {
+                reserve_spec.meter_to = MeterTarget {
+                    reserve_id: "__exhausted__".into(),
+                };
+            }
+            let res = hooks.reserve(&reserve_spec)?;
+            self.order.lock().unwrap().push("reserve");
+            if let Err(error) = hooks.attribute(spec) {
+                hooks.release_unused(&reserve_spec, &res)?;
+                return Err(error);
+            }
+            self.order.lock().unwrap().push("attribute");
+            // ... the hardened guest runs the (compute) command here; the seam carries the
+            // result back ...
+            let result = SandboxResult::stub_ok(ResourceUsage {
+                cpu_seconds: 2,
+                mem_byte_seconds: 4,
+            });
+            hooks.settle_completed(&reserve_spec, &res, result.usage)?;
+            self.order.lock().unwrap().push("settle");
+            Ok(SandboxLaunch {
+                handle: SandboxHandle {
+                    guest_id: "fabric-guest".into(),
+                },
+                result,
+                output_complete: true,
+            })
+        })()
+        .map_err(SandboxLaunchError::Failed)
     }
     fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
         self.kills.fetch_add(1, Ordering::SeqCst);
