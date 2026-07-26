@@ -135,8 +135,7 @@ pub use gvisor::{
 pub use gvisor::{
     assert_repo_under_root, resolve_bare_repo_path, resolved_gvisor_git_rootfs,
     validate_wire_repo_slug, validate_wire_segment, GitWireSpec, MemoryCgroup, WireError,
-    WireMount, ENV_GVISOR_GIT_ROOTFS, ENV_RUNSC_BIN, WIRE_QUARANTINE_MOUNT, WIRE_REPO_MOUNT,
-    WIRE_STDIN_BOUND,
+    ENV_GVISOR_GIT_ROOTFS, ENV_RUNSC_BIN, WIRE_QUARANTINE_MOUNT, WIRE_REPO_MOUNT, WIRE_STDIN_BOUND,
 };
 
 pub use runner::{
