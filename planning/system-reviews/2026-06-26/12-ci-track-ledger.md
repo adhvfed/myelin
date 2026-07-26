@@ -846,3 +846,103 @@ workspaces` doc names as the caller's job) — all deferred, none built yet. 11 
 `ci-workload-inventory.toml` rows remain `not-started`; the other CI job families
 (frontend+Chromium+Valkey, web-container Docker-in-guest, integration multi-service stack, rustsec
 advisory-DB broker, pnpm) have no runner-asset design started at all yet.
+
+**2026-07-26 (later): planned the `gvisor.rs` integration with Sol before writing any code —
+the scope is substantially larger than a single reviewable slice, recorded here in full rather
+than discovered piecemeal mid-implementation.**
+
+**Revised launch order** (vs. today's isolation-floor → hardening → registry-resolve → reserve →
+permit → run → settle): resolve immutable assets (rootfs + any read-only dep asset) → a read-only
+workspace-storage health check → `reserve` (now must include AGGREGATE host-disk admission, not
+just this job's own quota — a per-job qgroup limit is a ceiling, not a reservation of physical free
+space) → create the Btrfs workspace → build the OCI config with the workspace mount → acquire the
+launch permit → run to completion, confirming the runsc/gofer process tree is actually gone → settle
+→ delete+sync the workspace regardless of settlement outcome → release the local disk-capacity
+lease. Workspace creation must NOT happen before `reserve` (as I first proposed) — that would let
+jobs that can never get capacity still churn privileged Btrfs subvolume/qgroup operations, an
+avoidable host-DoS surface.
+
+**A persistent workspace manager, not per-launch `WorkspaceStorage::open`:** `GvisorBackend` needs
+one long-lived manager owning a process-lifetime exclusive lock on the workspace base, a
+`Mutex<WorkspaceStorage>` for short create/delete calls, the active workspace-id set, a
+poisoned/unhealthy admission flag, and boot-time orphan reconciliation run while admission is
+closed. The launch-permit CAS is NOT a workspace lock — it protects a scheduler generation, not
+concurrent workspace mutation. This is the module's own documented, deliberately-deferred
+create-to-bind race; the process-lifetime base lock + centralized active-id tracking is the
+MINIMUM acceptable close for a single-process runner. (If multiple same-euid host processes must
+be in the threat model, an advisory lock alone is insuficient and needs an FD/stable-mount-source
+solution — out of scope for now.)
+
+**Job/subvolume naming:** don't reuse the raw idempotency token as the Btrfs directory name — use
+a server-resolved job/claim-generation identifier encoded as safe hex.
+
+**Spec shape:** an explicit `WorkspaceStorageMode::{Disabled, EphemeralDisk}` (not a bare bool);
+`disk_bytes` stays the quota; host path and ownership are derived INSIDE the backend, never
+caller-supplied in `WorkspaceSpec`. A checkout-bearing spec with storage disabled should be
+refused; an agent job with no repo may still request scratch storage.
+
+**OCI mount details, several of them real gotchas already documented elsewhere in this exact
+file:** bind `/workspace` read-write with `rw,nosuid,nodev` (deliberately NOT `noexec` — cargo
+build scripts and produced binaries must execute from `target/`); set `process.cwd` to
+`/workspace` (currently hardcoded to `/`); keep `/tmp` as the separately-bounded RAM tmpfs
+untouched; construct the mount only from a borrowed `PreparedWorkspace`, never a caller-supplied
+host path; generalize the existing `WireMount` type into a private OCI bind-mount representation
+rather than widening a wire-specific public type into a general host-path authority. **Critically:**
+`root.path` must be set to the ABSOLUTE verified rootfs path for workspace jobs — this file already
+documents (line ~249) that a bundle-relative rootfs symlink combined with a host bind mount breaks
+rootless gofer startup; naively appending `/workspace` to `extra_mounts` while leaving
+`root_path=None` is very likely broken the same way.
+
+**Lifetime/failure handling:** a launch-local `WorkspaceLease` owning the non-`Clone`
+`PreparedWorkspace`; explicit cleanup consumes it, `Drop` never runs the privileged delete — but
+`Drop` (an un-consumed lease, e.g. an unexpected early return) should ATOMICALLY POISON workspace
+admission and emit a critical event, not merely log. `launch_with` should become one inner
+operation plus a single unconditional finalization epilogue, not per-branch duplicated cleanup,
+with these rules: failure before permit commit → rollback permit, release reserve at zero, delete
+workspace; failure after permit commit → terminate/reap the sandbox, settle actual-or-conservative
+usage, delete workspace; settlement failure → still attempt workspace deletion; deletion/sync
+failure → mark the workspace subsystem unhealthy and refuse new admissions (never fold into an
+ordinary retryable "launch failed" that could cause the SAME job to execute twice).
+
+**A real, pre-existing bug found independently while planning this (unrelated to workspace
+storage, a genuine production gap in the CURRENTLY LIVE launch path), confirmed by reading the
+code directly:** `run_production_container_streaming` (`gvisor.rs:918-941`) can return `Err(e)`
+from `run_and_capture` for reasons that occur AFTER the sandbox has actually spawned (the comment
+even says "spawning/waiting failed before a trustworthy result" — not "before spawning"). That
+`Err` bubbles straight up through `launch_with`'s `run(...).map_err(GvisorError::Runtime)?` at line
+~774, which returns EARLY — calling neither `hooks.release_unused` (already past permit
+acquisition) nor `hooks.settle_completed`. **`hooks.reserve(spec)`'s reservation from step 4 is
+never released or settled on this path — a silent, permanent capacity leak in the real, currently
+live production CI launch path**, independent of and blocking-for the workspace-storage
+integration (which needs an honest `NotStarted`/`Started{result, usage, error}` distinction on the
+run outcome to decide release-vs-settle correctly, which today's opaque `Result<ContainerRun,
+String>` cannot express). Also noted: `delete_container` is currently best-effort and ignores its
+own result — workspace jobs need to confirm the runsc/gofer cgroup is actually empty and container
+deletion is complete BEFORE deleting the subvolume underneath it.
+
+**UID namespace: confirmed no shortcut exists.** `runsc --rootless` maps only the caller's host
+UID/GID to container UID/GID 0; container UID 65534 (the non-root payload identity this sandbox
+already uses via `--reuid`/`--regid`) has NO mapping at all — there is no host UID a workspace
+could simply be `chown`'d to that would satisfy it, and no permissive mode-bit/ACL fixes an
+unmapped-id `EINVAL`. Real production Rust jobs writing to `/workspace` as UID 65534 need a real
+fix, not a workaround. Two choices exist: run the payload as container UID 0 (abandons this
+sandbox's explicit non-root-inside invariant — rejected) or a caller-configured multi-ID OCI user
+namespace (the correct path): allocate a subordinate UID/GID lease per concurrent job, map
+container 0 → the runner's own identity and container 65534 → the leased subordinate ids, chown
+the workspace to those mapped HOST ids, set explicit OCI user-namespace mappings, and invoke
+`runsc` directly (not via its single-ID `--rootless` shortcut). A `UserNamespaceLease` type used
+consistently by `run`/`kill`/`delete`, released only after runtime teardown AND workspace
+deletion, tested against the exact digest-pinned `runsc` build this repo already pins.
+
+**Explicitly out of scope for this integration, named rather than assumed:** the in-guest git
+checkout transport (the scoped job-token git wire `WorkspaceSpec`'s own doc comment describes).
+Ordinary gVisor launch today exposes no `repo_ref`/`commit`/usable scoped git transport to the
+guest at all — `/workspace` will correctly be writable but EMPTY until that separate, required
+slice lands. This integration is pure storage provisioning, never a host-side checkout.
+
+**Assessment:** this is now clearly a multi-week body of work (a new `UserNamespaceLease`
+subsystem, host-disk-capacity accounting in `reserve`, a persistent locked/poisoned workspace
+manager, a generalized OCI mount abstraction, the pre-existing `ContainerRun` opacity fix as a
+genuine prerequisite, plus the separately-scoped in-guest checkout transport) — not a single
+slice like `workspace_storage.rs` itself was. Not started; checked in with the founder on
+sequencing before touching `gvisor.rs` at all, given its criticality and the size just revealed.
