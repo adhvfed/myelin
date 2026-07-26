@@ -34,7 +34,7 @@
 //! exclusion of this one file (registered in `lint-gate` + `tests/workspace_clean.rs`).
 
 use crate::hardening::HardeningProfile;
-use crate::launch_gate::{SandboxCommand, SpawnPhase};
+use crate::launch_gate::{DirectChildRetirement, SandboxCommand, SpawnPhase};
 use crate::redaction::RedactionPlan;
 use crate::runner::RetryableAttemptCause;
 use crate::user_namespace::{
@@ -205,6 +205,12 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         extra_env: Vec::new(),
         layout: OciExecutionLayout::Rootless,
     };
+    // CT-007 slice 3, piece 7b (Sol's round-2 review, blocker 2): the single prepared mode this
+    // preflight both executes under AND finalizes under — validated against `config` BEFORE
+    // staging anything.
+    let prepared_mode = PreparedRuntimeMode::Rootless;
+    let mode = require_oci_layout_matches_prepared_mode(&config, &prepared_mode)
+        .map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
     let bundle = stage_production_bundle(&config, &rootfs)
         .map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
     let container_id = format!(
@@ -212,7 +218,19 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         std::process::id(),
         unique_suffix()
     );
-    let outcome = run_and_capture(
+    // CT-007 slice 3, piece 7b: same cgroup hoist as the production run paths — this preflight is
+    // real production code (it gates host activation), so it gets the same checked teardown rather
+    // than a best-effort `delete_container`/`Drop`-only cleanup.
+    let cgroup = match MemoryCgroup::create(config.mem_bytes) {
+        Ok(cgroup) => cgroup,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&bundle);
+            return Err(format!(
+                "CI runner sandbox host preflight failed: establish memory cgroup: {e}"
+            ));
+        }
+    };
+    let (result, child_retirement) = run_and_capture(
         &runsc,
         &bundle,
         &container_id,
@@ -225,12 +243,20 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
             output: None,
         },
         None,
-        config.invocation_mode(),
+        mode,
+        &cgroup,
     );
-    delete_container(&runsc, &container_id, config.invocation_mode());
+    let finalize_result = finalize_runtime(
+        &runsc,
+        &container_id,
+        &prepared_mode,
+        cgroup,
+        RUNTIME_QUIESCE_TIMEOUT,
+        child_retirement,
+    );
     let _ = std::fs::remove_dir_all(&bundle);
-    let outcome =
-        outcome.map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
+    let outcome = preflight_capture_and_teardown_result(result, finalize_result)
+        .map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
     if outcome.timed_out || outcome.exit != Some(1) {
         let stderr = String::from_utf8_lossy(&outcome.stderr);
         let stderr: String = stderr.chars().take(512).collect();
@@ -240,6 +266,25 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// The compound-failure decision behind [`preflight_gvisor_runner_host`] (Sol's round-2 review,
+/// blocker 4), pulled out into its own pure function so it can be unit-tested with fabricated
+/// values — a bare `?` on `result` before inspecting `finalize_result` would silently discard a
+/// teardown failure whenever BOTH failed. Mirrors the same "augment, never replace" rule
+/// [`augment_run_failure_with_teardown`] applies to the production path's `RunFailure`.
+fn preflight_capture_and_teardown_result(
+    result: Result<RunscOutcome, RunFailure>,
+    finalize_result: Result<RuntimeQuiescenceEvidence, RuntimeTeardownError>,
+) -> Result<RunscOutcome, String> {
+    match (result, finalize_result) {
+        (Ok(outcome), Ok(_evidence)) => Ok(outcome),
+        (Ok(_outcome), Err(teardown)) => Err(format!("runtime teardown check failed: {teardown}")),
+        (Err(capture_error), Ok(_evidence)) => Err(capture_error.to_string()),
+        (Err(capture_error), Err(teardown)) => Err(format!(
+            "{capture_error} AND runtime teardown check also failed: {teardown}"
+        )),
+    }
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -269,6 +314,12 @@ fn is_executable_file(path: &Path) -> bool {
 const UNTRUSTED_UID: u32 = 65534;
 const UNTRUSTED_GID: u32 = 65534;
 static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// How long [`finalize_runtime`]'s call to [`MemoryCgroup::quiesce`] polls `cgroup.events` before
+/// giving up. By the time `finalize_runtime` runs, `run_and_capture` has already confirmed (or
+/// force-killed) the whole container — this only bounds the wait for the kernel to finish
+/// unwinding an already-terminated cgroup, not the workload's own execution.
+const RUNTIME_QUIESCE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The fixed guest mount point a workspace is ALWAYS bound at — never caller-selectable (matching
 /// [`WorkspaceStorageMode::Disabled`]'s own doc: "`/workspace` is never mounted" when disabled).
@@ -1495,7 +1546,8 @@ impl GvisorBackend {
             LaunchPermit,
             &Path,
             &str,
-        ) -> Result<ContainerRun, RunFailure>,
+        )
+            -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure>,
     {
         // #4 isolation floor FIRST — the hardening profile must hold before any code (including the
         // registry lookup) runs. Mirrors the Firecracker backend's own ordering. Every early refusal
@@ -1559,17 +1611,34 @@ impl GvisorBackend {
         // `report_retryable_attempt` transaction, which durably accounts usage AND requeues the exact
         // claim without emitting `job.done`. Returning a bare `Failed` here for a post-commit failure
         // under reporter ownership would silently discard the accounting the reporter exists to do.
-        let ContainerRun {
-            child,
-            bundle_dir,
-            result,
-            run_error,
-        } = match run(
+        let finalization = match run(
             spec,
             &cfg,
             launch_permit,
             verified_rootfs.path(),
             &container_id,
+        ) {
+            Ok(finalization) => finalization,
+            Err(run_failure) => {
+                // A pre-cgroup failure (rootfs missing, mode mismatch, bundle staging, cgroup
+                // creation) — no runtime was ever prepared, so there is nothing to finalize, and
+                // (7c) no lease was ever bound.
+                return Err(self.dispose_run_failure(spec, hooks, &reserve, run_failure));
+            }
+        };
+        // CT-007 slice 3, piece 7b: `self.workspace_integration` is always `Disabled` here, so
+        // there is no bound lease this evidence could release — settle immediately, discarding it.
+        // 7c: inspect `finalization`'s evidence BEFORE settling, to decide `lease.release(evidence)`
+        // vs. quarantine, rather than reaching this unconditional settle at all.
+        let ContainerRun {
+            child,
+            bundle_dir,
+            result,
+            run_error,
+        } = match settle_finalization(
+            finalization,
+            |run: &ContainerRun| run.result.usage,
+            discard_container_run_after_teardown_failure,
         ) {
             Ok(container_run) => container_run,
             Err(run_failure) => {
@@ -1766,14 +1835,17 @@ impl SandboxBackend for GvisorBackend {
 /// 2. Run `runsc --rootless --network=none run -bundle <dir> <cid>` with stdout/stderr piped, waiting
 ///    at most `spec.limits.timeout_secs`; on expiry the WHOLE CONTAINER is killed (`runsc kill <cid>
 ///    KILL` + the child) ⇒ `timed_out=true`, `exit_code=None`.
-/// 3. Best-effort `runsc delete -force <cid>` + remove the bundle dir on EVERY path (no leaks).
+/// 3. CT-007 slice 3, piece 7b: CHECKED `runsc delete -force <cid>` + verified [`MemoryCgroup`]
+///    quiescence (via [`finalize_runtime`]), not merely best-effort — a teardown failure now
+///    changes the disposition `launch_with` sees (see [`settle_finalization`]). The bundle dir is
+///    removed on every path (no leaks).
 fn run_production_container(
     spec: &JobSpec,
     cfg: &OciConfig,
     launch_permit: LaunchPermit,
     rootfs: &Path,
     container_id: &str,
-) -> Result<ContainerRun, RunFailure> {
+) -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure> {
     run_production_container_streaming(
         spec,
         cfg,
@@ -1793,7 +1865,7 @@ fn run_production_container_streaming(
     container_id: &str,
     output: Option<Arc<dyn SandboxOutputSink>>,
     cancellation: SandboxCancellation,
-) -> Result<ContainerRun, RunFailure> {
+) -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure> {
     let bin = runsc_bin();
     // `rootfs` is the ALREADY-VERIFIED path `GvisorBackend::launch_with` resolved from `spec.image`
     // via the `GvisorAssetRegistry` (CT-007 gate 2/4) — this production run path no longer calls
@@ -1811,12 +1883,35 @@ fn run_production_container_streaming(
             rootfs.display()
         )));
     }
+    // CT-007 slice 3, piece 7b (Sol's round-2 review, blocker 2): validated BEFORE staging anything
+    // — a disagreement between what `cfg` will actually execute and what checked
+    // deletion/finalization expects must refuse at zero cost, never execute under one mode while
+    // finalizing under another. 7b never constructs a non-Rootless prepared mode in production —
+    // 7c adds that constructor.
+    let prepared_mode = PreparedRuntimeMode::Rootless;
+    let mode = require_oci_layout_matches_prepared_mode(cfg, &prepared_mode)
+        .map_err(RunFailure::uncommitted)?;
+
     let bundle_dir = stage_production_bundle(cfg, rootfs).map_err(RunFailure::uncommitted)?;
+
+    // CT-003b (SI-017): establish the OUT-OF-BAND memory cgroup BEFORE spawning runsc and FAIL
+    // CLOSED if it cannot be established (rootless runsc would otherwise run the workload's
+    // anonymous memory UNBOUNDED — a host-DoS escape). CT-007 slice 3, piece 7b: creation lives
+    // HERE (one call-frame up from `run_and_capture`, which now only borrows it) so this function
+    // — not `run_and_capture` — owns the checked teardown via `finalize_runtime`. A creation
+    // failure here happens AFTER the bundle was staged, so it must clean the bundle up itself
+    // (nothing else will).
+    let cgroup = match MemoryCgroup::create(spec.limits.mem_bytes) {
+        Ok(cgroup) => cgroup,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&bundle_dir);
+            return Err(RunFailure::uncommitted(e));
+        }
+    };
 
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
     let redaction = RedactionPlan::for_job(spec);
-    let mode = cfg.invocation_mode();
-    let outcome = match run_and_capture(
+    let (result, child_retirement) = run_and_capture(
         bin,
         &bundle_dir,
         container_id,
@@ -1833,30 +1928,43 @@ fn run_production_container_streaming(
         },
         Some(launch_permit),
         mode,
-    ) {
-        Ok(o) => o,
+        &cgroup,
+    );
+    let primary: Result<ContainerRun, RunFailure> = match result {
+        Ok(outcome) => {
+            let result = build_result(spec, &outcome, &redaction);
+            Ok(ContainerRun {
+                child: Box::new(SpawnedRunsc {
+                    bin,
+                    container_id: container_id.to_string(),
+                    mode,
+                }),
+                bundle_dir,
+                result,
+                run_error: outcome.stream_error,
+            })
+        }
         Err(e) => {
             // Spawning/waiting failed before a trustworthy result — clean up + surface honestly.
-            delete_container(bin, container_id, mode);
             let _ = std::fs::remove_dir_all(&bundle_dir);
-            return Err(e);
+            Err(e)
         }
     };
-    // The container has exited (or been timeout-killed) — best-effort delete (idempotent; `runsc run`
-    // usually self-deletes on a clean exit, but the timeout path leaves it for us to reap).
-    delete_container(bin, container_id, mode);
-
-    let result = build_result(spec, &outcome, &redaction);
-    Ok(ContainerRun {
-        child: Box::new(SpawnedRunsc {
-            bin,
-            container_id: container_id.to_string(),
-            mode,
-        }),
-        bundle_dir,
-        result,
-        run_error: outcome.stream_error,
-    })
+    // Checked teardown replaces the old best-effort `delete_container`/`cgroup.cleanup()` pair —
+    // ALWAYS runs, regardless of whether the primary run succeeded or failed, and NEVER discards
+    // whichever outcome it finds. CT-007 slice 3, piece 7b (Sol's round-2 review, blocker 1): the
+    // envelope is returned to `launch_with`, not settled here — `launch_with` (not this function)
+    // will own the bound `UserNamespaceLease` starting in 7c, and needs this evidence to decide
+    // whether to release it, before ever collapsing this back to a bare `Result`.
+    Ok(finalize_and_merge(
+        primary,
+        bin,
+        container_id,
+        &prepared_mode,
+        cgroup,
+        RUNTIME_QUIESCE_TIMEOUT,
+        child_retirement,
+    ))
 }
 
 /// A unique suffix for bundle dirs / container ids. The wall-clock nanos alone are NOT unique: two
@@ -2448,6 +2556,415 @@ fn delete_container(bin: &Path, container_id: &str, mode: RunscInvocationMode) {
     let _ = cmd.arg("delete").arg("-force").arg(container_id).output();
 }
 
+/// Which invocation mode a prepared runtime is committed to, paired ATOMICALLY with whatever
+/// identity evidence that mode implies must hold at teardown (CT-007 slice 3, piece 7b, Sol's
+/// review point 5) — a caller cannot pass an inconsistent `(RunscInvocationMode, identity)` pair
+/// because there is only ever ONE value to pass. 7b only ever constructs `Rootless`; 7c adds the
+/// `ExplicitUserNamespace` constructor without reshaping this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedRuntimeMode {
+    Rootless,
+    #[allow(dead_code)] // constructed starting in piece 7c.
+    ExplicitUserNamespace {
+        config: UserNamespaceConfig,
+        /// The runsc state-root identity [`preflight_explicit_userns_policy`] validated at boot —
+        /// re-confirmed via [`revalidated_explicit_userns_root_identity`] at teardown time, so the
+        /// SAME proof covers both the launch and the teardown of one run.
+        expected_root_identity: (u64, u64),
+    },
+}
+
+impl PreparedRuntimeMode {
+    fn invocation_mode(self) -> RunscInvocationMode {
+        match self {
+            PreparedRuntimeMode::Rootless => RunscInvocationMode::Rootless,
+            PreparedRuntimeMode::ExplicitUserNamespace { config, .. } => {
+                RunscInvocationMode::ExplicitUserNamespace(config)
+            }
+        }
+    }
+}
+
+/// CT-007 slice 3, piece 7b (Sol's round-2 review): `cfg.invocation_mode()` (what actually gets
+/// executed and mounted) and a `PreparedRuntimeMode` (what checked deletion/finalization expects)
+/// were previously constructed INDEPENDENTLY at every call site — nothing stopped them from
+/// disagreeing. This is the ONE place that compares them and hands back the single
+/// `RunscInvocationMode` every downstream use (`run_and_capture`, `SpawnedRunsc`,
+/// `retire_container`, `finalize_runtime`) must share — called BEFORE any spawn attempt, so a
+/// disagreement refuses at zero cost rather than executing under one mode while (dishonestly)
+/// finalizing under another.
+fn require_oci_layout_matches_prepared_mode(
+    cfg: &OciConfig,
+    prepared_mode: &PreparedRuntimeMode,
+) -> Result<RunscInvocationMode, String> {
+    let mode = prepared_mode.invocation_mode();
+    let oci_mode = cfg.invocation_mode();
+    if oci_mode != mode {
+        return Err(format!(
+            "the OCI config's invocation mode {oci_mode:?} disagrees with the prepared runtime \
+             mode {mode:?} — refusing rather than executing under one and finalizing under \
+             the other"
+        ));
+    }
+    Ok(mode)
+}
+
+/// What [`RuntimeQuiescenceEvidence`] vouches for regarding the runsc state-root namespace: either
+/// there was none to check (`Rootless`), or the pinned state root's identity was re-confirmed
+/// unchanged immediately before minting this evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeNamespaceQuiescence {
+    Rootless,
+    ExplicitUserNamespace { runsc_root_identity: (u64, u64) },
+}
+
+/// Non-forgeable (outside tests) proof that ONE runtime instance — its direct child process, its
+/// exact `container_id`, its runsc-state-root namespace (if any), and its [`MemoryCgroup`] — was
+/// independently checked torn down, produced ONLY by a successful [`finalize_runtime`]. This is
+/// the evidence [`crate::user_namespace::UserNamespaceQuiescenceProof`] will be minted from once
+/// 7c wires the `ExplicitUserNamespace` path to a real lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeQuiescenceEvidence {
+    container_id: String,
+    namespace: RuntimeNamespaceQuiescence,
+    cgroup: CgroupQuiescenceEvidence,
+}
+
+/// One independent thing [`finalize_runtime`] found wrong. Deliberately NOT a single first-error
+/// enum (Sol's review): the direct-child reap, the namespace-identity revalidation, the checked
+/// container delete, and the cgroup quiescence are four INDEPENDENT checks, and more than one can
+/// genuinely fail on the same run — collapsing them into "whichever failed first" would silently
+/// discard the others.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeTeardownIssue {
+    /// The direct `runsc` child's `wait()` did not confirm a reap (its fate is unknown).
+    ChildNotConfirmedReaped(String),
+    /// The runsc state-root identity no longer matches what the run was validated against —
+    /// `ExplicitUserNamespace` mode only; SKIPS the checked container delete below it (acting on a
+    /// path-based policy that may no longer name the trusted state root is not safe).
+    NamespaceIdentityDrifted(String),
+    /// `runsc delete -force <container_id>` did not confirm the container is gone.
+    ContainerNotConfirmedDeleted(String),
+    /// [`MemoryCgroup::quiesce`] failed to independently verify + remove the cgroup.
+    Cgroup(CgroupQuiescenceError),
+}
+
+impl std::fmt::Display for RuntimeTeardownIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuntimeTeardownIssue::ChildNotConfirmedReaped(e) => {
+                write!(f, "the direct child was not confirmed reaped: {e}")
+            }
+            RuntimeTeardownIssue::NamespaceIdentityDrifted(e) => {
+                write!(f, "the runsc state-root identity drifted: {e}")
+            }
+            RuntimeTeardownIssue::ContainerNotConfirmedDeleted(e) => {
+                write!(f, "the container was not confirmed deleted: {e}")
+            }
+            RuntimeTeardownIssue::Cgroup(e) => write!(f, "cgroup quiescence failed: {e}"),
+        }
+    }
+}
+
+/// Every independent [`RuntimeTeardownIssue`] [`finalize_runtime`] found — always non-empty (a
+/// caller never constructs this with zero issues; see [`finalize_runtime`]'s own contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeTeardownError {
+    issues: Vec<RuntimeTeardownIssue>,
+}
+
+impl std::fmt::Display for RuntimeTeardownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let joined = self
+            .issues
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(f, "{joined}")
+    }
+}
+
+/// Checked container retirement — confirms the exit status of `runsc delete -force`, rather than
+/// silently discarding it like the pre-existing best-effort [`delete_container`] (which remains,
+/// unchanged, as the DEFERRED/idempotent teardown [`SpawnedRunsc::kill`] uses — a legitimately
+/// separate, later, best-effort safety net, not the authoritative check this function is).
+fn retire_container(
+    bin: &Path,
+    container_id: &str,
+    mode: RunscInvocationMode,
+) -> Result<(), String> {
+    let mut cmd = Command::new(bin);
+    apply_runsc_invocation_policy(&mut cmd, mode)
+        .map_err(|e| format!("apply runsc invocation policy for delete: {e}"))?;
+    let output = cmd
+        .arg("delete")
+        .arg("-force")
+        .arg(container_id)
+        .output()
+        .map_err(|e| format!("run `runsc delete -force {container_id}`: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`runsc delete -force {container_id}` exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+/// **The authoritative, checked teardown for ONE runtime instance (CT-007 slice 3, piece 7b).**
+/// Consumes `cgroup` (ownership was hoisted out of [`run_and_capture`] into the caller precisely so
+/// this function can own the final `quiesce()`). Never returns early on a non-cgroup failure —
+/// EVERY check below always runs, and every issue found is collected, because a caller must never
+/// assume "the first thing that failed" is the only thing that failed:
+///
+/// 1. The direct child's [`DirectChildRetirement`] (already known from `run_and_capture`/
+///    `SandboxCommand::spawn`'s own real `wait()` outcome — nothing to re-check here).
+/// 2. For `ExplicitUserNamespace` mode: re-confirm the runsc state-root identity via
+///    [`revalidated_explicit_userns_root_identity`]. A drift here means the path-based policy this
+///    process would otherwise `runsc delete` through may no longer name the trusted state root —
+///    so step 3 is SKIPPED, but step 4 (cgroup quiescence, identified independently by its own
+///    `(dev, ino)`, never by this path) still always runs.
+/// 3. Checked `runsc delete -force` ([`retire_container`]) — skipped per (2) above.
+/// 4. `cgroup.quiesce()` — ALWAYS attempted, regardless of whether (1)-(3) found anything wrong.
+///
+/// Evidence is minted ONLY when every check that ran found nothing wrong.
+fn finalize_runtime(
+    bin: &Path,
+    container_id: &str,
+    prepared_mode: &PreparedRuntimeMode,
+    cgroup: MemoryCgroup,
+    quiesce_timeout: Duration,
+    child_retirement: DirectChildRetirement,
+) -> Result<RuntimeQuiescenceEvidence, RuntimeTeardownError> {
+    finalize_runtime_given(
+        bin,
+        container_id,
+        prepared_mode,
+        cgroup,
+        quiesce_timeout,
+        child_retirement,
+        revalidated_explicit_userns_root_identity,
+        retire_container,
+    )
+}
+
+/// The actual decision logic behind [`finalize_runtime`], taking the namespace-identity
+/// revalidation AND the checked container retirement as injectable closures rather than calling
+/// the process-global [`revalidated_explicit_userns_root_identity`]/[`retire_container`] directly
+/// — mirrors this file's own established `_given` pattern (see
+/// [`apply_runsc_invocation_policy_given`]): once ANY test in the same test binary's process
+/// installs the real global `EXPLICIT_USERNS_POLICY`, it stays installed for every other test
+/// sharing that process, making the drift-detection AND identity-match branches impossible to
+/// test deterministically without this seam (Sol's round-2 review: the identity-match branch
+/// specifically needs `retire_container` injectable too, since it runs immediately after a
+/// matching identity and would otherwise hit the same global-policy dependency).
+#[allow(clippy::too_many_arguments)]
+fn finalize_runtime_given(
+    bin: &Path,
+    container_id: &str,
+    prepared_mode: &PreparedRuntimeMode,
+    cgroup: MemoryCgroup,
+    quiesce_timeout: Duration,
+    child_retirement: DirectChildRetirement,
+    revalidate_namespace_identity: impl FnOnce() -> Result<(u64, u64), String>,
+    retire_container_fn: impl FnOnce(&Path, &str, RunscInvocationMode) -> Result<(), String>,
+) -> Result<RuntimeQuiescenceEvidence, RuntimeTeardownError> {
+    let mut issues = Vec::new();
+
+    if let DirectChildRetirement::Unconfirmed(reason) = child_retirement {
+        issues.push(RuntimeTeardownIssue::ChildNotConfirmedReaped(reason));
+    }
+
+    let namespace = match prepared_mode {
+        PreparedRuntimeMode::Rootless => Some(RuntimeNamespaceQuiescence::Rootless),
+        PreparedRuntimeMode::ExplicitUserNamespace {
+            expected_root_identity,
+            ..
+        } => match revalidate_namespace_identity() {
+            Ok(current) if current == *expected_root_identity => {
+                Some(RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: current,
+                })
+            }
+            Ok(current) => {
+                issues.push(RuntimeTeardownIssue::NamespaceIdentityDrifted(format!(
+                    "expected {expected_root_identity:?}, found {current:?}"
+                )));
+                None
+            }
+            Err(reason) => {
+                issues.push(RuntimeTeardownIssue::NamespaceIdentityDrifted(reason));
+                None
+            }
+        },
+    };
+
+    // Only attempt the checked delete when the namespace identity is trusted (or not applicable) —
+    // acting on a path-based policy that may no longer name the trusted state root is not safe.
+    if namespace.is_some() {
+        if let Err(reason) = retire_container_fn(bin, container_id, prepared_mode.invocation_mode())
+        {
+            issues.push(RuntimeTeardownIssue::ContainerNotConfirmedDeleted(reason));
+        }
+    }
+
+    // ALWAYS attempt cgroup quiescence, regardless of anything found above — the cgroup is
+    // identified by its own (device, inode), independent of the container/namespace checks.
+    let cgroup_evidence = match cgroup.quiesce(quiesce_timeout) {
+        Ok(evidence) => Some(evidence),
+        Err(e) => {
+            issues.push(RuntimeTeardownIssue::Cgroup(e));
+            None
+        }
+    };
+
+    match (namespace, cgroup_evidence, issues.is_empty()) {
+        (Some(namespace), Some(cgroup), true) => Ok(RuntimeQuiescenceEvidence {
+            container_id: container_id.to_string(),
+            namespace,
+            cgroup,
+        }),
+        _ => Err(RuntimeTeardownError { issues }),
+    }
+}
+
+/// A run's primary disposition (`T`, typically `Result<ContainerRun, RunFailure>`-shaped) PLUS
+/// independently-verified proof its runtime instance was fully torn down — [`finalize_runtime`]'s
+/// only production constructor.
+#[derive(Debug)]
+struct FinalizedRun<T> {
+    primary: T,
+    #[allow(dead_code)] // consumed starting in piece 7c (feeds UserNamespaceQuiescenceProof).
+    evidence: RuntimeQuiescenceEvidence,
+}
+
+/// The TOTAL result of finalizing a runtime instance (CT-007 slice 3, piece 7b, Sol's design
+/// review): a caller must never be able to lose the primary run disposition OR the teardown
+/// result — a bare `Result<FinalizedRun<T>, RuntimeTeardownError>` would let a `?` silently
+/// discard `T` the moment teardown failed, even though the primary run may have succeeded (or
+/// failed for a completely different, already-informative reason).
+#[derive(Debug)]
+enum RuntimeFinalization<T> {
+    Finalized(FinalizedRun<T>),
+    Failed {
+        primary: T,
+        teardown: RuntimeTeardownError,
+    },
+}
+
+/// Run [`finalize_runtime`] and merge its outcome with `primary`, never losing either.
+fn finalize_and_merge<T>(
+    primary: T,
+    bin: &Path,
+    container_id: &str,
+    prepared_mode: &PreparedRuntimeMode,
+    cgroup: MemoryCgroup,
+    quiesce_timeout: Duration,
+    child_retirement: DirectChildRetirement,
+) -> RuntimeFinalization<T> {
+    match finalize_runtime(
+        bin,
+        container_id,
+        prepared_mode,
+        cgroup,
+        quiesce_timeout,
+        child_retirement,
+    ) {
+        Ok(evidence) => RuntimeFinalization::Finalized(FinalizedRun { primary, evidence }),
+        Err(teardown) => RuntimeFinalization::Failed { primary, teardown },
+    }
+}
+
+/// Append a teardown failure to an existing [`RunFailure`], preserving its exact phase/usage and
+/// its original message — mirrors [`GvisorBackend::dispose_run_failure`]'s established "augment,
+/// never replace" compound-message pattern, extended here to runtime-teardown failures.
+fn augment_run_failure_with_teardown(
+    failure: RunFailure,
+    teardown: &RuntimeTeardownError,
+) -> RunFailure {
+    match failure {
+        RunFailure::Uncommitted { message } => RunFailure::Uncommitted {
+            message: format!("{message} AND runtime teardown failed ({teardown})"),
+        },
+        RunFailure::CommitOutcomeUnknown { message } => RunFailure::CommitOutcomeUnknown {
+            message: format!("{message} AND runtime teardown failed ({teardown})"),
+        },
+        RunFailure::CommittedButNotExecuted { message } => RunFailure::CommittedButNotExecuted {
+            message: format!("{message} AND runtime teardown failed ({teardown})"),
+        },
+        RunFailure::Executed { message, usage } => RunFailure::Executed {
+            message: format!("{message} AND runtime teardown failed ({teardown})"),
+            usage,
+        },
+    }
+}
+
+/// Settle a [`RuntimeFinalization`] of a `Result<S, RunFailure>`-shaped primary into the actual
+/// `Result<S, RunFailure>` a run-closure returns (CT-007 slice 3, piece 7b, Sol's review point 4):
+/// a teardown failure is NEVER incident-only — it must change what the caller (and, downstream,
+/// the job's billing/retry disposition) sees. `usage_of` extracts the measured [`ResourceUsage`]
+/// from a successful `S`, needed to convert a clean success into a `RunFailure::Executed` when
+/// teardown fails after it (the run itself still consumed real resources — settling it as if
+/// nothing happened would keep treating the job as successful while the new safety invariant this
+/// piece adds — "teardown is independently verified" — was actually false).
+///
+/// `on_discarded_success` (Sol's round-2 review, blocker 3): a successful `S` this function is
+/// about to convert into a failure and DROP would otherwise leak whatever resources `S` owned —
+/// for a [`ContainerRun`], its staged `bundle_dir` (which would never be entered into `self.live`
+/// for later teardown, since this whole call is returning `Err`). Called with the discarded `S`
+/// and the `RuntimeTeardownError` that caused the discard, so the caller can make an informed
+/// decision (e.g. skip a path-based cleanup step the teardown itself found unsafe to trust).
+fn settle_finalization<S>(
+    finalization: RuntimeFinalization<Result<S, RunFailure>>,
+    usage_of: impl FnOnce(&S) -> ResourceUsage,
+    on_discarded_success: impl FnOnce(S, &RuntimeTeardownError),
+) -> Result<S, RunFailure> {
+    match finalization {
+        RuntimeFinalization::Finalized(FinalizedRun { primary, .. }) => primary,
+        RuntimeFinalization::Failed {
+            primary: Ok(success),
+            teardown,
+        } => {
+            let usage = usage_of(&success);
+            on_discarded_success(success, &teardown);
+            Err(RunFailure::executed(
+                format!("runtime teardown failed after a successful run ({teardown})"),
+                usage,
+            ))
+        }
+        RuntimeFinalization::Failed {
+            primary: Err(failure),
+            teardown,
+        } => Err(augment_run_failure_with_teardown(failure, &teardown)),
+    }
+}
+
+/// Clean up a [`ContainerRun`] that a teardown failure is forcing [`settle_finalization`] to
+/// discard instead of returning to its caller (Sol's round-2 review, blocker 3): BEST-EFFORT
+/// removes the staged bundle dir (a leaked temp dir, not a leaked live container/cgroup — this
+/// function does not surface a removal failure, matching how bundle-dir cleanup is treated
+/// EVERYWHERE ELSE in this file's ordinary error paths), and best-effort re-attempts the deferred
+/// [`SpawnedRunsc::kill`] as one more defense-in-depth try — UNLESS the teardown issues include a
+/// namespace-identity drift, in which case the finalizer already determined the path-based `runsc
+/// delete`/`kill` this would perform is not safe to trust (acting on it here would be exactly the
+/// mistake `finalize_runtime` itself refused to make).
+fn discard_container_run_after_teardown_failure(
+    mut run: ContainerRun,
+    teardown: &RuntimeTeardownError,
+) {
+    let namespace_drifted = teardown
+        .issues
+        .iter()
+        .any(|issue| matches!(issue, RuntimeTeardownIssue::NamespaceIdentityDrifted(_)));
+    if !namespace_drifted {
+        let _ = run.child.kill();
+    }
+    let _ = std::fs::remove_dir_all(&run.bundle_dir);
+}
+
 /// Read the `runsc` process's cumulative CPU time (utime+stime) from `/proc/<pid>/stat`, in whole
 /// seconds (USER_HZ = 100 on Linux). Mirrors the Firecracker backend's measurement (a small,
 /// backend-specific `/proc` read of the spawned runtime's pid). `None` if `/proc` is unavailable or
@@ -2572,6 +3089,13 @@ impl std::error::Error for RunFailure {}
 /// WHOLE CONTAINER is killed (`runsc kill <cid> KILL` then the child) and `timed_out` is set. The exit
 /// code is the `runsc` child's REAL `ExitStatus.code()` — the container process's actual exit, never
 /// parsed from container output (the structural reason gVisor needs no forge defense).
+///
+/// CT-007 slice 3, piece 7b: `cgroup` is BORROWED, not created here — ownership belongs to the
+/// caller, which must run checked teardown ([`finalize_runtime`]) once this returns, using the
+/// SAME cgroup value. This function never calls `cgroup.cleanup()`/`quiesce()` itself. It always
+/// returns a [`DirectChildRetirement`] alongside its primary result (`Ok` or `Err`) — every early
+/// return before `sandbox_command.spawn()` succeeds implies [`DirectChildRetirement::NoChildReturned`];
+/// every return after implies whatever the real (no longer discarded) `wait()` outcome was.
 #[allow(clippy::too_many_arguments)]
 fn run_and_capture(
     bin: &Path,
@@ -2582,6 +3106,36 @@ fn run_and_capture(
     options: RunCaptureOptions<'_>,
     launch_permit: Option<LaunchPermit>,
     mode: RunscInvocationMode,
+    cgroup: &MemoryCgroup,
+) -> (Result<RunscOutcome, RunFailure>, DirectChildRetirement) {
+    let mut child_retirement = DirectChildRetirement::NoChildReturned;
+    let result = run_and_capture_impl(
+        bin,
+        bundle,
+        container_id,
+        timeout,
+        mem_bytes,
+        options,
+        launch_permit,
+        mode,
+        cgroup,
+        &mut child_retirement,
+    );
+    (result, child_retirement)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_and_capture_impl(
+    bin: &Path,
+    bundle: &Path,
+    container_id: &str,
+    timeout: Duration,
+    mem_bytes: u64,
+    options: RunCaptureOptions<'_>,
+    launch_permit: Option<LaunchPermit>,
+    mode: RunscInvocationMode,
+    cgroup: &MemoryCgroup,
+    child_retirement: &mut DirectChildRetirement,
 ) -> Result<RunscOutcome, RunFailure> {
     let RunCaptureOptions {
         stdin,
@@ -2590,12 +3144,6 @@ fn run_and_capture(
         output,
     } = options;
     let has_streaming_output = output.is_some();
-    // CT-003b (SI-017): establish the OUT-OF-BAND memory cgroup BEFORE spawning runsc and FAIL
-    // CLOSED if it cannot be established (rootless runsc would otherwise run the workload's anonymous
-    // memory UNBOUNDED — a host-DoS escape). The cgroup is torn down on every path (its `Drop`).
-    // Every error up to (and including) `sandbox_command.spawn()` itself is Uncommitted-or-typed:
-    // nothing durable happened yet, so a caller-side `release_unused` is correct.
-    let cgroup = MemoryCgroup::create(mem_bytes).map_err(RunFailure::uncommitted)?;
 
     let watchdog_timeout = launch_permit.as_ref().map(|_| timeout);
     let mut sandbox_command = SandboxCommand::new(bin, launch_permit, watchdog_timeout)
@@ -2633,6 +3181,7 @@ fn run_and_capture(
     }
     let mut child = sandbox_command.spawn().map_err(|spawn_failure| {
         let message = format!("spawn runsc: {}", spawn_failure.message());
+        *child_retirement = spawn_failure.child_retirement().clone();
         match spawn_failure.phase() {
             SpawnPhase::Uncommitted => RunFailure::uncommitted(message),
             SpawnPhase::CommitOutcomeUnknown => RunFailure::commit_outcome_unknown(message),
@@ -2667,7 +3216,7 @@ fn run_and_capture(
         None
     };
     if stdin.is_some() && stdin_pipe.is_none() {
-        child.kill_and_wait();
+        *child_retirement = child.kill_and_wait();
         return Err(RunFailure::executed(
             "runsc stdin pipe unavailable",
             executed_fallback_usage(mem_bytes, executed_at.elapsed(), None),
@@ -2685,7 +3234,7 @@ fn run_and_capture(
 
     // Drain both pipes on threads so a chatty container cannot fill a pipe buffer and deadlock.
     let (Some(mut out), Some(mut err)) = (child.stdout().take(), child.stderr().take()) else {
-        child.kill_and_wait();
+        *child_retirement = child.kill_and_wait();
         if let Some(t) = stdin_th {
             let _ = t.join();
         }
@@ -2739,6 +3288,8 @@ fn run_and_capture(
         match child.try_wait() {
             Ok(Some(status)) => {
                 timed_out = child.watchdog_deadline_expired();
+                // `try_wait()` itself just returned a real exit status — this IS the confirmed reap.
+                *child_retirement = DirectChildRetirement::Reaped;
                 break status.code();
             }
             Ok(None) => {}
@@ -2747,7 +3298,7 @@ fn run_and_capture(
                 // them — no thread may outlive this run, even on a wait-syscall failure (a bare
                 // early return here would leak the stdin/stdout/stderr threads, still blocked on
                 // pipes from a child nothing ever killed).
-                child.kill_and_wait();
+                *child_retirement = child.kill_and_wait();
                 let _ = th_out.join();
                 let _ = th_err.join();
                 if let Some(t) = stdin_th {
@@ -2775,7 +3326,7 @@ fn run_and_capture(
             if apply_runsc_invocation_policy(&mut kill_cmd, mode).is_ok() {
                 let _ = kill_cmd.arg("kill").arg(container_id).arg("KILL").output();
             }
-            child.kill_and_wait();
+            *child_retirement = child.kill_and_wait();
             timed_out = !cancelled;
             break None;
         }
@@ -2822,9 +3373,8 @@ fn run_and_capture(
         }
     }
 
-    // The container + its sentry/gofer tree are gone; reap the cgroup (kill any straggler, rmdir).
-    // `Drop` is the backstop, but tear it down deterministically here on the success/timeout path.
-    cgroup.cleanup();
+    // The container + its sentry/gofer tree are gone. Cgroup teardown is now the CALLER's
+    // responsibility (it owns `cgroup`, borrowed here) — see [`finalize_runtime`].
 
     Ok(RunscOutcome {
         exit,
@@ -4026,11 +4576,31 @@ fn run_git_wire_container(
             rootfs.display()
         )));
     }
+    // CT-007 slice 3, piece 7b (Sol's round-3 review): validated BEFORE staging anything, exactly
+    // like the production path — `run_git_wire_container`'s own signature does not structurally
+    // restrict `cfg` to `RootlessWithHostMounts` (only its current caller always builds one), so
+    // this invariant must be enforced here, not merely true by convention. 7b never constructs a
+    // non-Rootless prepared mode in production — 7c adds that constructor.
+    let prepared_mode = PreparedRuntimeMode::Rootless;
+    let mode = require_oci_layout_matches_prepared_mode(cfg, &prepared_mode)
+        .map_err(RunFailure::uncommitted)?;
+
     // Stage a config-only bundle: `cfg`'s `root.path` is the ABSOLUTE staged rootfs (set by
     // `launch_git_wire`), so no `rootfs` symlink is staged (a symlinked root.path + a host bind mount
     // makes the rootless gofer fail to start the sandbox; an absolute root.path + bind mount works).
     let bundle_dir = stage_git_wire_bundle(cfg).map_err(RunFailure::uncommitted)?;
     let container_id = format!("myelin-gitwire-{}-{}", std::process::id(), unique_suffix());
+
+    // CT-007 slice 3, piece 7b: cgroup ownership hoisted up here (see
+    // `run_production_container_streaming`'s identical treatment) — `run_and_capture` only
+    // borrows it now, and this function owns the checked teardown via `finalize_runtime`.
+    let cgroup = match MemoryCgroup::create(job.limits.mem_bytes) {
+        Ok(cgroup) => cgroup,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&bundle_dir);
+            return Err(RunFailure::uncommitted(e));
+        }
+    };
 
     let timeout = Duration::from_secs(job.limits.timeout_secs as u64);
     // The git-wire response (the packfile / advertisement) is STREAMED to a host temp file under a
@@ -4039,8 +4609,7 @@ fn run_git_wire_container(
     // through whole while host RAM stays bounded to one chunk. Over the cap ⇒ `outcome.stdout_truncated`,
     // which the caller turns into a LOUD [`WireError::OutputTooLarge`] (never a silently-short pack).
     let wire_cap = job.limits.disk_bytes as usize;
-    let mode = cfg.invocation_mode();
-    let outcome = match run_and_capture(
+    let (result, child_retirement) = run_and_capture(
         bin,
         &bundle_dir,
         &container_id,
@@ -4054,37 +4623,54 @@ fn run_git_wire_container(
         },
         Some(launch_permit),
         mode,
-    ) {
-        Ok(o) => o,
+        &cgroup,
+    );
+    let primary: Result<(ContainerRun, bool), RunFailure> = match result {
+        Ok(outcome) => {
+            let stdout_truncated = outcome.stdout_truncated;
+            // The git-wire path's stdout is the git smart-transport packfile/protocol stream
+            // (StreamToFile), NOT job LOG output — it never reaches the durable log pipeline, and
+            // masking arbitrary bytes in a binary packfile would corrupt it. So this path NEVER
+            // redacts (an explicit `none()`, not `for_job`) — a deliberate distinction that matters
+            // the day CI-1 injection makes `for_job` non-empty. Boundary redaction is a LOG-path
+            // concern (the CappedHead capture in `run_production_container`), not a transport-path
+            // concern.
+            let result = build_result(job, &outcome, &RedactionPlan::none());
+            Ok((
+                ContainerRun {
+                    child: Box::new(SpawnedRunsc {
+                        bin,
+                        container_id: container_id.clone(),
+                        mode,
+                    }),
+                    bundle_dir,
+                    result,
+                    run_error: outcome.stream_error,
+                },
+                stdout_truncated,
+            ))
+        }
         Err(e) => {
-            delete_container(bin, &container_id, mode);
             let _ = std::fs::remove_dir_all(&bundle_dir);
-            return Err(e);
+            Err(e)
         }
     };
-    delete_container(bin, &container_id, mode);
-
-    let stdout_truncated = outcome.stdout_truncated;
-    // The git-wire path's stdout is the git smart-transport packfile/protocol stream (StreamToFile),
-    // NOT job LOG output — it never reaches the durable log pipeline, and masking arbitrary bytes in a
-    // binary packfile would corrupt it. So this path NEVER redacts (an explicit `none()`, not
-    // `for_job`) — a deliberate distinction that matters the day CI-1 injection makes `for_job`
-    // non-empty. Boundary redaction is a LOG-path concern (the CappedHead capture in
-    // `run_production_container`), not a transport-path concern.
-    let result = build_result(job, &outcome, &RedactionPlan::none());
-    Ok((
-        ContainerRun {
-            child: Box::new(SpawnedRunsc {
-                bin,
-                container_id,
-                mode,
-            }),
-            bundle_dir,
-            result,
-            run_error: outcome.stream_error,
+    let finalization = finalize_and_merge(
+        primary,
+        bin,
+        &container_id,
+        &prepared_mode,
+        cgroup,
+        RUNTIME_QUIESCE_TIMEOUT,
+        child_retirement,
+    );
+    settle_finalization(
+        finalization,
+        |(run, _): &(ContainerRun, bool)| run.result.usage,
+        |(run, _): (ContainerRun, bool), teardown| {
+            discard_container_run_after_teardown_failure(run, teardown)
         },
-        stdout_truncated,
-    ))
+    )
 }
 
 /// Stage a CONFIG-ONLY OCI bundle (just `config.json`) for the git wire — the rootfs is referenced by
@@ -4551,6 +5137,23 @@ mod tests {
         }
     }
 
+    /// CT-007 slice 3, piece 7b: since `launch_with`'s `F` now returns a
+    /// `RuntimeFinalization<Result<ContainerRun, RunFailure>>` envelope (not a bare
+    /// `Result<ContainerRun, RunFailure>`), every fake test closure that used to return
+    /// `Ok(fake_run())` needs a fabricated, already-`Finalized` envelope instead — these tests are
+    /// exercising `launch_with`'s OWN dispatch logic (settle/reserve/hooks), not
+    /// `finalize_runtime`'s teardown checks, so a canned `Rootless` evidence is all that's needed.
+    fn fake_finalization() -> RuntimeFinalization<Result<ContainerRun, RunFailure>> {
+        RuntimeFinalization::Finalized(FinalizedRun {
+            primary: Ok(fake_run()),
+            evidence: RuntimeQuiescenceEvidence {
+                container_id: "fake-container".to_string(),
+                namespace: RuntimeNamespaceQuiescence::Rootless,
+                cgroup: CgroupQuiescenceEvidence::assert_for_tests((0, 0)),
+            },
+        })
+    }
+
     /// CT-006c (the streaming fix): the git-wire stdout drain stages straight to a host temp file under
     /// a generous cap with host memory bounded to one chunk. A response WITHIN the cap comes through
     /// WHOLE (no 256 KiB truncation); a response OVER the cap is head-bounded AND flagged `truncated`
@@ -4823,6 +5426,59 @@ mod tests {
             "attaching a user namespace after host mounts were already selected must refuse, not \
              silently discard the mounts"
         );
+    }
+
+    /// Sol's round-2 review, blocker 2: `cfg.invocation_mode()` (what actually executes) and a
+    /// `PreparedRuntimeMode` (what checked deletion/finalization expects) were previously
+    /// constructed independently, with nothing refusing a disagreement between them. Proves the
+    /// mismatch refuses before any spawn attempt, in both directions.
+    #[test]
+    fn require_oci_layout_matches_prepared_mode_refuses_a_disagreement() {
+        let userns_config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
+        let explicit_userns_cfg = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_user_namespace(userns_config)
+            .unwrap();
+        let rootless_cfg = GvisorBackend::oci_config(&spec(vec![])).unwrap();
+
+        // The OCI config selected ExplicitUserNamespace, but the prepared mode says Rootless.
+        assert!(
+            require_oci_layout_matches_prepared_mode(
+                &explicit_userns_cfg,
+                &PreparedRuntimeMode::Rootless
+            )
+            .is_err(),
+            "an ExplicitUserNamespace OCI config paired with a Rootless prepared mode must refuse"
+        );
+
+        // The reverse disagreement: OCI config is Rootless, but the prepared mode says
+        // ExplicitUserNamespace.
+        assert!(
+            require_oci_layout_matches_prepared_mode(
+                &rootless_cfg,
+                &PreparedRuntimeMode::ExplicitUserNamespace {
+                    config: userns_config,
+                    expected_root_identity: (1, 2),
+                }
+            )
+            .is_err(),
+            "a Rootless OCI config paired with an ExplicitUserNamespace prepared mode must refuse"
+        );
+
+        // Agreement in both directions must be accepted.
+        assert!(require_oci_layout_matches_prepared_mode(
+            &rootless_cfg,
+            &PreparedRuntimeMode::Rootless
+        )
+        .is_ok());
+        assert!(require_oci_layout_matches_prepared_mode(
+            &explicit_userns_cfg,
+            &PreparedRuntimeMode::ExplicitUserNamespace {
+                config: userns_config,
+                expected_root_identity: (1, 2),
+            }
+        )
+        .is_ok());
     }
 
     /// Sol's round-1 review of piece 6: `RootlessWithHostMounts` must never accept a free-form
@@ -5316,18 +5972,30 @@ mod tests {
             std::process::id(),
             unique_suffix()
         );
-        // CT-007 slice 3: durably bind BEFORE exec — real `runsc_root_identity`/`cgroup_identity`
-        // (the pinned runsc state-root's and the `MemoryCgroup`'s own (device, inode) identity)
-        // land with this slice's own gvisor.rs wiring piece, not yet built; `(0, 0)` is a
-        // placeholder here, matching only what THIS drill (which doesn't yet construct a real
-        // `MemoryCgroup`-backed quiescence proof) needs to prove `bind`/`release`'s own contract.
-        let runsc_root_identity = (0, 0);
-        let cgroup_identity = (0, 0);
+        // CT-007 slice 3, piece 7b: `preflight_explicit_userns_policy` above already installed the
+        // REAL global policy this drill is exercising — the `(0, 0)` placeholder this test
+        // previously used for `runsc_root_identity` is gone now that piece 7b's real
+        // `finalize_runtime`/`revalidated_explicit_userns_root_identity` wiring exists; this is the
+        // SAME identity `finalize_runtime` will re-confirm at teardown below.
+        let runsc_root_identity = revalidated_explicit_userns_root_identity()
+            .expect("the policy this drill just installed via preflight must revalidate cleanly");
+        let cgroup = MemoryCgroup::create(command_spec.limits.mem_bytes)
+            .expect("establish a real memory cgroup for this drill");
+        let cgroup_identity = cgroup.identity();
         lease
             .bind(container_id.clone(), runsc_root_identity, cgroup_identity)
             .expect("bind must succeed for a fresh Allocated lease");
-        let mode = cfg.invocation_mode();
-        let outcome = run_and_capture(
+        // Sol's round-3 review: construct `prepared_mode` and derive `mode` through the SAME
+        // agreement-checking helper the production path uses, rather than reading
+        // `cfg.invocation_mode()` independently — this drill should demonstrate the exact contract
+        // it exercises, not bypass it.
+        let prepared_mode = PreparedRuntimeMode::ExplicitUserNamespace {
+            config: lease.config(),
+            expected_root_identity: runsc_root_identity,
+        };
+        let mode = require_oci_layout_matches_prepared_mode(&cfg, &prepared_mode)
+            .expect("the drill's own cfg and prepared mode must agree");
+        let (result, child_retirement) = run_and_capture(
             bin,
             &bundle,
             &container_id,
@@ -5341,11 +6009,26 @@ mod tests {
             },
             None,
             mode,
+            &cgroup,
         );
-        delete_container(bin, &container_id, mode);
+        let evidence = finalize_runtime(
+            bin,
+            &container_id,
+            &prepared_mode,
+            cgroup,
+            RUNTIME_QUIESCE_TIMEOUT,
+            child_retirement,
+        )
+        .expect("checked teardown must succeed through the real production path");
+        assert_eq!(
+            evidence.namespace,
+            RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                runsc_root_identity
+            }
+        );
         let _ = std::fs::remove_dir_all(&bundle);
 
-        let outcome = outcome.unwrap_or_else(|e| {
+        let outcome = result.unwrap_or_else(|e| {
             panic!("run_and_capture must succeed through the real production path: {e:?}")
         });
         assert!(
@@ -5391,7 +6074,7 @@ mod tests {
                     permit
                         .commit_and_release()
                         .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
-                    Ok(fake_run())
+                    Ok(fake_finalization())
                 },
             )
             .unwrap();
@@ -5420,7 +6103,7 @@ mod tests {
                         permit
                             .commit_and_release()
                             .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
-                        Ok(fake_run())
+                        Ok(fake_finalization())
                     },
                 )
                 .unwrap();
@@ -6122,7 +6805,7 @@ mod tests {
         let r = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            |_spec, _cfg, _permit, _rootfs, _container_id| Ok(fake_run()),
+            |_spec, _cfg, _permit, _rootfs, _container_id| Ok(fake_finalization()),
         );
         assert!(matches!(
             r,
@@ -6154,7 +6837,7 @@ mod tests {
                     permit
                         .commit_and_release()
                         .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
-                    Ok(fake_run())
+                    Ok(fake_finalization())
                 },
             )
             .expect("the sandbox returns measured usage for the reporter transaction");
@@ -6184,7 +6867,7 @@ mod tests {
                 permit
                     .commit_and_release()
                     .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
-                Ok(fake_run())
+                Ok(fake_finalization())
             },
         );
 
@@ -6220,7 +6903,7 @@ mod tests {
             &hooks,
             move |_spec, _cfg, _permit, _rootfs, _container_id| {
                 spawned_at.store(true, Ordering::SeqCst);
-                Ok(fake_run())
+                Ok(fake_finalization())
             },
         );
         assert!(matches!(
@@ -6581,7 +7264,7 @@ mod tests {
             &hooks,
             move |_spec, _cfg, _permit, _rootfs, _container_id| {
                 spawned_at.store(true, Ordering::SeqCst);
-                Ok(fake_run())
+                Ok(fake_finalization())
             },
         );
 
@@ -6644,7 +7327,7 @@ mod tests {
             &hooks,
             move |_spec, _cfg, _permit, _rootfs, _container_id| {
                 spawned_at.store(true, Ordering::SeqCst);
-                Ok(fake_run())
+                Ok(fake_finalization())
             },
         );
 
@@ -6944,5 +7627,440 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // --- CT-007 slice 3, piece 7b: finalize_runtime / settle_finalization -----------------------
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn finalize_runtime_mints_evidence_on_a_clean_rootless_teardown() {
+        let cg = MemoryCgroup::create(64 << 20)
+            .expect("this test-support gate requires a real delegated cgroup");
+        let dir = cg.dir.clone();
+        let cgroup_identity = cg.identity();
+        // `/bin/true` ignores every argument and always exits 0 — a deterministic stand-in for a
+        // `runsc delete -force` that succeeds, with no real runtime involved.
+        let evidence = finalize_runtime(
+            Path::new("/bin/true"),
+            "container-does-not-matter-for-bin-true",
+            &PreparedRuntimeMode::Rootless,
+            cg,
+            Duration::from_secs(2),
+            DirectChildRetirement::Reaped,
+        )
+        .expect(
+            "a confirmed-reaped child, a successful delete, and a clean cgroup must mint evidence",
+        );
+        assert_eq!(evidence.namespace, RuntimeNamespaceQuiescence::Rootless);
+        assert_eq!(evidence.cgroup.cgroup_identity(), cgroup_identity);
+        assert!(
+            !dir.exists(),
+            "finalize_runtime must remove the cgroup on success"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn finalize_runtime_refuses_when_the_direct_child_was_not_confirmed_reaped() {
+        let cg = MemoryCgroup::create(64 << 20)
+            .expect("this test-support gate requires a real delegated cgroup");
+        let dir = cg.dir.clone();
+        let result = finalize_runtime(
+            Path::new("/bin/true"),
+            "container-does-not-matter-for-bin-true",
+            &PreparedRuntimeMode::Rootless,
+            cg,
+            Duration::from_secs(2),
+            DirectChildRetirement::Unconfirmed("wait() returned ECHILD".to_string()),
+        );
+        let error = result.expect_err("an unconfirmed direct-child reap must refuse evidence");
+        assert_eq!(error.issues.len(), 1, "{error:?}");
+        assert!(matches!(
+            error.issues[0],
+            RuntimeTeardownIssue::ChildNotConfirmedReaped(_)
+        ));
+        // The cgroup itself was genuinely empty — quiescence still ran (and succeeded) despite the
+        // unrelated child-reap issue; a caller must not assume "the cgroup leaked" from this Err.
+        assert!(
+            !dir.exists(),
+            "quiesce must still run (and succeed) even though evidence was refused"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn finalize_runtime_refuses_when_the_container_delete_is_not_confirmed() {
+        let cg = MemoryCgroup::create(64 << 20)
+            .expect("this test-support gate requires a real delegated cgroup");
+        let dir = cg.dir.clone();
+        // `/bin/false` ignores every argument and always exits 1 — a deterministic stand-in for a
+        // `runsc delete -force` that fails.
+        let result = finalize_runtime(
+            Path::new("/bin/false"),
+            "container-does-not-matter-for-bin-false",
+            &PreparedRuntimeMode::Rootless,
+            cg,
+            Duration::from_secs(2),
+            DirectChildRetirement::Reaped,
+        );
+        let error = result.expect_err("a non-zero delete exit must refuse evidence");
+        assert_eq!(error.issues.len(), 1, "{error:?}");
+        assert!(matches!(
+            error.issues[0],
+            RuntimeTeardownIssue::ContainerNotConfirmedDeleted(_)
+        ));
+        assert!(
+            !dir.exists(),
+            "cgroup quiescence must still run (and succeed) despite the delete failure"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn finalize_runtime_skips_the_delete_but_still_quiesces_when_namespace_identity_drifts() {
+        // `/bin/false` stands in for a `runsc delete` that would fail — but it must never even be
+        // invoked here, since the (injected) namespace-identity revalidation reports a drift first.
+        // If `retire_container` ran anyway, `ContainerNotConfirmedDeleted` would ALSO appear in
+        // `issues`, which the assertion below rules out.
+        let cg = MemoryCgroup::create(64 << 20)
+            .expect("this test-support gate requires a real delegated cgroup");
+        let dir = cg.dir.clone();
+        let expected_root_identity = (11, 22);
+        let drifted_identity = (11, 99);
+        let prepared_mode = PreparedRuntimeMode::ExplicitUserNamespace {
+            config: UserNamespaceConfig::for_tests(1000, 1000, 200000, 200000),
+            expected_root_identity,
+        };
+        let result = finalize_runtime_given(
+            Path::new("/bin/false"),
+            "container-must-not-be-deleted",
+            &prepared_mode,
+            cg,
+            Duration::from_secs(2),
+            DirectChildRetirement::Reaped,
+            move || Ok(drifted_identity),
+            |_bin, _container_id, _mode| {
+                panic!("retire_container must never be invoked after a namespace-identity drift")
+            },
+        );
+        let error = result.expect_err("a drifted namespace identity must refuse evidence");
+        assert_eq!(error.issues.len(), 1, "{error:?}");
+        assert!(matches!(
+            error.issues[0],
+            RuntimeTeardownIssue::NamespaceIdentityDrifted(_)
+        ));
+        assert!(
+            !dir.exists(),
+            "cgroup quiescence must still run (and succeed) even though the delete was skipped"
+        );
+    }
+
+    /// Sol's round-2 review: the identity-MATCHES branch, using the `_given` seam's SECOND
+    /// injectable (`retire_container_fn`) so this test never touches the real global
+    /// `EXPLICIT_USERNS_POLICY`. Proves: deletion is invoked exactly once, with the derived
+    /// explicit invocation mode, and the minted evidence carries the expected container/namespace/
+    /// cgroup identities.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn finalize_runtime_mints_explicit_userns_evidence_when_the_identity_still_matches() {
+        let cg = MemoryCgroup::create(64 << 20)
+            .expect("this test-support gate requires a real delegated cgroup");
+        let cgroup_identity = cg.identity();
+        let identity = (33, 44);
+        let userns_config = UserNamespaceConfig::for_tests(1000, 1000, 200000, 200000);
+        let prepared_mode = PreparedRuntimeMode::ExplicitUserNamespace {
+            config: userns_config,
+            expected_root_identity: identity,
+        };
+        let delete_calls = std::cell::Cell::new(0u32);
+        let seen_mode = std::cell::RefCell::new(None);
+        let evidence = finalize_runtime_given(
+            Path::new("/bin/true"),
+            "container-xyz",
+            &prepared_mode,
+            cg,
+            Duration::from_secs(2),
+            DirectChildRetirement::Reaped,
+            move || Ok(identity),
+            |_bin, container_id, mode| {
+                delete_calls.set(delete_calls.get() + 1);
+                *seen_mode.borrow_mut() = Some(mode);
+                assert_eq!(container_id, "container-xyz");
+                Ok(())
+            },
+        )
+        .expect("a matching identity, successful delete, and clean cgroup must mint evidence");
+
+        assert_eq!(delete_calls.get(), 1, "delete must be invoked exactly once");
+        assert_eq!(
+            seen_mode.into_inner(),
+            Some(RunscInvocationMode::ExplicitUserNamespace(userns_config)),
+            "the derived explicit invocation mode must be used"
+        );
+        assert_eq!(evidence.container_id, "container-xyz");
+        assert_eq!(
+            evidence.namespace,
+            RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                runsc_root_identity: identity
+            }
+        );
+        assert_eq!(evidence.cgroup.cgroup_identity(), cgroup_identity);
+    }
+
+    #[test]
+    fn preflight_capture_and_teardown_result_passes_through_a_clean_success() {
+        let evidence = RuntimeQuiescenceEvidence {
+            container_id: "c".to_string(),
+            namespace: RuntimeNamespaceQuiescence::Rootless,
+            cgroup: CgroupQuiescenceEvidence::assert_for_tests((1, 2)),
+        };
+        let result = preflight_capture_and_teardown_result(Ok(outcome(b"", b"")), Ok(evidence));
+        assert!(result.is_ok(), "expected Ok, got Err");
+    }
+
+    #[test]
+    fn preflight_capture_and_teardown_result_surfaces_a_teardown_only_failure() {
+        let teardown = RuntimeTeardownError {
+            issues: vec![RuntimeTeardownIssue::Cgroup(
+                CgroupQuiescenceError::StillPopulated {
+                    waited: Duration::from_secs(2),
+                },
+            )],
+        };
+        let result = preflight_capture_and_teardown_result(Ok(outcome(b"", b"")), Err(teardown));
+        let Err(message) = result else {
+            panic!("a teardown-only failure must still refuse");
+        };
+        assert!(
+            message.contains("runtime teardown check failed"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn preflight_capture_and_teardown_result_surfaces_a_capture_only_failure() {
+        let evidence = RuntimeQuiescenceEvidence {
+            container_id: "c".to_string(),
+            namespace: RuntimeNamespaceQuiescence::Rootless,
+            cgroup: CgroupQuiescenceEvidence::assert_for_tests((1, 2)),
+        };
+        let capture_failure = RunFailure::uncommitted("spawn runsc: boom");
+        let result = preflight_capture_and_teardown_result(Err(capture_failure), Ok(evidence));
+        let Err(message) = result else {
+            panic!("a capture-only failure must still refuse");
+        };
+        assert!(message.contains("boom"), "{message}");
+    }
+
+    /// Sol's round-2 review, blocker 4: the previous implementation applied `?` to the capture
+    /// result BEFORE ever inspecting the teardown result — when BOTH failed, the teardown
+    /// diagnostic silently disappeared. Proves both messages survive when both fail.
+    #[test]
+    fn preflight_capture_and_teardown_result_reports_both_failures_when_both_fail() {
+        let capture_failure = RunFailure::uncommitted("spawn runsc: boom");
+        let teardown = RuntimeTeardownError {
+            issues: vec![RuntimeTeardownIssue::Cgroup(
+                CgroupQuiescenceError::StillPopulated {
+                    waited: Duration::from_secs(2),
+                },
+            )],
+        };
+        let result = preflight_capture_and_teardown_result(Err(capture_failure), Err(teardown));
+        let Err(message) = result else {
+            panic!("a compound failure must still refuse");
+        };
+        assert!(message.contains("boom"), "{message}");
+        assert!(
+            message.contains("runtime teardown check also failed"),
+            "{message}"
+        );
+    }
+
+    /// A [`RunscChild`] that records whether `kill()` was invoked, for
+    /// `discard_container_run_after_teardown_failure`'s tests below.
+    struct CountingFakeRunsc {
+        killed: Arc<AtomicBool>,
+    }
+    impl RunscChild for CountingFakeRunsc {
+        fn kill(&mut self) -> Result<(), String> {
+            self.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn wait(&mut self) -> Result<i32, String> {
+            Ok(0)
+        }
+    }
+
+    fn container_run_with_real_bundle_dir(killed: Arc<AtomicBool>) -> (ContainerRun, PathBuf) {
+        let bundle_dir = std::env::temp_dir().join(format!(
+            "myelin-gvisor-discard-bundle-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        let run = ContainerRun {
+            child: Box::new(CountingFakeRunsc { killed }),
+            bundle_dir: bundle_dir.clone(),
+            result: SandboxResult::stub_ok(ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 1,
+            }),
+            run_error: None,
+        };
+        (run, bundle_dir)
+    }
+
+    /// Sol's round-2 review, blocker 3: a successful `ContainerRun` that `settle_finalization`
+    /// converts into a failure must not leak its staged bundle dir (it will never reach
+    /// `self.live`, which is the ONLY other place that removes it). Non-drift issues are safe to
+    /// best-effort re-attempt the deferred kill on, as one more defense-in-depth try.
+    #[test]
+    fn discard_container_run_after_teardown_failure_removes_bundle_and_best_effort_kills_on_a_non_drift_issue(
+    ) {
+        let killed = Arc::new(AtomicBool::new(false));
+        let (run, bundle_dir) = container_run_with_real_bundle_dir(killed.clone());
+        let teardown = RuntimeTeardownError {
+            issues: vec![RuntimeTeardownIssue::ContainerNotConfirmedDeleted(
+                "exited 1".to_string(),
+            )],
+        };
+        discard_container_run_after_teardown_failure(run, &teardown);
+        assert!(
+            !bundle_dir.exists(),
+            "the staged bundle must be removed even when the run is discarded"
+        );
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "a non-drift issue must still attempt the best-effort deferred kill"
+        );
+    }
+
+    /// Sol's round-2 review, blocker 3: when the teardown issues include a namespace-identity
+    /// drift, `finalize_runtime` already determined the path-based delete/kill is unsafe to trust
+    /// — this cleanup must NOT retroactively invoke it, even as a "best effort", but must still
+    /// remove the bundle dir (that part is unconditional).
+    #[test]
+    fn discard_container_run_after_teardown_failure_skips_kill_but_still_removes_bundle_on_namespace_drift(
+    ) {
+        let killed = Arc::new(AtomicBool::new(false));
+        let (run, bundle_dir) = container_run_with_real_bundle_dir(killed.clone());
+        let teardown = RuntimeTeardownError {
+            issues: vec![RuntimeTeardownIssue::NamespaceIdentityDrifted(
+                "expected (1, 2), found (1, 3)".to_string(),
+            )],
+        };
+        discard_container_run_after_teardown_failure(run, &teardown);
+        assert!(
+            !bundle_dir.exists(),
+            "the staged bundle must still be removed even when kill is skipped"
+        );
+        assert!(
+            !killed.load(Ordering::SeqCst),
+            "a namespace-identity drift must NOT trigger the path-based deferred kill"
+        );
+    }
+
+    #[test]
+    fn settle_finalization_returns_the_primary_unchanged_when_finalized() {
+        let evidence = RuntimeQuiescenceEvidence {
+            container_id: "c".to_string(),
+            namespace: RuntimeNamespaceQuiescence::Rootless,
+            cgroup: CgroupQuiescenceEvidence::assert_for_tests((1, 2)),
+        };
+        let finalization: RuntimeFinalization<Result<u64, RunFailure>> =
+            RuntimeFinalization::Finalized(FinalizedRun {
+                primary: Ok(42),
+                evidence,
+            });
+        let result = settle_finalization(
+            finalization,
+            |_: &u64| ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            },
+            |_: u64, _: &RuntimeTeardownError| {
+                panic!("on_discarded_success must not run when finalization succeeded")
+            },
+        );
+        assert!(matches!(result, Ok(42)), "{result:?}");
+    }
+
+    #[test]
+    fn settle_finalization_converts_a_clean_success_into_executed_when_teardown_fails() {
+        let teardown = RuntimeTeardownError {
+            issues: vec![RuntimeTeardownIssue::ContainerNotConfirmedDeleted(
+                "exited 1".to_string(),
+            )],
+        };
+        let usage = ResourceUsage {
+            cpu_seconds: 3,
+            mem_byte_seconds: 4096,
+        };
+        let finalization: RuntimeFinalization<Result<u64, RunFailure>> =
+            RuntimeFinalization::Failed {
+                primary: Ok(42),
+                teardown,
+            };
+        let discarded = std::cell::Cell::new(false);
+        let result = settle_finalization(
+            finalization,
+            move |_: &u64| usage,
+            |value: u64, _: &RuntimeTeardownError| {
+                assert_eq!(value, 42);
+                discarded.set(true);
+            },
+        );
+        assert!(
+            discarded.get(),
+            "on_discarded_success must run for a discarded successful primary"
+        );
+        match result {
+            Err(RunFailure::Executed {
+                usage: got_usage,
+                message,
+            }) => {
+                assert_eq!(got_usage, usage);
+                assert!(message.contains("runtime teardown failed"));
+            }
+            other => panic!("expected RunFailure::Executed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settle_finalization_augments_an_existing_run_failure_without_losing_its_phase_or_usage() {
+        let teardown = RuntimeTeardownError {
+            issues: vec![RuntimeTeardownIssue::Cgroup(
+                CgroupQuiescenceError::StillPopulated {
+                    waited: Duration::from_secs(2),
+                },
+            )],
+        };
+        let original_usage = ResourceUsage {
+            cpu_seconds: 7,
+            mem_byte_seconds: 8192,
+        };
+        let finalization: RuntimeFinalization<Result<u64, RunFailure>> =
+            RuntimeFinalization::Failed {
+                primary: Err(RunFailure::executed("original failure", original_usage)),
+                teardown,
+            };
+        let result = settle_finalization(
+            finalization,
+            |_: &u64| panic!("usage_of must not be called when the primary already failed"),
+            |_: u64, _: &RuntimeTeardownError| {
+                panic!("on_discarded_success must not run when the primary already failed")
+            },
+        );
+        match result {
+            Err(RunFailure::Executed {
+                usage: got_usage,
+                message,
+            }) => {
+                assert_eq!(got_usage, original_usage);
+                assert!(message.contains("original failure"));
+                assert!(message.contains("runtime teardown failed"));
+            }
+            other => panic!("expected an augmented RunFailure::Executed, got {other:?}"),
+        }
     }
 }

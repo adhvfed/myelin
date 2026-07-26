@@ -135,9 +135,10 @@ impl SandboxCommand {
                         .expect("fenced sandbox command owns a watchdog deadline"),
                 )
                 .map_err(|error| {
-                    SpawnFailure::uncommitted(format!(
-                        "arm sandbox launch watchdog deadline: {error}"
-                    ))
+                    SpawnFailure::uncommitted(
+                        format!("arm sandbox launch watchdog deadline: {error}"),
+                        DirectChildRetirement::NoChildReturned,
+                    )
                 })?,
             )
         } else {
@@ -203,7 +204,10 @@ impl SandboxCommand {
         // release-to-exec moment).
         let mut executed_at = (!self.fenced).then(Instant::now);
         let mut child = self.command.spawn().map_err(|error| {
-            SpawnFailure::uncommitted(format!("spawn sandbox process: {error}"))
+            SpawnFailure::uncommitted(
+                format!("spawn sandbox process: {error}"),
+                DirectChildRetirement::NoChildReturned,
+            )
         })?;
         drop(self.liveness_read.take());
         drop(self.ready_write.take());
@@ -215,9 +219,10 @@ impl SandboxCommand {
                 Some(gate) => gate,
                 None => {
                     kill_process_group(group_id);
-                    let _ = child.wait();
+                    let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
                     return Err(SpawnFailure::uncommitted(
                         "launch guard gate pipe unavailable".to_string(),
+                        child_retirement,
                     ));
                 }
             };
@@ -229,10 +234,11 @@ impl SandboxCommand {
             drop(self.ready_read.take());
             if let Err(error) = ready_result {
                 kill_process_group(group_id);
-                let _ = child.wait();
-                return Err(SpawnFailure::uncommitted(format!(
-                    "launch guard failed to arm liveness watchdog: {error}"
-                )));
+                let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
+                return Err(SpawnFailure::uncommitted(
+                    format!("launch guard failed to arm liveness watchdog: {error}"),
+                    child_retirement,
+                ));
             }
             let permit = self
                 .permit
@@ -242,28 +248,32 @@ impl SandboxCommand {
                 Ok(ownership) => ownership,
                 Err(error) => {
                     kill_process_group(group_id);
-                    let _ = child.wait();
+                    let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
                     // The CAS returned an error, but that does NOT prove nothing committed: the
                     // durable store may have committed and lost the acknowledgement (e.g. a
                     // Postgres commit whose result never reached the caller). Calling this
                     // Uncommitted would let a caller release a reservation the store may still
                     // consider owned. Neither release nor settle — surface the ambiguity so the
                     // caller defers to durable reconciliation instead of guessing.
-                    return Err(SpawnFailure::commit_outcome_unknown(format!(
-                        "durable launch commit returned an error before sandbox exec: {error}"
-                    )));
+                    return Err(SpawnFailure::commit_outcome_unknown(
+                        format!(
+                            "durable launch commit returned an error before sandbox exec: {error}"
+                        ),
+                        child_retirement,
+                    ));
                 }
             };
             let ownership = match ownership.validate() {
                 Ok(ownership) => ownership,
                 Err(error) => {
                     kill_process_group(group_id);
-                    let _ = child.wait();
+                    let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
                     // The CAS DID commit (durably); the runtime is being killed before exec — the
                     // reservation's cost is real even though no workload ran.
-                    return Err(SpawnFailure::committed_but_not_executed(format!(
-                        "durable launch ownership was lost before sandbox exec: {error}"
-                    )));
+                    return Err(SpawnFailure::committed_but_not_executed(
+                        format!("durable launch ownership was lost before sandbox exec: {error}"),
+                        child_retirement,
+                    ));
                 }
             };
             // Captured IMMEDIATELY BEFORE the write below, not after: once the byte is written the
@@ -274,19 +284,20 @@ impl SandboxCommand {
             let release_at = Instant::now();
             if let Err(error) = gate.write_all(b"launch\n") {
                 kill_process_group(group_id);
-                let _ = child.wait();
+                let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
                 // Committed, but the guard never even read the release byte — still no exec. The
                 // write failed, so `release_at` is discarded (never assigned to `executed_at`) —
                 // this phase carries no execution timestamp.
-                return Err(SpawnFailure::committed_but_not_executed(format!(
-                    "release sandbox after durable launch commit: {error}"
-                )));
+                return Err(SpawnFailure::committed_but_not_executed(
+                    format!("release sandbox after durable launch commit: {error}"),
+                    child_retirement,
+                ));
             }
             executed_at = Some(release_at);
             drop(gate);
             if let Err(error) = ownership.release() {
                 kill_process_group(group_id);
-                let _ = child.wait();
+                let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
                 // The gate byte WAS written above — the guard's `exec "$@"` may already be
                 // running by the time this specific release call failed. Treat as a real (if
                 // botched) execution: the caller must account conservative fallback usage, never
@@ -294,6 +305,7 @@ impl SandboxCommand {
                 return Err(SpawnFailure::executed(
                     format!("release durable launch ownership after sandbox exec handoff: {error}"),
                     executed_at.expect("executed_at was just set above"),
+                    child_retirement,
                 ));
             }
         }
@@ -307,6 +319,36 @@ impl SandboxCommand {
             executed_at: executed_at
                 .expect("executed_at is always set (pre-spawn if unfenced, pre-gate-write if fenced) by the time spawn succeeds"),
         })
+    }
+}
+
+/// Whether the sandbox's DIRECT child process (the `runsc` runtime `SandboxCommand` spawned — not
+/// any container it may itself have started) was confirmed reaped by the time a
+/// [`SandboxCommand::spawn`] failure, or a later [`SandboxChild::kill_and_wait`] call, returned.
+/// CT-007 slice 3, piece 7b (Sol's design review): `wait()`'s own `Result` was previously discarded
+/// everywhere it was called on a failure path — a `wait()` failure (e.g. ECHILD from a reaper race,
+/// or an I/O error) does NOT mean the process is gone, only that ITS FATE IS UNKNOWN. Callers that
+/// need to mint teardown evidence must be able to tell "confirmed gone" apart from "no idea".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DirectChildRetirement {
+    /// The caller never acquired a child handle — either `Command::spawn` itself never ran (e.g. a
+    /// pre-spawn watchdog-arming failure), or it was attempted and returned `Err`. NOT a claim that
+    /// no process was ever created: a failed pre-exec/exec attempt can still have forked a process
+    /// this handle never learned the pid of. Cgroup quiescence (identified independently by its own
+    /// (device, inode), never by this handle) is the backstop that catches such a descendant.
+    NoChildReturned,
+    /// `wait()` returned a real exit status — the process is confirmed gone.
+    Reaped,
+    /// `wait()` itself failed — the process's fate is NOT confirmed; it may still be alive.
+    Unconfirmed(String),
+}
+
+impl DirectChildRetirement {
+    fn from_wait_result(result: io::Result<ExitStatus>) -> Self {
+        match result {
+            Ok(_) => DirectChildRetirement::Reaped,
+            Err(error) => DirectChildRetirement::Unconfirmed(error.to_string()),
+        }
     }
 }
 
@@ -335,43 +377,61 @@ pub(crate) enum SpawnPhase {
 /// earliest moment the guard's `exec "$@"` could have started) — so a caller with no OTHER
 /// elapsed-time reference (`spawn()` itself failed, so the caller never got a `child`/start-time
 /// of its own) can still compute a conservative fallback usage from `executed_at.elapsed()`.
+///
+/// `child_retirement` (CT-007 slice 3, piece 7b) carries whatever this method itself already knows
+/// about the DIRECT child's fate — [`DirectChildRetirement::NoChildReturned`] for every failure before
+/// `Command::spawn` succeeded, or the real `wait()` outcome (no longer discarded) for every failure
+/// after a child existed. A caller building teardown evidence needs this instead of assuming
+/// "spawn() failed" implies "nothing to reap".
 #[derive(Debug)]
 pub(crate) struct SpawnFailure {
     phase: SpawnPhase,
     message: String,
     executed_at: Option<Instant>,
+    child_retirement: DirectChildRetirement,
 }
 
 impl SpawnFailure {
-    fn uncommitted(message: String) -> Self {
+    fn uncommitted(message: String, child_retirement: DirectChildRetirement) -> Self {
         Self {
             phase: SpawnPhase::Uncommitted,
             message,
             executed_at: None,
+            child_retirement,
         }
     }
 
-    fn commit_outcome_unknown(message: String) -> Self {
+    fn commit_outcome_unknown(message: String, child_retirement: DirectChildRetirement) -> Self {
         Self {
             phase: SpawnPhase::CommitOutcomeUnknown,
             message,
             executed_at: None,
+            child_retirement,
         }
     }
 
-    fn committed_but_not_executed(message: String) -> Self {
+    fn committed_but_not_executed(
+        message: String,
+        child_retirement: DirectChildRetirement,
+    ) -> Self {
         Self {
             phase: SpawnPhase::CommittedButNotExecuted,
             message,
             executed_at: None,
+            child_retirement,
         }
     }
 
-    fn executed(message: String, executed_at: Instant) -> Self {
+    fn executed(
+        message: String,
+        executed_at: Instant,
+        child_retirement: DirectChildRetirement,
+    ) -> Self {
         Self {
             phase: SpawnPhase::Executed,
             message,
             executed_at: Some(executed_at),
+            child_retirement,
         }
     }
 
@@ -388,6 +448,12 @@ impl SpawnFailure {
     /// usage.
     pub(crate) fn executed_at(&self) -> Option<Instant> {
         self.executed_at
+    }
+
+    /// Whether the DIRECT child (if one was ever spawned) is confirmed reaped by the time this
+    /// failure occurred. See [`DirectChildRetirement`].
+    pub(crate) fn child_retirement(&self) -> &DirectChildRetirement {
+        &self.child_retirement
     }
 }
 
@@ -458,14 +524,18 @@ impl SandboxChild {
         unsafe { libc::poll(&mut poll_fd, 1, 0) == 1 && poll_fd.revents & libc::POLLIN != 0 }
     }
 
-    pub(crate) fn kill_and_wait(&mut self) {
+    /// Kill and reap the direct child, returning whether the reap is actually confirmed (CT-007
+    /// slice 3, piece 7b) — `wait()`'s result was previously discarded here, so a caller could not
+    /// tell "confirmed gone" apart from "no idea" when building teardown evidence.
+    pub(crate) fn kill_and_wait(&mut self) -> DirectChildRetirement {
         if let Some(group_id) = self.process_group {
             kill_process_group(group_id);
         } else {
             let _ = self.child.kill();
         }
-        let _ = self.child.wait();
+        let child_retirement = DirectChildRetirement::from_wait_result(self.child.wait());
         self.finish_liveness();
+        child_retirement
     }
 
     pub(crate) fn finish_liveness(&mut self) {
