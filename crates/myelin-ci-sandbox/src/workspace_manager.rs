@@ -73,7 +73,7 @@
 //!   quietly starts provisioning real disk.
 
 use crate::dirlock::{fd_identity, path_identity};
-use crate::workspace_storage::{WorkspaceStorage, WorkspaceStorageError};
+use crate::workspace_storage::{PreparedWorkspace, WorkspaceStorage, WorkspaceStorageError};
 use std::collections::BTreeSet;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -233,6 +233,156 @@ impl std::fmt::Display for CapacityRefusal {
     }
 }
 
+/// CT-007 slice 3: why [`WorkspaceManager::create_workspace`] refused, before ever touching
+/// `WorkspaceStorage`. EVERY variant here hands the caller's [`CapacityLease`] BACK — a refusal at
+/// this stage means NOTHING was provisioned, so the lease is exactly as valid as it was before the
+/// call. Without this, a caller's mistake (e.g. passing a lease from the wrong manager) would drop
+/// the lease at the end of this function's scope, triggering its OWN `Drop` — silently poisoning
+/// an otherwise-perfectly-healthy, unrelated manager over what was really just a refused call. A
+/// caller receiving one of these can retry against the right manager/arguments or call
+/// `.release()` on the returned lease.
+#[derive(Debug)]
+pub enum WorkspaceRequestRefusal {
+    /// This manager is [`WorkspaceStorageMode::Disabled`] — no workspace is ever provisioned.
+    Disabled { capacity: CapacityLease },
+    /// Boot-time reconciliation has not finished yet.
+    Reconciling { capacity: CapacityLease },
+    /// The manager is [`WorkspaceAdmission::Poisoned`] — refuses every admission until restarted.
+    Poisoned { capacity: CapacityLease },
+    /// `job_key` already has a checked-out, undeleted workspace — a caller bug (the same job key
+    /// must never be provisioned twice concurrently) rather than something to silently paper over.
+    JobAlreadyActive {
+        job_key: String,
+        capacity: CapacityLease,
+    },
+    /// The supplied [`CapacityLease`] was not leased from THIS manager — accepting a lease from a
+    /// different manager instance would let one manager's admission decision authorize provisioning
+    /// against another's bookkeeping entirely.
+    WrongManager { capacity: CapacityLease },
+    /// The supplied [`CapacityLease`]'s own `bytes()` does not EXACTLY equal the requested
+    /// `quota_bytes` — both are meant to originate from the SAME `spec.limits.disk_bytes`, so any
+    /// inequality indicates a caller bug, not something to silently reconcile by taking the smaller
+    /// (or larger) of the two.
+    CapacityMismatch {
+        requested: u64,
+        leased: u64,
+        capacity: CapacityLease,
+    },
+}
+
+impl WorkspaceRequestRefusal {
+    /// Take back the [`CapacityLease`] this refusal returned — every variant carries one, since a
+    /// refusal at THIS stage means nothing was provisioned and the lease remains exactly as valid
+    /// as before the call.
+    pub fn into_capacity(self) -> CapacityLease {
+        match self {
+            WorkspaceRequestRefusal::Disabled { capacity }
+            | WorkspaceRequestRefusal::Reconciling { capacity }
+            | WorkspaceRequestRefusal::Poisoned { capacity }
+            | WorkspaceRequestRefusal::JobAlreadyActive { capacity, .. }
+            | WorkspaceRequestRefusal::WrongManager { capacity }
+            | WorkspaceRequestRefusal::CapacityMismatch { capacity, .. } => capacity,
+        }
+    }
+}
+
+impl std::fmt::Display for WorkspaceRequestRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkspaceRequestRefusal::Disabled { .. } => {
+                write!(
+                    f,
+                    "workspace storage is Disabled — no workspace is ever provisioned"
+                )
+            }
+            WorkspaceRequestRefusal::Reconciling { .. } => write!(
+                f,
+                "workspace manager has not finished boot-time reconciliation yet"
+            ),
+            WorkspaceRequestRefusal::Poisoned { .. } => {
+                write!(f, "workspace manager is poisoned — refusing all admission")
+            }
+            WorkspaceRequestRefusal::JobAlreadyActive { job_key, .. } => write!(
+                f,
+                "job key {job_key:?} already has an active, undeleted workspace"
+            ),
+            WorkspaceRequestRefusal::WrongManager { .. } => write!(
+                f,
+                "the supplied capacity lease was not leased from this manager"
+            ),
+            WorkspaceRequestRefusal::CapacityMismatch {
+                requested, leased, ..
+            } => write!(
+                f,
+                "requested {requested} quota bytes but the supplied capacity lease holds \
+                 {leased} bytes — both must originate from the same spec.limits.disk_bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceRequestRefusal {}
+
+/// CT-007 slice 3: the combined failure mode of [`WorkspaceManager::create_workspace`] SPECIFICALLY
+/// (`delete_workspace` has its own dedicated [`DeleteWorkspaceError`] — the two are not, and must
+/// not be, the same type, since a `delete_workspace` refusal hands back a whole
+/// [`ManagedWorkspace`], not a bare [`CapacityLease`]). `Refused` covers every refusal that happens
+/// BEFORE any real `WorkspaceStorage` operation is attempted — the caller's `CapacityLease` (via
+/// [`WorkspaceRequestRefusal::into_capacity`]) is always recoverable from it. `Storage` covers a
+/// real operation that was attempted and failed — by this point the caller's `CapacityLease` has
+/// ALREADY been consumed internally (released back to the pool, or abandoned — poisoning this
+/// manager — depending on what `WorkspaceStorage` itself proved), so there is nothing left to hand
+/// back.
+#[derive(Debug)]
+pub enum WorkspaceProvisionError {
+    Refused(WorkspaceRequestRefusal),
+    Storage(WorkspaceStorageError),
+    /// Sol's review, round 3: the disk operation genuinely SUCCEEDED, but this manager's own
+    /// `active_job_ids` bookkeeping was already wrong beforehand (should be structurally
+    /// impossible, given the immediately-preceding check happens under the SAME continuously-held
+    /// lock — never silently trusted anyway). This is a HARD failure — NOT `Ok(ManagedWorkspace)`
+    /// — so a caller like `launch_with` cannot mistake a corrupted invariant for authorization to
+    /// proceed with launching the workload. The real, freshly-created `ManagedWorkspace`
+    /// capability is still carried along (via [`Self::into_workspace_after_invariant_violation`])
+    /// so the caller can still clean up the real subvolume via [`WorkspaceManager::delete_workspace`]
+    /// — which does not itself refuse merely because admission is poisoned.
+    InternalInvariantViolated {
+        reason: String,
+        workspace: Box<ManagedWorkspace>,
+    },
+}
+
+impl WorkspaceProvisionError {
+    /// Take back the [`ManagedWorkspace`] an `InternalInvariantViolated` failure carries — the
+    /// real subvolume was actually created; this is the only way to eventually clean it up. Panics
+    /// on any other variant (neither carries one — see the type's own doc).
+    pub fn into_workspace_after_invariant_violation(self) -> ManagedWorkspace {
+        match self {
+            WorkspaceProvisionError::InternalInvariantViolated { workspace, .. } => *workspace,
+            WorkspaceProvisionError::Refused(_) | WorkspaceProvisionError::Storage(_) => panic!(
+                "only WorkspaceProvisionError::InternalInvariantViolated carries a \
+                 ManagedWorkspace back"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkspaceProvisionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkspaceProvisionError::Refused(refusal) => write!(f, "{refusal}"),
+            WorkspaceProvisionError::Storage(e) => {
+                write!(f, "workspace-storage provisioning/deletion failed: {e}")
+            }
+            WorkspaceProvisionError::InternalInvariantViolated { reason, .. } => {
+                write!(f, "internal invariant violated: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceProvisionError {}
+
 /// The manager's full mutable state, behind ONE mutex — admission, capacity bookkeeping, active
 /// job ids, and the open `WorkspaceStorage` handle are never independently synchronized, so "is
 /// this manager Healthy AND does this fit the ceiling" is always one atomic critical section
@@ -387,6 +537,17 @@ impl CapacityLease {
             }
         }
     }
+
+    /// CT-007 slice 3: consumed when a workspace provisioning/deletion failure leaves the byte
+    /// accounting genuinely unreconciled (e.g. [`crate::workspace_storage::WorkspaceStorageError::UnrecoverableLeak`]
+    /// — the subvolume may still exist on disk, still consuming this capacity). Poisons the
+    /// manager with the SPECIFIC provisioning/deletion reason (not the generic "dropped without an
+    /// explicit release" message `Drop` would otherwise report), and marks itself released so
+    /// `Drop` stays silent — the specific, more useful incident has already fired.
+    fn abandon_with_reason(mut self, reason: impl Into<String>) {
+        self.shared.poison(reason);
+        self.released = true;
+    }
 }
 
 impl Drop for CapacityLease {
@@ -398,6 +559,92 @@ impl Drop for CapacityLease {
                  admission until a human reconciles",
                 self.bytes
             ));
+        }
+    }
+}
+
+/// CT-007 slice 3: a real, checked-out workspace bound to the [`CapacityLease`] that authorized
+/// it. Sol's review: a borrowed `&CapacityLease` would let ONE lease authorize multiple workspace
+/// creations — this type CONSUMES the lease instead, so "a workspace is checked out" and "its
+/// capacity is spoken for" can never drift apart. Non-`Clone`; the only way to get one is
+/// [`WorkspaceManager::create_workspace`], the only way to give one up is
+/// [`WorkspaceManager::delete_workspace`] (which consumes it by value).
+pub struct ManagedWorkspace {
+    job_key: String,
+    /// `None` only in the brief window inside [`WorkspaceManager::delete_workspace`] after both
+    /// fields have been taken out for the actual delete call — never observable by any external
+    /// caller.
+    prepared: Option<PreparedWorkspace>,
+    capacity: Option<CapacityLease>,
+    shared: Arc<SharedState>,
+    released: bool,
+}
+
+impl std::fmt::Debug for ManagedWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedWorkspace")
+            .field("job_key", &self.job_key)
+            .field("host_path", &self.prepared.as_ref().map(|p| p.host_path()))
+            .field("released", &self.released)
+            .finish()
+    }
+}
+
+impl ManagedWorkspace {
+    /// The job key this workspace was provisioned for.
+    pub fn job_key(&self) -> &str {
+        &self.job_key
+    }
+
+    /// The host filesystem path — bind-mount this (read-write) into the sandbox's OCI bundle.
+    /// `None` only during the brief internal window inside [`WorkspaceManager::delete_workspace`].
+    pub fn host_path(&self) -> &Path {
+        self.prepared
+            .as_ref()
+            .expect("host_path() called after this workspace was already consumed by delete")
+            .host_path()
+    }
+
+    /// The capacity (bytes) this workspace's [`CapacityLease`] holds.
+    pub fn capacity_bytes(&self) -> u64 {
+        self.capacity
+            .as_ref()
+            .expect("capacity_bytes() called after this workspace was already consumed by delete")
+            .bytes()
+    }
+
+    /// CT-007 slice 3, Sol's review (round 3): a test-only clean teardown for a `ManagedWorkspace`
+    /// built via the `apply_create_result` seam (no real `WorkspaceStorage` exists to delete
+    /// against, so the real `WorkspaceManager::delete_workspace` cannot be used) — releases the
+    /// held `CapacityLease` properly and marks this workspace released, so neither its own `Drop`
+    /// nor the lease's fires an incident. `mem::forget`, used here in an earlier round, would have
+    /// silently leaked the lease's `Arc<SharedState>`, this workspace's directory-lock FD, and its
+    /// heap allocation for the remainder of the test process.
+    #[cfg(test)]
+    fn dismantle_for_tests(mut self) {
+        if let Some(capacity) = self.capacity.take() {
+            capacity.release();
+        }
+        self.released = true;
+    }
+}
+
+impl Drop for ManagedWorkspace {
+    fn drop(&mut self) {
+        if !self.released {
+            self.shared.poison(format!(
+                "a managed workspace for job {:?} (host path {:?}) was dropped without being \
+                 deleted — it may still exist on disk, still consuming its leased capacity; \
+                 refusing further admission until a human reconciles",
+                self.job_key,
+                self.prepared.as_ref().map(|p| p.host_path())
+            ));
+            // The capacity lease, if still held, is abandoned TOGETHER with this workspace — one
+            // comprehensive incident above, not a second, less-specific "abandoned lease" message
+            // from `CapacityLease`'s own `Drop` immediately after.
+            if let Some(mut capacity) = self.capacity.take() {
+                capacity.released = true;
+            }
         }
     }
 }
@@ -717,7 +964,277 @@ impl WorkspaceManager {
     pub fn active_job_ids(&self) -> BTreeSet<String> {
         self.shared.lock_state().active_job_ids.clone()
     }
+
+    /// CT-007 slice 3: provision a real, checked-out workspace for `job_key`, CONSUMING `capacity`
+    /// (Sol's review: a borrowed lease could authorize multiple workspace creations — consuming it
+    /// makes "a workspace is checked out" and "its capacity is spoken for" the same fact). Every
+    /// PRE-ATTEMPT refusal ([`WorkspaceRequestRefusal`], reachable via
+    /// [`WorkspaceProvisionError::Refused`]) hands `capacity` straight back — nothing was
+    /// provisioned, so the lease remains exactly as valid as before this call; the caller may
+    /// retry or `.release()` it. Only once a REAL `WorkspaceStorage::create_workspace` attempt is
+    /// made is `capacity` actually consumed: released back to the pool if `WorkspaceStorage`
+    /// itself proved its own rollback succeeded, or abandoned (poisoning this manager, never
+    /// silently freed) if the failure is an `UnrecoverableLeak` — the subvolume may still exist.
+    pub fn create_workspace(
+        &self,
+        job_key: &str,
+        quota_bytes: u64,
+        owner_uid: u32,
+        owner_gid: u32,
+        capacity: CapacityLease,
+    ) -> Result<ManagedWorkspace, WorkspaceProvisionError> {
+        // Checked FIRST, before `WrongManager`/`CapacityMismatch`: a `Disabled` manager can never
+        // have issued a real capacity lease of its own (`acquire_capacity` always refuses on
+        // `Disabled`), so ANY lease passed here already fails the ptr-equality check below —
+        // `WrongManager` would always fire first and mask the actually more informative "this
+        // manager doesn't do workspaces at all" reason.
+        if matches!(self.mode, WorkspaceStorageMode::Disabled) {
+            return Err(WorkspaceProvisionError::Refused(
+                WorkspaceRequestRefusal::Disabled { capacity },
+            ));
+        }
+        if !Arc::ptr_eq(&self.shared, &capacity.shared) {
+            return Err(WorkspaceProvisionError::Refused(
+                WorkspaceRequestRefusal::WrongManager { capacity },
+            ));
+        }
+        if capacity.bytes() != quota_bytes {
+            let leased = capacity.bytes();
+            return Err(WorkspaceProvisionError::Refused(
+                WorkspaceRequestRefusal::CapacityMismatch {
+                    requested: quota_bytes,
+                    leased,
+                    capacity,
+                },
+            ));
+        }
+        let mut state = self.shared.lock_state();
+        match &state.admission {
+            WorkspaceAdmission::Healthy => {}
+            WorkspaceAdmission::Reconciling => {
+                return Err(WorkspaceProvisionError::Refused(
+                    WorkspaceRequestRefusal::Reconciling { capacity },
+                ))
+            }
+            WorkspaceAdmission::Poisoned { .. } => {
+                return Err(WorkspaceProvisionError::Refused(
+                    WorkspaceRequestRefusal::Poisoned { capacity },
+                ))
+            }
+        }
+        if state.active_job_ids.contains(job_key) {
+            return Err(WorkspaceProvisionError::Refused(
+                WorkspaceRequestRefusal::JobAlreadyActive {
+                    job_key: job_key.to_string(),
+                    capacity,
+                },
+            ));
+        }
+        let storage = state
+            .storage
+            .as_mut()
+            .expect("Healthy admission implies storage is Some for an EphemeralDisk manager");
+        let result = storage.create_workspace(job_key, quota_bytes, owner_uid, owner_gid);
+        self.apply_create_result(state, job_key, capacity, result)
+    }
+
+    /// The capacity/active-job-id/admission state transition given the OUTCOME of a
+    /// `WorkspaceStorage::create_workspace` attempt — pulled out of [`Self::create_workspace`] so
+    /// this transition logic is testable WITHOUT real Btrfs (Sol's review: the safety-critical
+    /// post-attempt branches — recoverable-failure release, `UnrecoverableLeak` abandonment,
+    /// the impossible-invariant check below — had no always-on coverage, since minting a REAL
+    /// `ManagedWorkspace` required privileged storage). Takes the ALREADY-HELD `state` guard (the
+    /// real caller holds it continuously from the admission check through the storage call
+    /// itself); a test acquires the lock itself and calls this directly with an INJECTED
+    /// `Result` (via [`crate::workspace_storage::PreparedWorkspace::for_tests`]), never touching
+    /// real storage at all.
+    fn apply_create_result(
+        &self,
+        mut state: MutexGuard<'_, ManagerState>,
+        job_key: &str,
+        capacity: CapacityLease,
+        result: Result<PreparedWorkspace, WorkspaceStorageError>,
+    ) -> Result<ManagedWorkspace, WorkspaceProvisionError> {
+        match result {
+            Ok(prepared) => {
+                let inserted = state.active_job_ids.insert(job_key.to_string());
+                drop(state);
+                let workspace = ManagedWorkspace {
+                    job_key: job_key.to_string(),
+                    prepared: Some(prepared),
+                    capacity: Some(capacity),
+                    shared: self.shared.clone(),
+                    released: false,
+                };
+                if !inserted {
+                    // Sol's review (round 3): the immediately-preceding check
+                    // (`!active_job_ids.contains`) happened under this SAME continuously-held
+                    // lock, so this should be structurally impossible — never silently trusted
+                    // anyway. This is a HARD failure, NOT `Ok(ManagedWorkspace)` — a caller like
+                    // `launch_with` must never mistake a corrupted invariant for authorization to
+                    // launch the workload. The real, freshly-created `ManagedWorkspace` capability
+                    // is still carried IN the error (not discarded) so the caller can still clean
+                    // up the real subvolume via `delete_workspace`, which does not itself refuse
+                    // merely because admission is poisoned.
+                    let reason = format!(
+                        "job {job_key:?} was already in active_job_ids despite the \
+                         immediately-preceding locked check — a workspace was just created on \
+                         disk for it anyway and must still be cleaned up via delete_workspace"
+                    );
+                    self.shared.poison(reason.clone());
+                    return Err(WorkspaceProvisionError::InternalInvariantViolated {
+                        reason,
+                        workspace: Box::new(workspace),
+                    });
+                }
+                Ok(workspace)
+            }
+            Err(error @ WorkspaceStorageError::UnrecoverableLeak { .. }) => {
+                drop(state);
+                let job_key = job_key.to_string();
+                capacity.abandon_with_reason(format!(
+                    "workspace provisioning for job {job_key:?} failed unrecoverably: {error} — \
+                     capacity retained rather than freed, since the subvolume may still exist"
+                ));
+                Err(WorkspaceProvisionError::Storage(error))
+            }
+            Err(error) => {
+                drop(state);
+                // `WorkspaceStorage::create_workspace`'s own doc guarantees any OTHER failure means
+                // its internal rollback already fully cleaned up (no subvolume left behind) — the
+                // bytes are genuinely free again.
+                capacity.release();
+                Err(WorkspaceProvisionError::Storage(error))
+            }
+        }
+    }
+
+    /// CT-007 slice 3: delete a [`ManagedWorkspace`] and release its capacity back to the pool.
+    /// Refuses (handing the WHOLE `workspace` straight back, unconsumed — via
+    /// [`DeleteWorkspaceError::WrongManager`] — dropping it here would incorrectly trigger its own
+    /// abandonment `Drop`) if it was checked out from a DIFFERENT manager instance. On success,
+    /// removes `job_key` from the active set and releases the workspace's own [`CapacityLease`].
+    /// On a delete/sync failure, the active-job entry is LEFT IN PLACE (this job's workspace state
+    /// is now unknown, not confirmed absent), the capacity is abandoned (poisoning this manager —
+    /// never silently freed, since the subvolume may still exist and still be consuming it), and
+    /// an incident is reported.
+    pub fn delete_workspace(
+        &self,
+        workspace: ManagedWorkspace,
+    ) -> Result<(), DeleteWorkspaceError> {
+        if !Arc::ptr_eq(&self.shared, &workspace.shared) {
+            return Err(DeleteWorkspaceError::WrongManager { workspace });
+        }
+        let mut workspace = workspace;
+        let job_key = workspace.job_key.clone();
+        let prepared = workspace
+            .prepared
+            .take()
+            .expect("not yet consumed by a prior delete_workspace call");
+        let capacity = workspace
+            .capacity
+            .take()
+            .expect("not yet consumed by a prior delete_workspace call");
+        workspace.released = true; // this local binding's own Drop must now be a no-op.
+
+        let mut state = self.shared.lock_state();
+        let storage = state
+            .storage
+            .as_mut()
+            .expect("a ManagedWorkspace can only exist for an EphemeralDisk manager with storage");
+        let result = storage.delete_workspace(prepared);
+        self.apply_delete_result(state, &job_key, capacity, result)
+    }
+
+    /// The capacity/active-job-id state transition given the OUTCOME of a
+    /// `WorkspaceStorage::delete_workspace` attempt — pulled out of [`Self::delete_workspace`] for
+    /// the SAME always-on-testability reason as [`Self::apply_create_result`].
+    fn apply_delete_result(
+        &self,
+        mut state: MutexGuard<'_, ManagerState>,
+        job_key: &str,
+        capacity: CapacityLease,
+        result: Result<(), WorkspaceStorageError>,
+    ) -> Result<(), DeleteWorkspaceError> {
+        match result {
+            Ok(()) => {
+                let removed = state.active_job_ids.remove(job_key);
+                drop(state);
+                // The disk deletion genuinely succeeded — release capacity regardless of the
+                // bookkeeping check below (Sol's review: the bytes are proven free either way).
+                capacity.release();
+                if !removed {
+                    // Disk deletion succeeded but this job was never actually tracked as active —
+                    // a real bookkeeping corruption, never silently reported as a healthy `Ok(())`.
+                    let reason = format!(
+                        "internal invariant violated: job {job_key:?} was not in active_job_ids \
+                         even though its workspace was just successfully deleted from disk"
+                    );
+                    self.shared.poison(reason.clone());
+                    return Err(DeleteWorkspaceError::InternalInvariantViolated { reason });
+                }
+                Ok(())
+            }
+            Err(error) => {
+                drop(state);
+                capacity.abandon_with_reason(format!(
+                    "workspace delete/sync for job {job_key:?} failed: {error} — capacity \
+                     retained and the job's active entry left in place pending reconciliation"
+                ));
+                Err(DeleteWorkspaceError::Storage(error))
+            }
+        }
+    }
 }
+
+/// CT-007 slice 3: why [`WorkspaceManager::delete_workspace`] failed. `WrongManager` hands the
+/// WHOLE, still-intact [`ManagedWorkspace`] back (nothing was attempted — dropping it here would
+/// incorrectly trigger its own abandonment `Drop`). `Storage` means a real delete was ATTEMPTED and
+/// FAILED — by this point the workspace and its capacity have ALREADY been consumed internally
+/// (capacity abandoned, poisoning this manager), so there is nothing left to hand back.
+/// `InternalInvariantViolated` means the delete itself SUCCEEDED (the disk is genuinely clean, and
+/// capacity has already been released) but this job's `active_job_ids` bookkeeping was already
+/// wrong beforehand — a real corruption, surfaced rather than masked by a healthy `Ok(())`.
+#[derive(Debug)]
+pub enum DeleteWorkspaceError {
+    WrongManager { workspace: ManagedWorkspace },
+    Storage(WorkspaceStorageError),
+    InternalInvariantViolated { reason: String },
+}
+
+impl DeleteWorkspaceError {
+    /// Take back the [`ManagedWorkspace`] a `WrongManager` refusal returned. Panics on any other
+    /// variant (neither carries one back — see the type's own doc).
+    pub fn into_workspace(self) -> ManagedWorkspace {
+        match self {
+            DeleteWorkspaceError::WrongManager { workspace } => workspace,
+            DeleteWorkspaceError::Storage(_)
+            | DeleteWorkspaceError::InternalInvariantViolated { .. } => panic!(
+                "only DeleteWorkspaceError::WrongManager carries a recoverable ManagedWorkspace \
+                 back — every other variant means it was already consumed internally"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for DeleteWorkspaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeleteWorkspaceError::WrongManager { .. } => write!(
+                f,
+                "the supplied workspace was not checked out from this manager"
+            ),
+            DeleteWorkspaceError::Storage(e) => {
+                write!(f, "workspace delete/sync failed: {e}")
+            }
+            DeleteWorkspaceError::InternalInvariantViolated { reason } => {
+                write!(f, "internal invariant violated: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DeleteWorkspaceError {}
 
 /// Boot-time orphan reconciliation: NOTHING is active yet (this runs before the manager ever
 /// returns to its caller), so every subvolume discovered under the base is necessarily an orphan
@@ -1158,6 +1675,391 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // ──────────── CT-007 slice 3: create_workspace/delete_workspace refusal paths ────────────
+    // These all return before ever touching the (possibly-`None`, state-test-only) `storage`
+    // field, so they run unconditionally — no real Btrfs needed.
+
+    #[test]
+    fn create_workspace_refuses_a_capacity_lease_from_a_different_manager() {
+        let base_a = test_base("create-wrong-manager-a");
+        let base_b = test_base("create-wrong-manager-b");
+        let (sink_a, _log_a) = recording_sink();
+        let (sink_b, _log_b) = recording_sink();
+        let manager_a = WorkspaceManager::new_for_state_tests(&base_a, 100, sink_a).unwrap();
+        let manager_b = WorkspaceManager::new_for_state_tests(&base_b, 100, sink_b).unwrap();
+        let capacity_from_b = manager_b.acquire_capacity(10).unwrap();
+        let result = manager_a.create_workspace("job-1", 10, 1000, 1000, capacity_from_b);
+        let Err(WorkspaceProvisionError::Refused(refusal)) = result else {
+            panic!("expected a WrongManager refusal, got {result:?}");
+        };
+        assert!(matches!(
+            refusal,
+            WorkspaceRequestRefusal::WrongManager { .. }
+        ));
+        // The rejected lease is handed straight back (never consumed on a pre-attempt refusal) —
+        // the caller can release it cleanly, and `manager_b`'s own capacity accounting must be
+        // unaffected either way.
+        assert_eq!(manager_b.capacity_used_bytes(), 10);
+        refusal.into_capacity().release();
+        assert_eq!(manager_b.capacity_used_bytes(), 0);
+        assert!(
+            manager_b.is_healthy(),
+            "handing the lease back and releasing it normally must not poison its real owner"
+        );
+        let _ = std::fs::remove_dir_all(&base_a);
+        let _ = std::fs::remove_dir_all(&base_b);
+    }
+
+    #[test]
+    fn create_workspace_refuses_a_capacity_lease_whose_bytes_disagree_with_quota() {
+        let base = test_base("create-capacity-mismatch");
+        let (sink, _log) = recording_sink();
+        let manager = WorkspaceManager::new_for_state_tests(&base, 100, sink).unwrap();
+        let capacity = manager.acquire_capacity(10).unwrap();
+        let result = manager.create_workspace("job-1", 20, 1000, 1000, capacity);
+        let Err(WorkspaceProvisionError::Refused(refusal)) = result else {
+            panic!("expected a CapacityMismatch refusal, got {result:?}");
+        };
+        assert!(matches!(
+            refusal,
+            WorkspaceRequestRefusal::CapacityMismatch {
+                requested: 20,
+                leased: 10,
+                ..
+            }
+        ));
+        assert_eq!(
+            manager.capacity_used_bytes(),
+            10,
+            "a mismatched-quota refusal must not touch the caller's own capacity accounting"
+        );
+        refusal.into_capacity().release();
+        assert_eq!(manager.capacity_used_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A `Disabled` manager can never have issued its own capacity lease (`acquire_capacity`
+    /// always refuses `Disabled` outright), so `Disabled` is checked BEFORE the ptr-equality
+    /// check — otherwise `WrongManager` would always fire first and mask the more informative
+    /// "this manager doesn't do workspaces at all" reason. Uses a lease from an unrelated donor
+    /// manager to prove `Disabled` wins regardless of the lease's own origin, and that the donor
+    /// is unaffected once the returned lease is released back to it.
+    #[test]
+    fn create_workspace_refuses_when_disabled() {
+        let base = test_base("create-disabled-donor");
+        let (donor_sink, _donor_log) = recording_sink();
+        let donor = WorkspaceManager::new_for_state_tests(&base, 100, donor_sink).unwrap();
+        let lease = donor.acquire_capacity(10).unwrap();
+
+        let (sink, _log) = recording_sink();
+        let manager = WorkspaceManager::try_new(WorkspaceStorageMode::Disabled, sink).unwrap();
+        let result = manager.create_workspace("job-1", 10, 1000, 1000, lease);
+        let Err(WorkspaceProvisionError::Refused(refusal)) = result else {
+            panic!("expected a Disabled refusal, got {result:?}");
+        };
+        assert!(matches!(refusal, WorkspaceRequestRefusal::Disabled { .. }));
+        refusal.into_capacity().release();
+        assert_eq!(donor.capacity_used_bytes(), 0);
+        assert!(donor.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn create_workspace_refuses_an_already_active_job_key() {
+        let base = test_base("create-already-active");
+        let (sink, _log) = recording_sink();
+        let manager = WorkspaceManager::new_for_state_tests(&base, 100, sink).unwrap();
+        manager
+            .shared
+            .lock_state()
+            .active_job_ids
+            .insert("job-1".to_string());
+        let capacity = manager.acquire_capacity(10).unwrap();
+        let result = manager.create_workspace("job-1", 10, 1000, 1000, capacity);
+        let Err(WorkspaceProvisionError::Refused(refusal)) = result else {
+            panic!("expected a JobAlreadyActive refusal, got {result:?}");
+        };
+        assert!(matches!(
+            &refusal,
+            WorkspaceRequestRefusal::JobAlreadyActive { job_key, .. } if job_key == "job-1"
+        ));
+        refusal.into_capacity().release();
+        assert_eq!(manager.capacity_used_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Acquires a real capacity lease WHILE the manager is still healthy, THEN poisons it via a
+    /// SEPARATE abandoned lease (mirroring `acquire_capacity`'s own refusal, which cannot itself
+    /// be poisoned-and-still-hold-a-valid-lease at the same time) — proving `create_workspace`
+    /// hands the already-held, still-valid lease back rather than consuming it into a doomed call.
+    #[test]
+    fn create_workspace_refuses_when_poisoned() {
+        let base = test_base("create-poisoned");
+        let (sink, _log) = recording_sink();
+        let manager = WorkspaceManager::new_for_state_tests(&base, 100, sink).unwrap();
+        let capacity = manager.acquire_capacity(10).unwrap();
+        let abandoned = manager.acquire_capacity(10).unwrap();
+        drop(abandoned); // an un-released Drop poisons the manager.
+        assert!(!manager.is_healthy());
+        let result = manager.create_workspace("job-1", 10, 1000, 1000, capacity);
+        let Err(WorkspaceProvisionError::Refused(refusal)) = result else {
+            panic!("expected a Poisoned refusal, got {result:?}");
+        };
+        assert!(matches!(refusal, WorkspaceRequestRefusal::Poisoned { .. }));
+        // `release()` doesn't check admission state — releasing cleanly here (rather than
+        // dropping) avoids a second, redundant "abandoned lease" incident on top of the one the
+        // earlier deliberately-abandoned lease already fired.
+        refusal.into_capacity().release();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ──── CT-007 slice 3: post-attempt state transitions, always-on via an injected outcome ────
+    // Sol's review: these branches previously had NO always-on coverage — both tests that mint a
+    // real `ManagedWorkspace` require privileged Btrfs and SKIP on this host. Exercised here via
+    // `apply_create_result`/`apply_delete_result` directly, fed a FAKE `Result` (using
+    // `PreparedWorkspace::for_tests` where a value is needed), never touching real storage.
+
+    #[test]
+    fn apply_create_result_releases_capacity_on_a_recoverable_failure_without_poisoning() {
+        let base = test_base("apply-create-recoverable-failure");
+        let (sink, _log) = recording_sink();
+        let manager = WorkspaceManager::new_for_state_tests(&base, 100, sink).unwrap();
+        let capacity = manager.acquire_capacity(10).unwrap();
+        let state = manager.shared.lock_state();
+        let result = manager.apply_create_result(
+            state,
+            "job-1",
+            capacity,
+            Err(WorkspaceStorageError::SubvolumeCreateFailed {
+                path: base.join("job-1"),
+                stderr: "injected failure".to_string(),
+            }),
+        );
+        assert!(matches!(
+            result,
+            Err(WorkspaceProvisionError::Storage(
+                WorkspaceStorageError::SubvolumeCreateFailed { .. }
+            ))
+        ));
+        assert_eq!(
+            manager.capacity_used_bytes(),
+            0,
+            "a recoverable provisioning failure must release the capacity back to the pool"
+        );
+        assert!(manager.is_healthy());
+        assert!(
+            !manager.active_job_ids().contains("job-1"),
+            "a failed create must never leave the job key marked active"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn apply_create_result_retains_capacity_and_poisons_on_an_unrecoverable_leak() {
+        let base = test_base("apply-create-leak");
+        let (sink, _log) = recording_sink();
+        let manager = WorkspaceManager::new_for_state_tests(&base, 100, sink).unwrap();
+        let capacity = manager.acquire_capacity(10).unwrap();
+        let state = manager.shared.lock_state();
+        let result = manager.apply_create_result(
+            state,
+            "job-1",
+            capacity,
+            Err(WorkspaceStorageError::UnrecoverableLeak {
+                path: base.join("job-1"),
+                subvol_id: None,
+                provisioning_error: "injected provisioning error".to_string(),
+                cleanup_error: "injected cleanup error".to_string(),
+            }),
+        );
+        assert!(matches!(
+            result,
+            Err(WorkspaceProvisionError::Storage(
+                WorkspaceStorageError::UnrecoverableLeak { .. }
+            ))
+        ));
+        assert_eq!(
+            manager.capacity_used_bytes(),
+            10,
+            "an UnrecoverableLeak must retain (never silently free) the capacity — the subvolume \
+             may still exist"
+        );
+        assert!(!manager.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn apply_create_result_succeeds_and_tracks_the_job_key() {
+        let base = test_base("apply-create-success");
+        let (sink, _log) = recording_sink();
+        let manager = WorkspaceManager::new_for_state_tests(&base, 100, sink).unwrap();
+        let capacity = manager.acquire_capacity(10).unwrap();
+        let state = manager.shared.lock_state();
+        let fake = PreparedWorkspace::for_tests(base.join("job-1"), 42, base.clone());
+        let workspace = manager
+            .apply_create_result(state, "job-1", capacity, Ok(fake))
+            .expect("an injected Ok outcome must succeed");
+        assert_eq!(workspace.job_key(), "job-1");
+        assert_eq!(workspace.capacity_bytes(), 10);
+        assert!(manager.active_job_ids().contains("job-1"));
+        assert!(manager.is_healthy());
+        workspace.dismantle_for_tests(); // no real storage to delete_workspace() against.
+        assert_eq!(manager.capacity_used_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The state-only equivalent of the privileged
+    /// `dropping_a_managed_workspace_without_deleting_poisons_the_manager_with_one_incident` test —
+    /// exercises the SAME `ManagedWorkspace::drop` abandonment path this seam lets us reach without
+    /// real Btrfs, proving exactly ONE incident fires (not a duplicate from `CapacityLease`'s own
+    /// `Drop`).
+    #[test]
+    fn abandoning_a_managed_workspace_from_the_seam_poisons_with_exactly_one_incident() {
+        let base = test_base("apply-create-abandon");
+        let (sink, incidents) = recording_sink();
+        let manager = WorkspaceManager::new_for_state_tests(&base, 100, sink).unwrap();
+        let capacity = manager.acquire_capacity(10).unwrap();
+        let state = manager.shared.lock_state();
+        let fake = PreparedWorkspace::for_tests(base.join("job-1"), 42, base.clone());
+        let workspace = manager
+            .apply_create_result(state, "job-1", capacity, Ok(fake))
+            .unwrap();
+        drop(workspace); // simulates a crash: never calls delete_workspace.
+        assert!(!manager.is_healthy());
+        let log = incidents.lock().unwrap();
+        assert_eq!(log.len(), 1, "expected exactly one incident, got {log:?}");
+        assert!(log[0].contains("job-1"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn apply_delete_result_abandons_capacity_and_leaves_the_active_entry_on_failure() {
+        let base = test_base("apply-delete-failure");
+        let (sink, _log) = recording_sink();
+        let manager = WorkspaceManager::new_for_state_tests(&base, 100, sink).unwrap();
+        manager
+            .shared
+            .lock_state()
+            .active_job_ids
+            .insert("job-1".to_string());
+        let capacity = manager.acquire_capacity(10).unwrap();
+        let state = manager.shared.lock_state();
+        let result = manager.apply_delete_result(
+            state,
+            "job-1",
+            capacity,
+            // `DeleteFailed` (not `SubvolumeCreateFailed`, which `delete_workspace` can never
+            // actually return — Sol's review) models a genuinely reachable delete-path result.
+            Err(WorkspaceStorageError::DeleteFailed {
+                subvol_id: 42,
+                stderr: "injected delete failure".to_string(),
+            }),
+        );
+        assert!(matches!(result, Err(DeleteWorkspaceError::Storage(_))));
+        assert_eq!(
+            manager.capacity_used_bytes(),
+            10,
+            "a delete/sync failure must retain (never silently free) the capacity"
+        );
+        assert!(
+            manager.active_job_ids().contains("job-1"),
+            "a delete/sync failure must leave the active-job entry in place, not confirmed absent"
+        );
+        assert!(!manager.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn apply_delete_result_succeeds_and_clears_bookkeeping() {
+        let base = test_base("apply-delete-success");
+        let (sink, _log) = recording_sink();
+        let manager = WorkspaceManager::new_for_state_tests(&base, 100, sink).unwrap();
+        manager
+            .shared
+            .lock_state()
+            .active_job_ids
+            .insert("job-1".to_string());
+        let capacity = manager.acquire_capacity(10).unwrap();
+        let state = manager.shared.lock_state();
+        let result = manager.apply_delete_result(state, "job-1", capacity, Ok(()));
+        assert!(result.is_ok());
+        assert_eq!(manager.capacity_used_bytes(), 0);
+        assert!(!manager.active_job_ids().contains("job-1"));
+        assert!(manager.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's review: a delete that genuinely succeeds on disk but finds `job_key` was NEVER
+    /// actually tracked as active is a real bookkeeping corruption — must release capacity (the
+    /// disk is proven clean either way) but poison the manager and surface a typed error, never a
+    /// silently-healthy `Ok(())`.
+    #[test]
+    fn apply_delete_result_surfaces_the_invariant_violation_when_the_job_key_was_never_active() {
+        let base = test_base("apply-delete-invariant");
+        let (sink, _log) = recording_sink();
+        let manager = WorkspaceManager::new_for_state_tests(&base, 100, sink).unwrap();
+        // Deliberately do NOT insert "job-1" into active_job_ids — simulating the impossible case.
+        let capacity = manager.acquire_capacity(10).unwrap();
+        let state = manager.shared.lock_state();
+        let result = manager.apply_delete_result(state, "job-1", capacity, Ok(()));
+        assert!(matches!(
+            result,
+            Err(DeleteWorkspaceError::InternalInvariantViolated { .. })
+        ));
+        assert_eq!(
+            manager.capacity_used_bytes(),
+            0,
+            "capacity must still be released — the disk deletion itself genuinely succeeded"
+        );
+        assert!(!manager.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's review (round 3): the create-side mirror of the delete-invariant test above — the
+    /// disk operation genuinely SUCCEEDS, but `job_key` was ALREADY (impossibly) in
+    /// `active_job_ids` beforehand. Unlike delete's case, this must NOT be treated the same as an
+    /// ordinary failure: the real subvolume now exists on disk, so the typed error carries the
+    /// `ManagedWorkspace` capability along specifically so cleanup remains possible — proven here
+    /// by actually extracting it and dismantling it.
+    #[test]
+    fn apply_create_result_surfaces_the_invariant_violation_when_the_job_key_was_already_active() {
+        let base = test_base("apply-create-invariant");
+        let (sink, _log) = recording_sink();
+        let manager = WorkspaceManager::new_for_state_tests(&base, 100, sink).unwrap();
+        // Deliberately pre-insert "job-1" — simulating the impossible case the immediately
+        // preceding `create_workspace` check is supposed to make unreachable.
+        manager
+            .shared
+            .lock_state()
+            .active_job_ids
+            .insert("job-1".to_string());
+        let capacity = manager.acquire_capacity(10).unwrap();
+        let state = manager.shared.lock_state();
+        let fake = PreparedWorkspace::for_tests(base.join("job-1"), 42, base.clone());
+        let result = manager.apply_create_result(state, "job-1", capacity, Ok(fake));
+        assert!(matches!(
+            result,
+            Err(WorkspaceProvisionError::InternalInvariantViolated { .. })
+        ));
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("job-1"));
+        // Uses the PUBLIC recovery accessor (not a direct field destructure) — pins its contract.
+        let workspace = error.into_workspace_after_invariant_violation();
+        assert_eq!(
+            manager.capacity_used_bytes(),
+            10,
+            "the capacity must still be tracked as used — the real subvolume now exists on disk"
+        );
+        assert!(!manager.is_healthy());
+        // The real capability is genuinely usable for cleanup, exactly as the error's own
+        // contract promises — dismantle it here (no real storage exists in this state-only test
+        // to run a real `delete_workspace` against).
+        assert_eq!(workspace.job_key(), "job-1");
+        workspace.dismantle_for_tests();
+        assert_eq!(manager.capacity_used_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // ───────────────────── Real Btrfs lifecycle: privileged, gated, unfaked ─────────────────────
 
     /// Probes whether privileged qgroup operations (`CAP_SYS_ADMIN`) — the ones `create_workspace`
@@ -1264,6 +2166,126 @@ mod tests {
         .unwrap();
         assert!(manager.check_health().is_ok());
         assert!(manager.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// CT-007 slice 3's real create/delete lifecycle: a genuine Btrfs workspace is provisioned,
+    /// confirmed live (on disk, tracked in `active_job_ids`, its capacity leased), then deleted —
+    /// confirming it disappears from disk, its `job_key` leaves the active set, and its capacity
+    /// is released back to the pool.
+    #[test]
+    fn create_workspace_then_delete_workspace_releases_capacity_and_clears_active_job_id() {
+        let base = btrfs_test_base("create-then-delete");
+        if !ephemeral_disk_available(&base) {
+            return;
+        }
+        let (sink, _incidents) = recording_sink();
+        let manager = WorkspaceManager::try_new(
+            WorkspaceStorageMode::EphemeralDisk {
+                base_dir: base.clone(),
+                host_capacity_bytes: 1 << 30,
+            },
+            sink,
+        )
+        .unwrap();
+        // SAFETY: read-only identity syscalls.
+        let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let capacity = manager.acquire_capacity(8 << 20).unwrap();
+        let workspace = manager
+            .create_workspace("real-job", 8 << 20, euid, egid, capacity)
+            .expect("create_workspace must succeed against a real, privileged Btrfs backend");
+        let host_path = workspace.host_path().to_path_buf();
+        assert!(
+            host_path.exists(),
+            "the workspace must really exist on disk"
+        );
+        assert_eq!(workspace.job_key(), "real-job");
+        assert_eq!(workspace.capacity_bytes(), 8 << 20);
+        assert!(manager.active_job_ids().contains("real-job"));
+        assert_eq!(manager.capacity_used_bytes(), 8 << 20);
+
+        manager
+            .delete_workspace(workspace)
+            .expect("delete_workspace must succeed against a real, privileged Btrfs backend");
+        assert!(
+            !host_path.exists(),
+            "the workspace subvolume must be gone from disk after delete_workspace"
+        );
+        assert!(!manager.active_job_ids().contains("real-job"));
+        assert_eq!(manager.capacity_used_bytes(), 0);
+        assert!(manager.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Dropping a [`ManagedWorkspace`] WITHOUT deleting it (simulating a crash mid-job) must
+    /// poison the manager with ONE comprehensive incident naming the job/path — and must NOT
+    /// separately fire the generic `CapacityLease` abandonment message on top of it, since the
+    /// capacity lease is abandoned together with (not independently of) the workspace it backs.
+    #[test]
+    fn dropping_a_managed_workspace_without_deleting_poisons_the_manager_with_one_incident() {
+        let base = btrfs_test_base("drop-without-delete");
+        if !ephemeral_disk_available(&base) {
+            return;
+        }
+        let (sink, incidents) = recording_sink();
+        let manager = WorkspaceManager::try_new(
+            WorkspaceStorageMode::EphemeralDisk {
+                base_dir: base.clone(),
+                host_capacity_bytes: 1 << 30,
+            },
+            sink,
+        )
+        .unwrap();
+        // SAFETY: read-only identity syscalls.
+        let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let capacity = manager.acquire_capacity(8 << 20).unwrap();
+        let workspace = manager
+            .create_workspace("abandoned-job", 8 << 20, euid, egid, capacity)
+            .expect("create_workspace must succeed against a real, privileged Btrfs backend");
+        let host_path = workspace.host_path().to_path_buf();
+        drop(workspace); // simulates a crash: never calls delete_workspace.
+
+        assert!(
+            !manager.is_healthy(),
+            "an abandoned ManagedWorkspace must poison the manager"
+        );
+        let log = incidents.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            1,
+            "exactly ONE comprehensive incident must fire — not a second, generic \
+             CapacityLease-abandonment message on top of it: {log:?}"
+        );
+        assert!(log[0].contains("abandoned-job"));
+        drop(log);
+        // The subvolume itself is still real and still on disk — this manager instance is now
+        // poisoned and cannot clean it up.
+        assert!(host_path.exists());
+
+        // Sol's review: `remove_dir_all` CANNOT remove a real Btrfs subvolume (it needs a
+        // privileged `btrfs subvolume delete`) — the earlier version of this test called it here
+        // anyway, leaking a real subvolume on every run on a capable host. Fixed by exercising the
+        // ACTUAL claimed crash-recovery path directly: drop this poisoned manager (releasing its
+        // lock), open a FRESH manager on the SAME base, and let ITS OWN boot-time reconciliation
+        // (already proven by `boot_reconciliation_deletes_a_preexisting_orphan_before_reporting_healthy`)
+        // find and delete the orphan for real — only THEN is `remove_dir_all` safe to call on the
+        // (now subvolume-free) base directory itself.
+        drop(manager);
+        let (sink2, _incidents2) = recording_sink();
+        let fresh = WorkspaceManager::try_new(
+            WorkspaceStorageMode::EphemeralDisk {
+                base_dir: base.clone(),
+                host_capacity_bytes: 1 << 30,
+            },
+            sink2,
+        )
+        .expect("a fresh manager's own boot reconciliation must clean up the orphan and succeed");
+        assert!(fresh.is_healthy());
+        assert!(
+            !host_path.exists(),
+            "boot reconciliation must have deleted the abandoned subvolume for real"
+        );
+        drop(fresh);
         let _ = std::fs::remove_dir_all(&base);
     }
 }
