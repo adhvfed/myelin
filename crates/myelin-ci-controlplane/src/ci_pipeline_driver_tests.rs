@@ -542,3 +542,119 @@ fn retry_attempt_accrual_is_fixed_size_and_projects_exact_usage() {
         "an impossible attempt count is corrupt state, never zero usage"
     );
 }
+
+/// The `sandbox_infrastructure` cause (added alongside `RetryableAttemptCause::
+/// SandboxInfrastructure`, the CT-007 gVisor launch-failure fix) must decode exactly like
+/// `output_persistence` — proving `decode_retry_attempts`'s validation was generalized from a
+/// single hardcoded literal to `RetryableAttemptCause::from_storage_token(...).is_some()` (Sol's
+/// review caught the original hardcoded-cause bug at the persist site; this proves the read-side
+/// validation was fixed too, not just the write side). An unrecognized cause token must still be
+/// rejected as corrupt, never silently accepted.
+#[test]
+fn retry_attempt_accrual_accepts_sandbox_infrastructure_and_rejects_an_unknown_cause() {
+    let accrual_with = |cause: &str| {
+        serde_json::json!({
+            "version": 1,
+            "attempts": 1,
+            "cpu_seconds": 9,
+            "mem_byte_seconds": 900,
+            "last": {
+                "lease_epoch": 1,
+                "claim_nonce": "22222222-2222-2222-2222-222222222222",
+                "lease_owner": "runner-2",
+                "cause": cause,
+                "cpu_seconds": 9,
+                "mem_byte_seconds": 900,
+                "receipt": format!("retry-v1:{}", "b".repeat(64)),
+            }
+        })
+    };
+    assert_eq!(
+        decode_retry_attempt_usage(accrual_with("sandbox_infrastructure")),
+        Ok(Some(ResourceUsage {
+            cpu_seconds: 9,
+            mem_byte_seconds: 900,
+        })),
+        "sandbox_infrastructure must decode exactly like output_persistence"
+    );
+    assert!(
+        matches!(
+            decode_retry_attempts(accrual_with("some_future_cause_this_binary_does_not_know")),
+            Err(CompletionTxError::RetryCorrupt)
+        ),
+        "an unrecognized cause token must be rejected as corrupt, never silently accepted"
+    );
+}
+
+/// The write-side construction Sol's review caught hardcoding `OUTPUT_PERSISTENCE_CAUSE`
+/// regardless of `failure.cause` — this test would FAIL if that regressed, unlike the
+/// decode-only tests above (which would still pass against a hardcoded write side, since decoding
+/// never sees what the write side chose not to write). Proves `SandboxInfrastructure` produces
+/// `cause == "sandbox_infrastructure"` in the actual persisted record, and that its receipt
+/// genuinely differs from `OutputPersistence`'s for the identical claim/usage — i.e. the receipt
+/// hash really binds to the cause, not just to fields a hardcoded cause would leave unchanged.
+#[test]
+fn expected_retry_attempt_record_binds_the_actual_cause_not_a_hardcoded_one() {
+    let claim = CompletionClaim {
+        tenant: TenantId("acme".into()),
+        run: RunId("33333333-3333-3333-3333-333333333333".into()),
+        job_id: "job-cause-binding".into(),
+        idem_token: "idem-cause-binding".into(),
+        lease_owner: "runner-3".into(),
+        lease_epoch: 1,
+        claim_nonce: "44444444-4444-4444-4444-444444444444".into(),
+    };
+    let usage = ResourceUsage {
+        cpu_seconds: 5,
+        mem_byte_seconds: 500,
+    };
+    let sandbox_infra = expected_retry_attempt_record(
+        &claim,
+        "fr-par",
+        &RetryableAttemptFailure {
+            cause: RetryableAttemptCause::SandboxInfrastructure,
+            usage,
+        },
+    );
+    assert_eq!(sandbox_infra.cause, "sandbox_infrastructure");
+
+    let output_persistence = expected_retry_attempt_record(
+        &claim,
+        "fr-par",
+        &RetryableAttemptFailure {
+            cause: RetryableAttemptCause::OutputPersistence,
+            usage,
+        },
+    );
+    assert_eq!(output_persistence.cause, "output_persistence");
+    assert_ne!(
+        sandbox_infra.receipt, output_persistence.receipt,
+        "the receipt must actually bind to the cause — a reverted hardcoded-cause bug would make \
+         every cause produce the SAME receipt for identical claim/usage"
+    );
+}
+
+/// The canonical cause -> storage-token mapping is the ONE place this is defined (Sol's review
+/// caught a pre-existing bug where the persist site hardcoded `OUTPUT_PERSISTENCE_CAUSE`
+/// regardless of the actual `failure.cause`, silently mislabeling every non-output-persistence
+/// row). Round-tripping both known causes through `as_storage_token`/`from_storage_token` proves
+/// the mapping is bijective and an unknown token maps to `None`, never a default guess.
+#[test]
+fn retryable_attempt_cause_storage_token_round_trips_and_rejects_unknown_tokens() {
+    for cause in [
+        RetryableAttemptCause::OutputPersistence,
+        RetryableAttemptCause::SandboxInfrastructure,
+    ] {
+        let token = cause.as_storage_token();
+        assert_eq!(
+            RetryableAttemptCause::from_storage_token(token),
+            Some(cause),
+            "cause {cause:?} must round-trip through its own storage token"
+        );
+    }
+    assert_eq!(
+        RetryableAttemptCause::from_storage_token("not_a_real_cause"),
+        None,
+        "an unrecognized token must map to None, never silently coerce to an existing cause"
+    );
+}

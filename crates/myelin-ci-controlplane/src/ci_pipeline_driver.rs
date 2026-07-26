@@ -452,7 +452,6 @@ fn completion_receipt(input: CompletionReceiptInput<'_>) -> String {
 }
 
 const RETRY_ATTEMPT_RECORD_VERSION: u8 = 1;
-const OUTPUT_PERSISTENCE_CAUSE: &str = "output_persistence";
 
 /// Last immutable measured-attempt receipt retained beside fixed-size cumulative usage on
 /// `job_queue` until a later terminal generation settles the aggregate. The JSON object is PII-free
@@ -484,9 +483,7 @@ fn retry_attempt_receipt(
     region: &str,
     failure: &RetryableAttemptFailure,
 ) -> String {
-    let cause = match failure.cause {
-        RetryableAttemptCause::OutputPersistence => OUTPUT_PERSISTENCE_CAUSE,
-    };
+    let cause = failure.cause.as_storage_token();
     let key = blake3::derive_key(
         "myelin.ci.retry-attempt-receipt.v1",
         claim.claim_nonce.as_bytes(),
@@ -511,6 +508,27 @@ fn retry_attempt_receipt(
     format!("retry-v1:{}", hasher.finalize().to_hex())
 }
 
+/// Build the exact durable `RetryAttemptRecord` a real attempt would persist — a small PURE helper
+/// (no DB access) extracted from `record_retryable_attempt_on_conn` so the write-side cause binding
+/// is directly unit-testable. This is the exact site Sol's review caught hardcoding
+/// `OUTPUT_PERSISTENCE_CAUSE` regardless of `failure.cause` — a unit test against THIS function,
+/// not just `decode_retry_attempts`, is what would actually catch a regression back to that bug.
+fn expected_retry_attempt_record(
+    claim: &CompletionClaim,
+    region: &str,
+    failure: &RetryableAttemptFailure,
+) -> RetryAttemptRecord {
+    RetryAttemptRecord {
+        lease_epoch: claim.lease_epoch,
+        claim_nonce: claim.claim_nonce.clone(),
+        lease_owner: claim.lease_owner.clone(),
+        cause: failure.cause.as_storage_token().to_string(),
+        cpu_seconds: failure.usage.cpu_seconds,
+        mem_byte_seconds: failure.usage.mem_byte_seconds,
+        receipt: retry_attempt_receipt(claim, region, failure),
+    }
+}
+
 fn decode_retry_attempts(
     value: serde_json::Value,
 ) -> Result<Option<RetryAttemptAccrual>, CompletionTxError> {
@@ -527,7 +545,7 @@ fn decode_retry_attempts(
         && accrual.attempts <= accrual.last.lease_epoch as u64
         && Uuid::parse_str(&accrual.last.claim_nonce).is_ok()
         && !accrual.last.lease_owner.is_empty()
-        && accrual.last.cause == OUTPUT_PERSISTENCE_CAUSE
+        && RetryableAttemptCause::from_storage_token(&accrual.last.cause).is_some()
         && accrual.last.receipt.starts_with("retry-v1:")
         && accrual.last.receipt.len() == "retry-v1:".len() + 64;
     if valid {
@@ -775,16 +793,7 @@ async fn record_retryable_attempt_on_conn(
     let completion_receipt: Option<String> = row.get("completion_receipt");
     let retry_attempts: serde_json::Value = row.get("retry_attempts");
     let attempts = decode_retry_attempts(retry_attempts.clone())?;
-    let receipt = retry_attempt_receipt(claim, region, failure);
-    let expected = RetryAttemptRecord {
-        lease_epoch: claim.lease_epoch,
-        claim_nonce: claim.claim_nonce.clone(),
-        lease_owner: claim.lease_owner.clone(),
-        cause: OUTPUT_PERSISTENCE_CAUSE.into(),
-        cpu_seconds: failure.usage.cpu_seconds,
-        mem_byte_seconds: failure.usage.mem_byte_seconds,
-        receipt,
-    };
+    let expected = expected_retry_attempt_record(claim, region, failure);
 
     if let Some(recorded) = attempts
         .as_ref()

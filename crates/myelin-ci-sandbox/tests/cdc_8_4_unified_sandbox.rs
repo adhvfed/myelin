@@ -33,7 +33,8 @@
 use myelin_ci_sandbox::{
     agent_job, EgressPolicy, HookError, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
     ReserveHandle, ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend,
-    SandboxHandle, SandboxLaunch, SandboxResult, SpecError, TrustTier, WorkspaceSpec,
+    SandboxHandle, SandboxLaunch, SandboxLaunchError, SandboxResult, SpecError, TrustTier,
+    WorkspaceSpec,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -72,41 +73,48 @@ struct RunnerSeam {
 impl SandboxBackend for RunnerSeam {
     type Error = HookError;
 
-    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
-        // #4 isolation floor FIRST — the hardening profile must hold before any code runs.
-        hooks.enforce_isolation_floor(spec)?;
-        self.order.lock().unwrap().push("isolation_floor");
-        // #1a cost gate — reserve at dispatch; refuse-to-start on exhaustion (never starts).
-        let mut reserve_spec = spec.clone();
-        if self.exhausted {
-            reserve_spec.meter_to = MeterTarget {
-                reserve_id: "__exhausted__".into(),
-            };
-        }
-        let reserve = hooks.reserve(&reserve_spec)?;
-        self.order.lock().unwrap().push("reserve");
-        // #2 final attribution — immediately before untrusted code would spawn.
-        if let Err(error) = hooks.attribute(spec) {
-            hooks.release_unused(&reserve_spec, &reserve)?;
-            return Err(error);
-        }
-        self.order.lock().unwrap().push("attribute");
-        // ... the hardened guest would run the (compute/external) command here; the seam carries
-        // the result back (RESHAPE-001 / CT-001 stub) ...
-        let result = SandboxResult::stub_ok(ResourceUsage {
-            cpu_seconds: 2,
-            mem_byte_seconds: 4,
-        });
-        // #1b settle — release the unused reserve on completion (never interrupt in-flight).
-        hooks.settle_completed(&reserve_spec, &reserve, result.usage)?;
-        self.order.lock().unwrap().push("settle");
-        Ok(SandboxLaunch {
-            handle: SandboxHandle {
-                guest_id: "guest-1".into(),
-            },
-            result,
-            output_complete: true,
-        })
+    fn launch(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+    ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+        (|| -> Result<SandboxLaunch, HookError> {
+            // #4 isolation floor FIRST — the hardening profile must hold before any code runs.
+            hooks.enforce_isolation_floor(spec)?;
+            self.order.lock().unwrap().push("isolation_floor");
+            // #1a cost gate — reserve at dispatch; refuse-to-start on exhaustion (never starts).
+            let mut reserve_spec = spec.clone();
+            if self.exhausted {
+                reserve_spec.meter_to = MeterTarget {
+                    reserve_id: "__exhausted__".into(),
+                };
+            }
+            let reserve = hooks.reserve(&reserve_spec)?;
+            self.order.lock().unwrap().push("reserve");
+            // #2 final attribution — immediately before untrusted code would spawn.
+            if let Err(error) = hooks.attribute(spec) {
+                hooks.release_unused(&reserve_spec, &reserve)?;
+                return Err(error);
+            }
+            self.order.lock().unwrap().push("attribute");
+            // ... the hardened guest would run the (compute/external) command here; the seam
+            // carries the result back (RESHAPE-001 / CT-001 stub) ...
+            let result = SandboxResult::stub_ok(ResourceUsage {
+                cpu_seconds: 2,
+                mem_byte_seconds: 4,
+            });
+            // #1b settle — release the unused reserve on completion (never interrupt in-flight).
+            hooks.settle_completed(&reserve_spec, &reserve, result.usage)?;
+            self.order.lock().unwrap().push("settle");
+            Ok(SandboxLaunch {
+                handle: SandboxHandle {
+                    guest_id: "guest-1".into(),
+                },
+                result,
+                output_complete: true,
+            })
+        })()
+        .map_err(SandboxLaunchError::Failed)
     }
 
     fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {

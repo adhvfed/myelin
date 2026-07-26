@@ -42,8 +42,8 @@ use crate::launch_gate::SandboxCommand;
 use crate::redaction::RedactionPlan;
 use crate::{
     drain_capped, JobSpec, LaunchPermit, ResourceUsage, RunnerHooks, SandboxBackend,
-    SandboxCancellation, SandboxHandle, SandboxLaunch, SandboxOutputSink, SandboxOutputStream,
-    SandboxResult, SANDBOX_CAPTURE_BOUND,
+    SandboxCancellation, SandboxHandle, SandboxLaunch, SandboxLaunchError, SandboxOutputSink,
+    SandboxOutputStream, SandboxResult, SANDBOX_CAPTURE_BOUND,
 };
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -821,8 +821,26 @@ impl SandboxBackend for FirecrackerBackend {
     /// up and the four guarantees have fired (the in-line compute contract). The REAL VMM is spawned
     /// here — the one legitimate host-exec site (the `no-host-exec` named exclusion; this seam IS
     /// the unified sandbox, not a bypass of it).
-    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
+    // NOTE (a NAMED production-activation blocker, mechanically enforced — not merely this
+    // comment): unlike gVisor's `launch_with`/`launch_git_command`, this backend's own
+    // `launch_with` does not yet distinguish Uncommitted/CommitOutcomeUnknown/
+    // CommittedButNotExecuted/Executed for a post-reserve run failure — it has the SAME class of
+    // reservation leak gVisor had before this fix. Every error is therefore compatibility-wrapped
+    // as `Failed` (phase-unclassified — no retryable-attempt record is available through this
+    // return, since this backend makes no phase distinction to report one from) rather than
+    // claiming a phase distinction this backend does not make. This backend is
+    // currently dormant/unwired (`runner_bind.rs`, the real production wiring, constructs ONLY
+    // `GvisorBackend`) — a source-text guard in
+    // `myelin-ci-controlplane/tests/production_pg_bootstrap_source.rs` fails RED the moment
+    // `runner_bind.rs` ever references `FirecrackerBackend`, until this backend gets the same
+    // phase-aware treatment gVisor just got.
+    fn launch(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+    ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
         self.launch_with(spec, hooks, run_production_guest)
+            .map_err(SandboxLaunchError::Failed)
     }
 
     fn launch_streaming(
@@ -831,10 +849,11 @@ impl SandboxBackend for FirecrackerBackend {
         hooks: &RunnerHooks,
         output: Arc<dyn SandboxOutputSink>,
         cancellation: SandboxCancellation,
-    ) -> Result<SandboxLaunch, Self::Error> {
+    ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
         self.launch_with(spec, hooks, move |spec, profile, permit| {
             run_production_guest_streaming(spec, profile, permit, Some(output), cancellation)
         })
+        .map_err(SandboxLaunchError::Failed)
     }
 
     /// Whole-guest kill on teardown (arch 01 §2): destroy the guest VMM and clean its config. The

@@ -24,7 +24,7 @@ use myelin_ci_sandbox::{
     CompletionClaim, CountingFirehose, EgressPolicy, EngineTerminalReporter, IdemToken, ImageRef,
     JobKind, JobLeaseStore, JobSpec, MeterTarget, QueuedJob, ReserveHandle, ResourceLimits,
     ResourceUsage, RunnerAgent, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch,
-    SandboxResult, TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec,
+    SandboxLaunchError, SandboxResult, TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec,
 };
 use myelin_events::MonotonicMinter;
 use myelin_flow::{
@@ -87,25 +87,32 @@ fn hooks() -> RunnerHooks {
 struct NoopBackend;
 impl SandboxBackend for NoopBackend {
     type Error = myelin_ci_sandbox::HookError;
-    fn launch(&self, spec: &JobSpec, h: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
-        h.enforce_isolation_floor(spec)?;
-        let r = h.reserve(spec)?;
-        if let Err(error) = h.attribute(spec) {
-            h.release_unused(spec, &r)?;
-            return Err(error);
-        }
-        let result = SandboxResult::stub_ok(ResourceUsage {
-            cpu_seconds: 1,
-            mem_byte_seconds: 1,
-        });
-        h.settle_completed(spec, &r, result.usage)?;
-        Ok(SandboxLaunch {
-            handle: SandboxHandle {
-                guest_id: "g".into(),
-            },
-            result,
-            output_complete: true,
-        })
+    fn launch(
+        &self,
+        spec: &JobSpec,
+        h: &RunnerHooks,
+    ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+        (|| -> Result<SandboxLaunch, myelin_ci_sandbox::HookError> {
+            h.enforce_isolation_floor(spec)?;
+            let r = h.reserve(spec)?;
+            if let Err(error) = h.attribute(spec) {
+                h.release_unused(spec, &r)?;
+                return Err(error);
+            }
+            let result = SandboxResult::stub_ok(ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 1,
+            });
+            h.settle_completed(spec, &r, result.usage)?;
+            Ok(SandboxLaunch {
+                handle: SandboxHandle {
+                    guest_id: "g".into(),
+                },
+                result,
+                output_complete: true,
+            })
+        })()
+        .map_err(SandboxLaunchError::Failed)
     }
     fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
         Ok(())

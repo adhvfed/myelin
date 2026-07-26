@@ -34,13 +34,15 @@
 //! exclusion of this one file (registered in `lint-gate` + `tests/workspace_clean.rs`).
 
 use crate::hardening::HardeningProfile;
-use crate::launch_gate::SandboxCommand;
+use crate::launch_gate::{SandboxCommand, SpawnPhase};
 use crate::redaction::RedactionPlan;
+use crate::runner::RetryableAttemptCause;
 use crate::{
-    drain_capped, EgressPolicy, HookError, IdemToken, ImageRef, JobKind, JobSpec, LaunchPermit,
-    MeterTarget, ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend,
-    SandboxCancellation, SandboxHandle, SandboxLaunch, SandboxOutputSink, SandboxOutputStream,
-    SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
+    drain_capped, CompletionSettlementOwner, EgressPolicy, HookError, IdemToken, ImageRef, JobKind,
+    JobSpec, LaunchPermit, MeterTarget, ReserveHandle, ResourceLimits, ResourceUsage,
+    RunTokenCredential, RunnerHooks, SandboxBackend, SandboxCancellation, SandboxHandle,
+    SandboxLaunch, SandboxLaunchError, SandboxOutputSink, SandboxOutputStream, SandboxResult,
+    TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
@@ -48,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Env var naming the `runsc` binary; defaults to `runsc` on `PATH`.
 pub const ENV_RUNSC_BIN: &str = "MYELIN_RUNSC_BIN";
@@ -729,15 +731,20 @@ impl GvisorBackend {
         spec: &JobSpec,
         hooks: &RunnerHooks,
         run: F,
-    ) -> Result<SandboxLaunch, GvisorError>
+    ) -> Result<SandboxLaunch, SandboxLaunchError<GvisorError>>
     where
-        F: FnOnce(&JobSpec, &OciConfig, LaunchPermit, &Path) -> Result<ContainerRun, String>,
+        F: FnOnce(&JobSpec, &OciConfig, LaunchPermit, &Path) -> Result<ContainerRun, RunFailure>,
     {
         // #4 isolation floor FIRST — the hardening profile must hold before any code (including the
-        // registry lookup) runs. Mirrors the Firecracker backend's own ordering.
-        hooks.enforce_isolation_floor(spec)?;
+        // registry lookup) runs. Mirrors the Firecracker backend's own ordering. Every early refusal
+        // here is an ordinary pre-commit `Failed` — nothing durable has been claimed yet.
+        hooks
+            .enforce_isolation_floor(spec)
+            .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
         let profile = HardeningProfile::derive(spec);
-        profile.assert_enforced().map_err(GvisorError::Hardening)?;
+        profile
+            .assert_enforced()
+            .map_err(|e| SandboxLaunchError::Failed(GvisorError::Hardening(e)))?;
 
         // CT-007 gate 2/4: resolve `spec.image` against the registry's ALREADY-VERIFIED entries — a
         // cheap O(1) lookup now (verification happened once, at registry construction). Still BEFORE
@@ -745,33 +752,56 @@ impl GvisorBackend {
         // `git_wire_only()` backend has no registry at all and refuses here, so it can never launch
         // an ordinary image-bearing job.
         let registry = self.registry.as_ref().ok_or_else(|| {
-            GvisorError::Image(
+            SandboxLaunchError::Failed(GvisorError::Image(
                 "this GvisorBackend was constructed via GvisorBackend::git_wire_only() (no asset \
                  registry) and cannot launch an ordinary image-bearing job — construct it via \
                  GvisorBackend::new(registry) for CI/agent job launch"
                     .to_string(),
-            )
+            ))
         })?;
-        let verified_rootfs = registry.resolve(&spec.image)?;
+        let verified_rootfs = registry
+            .resolve(&spec.image)
+            .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
 
-        let reserve = hooks.reserve(spec)?;
+        let reserve = hooks
+            .reserve(spec)
+            .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
         let cfg = OciConfig::from_spec(spec, &profile);
         let launch_permit = match hooks.acquire_launch_permit(spec) {
             Ok(permit) => permit,
             Err(attribute_error) => {
-                hooks.release_unused(spec, &reserve)?;
-                return Err(attribute_error.into());
+                hooks
+                    .release_unused(spec, &reserve)
+                    .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
+                return Err(SandboxLaunchError::Failed(attribute_error.into()));
             }
         };
         // Run the container + capture the REAL result (the ONE legitimate `runsc`-spawn site — the
         // sandbox seam's mechanism; the `no-host-exec` named exclusion). `run` cleans up its own
         // bundle/container on error.
+        //
+        // `run`'s failure carries the phase the launch reached before it failed (Sol's design, fixing
+        // a genuine pre-existing leak: the OLD code just propagated the error here and returned early,
+        // never calling `release_unused` NOR `settle_completed` — leaking the reservation forever on
+        // ANY run() failure, including ones where a real sandbox process actually executed). The
+        // correct disposition ALSO depends on `hooks.completion_settlement_owner()`: under
+        // `TerminalReporter` ownership, `settle_completed` is a documented no-op (deferred to the
+        // real reporter), so a post-commit failure can only be honestly recorded by routing it
+        // through `SandboxLaunchError::RetryableAttempt` — the runner then calls the reporter's own
+        // `report_retryable_attempt` transaction, which durably accounts usage AND requeues the exact
+        // claim without emitting `job.done`. Returning a bare `Failed` here for a post-commit failure
+        // under reporter ownership would silently discard the accounting the reporter exists to do.
         let ContainerRun {
             child,
             bundle_dir,
             result,
             run_error,
-        } = run(spec, &cfg, launch_permit, verified_rootfs.path()).map_err(GvisorError::Runtime)?;
+        } = match run(spec, &cfg, launch_permit, verified_rootfs.path()) {
+            Ok(container_run) => container_run,
+            Err(run_failure) => {
+                return Err(self.dispose_run_failure(spec, hooks, &reserve, run_failure));
+            }
+        };
 
         let guest_id = format!("runsc-{}", spec.idem_token.0);
         self.live
@@ -784,7 +814,7 @@ impl GvisorBackend {
             let _ = self.kill(&SandboxHandle {
                 guest_id: guest_id.clone(),
             });
-            return Err(error.into());
+            return Err(SandboxLaunchError::Failed(error.into()));
         }
 
         Ok(SandboxLaunch {
@@ -792,6 +822,90 @@ impl GvisorBackend {
             result,
             output_complete: run_error.is_none(),
         })
+    }
+
+    /// Dispose of a post-`reserve` [`RunFailure`] into the correct [`SandboxLaunchError`] variant,
+    /// per phase AND per `hooks.completion_settlement_owner()` (Sol's disposition table):
+    ///
+    /// | Phase                     | `Hook` owner                        | `TerminalReporter` owner             |
+    /// |----------------------------|--------------------------------------|----------------------------------------|
+    /// | `Uncommitted`              | `release_unused`, then `Failed`       | `release_unused`, then `Failed`         |
+    /// | `CommitOutcomeUnknown`     | `DurableOutcomeUnknown`               | `DurableOutcomeUnknown`                 |
+    /// | `CommittedButNotExecuted`  | settle zero, then `Failed`            | `RetryableAttempt(SandboxInfrastructure, zero)` |
+    /// | `Executed`                 | settle carried usage, then `Failed`   | `RetryableAttempt(SandboxInfrastructure, usage)` |
+    ///
+    /// `Uncommitted` and `CommitOutcomeUnknown` are owner-independent: an uncommitted attempt has no
+    /// terminal report to defer to regardless of who owns completion, and an outcome-unknown attempt
+    /// must never be guessed at either way. Only the two post-commit phases branch on ownership,
+    /// because only they have a real (if zero) measured cost a `TerminalReporter` must account.
+    fn dispose_run_failure(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        reserve: &ReserveHandle,
+        run_failure: RunFailure,
+    ) -> SandboxLaunchError<GvisorError> {
+        let message = run_failure.to_string();
+        match run_failure {
+            RunFailure::Uncommitted { .. } => {
+                if let Err(settle_error) = hooks.release_unused(spec, reserve) {
+                    return SandboxLaunchError::Failed(GvisorError::Runtime(format!(
+                        "run() failed (uncommitted: {message}) AND release_unused also failed \
+                         ({settle_error}) — reservation may be leaked"
+                    )));
+                }
+                SandboxLaunchError::Failed(GvisorError::Runtime(message))
+            }
+            RunFailure::CommitOutcomeUnknown { .. } => {
+                // Neither release nor settle — the durable store may or may not have actually
+                // committed. Guessing either way misaccounts a real reservation; durable
+                // reconciliation (the existing lease/claim reaper) is the only honest owner here.
+                SandboxLaunchError::DurableOutcomeUnknown(GvisorError::Runtime(message))
+            }
+            RunFailure::CommittedButNotExecuted { .. } => {
+                let zero = ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0,
+                };
+                match hooks.completion_settlement_owner() {
+                    CompletionSettlementOwner::TerminalReporter => {
+                        SandboxLaunchError::RetryableAttempt {
+                            source: GvisorError::Runtime(message),
+                            cause: RetryableAttemptCause::SandboxInfrastructure,
+                            usage: zero,
+                        }
+                    }
+                    CompletionSettlementOwner::Hook => {
+                        if let Err(settle_error) = hooks.settle_completed(spec, reserve, zero) {
+                            return SandboxLaunchError::Failed(GvisorError::Runtime(format!(
+                                "run() failed (committed but not executed: {message}) AND its \
+                                 zero-usage settlement also failed ({settle_error}) — \
+                                 reservation may be leaked"
+                            )));
+                        }
+                        SandboxLaunchError::Failed(GvisorError::Runtime(message))
+                    }
+                }
+            }
+            RunFailure::Executed { usage, .. } => match hooks.completion_settlement_owner() {
+                CompletionSettlementOwner::TerminalReporter => {
+                    SandboxLaunchError::RetryableAttempt {
+                        source: GvisorError::Runtime(message),
+                        cause: RetryableAttemptCause::SandboxInfrastructure,
+                        usage,
+                    }
+                }
+                CompletionSettlementOwner::Hook => {
+                    if let Err(settle_error) = hooks.settle_completed(spec, reserve, usage) {
+                        return SandboxLaunchError::Failed(GvisorError::Runtime(format!(
+                            "run() failed (executed: {message}) AND its conservative-usage \
+                             settlement also failed ({settle_error}) — reservation may be leaked"
+                        )));
+                    }
+                    SandboxLaunchError::Failed(GvisorError::Runtime(message))
+                }
+            },
+        }
     }
 }
 
@@ -802,7 +916,11 @@ impl SandboxBackend for GvisorBackend {
     /// container has run and the four guarantees have fired. The REAL `runsc` container is spawned
     /// here — the one legitimate runtime-spawn site (the `no-host-exec` named exclusion; this seam IS
     /// the unified sandbox, not a bypass of it).
-    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
+    fn launch(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+    ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
         self.launch_with(spec, hooks, |spec, cfg, permit, rootfs| {
             run_production_container(spec, cfg, permit, rootfs)
         })
@@ -814,7 +932,7 @@ impl SandboxBackend for GvisorBackend {
         hooks: &RunnerHooks,
         output: Arc<dyn SandboxOutputSink>,
         cancellation: SandboxCancellation,
-    ) -> Result<SandboxLaunch, Self::Error> {
+    ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
         self.launch_with(spec, hooks, move |spec, cfg, permit, rootfs| {
             run_production_container_streaming(
                 spec,
@@ -875,7 +993,7 @@ fn run_production_container(
     cfg: &OciConfig,
     launch_permit: LaunchPermit,
     rootfs: &Path,
-) -> Result<ContainerRun, String> {
+) -> Result<ContainerRun, RunFailure> {
     run_production_container_streaming(
         spec,
         cfg,
@@ -893,7 +1011,7 @@ fn run_production_container_streaming(
     rootfs: &Path,
     output: Option<Arc<dyn SandboxOutputSink>>,
     cancellation: SandboxCancellation,
-) -> Result<ContainerRun, String> {
+) -> Result<ContainerRun, RunFailure> {
     let bin = runsc_bin();
     // `rootfs` is the ALREADY-VERIFIED path `GvisorBackend::launch_with` resolved from `spec.image`
     // via the `GvisorAssetRegistry` (CT-007 gate 2/4) — this production run path no longer calls
@@ -904,13 +1022,14 @@ fn run_production_container_streaming(
     // runtime/start precondition failure surfaces as an error (never a fabricated exit). An absent
     // rootfs cannot produce a valid bundle (defense in depth — construction-time verification already
     // checked this, but a TOCTOU window between verification and staging is still handled honestly).
+    // Both errors below occur before any spawn attempt — Uncommitted.
     if !rootfs.exists() {
-        return Err(format!(
+        return Err(RunFailure::uncommitted(format!(
             "staged gVisor rootfs absent: {} (cannot build a valid OCI bundle)",
             rootfs.display()
-        ));
+        )));
     }
-    let bundle_dir = stage_production_bundle(cfg, rootfs)?;
+    let bundle_dir = stage_production_bundle(cfg, rootfs).map_err(RunFailure::uncommitted)?;
     let container_id = format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
 
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
@@ -1043,6 +1162,81 @@ struct RunscOutcome {
     stream_error: Option<String>,
 }
 
+/// A phase-tagged [`run_and_capture`] failure — CT-007 vertical-slice step 2b's gvisor.rs-
+/// integration planning found a real, pre-existing gap this closes: `launch_with` used to
+/// propagate a bare `String` from this function and return early WITHOUT ever calling
+/// `hooks.release_unused` or `hooks.settle_completed`, silently leaking the job's cost/capacity
+/// reservation on every failure path — regardless of whether the sandbox had actually spawned
+/// and consumed real host resources by the time it failed. The four variants (mirroring
+/// [`crate::launch_gate::SpawnPhase`]'s own four-way distinction from the durable-launch-commit
+/// boundary) tell the caller exactly which of `release_unused` / `DurableOutcomeUnknown` /
+/// `settle_completed(zero)` / `settle_completed(usage)` is correct — `Executed` makes its usage
+/// mandatory (not an `Option`), so an "executed but no usage was ever computed" state cannot be
+/// constructed at all. This prevents a MISSING usage, not a zero one — a caller can still
+/// construct `Executed` with a genuinely zero `ResourceUsage`; every real call site computes it via
+/// `executed_fallback_usage`, which floors elapsed wall-time at 1 second precisely so that never
+/// happens in practice.
+#[derive(Debug)]
+enum RunFailure {
+    /// No durable launch CAS committed. Safe to release the reservation at zero cost.
+    Uncommitted { message: String },
+    /// The durable launch CAS returned an error, but whether it actually committed durably is
+    /// UNKNOWN. Neither release nor settle is safe; the caller must defer to reconciliation.
+    CommitOutcomeUnknown { message: String },
+    /// The durable launch CAS committed, but the runtime never got to exec. The reservation's
+    /// cost is real (the commit itself is durably accounted) even though no workload ran.
+    CommittedButNotExecuted { message: String },
+    /// The runtime was released to exec (or genuinely started, for an unfenced spawn) by the
+    /// time this failure occurred. `usage` is the conservative fallback accounting — mandatory
+    /// (an "executed but no usage was ever computed" state cannot be constructed), computed by
+    /// every real call site via `executed_fallback_usage`'s 1-second wall-time floor so a job
+    /// engineered to fail exactly after exec cannot run for free in practice.
+    Executed {
+        message: String,
+        usage: ResourceUsage,
+    },
+}
+
+impl RunFailure {
+    fn uncommitted(message: impl Into<String>) -> Self {
+        Self::Uncommitted {
+            message: message.into(),
+        }
+    }
+
+    fn commit_outcome_unknown(message: impl Into<String>) -> Self {
+        Self::CommitOutcomeUnknown {
+            message: message.into(),
+        }
+    }
+
+    fn committed_but_not_executed(message: impl Into<String>) -> Self {
+        Self::CommittedButNotExecuted {
+            message: message.into(),
+        }
+    }
+
+    fn executed(message: impl Into<String>, usage: ResourceUsage) -> Self {
+        Self::Executed {
+            message: message.into(),
+            usage,
+        }
+    }
+}
+
+impl std::fmt::Display for RunFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunFailure::Uncommitted { message }
+            | RunFailure::CommitOutcomeUnknown { message }
+            | RunFailure::CommittedButNotExecuted { message }
+            | RunFailure::Executed { message, .. } => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for RunFailure {}
+
 /// Spawn the REAL `runsc` container (`runsc --rootless --network=none run -bundle <dir> <cid>`) — THE
 /// one legitimate runtime-spawn site (the `no-host-exec` named exclusion; the mechanism that CREATES
 /// the userspace-kernel boundary, not a bypass) — drain its stdout/stderr on dedicated threads (so a
@@ -1058,7 +1252,7 @@ fn run_and_capture(
     mem_bytes: u64,
     options: RunCaptureOptions<'_>,
     launch_permit: Option<LaunchPermit>,
-) -> Result<RunscOutcome, String> {
+) -> Result<RunscOutcome, RunFailure> {
     let RunCaptureOptions {
         stdin,
         stdout_mode,
@@ -1069,11 +1263,13 @@ fn run_and_capture(
     // CT-003b (SI-017): establish the OUT-OF-BAND memory cgroup BEFORE spawning runsc and FAIL
     // CLOSED if it cannot be established (rootless runsc would otherwise run the workload's anonymous
     // memory UNBOUNDED — a host-DoS escape). The cgroup is torn down on every path (its `Drop`).
-    let cgroup = MemoryCgroup::create(mem_bytes)?;
+    // Every error up to (and including) `sandbox_command.spawn()` itself is Uncommitted-or-typed:
+    // nothing durable happened yet, so a caller-side `release_unused` is correct.
+    let cgroup = MemoryCgroup::create(mem_bytes).map_err(RunFailure::uncommitted)?;
 
     let watchdog_timeout = launch_permit.as_ref().map(|_| timeout);
     let mut sandbox_command = SandboxCommand::new(bin, launch_permit, watchdog_timeout)
-        .map_err(|error| format!("prepare runsc launch gate: {error}"))?;
+        .map_err(|error| RunFailure::uncommitted(format!("prepare runsc launch gate: {error}")))?;
     let fenced = sandbox_command.is_fenced();
     {
         let cmd = sandbox_command.command_mut();
@@ -1095,19 +1291,42 @@ fn run_and_capture(
             });
         }
         // Place the runsc child (and the sentry/gofer tree it forks) into the memory cgroup at birth.
-        cgroup
-            .place_child(cmd)
-            .map_err(|e| format!("bind runsc into the memory cgroup: {e}"))?;
+        cgroup.place_child(cmd).map_err(|e| {
+            RunFailure::uncommitted(format!("bind runsc into the memory cgroup: {e}"))
+        })?;
     }
     if fenced {
-        let kill_file = cgroup
-            .kill_file()
-            .map_err(|error| format!("open runsc cgroup kill switch: {error}"))?;
+        let kill_file = cgroup.kill_file().map_err(|error| {
+            RunFailure::uncommitted(format!("open runsc cgroup kill switch: {error}"))
+        })?;
         sandbox_command.kill_cgroup_on_liveness_loss(kill_file);
     }
-    let mut child = sandbox_command
-        .spawn()
-        .map_err(|error| format!("spawn runsc: {error}"))?;
+    let mut child = sandbox_command.spawn().map_err(|spawn_failure| {
+        let message = format!("spawn runsc: {}", spawn_failure.message());
+        match spawn_failure.phase() {
+            SpawnPhase::Uncommitted => RunFailure::uncommitted(message),
+            SpawnPhase::CommitOutcomeUnknown => RunFailure::commit_outcome_unknown(message),
+            SpawnPhase::CommittedButNotExecuted => RunFailure::committed_but_not_executed(message),
+            SpawnPhase::Executed => {
+                let elapsed = spawn_failure
+                    .executed_at()
+                    .expect("Executed phase always carries executed_at")
+                    .elapsed();
+                RunFailure::executed(message, executed_fallback_usage(mem_bytes, elapsed, None))
+            }
+        }
+    })?;
+
+    // From here on, `sandbox_command.spawn()` has succeeded — per its own contract, the runtime
+    // has ALREADY been released to exec (the fenced case's gate release + ownership.release()
+    // both succeeded before `Ok(SandboxChild)` is ever returned). Every failure below is
+    // therefore `Executed`: the sandbox may already be consuming real host resources, and must
+    // never be charged zero. `executed_at` is the TRUE release/spawn moment `SandboxChild`
+    // captured (immediately before the gate write for a fenced launch, immediately before
+    // `Command::spawn` for an unfenced one) — never a LATER `Instant::now()` taken here, which
+    // would silently exclude real gate-release/pipe-setup execution time from every fallback
+    // computation below, AND from the timeout deadline and successful `wall` duration further on.
+    let executed_at = child.executed_at();
 
     // CT-006a: feed the bounded request body to the container's stdin on a DEDICATED thread (so a
     // large body + a slow in-guest reader cannot deadlock against our stdout/stderr drains), then drop
@@ -1119,7 +1338,10 @@ fn run_and_capture(
     };
     if stdin.is_some() && stdin_pipe.is_none() {
         child.kill_and_wait();
-        return Err("runsc stdin pipe unavailable".to_string());
+        return Err(RunFailure::executed(
+            "runsc stdin pipe unavailable",
+            executed_fallback_usage(mem_bytes, executed_at.elapsed(), None),
+        ));
     }
     let stdin_th = stdin.zip(stdin_pipe).map(|(bytes, mut si)| {
         std::thread::spawn(move || {
@@ -1130,7 +1352,6 @@ fn run_and_capture(
     });
 
     let pid = child.id();
-    let start = Instant::now();
 
     // Drain both pipes on threads so a chatty container cannot fill a pipe buffer and deadlock.
     let (Some(mut out), Some(mut err)) = (child.stdout().take(), child.stderr().take()) else {
@@ -1138,7 +1359,10 @@ fn run_and_capture(
         if let Some(t) = stdin_th {
             let _ = t.join();
         }
-        return Err("runsc output pipe unavailable".to_string());
+        return Err(RunFailure::executed(
+            "runsc output pipe unavailable",
+            executed_fallback_usage(mem_bytes, executed_at.elapsed(), None),
+        ));
     };
     // stdout draining depends on the stream's mode (CT-006c):
     //   - `CappedHead` (CI/agent logs): cap at SANDBOX_CAPTURE_BOUND (256 KiB head capture) + DISCARD the
@@ -1182,15 +1406,34 @@ fn run_and_capture(
     let timed_out;
     let mut last_cpu: Option<u64> = None;
     let exit = loop {
-        if let Some(status) = child.try_wait().map_err(|e| format!("wait runsc: {e}"))? {
-            timed_out = child.watchdog_deadline_expired();
-            break status.code();
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                timed_out = child.watchdog_deadline_expired();
+                break status.code();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // Kill/reap FIRST so the pipes hit EOF, THEN join every thread that was reading
+                // them — no thread may outlive this run, even on a wait-syscall failure (a bare
+                // early return here would leak the stdin/stdout/stderr threads, still blocked on
+                // pipes from a child nothing ever killed).
+                child.kill_and_wait();
+                let _ = th_out.join();
+                let _ = th_err.join();
+                if let Some(t) = stdin_th {
+                    let _ = t.join();
+                }
+                return Err(RunFailure::executed(
+                    format!("wait runsc: {error}"),
+                    executed_fallback_usage(mem_bytes, executed_at.elapsed(), last_cpu),
+                ));
+            }
         }
         if let Some(c) = read_proc_cpu_seconds(pid) {
             last_cpu = Some(c);
         }
         let cancelled = cancellation.load(Ordering::Acquire);
-        if cancelled || start.elapsed() >= timeout {
+        if cancelled || executed_at.elapsed() >= timeout {
             // Wall-clock ceiling hit: whole-CONTAINER kill (SIGKILL the container's PID1 via the
             // runtime), then reap the `runsc` child process so the pipes hit EOF.
             let _ = Command::new(bin)
@@ -1205,7 +1448,7 @@ fn run_and_capture(
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let wall = start.elapsed();
+    let wall = executed_at.elapsed();
 
     // The child has exited/been-killed ⇒ the pipes hit EOF ⇒ the drain threads finish.
     let stdout_result = th_out.join();
@@ -1214,18 +1457,35 @@ fn run_and_capture(
     // EPIPE'd — either way `write_all` returned). Join so no thread outlives the run.
     let stdin_result = stdin_th.map(std::thread::JoinHandle::join);
 
-    let (stdout, stdout_truncated, stdout_error) =
-        stdout_result.map_err(|_| "runsc stdout drain thread panicked".to_string())?;
-    let (stderr, stderr_error) =
-        stderr_result.map_err(|_| "runsc stderr drain thread panicked".to_string())?;
+    let (stdout, stdout_truncated, stdout_error) = stdout_result.map_err(|_| {
+        RunFailure::executed(
+            "runsc stdout drain thread panicked",
+            executed_fallback_usage(mem_bytes, wall, last_cpu),
+        )
+    })?;
+    let (stderr, stderr_error) = stderr_result.map_err(|_| {
+        RunFailure::executed(
+            "runsc stderr drain thread panicked",
+            executed_fallback_usage(mem_bytes, wall, last_cpu),
+        )
+    })?;
     if let Some(write_result) = stdin_result {
-        let write_result =
-            write_result.map_err(|_| "runsc stdin writer thread panicked".to_string())?;
+        let write_result = write_result.map_err(|_| {
+            RunFailure::executed(
+                "runsc stdin writer thread panicked",
+                executed_fallback_usage(mem_bytes, wall, last_cpu),
+            )
+        })?;
         // A child that failed or was killed may legitimately close stdin early; its primary outcome
         // remains authoritative. A successful child, however, must have received the full bounded
         // request body or the Git wire exchange is incomplete.
         if exit == Some(0) {
-            write_result.map_err(|e| format!("write runsc stdin: {e}"))?;
+            write_result.map_err(|e| {
+                RunFailure::executed(
+                    format!("write runsc stdin: {e}"),
+                    executed_fallback_usage(mem_bytes, wall, last_cpu),
+                )
+            })?;
         }
     }
 
@@ -1393,6 +1653,28 @@ fn drain_to_temp_file<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
     };
     let _ = std::fs::remove_file(&path);
     (head, truncated)
+}
+
+/// Fallback usage for a [`RunFailure`] in the `Executed` phase (CT-007 vertical-slice step 2b's
+/// gvisor.rs-integration planning, Sol's review): the runtime had already been released to exec
+/// by the time the failure occurred, so it must never be charged zero (that would let a spawn
+/// that ran real, if briefly, execute for free — a host-DoS surface via jobs engineered to fail
+/// exactly this way). Deliberately similar to, but NOT reusing, [`build_result`]'s own formula:
+/// this rounds elapsed time UP TO AT LEAST ONE SECOND (a `.max(1)` floor `build_result`'s own,
+/// separately-tested success-path formula does not have and must not silently gain) — the
+/// distinct floor Sol's review specified for a conservative FAILURE estimate, not a change to
+/// already-tested successful-completion accounting.
+fn executed_fallback_usage(
+    mem_bytes: u64,
+    elapsed: Duration,
+    cpu_seconds: Option<u64>,
+) -> ResourceUsage {
+    let wall_secs_ceil = (elapsed.as_secs() + u64::from(elapsed.subsec_nanos() > 0)).max(1);
+    let cpu_seconds = cpu_seconds.filter(|c| *c > 0).unwrap_or(wall_secs_ceil);
+    ResourceUsage {
+        cpu_seconds,
+        mem_byte_seconds: mem_bytes.saturating_mul(wall_secs_ceil),
+    }
 }
 
 /// Build the [`SandboxResult`] from the runtime outcome. The exit code is the `runsc` child's REAL
@@ -2196,6 +2478,21 @@ impl GvisorBackend {
         )
         .map_err(|e| WireError::Runtime(e.to_string()))?;
 
+        // The git wire is a direct synchronous API call (an HTTP-shaped request/response), NOT a
+        // `RunnerAgent`-mediated job with a terminal reporter parked above it. There is no
+        // `report_retryable_attempt` mechanism this path can route a post-commit failure through —
+        // refuse loudly here, before reserve, rather than silently mis-defer a real measured attempt
+        // the way `TerminalReporter` ownership would (Sol's finding: git-wire must require `Hook`
+        // ownership, unconditionally).
+        if hooks.completion_settlement_owner() == CompletionSettlementOwner::TerminalReporter {
+            return Err(WireError::Runtime(
+                "git-wire launch requires Hook-owned completion settlement — it is a direct \
+                 synchronous path with no terminal reporter above it to defer a retryable-attempt \
+                 accounting to"
+                    .to_string(),
+            ));
+        }
+
         // Derive the isolation/config posture before the final mutable launch boundary.
         hooks.enforce_isolation_floor(&job)?;
         let profile = HardeningProfile::derive(&job);
@@ -2224,11 +2521,28 @@ impl GvisorBackend {
             .with_extra_mounts(mounts)
             .with_root_path(root_abs);
         let reserve = hooks.reserve(&job)?;
-        if let Err(attribute_error) = hooks.attribute(&job) {
-            hooks.release_unused(&job, &reserve)?;
-            return Err(attribute_error.into());
-        }
+        // Thread the REAL launch permit through to `run_and_capture` (Sol's fix): the old
+        // `hooks.attribute(&job)` eagerly committed-and-released attribution HERE, before any
+        // spawn attempt — decoupling the durable commit from the actual OS spawn entirely, which
+        // made every subsequent `RunFailure` phase from `run_git_wire_container` structurally
+        // mislabeled (e.g. a post-exec pipe failure would be reported `Uncommitted` even though
+        // attribution had already, durably, committed). Acquiring (not immediately committing) the
+        // permit and passing it into `run_and_capture` makes the SAME durable-launch-commit gate
+        // that the CI/agent path uses also govern the git-wire spawn, so its phase reporting
+        // becomes truthful.
+        let launch_permit = match hooks.acquire_launch_permit(&job) {
+            Ok(permit) => permit,
+            Err(attribute_error) => {
+                hooks.release_unused(&job, &reserve)?;
+                return Err(attribute_error.into());
+            }
+        };
 
+        // Same pre-existing leak, same fix, as `launch_with` above: `run_git_wire_container`'s
+        // failure carries the phase the launch reached, so the reservation is released/settled
+        // correctly instead of leaking on every failure path. Git-wire has no terminal reporter
+        // above it (refused up front, above) so every post-commit phase settles synchronously here
+        // — there is no `RetryableAttempt`/reporter path to defer to.
         let (
             ContainerRun {
                 child,
@@ -2237,15 +2551,40 @@ impl GvisorBackend {
                 run_error,
             },
             stdout_truncated,
-        ) = run_git_wire_container(&job, &cfg, spec.stdin.clone(), &rootfs, cancellation)
-            .map_err(WireError::Runtime)?;
+        ) = match run_git_wire_container(
+            &job,
+            &cfg,
+            spec.stdin.clone(),
+            &rootfs,
+            cancellation,
+            launch_permit,
+        ) {
+            Ok(run_and_truncated) => run_and_truncated,
+            Err(run_failure) => {
+                return Err(dispose_git_wire_run_failure(
+                    hooks,
+                    &job,
+                    &reserve,
+                    run_failure,
+                ))
+            }
+        };
 
         // FAIL LOUD at the seam (CT-006c FU-1): if the response overflowed the generous wire cap, the
         // captured pack is TRUNCATED — refuse rather than hand back a short pack the client's
-        // `index-pack` would reject with "early EOF". Tear down the just-run container's bundle (the
-        // container itself is already deleted by `run_git_wire_container`).
+        // `index-pack` would reject with "early EOF". A real execution genuinely happened (this is
+        // deterministic for the same request/limit, never retryable), so settle its already-measured
+        // usage SYNCHRONOUSLY before returning — never leave a real, completed attempt unsettled.
+        // Tear down the just-run container's bundle (the container itself is already deleted by
+        // `run_git_wire_container`).
         if stdout_truncated {
             let _ = std::fs::remove_dir_all(&bundle_dir);
+            if let Err(settle_error) = hooks.settle_completed(&job, &reserve, result.usage) {
+                return Err(WireError::Runtime(format!(
+                    "response exceeded the wire cap AND settling its measured usage also failed \
+                     ({settle_error}) — reservation may be leaked"
+                )));
+            }
             return Err(WireError::OutputTooLarge {
                 cap: job.limits.disk_bytes as usize,
             });
@@ -2278,6 +2617,66 @@ impl GvisorBackend {
     }
 }
 
+/// Dispose of a post-reserve [`RunFailure`] from `run_git_wire_container` into the correct
+/// [`WireError`], settling/releasing the reservation along the way wherever that is safe.
+/// `CommitOutcomeUnknown` still settles/releases NOTHING here, same as gVisor's own
+/// [`GvisorBackend::dispose_run_failure`] — the durable commit outcome is genuinely unknown
+/// regardless of backend. What differs is the OTHER three phases: git-wire has NO terminal
+/// reporter above it (`launch_git_command` refuses reporter-owned hooks before reserve), so
+/// `CommittedButNotExecuted`/`Executed` always settle synchronously here — there is no
+/// `RetryableAttempt`/reporter path to ever defer to. Extracted as a standalone function (rather
+/// than only inlined in `launch_git_command`) so it is unit-testable without a real `runsc` binary.
+fn dispose_git_wire_run_failure(
+    hooks: &RunnerHooks,
+    job: &JobSpec,
+    reserve: &ReserveHandle,
+    run_failure: RunFailure,
+) -> WireError {
+    let message = run_failure.to_string();
+    match run_failure {
+        RunFailure::Uncommitted { .. } => {
+            if let Err(settle_error) = hooks.release_unused(job, reserve) {
+                return WireError::Runtime(format!(
+                    "run_git_wire_container() failed (uncommitted: {message}) AND \
+                     release_unused also failed ({settle_error}) — reservation may be leaked"
+                ));
+            }
+            WireError::Runtime(message)
+        }
+        RunFailure::CommitOutcomeUnknown { .. } => {
+            // Neither release nor settle — the durable commit outcome is genuinely unknown;
+            // guessing either way misaccounts a real reservation.
+            WireError::Runtime(format!(
+                "durable launch commit outcome unknown, needs reconciliation: {message}"
+            ))
+        }
+        RunFailure::CommittedButNotExecuted { .. } => {
+            let zero = ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            };
+            if let Err(settle_error) = hooks.settle_completed(job, reserve, zero) {
+                return WireError::Runtime(format!(
+                    "run_git_wire_container() failed (committed but not executed: {message}) \
+                     AND its zero-usage settlement also failed ({settle_error}) — reservation \
+                     may be leaked"
+                ));
+            }
+            WireError::Runtime(message)
+        }
+        RunFailure::Executed { usage, .. } => {
+            if let Err(settle_error) = hooks.settle_completed(job, reserve, usage) {
+                return WireError::Runtime(format!(
+                    "run_git_wire_container() failed (executed: {message}) AND its \
+                     conservative-usage settlement also failed ({settle_error}) — reservation \
+                     may be leaked"
+                ));
+            }
+            WireError::Runtime(message)
+        }
+    }
+}
+
 /// The git-wire production run path — mirrors [`run_production_container`] but stages the GIT-bearing
 /// rootfs ([`resolved_gvisor_git_rootfs`]) and pipes the bounded request body to the container's stdin.
 /// The bind mounts (RO repo + optional writable quarantine) are already in `cfg`'s `mounts` array. The
@@ -2288,20 +2687,21 @@ fn run_git_wire_container(
     stdin: Vec<u8>,
     rootfs: &Path,
     cancellation: &AtomicBool,
-) -> Result<(ContainerRun, bool), String> {
+    launch_permit: LaunchPermit,
+) -> Result<(ContainerRun, bool), RunFailure> {
     let bin = runsc_bin();
     if !rootfs.exists() {
-        return Err(format!(
+        return Err(RunFailure::uncommitted(format!(
             "staged gVisor git rootfs absent: {} (the git wire REQUIRES a real `git` in the guest — \
              stage a git-bearing rootfs and point {ENV_GVISOR_GIT_ROOTFS} at it; see \
              tests/git_wire_prod_exec_test.rs)",
             rootfs.display()
-        ));
+        )));
     }
     // Stage a config-only bundle: `cfg`'s `root.path` is the ABSOLUTE staged rootfs (set by
     // `launch_git_wire`), so no `rootfs` symlink is staged (a symlinked root.path + a host bind mount
     // makes the rootless gofer fail to start the sandbox; an absolute root.path + bind mount works).
-    let bundle_dir = stage_git_wire_bundle(cfg)?;
+    let bundle_dir = stage_git_wire_bundle(cfg).map_err(RunFailure::uncommitted)?;
     let container_id = format!("myelin-gitwire-{}-{}", std::process::id(), unique_suffix());
 
     let timeout = Duration::from_secs(job.limits.timeout_secs as u64);
@@ -2323,7 +2723,7 @@ fn run_git_wire_container(
             cancellation,
             output: None,
         },
-        None,
+        Some(launch_permit),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -2374,7 +2774,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::{CompletionSettlementOwner, ReserveHandle, RunTokenCredential};
+    use crate::RunTokenCredential;
 
     #[derive(Default)]
     struct RecordingOutput {
@@ -2682,7 +3082,7 @@ mod tests {
                 |_spec, _cfg, permit, _rootfs| {
                     permit
                         .commit_and_release()
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
                     Ok(fake_run())
                 },
             )
@@ -2780,6 +3180,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn launch_watchdog_cgroup_kills_a_descendant_outside_the_runtime_process_group() {
+        use std::time::Instant;
         let cgroup = MemoryCgroup::create(64 << 20)
             .expect("the all-feature gVisor cgroup watchdog gate requires a real delegated cgroup");
         let armed = std::env::temp_dir().join(format!(
@@ -2891,7 +3292,10 @@ mod tests {
         let r = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit, _rootfs| {
             Ok(fake_run())
         });
-        assert!(matches!(r, Err(GvisorError::Hook(_))));
+        assert!(matches!(
+            r,
+            Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))
+        ));
     }
 
     #[test]
@@ -2914,7 +3318,7 @@ mod tests {
             .launch_with(&spec(vec![]), &hooks, |_spec, _cfg, permit, _rootfs| {
                 permit
                     .commit_and_release()
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
                 Ok(fake_run())
             })
             .expect("the sandbox returns measured usage for the reporter transaction");
@@ -2940,11 +3344,14 @@ mod tests {
         let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, permit, _rootfs| {
             permit
                 .commit_and_release()
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
             Ok(fake_run())
         });
 
-        assert!(matches!(result, Err(GvisorError::Hook(_))));
+        assert!(matches!(
+            result,
+            Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))
+        ));
         assert!(
             backend.live.lock().unwrap().is_empty(),
             "an error without a returned handle cannot retain an unreachable live-map entry"
@@ -2976,7 +3383,10 @@ mod tests {
                 Ok(fake_run())
             },
         );
-        assert!(matches!(result, Err(GvisorError::Hook(_))));
+        assert!(matches!(
+            result,
+            Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))
+        ));
         assert!(!spawned.load(Ordering::SeqCst));
         assert_eq!(
             *settled.lock().unwrap(),
@@ -2984,6 +3394,286 @@ mod tests {
                 cpu_seconds: 0,
                 mem_byte_seconds: 0,
             })
+        );
+    }
+
+    /// The pre-existing leak this fix closes: previously, ANY error from `run(...)` propagated
+    /// straight out of `launch_with` with NEITHER `release_unused` NOR `settle_completed` ever
+    /// called — leaking the reservation on every single run failure. These tests prove each of the
+    /// four `RunFailure` phases dispatches to the correct outcome, per Sol's corrected disposition
+    /// table (phase × `CompletionSettlementOwner`):
+    ///
+    /// | Phase                    | `Hook` owner                       | `TerminalReporter` owner                  |
+    /// |---------------------------|-------------------------------------|--------------------------------------------|
+    /// | `Uncommitted`             | `release_unused`, then `Failed`     | `release_unused`, then `Failed`             |
+    /// | `CommitOutcomeUnknown`    | `DurableOutcomeUnknown`             | `DurableOutcomeUnknown`                     |
+    /// | `CommittedButNotExecuted` | settle zero, then `Failed`          | `RetryableAttempt(SandboxInfrastructure, 0)`|
+    /// | `Executed`                | settle usage, then `Failed`         | `RetryableAttempt(SandboxInfrastructure, usage)`|
+    ///
+    /// `Uncommitted` and `CommitOutcomeUnknown` are owner-INDEPENDENT (an uncommitted attempt has no
+    /// terminal report to defer to regardless of owner; an outcome-unknown attempt must never be
+    /// guessed at either way) — only the two post-commit phases branch on ownership, since only they
+    /// carry a real (if zero) measured cost a `TerminalReporter` must eventually account for.
+    #[test]
+    fn gvisor_run_failure_uncommitted_releases_reserve_via_release_unused() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(Mutex::new(None));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, usage| {
+                *settled_at.lock().unwrap() = Some(usage);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit, _rootfs| {
+            Err(RunFailure::uncommitted("injected uncommitted run failure"))
+        });
+        assert!(
+            matches!(
+                result,
+                Err(SandboxLaunchError::Failed(GvisorError::Runtime(_)))
+            ),
+            "an uncommitted run failure must surface as Failed(GvisorError::Runtime): {result:?}"
+        );
+        assert_eq!(
+            *settled.lock().unwrap(),
+            Some(ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            }),
+            "release_unused must settle at zero even under reporter-owned completion — it is \
+             owner-independent, unlike settle_completed"
+        );
+    }
+
+    /// `CommitOutcomeUnknown` must NEVER release or settle — the durable commit outcome is
+    /// genuinely unknown, and guessing either way misaccounts a real reservation. Owner-independent:
+    /// this test uses `Hook` ownership specifically to prove the outcome-unknown path bypasses
+    /// `settle_completed` entirely rather than merely happening to observe a reporter's no-op.
+    #[test]
+    fn gvisor_run_failure_commit_outcome_unknown_never_releases_or_settles() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(AtomicBool::new(false));
+        let settled_at = settled.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        let released_at = released.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, usage| {
+                settled_at.store(true, Ordering::SeqCst);
+                if usage
+                    == (ResourceUsage {
+                        cpu_seconds: 0,
+                        mem_byte_seconds: 0,
+                    })
+                {
+                    released_at.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit, _rootfs| {
+            Err(RunFailure::commit_outcome_unknown(
+                "injected commit-outcome-unknown run failure",
+            ))
+        });
+        assert!(
+            matches!(
+                result,
+                Err(SandboxLaunchError::DurableOutcomeUnknown(GvisorError::Runtime(_)))
+            ),
+            "a commit-outcome-unknown run failure must surface as DurableOutcomeUnknown: {result:?}"
+        );
+        assert!(
+            !settled.load(Ordering::SeqCst) && !released.load(Ordering::SeqCst),
+            "neither settle_completed nor release_unused (which also calls the settle hook) may \
+             ever fire for an outcome-unknown attempt"
+        );
+    }
+
+    /// `CommittedButNotExecuted` under `Hook` ownership settles zero synchronously, then surfaces
+    /// `Failed` — a real terminal report IS expected here (unlike `Uncommitted`'s "none will ever
+    /// follow"), and `Hook` ownership means the hook itself is the one committing that report.
+    #[test]
+    fn gvisor_run_failure_committed_but_not_executed_hook_owner_settles_zero_then_fails() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(Mutex::new(None));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, usage| {
+                *settled_at.lock().unwrap() = Some(usage);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit, _rootfs| {
+            Err(RunFailure::committed_but_not_executed(
+                "injected committed-but-not-executed run failure",
+            ))
+        });
+        assert!(
+            matches!(
+                result,
+                Err(SandboxLaunchError::Failed(GvisorError::Runtime(_)))
+            ),
+            "a Hook-owned committed-but-not-executed failure must surface as Failed: {result:?}"
+        );
+        assert_eq!(
+            *settled.lock().unwrap(),
+            Some(ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            }),
+            "Hook ownership must settle zero usage synchronously through settle_completed"
+        );
+    }
+
+    /// `CommittedButNotExecuted` under `TerminalReporter` ownership must NOT call `settle_completed`
+    /// at all (it would silently no-op) — it must instead surface `RetryableAttempt` so the RUNNER
+    /// routes it through the reporter's own `report_retryable_attempt` transaction, which durably
+    /// accounts usage and either requeues or terminalizes the exact claim. This is the exact case
+    /// Sol's review caught: the original fix called `settle_completed` here and returned an
+    /// ordinary `Failed`, which under reporter ownership silently discarded the accounting with no
+    /// terminal report ever following.
+    #[test]
+    fn gvisor_run_failure_committed_but_not_executed_reporter_owner_yields_retryable_attempt() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(AtomicBool::new(false));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, _usage| {
+                settled_at.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let result = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg, _permit, _rootfs| {
+            Err(RunFailure::committed_but_not_executed(
+                "injected committed-but-not-executed run failure",
+            ))
+        });
+        match result {
+            Err(SandboxLaunchError::RetryableAttempt { cause, usage, .. }) => {
+                assert_eq!(cause, RetryableAttemptCause::SandboxInfrastructure);
+                assert_eq!(
+                    usage,
+                    ResourceUsage {
+                        cpu_seconds: 0,
+                        mem_byte_seconds: 0,
+                    }
+                );
+            }
+            other => panic!("expected RetryableAttempt with zero usage, got {other:?}"),
+        }
+        assert!(
+            !settled.load(Ordering::SeqCst),
+            "settle_completed must never be called directly here — the runner's retryable-attempt \
+             transaction is the sole accounting path under reporter ownership"
+        );
+    }
+
+    /// `Executed` under `Hook` ownership must settle the CONSERVATIVE fallback usage synchronously,
+    /// never zero — a job engineered to fail exactly after the runtime was released to exec must not
+    /// execute for free (the host-DoS surface Sol's design closes) — then surface `Failed`.
+    #[test]
+    fn gvisor_run_failure_executed_hook_owner_settles_fallback_usage_then_fails() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(Mutex::new(None));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, usage| {
+                *settled_at.lock().unwrap() = Some(usage);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let fallback_usage = ResourceUsage {
+            cpu_seconds: 7,
+            mem_byte_seconds: 700,
+        };
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs| {
+                Err(RunFailure::executed(
+                    "injected executed-phase run failure",
+                    fallback_usage,
+                ))
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SandboxLaunchError::Failed(GvisorError::Runtime(_)))
+            ),
+            "a Hook-owned executed-phase failure must surface as Failed: {result:?}"
+        );
+        assert_eq!(
+            *settled.lock().unwrap(),
+            Some(fallback_usage),
+            "the executed phase must settle its carried conservative fallback usage, never zero"
+        );
+    }
+
+    /// `Executed` under `TerminalReporter` ownership must surface `RetryableAttempt` carrying the
+    /// SAME conservative fallback usage (never zero) — the reporter's own transaction, not
+    /// `settle_completed`, is what durably accounts it.
+    #[test]
+    fn gvisor_run_failure_executed_reporter_owner_yields_retryable_attempt_with_fallback_usage() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(AtomicBool::new(false));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, _usage| {
+                settled_at.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let fallback_usage = ResourceUsage {
+            cpu_seconds: 3,
+            mem_byte_seconds: 300,
+        };
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs| {
+                Err(RunFailure::executed(
+                    "injected executed-phase run failure",
+                    fallback_usage,
+                ))
+            },
+        );
+        match result {
+            Err(SandboxLaunchError::RetryableAttempt { cause, usage, .. }) => {
+                assert_eq!(cause, RetryableAttemptCause::SandboxInfrastructure);
+                assert_eq!(usage, fallback_usage);
+            }
+            other => panic!("expected RetryableAttempt with the fallback usage, got {other:?}"),
+        }
+        assert!(
+            !settled.load(Ordering::SeqCst),
+            "settle_completed must never be called directly here — the runner's retryable-attempt \
+             transaction is the sole accounting path under reporter ownership"
         );
     }
 
@@ -3011,7 +3701,9 @@ mod tests {
             Box::new(|_t| Ok(())),
             Box::new(move |_spec| {
                 floor_called_at.store(true, Ordering::SeqCst);
-                Err(crate::HookError("isolation floor is RED for this test".into()))
+                Err(crate::HookError(
+                    "isolation floor is RED for this test".into(),
+                ))
             }),
         );
 
@@ -3038,7 +3730,7 @@ mod tests {
         );
 
         assert!(
-            matches!(result, Err(GvisorError::Hook(_))),
+            matches!(result, Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))),
             "the isolation floor's own refusal must surface, proving it ran BEFORE the registry \
              lookup (an unregistered image would otherwise short-circuit as `Image` first): {result:?}"
         );
@@ -3100,7 +3792,10 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(GvisorError::Image(_))));
+        assert!(matches!(
+            result,
+            Err(SandboxLaunchError::Failed(GvisorError::Image(_)))
+        ));
         assert!(
             floor_called.load(Ordering::SeqCst),
             "the isolation floor must have been consulted (and passed) first"
@@ -3124,7 +3819,10 @@ mod tests {
         let hooks = ok_hooks();
         let result = backend.launch(&spec(vec![]), &hooks);
         assert!(
-            matches!(result, Err(GvisorError::Image(_))),
+            matches!(
+                result,
+                Err(SandboxLaunchError::Failed(GvisorError::Image(_)))
+            ),
             "a git-wire-only backend has no asset registry and must refuse an ordinary launch as \
              GvisorError::Image, not panic or hang: {result:?}"
         );
@@ -3139,7 +3837,7 @@ mod tests {
         let result =
             backend.launch_streaming(&spec(vec![]), &hooks, output, SandboxCancellation::new());
         assert!(
-            matches!(result, Err(GvisorError::Image(_))),
+            matches!(result, Err(SandboxLaunchError::Failed(GvisorError::Image(_)))),
             "a git-wire-only backend must refuse ordinary launch_streaming the same way as launch: \
              {result:?}"
         );
@@ -3176,6 +3874,159 @@ mod tests {
         );
         assert!(
             matches!(result, Err(WireError::Runtime(message)) if message.contains("cancelled by process shutdown"))
+        );
+    }
+
+    /// Git-wire is a direct synchronous path with no terminal reporter above it — reporter-owned
+    /// hooks must be refused BEFORE reserve or any rootfs/mount/spawn work, exactly like the
+    /// analogous agent-service `dispatch_compute` refusal. Proven WITHOUT a real `runsc`: the
+    /// refusal happens before any of that is ever touched.
+    #[test]
+    fn git_wire_refuses_reporter_owned_hooks_before_reserve() {
+        // A REAL repo directory under a REAL root — this test is about the ownership refusal, not
+        // the symlink/path-confinement defense (`symlinked_repo_path_is_refused_before_mount`
+        // covers that), so the path itself must actually pass `assert_repo_under_root` first.
+        let tmp = std::env::temp_dir().join(format!(
+            "myelin-gitwire-reporter-owned-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let root = tmp.join("git-root");
+        let repo = root.join("acme").join("fr-par").join("widgets.git");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let reserve_called = Arc::new(AtomicBool::new(false));
+        let reserve_called_at = reserve_called.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(move |spec| {
+                reserve_called_at.store(true, Ordering::SeqCst);
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let spec = GitWireSpec {
+            repo_host_path: repo,
+            root,
+            git_argv: vec!["upload-pack".into()],
+            stdin: Vec::new(),
+            env: Vec::new(),
+            quarantine_host_path: None,
+            limits: ResourceLimits {
+                cpu_millis: 1,
+                mem_bytes: 1,
+                disk_bytes: 1,
+                tmpfs_bytes: 1,
+                pids_max: 1,
+                timeout_secs: 1,
+            },
+            run_token: RunTokenCredential::new("test-bearer", "reporter-owned", 300).unwrap(),
+            meter_to: MeterTarget {
+                reserve_id: "reporter-owned".into(),
+            },
+            idem_token: IdemToken("reporter-owned".into()),
+        };
+        let result = GvisorBackend::git_wire_only().launch_git_wire_until_cancelled(
+            &spec,
+            &hooks,
+            &NEVER_CANCELLED,
+        );
+        assert!(
+            matches!(result, Err(WireError::Runtime(ref message)) if message.contains("requires Hook-owned")),
+            "expected a Hook-ownership refusal, got {result:?}"
+        );
+        assert!(
+            !reserve_called.load(Ordering::SeqCst),
+            "reporter-owned hooks must refuse before reserve is ever called"
+        );
+    }
+
+    /// The four `RunFailure` phases dispatch through `dispose_git_wire_run_failure` exactly as
+    /// gVisor's `dispose_run_failure` does under `Hook` ownership (git-wire always settles
+    /// synchronously — there is no reporter to defer to): `Uncommitted` -> `release_unused`;
+    /// `CommitOutcomeUnknown` -> neither release nor settle; `CommittedButNotExecuted` -> settle
+    /// zero; `Executed` -> settle the carried usage. Unit-tested directly (no real `runsc` needed).
+    #[test]
+    fn dispose_git_wire_run_failure_dispatches_all_four_phases() {
+        fn recording_hooks() -> (RunnerHooks, Arc<Mutex<Vec<ResourceUsage>>>) {
+            let settled = Arc::new(Mutex::new(Vec::new()));
+            let settled_at = settled.clone();
+            let hooks = RunnerHooks::new(
+                CompletionSettlementOwner::Hook,
+                Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+                Box::new(move |_spec, _h, usage| {
+                    settled_at.lock().unwrap().push(usage);
+                    Ok(())
+                }),
+                Box::new(|_t| Ok(())),
+                Box::new(|_s| Ok(())),
+            );
+            (hooks, settled)
+        }
+        let job = spec(vec![]);
+        let reserve = ReserveHandle(job.meter_to.reserve_id.clone());
+        let zero = ResourceUsage {
+            cpu_seconds: 0,
+            mem_byte_seconds: 0,
+        };
+
+        let (hooks, settled) = recording_hooks();
+        let error = dispose_git_wire_run_failure(
+            &hooks,
+            &job,
+            &reserve,
+            RunFailure::uncommitted("injected uncommitted"),
+        );
+        assert!(matches!(error, WireError::Runtime(m) if m.contains("injected uncommitted")));
+        assert_eq!(
+            *settled.lock().unwrap(),
+            vec![zero],
+            "release_unused settles zero"
+        );
+
+        let (hooks, settled) = recording_hooks();
+        let error = dispose_git_wire_run_failure(
+            &hooks,
+            &job,
+            &reserve,
+            RunFailure::commit_outcome_unknown("injected outcome unknown"),
+        );
+        assert!(matches!(error, WireError::Runtime(m) if m.contains("needs reconciliation")));
+        assert!(
+            settled.lock().unwrap().is_empty(),
+            "commit-outcome-unknown must never release or settle"
+        );
+
+        let (hooks, settled) = recording_hooks();
+        let error = dispose_git_wire_run_failure(
+            &hooks,
+            &job,
+            &reserve,
+            RunFailure::committed_but_not_executed("injected committed but not executed"),
+        );
+        assert!(
+            matches!(error, WireError::Runtime(m) if m.contains("injected committed but not executed"))
+        );
+        assert_eq!(*settled.lock().unwrap(), vec![zero]);
+
+        let (hooks, settled) = recording_hooks();
+        let fallback_usage = ResourceUsage {
+            cpu_seconds: 4,
+            mem_byte_seconds: 400,
+        };
+        let error = dispose_git_wire_run_failure(
+            &hooks,
+            &job,
+            &reserve,
+            RunFailure::executed("injected executed", fallback_usage),
+        );
+        assert!(matches!(error, WireError::Runtime(m) if m.contains("injected executed")));
+        assert_eq!(
+            *settled.lock().unwrap(),
+            vec![fallback_usage],
+            "executed must settle the carried conservative usage, never zero"
         );
     }
 

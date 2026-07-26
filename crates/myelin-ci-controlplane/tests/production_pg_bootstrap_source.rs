@@ -351,6 +351,17 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(runner_bind_source.contains("pub fn durable_spec_resolver_test_support"));
     assert!(runner_bind_source.contains("#[cfg(any(test, feature = \"test-support\"))]"));
     assert!(!runner_bind_source.contains("#[cfg(any(test, feature = \"integration\"))]"));
+    assert!(
+        !runner_bind_source.contains("FirecrackerBackend"),
+        "FirecrackerBackend must NEVER be wired into production runner_bind.rs: unlike \
+         GvisorBackend, it does not yet make the Uncommitted/CommitOutcomeUnknown/\
+         CommittedButNotExecuted/Executed phase distinction on a post-reserve launch failure — \
+         every failure is compatibility-wrapped (phase-unclassified) as `SandboxLaunchError::Failed` \
+         (see firecracker.rs's SandboxBackend impl). Wiring it into production today would \
+         silently reproduce the exact reservation-leak class this whole CT-007 fix closed for \
+         gVisor. This is a NAMED production-activation blocker, not merely a comment — give \
+         FirecrackerBackend gVisor's same phase-aware treatment before ever removing this guard."
+    );
     let claim_lock = claim_issuer_source
         .find("CiJobQueueStore::lock_for_token_mint_on_conn")
         .expect("claim-time issuer must lock the durable scheduler claim");

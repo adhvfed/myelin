@@ -22,7 +22,7 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const GATE_SCRIPT: &str = r#"
 IFS= read -r myelin_launch_gate || exit 125
@@ -117,14 +117,28 @@ impl SandboxCommand {
 
     /// Spawn the blocked guard, durably commit the launch CAS, then release the runtime. Any error
     /// before release kills and reaps the complete still-trusted process group.
-    pub(crate) fn spawn(mut self) -> Result<SandboxChild, String> {
+    ///
+    /// The error carries a [`SpawnPhase`] disposition (CT-007 vertical-slice step 2b's
+    /// gvisor.rs-integration planning found a real, pre-existing gap this exists to close): a
+    /// caller that only sees a flat `String` cannot tell "nothing durable happened" (safe to
+    /// release the caller's cost reservation at zero) apart from "the durable launch CAS
+    /// committed, but the runtime never got to exec" (the reservation's cost is real even though
+    /// no workload ran — it must be settled at zero, not released) apart from "the runtime may
+    /// ALREADY be executing" (the release-byte write below succeeds and the guard's `exec "$@"`
+    /// runs immediately after — a failure AFTER that point must be accounted as a real, if
+    /// botched, execution, never charged for free).
+    pub(crate) fn spawn(mut self) -> Result<SandboxChild, SpawnFailure> {
         let watchdog_timer = if self.fenced {
             Some(
                 boottime_timer(
                     self.watchdog_timeout
                         .expect("fenced sandbox command owns a watchdog deadline"),
                 )
-                .map_err(|error| format!("arm sandbox launch watchdog deadline: {error}"))?,
+                .map_err(|error| {
+                    SpawnFailure::uncommitted(format!(
+                        "arm sandbox launch watchdog deadline: {error}"
+                    ))
+                })?,
             )
         } else {
             None
@@ -183,10 +197,14 @@ impl SandboxCommand {
                 });
             }
         }
-        let mut child = self
-            .command
-            .spawn()
-            .map_err(|error| format!("spawn sandbox process: {error}"))?;
+        // Unfenced commands (no launch permit — e.g. the host preflight self-test) have no
+        // commit/gate boundary at all — the process spawn itself IS the moment execution starts.
+        // Fenced commands capture this later, immediately before the gate write (the true
+        // release-to-exec moment).
+        let mut executed_at = (!self.fenced).then(Instant::now);
+        let mut child = self.command.spawn().map_err(|error| {
+            SpawnFailure::uncommitted(format!("spawn sandbox process: {error}"))
+        })?;
         drop(self.liveness_read.take());
         drop(self.ready_write.take());
         drop(self.cgroup_kill.take());
@@ -198,7 +216,9 @@ impl SandboxCommand {
                 None => {
                     kill_process_group(group_id);
                     let _ = child.wait();
-                    return Err("launch guard gate pipe unavailable".to_string());
+                    return Err(SpawnFailure::uncommitted(
+                        "launch guard gate pipe unavailable".to_string(),
+                    ));
                 }
             };
             let ready_result = wait_until_ready(
@@ -210,9 +230,9 @@ impl SandboxCommand {
             if let Err(error) = ready_result {
                 kill_process_group(group_id);
                 let _ = child.wait();
-                return Err(format!(
+                return Err(SpawnFailure::uncommitted(format!(
                     "launch guard failed to arm liveness watchdog: {error}"
-                ));
+                )));
             }
             let permit = self
                 .permit
@@ -223,9 +243,15 @@ impl SandboxCommand {
                 Err(error) => {
                     kill_process_group(group_id);
                     let _ = child.wait();
-                    return Err(format!(
-                        "durable launch commit failed before sandbox exec: {error}"
-                    ));
+                    // The CAS returned an error, but that does NOT prove nothing committed: the
+                    // durable store may have committed and lost the acknowledgement (e.g. a
+                    // Postgres commit whose result never reached the caller). Calling this
+                    // Uncommitted would let a caller release a reservation the store may still
+                    // consider owned. Neither release nor settle — surface the ambiguity so the
+                    // caller defers to durable reconciliation instead of guessing.
+                    return Err(SpawnFailure::commit_outcome_unknown(format!(
+                        "durable launch commit returned an error before sandbox exec: {error}"
+                    )));
                 }
             };
             let ownership = match ownership.validate() {
@@ -233,24 +259,41 @@ impl SandboxCommand {
                 Err(error) => {
                     kill_process_group(group_id);
                     let _ = child.wait();
-                    return Err(format!(
+                    // The CAS DID commit (durably); the runtime is being killed before exec — the
+                    // reservation's cost is real even though no workload ran.
+                    return Err(SpawnFailure::committed_but_not_executed(format!(
                         "durable launch ownership was lost before sandbox exec: {error}"
-                    ));
+                    )));
                 }
             };
+            // Captured IMMEDIATELY BEFORE the write below, not after: once the byte is written the
+            // guard's `exec "$@"` could start at any moment, so this must be the TRUE release
+            // moment a later Executed-phase failure, and the eventual successful `SandboxChild`,
+            // report elapsed time from — never a later point after the (possibly slow) write
+            // syscall or this whole call has returned.
+            let release_at = Instant::now();
             if let Err(error) = gate.write_all(b"launch\n") {
                 kill_process_group(group_id);
                 let _ = child.wait();
-                return Err(format!(
+                // Committed, but the guard never even read the release byte — still no exec. The
+                // write failed, so `release_at` is discarded (never assigned to `executed_at`) —
+                // this phase carries no execution timestamp.
+                return Err(SpawnFailure::committed_but_not_executed(format!(
                     "release sandbox after durable launch commit: {error}"
-                ));
+                )));
             }
+            executed_at = Some(release_at);
             drop(gate);
             if let Err(error) = ownership.release() {
                 kill_process_group(group_id);
                 let _ = child.wait();
-                return Err(format!(
-                    "release durable launch ownership after sandbox exec handoff: {error}"
+                // The gate byte WAS written above — the guard's `exec "$@"` may already be
+                // running by the time this specific release call failed. Treat as a real (if
+                // botched) execution: the caller must account conservative fallback usage, never
+                // charge zero for it.
+                return Err(SpawnFailure::executed(
+                    format!("release durable launch ownership after sandbox exec handoff: {error}"),
+                    executed_at.expect("executed_at was just set above"),
                 ));
             }
         }
@@ -261,9 +304,100 @@ impl SandboxCommand {
             liveness_write: self.liveness_write,
             watchdog_timer,
             process_group,
+            executed_at: executed_at
+                .expect("executed_at is always set (pre-spawn if unfenced, pre-gate-write if fenced) by the time spawn succeeds"),
         })
     }
 }
+
+/// Which of four phases a [`SandboxCommand::spawn`] failure occurred in — see that method's own
+/// doc for the accounting rule each phase implies for the caller's cost reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnPhase {
+    /// No durable launch CAS committed. Safe to release the caller's reservation at zero cost.
+    Uncommitted,
+    /// The durable launch CAS returned an error, but whether it actually committed durably is
+    /// UNKNOWN (e.g. the store committed but the acknowledgement was lost). Neither release nor
+    /// settle — the caller must defer to durable reconciliation rather than guess either way.
+    CommitOutcomeUnknown,
+    /// The durable launch CAS committed, but the runtime never got to exec (or was killed before
+    /// it could). The reservation's cost is real (the commit itself is a durable, accounted
+    /// fact) even though no workload ran — settle at zero, never release-as-unused.
+    CommittedButNotExecuted,
+    /// The runtime may already be executing (the release byte was written) by the time this
+    /// specific failure occurred. The caller must settle CONSERVATIVE fallback usage — never
+    /// zero, which would let a spawn that ran real (if briefly) execute for free.
+    Executed,
+}
+
+/// A phase-tagged [`SandboxCommand::spawn`] failure. `executed_at` is populated ONLY for the
+/// `Executed` phase — the `Instant` captured immediately before the release byte was written (the
+/// earliest moment the guard's `exec "$@"` could have started) — so a caller with no OTHER
+/// elapsed-time reference (`spawn()` itself failed, so the caller never got a `child`/start-time
+/// of its own) can still compute a conservative fallback usage from `executed_at.elapsed()`.
+#[derive(Debug)]
+pub(crate) struct SpawnFailure {
+    phase: SpawnPhase,
+    message: String,
+    executed_at: Option<Instant>,
+}
+
+impl SpawnFailure {
+    fn uncommitted(message: String) -> Self {
+        Self {
+            phase: SpawnPhase::Uncommitted,
+            message,
+            executed_at: None,
+        }
+    }
+
+    fn commit_outcome_unknown(message: String) -> Self {
+        Self {
+            phase: SpawnPhase::CommitOutcomeUnknown,
+            message,
+            executed_at: None,
+        }
+    }
+
+    fn committed_but_not_executed(message: String) -> Self {
+        Self {
+            phase: SpawnPhase::CommittedButNotExecuted,
+            message,
+            executed_at: None,
+        }
+    }
+
+    fn executed(message: String, executed_at: Instant) -> Self {
+        Self {
+            phase: SpawnPhase::Executed,
+            message,
+            executed_at: Some(executed_at),
+        }
+    }
+
+    pub(crate) fn phase(&self) -> SpawnPhase {
+        self.phase
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The `Instant` captured immediately before the release byte was written — `Some` only for
+    /// `phase() == SpawnPhase::Executed`. Use `.elapsed()` on this to compute conservative fallback
+    /// usage.
+    pub(crate) fn executed_at(&self) -> Option<Instant> {
+        self.executed_at
+    }
+}
+
+impl std::fmt::Display for SpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for SpawnFailure {}
 
 /// Child returned by [`SandboxCommand`]. Closing `liveness_write` after the process leader exits
 /// releases the watchdog, which removes surviving descendants and then kills itself.
@@ -273,11 +407,22 @@ pub(crate) struct SandboxChild {
     liveness_write: Option<OwnedFd>,
     watchdog_timer: Option<OwnedFd>,
     process_group: Option<i32>,
+    executed_at: Instant,
 }
 
 impl SandboxChild {
     pub(crate) fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// The TRUE moment execution began: for a fenced launch, immediately before the gate-release
+    /// byte was written (the earliest point the guard's `exec "$@"` could start); for an unfenced
+    /// launch, immediately before `Command::spawn`. Use this (never a later `Instant::now()`
+    /// captured after `spawn()` already returned `Ok`) as the base for every elapsed-time
+    /// computation — gate-release/pipe-setup time is real execution time the caller must not
+    /// silently exclude from usage accounting.
+    pub(crate) fn executed_at(&self) -> Instant {
+        self.executed_at
     }
 
     pub(crate) fn stdin(&mut self) -> &mut Option<ChildStdin> {
@@ -584,7 +729,7 @@ pub fn launch_gate_parent_death_probe(
         .arg(escaped)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let _owned_child = command.spawn()?;
+    let _owned_child = command.spawn().map_err(|error| error.to_string())?;
     std::fs::write(armed, b"armed")
         .map_err(|error| format!("publish process-death probe readiness: {error}"))?;
     loop {
@@ -671,7 +816,13 @@ mod tests {
         let error = command
             .spawn()
             .expect_err("failed commit must refuse launch");
-        assert!(error.contains("injected commit failure"));
+        assert!(error.message().contains("injected commit failure"));
+        // The CAS returned an error — whether it actually committed durably is UNKNOWN (a Postgres
+        // commit can return an error after the server committed and lost the acknowledgement).
+        // This must NOT be classified `Uncommitted` (which would tell the caller it is safe to
+        // release the reservation at zero — an outcome-unknown attempt must never be guessed at).
+        assert_eq!(error.phase(), SpawnPhase::CommitOutcomeUnknown);
+        assert!(error.executed_at().is_none());
         assert!(!marker.exists(), "failed commit executed the runtime");
     }
 
@@ -687,7 +838,11 @@ mod tests {
         let error = command
             .spawn()
             .expect_err("lost post-commit ownership must refuse gate release");
-        assert!(error.contains("injected session ownership loss"));
+        assert!(error.message().contains("injected session ownership loss"));
+        // The CAS DID commit durably (ownership.validate() is what failed, AFTER commit()
+        // succeeded) — the reservation's cost is real even though the guest never got to exec.
+        assert_eq!(error.phase(), SpawnPhase::CommittedButNotExecuted);
+        assert!(error.executed_at().is_none());
         assert!(
             !marker.exists(),
             "runtime executed after launch ownership was lost"
@@ -740,7 +895,17 @@ mod tests {
         let error = command
             .spawn()
             .expect_err("post-gate ownership release failure must kill the runtime");
-        assert!(error.contains("injected post-gate unlock failure"));
+        assert!(error
+            .message()
+            .contains("injected post-gate unlock failure"));
+        // The release byte WAS already written when `ownership.release()` failed — the guard's
+        // `exec "$@"` may already be running. Must be Executed (never a phase that would let the
+        // caller charge zero), and `executed_at` must be populated with a plausible timestamp.
+        assert_eq!(error.phase(), SpawnPhase::Executed);
+        assert!(
+            error.executed_at().is_some(),
+            "Executed phase always carries executed_at"
+        );
         std::thread::sleep(Duration::from_millis(300));
         assert!(
             !marker.exists(),

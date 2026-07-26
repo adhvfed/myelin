@@ -185,7 +185,10 @@ fn ok_hooks() -> RunnerHooks {
 fn launch_against_rust_rootfs(
     backend: &GvisorBackend,
     spec: &JobSpec,
-) -> Result<myelin_ci_sandbox::SandboxLaunch, myelin_ci_sandbox::gvisor::GvisorError> {
+) -> Result<
+    myelin_ci_sandbox::SandboxLaunch,
+    myelin_ci_sandbox::SandboxLaunchError<myelin_ci_sandbox::gvisor::GvisorError>,
+> {
     backend.launch(spec, &ok_hooks())
 }
 

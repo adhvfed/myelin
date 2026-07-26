@@ -23,7 +23,7 @@ use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
 use myelin_ci_sandbox::{
     parse_console, Backend, BackendRun, EgressPolicy, EscapeAttestation, IdemToken, ImageRef,
     MeterTarget, ResourceLimits, ResourceUsage, RunTokenCredential, SandboxBackend, SandboxHandle,
-    SandboxLaunch, SandboxResult, SpecError, TrustTier, CORPUS, CORPUS_VERSION,
+    SandboxLaunch, SandboxLaunchError, SandboxResult, SpecError, TrustTier, CORPUS, CORPUS_VERSION,
 };
 use myelin_ci_sandbox::{JobSpec as SandboxJobSpec, RunnerHooks};
 use myelin_events::{
@@ -55,7 +55,7 @@ impl SandboxBackend for UnifiedRunnerProducer {
         &self,
         _spec: &SandboxJobSpec,
         _hooks: &RunnerHooks,
-    ) -> Result<SandboxLaunch, Self::Error> {
+    ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
         // the in-line launch is unused on the long-park path.
         Ok(SandboxLaunch {
             handle: SandboxHandle {
