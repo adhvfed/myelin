@@ -61,6 +61,7 @@
 
 pub mod asset_registry;
 pub mod canonical_tar;
+mod dirlock;
 pub mod escape_corpus;
 pub mod events;
 pub mod firecracker;
@@ -73,6 +74,7 @@ pub mod replay;
 pub mod runner;
 pub mod self_hosted;
 pub mod snapshot_pool;
+pub mod user_namespace;
 pub mod workspace_manager;
 pub mod workspace_storage;
 

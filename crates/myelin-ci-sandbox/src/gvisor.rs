@@ -37,6 +37,7 @@ use crate::hardening::HardeningProfile;
 use crate::launch_gate::{SandboxCommand, SpawnPhase};
 use crate::redaction::RedactionPlan;
 use crate::runner::RetryableAttemptCause;
+use crate::user_namespace::{RunscInvocationMode, UserNamespaceConfig};
 use crate::{
     drain_capped, CompletionSettlementOwner, EgressPolicy, HookError, IdemToken, ImageRef, JobKind,
     JobSpec, LaunchPermit, MeterTarget, ReserveHandle, ResourceLimits, ResourceUsage,
@@ -44,7 +45,9 @@ use crate::{
     SandboxLaunch, SandboxLaunchError, SandboxOutputSink, SandboxOutputStream, SandboxResult,
     TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
+use std::io;
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -55,8 +58,50 @@ use std::time::Duration;
 /// Env var naming the `runsc` binary; defaults to `runsc` on `PATH`.
 pub const ENV_RUNSC_BIN: &str = "MYELIN_RUNSC_BIN";
 
-fn runsc_bin() -> String {
-    std::env::var(ENV_RUNSC_BIN).unwrap_or_else(|_| "runsc".to_string())
+/// The resolved, CANONICALIZED, ABSOLUTE `runsc` binary path — computed ONCE and cached (Sol's
+/// review, round 2: re-reading the env var on every launch means a boot preflight validating one
+/// binary and a later launch resolving a DIFFERENT one, if the environment changed mid-process,
+/// could silently diverge — caching makes "the boot-validated binary is the one every launch uses"
+/// an actual invariant, not merely usually true). Round 3: [`preflight_gvisor_runner_host`], if
+/// called, populates this SAME cell with its own already-canonicalized, already-probed path. Round
+/// 4 correction: a `set()` conflict is NOT a harmless no-op — [`preflight_gvisor_runner_host`]
+/// treats it as a hard preflight FAILURE (something else already cached a DIFFERENT path before
+/// preflight ran), since silently keeping the earlier, unvalidated value would let preflight report
+/// success for a binary no launch actually uses. A test or tool that calls
+/// [`run_and_capture`]/[`delete_container`] directly, without ever calling preflight, gets the lazy
+/// fallback below instead (best-effort, matching this function's pre-round-3 behavior).
+static RESOLVED_RUNSC_BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn resolved_runsc_bin_path() -> &'static Path {
+    RESOLVED_RUNSC_BIN.get_or_init(|| {
+        let configured = std::env::var(ENV_RUNSC_BIN).unwrap_or_else(|_| "runsc".to_string());
+        let candidate = if configured.contains('/') {
+            PathBuf::from(&configured)
+        } else {
+            std::env::var("PATH")
+                .ok()
+                .and_then(|paths| {
+                    paths
+                        .split(':')
+                        .map(|dir| Path::new(dir).join(&configured))
+                        .find(|candidate| candidate.exists())
+                })
+                .unwrap_or_else(|| PathBuf::from(&configured))
+        };
+        // Canonicalize when possible (resolves symlinks, makes the cached value absolute) —
+        // falls back to the unresolved candidate when canonicalization fails (e.g. a test
+        // environment with no `runsc` installed at all); resolution failure surfaces naturally as
+        // a spawn error at first actual use, exactly as before this round's hardening.
+        candidate.canonicalize().unwrap_or(candidate)
+    })
+}
+
+/// Sol's review, round 4: returns the resolved `&Path` directly (was `&str` via `.to_str().
+/// unwrap_or("runsc")`) — falling back to the unrelated literal `"runsc"` for a non-UTF-8 resolved
+/// path would have silently swapped in a DIFFERENT, unvalidated binary resolution. `Command::new`/
+/// `SandboxCommand::new` both accept `impl AsRef<OsStr>`, so callers pass this straight through.
+fn runsc_bin() -> &'static Path {
+    resolved_runsc_bin_path()
 }
 
 /// How a [`probe_runsc_version`] boot preflight failed; the caller owns the operator-facing wording.
@@ -105,6 +150,25 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
             "MYELIN_RUNSC_BIN did not identify itself as runsc".to_string()
         }
     })?;
+    // Feed THIS canonicalized, probed path into the SAME cell `runsc_bin()` reads, so every
+    // subsequent launch uses the exact binary this preflight just validated (Sol's review, round
+    // 3) rather than a separately (if identically) re-derived path. Round 4: a `set()` failure
+    // (something already cached a DIFFERENT value before this preflight ran) is now a PREFLIGHT
+    // FAILURE, not a silently ignored no-op — otherwise preflight could report success having
+    // validated binary B while every launch keeps using a stale, previously-cached binary A, with
+    // nothing surfacing the divergence.
+    if RESOLVED_RUNSC_BIN.set(runsc.clone()).is_err() {
+        let already_cached = RESOLVED_RUNSC_BIN
+            .get()
+            .expect("set() just failed, so the cell must already be initialized");
+        if already_cached != &runsc {
+            return Err(format!(
+                "MYELIN_RUNSC_BIN preflight validated {runsc:?}, but {already_cached:?} was \
+                 already cached by an earlier resolution — refusing rather than leaving launches \
+                 on a stale, unvalidated binary"
+            ));
+        }
+    }
 
     if !rootfs.is_absolute() {
         return Err("MYELIN_GVISOR_ROOTFS must be an absolute path".into());
@@ -138,6 +202,7 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         extra_mounts: Vec::new(),
         extra_env: Vec::new(),
         root_path: None,
+        user_namespace: None,
     };
     let bundle = stage_production_bundle(&config, &rootfs)
         .map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
@@ -146,12 +211,8 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         std::process::id(),
         unique_suffix()
     );
-    let Some(runsc) = runsc.to_str() else {
-        let _ = std::fs::remove_dir_all(&bundle);
-        return Err("MYELIN_RUNSC_BIN must resolve to a Unicode path".into());
-    };
     let outcome = run_and_capture(
-        runsc,
+        &runsc,
         &bundle,
         &container_id,
         Duration::from_secs(5),
@@ -163,8 +224,9 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
             output: None,
         },
         None,
+        config.invocation_mode(),
     );
-    delete_container(runsc, &container_id);
+    delete_container(&runsc, &container_id, config.invocation_mode());
     let _ = std::fs::remove_dir_all(&bundle);
     let outcome =
         outcome.map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
@@ -254,6 +316,15 @@ pub struct OciConfig {
     /// COMBINED with a host bind mount makes the rootless `runsc` gofer fail to bring up the sandbox
     /// ("cannot read client sync file"), whereas an absolute root.path + a bind mount works.
     root_path: Option<PathBuf>,
+    /// CT-007 slice 2: `None` ⇒ [`RunscInvocationMode::Rootless`] (today's ONLY production
+    /// behavior, BYTE-IDENTICAL JSON to before this field existed — no `user` namespace declared,
+    /// no `uidMappings`/`gidMappings` emitted). `Some(config)` ⇒
+    /// [`RunscInvocationMode::ExplicitUserNamespace`]: this field is the ONE source of truth for
+    /// which mode a given config implies (see [`Self::invocation_mode`]) — a caller can never pass
+    /// a `RunscInvocationMode` to `run_and_capture`/`delete_container` that disagrees with what
+    /// this same `OciConfig` serializes, because both are always derived from this ONE field at
+    /// the same call site.
+    user_namespace: Option<UserNamespaceConfig>,
 }
 
 /// CT-006a (the git wire): a single host→guest bind mount injected into the hardened OCI bundle, with
@@ -292,6 +363,9 @@ impl OciConfig {
             extra_mounts: Vec::new(),
             extra_env: Vec::new(),
             root_path: None,
+            // Rootless by default — CT-007 slice 2 makes ExplicitUserNamespace mode POSSIBLE, it
+            // does not change any existing caller's default behavior.
+            user_namespace: None,
         }
     }
 
@@ -300,6 +374,25 @@ impl OciConfig {
     pub fn with_root_path(mut self, path: PathBuf) -> OciConfig {
         self.root_path = Some(path);
         self
+    }
+
+    /// CT-007 slice 2: attach an explicit user-namespace mapping — the resulting `to_json` gains a
+    /// `user` namespace entry plus the exact two-entry `uidMappings`/`gidMappings`, and
+    /// [`Self::invocation_mode`] reports [`RunscInvocationMode::ExplicitUserNamespace`]. Consuming
+    /// builder.
+    pub fn with_user_namespace(mut self, config: UserNamespaceConfig) -> OciConfig {
+        self.user_namespace = Some(config);
+        self
+    }
+
+    /// The [`RunscInvocationMode`] this config implies — the ONE place that decision is made,
+    /// derived structurally from [`Self::user_namespace`] so it can never disagree with what
+    /// [`Self::to_json`] actually serializes.
+    pub fn invocation_mode(&self) -> RunscInvocationMode {
+        match self.user_namespace {
+            Some(config) => RunscInvocationMode::ExplicitUserNamespace(config),
+            None => RunscInvocationMode::Rootless,
+        }
     }
 
     /// CT-006a: attach the git-wire bind mounts (RO repo + optional writable quarantine) to this
@@ -364,6 +457,30 @@ impl OciConfig {
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "rootfs".to_string());
+        // CT-007 slice 2: `Rootless` (the ONLY production behavior before this field existed)
+        // emits BYTE-IDENTICAL JSON — no `user` namespace, no `uidMappings`/`gidMappings`.
+        // `ExplicitUserNamespace` adds a `user` namespace entry alongside the always-present
+        // network one, plus the exact two-entry uid/gid maps (container 0 -> this process's real
+        // identity, container 65534 -> the leased subordinate host uid/gid).
+        let (namespaces_json, id_mappings_json) = match &self.user_namespace {
+            None => (net_ns.to_string(), String::new()),
+            Some(cfg) => (
+                format!("{net_ns}, {{ \"type\": \"user\" }}"),
+                format!(
+                    ",\n    \"uidMappings\": [ {{ \"containerID\": 0, \"hostID\": {ruid}, \
+                     \"size\": 1 }}, {{ \"containerID\": {untrusted_uid}, \"hostID\": {suid}, \
+                     \"size\": 1 }} ],\n    \
+                     \"gidMappings\": [ {{ \"containerID\": 0, \"hostID\": {rgid}, \"size\": 1 }}, \
+                     {{ \"containerID\": {untrusted_gid}, \"hostID\": {sgid}, \"size\": 1 }} ]",
+                    ruid = cfg.runner_uid(),
+                    rgid = cfg.runner_gid(),
+                    suid = cfg.subordinate_uid(),
+                    sgid = cfg.subordinate_gid(),
+                    untrusted_uid = UNTRUSTED_UID,
+                    untrusted_gid = UNTRUSTED_GID,
+                ),
+            ),
+        };
         format!(
             "{{\n  \"ociVersion\": \"1.0.0\",\n  \"process\": {{\n    \
              \"user\": {{ \"uid\": {uid}, \"gid\": {gid} }},\n    \
@@ -377,7 +494,7 @@ impl OciConfig {
              \"linux\": {{\n    \"resources\": {{ \"memory\": {{ \"limit\": {mem} }}, \
              \"pids\": {{ \"limit\": {pids} }} }},\n    \
              \"seccomp\": {{ \"defaultAction\": \"SCMP_ACT_ERRNO\" }},\n    \
-             \"namespaces\": [ {net_ns} ]\n  }}\n}}",
+             \"namespaces\": [ {namespaces_json} ]{id_mappings_json}\n  }}\n}}",
             uid = UNTRUSTED_UID,
             gid = UNTRUSTED_GID,
             args = args,
@@ -387,7 +504,8 @@ impl OciConfig {
             mounts_json = mounts_json,
             mem = self.mem_bytes,
             pids = self.pids_max,
-            net_ns = net_ns,
+            namespaces_json = namespaces_json,
+            id_mappings_json = id_mappings_json,
         )
     }
 
@@ -1034,8 +1152,9 @@ fn run_production_container_streaming(
 
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
     let redaction = RedactionPlan::for_job(spec);
+    let mode = cfg.invocation_mode();
     let outcome = match run_and_capture(
-        &bin,
+        bin,
         &bundle_dir,
         &container_id,
         timeout,
@@ -1050,22 +1169,27 @@ fn run_production_container_streaming(
             }),
         },
         Some(launch_permit),
+        mode,
     ) {
         Ok(o) => o,
         Err(e) => {
             // Spawning/waiting failed before a trustworthy result — clean up + surface honestly.
-            delete_container(&bin, &container_id);
+            delete_container(bin, &container_id, mode);
             let _ = std::fs::remove_dir_all(&bundle_dir);
             return Err(e);
         }
     };
     // The container has exited (or been timeout-killed) — best-effort delete (idempotent; `runsc run`
     // usually self-deletes on a clean exit, but the timeout path leaves it for us to reap).
-    delete_container(&bin, &container_id);
+    delete_container(bin, &container_id, mode);
 
     let result = build_result(spec, &outcome, &redaction);
     Ok(ContainerRun {
-        child: Box::new(SpawnedRunsc { bin, container_id }),
+        child: Box::new(SpawnedRunsc {
+            bin,
+            container_id,
+            mode,
+        }),
         bundle_dir,
         result,
         run_error: outcome.stream_error,
@@ -1109,15 +1233,478 @@ fn stage_production_bundle(cfg: &OciConfig, rootfs: &Path) -> Result<PathBuf, St
     Ok(bundle)
 }
 
-/// Best-effort idempotent container delete (`runsc --rootless delete -force <cid>`). Deleting an
-/// already-gone container is a harmless no-op — called on EVERY teardown path so no container leaks.
-fn delete_container(bin: &str, container_id: &str) {
-    let _ = Command::new(bin)
-        .arg("--rootless")
-        .arg("delete")
-        .arg("-force")
-        .arg(container_id)
-        .output();
+/// The `runsc` GLOBAL flags (BEFORE the subcommand) `mode` implies — the ONE place any of
+/// `run`/`kill`/`delete` decides this, so no call site makes an independent flag decision (CT-007
+/// slice 2). `Rootless` is byte-identical to the pre-slice-2 flag (just `--rootless`).
+/// `ExplicitUserNamespace` drops `--rootless` and adds `-ignore-cgroups` — confirmed by a live
+/// spike against the pinned `runsc` build that dropping `--rootless` surfaces a REAL cgroup-setup
+/// requirement `runsc`'s own cgroupfs manager cannot satisfy without root (even under a cgroup
+/// path nested entirely under this process's own delegated slice); `-ignore-cgroups` makes it skip
+/// that internal management entirely WITHOUT weakening [`MemoryCgroup`], which places the spawned
+/// `runsc` process into a real, already-owned cgroup externally, independent of this flag.
+/// Env var naming the directory `runsc` resolves `newuidmap`/`newgidmap` through, under
+/// [`RunscInvocationMode::ExplicitUserNamespace`] — the ONLY entry in the (otherwise cleared)
+/// `PATH` that mode's `runsc` invocation sees. Defaults to `/usr/bin` (where this host's real
+/// setuid helpers live); a production deployment SHOULD point this at a dedicated, curated
+/// directory containing ONLY the two validated helpers (Sol's review) — [`preflight_explicit_userns_helpers`]
+/// validates whatever directory is actually configured, it does not require it to be minimal.
+pub const ENV_EXPLICIT_USERNS_HELPER_DIR: &str = "MYELIN_EXPLICIT_USERNS_HELPER_DIR";
+
+/// Resolved ONCE and cached (Sol's review, round 3: re-reading the env var inside every
+/// `run`/`kill`/`delete` call meant an environment mutation mid-process could launch a container
+/// under one helper directory and later kill/delete it under a DIFFERENT one — caching makes "one
+/// resolved value for the whole process" an actual invariant). Not itself validated (this is a
+/// plain resolver, matching [`resolved_explicit_userns_runsc_root`]'s role) — a caller enabling
+/// [`RunscInvocationMode::ExplicitUserNamespace`] in production reads this value and passes it to
+/// [`preflight_explicit_userns_policy`] once at startup (mirroring how [`preflight_gvisor_runner_host`]'s
+/// own caller resolves `MYELIN_RUNSC_BIN` itself before calling in).
+pub fn resolved_explicit_userns_helper_dir() -> &'static Path {
+    static CACHED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        std::env::var(ENV_EXPLICIT_USERNS_HELPER_DIR)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/usr/bin"))
+    })
+}
+
+/// Env var naming the `runsc` state-root directory used ONLY under
+/// [`RunscInvocationMode::ExplicitUserNamespace`] — passed explicitly (`--root=<path>`) so
+/// container-state lookup never depends on `$XDG_RUNTIME_DIR` (cleared, along with the rest of
+/// the environment, for this mode — Sol's review: clearing the environment without ALSO fixing
+/// `--root` could make startup fail or state lookup diverge from whatever `runsc`'s own default
+/// resolution would have picked).
+pub const ENV_EXPLICIT_USERNS_RUNSC_ROOT: &str = "MYELIN_EXPLICIT_USERNS_RUNSC_ROOT";
+
+/// Resolved ONCE and cached (Sol's review, round 3: a relative `--root=` would resolve against
+/// `runsc`'s own current working directory at spawn time, which this process does not control — a
+/// state root that silently moved between launches would fragment container-state lookup). A
+/// relative configured value is joined onto this process's current directory AT THE MOMENT OF
+/// FIRST RESOLUTION, making the RESULT absolute in the ordinary case — but this resolver alone does
+/// NOT guarantee absoluteness (if `current_dir()` itself fails, the relative value is returned
+/// as-is; round 4's doc comment overclaimed this). What actually enforces absoluteness is
+/// [`preflight_explicit_userns_policy`], which explicitly refuses a non-absolute `runsc_root`
+/// before ever installing it into [`EXPLICIT_USERNS_POLICY`] — this resolver is a best-effort
+/// convenience the caller feeds INTO that real gate, not the gate itself.
+pub fn resolved_explicit_userns_runsc_root() -> &'static Path {
+    static CACHED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        let configured = std::env::var(ENV_EXPLICIT_USERNS_RUNSC_ROOT)
+            .ok()
+            .map(PathBuf::from);
+        let default = || {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("myelin-runsc-explicit-userns")
+        };
+        let resolved = configured.unwrap_or_else(default);
+        if resolved.is_absolute() {
+            resolved
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&resolved))
+                .unwrap_or(resolved)
+        }
+    })
+}
+
+/// Boot preflight for [`RunscInvocationMode::ExplicitUserNamespace`] (mirrors
+/// [`preflight_gvisor_runner_host`]'s role for the base runtime): verify `helper_dir` is an
+/// absolute, non-symlinked, root-owned, not-group/other-writable directory whose own ANCESTOR
+/// chain this process cannot rename/replace (Sol's review, round 3: an earlier version used
+/// `std::fs::metadata`, which FOLLOWS a symlink at `helper_dir` itself, silently validating
+/// whatever the symlink pointed at instead of refusing it — fixed by checking
+/// `symlink_metadata` first), and that it contains `newuidmap`/`newgidmap` as regular, root-owned,
+/// setuid files, never group/other-writable, and executable BY THIS PROCESS'S OWN EFFECTIVE
+/// IDENTITY specifically (checked via the kernel's own `faccessat(..., AT_EACCESS)` rather than
+/// "some execute bit is set somewhere," which could pass on a root-only-executable file this
+/// process could never actually run) — the trust chain `runsc`'s own internal resolution depends
+/// on once `PATH` is fixed to exactly this directory. Never called automatically; a caller enabling
+/// `ExplicitUserNamespace` mode in production calls this once at startup.
+pub fn preflight_explicit_userns_helpers(helper_dir: &Path) -> Result<(), String> {
+    if !helper_dir.is_absolute() {
+        return Err(format!("{helper_dir:?} must be an absolute path"));
+    }
+    // `symlink_metadata` (NOT `metadata`) so a symlinked `helper_dir` is refused outright rather
+    // than transparently validating whatever it points at.
+    let dir_meta =
+        std::fs::symlink_metadata(helper_dir).map_err(|e| format!("stat {helper_dir:?}: {e}"))?;
+    if dir_meta.file_type().is_symlink() {
+        return Err(format!("{helper_dir:?} must not be a symlink"));
+    }
+    if !dir_meta.is_dir() {
+        return Err(format!("{helper_dir:?} is not a directory"));
+    }
+    if dir_meta.uid() != 0 {
+        return Err(format!(
+            "{helper_dir:?} must be owned by root (uid 0), got uid {}",
+            dir_meta.uid()
+        ));
+    }
+    if dir_meta.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{helper_dir:?} must not be group/other-writable (mode {:o})",
+            dir_meta.mode() & 0o777
+        ));
+    }
+    crate::dirlock::verify_ancestors_not_writable_by_us(helper_dir).map_err(|reason| {
+        format!("{helper_dir:?}'s ancestor chain is not safely anchored: {reason}")
+    })?;
+    for helper in ["newuidmap", "newgidmap"] {
+        let path = helper_dir.join(helper);
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("stat {path:?}: {e}"))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!("{path:?} must not be a symlink"));
+        }
+        if !meta.is_file() {
+            return Err(format!("{path:?} must be a regular file"));
+        }
+        if meta.uid() != 0 {
+            return Err(format!(
+                "{path:?} must be owned by root (uid 0), got uid {}",
+                meta.uid()
+            ));
+        }
+        if meta.mode() & 0o4000 == 0 {
+            return Err(format!(
+                "{path:?} must be setuid (mode {:o} lacks the setuid bit)",
+                meta.mode() & 0o7777
+            ));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{path:?} must not be group/other-writable (mode {:o})",
+                meta.mode() & 0o777
+            ));
+        }
+        let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|e| format!("{path:?} contains an interior NUL: {e}"))?;
+        // SAFETY: `path_c` is a valid, NUL-terminated path; `faccessat` only queries permission
+        // bits, it never mutates anything. `AT_EACCESS` checks this process's EFFECTIVE identity
+        // (matching the identity `runsc` — spawned by this same process — will actually run as),
+        // rather than "does some execute bit exist," which could pass for a root-only-executable
+        // file this process could never actually invoke.
+        let executable_by_us = unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                path_c.as_ptr(),
+                libc::X_OK,
+                libc::AT_EACCESS,
+            )
+        } == 0;
+        if !executable_by_us {
+            return Err(format!(
+                "{path:?} is not executable by this process's effective identity"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The runsc release this slice's `ExplicitUserNamespace` OCI/CLI contract (multi-ID `uidMappings`/
+/// `gidMappings`, `-ignore-cgroups`, explicit `--root=`) was actually validated against (the live
+/// spike + every drill run in this repo's own development). Sol's review, round 4: the new
+/// contract is "explicitly justified and accepted against that release" specifically, not against
+/// "whatever identifies itself as runsc" — pin the exact version string AND the binary's own
+/// content digest, rather than accepting a same-named-but-different build.
+const PINNED_EXPLICIT_USERNS_RUNSC_VERSION: &str = "runsc version release-20260608.0";
+/// SHA-256 of the exact `runsc` binary this repo's `ExplicitUserNamespace` contract was validated
+/// against (computed once, off this development host's own pinned install).
+const PINNED_EXPLICIT_USERNS_RUNSC_SHA256_HEX: &str =
+    "4ec073363641a44cc5d171f63f1e23b76016ef632eb3269395c79ac8aecb71bc";
+
+fn sha256_hex_of_file(path: &Path) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// Verify `bin` is EXACTLY the runsc release+build this slice's `ExplicitUserNamespace` contract
+/// was validated against — both the binary's own content digest AND the reported version string.
+/// Sol's review, round 6: HASH FIRST, EXECUTE ONLY AFTER the digest matches — the previous version
+/// ran `bin --version` before ever checking the digest, meaning ANY candidate at `bin` (forged,
+/// corrupted, or attacker-planted) got arbitrary host execution before this function could ever
+/// reject it. Hashing first means a candidate that doesn't match the pinned digest is NEVER
+/// executed at all. This function alone does not close the TOCTOU between the hash-read and the
+/// `--version` exec a moment later — that gap is closed by requiring the CALLER to have already
+/// established the path's immutability (via [`harden_explicit_userns_runsc_binary`]) before this
+/// function ever runs, so nothing could swap the file's content in between.
+fn verify_pinned_explicit_userns_runsc(bin: &Path) -> Result<(), String> {
+    let digest = sha256_hex_of_file(bin).map_err(|e| format!("hash {bin:?}: {e}"))?;
+    if digest != PINNED_EXPLICIT_USERNS_RUNSC_SHA256_HEX {
+        return Err(format!(
+            "{bin:?}'s content digest {digest} does not match the pinned \
+             {PINNED_EXPLICIT_USERNS_RUNSC_SHA256_HEX} — refusing to execute a candidate that \
+             hasn't already been proven byte-identical to the trusted build"
+        ));
+    }
+    let output = Command::new(bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("{bin:?} --version: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{bin:?} --version exited {:?} (expected success)",
+            output.status.code()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version_line = stdout.lines().next().unwrap_or("");
+    if version_line != PINNED_EXPLICIT_USERNS_RUNSC_VERSION {
+        return Err(format!(
+            "{bin:?} reports {version_line:?}, but ExplicitUserNamespace mode is pinned to \
+             exactly {PINNED_EXPLICIT_USERNS_RUNSC_VERSION:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The fully resolved, atomically-validated set of values `ExplicitUserNamespace` mode's `runsc`
+/// invocation depends on (Sol's review, round 4: three independently-cached `OnceLock`s do not
+/// bind VALIDATION to USE — a caller could validate directory B while a stale, independently
+/// resolved cache still points at directory A). Installed ONCE, as a single unit, only after every
+/// field has been checked TOGETHER — there is no way to observe a partially-validated policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedExplicitUsernsPolicy {
+    helper_dir: PathBuf,
+    runsc_root: PathBuf,
+}
+
+static EXPLICIT_USERNS_POLICY: std::sync::OnceLock<ResolvedExplicitUsernsPolicy> =
+    std::sync::OnceLock::new();
+
+/// Verify `bin` (the runsc binary `ExplicitUserNamespace` mode will execute) cannot be replaced
+/// between THIS preflight and any later `run`/`kill`/`delete` — a real, non-symlinked, root-owned,
+/// non-group/other-writable regular file, whose FULL ancestor chain is neither owned nor writable
+/// by this process (Sol's review, round 5: the version+digest pin alone only proves what WAS true
+/// AT preflight time via a path-based open+hash — a runner-writable binary, or a runner-writable
+/// ANCESTOR of it, could still be replaced before or between any later invocation, which would
+/// silently execute the replacement despite the installed policy claiming a validated binary).
+/// Reuses the exact same ancestor-walk [`crate::user_namespace`]'s leases directory relies on.
+fn harden_explicit_userns_runsc_binary(bin: &Path) -> Result<(), String> {
+    if !bin.is_absolute() {
+        return Err(format!("{bin:?} must be an absolute path"));
+    }
+    let meta = std::fs::symlink_metadata(bin).map_err(|e| format!("stat {bin:?}: {e}"))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("{bin:?} must not be a symlink"));
+    }
+    if !meta.is_file() {
+        return Err(format!("{bin:?} must be a regular file"));
+    }
+    if meta.uid() != 0 {
+        return Err(format!(
+            "{bin:?} must be owned by root (uid 0), got uid {}",
+            meta.uid()
+        ));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{bin:?} must not be group/other-writable (mode {:o})",
+            meta.mode() & 0o777
+        ));
+    }
+    crate::dirlock::verify_ancestors_not_writable_by_us(bin)
+        .map_err(|reason| format!("{bin:?}'s ancestor chain is not safely anchored: {reason}"))
+}
+
+/// This module's own hardening policy for the `runsc` explicit-userns state root. Sol's review,
+/// round 6: the earlier version auto-created the leaf with `create_dir_all` before checking
+/// anything — which is INTERNALLY CONTRADICTORY with the ancestor-writability requirement below,
+/// since creating a missing leaf REQUIRES write access to its parent, meaning "auto-create
+/// succeeded" and "the parent chain is safely non-writable by us" can never BOTH be true at once.
+/// It also meant a FAILED preflight could still leave a freshly-created directory behind as a side
+/// effect. Fixed by performing NO MUTATION at all: verifies the ancestor chain FIRST (so an unsafe
+/// deployment is rejected before even looking at the leaf), then requires the leaf to ALREADY
+/// EXIST as a real (non-symlink) directory, owned by this process's own euid, with a private mode
+/// (`0700` or stricter) — pre-provisioning the leaf is now the CALLER's responsibility (a real
+/// deployment's install step, or a test fixture), exactly mirroring the split
+/// [`crate::user_namespace`]'s own leases-directory hardening now uses between its strict
+/// production path and non-strict test setup.
+fn harden_explicit_userns_runsc_root(dir: &Path) -> Result<(), String> {
+    if !dir.is_absolute() {
+        return Err(format!("{dir:?} must be an absolute path"));
+    }
+    crate::dirlock::verify_ancestors_not_writable_by_us(dir)
+        .map_err(|reason| format!("{dir:?}'s ancestor chain is not safely anchored: {reason}"))?;
+    verify_explicit_userns_runsc_root_leaf(dir)
+}
+
+/// The LEAF-only checks [`harden_explicit_userns_runsc_root`] applies, pulled out into its own
+/// function so a test can exercise them directly against a fixture whose ANCESTORS are not
+/// necessarily hardened (the full function's own ancestor check would otherwise refuse first
+/// against any fixture a non-privileged test creates under a writable temp directory, proving
+/// nothing about the leaf-specific checks this function targets).
+fn verify_explicit_userns_runsc_root_leaf(dir: &Path) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| {
+        format!(
+            "stat {dir:?}: {e} — the explicit-userns runsc state root must be pre-provisioned; \
+             this preflight does not create it"
+        )
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("{dir:?} must not be a symlink"));
+    }
+    if !meta.is_dir() {
+        return Err(format!("{dir:?} must be a directory"));
+    }
+    let our_uid = unsafe { libc::geteuid() };
+    if meta.uid() != our_uid {
+        return Err(format!(
+            "{dir:?} is owned by uid {} (expected this process's own euid {our_uid})",
+            meta.uid()
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{dir:?} mode {:o} is group/other-accessible — expected 0700 or stricter",
+            meta.mode() & 0o777
+        ));
+    }
+    // Sol's review, round 7: rejecting group/other bits alone still admits `0500`/`0000` — modes
+    // this process itself could never actually write into (state-marker creation) or search
+    // through. The owner must retain full `rwx`.
+    if meta.mode() & 0o700 != 0o700 {
+        return Err(format!(
+            "{dir:?} mode {:o} does not grant this process's own owner bits full rwx — required \
+             to create/search state under it",
+            meta.mode() & 0o777
+        ));
+    }
+    Ok(())
+}
+
+/// Validate `helper_dir` (via [`preflight_explicit_userns_helpers`]), harden+validate `runsc_root`
+/// (via [`harden_explicit_userns_runsc_root`]), and validate the currently-resolved `runsc` binary
+/// ([`runsc_bin`]) both against the exact pinned release+digest this contract was accepted against
+/// ([`verify_pinned_explicit_userns_runsc`]) AND against replacement
+/// ([`harden_explicit_userns_runsc_binary`]) — then atomically install all of it as the ONE
+/// [`ResolvedExplicitUsernsPolicy`] [`apply_runsc_invocation_policy`]'s `ExplicitUserNamespace`
+/// branch will use for the rest of this process's lifetime. Never called automatically; a caller
+/// enabling `ExplicitUserNamespace` mode in production calls this once at startup —
+/// `apply_runsc_invocation_policy` REFUSES that mode outright (rather than falling back to ad hoc
+/// unvalidated resolution) if this was never called or never succeeded.
+pub fn preflight_explicit_userns_policy(
+    helper_dir: &Path,
+    runsc_root: &Path,
+) -> Result<(), String> {
+    let bin = runsc_bin();
+    // Order matters (Sol's review, round 6): harden the PATHNAME first (no execution at all in
+    // this step) so the file cannot be swapped out from under us — only THEN does
+    // `verify_pinned_explicit_userns_runsc` hash and (only on a matching digest) execute it.
+    harden_explicit_userns_runsc_binary(bin)?;
+    verify_pinned_explicit_userns_runsc(bin)?;
+    preflight_explicit_userns_helpers(helper_dir)?;
+    harden_explicit_userns_runsc_root(runsc_root)?;
+    let policy = ResolvedExplicitUsernsPolicy {
+        helper_dir: helper_dir.to_path_buf(),
+        runsc_root: runsc_root.to_path_buf(),
+    };
+    if EXPLICIT_USERNS_POLICY.set(policy.clone()).is_err() {
+        let already = EXPLICIT_USERNS_POLICY
+            .get()
+            .expect("set() just failed, so the cell must already be initialized");
+        if already != &policy {
+            return Err(format!(
+                "explicit-userns policy already installed as {already:?}, which disagrees with \
+                 this preflight's {policy:?} — refusing rather than leaving some callers on a \
+                 stale policy"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Apply the COMPLETE `runsc` invocation policy for `mode` to `cmd` — the ONE place `run`/`kill`/
+/// `delete` decide BOTH the global flags AND the environment, so no call site makes an
+/// independent decision (Sol's review). `Rootless` is BYTE-IDENTICAL to the pre-slice-2 behavior
+/// (only `--rootless`; the inherited environment is untouched). `ExplicitUserNamespace` REFUSES
+/// outright unless [`preflight_explicit_userns_policy`] has already succeeded (Sol's review, round
+/// 4: binding validation to use, not merely resolving a value that happens to usually agree with
+/// what was validated) — otherwise drops `--rootless`, adds `-ignore-cgroups` and an absolute
+/// `--root=<state-root>` (never depending on `$XDG_RUNTIME_DIR`), clears the ENTIRE inherited
+/// environment, and sets `PATH` to name ONLY the trusted helper directory `runsc` resolves
+/// `newuidmap`/`newgidmap` through internally (per the live spike + gVisor's own docs: OCI-native
+/// multi-ID mappings make `runsc` itself invoke these helpers — this process never does — so the
+/// only lever we have is WHERE `runsc`'s own lookup can find them).
+fn apply_runsc_invocation_policy(
+    cmd: &mut Command,
+    mode: RunscInvocationMode,
+) -> Result<(), String> {
+    apply_runsc_invocation_policy_given(cmd, mode, EXPLICIT_USERNS_POLICY.get())
+}
+
+/// The actual decision logic behind [`apply_runsc_invocation_policy`], taking the installed policy
+/// as an EXPLICIT `Option` parameter rather than reading the process-global `OnceLock` itself. Pulled
+/// out so a test can deterministically prove the "no policy installed yet" refusal by passing `None`
+/// directly — reading the real global would be ordering-dependent (once ANY test in the same test
+/// binary's process installs a policy, it stays installed for every other test sharing that
+/// process; Sol's review, round 5, flagged the previous test's silent skip-on-wrong-ordering as
+/// non-deterministic).
+fn apply_runsc_invocation_policy_given(
+    cmd: &mut Command,
+    mode: RunscInvocationMode,
+    policy: Option<&ResolvedExplicitUsernsPolicy>,
+) -> Result<(), String> {
+    match mode {
+        RunscInvocationMode::Rootless => {
+            cmd.arg("--rootless");
+            Ok(())
+        }
+        RunscInvocationMode::ExplicitUserNamespace(_) => {
+            let policy = policy.ok_or_else(|| {
+                "ExplicitUserNamespace mode requires preflight_explicit_userns_policy to have \
+                 succeeded first — refusing rather than falling back to unvalidated resolution"
+                    .to_string()
+            })?;
+            apply_explicit_userns_env(cmd, policy);
+            Ok(())
+        }
+    }
+}
+
+/// The pure `Command` mutation `ExplicitUserNamespace` mode applies, GIVEN an already-validated
+/// [`ResolvedExplicitUsernsPolicy`]. Factored out of [`apply_runsc_invocation_policy`] so a test can
+/// exercise this mechanism directly against a hand-built policy value, without depending on the
+/// process-global [`EXPLICIT_USERNS_POLICY`] `OnceLock` (which, once set by any test in the same
+/// test binary, stays set for every other test sharing that process) or on a real pinned `runsc`
+/// binary being present to satisfy [`preflight_explicit_userns_policy`]'s digest check.
+fn apply_explicit_userns_env(cmd: &mut Command, policy: &ResolvedExplicitUsernsPolicy) {
+    cmd.arg("-ignore-cgroups");
+    cmd.arg(format!("--root={}", policy.runsc_root.display()));
+    cmd.env_clear();
+    cmd.env("PATH", &policy.helper_dir);
+}
+
+/// Best-effort idempotent container delete (`runsc <mode's global args> delete -force <cid>`).
+/// Deleting an already-gone container is a harmless no-op — called on EVERY teardown path so no
+/// container leaks. `mode` MUST be the same one the container was launched with (CT-007 slice 2:
+/// [`SpawnedRunsc`] carries it alongside `bin`/`container_id` for exactly this reason). If the
+/// invocation policy can't be applied (only possible if `ExplicitUserNamespace`'s policy was
+/// somehow never validated, which the ORIGINAL launch that created this container already
+/// required — practically unreachable), this is a silent no-op: there is nothing safe to delete
+/// with, and this path is best-effort cleanup already, never the sole source of truth for container
+/// lifecycle.
+fn delete_container(bin: &Path, container_id: &str, mode: RunscInvocationMode) {
+    let mut cmd = Command::new(bin);
+    if apply_runsc_invocation_policy(&mut cmd, mode).is_err() {
+        return;
+    }
+    let _ = cmd.arg("delete").arg("-force").arg(container_id).output();
 }
 
 /// Read the `runsc` process's cumulative CPU time (utime+stime) from `/proc/<pid>/stat`, in whole
@@ -1244,14 +1831,16 @@ impl std::error::Error for RunFailure {}
 /// WHOLE CONTAINER is killed (`runsc kill <cid> KILL` then the child) and `timed_out` is set. The exit
 /// code is the `runsc` child's REAL `ExitStatus.code()` — the container process's actual exit, never
 /// parsed from container output (the structural reason gVisor needs no forge defense).
+#[allow(clippy::too_many_arguments)]
 fn run_and_capture(
-    bin: &str,
+    bin: &Path,
     bundle: &Path,
     container_id: &str,
     timeout: Duration,
     mem_bytes: u64,
     options: RunCaptureOptions<'_>,
     launch_permit: Option<LaunchPermit>,
+    mode: RunscInvocationMode,
 ) -> Result<RunscOutcome, RunFailure> {
     let RunCaptureOptions {
         stdin,
@@ -1273,8 +1862,8 @@ fn run_and_capture(
     let fenced = sandbox_command.is_fenced();
     {
         let cmd = sandbox_command.command_mut();
-        cmd.arg("--rootless")
-            .arg("--network=none")
+        apply_runsc_invocation_policy(cmd, mode).map_err(RunFailure::uncommitted)?;
+        cmd.arg("--network=none")
             .arg("run")
             .arg("-bundle")
             .arg(bundle)
@@ -1436,12 +2025,15 @@ fn run_and_capture(
         if cancelled || executed_at.elapsed() >= timeout {
             // Wall-clock ceiling hit: whole-CONTAINER kill (SIGKILL the container's PID1 via the
             // runtime), then reap the `runsc` child process so the pipes hit EOF.
-            let _ = Command::new(bin)
-                .arg("--rootless")
-                .arg("kill")
-                .arg(container_id)
-                .arg("KILL")
-                .output();
+            // The SAME `mode` already passed `apply_runsc_invocation_policy` once, at this exact
+            // container's spawn earlier in this function call — the policy this reads from is a
+            // process-lifetime `OnceLock` that cannot have changed since, so failure here is not
+            // reachable in practice. Best-effort regardless: if it somehow did fail, skip the
+            // `runsc kill` (nothing safe to send it with) but still reap the host-side child below.
+            let mut kill_cmd = Command::new(bin);
+            if apply_runsc_invocation_policy(&mut kill_cmd, mode).is_ok() {
+                let _ = kill_cmd.arg("kill").arg(container_id).arg("KILL").output();
+            }
             child.kill_and_wait();
             timed_out = !cancelled;
             break None;
@@ -1726,12 +2318,16 @@ fn build_result(spec: &JobSpec, o: &RunscOutcome, redaction: &RedactionPlan) -> 
 /// -force` (no-op if already gone). [`wait`](RunscChild::wait) is a no-op for trait parity with the
 /// Firecracker `VmmChild` — the REAL exit was already captured from the `runsc` child's exit status.
 struct SpawnedRunsc {
-    bin: String,
+    bin: &'static Path,
     container_id: String,
+    /// The SAME mode this container was launched with (CT-007 slice 2) — `kill`'s `delete`
+    /// invocation MUST use identical global flags to the original `run`, or `runsc` may fail to
+    /// locate/manage a container whose namespace/cgroup posture it was never told to expect.
+    mode: RunscInvocationMode,
 }
 impl RunscChild for SpawnedRunsc {
     fn kill(&mut self) -> Result<(), String> {
-        delete_container(&self.bin, &self.container_id);
+        delete_container(self.bin, &self.container_id, self.mode);
         Ok(())
     }
     fn wait(&mut self) -> Result<i32, String> {
@@ -2711,8 +3307,9 @@ fn run_git_wire_container(
     // through whole while host RAM stays bounded to one chunk. Over the cap ⇒ `outcome.stdout_truncated`,
     // which the caller turns into a LOUD [`WireError::OutputTooLarge`] (never a silently-short pack).
     let wire_cap = job.limits.disk_bytes as usize;
+    let mode = cfg.invocation_mode();
     let outcome = match run_and_capture(
-        &bin,
+        bin,
         &bundle_dir,
         &container_id,
         timeout,
@@ -2724,15 +3321,16 @@ fn run_git_wire_container(
             output: None,
         },
         Some(launch_permit),
+        mode,
     ) {
         Ok(o) => o,
         Err(e) => {
-            delete_container(&bin, &container_id);
+            delete_container(bin, &container_id, mode);
             let _ = std::fs::remove_dir_all(&bundle_dir);
             return Err(e);
         }
     };
-    delete_container(&bin, &container_id);
+    delete_container(bin, &container_id, mode);
 
     let stdout_truncated = outcome.stdout_truncated;
     // The git-wire path's stdout is the git smart-transport packfile/protocol stream (StreamToFile),
@@ -2744,7 +3342,11 @@ fn run_git_wire_container(
     let result = build_result(job, &outcome, &RedactionPlan::none());
     Ok((
         ContainerRun {
-            child: Box::new(SpawnedRunsc { bin, container_id }),
+            child: Box::new(SpawnedRunsc {
+                bin,
+                container_id,
+                mode,
+            }),
             bundle_dir,
             result,
             run_error: outcome.stream_error,
@@ -3069,6 +3671,500 @@ mod tests {
             json.contains(&format!("size={}", 1u64 << 30)) && json.contains("mode=1777"),
             "the /tmp tmpfs must be sized from spec.limits.tmpfs_bytes and writable by the non-root payload"
         );
+        assert!(
+            !json.contains("\"type\": \"user\"") && !json.contains("uidMappings"),
+            "Rootless mode (the default) must never declare a user namespace or uid/gid mappings \
+             — runsc --rootless installs its own, and a doubly-declared userns fails the gofer"
+        );
+        assert_eq!(
+            cfg.invocation_mode(),
+            RunscInvocationMode::Rootless,
+            "a config with no explicit user namespace attached must report Rootless"
+        );
+    }
+
+    /// CT-007 slice 2: `with_user_namespace` must produce the EXACT two-entry OCI mapping the
+    /// design specifies, alongside a declared `user` namespace — and `invocation_mode()` must
+    /// report `ExplicitUserNamespace` carrying the SAME config back out.
+    #[test]
+    fn oci_config_with_user_namespace_emits_the_exact_two_entry_mapping() {
+        let config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
+        let cfg = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_user_namespace(config);
+        assert_eq!(
+            cfg.invocation_mode(),
+            RunscInvocationMode::ExplicitUserNamespace(config)
+        );
+        let json = cfg.to_json();
+        assert!(
+            json.contains("\"type\": \"user\""),
+            "a user namespace must be declared: {json}"
+        );
+        assert!(
+            json.contains("\"containerID\": 0, \"hostID\": 1000, \"size\": 1"),
+            "container uid/gid 0 must map to the runner's own real identity: {json}"
+        );
+        assert!(
+            json.contains("\"containerID\": 65534, \"hostID\": 100005, \"size\": 1"),
+            "container uid 65534 must map to the leased subordinate host uid: {json}"
+        );
+        assert!(
+            json.contains("\"containerID\": 65534, \"hostID\": 200005, \"size\": 1"),
+            "container gid 65534 must map to the leased subordinate host gid: {json}"
+        );
+        // Every OTHER hardening assertion from the Rootless test must still hold — attaching a
+        // user namespace changes ONLY the namespaces/mappings, nothing else.
+        assert!(json.contains("\"readonly\": true"));
+        assert!(json.contains("\"noNewPrivileges\": true"));
+        assert!(json.contains("\"uid\": 65534") && json.contains("\"gid\": 65534"));
+    }
+
+    /// `apply_runsc_invocation_policy` is the ONE place `run`/`kill`/`delete` decide their global
+    /// flags AND environment — this test is the single source of truth for `Rootless`'s exact
+    /// flag-and-environment contract (Sol's review: "no independent flag decisions left" at any of
+    /// the three call sites). `ExplicitUserNamespace`'s own contract is covered by
+    /// `apply_explicit_userns_env_matches_the_policy_exactly` below, which exercises the pure
+    /// `Command`-mutation mechanism directly against a hand-built policy — NOT through
+    /// `apply_runsc_invocation_policy` itself, since that requires the process-global
+    /// `EXPLICIT_USERNS_POLICY` to already be validated-and-installed (see that function's own
+    /// refusal-without-preflight behavior, covered by
+    /// `apply_runsc_invocation_policy_refuses_explicit_userns_without_a_validated_policy`).
+    #[test]
+    fn apply_runsc_invocation_policy_matches_the_mode_exactly() {
+        let mut rootless_cmd = Command::new("runsc");
+        apply_runsc_invocation_policy(&mut rootless_cmd, RunscInvocationMode::Rootless).unwrap();
+        assert_eq!(
+            rootless_cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["--rootless"],
+            "Rootless must be byte-identical to the pre-slice-2 flag"
+        );
+        assert_eq!(
+            rootless_cmd.get_envs().count(),
+            0,
+            "Rootless must not alter the child's environment at all"
+        );
+    }
+
+    /// Exercises the pure `Command`-mutation mechanism `ExplicitUserNamespace` mode applies, given
+    /// an already-validated policy — independent of the process-global `EXPLICIT_USERNS_POLICY`
+    /// `OnceLock` (which, once installed by any test sharing this test binary's process, cannot be
+    /// reset) and independent of `preflight_explicit_userns_policy`'s pinned-runsc-digest check
+    /// (which needs a real matching binary this test environment may not have).
+    #[test]
+    fn apply_explicit_userns_env_matches_the_policy_exactly() {
+        let policy = ResolvedExplicitUsernsPolicy {
+            helper_dir: PathBuf::from("/usr/bin"),
+            runsc_root: PathBuf::from("/var/lib/myelin-runsc-explicit-userns"),
+        };
+        let mut cmd = Command::new("runsc");
+        apply_explicit_userns_env(&mut cmd, &policy);
+        let args = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.contains(&"-ignore-cgroups".to_string()),
+            "ExplicitUserNamespace must add -ignore-cgroups: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--rootless".to_string()),
+            "ExplicitUserNamespace must drop --rootless: {args:?}"
+        );
+        assert!(
+            args.contains(&"--root=/var/lib/myelin-runsc-explicit-userns".to_string()),
+            "ExplicitUserNamespace must pass the exact policy's absolute --root=: {args:?}"
+        );
+        let envs: Vec<_> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs,
+            vec![("PATH".to_string(), Some("/usr/bin".to_string()))],
+            "ExplicitUserNamespace must clear the environment and set PATH to ONLY the exact \
+             policy's helper directory: {envs:?}"
+        );
+    }
+
+    /// Sol's review, round 4/5: `ExplicitUserNamespace` mode must REFUSE outright — not fall back
+    /// to ad hoc unvalidated resolution — when no policy has been validated. Calls
+    /// `apply_runsc_invocation_policy_given` directly with an EXPLICIT `None`, rather than driving
+    /// the real process-global `EXPLICIT_USERNS_POLICY` cell (which, once set by ANY test sharing
+    /// this test binary's process — e.g. the live drill — cannot be un-set for a later test to
+    /// observe the pre-installation state). This makes the assertion deterministic regardless of
+    /// test execution order (round 4's version relied on ordering and silently skipped otherwise;
+    /// Sol's review, round 5).
+    #[test]
+    fn apply_runsc_invocation_policy_refuses_explicit_userns_without_a_validated_policy() {
+        let mut cmd = Command::new("runsc");
+        let result = apply_runsc_invocation_policy_given(
+            &mut cmd,
+            RunscInvocationMode::ExplicitUserNamespace(UserNamespaceConfig::for_tests(
+                1000, 1000, 100_000, 200_000,
+            )),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "ExplicitUserNamespace must refuse without a validated policy, not silently proceed"
+        );
+    }
+
+    /// [`preflight_explicit_userns_helpers`] must accept this development host's real
+    /// `/usr/bin` (containing genuine setuid `newuidmap`/`newgidmap`) and must reject a
+    /// substitute helper directory containing a non-setuid stand-in.
+    #[test]
+    fn preflight_explicit_userns_helpers_accepts_real_and_rejects_a_non_setuid_substitute() {
+        let real = Path::new("/usr/bin");
+        if !real.join("newuidmap").exists() || !real.join("newgidmap").exists() {
+            eprintln!("skipping: this host has no /usr/bin/newuidmap or newgidmap");
+            return;
+        }
+        preflight_explicit_userns_helpers(real)
+            .expect("this host's real /usr/bin must pass preflight");
+
+        use std::os::unix::fs::PermissionsExt;
+        let tmp =
+            std::env::temp_dir().join(format!("myelin-preflight-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        for helper in ["newuidmap", "newgidmap"] {
+            std::fs::write(tmp.join(helper), b"#!/bin/sh\nexit 1\n").unwrap();
+            let mut perms = std::fs::metadata(tmp.join(helper)).unwrap().permissions();
+            perms.set_mode(0o755); // executable, but NOT setuid and NOT root-owned
+            std::fs::set_permissions(tmp.join(helper), perms).unwrap();
+        }
+        let result = preflight_explicit_userns_helpers(&tmp);
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(
+            result.is_err(),
+            "a non-root-owned, non-setuid substitute must be refused"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_of_file_matches_a_known_vector() {
+        let tmp = std::env::temp_dir().join(format!("myelin-sha256-test-{}", unique_suffix()));
+        std::fs::write(&tmp, b"abc").unwrap();
+        let digest = sha256_hex_of_file(&tmp).unwrap();
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(
+            digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "must match the well-known SHA-256(\"abc\") test vector"
+        );
+    }
+
+    /// Sol's review, round 4: pinning must check the binary's own content digest, not only the
+    /// version string it happens to print — a forged/rebuilt substitute that echoes the exact
+    /// pinned version line must still be refused if its content digest disagrees.
+    #[test]
+    fn verify_pinned_explicit_userns_runsc_rejects_a_forged_version_string_with_wrong_content() {
+        let tmp = std::env::temp_dir().join(format!("myelin-forged-runsc-{}", unique_suffix()));
+        std::fs::write(
+            &tmp,
+            format!("#!/bin/sh\necho '{PINNED_EXPLICIT_USERNS_RUNSC_VERSION}'\n"),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perms).unwrap();
+        let result = verify_pinned_explicit_userns_runsc(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        assert!(
+            result.is_err(),
+            "a forged version string with the wrong content digest must be refused: {result:?}"
+        );
+    }
+
+    /// Sol's review, round 5: the digest pin alone doesn't stop the binary being replaced between
+    /// preflight and a later launch — `harden_explicit_userns_runsc_binary` must refuse a binary
+    /// this process itself owns (which it could `chmod`/replace at will), not only a wrong digest.
+    #[test]
+    fn harden_explicit_userns_runsc_binary_refuses_a_non_root_owned_file() {
+        let tmp = std::env::temp_dir().join(format!("myelin-fake-runsc-{}", unique_suffix()));
+        std::fs::write(&tmp, b"#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perms).unwrap();
+        let result = harden_explicit_userns_runsc_binary(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        assert!(
+            result.is_err(),
+            "a binary owned by this process's own euid must be refused: {result:?}"
+        );
+    }
+
+    #[test]
+    fn harden_explicit_userns_runsc_binary_refuses_a_symlink() {
+        let base =
+            std::env::temp_dir().join(format!("myelin-fake-runsc-symlink-{}", unique_suffix()));
+        std::fs::create_dir_all(&base).unwrap();
+        let real = base.join("real-runsc");
+        std::fs::write(&real, b"#!/bin/sh\nexit 0\n").unwrap();
+        let link = base.join("runsc");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let result = harden_explicit_userns_runsc_binary(&link);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            result.is_err(),
+            "a symlinked binary path must be refused rather than followed: {result:?}"
+        );
+    }
+
+    /// Mirrors `strict_construction_refuses_a_leases_dir_whose_parent_is_writable_by_us` in
+    /// `user_namespace.rs` — the exact same ancestor-writability requirement, applied here to the
+    /// explicit-userns runsc state root (Sol's review, round 5: an absolute path string alone does
+    /// not freeze what it names).
+    #[test]
+    fn harden_explicit_userns_runsc_root_refuses_a_leaf_under_a_writable_parent() {
+        let base = std::env::temp_dir().join(format!(
+            "myelin-runsc-root-writable-parent-{}",
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let leaf = base.join("runsc-root");
+        let result = harden_explicit_userns_runsc_root(&leaf);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            result.is_err(),
+            "a leaf whose parent is writable by this process must be refused: {result:?}"
+        );
+    }
+
+    /// Sol's review, round 6: no auto-creation — a missing leaf must be refused outright (proven
+    /// via `verify_explicit_userns_runsc_root_leaf` directly, isolated from the ancestor check).
+    #[test]
+    fn verify_explicit_userns_runsc_root_leaf_refuses_a_missing_leaf() {
+        let missing =
+            std::env::temp_dir().join(format!("myelin-missing-runsc-root-{}", unique_suffix()));
+        let result = verify_explicit_userns_runsc_root_leaf(&missing);
+        assert!(
+            result.is_err(),
+            "a non-pre-provisioned leaf must be refused, never auto-created: {result:?}"
+        );
+    }
+
+    /// Isolates JUST `verify_explicit_userns_runsc_root_leaf` (not the full
+    /// `harden_explicit_userns_runsc_root`, whose ancestor check would refuse first against any
+    /// fixture under a writable temp directory) against a real symlinked leaf.
+    #[test]
+    fn verify_explicit_userns_runsc_root_leaf_refuses_a_symlinked_leaf() {
+        let base =
+            std::env::temp_dir().join(format!("myelin-runsc-root-symlink-{}", unique_suffix()));
+        std::fs::create_dir_all(&base).unwrap();
+        let real_dir = base.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link = base.join("runsc-root");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+        let result = verify_explicit_userns_runsc_root_leaf(&link);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            result.is_err(),
+            "a symlinked state-root leaf must be refused rather than followed: {result:?}"
+        );
+    }
+
+    /// Sol's review, round 7: rejecting group/other bits alone still admits a mode like `0500`
+    /// (owner cannot write) or `0000` (owner cannot even search it) — both unusable for actually
+    /// creating/reading runsc state, despite passing the group/other-only check.
+    #[test]
+    fn verify_explicit_userns_runsc_root_leaf_refuses_an_owner_non_writable_directory() {
+        let dir = std::env::temp_dir().join(format!("myelin-runsc-root-0500-{}", unique_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o500); // r-x------: owner cannot write, though group/other bits are clear.
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let result = verify_explicit_userns_runsc_root_leaf(&dir);
+        let mut restore = std::fs::metadata(&dir).unwrap().permissions();
+        restore.set_mode(0o700);
+        std::fs::set_permissions(&dir, restore).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            result.is_err(),
+            "an owner-non-writable directory must be refused even with no group/other bits: \
+             {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_explicit_userns_runsc_root_leaf_accepts_a_properly_pre_provisioned_leaf() {
+        let dir = std::env::temp_dir().join(format!("myelin-runsc-root-ok-{}", unique_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let result = verify_explicit_userns_runsc_root_leaf(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            result.is_ok(),
+            "a real, owned, mode-0700 pre-provisioned directory must be accepted: {result:?}"
+        );
+    }
+
+    /// CT-007 slice 2's live pinned drill: an `OciConfig` with `ExplicitUserNamespace` actually
+    /// boots through the REAL production `stage_production_bundle`/`run_and_capture` machinery
+    /// (not a throwaway spike bundle) — proving the exact command-line/OCI-JSON contract this
+    /// slice produces is genuinely runnable by the pinned `runsc` build, not merely well-formed
+    /// JSON. A real [`crate::user_namespace::UserNamespaceAllocator`] leases the subordinate
+    /// uid/gid pair from this host's REAL `/etc/subuid`/`/etc/subgid`. SKIPS gracefully without
+    /// `runsc` on PATH, the staged escape-drill rootfs, or a usable subordinate-range entry for
+    /// this process's own uid (present on this development host — CI hosts may lack one).
+    #[test]
+    #[cfg(feature = "integration")]
+    fn explicit_user_namespace_boots_through_the_real_production_run_path() {
+        // Sol's review, round 8: this drill previously resolved its OWN `bin` via a separate PATH
+        // search, while `preflight_explicit_userns_policy` validates the process-global cached
+        // `runsc_bin()` — the two could structurally diverge (e.g. if `RESOLVED_RUNSC_BIN` was
+        // already initialized to something else earlier in this process), letting the drill
+        // validate binary A and then execute binary B. Fixed by removing the drill's own
+        // resolution entirely and using `runsc_bin()` — the SAME binary preflight just validated —
+        // for the actual launch/delete calls below. `preflight_explicit_userns_policy` already
+        // fails (and this drill already skips gracefully) if `runsc_bin()` doesn't resolve to a
+        // usable, pinned binary at all, so no separate "runsc not on PATH" precondition check is
+        // needed here anymore.
+        //
+        // This drill's whole point is proving the exact CLI/OCI contract this slice produces is
+        // genuinely runnable — that claim is only proven against the SAME runsc release+build it
+        // was validated against (Sol's review, round 4), a different (even same-version-string)
+        // build is a drill PRECONDITION miss, not a bug this drill exists to catch, and the pin
+        // check must never run against an unhardened pathname (Sol's review, round 7: a standalone
+        // call to `verify_pinned_explicit_userns_runsc` here, BEFORE hardening, violated that
+        // function's own documented caller precondition — a matching binary could still be
+        // replaced between the hash and the `--version` exec if the pathname itself were never
+        // proven immutable first).
+        //
+        // `apply_runsc_invocation_policy`'s `ExplicitUserNamespace` branch now REFUSES outright
+        // without a validated policy (Sol's review, round 4) — this drill exercises the REAL
+        // production activation path, so it must actually install one, exactly as a real
+        // production caller would, rather than reaching into `EXPLICIT_USERNS_POLICY` directly.
+        if let Err(e) = preflight_explicit_userns_policy(
+            resolved_explicit_userns_helper_dir(),
+            resolved_explicit_userns_runsc_root(),
+        ) {
+            eprintln!("[explicit-userns drill] SKIP: preflight_explicit_userns_policy failed: {e}");
+            return;
+        }
+        let bin = runsc_bin();
+        let rootfs = crate::resolved_gvisor_rootfs();
+        if !rootfs.exists() {
+            eprintln!("[explicit-userns drill] SKIP: staged rootfs absent at {rootfs:?}");
+            return;
+        }
+        let leases_dir = std::env::temp_dir().join(format!(
+            "myelin-userns-drill-leases-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        // `try_new_for_tests` (not the strict production `try_new`): this drill's `leases_dir`
+        // sits under `std::env::temp_dir()`, whose PARENT (`/tmp`) is world-writable on virtually
+        // every host — the strict production constructor's parent-not-writable-by-us check (Sol's
+        // review, closing the replaceable-lock-anchor gap) would always refuse it here, which
+        // would test nothing about this drill's actual purpose (proving the REAL bundle/launch
+        // path boots an explicit-userns container). That deployment-layout requirement belongs to
+        // slice 4's production-activation drills, which verify the REAL runner deployment's
+        // directory permissions — not this slice's own test suite. The REAL host `/etc/subuid`/
+        // `/etc/subgid` are still used (this host's copies are already root-owned, mode 644).
+        let allocator = match crate::user_namespace::UserNamespaceAllocator::try_new_for_tests(
+            leases_dir.clone(),
+            Path::new("/etc/subuid"),
+            Path::new("/etc/subgid"),
+            1,
+            Arc::new(|msg: &str| eprintln!("[explicit-userns drill incident] {msg}")),
+        ) {
+            Ok(a) => a,
+            Err(
+                e @ crate::user_namespace::UserNamespaceAllocatorError::NoSubordinateEntry {
+                    ..
+                },
+            ) => {
+                eprintln!(
+                    "[explicit-userns drill] SKIP: no usable /etc/subuid|subgid range for this \
+                     process's uid: {e}"
+                );
+                let _ = std::fs::remove_dir_all(&leases_dir);
+                return;
+            }
+            Err(e) => panic!(
+                "allocator construction failed with an unexpected (non-\"no usable range\") \
+                 error — this indicates a real bug (malformed/unsafe config, lock contention, \
+                 corrupt state, unsafe directory), not an absent host configuration: {e}"
+            ),
+        };
+        let lease = allocator
+            .lease()
+            .expect("a fresh allocator's first lease must succeed");
+
+        let mut command_spec = spec(vec![]);
+        command_spec.command = vec!["/bin/sh".into(), "-c".into(), "id".into()];
+        let profile = HardeningProfile::derive(&command_spec);
+        let cfg = OciConfig::from_spec(&command_spec, &profile).with_user_namespace(lease.config());
+        assert_eq!(
+            cfg.invocation_mode(),
+            RunscInvocationMode::ExplicitUserNamespace(lease.config())
+        );
+
+        let bundle = stage_production_bundle(&cfg, &rootfs).expect("stage the production bundle");
+        let container_id = format!(
+            "myelin-userns-drill-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let mode = cfg.invocation_mode();
+        let outcome = run_and_capture(
+            bin,
+            &bundle,
+            &container_id,
+            Duration::from_secs(10),
+            command_spec.limits.mem_bytes,
+            RunCaptureOptions {
+                stdin: None,
+                stdout_mode: StdoutMode::CappedHead,
+                cancellation: &NEVER_CANCELLED,
+                output: None,
+            },
+            None,
+            mode,
+        );
+        delete_container(bin, &container_id, mode);
+        let _ = std::fs::remove_dir_all(&bundle);
+
+        let outcome = outcome.unwrap_or_else(|e| {
+            panic!("run_and_capture must succeed through the real production path: {e:?}")
+        });
+        assert!(
+            !outcome.timed_out,
+            "the guest `id` command must not time out"
+        );
+        assert_eq!(
+            outcome.exit,
+            Some(0),
+            "the guest `id` command must exit 0, stderr: {}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&outcome.stdout);
+        assert!(
+            stdout.contains("uid=65534") && stdout.contains("gid=65534"),
+            "the guest must report uid/gid 65534 (mapped via the OCI uidMappings/gidMappings \
+             this slice emits), got: {stdout:?}"
+        );
+
+        let nonce = lease.nonce_for_tests();
+        lease
+            .release(crate::user_namespace::UserNamespaceQuiescenceProof::assert_for_tests(nonce))
+            .expect("release with the lease's own nonce must succeed");
+        let _ = std::fs::remove_dir_all(&leases_dir);
     }
 
     #[test]
