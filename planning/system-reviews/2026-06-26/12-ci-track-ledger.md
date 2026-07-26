@@ -1100,3 +1100,71 @@ Neither is chased further here; both are named rather than silently dropped.
 manager, host-disk-capacity accounting in `reserve`, the generalized OCI mount abstraction, and the
 `UserNamespaceLease` subsystem for the UID-65534 mapping problem — none of that has started yet. This
 entry closes exactly the named prerequisite, as its own focused commit.
+
+## 2026-07-26 — agreed 4-slice sequencing for the workspace_storage.rs wiring (Sol)
+
+With the `ContainerRun` prerequisite above landed, consulted Sol on how to slice the remaining body
+of work into independently-shippable, independently-reviewable units (same discipline as the
+prerequisite fix). Agreed sequencing, recorded here before any of it is implemented:
+
+1. **Persistent workspace manager + startup reconciliation** — `GvisorBackend::try_new(registry,
+   WorkspaceStorageMode, incident_sink)` (explicit, fallible construction — no silent production
+   default). The manager owns: one process-lifetime directory-FD lock (`O_CLOEXEC`, or placed
+   OUTSIDE the workspace base — never a lockfile inside it, since `workspace_storage.rs`'s own orphan
+   scanner already rejects every non-subvolume entry as unexpected); `Mutex<WorkspaceStorage>`;
+   monotonic admission state `Reconciling | Healthy | Poisoned`; active workspace metadata; host-local
+   capacity accounting via non-`Clone` capacity leases; the critical-incident sink an abnormal
+   `WorkspaceLease::drop` reports through. A new read-only `WorkspaceStorage::check_health()` (not
+   repeated `open()` calls). Lock acquired BEFORE orphan enumeration/deletion; admission stays closed
+   until every orphan delete+sync succeeds; any unexpected entry/failed delete-sync/poisoned mutex/
+   abandoned capability makes poisoning MONOTONIC for that process. `Disabled` mode performs NO
+   Btrfs/lock/quota/helper I/O at all. Does NOT call `create_workspace` in this slice (no owner
+   UID/GID needed yet). Production passes `Disabled` explicitly until slice 4. `runner_bind.rs`
+   currently constructs the backend infallibly inside the runner thread — this slice adds typed
+   startup refusal before any claim is accepted. **This is the next concrete unit of work** — no OCI
+   or UID-namespace dependency, independently reviewable/testable without a real `runsc`.
+
+2. **Explicit user-namespace subsystem** — fully separate slice, large and security-critical enough
+   for its own review/commit. Cross-process-safe (not process-local-counter) subordinate UID/GID
+   allocation; non-`Clone` `UserNamespaceLease`; exact two-entry OCI mapping (container 0 → runner
+   identity, container 65534 → the leased subordinate id); absolute pinned `newuidmap`/`newgidmap`
+   invocation with cleared environment; fail-closed subordinate-range parsing/validation; a
+   `RunscInvocationMode::{Rootless, ExplicitUserNamespace(UserNamespaceConfig)}` centralizing the
+   currently-hardcoded `--rootless` flag (gvisor.rs's `run`/`kill`/`delete` all hardcode it
+   separately today). Ordinary CI/agent launches can move to explicit user namespaces here even
+   before workspace mounts exist (still `cwd="/"`, no workspace) — git-wire stays rootless unless
+   deliberately migrated and drilled on its own, since it shares `run_and_capture` and the
+   distinction must be explicit, never inferred. Owns the exact-pinned-runsc drill proving: ordinary
+   launch succeeds without `--rootless`; OCI userns/mappings are exact; guest process is UID/GID
+   65534; two concurrent leases get distinct subordinate ids; helper/allocation failure refuses
+   before launch; git-wire's rootless behavior is unchanged.
+
+3. **Workspace lifecycle integration** — only now does `PreparedWorkspace` get wired into
+   `launch_with`. Refined 15-step launch order (isolation floor → hardening → resolve rootfs/deps →
+   manager health/admission → `hooks.reserve` (durable/global) → host-local disk-capacity lease →
+   subordinate-id lease → create/chown Btrfs workspace → build OCI config → acquire launch permit →
+   run + prove the runsc/gofer cgroup is quiescent → settle/construct the correct disposition →
+   delete+sync the workspace REGARDLESS of settlement outcome → release/quarantine the UID+disk
+   leases → return). An explicit workspace config field inside `OciConfig` (fixed `/workspace`,
+   `rw,nosuid,nodev`, `process.cwd=/workspace`, absolute rootfs path) — NOT the generic git-wire mount
+   API, and no host path in `WorkspaceSpec` or any durable type. The launch-local lease's abnormal
+   `Drop` must: perform no privileged deletion; poison workspace admission; emit the critical
+   incident; QUARANTINE (not immediately recycle) the subordinate id + local capacity tied to the
+   leaked workspace — otherwise a leaked subvolume owned by subordinate UID X could survive while X
+   is reassigned to a different job. The failure matrix is the main review target (pre-reserve →
+   no mutation; post-reserve/pre-commit → release+delete; commit-outcome-unknown → neither
+   release/settle but still delete after quiescence; reporter-owned post-commit → preserve
+   `RetryableAttempt` cause+usage through cleanup; success-then-cleanup-failure → `RetryableAttempt`
+   under reporter ownership, loud `Failed` under hook ownership after settlement; cleanup failure
+   must AUGMENT the original diagnostic, never collapse `DurableOutcomeUnknown` or lose retryable
+   usage).
+
+4. **Production activation + drills** — enable `EphemeralDisk` only after proving: writable
+   `/workspace` + read-only root + `cwd=/workspace`; Btrfs quota exhaustion produces `EDQUOT`/`ENOSPC`
+   without host overuse; aggregate+local capacity refusal before creation/spawn; timeout/cancellation/
+   runsc-failure/drain-failure/settlement-failure/success ALL delete+sync; two concurrent jobs get
+   distinct subvolumes+subordinate ids; a runner SIGKILL leaves an orphan that restart reconciliation
+   removes BEFORE admission opens; lock contention prevents two runner processes managing the same
+   base; the exact pinned runsc passes the explicit-userns workspace drill.
+
+Not started. Slice 1 is the next concrete unit.
