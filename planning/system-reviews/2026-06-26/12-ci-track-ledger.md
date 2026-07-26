@@ -1300,8 +1300,170 @@ recorded and the cleanup remains tracked — which this entry does. **This debt 
 cleaned up (with a privileged session) before slice 4's production-activation drills**, and should
 not be allowed to silently age past that point.
 
-**Still open:** slice 2 (explicit user-namespace subsystem), slice 3 (workspace lifecycle wired into
-`launch_with`, which is also where `GvisorBackend`'s own `workspace_manager` field/accessor finally
-lands), slice 4 (production activation + drills, which must also verify the leaked subvolumes above
-are gone). None of the 4 slices are wired into production yet — `EphemeralDisk` is not constructed
-anywhere outside this module's own tests; `runner_bind.rs` is untouched.
+**Still open (superseded by the slice-2 entry below):** slice 2 (explicit user-namespace
+subsystem), slice 3 (workspace lifecycle wired into `launch_with`, which is also where
+`GvisorBackend`'s own `workspace_manager` field/accessor finally lands), slice 4 (production
+activation + drills, which must also verify the leaked subvolumes above are gone). None of the 4
+slices are wired into production yet — `EphemeralDisk` is not constructed anywhere outside this
+module's own tests; `runner_bind.rs` is untouched.
+
+## 2026-07-26 — CT-007 slice 2 landed: explicit user-namespace subsystem (Sol, 9 review rounds)
+
+Slice 2 of the agreed 4-slice `workspace_storage.rs` → `gvisor.rs` integration (prior entry, above)
+is complete: a new `crates/myelin-ci-sandbox/src/user_namespace.rs` module (`UserNamespaceLease`/
+`UserNamespaceAllocator`), a new shared `crate::dirlock::verify_ancestors_not_writable_by_us`
+primitive (used by both this module and `gvisor.rs`), and substantial `gvisor.rs` additions wiring
+`RunscInvocationMode::ExplicitUserNamespace` into the real `run`/`kill`/`delete` invocation path.
+Same deliberate scope discipline as slice 1: `GvisorBackend` itself is still untouched outside its
+own `invocation_mode()`/`to_json()` plumbing — wiring a real lease into `launch_with`'s lifecycle is
+slice 3's job, which is also where the deferred `UserNamespaceQuiescenceProof` production
+constructor finally lands.
+
+**What `user_namespace.rs` provides:** `UserNamespaceAllocator` — a `WorkspaceManager`-shaped
+persistent, process-lifetime-locked owner of subordinate-uid/gid-slot admission and leasing, parsing
+`/etc/subuid`/`/etc/subgid` once at construction, backed by durable JSON marker files
+(`slot-<N>.json`) as the crash-recovery source of truth, with FD-relative (`openat`/`unlinkat`,
+never path-based) marker I/O against a held directory-lock FD. `UserNamespaceLease` — a non-`Clone`
+hold on exactly one subordinate uid/gid pair, releasable only against a
+`UserNamespaceQuiescenceProof` bound to that lease's own nonce; an unreleased (abandoned) lease
+quarantines its slot forever rather than risking reissue. `UserNamespaceConfig` — opaque (private
+fields, accessors only), mintable only via `UserNamespaceLease::config()` or a `#[cfg(test)]`
+constructor, so no caller can forge a mapping bypassing the allocator. A constructor split
+(`try_new` — strict, hardcoded to the real `/etc/subuid`/`/etc/subgid`, no mutation, requires
+pre-provisioned state — vs. `#[cfg(test)] try_new_for_tests` — relaxed, fixture paths, auto-creates
+convenience state) mirrors `workspace_manager.rs`'s own production-vs-test split, needed here because
+this module's strict hardening genuinely cannot be satisfied by non-root test fixtures.
+
+**What `gvisor.rs` gained:** `OciConfig::user_namespace: Option<UserNamespaceConfig>` as the ONE
+source of truth `invocation_mode()` derives `RunscInvocationMode` from (mismatched
+mode/mapping combinations are unrepresentable, not merely validated); `to_json()` emits
+byte-identical JSON to before this slice when `None` (today's only production behavior,
+untouched), or the exact two-entry `uidMappings`/`gidMappings` OCI `user` namespace when `Some`.
+`apply_runsc_invocation_policy` is the ONE place `run`/`kill`/`delete` decide global flags AND
+environment — no call site makes an independent decision. A `ResolvedExplicitUsernsPolicy`
+(helper directory + runsc state root, installed atomically together) plus a pinned
+version+content-digest check (`PINNED_EXPLICIT_USERNS_RUNSC_VERSION`/`_SHA256_HEX`, validated
+against the exact `release-20260608.0` build this integration's live spike was developed against)
+gate `ExplicitUserNamespace` mode entirely: it REFUSES outright — never falling back to ad hoc
+unvalidated resolution — unless `preflight_explicit_userns_policy` has already succeeded.
+
+**Design/review process:** consulted with Sol (gpt-5.6-sol, persistent session `myelin-ct007`)
+across 9 rounds — far more than slice 1's 6, reflecting how much more adversarial surface a new
+security-load-bearing subsystem (real host uid/gid mappings, a new binary-execution trust
+boundary) exposes versus slice 1's storage-accounting scope. Real, distinct bugs found and fixed
+each round:
+
+- **Round 1:** boot reconciliation parsed markers through `serde_json::Value` first to peek
+  `schema_version` — `Value` cannot losslessly represent a real random `u128`, so every genuine
+  marker was rejected as corrupt (fixed via a minimal `SchemaPeek` struct deserialized directly from
+  the raw string). Path-based TOCTOU on marker create/delete (fixed via FD-relative `openat`/
+  `unlinkat` against the held lock FD). The single most protracted investigation of this slice: an
+  intermittent "two threads leased the same host_uid" failure that survived multiple standalone
+  minimal reproductions of `openat`/mutex primitives (all clean) before the true root cause was
+  found — not an allocator bug at all, but the TEST releasing leases mid-loop while sibling threads
+  were still retrying, legitimately re-leasing a freed slot. Fixed by restructuring the test to
+  collect all leases before asserting uniqueness, and the module's own doc comments (which had
+  briefly, incorrectly blamed "directory-listing staleness" from an earlier wrong diagnosis) were
+  corrected to describe the actual, verified cause.
+- **Round 2:** the directory lock protected against a REPLACEMENT directory but not this SAME
+  process renaming `leases_dir` away and creating a fresh one at the same path (closed then via an
+  immediate-parent-only `access(2)` check — later found insufficient, see round 3). Marker reads had
+  a leaf-level TOCTOU and were unbounded/blocking. Identity-range validation was incomplete (no
+  root-runner refusal, no self-uid-in-range refusal, no enforced minimum pool size). `gvisor.rs`'s
+  `ExplicitUserNamespace` mode needed environment-clearing (`runsc` invokes `newuidmap`/`newgidmap`
+  internally, not this process — confirmed against gVisor's own docs) plus a fixed `--root=`.
+- **Round 3:** the round-2 `access(2)`-based parent check missed three live attacks: owning the
+  parent (mode alone doesn't stop a `chmod`), a writable GRANDPARENT with a safe-looking immediate
+  parent, and a symlinked ancestor — fixed with a full `openat(O_NOFOLLOW)` ancestor walk from `/`
+  down, checking both ownership and `faccessat(AT_EACCESS)` writability at every level (later
+  extracted into the shared `dirlock.rs` primitive both this module and `gvisor.rs` use). `lease()`
+  only consulted `active_slots`/`quarantined_slots` AFTER an `EEXIST`, not before attempting create —
+  fixed to skip known slots unconditionally first. The `runsc` invocation policy was resolved via
+  three independently-`OnceLock`-cached values with no binding between "validated" and "used."
+  Subordinate-range overlaps between different owners were silently accepted.
+- **Round 4:** the round-3 `faccessat` ancestor check treated ANY nonzero result as "not writable" —
+  only `EACCES` actually proves that; every other errno (`EINVAL`/`ENOSYS`/`EBADF`) was fail-OPEN.
+  The round-3 ownership test drove the full ancestor walk, which refused at `/tmp` before ever
+  reaching the fixture it claimed to test — isolated into a standalone, directly-testable function.
+  A REAL bug of this session's own making: `NoSubordinateEntry` was split out of `SubordinateConfig`
+  this round, but the live drill's error-variant match was never updated to match it — found by Sol,
+  fixed. `PINNED_EXPLICIT_USERNS_RUNSC_VERSION` existed but nothing checked the binary's own content
+  digest, so a same-version rebuild would pass — added a real SHA-256 pin.
+- **Round 5:** the digest pin verified a PATH, not the binary eventually executed — nothing stopped
+  the runsc binary (or the state-root directory) from being replaced between preflight and any later
+  launch. Closed via the SAME ancestor-immutability + ownership/mode hardening already proven for the
+  leases directory, applied to both the runsc binary's parent chain and the state-root's.
+- **Round 6:** two more severe, distinct bugs. (1) `verify_pinned_explicit_userns_runsc` executed
+  `bin --version` BEFORE checking the digest — an unvalidated, potentially malicious candidate got
+  arbitrary host execution before this function could ever reject it; fixed to hash first, execute
+  only on a matching digest, and to check `output.status.success()` (previously unchecked). (2) the
+  new state-root hardening (and, per Sol's extension, the PRE-EXISTING leases-directory hardening
+  from round 2) auto-created the leaf via `create_dir_all` even in strict mode — internally
+  contradictory, since creating a missing leaf requires write access to its own parent, exactly what
+  the ancestor-immutability check exists to forbid; fixed in both places to perform NO mutation in
+  strict mode, requiring the leaf to be pre-provisioned instead.
+- **Rounds 7–9:** the drill's own standalone pin-check call, run before hardening, still violated
+  the (now-fixed) function's documented precondition — removed entirely, relying solely on
+  `preflight_explicit_userns_policy`'s correct ordering. Both new leaf-mode checks rejected
+  group/other bits but not missing owner `rwx` (a `0500`/`0000` directory would have passed) — fixed
+  in both `gvisor.rs` and `user_namespace.rs`. Finally, the drill validated the process-global cached
+  `runsc_bin()` via preflight but then launched/deleted using its OWN separately-PATH-resolved `bin`
+  — structurally capable of validating binary A and executing binary B — fixed by removing the
+  drill's independent resolution and using `runsc_bin()` throughout. **Round 9: cleared to commit.**
+
+**Verification, final round:** `cargo build` (crate + full workspace) clean; `cargo clippy
+--all-targets` with `--features integration`, `--features integration,test-support`, and no
+features, all `-D warnings`, clean; `rustfmt --check` clean (both touched files — `gvisor.rs` is
+tracked/committed, `user_namespace.rs`/`dirlock.rs`'s additions are new/uncommitted this slice, so a
+whole-file reformat carried no risk of diverging from a committed baseline); `myelin-lints`
+`lint-gate` clean (771 files, 0 violations); full `myelin-ci-sandbox` test suite (`--all-targets
+--features integration`): 245 lib tests pass (up from 191 at the end of slice 1), plus all
+integration test files. `concurrent_lease_calls_never_poison_the_allocator` specifically run 40
+times in a tight loop with 0 failures, both after this slice's own concurrency fix and again after
+every subsequent round's changes. Only the SAME pre-existing, unrelated
+`firecracker_production_launch_contains_the_corpus_non_root` failure remains (named in the slice-1
+entry above; not chased here).
+
+**Operational debt — the strict production-layout path has never been genuinely live-drilled, by
+explicit agreement with Sol (not an oversight):** this development host's real `runsc` binary
+(`~/.local/bin/runsc`) and the default explicit-userns state-root
+(`~/.local/state/myelin-runsc-explicit-userns`) both live under this runner's OWN home directory
+tree — exactly the deployment layout the round-5/6 hardening now correctly REFUSES (a non-root-owned
+binary/directory, or one reachable through a runner-writable ancestor, can be replaced by the
+runner itself, defeating the whole point of pinning it). Consequently:
+
+- The live drill (`gvisor::tests::explicit_user_namespace_boots_through_the_real_production_run_path`)
+  currently SKIPS on this host — it prints
+  `SKIP: preflight_explicit_userns_policy failed: "/home/adhv/.local/bin/runsc" must be owned by
+  root (uid 0), got uid 1000` and returns early (reporting `ok`, per its own established
+  skip-gracefully contract). It does NOT currently prove the fully-hardened strict production path
+  boots a real container end-to-end.
+- The drill's `UserNamespaceAllocator` is constructed via `try_new_for_tests` (the relaxed,
+  fixture-path test constructor), never the strict production `try_new` — mirroring the EXACT same,
+  already-accepted gap slice 1's own leases-directory drill has had since round 2 of that slice's
+  review.
+- Individual mechanisms (ancestor-chain immutability, ownership/mode enforcement, symlink refusal,
+  hash-before-exec ordering, no-mutation-in-strict-mode) are each independently proven via 15+
+  isolated unit tests added across rounds 3–7 — but no SINGLE test currently exercises all of them
+  together against a genuinely root-owned, immutably-anchored deployment.
+- **Before slice 4 can claim this subsystem is live-proven, it must run the fully-hardened strict
+  path once for real**, with: a root-owned pinned `runsc` binary under an immutable ancestor chain;
+  pre-provisioned, runner-owned state-root and lease directories under root-owned immutable parents
+  (e.g. `/var/lib/myelin/...`, with only the leaf delegated to the runner); and a second preflight
+  run AFTER the container completes, proving `runsc` itself did not leave the state-root in an
+  incompatible mode. This requires `sudo`/root-level host setup this session deliberately did not
+  perform without a fresh, explicit ask outside of Sol's own review — Sol agreed this is acceptable
+  to defer, not a slice-2 commit blocker, given it exactly mirrors slice 1's own accepted gap.
+- **Sequencing constraint slice 3/4's activation wiring must honor:** `preflight_explicit_userns_policy`
+  must run BEFORE any generic version-probing preflight (e.g. anything shaped like
+  `preflight_gvisor_runner_host`) that could execute the same candidate binary — running the generic
+  probe first would re-open the exact exec-before-verify TOCTOU round 6 closed for THIS preflight
+  specifically.
+
+**Still open:** slice 3 (workspace lifecycle wired into `launch_with` — also where `GvisorBackend`'s
+own `workspace_manager`/`user_namespace_allocator` fields and the deferred
+`UserNamespaceQuiescenceProof` production constructor finally land), slice 4 (production activation
++ drills, which must verify: the slice-1 leaked Btrfs subvolumes are gone, AND run this slice's
+own genuine strict-path live drill per the operational debt above). Neither `EphemeralDisk` nor
+`ExplicitUserNamespace` is constructed anywhere outside test/drill code yet; `runner_bind.rs` remains
+untouched.

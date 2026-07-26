@@ -72,11 +72,11 @@
 //!   `Disabled` explicitly until slice 4's drills are complete — never a silent default that
 //!   quietly starts provisioning real disk.
 
+use crate::dirlock::{fd_identity, path_identity};
 use crate::workspace_storage::{WorkspaceStorage, WorkspaceStorageError};
 use std::collections::BTreeSet;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::io::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -738,76 +738,21 @@ fn reconcile_orphans_at_boot(storage: &mut WorkspaceStorage) -> Result<(), Works
     Ok(())
 }
 
-/// Acquire a process-lifetime exclusive `flock` on `base_dir` ITSELF (never a lockfile created
-/// inside it — `WorkspaceStorage`'s orphan scanner already treats every unrecognized entry under
-/// the base as a loud [`WorkspaceStorageError::UnexpectedEntry`]). `O_CLOEXEC` so the FD is never
-/// inherited across an exec (the sandboxed guest process must never hold this host-side lock).
-/// Non-blocking (`LOCK_NB`): a second runner process sharing the same base refuses immediately at
-/// startup rather than hanging.
+/// Acquire a process-lifetime exclusive `flock` on `base_dir` ITSELF — thin wrapper over the
+/// shared [`crate::dirlock`] primitive (also used by [`crate::user_namespace`]'s lease directory),
+/// mapping [`crate::dirlock::DirLockError`] into this module's own richer error type.
+/// `WorkspaceStorage`'s orphan scanner already treats every unrecognized entry under the base as a
+/// loud [`WorkspaceStorageError::UnexpectedEntry`] — never a lockfile created inside it.
 fn acquire_directory_lock(base_dir: &Path) -> Result<OwnedFd, WorkspaceManagerError> {
-    std::fs::create_dir_all(base_dir).map_err(|e| WorkspaceManagerError::LockFailed {
-        base_dir: base_dir.to_path_buf(),
-        reason: format!("create workspace base dir: {e}"),
-    })?;
-    // SAFETY: `open`'s arguments are a NUL-free, valid path (converted via `CString` below) and
-    // standard POSIX flags; the returned fd, on success, is a newly-owned, exclusively-held
-    // descriptor this function transfers to its caller via `OwnedFd::from_raw_fd`.
-    let path_c = std::ffi::CString::new(base_dir.as_os_str().as_encoded_bytes()).map_err(|e| {
-        WorkspaceManagerError::LockFailed {
+    crate::dirlock::acquire_directory_lock(base_dir).map_err(|error| match error {
+        crate::dirlock::DirLockError::AlreadyLocked => WorkspaceManagerError::AlreadyLocked {
             base_dir: base_dir.to_path_buf(),
-            reason: format!("path contains an interior NUL: {e}"),
-        }
-    })?;
-    let fd = unsafe {
-        libc::open(
-            path_c.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
-        )
-    };
-    if fd < 0 {
-        return Err(WorkspaceManagerError::LockFailed {
+        },
+        crate::dirlock::DirLockError::Failed(reason) => WorkspaceManagerError::LockFailed {
             base_dir: base_dir.to_path_buf(),
-            reason: format!("open directory for locking: {}", io::Error::last_os_error()),
-        });
-    }
-    // SAFETY: `fd` was just returned by a successful `open` above and is not owned elsewhere yet.
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    // SAFETY: `owned` is a valid, open file descriptor for the duration of this call.
-    let flock_result = unsafe { libc::flock(owned.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if flock_result != 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
-            return Err(WorkspaceManagerError::AlreadyLocked {
-                base_dir: base_dir.to_path_buf(),
-            });
-        }
-        return Err(WorkspaceManagerError::LockFailed {
-            base_dir: base_dir.to_path_buf(),
-            reason: format!("flock: {error}"),
-        });
-    }
-    Ok(owned)
-}
-
-/// The (device, inode) of an already-open file descriptor — identifies the exact inode it
-/// references regardless of what happens to any path pointing at it afterward.
-fn fd_identity(fd: &OwnedFd) -> io::Result<(u64, u64)> {
-    // SAFETY: `stat` is a plain-old-data struct; `fd` is a valid, open file descriptor for the
-    // duration of this call.
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((stat.st_dev as u64, stat.st_ino as u64))
-}
-
-/// The (device, inode) the given PATH currently resolves to (following symlinks, matching
-/// `WorkspaceStorage::open`'s own `canonicalize` semantics).
-fn path_identity(path: &Path) -> io::Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)?;
-    Ok((meta.dev(), meta.ino()))
+            reason,
+        },
+    })
 }
 
 /// Verify `path` CURRENTLY resolves to `locked_identity` — the single check both construction and
