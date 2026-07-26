@@ -437,14 +437,23 @@ struct LeaseMarkerV1 {
     phase: LeasePhaseV1,
 }
 
-/// Slice 2 has exactly one phase: a slot has been reserved but never associated with any
-/// container. Slice 3 extends this to a `Bound` variant carrying `container_id`/
-/// `runsc_state_root`/cgroup identity — deliberately NOT added now as `Option` fields on a single
-/// struct, which would let nonsensical partial combinations exist; a phase enum keeps every valid
-/// state explicit.
+/// `Allocated`: a slot has been reserved but never associated with any container —
+/// [`UserNamespaceLease::release_unused`] is the only way to give one of these up (no runtime
+/// evidence to prove, since none ever ran with this identity). `Bound`: durably associated, via
+/// [`UserNamespaceLease::bind`], with the SPECIFIC runtime instance (`container_id`, the pinned
+/// `runsc` state-root's own (device, inode) identity, and the `MemoryCgroup`'s own (device, inode)
+/// identity) about to be exposed to this lease's uid/gid — deliberately a phase enum, not `Option`
+/// fields bolted onto one struct, which would let nonsensical partial combinations exist (e.g. a
+/// `container_id` with no cgroup identity). [`UserNamespaceLease::release`] is the only way to
+/// give one of THESE up, and only against a matching quiescence proof.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum LeasePhaseV1 {
     Allocated,
+    Bound {
+        container_id: String,
+        runsc_root_identity: (u64, u64),
+        cgroup_identity: (u64, u64),
+    },
 }
 
 fn marker_file_name(slot: u32) -> String {
@@ -455,6 +464,19 @@ fn marker_file_name(slot: u32) -> String {
 /// shape; anything else is an unexpected entry that poisons the whole allocator.
 fn parse_marker_file_name(name: &str) -> Option<u32> {
     let digits = name.strip_prefix("slot-")?.strip_suffix(".json")?;
+    if digits.len() != 10 {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Parse a leases-directory entry as a STALE `bind()`-rewrite temp file left behind by a crash
+/// between creating `<marker>.tmp` and the `renameat` that would have made it the real marker
+/// (see [`rewrite_marker_atomically`]). Recognized SPECIFICALLY so boot reconciliation can
+/// conservatively quarantine just the slot it names, rather than treating this entirely expected
+/// crash artifact as unrecognized-entry corruption that poisons the whole allocator.
+fn parse_stray_tmp_marker_file_name(name: &str) -> Option<u32> {
+    let digits = name.strip_prefix("slot-")?.strip_suffix(".json.tmp")?;
     if digits.len() != 10 {
         return None;
     }
@@ -613,15 +635,28 @@ impl std::error::Error for UserNamespaceAllocatorError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserNamespaceReleaseError {
     /// The supplied [`UserNamespaceQuiescenceProof`] was not minted for THIS lease (a different
-    /// lease's proof was supplied). The lease remains outstanding — a caller may retry with the
-    /// correct proof, or let it drop (quarantining its slot).
+    /// lease's proof was supplied). `release` takes `self` by value, so this call still consumes
+    /// the lease — there is no retry with the same value; the lease is simply dropped as `release`
+    /// returns, quarantining its slot exactly as any other abandoned lease would.
     ProofMismatch,
     /// The durable marker no longer matches this lease's own identity (nonce/host_uid/host_gid) —
     /// a global-trust failure, POISONS the whole allocator.
     MarkerMismatch,
+    /// The durable marker genuinely belongs to this lease (base identity matches), but its phase
+    /// disagrees with the supplied proof — either the marker was never `Bound` at all, or it is
+    /// `Bound` to a different runtime identity than the proof claims. This is an ordinary wrong
+    /// proof, NOT corruption: the lease remains outstanding (`self.released` stays `false`) and is
+    /// quarantined via ordinary `Drop`, exactly like [`Self::ProofMismatch`] — never a global
+    /// poison.
+    ProofDisagreesWithMarker,
     /// Unlink/dir-sync had an ambiguous outcome — POISONS the whole allocator (the release outcome
     /// itself is unproven).
     Poisoned,
+    /// The marker was durably unlinked (the slot is physically free), but this allocator's own
+    /// `active_slots` bookkeeping did not agree the slot was active — an internal invariant was
+    /// violated. POISONS the whole allocator, since its in-memory bookkeeping can no longer be
+    /// trusted to reflect disk state.
+    InternalInvariantViolated { reason: String },
 }
 
 impl std::fmt::Display for UserNamespaceReleaseError {
@@ -637,8 +672,16 @@ impl std::fmt::Display for UserNamespaceReleaseError {
                 f,
                 "the durable marker no longer matches this lease's own identity"
             ),
+            UserNamespaceReleaseError::ProofDisagreesWithMarker => write!(
+                f,
+                "the durable marker belongs to this lease but its phase disagrees with the \
+                 supplied proof"
+            ),
             UserNamespaceReleaseError::Poisoned => {
                 write!(f, "releasing this lease had an ambiguous outcome")
+            }
+            UserNamespaceReleaseError::InternalInvariantViolated { reason } => {
+                write!(f, "internal invariant violated while releasing: {reason}")
             }
         }
     }
@@ -671,6 +714,26 @@ struct AllocatorState {
     /// global-trust failure, not an ordinary collision).
     active_slots: BTreeSet<u32>,
     locked_identity: Option<(u64, u64)>,
+}
+
+/// Record `slot` as active, refusing (rather than silently trusting) if it was already there —
+/// which `lease()`'s own single-pass-under-one-lock-hold structure means should be impossible: a
+/// slot is only ever attempted after `!active_slots.contains(&slot)` is observed absent under the
+/// SAME lock hold, with no unlocked window between that check and this call (even though real
+/// marker I/O happens in between) that could let another caller race in. Extracted as its own
+/// function (rather than inlined in `lease()`) purely to give this "should be impossible"
+/// transition a seam for always-on test coverage — `lease()`'s own structure makes the violation
+/// itself unreachable through the public API in a single-threaded test.
+fn insert_active_slot_checked(active_slots: &mut BTreeSet<u32>, slot: u32) -> Result<(), String> {
+    if active_slots.insert(slot) {
+        Ok(())
+    } else {
+        Err(format!(
+            "slot {slot} was already marked active in active_slots despite being skipped as \
+             taken moments earlier under the same lock hold — a bookkeeping invariant was \
+             violated"
+        ))
+    }
 }
 
 struct SharedState {
@@ -781,6 +844,71 @@ fn openat_marker(dir_fd: RawFd, name: &str, create: bool) -> io::Result<std::fs:
     Ok(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) })
 }
 
+/// CT-007 slice 3: durably OVERWRITE an EXISTING marker's content — the `Allocated` → `Bound`
+/// phase transition. Deliberately NEVER a truncate-in-place (`O_WRONLY|O_TRUNC` on the existing
+/// file): if the process crashes mid-write, an in-place truncate could leave a marker that is
+/// PARTIALLY old content and partially new, and — worse — a truncate-then-write leaves a window
+/// where the file is SHORTER than either valid version, which a concurrent (or crash-recovery)
+/// reader could observe as a plausible-looking but wrong-length JSON fragment. Instead: write the
+/// full new content to a FRESH sibling file (`<name>.tmp`, `O_CREAT|O_EXCL` — this lease's `&mut
+/// self` borrow already makes a concurrent second bind on the SAME slot impossible at the type
+/// level, so `O_EXCL` here is a belt-and-suspenders invariant check, not a concurrency primitive),
+/// `fsync` IT (the new content is durable before it can ever become visible at the real name),
+/// `renameat` it over `name` (POSIX guarantees an FD-relative rename within the SAME directory is
+/// atomic — any reader, including a crash-recovery boot scan, observes EITHER the fully-old or the
+/// fully-new content, never a mix), then `fsync` the directory (durability for the rename/unlink
+/// of the old name the rename implies).
+fn rewrite_marker_atomically(dir_fd: RawFd, name: &str, content: &[u8]) -> io::Result<()> {
+    let tmp_name = format!("{name}.tmp");
+    let tmp_name_c = CString::new(tmp_name.as_str())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    // SAFETY: `dir_fd` is a valid, open directory FD held by the caller for the duration of this
+    // call; `tmp_name_c` is a valid, NUL-terminated path. `O_EXCL` refuses if a stale `.tmp` file
+    // somehow already exists (a prior crash mid-bind) rather than silently overwriting it.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd,
+            tmp_name_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by a successful `openat` above and is not owned elsewhere.
+    let mut tmp_file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let write_and_sync =
+        io::Write::write_all(&mut tmp_file, content).and_then(|()| tmp_file.sync_all());
+    if let Err(e) = write_and_sync {
+        // Best-effort cleanup of the half-written tmp file; the caller treats the overall
+        // operation as failed (and poisons) regardless of whether this cleanup itself succeeds.
+        let _ = unsafe { libc::unlinkat(dir_fd, tmp_name_c.as_ptr(), 0) };
+        return Err(e);
+    }
+    drop(tmp_file);
+    let name_c = CString::new(name)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    // SAFETY: `dir_fd` is a valid, open directory FD; both name `CString`s are NUL-terminated;
+    // renaming within the SAME directory (both paths relative to the identical `dir_fd`).
+    let rename_result =
+        unsafe { libc::renameat(dir_fd, tmp_name_c.as_ptr(), dir_fd, name_c.as_ptr()) };
+    if rename_result != 0 {
+        let rename_error = io::Error::last_os_error();
+        let _ = unsafe { libc::unlinkat(dir_fd, tmp_name_c.as_ptr(), 0) };
+        return Err(rename_error);
+    }
+    // The rename may already be visible to other readers even if this fsync fails, so a failure
+    // here is an ambiguous outcome for the caller to treat as such (poison), never a plain retry.
+    // SAFETY: `dir_fd` is a valid, open directory FD held by the caller for the duration of this
+    // call.
+    let fsync_result = unsafe { libc::fsync(dir_fd) };
+    if fsync_result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `unlinkat(2)` a marker file BY NAME relative to `dir_fd`.
 fn unlinkat_marker(dir_fd: RawFd, name: &str) -> io::Result<()> {
     let name_c = CString::new(name)
@@ -798,6 +926,23 @@ fn unlinkat_marker(dir_fd: RawFd, name: &str) -> io::Result<()> {
 /// serializes to well under this; anything past it is itself grounds for suspicion, not merely an
 /// oversized read.
 const MAX_MARKER_BYTES: usize = 4096;
+
+/// The longest `container_id` [`UserNamespaceLease::bind`] will ever accept — well under
+/// [`MAX_MARKER_BYTES`] so a valid-length id can never by itself push a serialized `Bound` marker
+/// over the limit.
+const MAX_CONTAINER_ID_LEN: usize = 256;
+
+/// `true` iff `container_id` is non-empty, at most [`MAX_CONTAINER_ID_LEN`] bytes, and contains
+/// only ASCII alphanumerics, `-`, `_`, or `.` — the safe subset every `container_id` this codebase
+/// actually generates (`format!("myelin-...-{pid}-{suffix}")`) already falls within. Rejects
+/// anything else BEFORE it is ever serialized into a marker or passed to `runsc`.
+fn is_valid_container_id(container_id: &str) -> bool {
+    !container_id.is_empty()
+        && container_id.len() <= MAX_CONTAINER_ID_LEN
+        && container_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
 
 /// Read a marker file BY NAME relative to `dir_fd`, closing the leaf-level TOCTOU Sol's review
 /// found: `openat(O_NOFOLLOW|O_NONBLOCK)` FIRST (the name can never resolve through a symlink, and
@@ -991,20 +1136,88 @@ fn verify_leases_dir_leaf_strict(dir: &Path) -> Result<(), UserNamespaceAllocato
     Ok(())
 }
 
-/// A production constructor for this type does not exist yet (deliberately) — slice 3 adds one,
-/// once `launch_with` has actual kill/delete/reap + cgroup-quiescence evidence to construct it
-/// honestly from. Bound to the SAME [`LeaseNonce`] as the lease it is minted for — `release` will
-/// refuse (`ProofMismatch`) any proof whose nonce disagrees.
+/// A production constructor for this type does not exist yet (deliberately) — the `gvisor.rs`
+/// piece of slice 3 adds one, once `launch_with` has actual kill/delete/reap +
+/// `MemoryCgroup::quiesce()`-verified cgroup-quiescence evidence to construct it honestly from.
+/// Bound to the SAME [`LeaseNonce`] as the lease it is minted for, AND to the specific
+/// `container_id`/`runsc_root_identity`/`cgroup_identity` the lease was durably [`bound
+/// <UserNamespaceLease::bind>`](UserNamespaceLease::bind) to — `release` refuses (`ProofMismatch`)
+/// any proof whose nonce disagrees, and refuses (`ProofDisagreesWithMarker`) any proof whose
+/// runtime identity disagrees with what the durable marker's own `Bound` phase records (or whose
+/// marker was never `Bound` at all), even if the nonce happens to match — an ordinary wrong proof
+/// for a lease that genuinely belongs to the caller, not corruption.
 pub struct UserNamespaceQuiescenceProof {
     lease_nonce: LeaseNonce,
+    container_id: String,
+    runsc_root_identity: (u64, u64),
+    cgroup_identity: (u64, u64),
 }
 
 impl UserNamespaceQuiescenceProof {
     #[cfg(test)]
-    pub(crate) fn assert_for_tests(lease_nonce: LeaseNonce) -> Self {
-        UserNamespaceQuiescenceProof { lease_nonce }
+    pub(crate) fn assert_for_tests(
+        lease_nonce: LeaseNonce,
+        container_id: String,
+        runsc_root_identity: (u64, u64),
+        cgroup_identity: (u64, u64),
+    ) -> Self {
+        UserNamespaceQuiescenceProof {
+            lease_nonce,
+            container_id,
+            runsc_root_identity,
+            cgroup_identity,
+        }
     }
 }
+
+/// Why [`UserNamespaceLease::bind`] failed — the durable `Allocated` → `Bound` transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserNamespaceBindError {
+    /// The durable marker no longer matches this lease's own identity in the `Allocated` phase
+    /// (already `Bound`, or corrupted, or externally tampered with) — a global-trust failure,
+    /// POISONS the whole allocator.
+    MarkerMismatch,
+    /// The durable rewrite itself had an ambiguous outcome (serialize/write/fsync/rename failure)
+    /// — POISONS the whole allocator (the on-disk phase is no longer provably `Allocated`, but
+    /// also not provably `Bound`).
+    Poisoned,
+    /// `container_id` is empty, exceeds [`MAX_CONTAINER_ID_LEN`], or contains a character outside
+    /// the safe subset — a caller bug, NOT a global-trust failure. Refused before touching disk at
+    /// all: does NOT poison, and the lease is left exactly as it was (still `Allocated`, still
+    /// usable — the caller may retry `bind` with a corrected id).
+    InvalidContainerId,
+    /// The serialized `Bound` marker would exceed [`MAX_MARKER_BYTES`] — writing it would produce
+    /// a marker `read_and_verify_marker`/boot reconciliation can never parse back, permanently
+    /// bricking this slot. Refused before any disk write is attempted: does NOT poison, and the
+    /// lease is left exactly as it was (still `Allocated`, still usable).
+    MarkerTooLarge,
+}
+
+impl std::fmt::Display for UserNamespaceBindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UserNamespaceBindError::MarkerMismatch => write!(
+                f,
+                "the durable marker no longer matches this lease's own identity in the \
+                 Allocated phase"
+            ),
+            UserNamespaceBindError::Poisoned => write!(
+                f,
+                "the durable Allocated -> Bound rewrite had an ambiguous outcome"
+            ),
+            UserNamespaceBindError::InvalidContainerId => write!(
+                f,
+                "container_id is empty, too long, or contains a character outside the safe subset"
+            ),
+            UserNamespaceBindError::MarkerTooLarge => write!(
+                f,
+                "the serialized Bound marker would exceed the maximum marker size"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UserNamespaceBindError {}
 
 /// A non-`Clone` hold on exactly one subordinate uid/gid slot. See this module's doc for the full
 /// lifecycle contract.
@@ -1056,25 +1269,104 @@ impl UserNamespaceLease {
         self.lease_nonce
     }
 
-    /// Ordinary release: the caller has ALREADY proven (via `proof`) that the container/gofer/
-    /// sentry this lease's identity was exposed to is fully torn down. Verifies `proof` was minted
-    /// for THIS lease, re-reads the durable marker to confirm it STILL matches this lease's own
-    /// identity, and ONLY THEN unlinks it (`openat`/`unlinkat` relative to the held lock FD —
-    /// never a path-based reopen) and syncs the directory FD.
+    /// CT-007 slice 3: durably transition this lease from `Allocated` to `Bound`, associating it
+    /// with the SPECIFIC runtime instance (`container_id`, the pinned `runsc` state-root's own
+    /// (device, inode) identity, and the `MemoryCgroup`'s own (device, inode) identity) about to be
+    /// exposed to this lease's uid/gid — MUST succeed BEFORE `runsc` ever execs with this identity.
+    /// Without a durable `Bound` record, a crash between spawn and settlement would leave no
+    /// evidence of which runtime instance this lease's identity was exposed to, making
+    /// [`Self::release`]'s whole "the runtime this lease was exposed to is confirmed torn down"
+    /// claim unverifiable at boot-recovery time.
     ///
-    /// NOTE on `ProofMismatch`: `release` takes `self` BY VALUE, so this call consumes the lease
-    /// regardless of outcome — there is no way to "retry with the correct proof" using the SAME
-    /// lease value once this method has been called at all. On `ProofMismatch` specifically,
-    /// `self.released` is left `false`, so `self`'s ordinary `Drop` (which fires as this call
-    /// returns) quarantines the slot exactly as any other abandoned lease would — a caller unsure
-    /// of the right proof should check BEFORE calling `release`, not rely on retrying after.
-    pub fn release(
-        mut self,
-        proof: UserNamespaceQuiescenceProof,
-    ) -> Result<(), UserNamespaceReleaseError> {
-        if proof.lease_nonce != self.lease_nonce {
-            return Err(UserNamespaceReleaseError::ProofMismatch);
+    /// Re-reads the durable marker first, requiring it to STILL be `Allocated` and match this
+    /// lease's own identity (schema/nonce/runner/host_uid/host_gid) — refuses (`MarkerMismatch`,
+    /// POISONING the whole allocator) if not, since that means the on-disk state no longer agrees
+    /// with what this in-memory lease believes. Rewrites the marker via
+    /// [`rewrite_marker_atomically`] (write-tmp-then-rename — never a truncate-in-place, which
+    /// could leave a crash-recovery reader observing a corrupt, partially-written marker).
+    pub fn bind(
+        &mut self,
+        container_id: String,
+        runsc_root_identity: (u64, u64),
+        cgroup_identity: (u64, u64),
+    ) -> Result<(), UserNamespaceBindError> {
+        if !is_valid_container_id(&container_id) {
+            // A caller bug, not a global-trust failure — nothing has touched disk yet, so the
+            // lease is left exactly as it was and the caller may retry with a corrected id.
+            return Err(UserNamespaceBindError::InvalidContainerId);
         }
+        let name = marker_file_name(self.slot);
+        let current = read_and_verify_marker(self.shared.dir_fd(), &name)
+            .ok()
+            .and_then(|content| serde_json::from_str::<LeaseMarkerV1>(&content).ok())
+            .filter(|marker| {
+                marker.schema_version == LEASE_MARKER_SCHEMA_V1
+                    && marker.lease_nonce == self.lease_nonce
+                    && marker.runner_instance_id == self.runner_instance_id
+                    && marker.host_uid == self.host_uid
+                    && marker.host_gid == self.host_gid
+                    && marker.phase == LeasePhaseV1::Allocated
+            });
+        let Some(marker) = current else {
+            self.released = true; // avoid a redundant abandonment incident from Drop on top.
+            self.shared.poison(format!(
+                "binding slot {} (host_uid={}): the durable marker no longer matches this \
+                 lease's own identity in the Allocated phase — treating as a global-trust failure",
+                self.slot, self.host_uid
+            ));
+            return Err(UserNamespaceBindError::MarkerMismatch);
+        };
+        let bound_marker = LeaseMarkerV1 {
+            phase: LeasePhaseV1::Bound {
+                container_id,
+                runsc_root_identity,
+                cgroup_identity,
+            },
+            ..marker
+        };
+        let marker_json = match serde_json::to_string(&bound_marker) {
+            Ok(json) => json,
+            Err(e) => {
+                self.released = true;
+                self.shared.poison(format!(
+                    "binding slot {} (host_uid={}): failed to serialize the Bound marker: {e}",
+                    self.slot, self.host_uid
+                ));
+                return Err(UserNamespaceBindError::Poisoned);
+            }
+        };
+        if marker_json.len() > MAX_MARKER_BYTES {
+            // Refused BEFORE any disk write: the marker is still `Allocated` and untouched, so
+            // the lease is left exactly as it was (not poisoned, not consumed) — a caller bug
+            // (an oversized/highly-escaped container_id), never a global-trust failure.
+            return Err(UserNamespaceBindError::MarkerTooLarge);
+        }
+        match rewrite_marker_atomically(self.shared.dir_fd(), &name, marker_json.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.released = true;
+                self.shared.poison(format!(
+                    "binding slot {} (host_uid={}): failed to durably rewrite the marker to \
+                     Bound ({e}) — the on-disk phase is now ambiguous",
+                    self.slot, self.host_uid
+                ));
+                Err(UserNamespaceBindError::Poisoned)
+            }
+        }
+    }
+
+    /// CT-007 slice 3: release a lease that was NEVER [`bound <Self::bind>`](Self::bind) to any
+    /// runtime — a pre-spawn failure, a refused launch permit, or any other path where this
+    /// lease's identity was never actually exposed to a container. Needs NO quiescence proof
+    /// (nothing ever ran with this identity, so there is nothing to prove torn down) — but DOES
+    /// re-read the durable marker first, requiring it to STILL be `Allocated`: if it is already
+    /// `Bound`, this is the WRONG release path (the identity WAS exposed to something — use
+    /// [`Self::release`] with a real quiescence proof instead), and this call refuses
+    /// (`MarkerMismatch`, POISONING the whole allocator) rather than silently unlinking a marker
+    /// whose `Bound` runtime evidence a caller might still need. Without this path, an ordinary
+    /// pre-spawn failure or a refused launch permit would permanently quarantine the subordinate
+    /// id for no reason — `Drop` would treat it as abandoned, since it was never released.
+    pub fn release_unused(mut self) -> Result<(), UserNamespaceReleaseError> {
         let name = marker_file_name(self.slot);
         let marker_matches = read_and_verify_marker(self.shared.dir_fd(), &name)
             .ok()
@@ -1089,11 +1381,12 @@ impl UserNamespaceLease {
             })
             .unwrap_or(false);
         if !marker_matches {
-            self.released = true; // Avoid a redundant abandonment incident from Drop on top.
+            self.released = true; // avoid a redundant abandonment incident from Drop on top.
             self.shared.poison(format!(
-                "releasing slot {} (host_uid={}): the durable marker no longer matches this \
-                 lease's own identity (schema/nonce/runner/host_uid/host_gid/phase) — treating \
-                 as a global-trust failure",
+                "release_unused on slot {} (host_uid={}): the durable marker is not (or no \
+                 longer) Allocated matching this lease's own identity — either it was already \
+                 Bound (use release() with a real quiescence proof instead) or the on-disk state \
+                 has diverged; treating as a global-trust failure",
                 self.slot, self.host_uid
             ));
             return Err(UserNamespaceReleaseError::MarkerMismatch);
@@ -1102,7 +1395,122 @@ impl UserNamespaceLease {
             Ok(()) => match self.shared.fsync_locked_dir() {
                 Ok(()) => {
                     self.released = true;
-                    self.shared.lock_state().active_slots.remove(&self.slot);
+                    let removed = self.shared.lock_state().active_slots.remove(&self.slot);
+                    if !removed {
+                        let reason = format!(
+                            "release_unused on slot {} (host_uid={}): its marker was durably \
+                             unlinked but active_slots did not contain it — a bookkeeping \
+                             invariant was violated",
+                            self.slot, self.host_uid
+                        );
+                        self.shared.poison(reason.clone());
+                        return Err(UserNamespaceReleaseError::InternalInvariantViolated {
+                            reason,
+                        });
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    self.released = true;
+                    self.shared.poison(format!(
+                        "release_unused on slot {} (host_uid={}): marker unlinked but syncing \
+                         the leases directory failed ({e}) — the release outcome is ambiguous",
+                        self.slot, self.host_uid
+                    ));
+                    Err(UserNamespaceReleaseError::Poisoned)
+                }
+            },
+            Err(e) => {
+                self.released = true;
+                self.shared.poison(format!(
+                    "release_unused on slot {} (host_uid={}): failed to unlink its marker ({e}) \
+                     — the release outcome is ambiguous",
+                    self.slot, self.host_uid
+                ));
+                Err(UserNamespaceReleaseError::Poisoned)
+            }
+        }
+    }
+
+    /// Ordinary release: the caller has ALREADY proven (via `proof`) that the container/gofer/
+    /// sentry this lease's identity was exposed to is fully torn down. Verifies `proof` was minted
+    /// for THIS lease AND for the SAME `container_id`/`runsc_root_identity`/`cgroup_identity` the
+    /// durable marker's own `Bound` phase records, re-reads the durable marker to confirm it STILL
+    /// matches this lease's own identity in that exact `Bound` state, and ONLY THEN unlinks it
+    /// (`openat`/`unlinkat` relative to the held lock FD — never a path-based reopen) and syncs the
+    /// directory FD.
+    ///
+    /// NOTE on `ProofMismatch`/`ProofDisagreesWithMarker`: `release` takes `self` BY VALUE, so this
+    /// call consumes the lease regardless of outcome — there is no way to "retry with the correct
+    /// proof" using the SAME lease value once this method has been called at all. On either of
+    /// those two outcomes specifically, `self.released` is left `false`, so `self`'s ordinary
+    /// `Drop` (which fires as this call returns) quarantines the slot exactly as any other
+    /// abandoned lease would — a caller unsure of the right proof should check BEFORE calling
+    /// `release`, not rely on retrying after.
+    pub fn release(
+        mut self,
+        proof: UserNamespaceQuiescenceProof,
+    ) -> Result<(), UserNamespaceReleaseError> {
+        if proof.lease_nonce != self.lease_nonce {
+            return Err(UserNamespaceReleaseError::ProofMismatch);
+        }
+        let name = marker_file_name(self.slot);
+        let marker = read_and_verify_marker(self.shared.dir_fd(), &name)
+            .ok()
+            .and_then(|content| serde_json::from_str::<LeaseMarkerV1>(&content).ok());
+        // Split in two: does the durable marker even BELONG to this lease (base identity — real
+        // corruption/tampering if not, a global-trust failure), versus does its PHASE agree with
+        // what the proof claims (an ordinary wrong-proof-for-a-valid-lease situation if not, no
+        // different in kind from the nonce-mismatch case above — never a global poison).
+        let base_identity_matches = marker.as_ref().is_some_and(|marker| {
+            marker.schema_version == LEASE_MARKER_SCHEMA_V1
+                && marker.lease_nonce == self.lease_nonce
+                && marker.runner_instance_id == self.runner_instance_id
+                && marker.host_uid == self.host_uid
+                && marker.host_gid == self.host_gid
+        });
+        if !base_identity_matches {
+            self.released = true; // Avoid a redundant abandonment incident from Drop on top.
+            self.shared.poison(format!(
+                "releasing slot {} (host_uid={}): the durable marker no longer matches this \
+                 lease's own identity (schema/nonce/runner/host_uid/host_gid) — treating as a \
+                 global-trust failure",
+                self.slot, self.host_uid
+            ));
+            return Err(UserNamespaceReleaseError::MarkerMismatch);
+        }
+        let phase_matches_proof = marker.as_ref().is_some_and(|marker| {
+            marker.phase
+                == LeasePhaseV1::Bound {
+                    container_id: proof.container_id.clone(),
+                    runsc_root_identity: proof.runsc_root_identity,
+                    cgroup_identity: proof.cgroup_identity,
+                }
+        });
+        if !phase_matches_proof {
+            // The marker genuinely belongs to this lease (verified above) — it was either never
+            // bound, or is Bound to a different runtime identity than this proof claims. An
+            // ordinary wrong proof, not corruption: leave `self.released` false so Drop quarantines
+            // only this one lease, and do NOT poison the allocator.
+            return Err(UserNamespaceReleaseError::ProofDisagreesWithMarker);
+        }
+        match unlinkat_marker(self.shared.dir_fd(), &name) {
+            Ok(()) => match self.shared.fsync_locked_dir() {
+                Ok(()) => {
+                    self.released = true;
+                    let removed = self.shared.lock_state().active_slots.remove(&self.slot);
+                    if !removed {
+                        let reason = format!(
+                            "releasing slot {} (host_uid={}): its marker was durably unlinked \
+                             but active_slots did not contain it — a bookkeeping invariant was \
+                             violated",
+                            self.slot, self.host_uid
+                        );
+                        self.shared.poison(reason.clone());
+                        return Err(UserNamespaceReleaseError::InternalInvariantViolated {
+                            reason,
+                        });
+                    }
                     Ok(())
                 }
                 Err(e) => {
@@ -1299,6 +1707,14 @@ impl UserNamespaceAllocator {
 
         let mut quarantined = BTreeSet::new();
         let mut incidents = Vec::new();
+        // Stray `bind()`-rewrite temp files, collected during the pass below but only ACTED on
+        // afterward (see the second pass past the end of this loop) — a temp file is deleted ONLY
+        // once we know its slot has a validated, durably quarantined primary marker of its own.
+        // Deleting it purely on the strength of an in-memory quarantine (this pass alone) would
+        // erase the only durable evidence a slot was ever touched if the primary marker happens to
+        // be absent, letting a later boot reissue it — exactly the never-reissue guarantee this
+        // module exists to uphold.
+        let mut stray_tmp_entries: Vec<(u32, String, PathBuf)> = Vec::new();
         // Read via the LOCKED FD's `/proc/self/fd/<fd>` alias — immune to `leases_dir`'s original
         // path being renamed/replaced out from under the lock (Sol's review).
         for entry in std::fs::read_dir(shared.listing_path()).map_err(|e| {
@@ -1314,6 +1730,25 @@ impl UserNamespaceAllocator {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             let Some(slot) = parse_marker_file_name(&name_str) else {
+                if let Some(tmp_slot) = parse_stray_tmp_marker_file_name(&name_str) {
+                    // A crash between creating `<marker>.tmp` and the `renameat` that would have
+                    // made it the real marker can leave this exact artifact behind. Recognize it
+                    // specifically so it doesn't fall into the generic unrecognized-entry error
+                    // below — but do NOT act on it yet: whether it's safe to delete depends on
+                    // whether this slot's primary marker survived too, which this single pass
+                    // cannot yet know (directory iteration order is unspecified).
+                    if tmp_slot >= pool_size {
+                        return Err(UserNamespaceAllocatorError::CorruptLeaseMarker {
+                            path: entry.path(),
+                            reason: format!(
+                                "stale bind-rewrite temp file {name_str:?} names slot \
+                                 {tmp_slot}, outside the current pool size {pool_size}"
+                            ),
+                        });
+                    }
+                    stray_tmp_entries.push((tmp_slot, name_str.into_owned(), entry.path()));
+                    continue;
+                }
                 return Err(UserNamespaceAllocatorError::CorruptLeaseMarker {
                     path: entry.path(),
                     reason: format!("unrecognized entry in leases dir: {name_str:?}"),
@@ -1376,10 +1811,16 @@ impl UserNamespaceAllocator {
                         });
                     }
                     quarantined.insert(slot);
+                    let phase_desc = match &marker.phase {
+                        LeasePhaseV1::Allocated => "Allocated".to_string(),
+                        LeasePhaseV1::Bound { container_id, .. } => {
+                            format!("Bound (container_id={container_id:?})")
+                        }
+                    };
                     incidents.push(format!(
                         "boot reconciliation: slot {slot} (host_uid={}, host_gid={}) has a \
-                         surviving Allocated marker from runner instance {:?} — quarantined, will \
-                         never be reissued by this allocator instance",
+                         surviving {phase_desc} marker from runner instance {:?} — quarantined, \
+                         will never be reissued by this allocator instance",
                         marker.host_uid, marker.host_gid, marker.runner_instance_id
                     ));
                 }
@@ -1390,6 +1831,50 @@ impl UserNamespaceAllocator {
                     });
                 }
             }
+        }
+
+        // Second pass: now that every primary marker has been validated and its slot durably
+        // quarantined (`quarantined` above), decide what to do with each stray bind-rewrite temp
+        // file. A temp file is only ever cleanup residue for a slot whose OWN primary marker
+        // survived (and is therefore already durably quarantined) — if that primary is absent, we
+        // cannot tell whether the slot was ever truly exposed to a runtime from the temp file
+        // alone, so refuse construction rather than silently deleting the only surviving evidence.
+        let had_stray_tmp_entries = !stray_tmp_entries.is_empty();
+        for (tmp_slot, tmp_name, tmp_path) in stray_tmp_entries {
+            if !quarantined.contains(&tmp_slot) {
+                return Err(UserNamespaceAllocatorError::CorruptLeaseMarker {
+                    path: tmp_path,
+                    reason: format!(
+                        "stale bind-rewrite temp file {tmp_name:?} names slot {tmp_slot}, but no \
+                         primary marker for that slot survived — refusing to guess whether the \
+                         slot is safe to reissue"
+                    ),
+                });
+            }
+            unlinkat_marker(shared.dir_fd(), &tmp_name).map_err(|e| {
+                UserNamespaceAllocatorError::CorruptLeaseMarker {
+                    path: tmp_path.clone(),
+                    reason: format!(
+                        "failed to remove stale bind-rewrite temp file {tmp_name:?}, alongside \
+                         its slot's already-quarantined primary marker: {e}"
+                    ),
+                }
+            })?;
+            incidents.push(format!(
+                "boot reconciliation: slot {tmp_slot} had a stale bind-rewrite temp file \
+                 ({tmp_name:?}) alongside its durably quarantined primary marker — removed"
+            ));
+        }
+        if had_stray_tmp_entries {
+            shared
+                .fsync_locked_dir()
+                .map_err(|e| UserNamespaceAllocatorError::LockFailed {
+                    leases_dir: leases_dir.clone(),
+                    reason: format!(
+                        "syncing the leases directory after removing stale bind-rewrite temp \
+                         file(s) failed: {e}"
+                    ),
+                })?;
         }
 
         {
@@ -1590,7 +2075,18 @@ impl UserNamespaceAllocator {
                 self.shared.report_incident(&reason);
                 return Err(UserNamespaceRefusal::Poisoned { reason });
             }
-            state.active_slots.insert(slot);
+            // The marker is already durably written and synced at this point, so silently
+            // returning `Ok` on a failed insert would hand out a lease this allocator's own
+            // bookkeeping cannot distinguish from a slot it already considers active.
+            if let Err(reason) = insert_active_slot_checked(&mut state.active_slots, slot) {
+                let reason = format!("lease: {reason}");
+                state.admission = UserNamespaceAdmission::Poisoned {
+                    reason: reason.clone(),
+                };
+                drop(state);
+                self.shared.report_incident(&reason);
+                return Err(UserNamespaceRefusal::Poisoned { reason });
+            }
             drop(state);
 
             return Ok(UserNamespaceLease {
@@ -1670,11 +2166,19 @@ mod tests {
         (allocator, base, log)
     }
 
-    fn release_for_tests(lease: UserNamespaceLease) {
+    fn release_for_tests(mut lease: UserNamespaceLease) {
         let nonce = lease.nonce_for_tests();
         lease
-            .release(UserNamespaceQuiescenceProof::assert_for_tests(nonce))
-            .expect("release with the lease's own nonce must succeed");
+            .bind("test-container".to_string(), (0, 0), (0, 0))
+            .expect("bind must succeed for a fresh Allocated lease");
+        lease
+            .release(UserNamespaceQuiescenceProof::assert_for_tests(
+                nonce,
+                "test-container".to_string(),
+                (0, 0),
+                (0, 0),
+            ))
+            .expect("release with the lease's own nonce and bound identity must succeed");
     }
 
     /// Tests that plant markers directly (bypassing `UserNamespaceAllocator::try_new`'s own
@@ -1943,13 +2447,261 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // ───────────────────── CT-007 slice 3: bind/release_unused lifecycle ─────────────────────
+
+    #[test]
+    fn bind_then_release_succeeds_with_a_matching_proof() {
+        let (allocator, base, _log) = new_allocator_for_test("bind-then-release", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        lease
+            .bind("container-1".to_string(), (7, 8), (9, 10))
+            .expect("bind must succeed for a fresh Allocated lease");
+        lease
+            .release(UserNamespaceQuiescenceProof::assert_for_tests(
+                nonce,
+                "container-1".to_string(),
+                (7, 8),
+                (9, 10),
+            ))
+            .expect("release with a proof matching the bound identity must succeed");
+        assert!(allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bind_refuses_a_lease_that_is_already_bound() {
+        let (allocator, base, _log) = new_allocator_for_test("bind-twice", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        lease
+            .bind("container-1".to_string(), (1, 1), (1, 1))
+            .expect("first bind must succeed");
+        let result = lease.bind("container-2".to_string(), (2, 2), (2, 2));
+        assert_eq!(result, Err(UserNamespaceBindError::MarkerMismatch));
+        assert!(
+            !allocator.is_healthy(),
+            "a second bind attempt on an already-Bound marker must poison the allocator"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bind_refuses_an_oversized_container_id_without_rewriting_the_marker() {
+        let (allocator, base, _log) = new_allocator_for_test("bind-oversized-id", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let marker_path = base.join("leases").join(marker_file_name(0));
+        let before = std::fs::read_to_string(&marker_path).unwrap();
+        let oversized_id = "x".repeat(MAX_CONTAINER_ID_LEN + 1);
+        let result = lease.bind(oversized_id, (1, 1), (1, 1));
+        assert_eq!(result, Err(UserNamespaceBindError::InvalidContainerId));
+        let after = std::fs::read_to_string(&marker_path).unwrap();
+        assert_eq!(
+            before, after,
+            "an invalid container_id must be refused before any disk write is attempted"
+        );
+        assert!(
+            allocator.is_healthy(),
+            "an oversized container_id is a caller bug, not a global-trust failure — it must \
+             not poison the allocator"
+        );
+        lease
+            .release_unused()
+            .expect("the lease is still Allocated and usable after the refused bind");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bind_refuses_a_container_id_with_an_unsafe_character() {
+        let (allocator, base, _log) = new_allocator_for_test("bind-unsafe-char", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let result = lease.bind("has a space".to_string(), (1, 1), (1, 1));
+        assert_eq!(result, Err(UserNamespaceBindError::InvalidContainerId));
+        assert!(allocator.is_healthy());
+        lease.release_unused().expect("lease is still Allocated");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's review: `release` must verify the proof's claimed runtime identity against what the
+    /// durable marker's `Bound` phase ACTUALLY records, not merely the lease nonce — a proof
+    /// minted for the right lease but the WRONG runtime instance must still be refused.
+    #[test]
+    fn release_refuses_a_proof_whose_bound_identity_disagrees_with_the_durable_marker() {
+        let (allocator, base, _log) = new_allocator_for_test("release-wrong-identity", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        lease
+            .bind("real-container".to_string(), (1, 1), (2, 2))
+            .expect("bind must succeed");
+        let result = lease.release(UserNamespaceQuiescenceProof::assert_for_tests(
+            nonce,
+            "different-container".to_string(), // right nonce, WRONG bound identity
+            (1, 1),
+            (2, 2),
+        ));
+        assert_eq!(
+            result,
+            Err(UserNamespaceReleaseError::ProofDisagreesWithMarker)
+        );
+        assert!(
+            allocator.is_healthy(),
+            "a proof with the wrong bound identity is an ordinary wrong proof for a valid lease, \
+             not corruption — it must NOT poison the whole allocator"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn release_refuses_a_lease_that_was_never_bound() {
+        let (allocator, base, _log) = new_allocator_for_test("release-never-bound", 1, 1);
+        let lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        // Never called `.bind()` — the marker is still Allocated, not Bound.
+        let result = lease.release(UserNamespaceQuiescenceProof::assert_for_tests(
+            nonce,
+            "container-1".to_string(),
+            (1, 1),
+            (1, 1),
+        ));
+        assert_eq!(
+            result,
+            Err(UserNamespaceReleaseError::ProofDisagreesWithMarker)
+        );
+        assert!(
+            allocator.is_healthy(),
+            "a never-bound marker still genuinely belongs to this lease — releasing it with a \
+             real-looking proof is an ordinary wrong proof, not corruption"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The whole point of `release_unused`: a pre-spawn failure or a refused launch permit must
+    /// not permanently quarantine the subordinate id just because the lease was never exposed to
+    /// a runtime.
+    #[test]
+    fn release_unused_succeeds_for_a_never_bound_lease_and_frees_its_slot() {
+        let (allocator, base, _log) = new_allocator_for_test("release-unused-ok", 1, 1);
+        let lease = allocator.lease().unwrap();
+        let freed_uid = lease.host_uid();
+        lease
+            .release_unused()
+            .expect("release_unused must succeed for a never-bound Allocated lease");
+        assert!(allocator.is_healthy());
+        let lease_again = allocator.lease().unwrap();
+        assert_eq!(
+            lease_again.host_uid(),
+            freed_uid,
+            "release_unused must genuinely free the slot for reuse"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `release_unused` must REFUSE a lease that WAS bound — that identity was actually exposed to
+    /// a runtime, so the caller needed a real quiescence proof (`release`), not the no-proof-needed
+    /// path.
+    #[test]
+    fn release_unused_refuses_a_lease_that_was_already_bound() {
+        let (allocator, base, _log) = new_allocator_for_test("release-unused-wrong-path", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        lease
+            .bind("container-1".to_string(), (1, 1), (1, 1))
+            .expect("bind must succeed");
+        let result = lease.release_unused();
+        assert_eq!(result, Err(UserNamespaceReleaseError::MarkerMismatch));
+        assert!(
+            !allocator.is_healthy(),
+            "release_unused on an already-Bound lease must poison the allocator, not silently \
+             unlink real runtime-binding evidence"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's round-2 review: the newly checked bookkeeping invariants (`active_slots.remove()`'s
+    /// return value on the successful-unlink path) had no always-on coverage. Simulate the
+    /// "should be impossible under this method's own lock hold" corruption directly, by removing
+    /// the slot from `active_slots` behind the lease's back before it is ever released.
+    #[test]
+    fn release_surfaces_an_internal_invariant_violation_when_active_slots_lost_the_entry() {
+        let (allocator, base, _log) = new_allocator_for_test("release-invariant-violation", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        lease
+            .bind("container-1".to_string(), (1, 1), (1, 1))
+            .expect("bind must succeed");
+        let slot = lease.slot;
+        lease.shared.lock_state().active_slots.remove(&slot);
+        let result = lease.release(UserNamespaceQuiescenceProof::assert_for_tests(
+            nonce,
+            "container-1".to_string(),
+            (1, 1),
+            (1, 1),
+        ));
+        match result {
+            Err(UserNamespaceReleaseError::InternalInvariantViolated { reason }) => {
+                assert!(reason.contains("bookkeeping invariant"));
+            }
+            other => panic!("expected InternalInvariantViolated, got {other:?}"),
+        }
+        assert!(
+            !allocator.is_healthy(),
+            "a lost active_slots entry is a genuine bookkeeping corruption and must poison the \
+             whole allocator"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Same invariant, exercised via `release_unused`'s never-bound path.
+    #[test]
+    fn release_unused_surfaces_an_internal_invariant_violation_when_active_slots_lost_the_entry() {
+        let (allocator, base, _log) =
+            new_allocator_for_test("release-unused-invariant-violation", 1, 1);
+        let lease = allocator.lease().unwrap();
+        let slot = lease.slot;
+        lease.shared.lock_state().active_slots.remove(&slot);
+        let result = lease.release_unused();
+        match result {
+            Err(UserNamespaceReleaseError::InternalInvariantViolated { reason }) => {
+                assert!(reason.contains("bookkeeping invariant"));
+            }
+            other => panic!("expected InternalInvariantViolated, got {other:?}"),
+        }
+        assert!(!allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's round-2 review: `lease()`'s newly checked `active_slots.insert()` return value also
+    /// had no always-on coverage. `lease()` itself holds its state mutex for its entire duration,
+    /// so the violation this check defends against is unreachable through the public API in a
+    /// single-threaded test — there is no window to mutate `active_slots` between the pre-check
+    /// skip and the `insert` call. So: test the extracted [`insert_active_slot_checked`] helper
+    /// directly (Sol's suggestion) — it holds the actual logic `lease()` calls, just without
+    /// requiring a whole allocator/lock to exercise it.
+    #[test]
+    fn insert_active_slot_checked_detects_a_bookkeeping_invariant_violation() {
+        let mut active_slots = BTreeSet::new();
+        active_slots.insert(3);
+        let result = insert_active_slot_checked(&mut active_slots, 3);
+        assert!(result.unwrap_err().contains("bookkeeping invariant"));
+    }
+
+    #[test]
+    fn insert_active_slot_checked_succeeds_for_a_fresh_slot() {
+        let mut active_slots = BTreeSet::new();
+        assert!(insert_active_slot_checked(&mut active_slots, 3).is_ok());
+        assert!(active_slots.contains(&3));
+    }
+
     /// Sol's review: a proof minted for lease A must never be able to release lease B.
     #[test]
     fn a_proof_minted_for_one_lease_cannot_release_another() {
         let (allocator, base, _log) = new_allocator_for_test("proof-cannot-cross-leases", 2, 2);
         let lease_a = allocator.lease().unwrap();
         let lease_b = allocator.lease().unwrap();
-        let wrong_proof = UserNamespaceQuiescenceProof::assert_for_tests(lease_a.nonce_for_tests());
+        let wrong_proof = UserNamespaceQuiescenceProof::assert_for_tests(
+            lease_a.nonce_for_tests(),
+            "irrelevant".to_string(),
+            (0, 0),
+            (0, 0),
+        );
         let result = lease_b.release(wrong_proof);
         assert_eq!(result, Err(UserNamespaceReleaseError::ProofMismatch));
         // lease_b was returned by the failed `release` call above via `Err` — but `release` takes
@@ -2119,6 +2871,194 @@ mod tests {
             "the leaked slot's host_uid must never be reissued"
         );
         release_for_tests(lease2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's round-1 review: no existing test proved a surviving `Bound` marker (as opposed to an
+    /// `Allocated` one) parses and quarantines correctly at boot — the boot-reconciliation loop
+    /// deserializes `LeaseMarkerV1` regardless of phase, but nothing exercised the `Bound` arm.
+    #[test]
+    fn a_bound_lease_survives_reopening_and_is_quarantined() {
+        let base = test_base("bound-marker-survives-reboot");
+        std::fs::create_dir_all(&base).unwrap();
+        let leases_dir = base.join("leases");
+        let subuid = base.join("subuid");
+        let subgid = base.join("subgid");
+        write_subordinate_file(&subuid, 100_000, 5);
+        write_subordinate_file(&subgid, 200_000, 5);
+
+        let (sink, _log) = recording_sink();
+        let allocator = UserNamespaceAllocator::try_new_for_tests(
+            leases_dir.clone(),
+            &subuid,
+            &subgid,
+            1,
+            sink,
+        )
+        .unwrap();
+        let mut lease = allocator.lease().unwrap();
+        let leaked_uid = lease.host_uid();
+        lease
+            .bind("crashed-container".to_string(), (7, 8), (9, 10))
+            .expect("bind must succeed for a fresh Allocated lease");
+        drop(lease); // abandoned mid-run — its Bound marker survives on disk, exactly as a crash
+                     // between bind() and a real teardown proof would leave it.
+        drop(allocator); // releases the lock (simulating the runner process exiting).
+
+        let (sink2, log2) = recording_sink();
+        let reopened =
+            UserNamespaceAllocator::try_new_for_tests(leases_dir, &subuid, &subgid, 1, sink2)
+                .unwrap();
+        assert!(
+            reopened.is_healthy(),
+            "a surviving Bound marker must parse successfully at boot, not be treated as corrupt"
+        );
+        assert!(reopened.quarantined_slots().contains(&0));
+        assert!(log2
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("Bound") && m.contains("crashed-container")));
+        let lease2 = reopened.lease().unwrap();
+        assert_ne!(
+            lease2.host_uid(),
+            leaked_uid,
+            "the leaked slot's host_uid must never be reissued"
+        );
+        release_for_tests(lease2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's round-1 review: a crash between creating `<marker>.tmp` (inside `bind()`) and the
+    /// `renameat` that would have made it the real marker leaves an undefined artifact behind —
+    /// boot reconciliation must recognize it specifically and quarantine only that slot, not treat
+    /// it as unrecognized-entry corruption that poisons the whole allocator.
+    #[test]
+    fn a_stray_bind_tmp_file_survives_reopening_and_only_quarantines_its_own_slot() {
+        let base = test_base("stray-bind-tmp-survives-reboot");
+        std::fs::create_dir_all(&base).unwrap();
+        let leases_dir = base.join("leases");
+        let subuid = base.join("subuid");
+        let subgid = base.join("subgid");
+        write_subordinate_file(&subuid, 100_000, 5);
+        write_subordinate_file(&subgid, 200_000, 5);
+
+        let (sink, _log) = recording_sink();
+        let allocator = UserNamespaceAllocator::try_new_for_tests(
+            leases_dir.clone(),
+            &subuid,
+            &subgid,
+            2,
+            sink,
+        )
+        .unwrap();
+        let lease_a = allocator.lease().unwrap();
+        let lease_b = allocator.lease().unwrap();
+        let leaked_uid = lease_a.host_uid();
+        // Simulate the exact crash window `rewrite_marker_atomically` is meant to close: the tmp
+        // file was created and fsynced, but the process died before the rename made it real — so
+        // BOTH the original (still Allocated) marker and the orphaned tmp file coexist on disk.
+        std::fs::write(
+            leases_dir.join(format!("{}.tmp", marker_file_name(0))),
+            b"whatever bind() had written - content is irrelevant, only the name matters",
+        )
+        .unwrap();
+        drop(lease_a); // abandoned mid-crash — slot 0's real marker is untouched (still Allocated).
+        drop(lease_b); // abandon slot 1's own real marker too, so both slots are exercised.
+        drop(allocator);
+
+        let (sink2, log2) = recording_sink();
+        let reopened = UserNamespaceAllocator::try_new_for_tests(
+            leases_dir.clone(),
+            &subuid,
+            &subgid,
+            2,
+            sink2,
+        )
+        .unwrap();
+        assert!(
+            reopened.is_healthy(),
+            "a stray bind-rewrite temp file must never poison the whole allocator"
+        );
+        assert!(
+            reopened.quarantined_slots().contains(&0),
+            "the slot the stray temp file names must still be quarantined, conservatively"
+        );
+        assert!(reopened.quarantined_slots().contains(&1));
+        assert!(log2
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("stale bind-rewrite temp file")));
+        assert!(
+            !leases_dir
+                .join(format!("{}.tmp", marker_file_name(0)))
+                .exists(),
+            "the stray temp file must be cleaned up once its slot is quarantined"
+        );
+        let lease2 = reopened.lease().unwrap();
+        assert_ne!(lease2.host_uid(), leaked_uid);
+        release_for_tests(lease2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's round-2 review: a stray bind-rewrite temp file with NO corresponding primary marker
+    /// (the primary was deleted, moved, or never existed for some other reason) must REFUSE
+    /// construction rather than silently deleting the only surviving evidence for that slot and
+    /// letting a later boot reissue it — that would violate the never-reissue guarantee.
+    #[test]
+    fn a_stray_bind_tmp_file_without_its_primary_marker_refuses_construction() {
+        let base = test_base("stray-bind-tmp-without-primary");
+        std::fs::create_dir_all(&base).unwrap();
+        let leases_dir = base.join("leases");
+        let subuid = base.join("subuid");
+        let subgid = base.join("subgid");
+        write_subordinate_file(&subuid, 100_000, 2);
+        write_subordinate_file(&subgid, 200_000, 2);
+        // A first construction creates and hardens `leases_dir` for us (0700, owned by us) —
+        // exactly as it would exist in production before any crash.
+        let (sink, _log) = recording_sink();
+        drop(
+            UserNamespaceAllocator::try_new_for_tests(
+                leases_dir.clone(),
+                &subuid,
+                &subgid,
+                2,
+                sink,
+            )
+            .unwrap(),
+        );
+        // No primary marker at all for slot 0 — only the crash-window temp file survives.
+        std::fs::write(
+            leases_dir.join(format!("{}.tmp", marker_file_name(0))),
+            b"whatever bind() had written - content is irrelevant, only the name matters",
+        )
+        .unwrap();
+
+        let (sink2, _log2) = recording_sink();
+        let result = UserNamespaceAllocator::try_new_for_tests(
+            leases_dir.clone(),
+            &subuid,
+            &subgid,
+            2,
+            sink2,
+        );
+        match result {
+            Err(UserNamespaceAllocatorError::CorruptLeaseMarker { reason, .. }) => {
+                assert!(
+                    reason.contains("no primary marker for that slot survived"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            Err(other) => panic!("expected CorruptLeaseMarker, got {other:?}"),
+            Ok(_) => panic!("expected CorruptLeaseMarker, got Ok"),
+        }
+        assert!(
+            leases_dir
+                .join(format!("{}.tmp", marker_file_name(0)))
+                .exists(),
+            "refusing construction must leave the only surviving evidence untouched, not delete it"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2592,10 +3532,12 @@ mod tests {
             "a slot this allocator still considers active must never be recreated, even if its \
              on-disk marker is gone"
         );
-        // Clean up: the ORIGINAL lease's marker is gone, so `release()` will (correctly) detect
-        // the tampering and poison — covered by a dedicated test below. Just drop it here without
-        // asserting on the outcome, since this test targets `lease()`'s behavior, not `release()`'s.
-        std::mem::forget(lease); // avoid a second, redundant `Drop`-triggered incident report
+        // Clean up: the ORIGINAL lease's marker is gone, so re-verifying it will (correctly)
+        // detect the tampering and poison — covered by a dedicated test below (this test targets
+        // `lease()`'s behavior, not `release()`'s). Consume it through this expected-to-fail
+        // `release_unused()` call rather than `mem::forget`, so the held lock FD is actually
+        // dropped instead of leaked for the rest of the test process's lifetime.
+        let _ = lease.release_unused();
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2629,7 +3571,12 @@ mod tests {
         let lease = allocator.lease().unwrap();
         std::fs::remove_file(leases_dir.join(marker_file_name(0))).unwrap();
         let nonce = lease.nonce_for_tests();
-        let result = lease.release(UserNamespaceQuiescenceProof::assert_for_tests(nonce));
+        let result = lease.release(UserNamespaceQuiescenceProof::assert_for_tests(
+            nonce,
+            "test-container".to_string(),
+            (0, 0),
+            (0, 0),
+        ));
         assert_eq!(result, Err(UserNamespaceReleaseError::MarkerMismatch));
         assert!(
             !allocator.is_healthy(),

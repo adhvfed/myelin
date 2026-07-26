@@ -4102,7 +4102,7 @@ mod tests {
                  corrupt state, unsafe directory), not an absent host configuration: {e}"
             ),
         };
-        let lease = allocator
+        let mut lease = allocator
             .lease()
             .expect("a fresh allocator's first lease must succeed");
 
@@ -4121,6 +4121,16 @@ mod tests {
             std::process::id(),
             unique_suffix()
         );
+        // CT-007 slice 3: durably bind BEFORE exec — real `runsc_root_identity`/`cgroup_identity`
+        // (the pinned runsc state-root's and the `MemoryCgroup`'s own (device, inode) identity)
+        // land with this slice's own gvisor.rs wiring piece, not yet built; `(0, 0)` is a
+        // placeholder here, matching only what THIS drill (which doesn't yet construct a real
+        // `MemoryCgroup`-backed quiescence proof) needs to prove `bind`/`release`'s own contract.
+        let runsc_root_identity = (0, 0);
+        let cgroup_identity = (0, 0);
+        lease
+            .bind(container_id.clone(), runsc_root_identity, cgroup_identity)
+            .expect("bind must succeed for a fresh Allocated lease");
         let mode = cfg.invocation_mode();
         let outcome = run_and_capture(
             bin,
@@ -4162,8 +4172,15 @@ mod tests {
 
         let nonce = lease.nonce_for_tests();
         lease
-            .release(crate::user_namespace::UserNamespaceQuiescenceProof::assert_for_tests(nonce))
-            .expect("release with the lease's own nonce must succeed");
+            .release(
+                crate::user_namespace::UserNamespaceQuiescenceProof::assert_for_tests(
+                    nonce,
+                    container_id,
+                    runsc_root_identity,
+                    cgroup_identity,
+                ),
+            )
+            .expect("release with the lease's own nonce and bound identity must succeed");
         let _ = std::fs::remove_dir_all(&leases_dir);
     }
 
