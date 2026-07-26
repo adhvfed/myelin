@@ -777,9 +777,72 @@ with `--features integration` clean across `myelin-ci-sandbox`/`myelin-ci-contro
 `myelin-agent-service`/`myelin-edge`/`myelin-control-plane`/`myelin-git`/`myelin-mcp`, `cargo
 clippy --workspace --all-targets -- -D warnings` clean, integration-feature clippy clean.
 
-**Still open for CT-007:** step 2b (Btrfs subvolume+qgroup provisioning, the UID-namespace fix, the
-EROFS cargo-vendor asset pipeline, the launch-ordering insert, crash reconciliation) — the bulk of
-Sol's design, not yet built. `firecracker.rs`'s identical tmpfs/disk conflation (flagged, not
-fixed). 11 of 12 `ci-workload-inventory.toml` rows remain `not-started`; the other CI job families
+**2026-07-26 (later): step 2b landed (commit `32dff06d`) — the Btrfs subvolume+qgroup workspace
+module, adversarially reviewed by Sol across SIX rounds before being approved.** Also fixed
+`firecracker.rs`'s identical tmpfs/disk conflation flagged above (commit `852bc7ae`).
+
+Every round found a genuine, concrete bug — not style preference, and none anticipated by my own
+first draft:
+1. ABA-unsafe deletion (a stale handle could delete a same-path-but-different subvolume created
+   after it) — fixed with a captured subvolume id; found STILL racy one round later (id-compare-
+   then-path-delete still re-resolves the leaf path at the delete call itself) — final fix deletes
+   by persistent subvolume id against the filesystem anchor, never touching the job's own path at
+   delete time.
+2. Deletion authority was unrestricted (any `(path, id)` pair could be handed to the API) — fixed
+   with a `WorkspaceStorage` handle owning the base directory, consuming `PreparedWorkspace`/
+   `OrphanCandidate` BY VALUE; found STILL forgeable ACROSS two different `WorkspaceStorage`
+   instances one round later — fixed by having both capability types carry the canonical base
+   they were minted against, checked before any deletion acts.
+3. Rollback failures on partial-provisioning were silently swallowed — fixed with a compound
+   `UnrecoverableLeak` error carrying both the original and the cleanup failure, requiring the
+   caller to treat it as "mark unhealthy, refuse admissions until a human reconciles" — never an
+   ordinary retryable error.
+4. The quota-enforcement precondition only checked "some qgroup interface exists," not that
+   quotas were ACTUALLY enforcing (Btrfs quotas can be nominally enabled but marked inconsistent,
+   which silently disables enforcement) — fixed with a real `btrfs quota status` parse requiring
+   all four fields (`Enabled`/`Mode`/`Inconsistent`/`Override limits`).
+5. The quota itself was never verified as a postcondition, just "the command exited 0" — fixed by
+   re-reading the qgroup's own row and asserting the applied limit matches exactly, and (found
+   while writing the exceed-quota test) an all-zero test payload would have "passed" without ever
+   proving enforcement at all under this mount's zstd compression — fixed with deterministic
+   incompressible test data and a specific `ENOSPC`/`EDQUOT` errno assertion.
+6. `btrfs inspect-internal rootid` silently resolves to the CONTAINING subvolume's id for a
+   non-subvolume path instead of erroring — a real bug found empirically (not theorized) while
+   testing orphan listing against a stray file — fixed with an inode-256
+   (`BTRFS_FIRST_FREE_OBJECTID`) check before ever trusting `rootid`'s output.
+7. `--commit-after` was the wrong tool for crash-durable deletion: btrfs-progs performs the
+   destroy ioctl FIRST and only then waits for the commit, so a `--commit-after` failure can mean
+   the destroy already happened while this code assumed "nonzero exit ⇒ nothing committed" —
+   removed the flag entirely; the already-unconditional `subvolume sync` afterward IS the real
+   "fully removed" postcondition and subsumes it (confirmed directly: sync on an already-fully-
+   gone id succeeds trivially).
+8. The base directory's ownership/permissions were only DOCUMENTED as a precondition for the
+   still-open create-time TOCTOU, not enforced — fixed: `WorkspaceStorage::open` fails loud
+   unless the base is owned by the calling process's own effective uid with no group/world write
+   bit, turning the mitigation from a wish into a real permission failure to obtain.
+9. Every mutating method now takes `&mut self` so the borrow checker forbids concurrent calls into
+   one handle within a process — a real gap found via the same shared-test-fixture reasoning this
+   whole day's work kept surfacing: my own first test suite shared ONE base directory across all
+   tests, which Rust runs concurrently by default; fixed with a per-test unique tag.
+
+**Honestly documented, not hidden:** the window from `subvolume create` through the eventual
+gVisor bind mount still resolves the leaf pathname more than once — genuinely closing it needs an
+exclusive lock or the raw `BTRFS_IOC_INO_LOOKUP` ioctl, neither of which this crate has today.
+Named as a required prerequisite for the `gvisor.rs` wiring, explicitly NOT solved in this module,
+per Sol's own accepted deferral for a staged, not-yet-integrated increment.
+
+Verified end-to-end against this host's real Btrfs filesystem (subvolume create/quota-limit/
+verify/exceed/delete/sync, plus the id-addressed qgroup-limit/qgroup-show forms) via direct shell
+reproduction of every mechanism this module uses, independent of the Rust test suite. 7 unit tests
+(4 run for real on this unprivileged host — job-id/quota validation, orphan-entry verification,
+tmpfs rejection — 3 correctly skip on the confirmed-specific `EPERM` for `CAP_SYS_ADMIN`-gated
+operations). Full workspace build/test/clippy/rustfmt clean.
+
+**Still open for CT-007:** the actual `gvisor.rs` wiring (OCI-bundle mount + the UID-namespace
+rework `runsc --rootless`'s single-UID shortcut needs — the writable-mount gap this whole module
+exists to close), the EROFS cargo-vendor asset pipeline, the launch-ordering insert, crash
+reconciliation orchestration (the admission-barrier discipline this module's `list_orphaned_
+workspaces` doc names as the caller's job) — all deferred, none built yet. 11 of 12
+`ci-workload-inventory.toml` rows remain `not-started`; the other CI job families
 (frontend+Chromium+Valkey, web-container Docker-in-guest, integration multi-service stack, rustsec
 advisory-DB broker, pnpm) have no runner-asset design started at all yet.
