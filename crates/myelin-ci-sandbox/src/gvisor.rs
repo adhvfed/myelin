@@ -202,10 +202,8 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         pids_max: 128,
         mem_bytes: 256 * 1024 * 1024,
         tmpfs_bytes: 1024 * 1024 * 1024,
-        extra_mounts: Vec::new(),
         extra_env: Vec::new(),
-        root_path: None,
-        user_namespace: None,
+        layout: OciExecutionLayout::Rootless,
     };
     let bundle = stage_production_bundle(&config, &rootfs)
         .map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
@@ -272,6 +270,130 @@ const UNTRUSTED_UID: u32 = 65534;
 const UNTRUSTED_GID: u32 = 65534;
 static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
+/// The fixed guest mount point a workspace is ALWAYS bound at — never caller-selectable (matching
+/// [`WorkspaceStorageMode::Disabled`]'s own doc: "`/workspace` is never mounted" when disabled).
+const OCI_WORKSPACE_MOUNT: &str = "/workspace";
+
+/// A path proven absolute AT CONSTRUCTION — every OCI `root.path` override this crate ever uses is
+/// meant to be absolute (a symlinked/relative `root.path` COMBINED with a host bind mount makes the
+/// rootless `runsc` gofer fail to bring up the sandbox), so this wrapper makes "claims absolute but
+/// isn't" unrepresentable rather than trusting every call site to remember to check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AbsoluteRootfs(PathBuf);
+
+impl AbsoluteRootfs {
+    fn new(path: PathBuf) -> Result<Self, String> {
+        if path.is_absolute() {
+            Ok(Self(path))
+        } else {
+            Err(format!(
+                "an OCI root.path override must be an absolute path, got {path:?}"
+            ))
+        }
+    }
+
+    fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// A serialization-only projection of a [`crate::workspace_manager::ManagedWorkspace`] for embedding
+/// into [`OciConfig`] — deliberately NEVER the real `ManagedWorkspace` itself, which is non-`Clone`,
+/// owns real leased capacity, and poisons its manager on an unconsumed drop; `OciConfig` is `Clone`
+/// and may be held/inspected well past the workspace's own real lifecycle. The destination, mount
+/// mode, and mount options are all fixed (never caller-selectable) — only the host source varies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OciWorkspaceMount {
+    host_source: PathBuf,
+}
+
+impl OciWorkspaceMount {
+    /// Piece 7 constructs this from a REAL `ManagedWorkspace` it keeps alive separately for the
+    /// duration of the launch; this projection carries only what `to_json` needs to render the bind
+    /// mount, never ownership of the workspace itself.
+    #[allow(dead_code)]
+    pub(crate) fn from_managed_workspace(
+        workspace: &crate::workspace_manager::ManagedWorkspace,
+    ) -> Self {
+        OciWorkspaceMount {
+            host_source: workspace.host_path().to_path_buf(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(host_source: PathBuf) -> Self {
+        OciWorkspaceMount { host_source }
+    }
+}
+
+/// The git-wire host mounts, in a FIXED shape — deliberately no free-form `guest_dest`/`readonly`
+/// fields a caller could set to smuggle e.g. a writable `/workspace`-shaped bind mount into a
+/// ROOTLESS layout, contradicting [`OciExecutionLayout`]'s whole invariant that a workspace
+/// requires explicit user-namespace support (and risking a destination collision with a reserved
+/// mount like `/tmp`). Destinations are fixed at [`WIRE_REPO_MOUNT`] (always read-only) and
+/// [`WIRE_QUARANTINE_MOUNT`] (always writable, only present when actually requested) — never
+/// caller-selectable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GitWireMounts {
+    repo_source: PathBuf,
+    quarantine_source: Option<PathBuf>,
+}
+
+impl GitWireMounts {
+    fn new(repo_source: PathBuf, quarantine_source: Option<PathBuf>) -> Self {
+        GitWireMounts {
+            repo_source,
+            quarantine_source,
+        }
+    }
+
+    fn bind_mounts_json(&self) -> Vec<String> {
+        let mut mounts = vec![bind_mount_json(WIRE_REPO_MOUNT, &self.repo_source, true)];
+        if let Some(quarantine_source) = &self.quarantine_source {
+            mounts.push(bind_mount_json(
+                WIRE_QUARANTINE_MOUNT,
+                quarantine_source,
+                false,
+            ));
+        }
+        mounts
+    }
+}
+
+/// The execution layout an [`OciConfig`] renders — a SINGLE enum, never independent `Option` fields
+/// for rootfs-path override / user-namespace / workspace-mount: exactly the 4 combinations this
+/// crate actually produces, each with its own fixed, internally-consistent shape. Rootfs-path
+/// resolution is conceptually orthogonal to user-namespace mode, but NOT orthogonal to host-mount
+/// behavior — a host bind mount (git-wire's repo/quarantine mounts, or a workspace mount) always
+/// requires an absolute `root.path` override in this codebase's own empirically-established
+/// gofer/rootless behavior, so those two are always paired here, never independent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OciExecutionLayout {
+    /// Ordinary CI/agent job launch — the ONLY production behavior before CT-007 slice 2/3 added
+    /// the other variants. Bundle-relative `rootfs`, no host mounts, no user namespace.
+    Rootless,
+    /// The git-wire path: an absolute rootfs override (required alongside its host bind mounts),
+    /// still fully rootless (no user namespace, no workspace).
+    RootlessWithHostMounts {
+        absolute_rootfs: AbsoluteRootfs,
+        mounts: GitWireMounts,
+    },
+    /// CT-007 slice 2: an explicit user-namespace mapping, no workspace mount — bundle-relative
+    /// `rootfs` (no host mounts are involved, so no absolute-root requirement applies).
+    ExplicitUserNamespace { config: UserNamespaceConfig },
+    /// CT-007 slice 3: an explicit user-namespace mapping WITH a disk-backed workspace mount.
+    /// Workspace-mount support REQUIRES explicit user-namespace support (the guest's unprivileged
+    /// uid, 65534, is unmapped under plain `--rootless`) — this variant is the only place a
+    /// workspace can appear, never combined with `Rootless`. The workspace mount is itself a host
+    /// bind mount, so (matching `RootlessWithHostMounts`) an absolute rootfs override is required
+    /// here too.
+    ExplicitUserNamespaceWithWorkspace {
+        config: UserNamespaceConfig,
+        workspace: OciWorkspaceMount,
+        absolute_rootfs: AbsoluteRootfs,
+    },
+}
+
 /// The OCI runtime config (`config.json`) the gVisor `runsc` path consumes, built from a [`JobSpec`]
 /// and the mandatory [`HardeningProfile`]. Every hardening field maps to a real OCI posture: the
 /// root is `readonly: true`, all capabilities are dropped, `no_new_privileges: true`, a seccomp
@@ -303,48 +425,28 @@ pub struct OciConfig {
     /// `disk_bytes` (that field is the disk-backed ephemeral-workspace quota — unrelated to this
     /// RAM-backed tmpfs).
     tmpfs_bytes: u64,
-    /// CT-006a (the git wire): EXTRA bind mounts injected into the bundle (host→guest, with a
-    /// `readonly` flag). EMPTY for every CI/agent job (so the prod-exec posture is byte-unchanged);
-    /// the git-wire launch path populates it with the **read-only bare-repo mount** at
-    /// [`WIRE_REPO_MOUNT`] and an optional **writable quarantine mount** at [`WIRE_QUARANTINE_MOUNT`].
-    /// Rendered into the SAME OCI `mounts` array the `/tmp` tmpfs uses (reusing the proven machinery).
-    extra_mounts: Vec<WireMount>,
     /// CT-006a: EXTRA `process.env` entries (`"KEY=VALUE"`) appended after the base `PATH`. EMPTY for
     /// every CI/agent job; the git-wire path sets `GIT_PROTOCOL=version=2` / `GIT_EXEC_PATH` so the
     /// sandboxed canonical `git` speaks protocol-v2 and finds its `git-core` helpers.
     extra_env: Vec<String>,
-    /// CT-006a: an ABSOLUTE OCI `root.path` override. `None` ⇒ `"rootfs"` (relative to the bundle — the
-    /// prod-exec path symlinks `rootfs` into the bundle, byte-unchanged). The git-wire path sets the
-    /// absolute staged-rootfs path here so the bundle needs NO `rootfs` symlink — a symlinked root.path
-    /// COMBINED with a host bind mount makes the rootless `runsc` gofer fail to bring up the sandbox
-    /// ("cannot read client sync file"), whereas an absolute root.path + a bind mount works.
-    root_path: Option<PathBuf>,
-    /// CT-007 slice 2: `None` ⇒ [`RunscInvocationMode::Rootless`] (today's ONLY production
-    /// behavior, BYTE-IDENTICAL JSON to before this field existed — no `user` namespace declared,
-    /// no `uidMappings`/`gidMappings` emitted). `Some(config)` ⇒
-    /// [`RunscInvocationMode::ExplicitUserNamespace`]: this field is the ONE source of truth for
-    /// which mode a given config implies (see [`Self::invocation_mode`]) — a caller can never pass
-    /// a `RunscInvocationMode` to `run_and_capture`/`delete_container` that disagrees with what
-    /// this same `OciConfig` serializes, because both are always derived from this ONE field at
-    /// the same call site.
-    user_namespace: Option<UserNamespaceConfig>,
+    /// CT-007 slice 3, piece 6: the ONE source of truth for rootfs-path resolution, host mounts,
+    /// user-namespace mode, and workspace mounting — replacing what were three independent fields
+    /// (`root_path`/`user_namespace`/`extra_mounts`) whose combinations could silently drift out of
+    /// sync with each other. [`Self::invocation_mode`] and [`Self::to_json`] both derive everything
+    /// from this ONE field, so neither can ever disagree with what the other implies.
+    layout: OciExecutionLayout,
 }
 
-/// CT-006a (the git wire): a single host→guest bind mount injected into the hardened OCI bundle, with
-/// an explicit `readonly` flag. The **bare repo** is mounted `readonly: true` (a serve can NEVER
-/// mutate it — `upload-pack` is read-only by construction; the RO is enforced by runsc, not advisory);
-/// the **quarantine** (push object intake) is mounted writable so the sandboxed `receive-pack` writes
-/// objects THERE, never into the real repo (the in-process ref-CAS policy inspects the quarantine on
-/// the host AFTER the run — CT-006b). The host source is ALWAYS a resolver-validated path (see
-/// [`resolve_bare_repo_path`]); a raw attacker-influenced path NEVER reaches a mount.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WireMount {
-    /// The host path to bind into the guest (a validated bare-repo / quarantine dir — never raw).
-    pub host_source: PathBuf,
-    /// The fixed guest mount point (e.g. `/repo`, `/quarantine`).
-    pub guest_dest: String,
-    /// `true` ⇒ the bind is `ro` (runsc-enforced read-only); `false` ⇒ writable (`rw`).
-    pub readonly: bool,
+/// Render one OCI `mounts` bind-mount entry. Source/dest are JSON-escaped via `{:?}` so a path can
+/// carry no JSON-injection.
+fn bind_mount_json(guest_dest: &str, host_source: &Path, readonly: bool) -> String {
+    let src = host_source.to_string_lossy();
+    let mode = if readonly { "ro" } else { "rw" };
+    format!(
+        "{{ \"destination\": {dest:?}, \"type\": \"bind\", \"source\": {src:?}, \
+         \"options\": [\"bind\", \"{mode}\", \"nosuid\", \"nodev\"] }}",
+        dest = guest_dest,
+    )
 }
 
 impl OciConfig {
@@ -362,47 +464,105 @@ impl OciConfig {
             mem_bytes: spec.limits.mem_bytes,
             // The hardening profile's scratch-tmpfs quota (= `spec.limits.tmpfs_bytes`).
             tmpfs_bytes: profile.scratch_quota_bytes,
-            // No extra bind mounts / env by default — a CI/agent job's posture is byte-unchanged.
-            extra_mounts: Vec::new(),
             extra_env: Vec::new(),
-            root_path: None,
-            // Rootless by default — CT-007 slice 2 makes ExplicitUserNamespace mode POSSIBLE, it
-            // does not change any existing caller's default behavior.
-            user_namespace: None,
+            // Rootless by default — every other layout is an explicit opt-in via a builder below;
+            // this does not change any existing caller's default behavior.
+            layout: OciExecutionLayout::Rootless,
         }
     }
 
-    /// CT-006a: override the OCI `root.path` with an ABSOLUTE staged-rootfs path (so the bundle needs no
-    /// `rootfs` symlink — required when a host bind mount is present). Consuming builder.
-    pub fn with_root_path(mut self, path: PathBuf) -> OciConfig {
-        self.root_path = Some(path);
-        self
+    /// Every layout-selecting builder below requires this — layout selection is ONE-SHOT (Sol's
+    /// round-1 review of piece 6): without this guard, chaining two layout builders (e.g.
+    /// `.with_user_namespace(cfg).with_rootless_host_mounts(...)`) would silently discard whichever
+    /// was selected first, even though the enum itself prevents an invalid FINAL combination —
+    /// the transition API could still silently erase an already-selected security obligation.
+    fn require_still_rootless(&self) -> Result<(), String> {
+        if matches!(self.layout, OciExecutionLayout::Rootless) {
+            Ok(())
+        } else {
+            Err(
+                "an execution-layout selection was already made on this config — layout \
+                 selection is one-shot and must never be silently overwritten"
+                    .to_string(),
+            )
+        }
     }
 
-    /// CT-007 slice 2: attach an explicit user-namespace mapping — the resulting `to_json` gains a
-    /// `user` namespace entry plus the exact two-entry `uidMappings`/`gidMappings`, and
-    /// [`Self::invocation_mode`] reports [`RunscInvocationMode::ExplicitUserNamespace`]. Consuming
-    /// builder.
-    pub fn with_user_namespace(mut self, config: UserNamespaceConfig) -> OciConfig {
-        self.user_namespace = Some(config);
-        self
+    /// CT-006a (the git wire): attach an ABSOLUTE staged-rootfs override plus its host bind mounts
+    /// (the RO repo + optional writable quarantine) atomically — these two were previously set via
+    /// two independent builders (`with_root_path`/`with_extra_mounts`), which could leave one set
+    /// without the other despite this codebase's own empirically-established requirement that a
+    /// host bind mount always needs an absolute `root.path` alongside it (a symlinked/relative one
+    /// COMBINED with a bind mount makes the rootless `runsc` gofer fail to bring up the sandbox —
+    /// "cannot read client sync file"). Fails if `absolute_rootfs` is not actually absolute — the
+    /// canonicalize-with-fallback pattern the git-wire call site used to use could otherwise
+    /// silently retain a relative path when the configured rootfs was absent. Takes the repo/
+    /// quarantine sources directly, never a free-form mount descriptor (see [`GitWireMounts`]'s
+    /// doc for why). `pub(crate)` — specialized to the git-wire path; the caller (not this type)
+    /// is responsible for the source paths already having passed [`resolve_bare_repo_path`]'s
+    /// confinement check, which the real backend call path always performs before this is ever
+    /// reached. Consuming builder.
+    pub(crate) fn with_rootless_host_mounts(
+        mut self,
+        absolute_rootfs: PathBuf,
+        repo_source: PathBuf,
+        quarantine_source: Option<PathBuf>,
+    ) -> Result<OciConfig, String> {
+        self.require_still_rootless()?;
+        self.layout = OciExecutionLayout::RootlessWithHostMounts {
+            absolute_rootfs: AbsoluteRootfs::new(absolute_rootfs)?,
+            mounts: GitWireMounts::new(repo_source, quarantine_source),
+        };
+        Ok(self)
+    }
+
+    /// CT-007 slice 2: attach an explicit user-namespace mapping (no workspace mount) — the
+    /// resulting `to_json` gains a `user` namespace entry plus the exact two-entry
+    /// `uidMappings`/`gidMappings`, and [`Self::invocation_mode`] reports
+    /// [`RunscInvocationMode::ExplicitUserNamespace`]. Consuming builder.
+    pub fn with_user_namespace(mut self, config: UserNamespaceConfig) -> Result<OciConfig, String> {
+        self.require_still_rootless()?;
+        self.layout = OciExecutionLayout::ExplicitUserNamespace { config };
+        Ok(self)
+    }
+
+    /// CT-007 slice 3, piece 6: attach an explicit user-namespace mapping WITH a disk-backed
+    /// workspace mount — the resulting `to_json` gains the `user` namespace entry/mappings AND
+    /// exactly one fixed writable bind mount at [`OCI_WORKSPACE_MOUNT`], with an absolute rootfs
+    /// override (workspace mounting is itself a host bind mount, so the same absolute-root
+    /// requirement `with_rootless_host_mounts` documents applies here too). `pub(crate)`, not yet
+    /// consumed by any production launch path — that's piece 7, which supplies the real
+    /// `ManagedWorkspace` this config's [`OciWorkspaceMount`] merely projects from. Consuming
+    /// builder; fails if `absolute_rootfs` is not actually absolute.
+    #[allow(dead_code)]
+    pub(crate) fn with_explicit_user_namespace_and_workspace(
+        mut self,
+        config: UserNamespaceConfig,
+        workspace: OciWorkspaceMount,
+        absolute_rootfs: PathBuf,
+    ) -> Result<OciConfig, String> {
+        self.require_still_rootless()?;
+        self.layout = OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+            config,
+            workspace,
+            absolute_rootfs: AbsoluteRootfs::new(absolute_rootfs)?,
+        };
+        Ok(self)
     }
 
     /// The [`RunscInvocationMode`] this config implies — the ONE place that decision is made,
-    /// derived structurally from [`Self::user_namespace`] so it can never disagree with what
+    /// derived structurally from [`Self::layout`] so it can never disagree with what
     /// [`Self::to_json`] actually serializes.
     pub fn invocation_mode(&self) -> RunscInvocationMode {
-        match self.user_namespace {
-            Some(config) => RunscInvocationMode::ExplicitUserNamespace(config),
-            None => RunscInvocationMode::Rootless,
+        match &self.layout {
+            OciExecutionLayout::Rootless | OciExecutionLayout::RootlessWithHostMounts { .. } => {
+                RunscInvocationMode::Rootless
+            }
+            OciExecutionLayout::ExplicitUserNamespace { config }
+            | OciExecutionLayout::ExplicitUserNamespaceWithWorkspace { config, .. } => {
+                RunscInvocationMode::ExplicitUserNamespace(*config)
+            }
         }
-    }
-
-    /// CT-006a: attach the git-wire bind mounts (RO repo + optional writable quarantine) to this
-    /// config — they render into the SAME OCI `mounts` array the `/tmp` tmpfs uses. Consuming builder.
-    pub fn with_extra_mounts(mut self, mounts: Vec<WireMount>) -> OciConfig {
-        self.extra_mounts = mounts;
-        self
     }
 
     /// CT-006a: append extra `process.env` entries (`"KEY=VALUE"`) after the base `PATH`. Consuming
@@ -436,38 +596,59 @@ impl OciConfig {
             envs.push(format!("{e:?}"));
         }
         let env_json = envs.join(", ");
-        // `mounts`: the size-bounded writable `/tmp` tmpfs first (byte-unchanged), then any extra bind
-        // mounts (CT-006a: the RO repo + optional writable quarantine). Source/dest are JSON-escaped via
-        // `{:?}` so a path can carry no JSON-injection. A RO bind carries `ro`; a writable one `rw`.
+        // `mounts`: the size-bounded writable `/tmp` tmpfs first (byte-unchanged), then whatever
+        // host mounts this config's layout implies (CT-006a's git-wire repo/quarantine binds, or
+        // CT-007 slice 3's fixed workspace bind) — `OciExecutionLayout` only ever produces one
+        // shape or the other, never both. Source/dest are JSON-escaped via `{:?}` so a path can
+        // carry no JSON-injection.
         let mut mounts = vec![format!(
             "{{ \"destination\": \"/tmp\", \"type\": \"tmpfs\", \"source\": \"tmpfs\", \
              \"options\": [\"nosuid\", \"nodev\", \"mode=1777\", \"size={}\"] }}",
             self.tmpfs_bytes
         )];
-        for m in &self.extra_mounts {
-            let src = m.host_source.to_string_lossy();
-            let mode = if m.readonly { "ro" } else { "rw" };
-            mounts.push(format!(
-                "{{ \"destination\": {dest:?}, \"type\": \"bind\", \"source\": {src:?}, \
-                 \"options\": [\"bind\", \"{mode}\", \"nosuid\", \"nodev\"] }}",
-                dest = m.guest_dest,
-            ));
+        match &self.layout {
+            OciExecutionLayout::Rootless | OciExecutionLayout::ExplicitUserNamespace { .. } => {}
+            OciExecutionLayout::RootlessWithHostMounts {
+                mounts: wire_mounts,
+                ..
+            } => {
+                mounts.extend(wire_mounts.bind_mounts_json());
+            }
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace { workspace, .. } => {
+                // Always exactly one fixed writable mount — never caller-selectable readonly/dest.
+                mounts.push(bind_mount_json(
+                    OCI_WORKSPACE_MOUNT,
+                    &workspace.host_source,
+                    false,
+                ));
+            }
         }
         let mounts_json = mounts.join(", ");
-        // `root.path`: the absolute staged rootfs for the git wire, else the bundle-relative `rootfs`.
-        let root_path = self
-            .root_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "rootfs".to_string());
-        // CT-007 slice 2: `Rootless` (the ONLY production behavior before this field existed)
-        // emits BYTE-IDENTICAL JSON — no `user` namespace, no `uidMappings`/`gidMappings`.
-        // `ExplicitUserNamespace` adds a `user` namespace entry alongside the always-present
-        // network one, plus the exact two-entry uid/gid maps (container 0 -> this process's real
-        // identity, container 65534 -> the leased subordinate host uid/gid).
-        let (namespaces_json, id_mappings_json) = match &self.user_namespace {
-            None => (net_ns.to_string(), String::new()),
-            Some(cfg) => (
+        // `root.path`: absolute for either host-mount-bearing layout (required alongside a bind
+        // mount — see `AbsoluteRootfs`'s doc), else the bundle-relative `rootfs`.
+        let root_path = match &self.layout {
+            OciExecutionLayout::Rootless | OciExecutionLayout::ExplicitUserNamespace { .. } => {
+                "rootfs".to_string()
+            }
+            OciExecutionLayout::RootlessWithHostMounts {
+                absolute_rootfs, ..
+            }
+            | OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+                absolute_rootfs, ..
+            } => absolute_rootfs.as_path().to_string_lossy().to_string(),
+        };
+        // CT-007 slice 2/3: `Rootless`/`RootlessWithHostMounts` (the ONLY production behavior
+        // before user namespaces existed) emit BYTE-IDENTICAL namespace/mapping JSON — no `user`
+        // namespace, no `uidMappings`/`gidMappings`. Either explicit-userns layout adds a `user`
+        // namespace entry alongside the always-present network one, plus the exact two-entry
+        // uid/gid maps (container 0 -> this process's real identity, container 65534 -> the
+        // leased subordinate host uid/gid).
+        let (namespaces_json, id_mappings_json) = match &self.layout {
+            OciExecutionLayout::Rootless | OciExecutionLayout::RootlessWithHostMounts { .. } => {
+                (net_ns.to_string(), String::new())
+            }
+            OciExecutionLayout::ExplicitUserNamespace { config }
+            | OciExecutionLayout::ExplicitUserNamespaceWithWorkspace { config, .. } => (
                 format!("{net_ns}, {{ \"type\": \"user\" }}"),
                 format!(
                     ",\n    \"uidMappings\": [ {{ \"containerID\": 0, \"hostID\": {ruid}, \
@@ -475,10 +656,10 @@ impl OciConfig {
                      \"size\": 1 }} ],\n    \
                      \"gidMappings\": [ {{ \"containerID\": 0, \"hostID\": {rgid}, \"size\": 1 }}, \
                      {{ \"containerID\": {untrusted_gid}, \"hostID\": {sgid}, \"size\": 1 }} ]",
-                    ruid = cfg.runner_uid(),
-                    rgid = cfg.runner_gid(),
-                    suid = cfg.subordinate_uid(),
-                    sgid = cfg.subordinate_gid(),
+                    ruid = config.runner_uid(),
+                    rgid = config.runner_gid(),
+                    suid = config.subordinate_uid(),
+                    sgid = config.subordinate_gid(),
                     untrusted_uid = UNTRUSTED_UID,
                     untrusted_gid = UNTRUSTED_GID,
                 ),
@@ -3018,8 +3199,8 @@ pub fn gvisor_drill_config_json(spec: &JobSpec, script_name: &str) -> Result<Str
 // seccomp, no-netns egress-deny, non-root uid, bounded mem/pids/disk, whole-container kill + cleanup,
 // bounded capture). On top of that floor the git wire needs THREE things this section adds, all by
 // REUSING the machinery above:
-//   1. the bare repo BIND-MOUNTED READ-ONLY at `/repo` (a serve can never mutate it) — a [`WireMount`]
-//      rendered into the SAME OCI `mounts` array as the `/tmp` tmpfs;
+//   1. the bare repo BIND-MOUNTED READ-ONLY at `/repo` (a serve can never mutate it) — a
+//      [`GitWireMounts`] entry rendered into the SAME OCI `mounts` array as the `/tmp` tmpfs;
 //   2. a WRITABLE QUARANTINE bind-mount at `/quarantine` for `receive-pack` object intake — the
 //      sandboxed receive-pack writes objects THERE, the host-side ref-CAS policy (CT-006b) inspects it
 //      AFTER the run; it NEVER touches the real repo;
@@ -3226,8 +3407,8 @@ pub fn validate_wire_repo_slug(repo: &str) -> Result<Vec<String>, WireError> {
 
 /// Resolve the on-disk bare-repo path `<root>/<tenant>/<region>/<repo>.git`, FAIL-CLOSED on any
 /// traversing/absolute/separator/non-allowlisted segment (the GT-001 cross-tenant isolation boundary).
-/// This is the ONLY way a host path reaches a [`WireMount`] — a raw attacker-influenced path can never
-/// be mounted. Mirrors `myelin_git::gix_backend::RootedResolver::repo_path`.
+/// This is the ONLY way a host path reaches a git-wire bind mount — a raw attacker-influenced path
+/// can never be mounted. Mirrors `myelin_git::gix_backend::RootedResolver::repo_path`.
 pub fn resolve_bare_repo_path(
     root: &Path,
     tenant: &str,
@@ -3551,19 +3732,6 @@ impl GvisorBackend {
         let profile = HardeningProfile::derive(&job);
         profile.assert_enforced().map_err(WireError::Hardening)?;
 
-        // The git-wire mounts: the RO bare repo, then (if requested) the writable quarantine.
-        let mut mounts = vec![WireMount {
-            host_source: spec.repo_host_path.clone(),
-            guest_dest: WIRE_REPO_MOUNT.to_string(),
-            readonly: true,
-        }];
-        if let Some(q) = &spec.quarantine_host_path {
-            mounts.push(WireMount {
-                host_source: q.clone(),
-                guest_dest: WIRE_QUARANTINE_MOUNT.to_string(),
-                readonly: false,
-            });
-        }
         // The staged rootfs is referenced by an ABSOLUTE `root.path` (no symlink — required alongside
         // the host bind mounts). Canonicalize so the path is absolute; an absent rootfs is caught
         // (fail-closed) in `run_git_wire_container`.
@@ -3571,8 +3739,12 @@ impl GvisorBackend {
         let root_abs = std::fs::canonicalize(&rootfs).unwrap_or_else(|_| rootfs.clone());
         let cfg = OciConfig::from_spec(&job, &profile)
             .with_extra_env(spec.env.clone())
-            .with_extra_mounts(mounts)
-            .with_root_path(root_abs);
+            .with_rootless_host_mounts(
+                root_abs,
+                spec.repo_host_path.clone(),
+                spec.quarantine_host_path.clone(),
+            )
+            .map_err(WireError::Runtime)?;
         let reserve = hooks.reserve(&job)?;
         // Thread the REAL launch permit through to `run_and_capture` (Sol's fix): the old
         // `hooks.attribute(&job)` eagerly committed-and-released attribution HERE, before any
@@ -4385,11 +4557,213 @@ mod tests {
             "Rootless mode (the default) must never declare a user namespace or uid/gid mappings \
              — runsc --rootless installs its own, and a doubly-declared userns fails the gofer"
         );
+        assert!(
+            json.contains("\"path\": \"rootfs\""),
+            "ordinary rootless launch must use the bundle-relative rootfs: {json}"
+        );
         assert_eq!(
             cfg.invocation_mode(),
             RunscInvocationMode::Rootless,
             "a config with no explicit user namespace attached must report Rootless"
         );
+    }
+
+    /// CT-007 slice 3, piece 6 test matrix: the git-wire-shaped `RootlessWithHostMounts` layout —
+    /// an absolute rootfs override alongside its host bind mounts, still fully rootless (no user
+    /// namespace, no uid/gid mappings).
+    #[test]
+    fn oci_config_rootless_with_host_mounts_emits_absolute_root_and_the_bind_mounts() {
+        let cfg = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_rootless_host_mounts(
+                PathBuf::from("/abs/staged-rootfs"),
+                PathBuf::from("/host/repo"),
+                Some(PathBuf::from("/host/quarantine")),
+            )
+            .expect("an absolute rootfs override must be accepted");
+        assert_eq!(
+            cfg.invocation_mode(),
+            RunscInvocationMode::Rootless,
+            "host mounts alone must not imply a user namespace"
+        );
+        let json = cfg.to_json();
+        assert!(
+            json.contains("\"path\": \"/abs/staged-rootfs\""),
+            "the absolute rootfs override must be emitted verbatim: {json}"
+        );
+        assert!(
+            json.contains("\"destination\": \"/repo\"") && json.contains("\"ro\""),
+            "the RO repo bind mount must be present: {json}"
+        );
+        assert!(
+            json.contains("\"destination\": \"/quarantine\"") && json.contains("\"rw\""),
+            "the writable quarantine bind mount must be present: {json}"
+        );
+        assert!(
+            !json.contains("\"type\": \"user\"") && !json.contains("uidMappings"),
+            "RootlessWithHostMounts must never declare a user namespace or uid/gid mappings"
+        );
+    }
+
+    #[test]
+    fn oci_config_with_rootless_host_mounts_refuses_a_relative_rootfs() {
+        let result = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_rootless_host_mounts(
+                PathBuf::from("relative/staged-rootfs"),
+                PathBuf::from("/host/repo"),
+                None,
+            );
+        assert!(
+            result.is_err(),
+            "a non-absolute rootfs override must be refused, not silently accepted"
+        );
+    }
+
+    /// CT-007 slice 3, piece 6 test matrix: the workspace-mount layout — absolute root, explicit
+    /// user-namespace mappings, AND exactly one fixed writable workspace bind mount.
+    #[test]
+    fn oci_config_explicit_userns_with_workspace_emits_absolute_root_mappings_and_the_fixed_mount()
+    {
+        let config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
+        let workspace = OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace-subvol"));
+        let cfg = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_explicit_user_namespace_and_workspace(
+                config,
+                workspace,
+                PathBuf::from("/abs/staged-rootfs"),
+            )
+            .expect("an absolute rootfs override must be accepted");
+        assert_eq!(
+            cfg.invocation_mode(),
+            RunscInvocationMode::ExplicitUserNamespace(config)
+        );
+        let json = cfg.to_json();
+        assert!(
+            json.contains("\"path\": \"/abs/staged-rootfs\""),
+            "the workspace layout must use an absolute rootfs override: {json}"
+        );
+        assert!(
+            json.contains("\"type\": \"user\""),
+            "a user namespace must be declared: {json}"
+        );
+        assert!(
+            json.contains("\"containerID\": 65534, \"hostID\": 100005, \"size\": 1"),
+            "container uid 65534 must map to the leased subordinate host uid: {json}"
+        );
+        assert!(
+            json.contains("\"destination\": \"/workspace\"")
+                && json.contains("\"source\": \"/host/workspace-subvol\"")
+                && json.contains("\"rw\""),
+            "exactly one fixed writable workspace bind mount must be present: {json}"
+        );
+        // Never readonly, never a caller-selectable destination — only ONE workspace mount entry.
+        assert_eq!(
+            json.matches("\"destination\": \"/workspace\"").count(),
+            1,
+            "exactly one workspace mount, never more: {json}"
+        );
+    }
+
+    #[test]
+    fn oci_config_with_explicit_user_namespace_and_workspace_refuses_a_relative_rootfs() {
+        let config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
+        let workspace = OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace-subvol"));
+        let result = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_explicit_user_namespace_and_workspace(
+                config,
+                workspace,
+                PathBuf::from("relative/staged-rootfs"),
+            );
+        assert!(
+            result.is_err(),
+            "a non-absolute rootfs override must be refused, not silently accepted"
+        );
+    }
+
+    /// Sol's round-1 review of piece 6: layout selection must be ONE-SHOT — chaining two
+    /// layout-selecting builders must never silently discard whichever was selected first, even
+    /// though the enum itself already prevents an invalid FINAL combination.
+    #[test]
+    fn oci_config_layout_selection_is_one_shot() {
+        let config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
+        // userns first, THEN an attempt at rootless host mounts — must refuse, not silently revert.
+        let result = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_user_namespace(config)
+            .unwrap()
+            .with_rootless_host_mounts(
+                PathBuf::from("/abs/staged-rootfs"),
+                PathBuf::from("/host/repo"),
+                None,
+            );
+        assert!(
+            result.is_err(),
+            "attaching host mounts after a user namespace was already selected must refuse, not \
+             silently discard the user namespace"
+        );
+        // host mounts first, THEN an attempt at a user namespace — must refuse, not silently
+        // discard the mounts.
+        let result = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_rootless_host_mounts(
+                PathBuf::from("/abs/staged-rootfs"),
+                PathBuf::from("/host/repo"),
+                None,
+            )
+            .unwrap()
+            .with_user_namespace(config);
+        assert!(
+            result.is_err(),
+            "attaching a user namespace after host mounts were already selected must refuse, not \
+             silently discard the mounts"
+        );
+    }
+
+    /// Sol's round-1 review of piece 6: `RootlessWithHostMounts` must never accept a free-form
+    /// mount descriptor with a caller-controlled destination/mode — that could otherwise smuggle a
+    /// writable `/workspace`-shaped mount into a layout that reports `Rootless`. This test proves
+    /// there is no way to reach that state: the builder's signature only ever accepts fixed
+    /// repo/quarantine host-source paths, never an arbitrary destination or mode.
+    #[test]
+    fn oci_config_rootless_with_host_mounts_never_accepts_an_arbitrary_destination_or_mode() {
+        // The only two mounts `RootlessWithHostMounts` can ever produce are the fixed
+        // WIRE_REPO_MOUNT (always ro) and WIRE_QUARANTINE_MOUNT (always rw, only if requested) —
+        // proven by construction (the builder takes no `guest_dest`/`readonly` parameters at all),
+        // and confirmed here by asserting the JSON never contains anything else.
+        let cfg = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_rootless_host_mounts(
+                PathBuf::from("/abs/staged-rootfs"),
+                PathBuf::from("/host/repo"),
+                Some(PathBuf::from("/host/quarantine")),
+            )
+            .unwrap();
+        let json = cfg.to_json();
+        assert!(!json.contains("\"destination\": \"/workspace\""));
+        assert!(json.contains(WIRE_REPO_MOUNT));
+        assert!(json.contains(WIRE_QUARANTINE_MOUNT));
+    }
+
+    /// Empty host-mount collections are still valid (git-wire's OWN quarantine mount is genuinely
+    /// optional — a read-only serve with no push in flight has none) — the repo mount alone is
+    /// never itself optional, so "empty" here means "repo only," never "no mounts at all," which
+    /// this test confirms is exactly what a `None` quarantine source produces.
+    #[test]
+    fn oci_config_rootless_with_host_mounts_omits_the_quarantine_mount_when_absent() {
+        let cfg = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_rootless_host_mounts(
+                PathBuf::from("/abs/staged-rootfs"),
+                PathBuf::from("/host/repo"),
+                None,
+            )
+            .unwrap();
+        let json = cfg.to_json();
+        assert!(json.contains(WIRE_REPO_MOUNT));
+        assert!(!json.contains(WIRE_QUARANTINE_MOUNT));
     }
 
     /// CT-007 slice 2: `with_user_namespace` must produce the EXACT two-entry OCI mapping the
@@ -4400,7 +4774,8 @@ mod tests {
         let config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
         let cfg = GvisorBackend::oci_config(&spec(vec![]))
             .unwrap()
-            .with_user_namespace(config);
+            .with_user_namespace(config)
+            .expect("a fresh Rootless config must accept a user-namespace layout selection");
         assert_eq!(
             cfg.invocation_mode(),
             RunscInvocationMode::ExplicitUserNamespace(config)
@@ -4427,6 +4802,11 @@ mod tests {
         assert!(json.contains("\"readonly\": true"));
         assert!(json.contains("\"noNewPrivileges\": true"));
         assert!(json.contains("\"uid\": 65534") && json.contains("\"gid\": 65534"));
+        assert!(
+            json.contains("\"path\": \"rootfs\""),
+            "explicit userns WITHOUT a workspace mount involves no host bind mount, so it must \
+             still use the bundle-relative rootfs, not an absolute override: {json}"
+        );
     }
 
     /// `apply_runsc_invocation_policy` is the ONE place `run`/`kill`/`delete` decide their global
@@ -4818,7 +5198,9 @@ mod tests {
         let mut command_spec = spec(vec![]);
         command_spec.command = vec!["/bin/sh".into(), "-c".into(), "id".into()];
         let profile = HardeningProfile::derive(&command_spec);
-        let cfg = OciConfig::from_spec(&command_spec, &profile).with_user_namespace(lease.config());
+        let cfg = OciConfig::from_spec(&command_spec, &profile)
+            .with_user_namespace(lease.config())
+            .expect("a fresh Rootless config must accept a user-namespace layout selection");
         assert_eq!(
             cfg.invocation_mode(),
             RunscInvocationMode::ExplicitUserNamespace(lease.config())
