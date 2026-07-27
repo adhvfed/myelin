@@ -2310,7 +2310,55 @@ reachable gap (doc corrected; a real full-chain test added showing `validate()` 
 catches it) — and asked for direct `idem_token` divergence test coverage (added). Final round:
 cleared with no remaining blocker.
 
-**Still open:** 5b.3-2c (dynamic `repo:<id>#pull` capability derivation/minting in
-`ci_identity_adapter.rs`, plus real `CheckoutAuthorizationHook` wiring) is designed with Sol but not
-yet implemented — the fixed fields are otherwise unaffected. 5b.3-3 through 5b.3-7 remain scoped
-only at a task-description level. Task #20 and the live-drill host-provisioning gap are unchanged.
+**Still open (at the time of that entry):** 5b.3-2c (dynamic `repo:<id>#pull` capability
+derivation/minting in `ci_identity_adapter.rs`, plus real `CheckoutAuthorizationHook` wiring) was
+designed with Sol but not yet implemented. See the next entry — it has since landed.
+
+## 2026-07-27 — CT-007 slice 5b.3-2c landed: dynamic exact-repo capability + real
+## checkout-authorization hook (Sol, design + 2 review rounds) — 5b.3-2 (the full checkout
+## authorization proof, umbrella task #66) is now COMPLETE
+
+Closes the last open piece of the checkout authorization chain: the exact-repo capability grant is
+now actually derived and minted (not just structurally checked), and
+`RunnerHooks.checkout_authorization` is wired to a real implementation in production instead of
+staying unconfigured. Committed `7e436775`.
+
+**What landed:**
+- `CiJobAuthorizationContext.checkout_scope: Option<CheckoutAuthorizationScope>` — the dynamic
+  `repo:<ref>#pull` capability alone proves repo-read authority but not the exact commit; this field
+  binds the exact commit separately.
+- `required_ci_capabilities(checkout)` — the one shared helper for minting, context construction,
+  and verification, so all three can never disagree. `repo:<full ArtifactRef>#pull`, never a bare
+  `repo_id`. Compute jobs keep exactly the original two capabilities.
+- `mint_claim_credential` now actually grants the capability at mint time (threaded from
+  `authority.checkout`), not just a context checked against a mint that never had it.
+- `IdentityCiJobLaunchAuthorizer::verify_ci_job_signed` — the shared, read-only verification core
+  both `authorize_retained` (the real workload launch boundary) and the new `authorize_checkout`
+  (the pre-Hop-A hook) call. A genuine re-verification each time: job kind, context shape, the exact
+  capability vector, that the checkout scope re-derived from the in-hand `JobSpec.workspace` agrees
+  exactly with the server-resolved authorization context, the cryptographic bearer, and that the
+  credential's expiry never outlives the durable claim.
+- `CiJobLaunchClaimGate::verify_live` + a new `CiJobQueueStore::verify_launch_live` query — the
+  read-only sibling of the real launch CAS (same generation predicate, including the `ci_job`
+  surface-state gate), never mutating state or holding an advisory lock.
+- `ci_runner_composition::ci_runner_hooks` now configures `.with_checkout_authorization(...)`,
+  backed by the same `Arc<IdentityCiJobLaunchAuthorizer>` the launch fence already uses.
+
+**Sol's review, 2 rounds:** Round 1 found the read-only durable-claim query omitted the `ci_job`
+surface gate (letting the checkout hook proceed for a job the real launch CAS would refuse),
+substitution tests that didn't exercise the actual production attack shapes (commit substitution
+must fail at the context-scope comparison specifically; repository substitution must fail at signed-
+token verification specifically, since structural comparisons alone would pass), and asked for a
+live-PostgreSQL proof of the new query's production semantics — extended the existing
+`integration_ci_drive_manifest_store` test (not a new one) to call `authorize_checkout` against real
+durable state at 4 points, run repeatably against the dev PostgreSQL instance. Round 2: cleared after
+two wording corrections (the context is server-resolved but not itself signed; only the bearer is
+signed — and precisely scoping what the live test does vs. does not yet prove about `RunnerHooks`
+invocation).
+
+**Still open:** 5b.3-3 through 5b.3-7 (refactor `fetch_checkout_pack` into a parent-attempt
+transport; durable pre-workload usage; honest terminal dispositions; full `launch_with` composition;
+the live drill through the public launch path) remain scoped only at a task-description level — none
+of the checkout-authorization plumbing landed in 5b.3-2a/2b/2c is actually INVOKED by a real launch
+yet (the hook is configured but nothing calls it until 5b.3-3+ wires Hop A through it). Task #20 and
+the live-drill host-provisioning gap (two entries up) are unchanged.
