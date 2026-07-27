@@ -1755,6 +1755,7 @@ fn settle_enabled_workspace_and_lease(
 /// `launch_with` now fully consumes `Enabled` (health checks, acquisition, durable bind, checked
 /// finalization, evidence-validated release) — this is `pub`, not `pub(crate)`, from this piece
 /// onward.
+#[derive(Debug)]
 pub enum GvisorWorkspaceConfig {
     Disabled,
     Enabled {
