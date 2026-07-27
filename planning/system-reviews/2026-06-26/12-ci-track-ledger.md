@@ -2018,3 +2018,143 @@ into `launch_with`'s real sequence, including the real Enabled-path drill). Neit
 slice's own `CheckoutPreparationSession`/`WorkloadBindingIdentity`/durable lease machinery is fully
 built and tested but not yet wired into `GvisorBackend`/`launch_with` — same deliberate deferral
 discipline as every earlier slice's own "not yet consumed" scaffolding.
+
+## 2026-07-27 — CT-007 slice 5b.2 landed: the checkout-specific runtime (Sol, 5 review rounds)
+
+Slice 5b.2 (previous entry's "still open") is closed: `fetch_checkout_pack` (Hop A) +
+`run_checkout_preparation` (Hop B) — a full, real checkout-preparation transport and sandboxed
+execution path, built on 5b.1's sequential lease lifecycle. Design was locked in with Sol across 2
+rounds before any code was written (a two-hop, host-glued sequence — Hop A finishes fully before Hop
+B starts, never a live inter-container pipe, never `/repo` mounted into either runtime), then
+implemented and adversarially reviewed across 5 more rounds before commit.
+
+**What Hop A is.** `fetch_checkout_pack`: a REAL, billed use of the EXISTING, unchanged
+`GvisorBackend::launch_git_wire` — advertise-refs, then a single-shot `want <oid> ... / deepen 1 /
+done` fetch, both under a dedicated per-invocation `-c uploadpack.allowReachableSHA1InWant=true`
+(never a general-serving-path reconfiguration; CI/merge-queue dispatch commonly targets a commit
+that is reachable but no longer an exact advertised tip by the time a queued attempt starts, and this
+codebase has no per-attempt ref to pin it with today — Sol's round-2 finding, resolved as a CHECKED
+precondition: parse the advertisement, proceed only if the oid is a direct tip OR the server actually
+offers the capability, never silently assume the `-c` was honored). A new hand-written pkt-line
+reader (`read_pkt_line`) implements the EXACT grammar for this one specialized request (never the
+general git-protocol grammar, which allows far more): `0000`/`0001`-`0003` reserved/`>0xfff0`
+refused; the fetch response's mandatory shallow-info section (always present because `deepen 1` was
+requested, even for a root commit) ends in exactly one flush, then exactly one `NAK` (no ACK — no
+`have` lines were ever sent), then the raw pack read directly to EOF, never scanned for. The
+advertisement parser requires the first line's capability section to be present (its absence is a
+malformed/spoofed response, not a capability-less repo) and REQUIRES `shallow`/`no-progress`/
+`ofs-delta` actually be advertised (this transport always relies on them), refusing on any missing
+capability or trailing bytes after the terminating flush. `PrefetchedCheckoutPack` carries the fetched
+pack as a file (never a second in-memory `Vec` — the git-wire capture path already materializes one).
+
+**What Hop B is.** `run_checkout_preparation`: a NEW, dedicated checkout-preparation container —
+`ExplicitUserNamespace` + the workspace mount (the lease's `PreparationBound` identity), no `/repo`,
+no network — NOT billable on its own (no `reserve`/`settle` call of its own; its measured usage is
+carried in every post-spawn `CheckoutPreparationError` variant for 5b.3's aggregate settlement to
+fold in, never silently free). Uses an internally-minted `LaunchPermit::immediate()` (never `None`,
+which would skip the mechanical launch-gate/watchdog entirely, not merely the durable CAS — Sol's
+round-1 finding). The checkout script (object-format-aware `git init`, `core.hooksPath=/dev/null` +
+empty `--template=`, seeded `.git/shallow`, `index-pack --stdin --strict` with no `--fix-thin`/
+thin-pack, `test "$(...)" = "..."` comparisons never bare exit codes, detached checkout, `diff-index
+--quiet` against the wanted tree) runs, and its confirmation line + exit status are checked — but
+NOT before the runtime's teardown is independently proven and `session.confirm_prepared` has already
+run REGARDLESS of the checkout's own outcome (an ordinary corrupt pack or wrong tree must never force
+permanent quarantine of a lease whose runtime genuinely tore down cleanly — the load-bearing ordering
+property from Sol's round-1 design review, extracted into a standalone `evaluate_checkout_finalization`
+specifically so it is unit-testable against synthetic `RuntimeFinalization`/`RuntimeQuiescenceEvidence`
+values against a REAL, non-privileged `UserNamespaceAllocator` lease, no `runsc` spawn needed).
+`CheckoutPreparationError` has four dispositions (`Refused` — free, nothing spawned;
+`Unreleasable`/`TeardownUnproven`/`RejectedAfterQuiescence` — every one carries real measured usage).
+
+**The locked ledger-12 contract (rejecting gitlinks, hashing `Cargo.lock`) — implemented.** The
+checkout script now runs `git ls-tree -r "$oid"` right after confirming the object exists (before
+checkout) and refuses if any gitlink (mode `160000`) entry is present — this transport never fetches
+submodule repos, so a superproject with unpopulated submodules would silently build wrong. A new
+`hash_workspace_cargo_lock_no_follow` re-reads `Cargo.lock` host-side (FD-safe, `openat(O_NOFOLLOW)`
+relative to the workspace, never a guest-reported hash — the same reasoning that makes `HEAD` itself
+host-re-verified: this digest becomes slice 6's cache/asset key, so it must be independently
+authoritative), SHA-256 via the `sha2` crate already used by `canonical_tar.rs` (no new dependency),
+bounded at 16 MiB, refuses absence/symlink/non-regular-file. `PreparedCheckoutEvidence` now carries
+`cargo_lock_sha256_hex`.
+
+**Host-side FD-safe re-verification, both HEAD and Cargo.lock.** Neither the guest's own
+`rev-parse`/`diff-index` claims nor a guest-reported hash are trusted alone. `verify_workspace_head_
+no_follow` walks `<workspace>/.git` via `openat(O_NOFOLLOW)` at every component and requires
+`.git/HEAD` to be a bounded real regular file containing exactly `<oid>\n`. A real defect found here
+(Sol's round-3 review): the file-open itself used plain `O_RDONLY`, which BLOCKS FOREVER on a
+guest-planted FIFO before the "is it a regular file" check is ever reached — fixed with `O_NONBLOCK`
+(harmless for a real regular file's reads) plus a bounded-READ (not merely a preceding
+`metadata().len()` stat-then-act gap) via `.take(129).read_to_end(...)`. A dedicated test proves the
+fix by running the check on a background thread with a bounded `recv_timeout`, so a regression fails
+loudly instead of hanging the whole suite.
+
+**Review process: 5 rounds with Sol, each finding genuine, concrete defects.** Round 1 (6 blockers):
+Hop A leaked both `SandboxLaunch` handles on every path and never checked `passed()` before trusting
+stdout; the claimed bind-boundary identity revalidation didn't actually happen (the STALE early-read
+value was durably bound, never a fresh live one — mirrors `bind_enabled_lease_given`'s two-check
+pattern, now actually implemented); the FIFO-blocking HEAD-reader bug above; bypassing `JobSpec` also
+bypassed its mandatory `pids_max`/`timeout_secs` validation (fixed via a new shared
+`validate_execution_limits`, `CheckoutPreparationSpec::new` now fallible); both new/pre-existing
+temp-file staging points used a plain, symlink-following, umask-dependent `File::create` rather than
+`create_new`+explicit `0600` (fixed in both `tempfile_for_checkout_pack` AND the pre-existing
+`drain_to_temp_file`, which now also carries 5b.2's private packs); the advertisement parser didn't
+enforce the capabilities its own request relies on. Round 2 (4 more): Hop A's cleanup still leaked on
+an early-return before `backend.kill` was ever reached; a successful checkout evaluation ignored
+`RunscOutcome::stdout_truncated`/`stream_error`; the gitlink/Cargo.lock requirement above was
+entirely missing (a real, previously-recorded ledger requirement this session's own design pass had
+overlooked); the live drill was a hard commit requirement, not something 5b.1's "not yet a live
+consumer" precedent could excuse (Sol: 5b.1 was predominantly a deterministic state machine; 5b.2 is
+a real interoperability composition across Git protocol, OCI, `runsc`, cgroups, user namespaces,
+Btrfs, and durable lease transitions — a materially different risk profile). Round 3 (3 more, after
+the live drill was built and genuinely exercised its own skip path): the live drill released the
+lease BEFORE deleting its workspace (violates the central identity invariant — fixed:
+`workspace_manager.delete_workspace` now required to succeed first); the two live drills (this one +
+the pre-existing Enabled activation drill) share the SAME operator-provisioned `leases_dir` and could
+race under `cargo test`'s default parallelism (fixed: a shared, poison-tolerant
+`USERNS_DRILL_LEASES_DIR_LOCK` both acquire first); a parse error's `?` could propagate before a
+simultaneous `kill` error was even inspected, silently hiding a real runtime leak (fixed: combined
+into one `match` over all four outcome combinations); the gitlink-detection pipeline treated a
+FAILING `git ls-tree` the same as "no gitlinks found," because a bare pipe's exit status is its LAST
+command's (`grep`'s) — fixed with an explicit `command_substitution || { exit 1; }` for `ls-tree`
+and an `if/else`-captured (hence `set -e`-exempt) grep exit status distinguishing found/not-found/
+hard-failure, plus 3 new tests running the identical snippet against real host `git`+`sh` (no
+`runsc` needed) proving the clean-commit, gitlink-present, AND ls-tree-failure dispositions. Round 4:
+**cleared to commit**, with one non-blocking note (a test-count miscount in my own summary, not a
+code defect).
+
+**The live drill.** `checkout_preparation_runs_end_to_end_through_real_git_wire_and_runsc`,
+`#[cfg(feature = "integration")]`, lives in `gvisor.rs`'s own `mod tests` (not an external
+`tests/*.rs` file — `run_checkout_preparation`/`fetch_checkout_pack`/`CheckoutPreparationSpec`/
+`CheckoutPreparationSession` are all `pub(crate)`, unreachable from outside the crate). Stages a
+real git-bearing rootfs from the busybox base (adapted from `tests/git_wire_prod_exec_test.rs`'s own
+recipe — that file's staging can't be reused directly since it runs in a separate test-binary
+process), builds a REAL bare repo with TWO commits + a committed `Cargo.lock`, requests the OLDER
+(non-tip) commit specifically to exercise `allow-reachable-sha1-in-want` + the shallow boundary (Sol's
+suggestion), runs Hop A against a real `GvisorBackend`, acquires a real workspace+lease via
+`acquire_enabled_workspace` (the SAME function `launch_with`'s Enabled path uses) against a real
+`GvisorBackend::try_new(Enabled)`, runs Hop B, and asserts the returned evidence's commit hex + a
+non-empty Cargo.lock digest before deleting the workspace and releasing the lease. Gating mirrors the
+pre-existing Enabled activation drill exactly (`runsc` absent / `preflight_explicit_userns_policy`
+failing / base rootfs absent / `MYELIN_USERNS_DRILL_LEASES_DIR` unset are the ONLY legitimate skips;
+every other failure is a hard `.expect`, never caught-and-skipped). Verified it actually RUNS (not
+merely compiles): on this dev host it correctly reaches and fails exactly the
+`preflight_explicit_userns_policy` gate (`runsc`'s own ancestor chain, under this user's home
+directory, is honestly refused by the strict own-euid-ownership check) — an honest, expected skip,
+not a vacuous one. Real end-to-end execution (provisioning a hardened `newuidmap`/`newgidmap` helper
+dir + `runsc` state root + an operator-installed `leases_dir`) remains explicitly tracked as
+follow-up infrastructure work, separate from this commit, per Sol's own call.
+
+**Verified, final round:** `cargo test -p myelin-ci-sandbox --lib --features "test-support
+integration"` — 459 passed, 0 failed (67 new in `checkout_preparation_5b2`, on top of the pre-existing
+392). `cargo clippy -p myelin-ci-sandbox --lib --all-targets` clean on both feature combinations.
+`cargo build --workspace --locked` clean. `cargo check --workspace` clean.
+
+**Still open:** 5b.3 (atomic composition into `launch_with`'s real sequence: the resource-reservation
+choreography — reserve aggregate resources, acquire workspace/userns identity, run Hop A + Hop B in
+sequence, acquire the real workload's own `LaunchPermit`, checked-add both usages into one final
+settlement — none of which 5b.2 attempts; it is a pure sandboxed-execution unit given
+already-acquired capabilities). Also open: task #20 (the EROFS cargo-vendor asset, now unblocked in
+principle since `PreparedCheckoutEvidence` carries the `Cargo.lock` digest it needs to key off of,
+but still gated behind 5b.3 landing a real materialized checkout in production). And the live-drill
+infrastructure gap noted above (host provisioning for a genuine green execution, not just an honest
+skip).
