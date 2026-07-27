@@ -61,6 +61,7 @@
 
 pub mod asset_registry;
 pub mod canonical_tar;
+mod checkout_authorization;
 mod dirlock;
 pub mod escape_corpus;
 pub mod events;
@@ -1197,6 +1198,11 @@ pub struct RunnerHooks {
     /// Guarantee #4: the isolation-floor hook the escape drill (CI-P5) drives — apply + verify the
     /// mandatory hardening profile (arch 02 §5.3) before any untrusted code runs.
     isolation_floor: IsolationFloorHook,
+    /// CT-007 slice 5b.3-2: the pre-Hop-A checkout-authorization hook. `None` for every ordinary
+    /// (non-checkout) caller, and for any caller that has not yet configured one via
+    /// [`Self::with_checkout_authorization`] — [`Self::authorize_checkout`] refuses outright on
+    /// `None` rather than silently treating a missing hook as authorization granted.
+    checkout_authorization: Option<CheckoutAuthorizationHook>,
 }
 
 /// Single durable owner of successful completion settlement.
@@ -1226,6 +1232,91 @@ pub type AttributeHook = Box<dyn Fn(&JobSpec) -> Result<(), HookError> + Send + 
 pub type LaunchFenceHook = Box<dyn Fn(&JobSpec) -> Result<LaunchPermit, HookError> + Send + Sync>;
 /// Guarantee #4 hook type (arch 02 §5.3): apply + verify the mandatory hardening profile.
 pub type IsolationFloorHook = Box<dyn Fn(&JobSpec) -> Result<(), HookError> + Send + Sync>;
+
+/// Re-exported from the private `workspace_intent` module (CT-007 slice 5b.3-2a, Sol's review: ONE
+/// enum, never a duplicated public mirror that could drift from it) — see
+/// [`workspace_intent::GitObjectFormat`](crate::workspace_intent::GitObjectFormat) for the full doc.
+pub use crate::workspace_intent::GitObjectFormat;
+
+/// A narrow, read-only view of a checkout-bearing job's target (CT-007 slice 5b.3-2a) — handed to
+/// the control-plane's [`CheckoutAuthorizationHook`], deliberately NOT the full
+/// `workspace_intent::ValidatedCheckoutRequest` (Sol's review: the authorizer needs exactly the
+/// repo/commit dimension, nothing else). Carries plain, already-validated data — no secrets, no
+/// filesystem paths (the opaque `repo_id` is never resolved to one here).
+///
+/// Fields are private (Sol's review): the redundant `tenant`/`repo_ref`/`repo_id` and
+/// `commit_hex`/`commit_format` pairs could otherwise be constructed disagreeing with each other by
+/// any public-field literal. `Self::new` is `pub(crate)` — the ONLY real caller is
+/// `workspace_intent::ValidatedCheckoutRequest::to_authorization_scope`, which always derives every
+/// field from the SAME already-validated request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckoutAuthorizationScope {
+    tenant: myelin_tenancy::TenantId,
+    repo_ref: myelin_events::ArtifactRef,
+    repo_id: String,
+    commit_hex: String,
+    commit_format: GitObjectFormat,
+}
+
+impl CheckoutAuthorizationScope {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        tenant: myelin_tenancy::TenantId,
+        repo_ref: myelin_events::ArtifactRef,
+        repo_id: String,
+        commit_hex: String,
+        commit_format: GitObjectFormat,
+    ) -> Self {
+        Self {
+            tenant,
+            repo_ref,
+            repo_id,
+            commit_hex,
+            commit_format,
+        }
+    }
+
+    pub fn tenant(&self) -> &myelin_tenancy::TenantId {
+        &self.tenant
+    }
+
+    pub fn repo_ref(&self) -> &myelin_events::ArtifactRef {
+        &self.repo_ref
+    }
+
+    pub fn repo_id(&self) -> &str {
+        &self.repo_id
+    }
+
+    pub fn commit_hex(&self) -> &str {
+        &self.commit_hex
+    }
+
+    pub fn commit_format(&self) -> GitObjectFormat {
+        self.commit_format
+    }
+}
+
+/// The pre-Hop-A checkout-authorization hook (CT-007 slice 5b.3-2): a READ-ONLY check (never a
+/// state transition — the real workload's `leased -> running` CAS stays `attribute`/
+/// `acquire_launch_permit`'s job, committed only later, after a successful Hop B) that the job's
+/// durably authorized claim actually grants read access to the EXACT repo/commit its
+/// `WorkspaceIntent` names. `None` on a [`RunnerHooks`] that never configured one (e.g. every
+/// ordinary compute-job caller) — `RunnerHooks::authorize_checkout` refuses outright rather than
+/// silently treating a missing hook as authorized.
+pub type CheckoutAuthorizationHook =
+    Box<dyn Fn(&JobSpec, &CheckoutAuthorizationScope) -> Result<(), HookError> + Send + Sync>;
+
+/// An unforgeable, one-shot proof that [`RunnerHooks::authorize_checkout`] genuinely succeeded for
+/// an EXACT [`CheckoutAuthorizationScope`] AND an exact token generation (CT-007 slice 5b.3-2a,
+/// Sol's review). Defined in the private `checkout_authorization` module — NOT here at the crate
+/// root — because Rust's privacy rules make a private field visible to every descendant module of
+/// its defining module; if this type lived here, `gvisor.rs` (a descendant of the crate root, same
+/// as every module in this crate) could forge one via a struct literal, defeating the whole
+/// capability guarantee. Living in its own sibling module means only that module — the one that
+/// actually calls the hook — can ever construct one.
+#[allow(unused_imports)]
+pub(crate) use checkout_authorization::CheckoutAuthorizationProof;
 
 enum AttributionHook {
     Immediate(AttributeHook),
@@ -1350,6 +1441,7 @@ impl RunnerHooks {
             settle,
             attribute: AttributionHook::Immediate(attribute),
             isolation_floor,
+            checkout_authorization: None,
         }
     }
 
@@ -1368,7 +1460,18 @@ impl RunnerHooks {
             settle,
             attribute: AttributionHook::Fenced(attribute),
             isolation_floor,
+            checkout_authorization: None,
         }
+    }
+
+    /// CT-007 slice 5b.3-2: attach the checkout-authorization hook. Consuming builder — every
+    /// existing `new`/`new_with_launch_fence` caller is byte-unchanged (`checkout_authorization`
+    /// defaults to `None`); only a caller that actually dispatches checkout-bearing jobs needs to
+    /// call this.
+    #[allow(dead_code)]
+    pub fn with_checkout_authorization(mut self, hook: CheckoutAuthorizationHook) -> Self {
+        self.checkout_authorization = Some(hook);
+        self
     }
 
     /// The one configured owner of successful completion settlement.
@@ -1913,6 +2016,61 @@ mod tests {
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         )
+    }
+
+    fn checkout_scope() -> CheckoutAuthorizationScope {
+        CheckoutAuthorizationScope::new(
+            myelin_tenancy::TenantId("acme".to_string()),
+            myelin_events::ArtifactRef("myelin://acme/git/repo/widgets".to_string()),
+            "widgets".to_string(),
+            "a".repeat(40),
+            GitObjectFormat::Sha1,
+        )
+    }
+
+    #[test]
+    fn authorize_checkout_refuses_when_no_hook_is_configured() {
+        let hooks = test_hooks();
+        let err = hooks
+            .authorize_checkout(&ci_spec(), checkout_scope())
+            .unwrap_err();
+        assert!(err.0.contains("no hook was configured") || err.0.contains("none was provided"));
+    }
+
+    #[test]
+    fn authorize_checkout_mints_a_proof_carrying_the_exact_scope_on_success() {
+        let hooks = test_hooks().with_checkout_authorization(Box::new(|_spec, _scope| Ok(())));
+        let proof = hooks
+            .authorize_checkout(&ci_spec(), checkout_scope())
+            .expect("configured hook returning Ok must mint a proof");
+        assert_eq!(proof.scope(), &checkout_scope());
+        assert_eq!(proof.run_token_jti(), "jti-1");
+    }
+
+    #[test]
+    fn authorize_checkout_propagates_the_hook_error_and_mints_no_proof() {
+        let hooks = test_hooks()
+            .with_checkout_authorization(Box::new(|_spec, _scope| {
+                Err(HookError("repo not authorized for this claim".to_string()))
+            }));
+        let err = hooks
+            .authorize_checkout(&ci_spec(), checkout_scope())
+            .unwrap_err();
+        assert_eq!(err.0, "repo not authorized for this claim");
+    }
+
+    #[test]
+    fn authorize_checkout_hands_the_hook_the_exact_scope_it_was_given() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_in_hook = Arc::clone(&seen);
+        let hooks = test_hooks().with_checkout_authorization(Box::new(move |_spec, scope| {
+            *seen_in_hook.lock().unwrap() = Some(scope.clone());
+            Ok(())
+        }));
+        hooks
+            .authorize_checkout(&ci_spec(), checkout_scope())
+            .expect("must succeed");
+        assert_eq!(seen.lock().unwrap().as_ref(), Some(&checkout_scope()));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! CT-007 slice 5b.3-1: deriving a job's checkout intent from its [`crate::WorkspaceSpec`] —
 //! backend-independent semantics, deliberately NOT in `gvisor.rs` (Sol's review: the intent parser
-//! must not depend conceptually on a backend implementation). `pub(crate)` throughout; nothing here
+//! must not depend conceptually on a backend implementation). `pub(crate)` throughout except
+//! [`GitObjectFormat`] itself (re-exported at the crate root — see its own doc); nothing else here
 //! is exposed outside this crate.
 //!
 //! This module answers ONLY "is this job checkout-bearing, and if so, what did the caller ask for,
@@ -12,7 +13,7 @@
 
 use crate::JobKind;
 
-/// The git object-format hex width an [`ExpectedGitCommitId`] was validated against. Local to this
+/// The git object-format hex width an `ExpectedGitCommitId` was validated against. Local to this
 /// crate deliberately: `myelin-ci-sandbox` does not depend on `myelin-git`'s
 /// `object_format::ObjectFormat`/`receive_pack::Oid` types (a much higher-level subsystem crate) —
 /// pulling those in just for this would be a genuinely new, unwarranted DAG edge. This type carries
@@ -20,8 +21,13 @@ use crate::JobKind;
 /// and which wire capability / `git init` flag that implies. (`myelin-refs`, used elsewhere in this
 /// module for `ArtifactRef` parsing, is a DIFFERENT, already-existing production dependency of this
 /// crate — a shared URN-grammar crate, not a subsystem crate — see this crate's own `Cargo.toml`.)
+///
+/// `pub` (re-exported at the crate root as `crate::GitObjectFormat`, CT-007 slice 5b.3-2a, Sol's
+/// review) so [`crate::CheckoutAuthorizationScope`] can carry it directly — ONE enum, not a
+/// duplicated public mirror that could drift from this one. Its wire-specific methods stay
+/// `pub(crate)`: only this crate's own checkout transport needs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GitObjectFormat {
+pub enum GitObjectFormat {
     Sha1,
     Sha256,
 }
@@ -170,6 +176,21 @@ impl ValidatedCheckoutRequest {
     pub(crate) fn commit(&self) -> &ExpectedGitCommitId {
         &self.commit
     }
+
+    /// Project this SYNTACTICALLY-validated request into the narrow
+    /// [`crate::CheckoutAuthorizationScope`] (CT-007 slice 5b.3-2a) — the ONE place a
+    /// `CheckoutAuthorizationScope` is ever constructed from real data (its own fields are
+    /// private; this module is the sole legitimate source).
+    #[allow(dead_code)]
+    pub(crate) fn to_authorization_scope(&self) -> crate::CheckoutAuthorizationScope {
+        crate::CheckoutAuthorizationScope::new(
+            self.tenant.clone(),
+            self.artifact_ref.clone(),
+            self.repo_id.clone(),
+            self.commit.as_str().to_string(),
+            self.commit.format(),
+        )
+    }
 }
 
 /// Derive a job's [`WorkspaceIntent`] from its `kind` + [`crate::WorkspaceSpec`] (CT-007 slice
@@ -301,6 +322,13 @@ mod tests {
         assert_eq!(request.commit().as_str(), oid);
         assert_eq!(request.commit().format(), GitObjectFormat::Sha1);
         assert_eq!(request.artifact_ref().0, "myelin://acme/git/repo/widgets");
+
+        let scope = request.to_authorization_scope();
+        assert_eq!(scope.tenant().0, "acme");
+        assert_eq!(scope.repo_ref().0, "myelin://acme/git/repo/widgets");
+        assert_eq!(scope.repo_id(), "widgets");
+        assert_eq!(scope.commit_hex(), oid);
+        assert_eq!(scope.commit_format(), GitObjectFormat::Sha1);
     }
 
     #[test]
