@@ -38,9 +38,15 @@ use crate::launch_gate::{DirectChildRetirement, SandboxCommand, SpawnPhase};
 use crate::redaction::RedactionPlan;
 use crate::runner::RetryableAttemptCause;
 use crate::user_namespace::{
-    RunscInvocationMode, UserNamespaceAllocator, UserNamespaceAllocatorError, UserNamespaceConfig,
+    RunscInvocationMode, UserNamespaceAllocator, UserNamespaceAllocatorError,
+    UserNamespaceBindError, UserNamespaceConfig, UserNamespaceLease, UserNamespaceQuiescenceProof,
+    UserNamespaceRefusal,
 };
-use crate::workspace_manager::{WorkspaceManager, WorkspaceManagerError, WorkspaceStorageMode};
+use crate::workspace_manager::{
+    CapacityLease, CapacityRefusal, DeleteWorkspaceError, ManagedWorkspace, WorkspaceManager,
+    WorkspaceManagerError, WorkspaceProvisionError, WorkspaceStorageMode,
+};
+use crate::workspace_storage::WorkspaceStorageError;
 use crate::{
     drain_capped, CompletionSettlementOwner, EgressPolicy, HookError, IdemToken, ImageRef, JobKind,
     JobSpec, LaunchPermit, MeterTarget, ReserveHandle, ResourceLimits, ResourceUsage,
@@ -362,7 +368,6 @@ impl OciWorkspaceMount {
     /// Piece 7 constructs this from a REAL `ManagedWorkspace` it keeps alive separately for the
     /// duration of the launch; this projection carries only what `to_json` needs to render the bind
     /// mount, never ownership of the workspace itself.
-    #[allow(dead_code)]
     pub(crate) fn from_managed_workspace(
         workspace: &crate::workspace_manager::ManagedWorkspace,
     ) -> Self {
@@ -585,7 +590,6 @@ impl OciConfig {
     /// consumed by any production launch path — that's piece 7, which supplies the real
     /// `ManagedWorkspace` this config's [`OciWorkspaceMount`] merely projects from. Consuming
     /// builder; fails if `absolute_rootfs` is not actually absolute.
-    #[allow(dead_code)]
     pub(crate) fn with_explicit_user_namespace_and_workspace(
         mut self,
         config: UserNamespaceConfig,
@@ -1290,7 +1294,6 @@ pub struct GvisorBackend {
     /// `launch_with` don't read this yet (that's the later `OciExecutionLayout`/launch-redesign
     /// piece). `new`/`git_wire_only` always construct `Disabled`; only the not-yet-public
     /// [`GvisorBackend::try_new`] can construct `Enabled`.
-    #[allow(dead_code)]
     workspace_integration: WorkspaceIntegration,
 }
 
@@ -1300,7 +1303,6 @@ pub struct GvisorBackend {
 /// together. Do not add a way to enable one without the other — if explicit-userns-without-
 /// workspace ever becomes a legitimate need, add a deliberate third variant then, rather than
 /// letting an invalid combination be constructed and pushing validation to a later layer.
-#[allow(dead_code)]
 enum WorkspaceIntegration {
     /// The production floor until slice 4: no workspace mount is ever offered, and no
     /// [`UserNamespaceAllocator`] is even constructed — avoids forcing every existing caller (most
@@ -1313,13 +1315,447 @@ enum WorkspaceIntegration {
     },
 }
 
+/// The Enabled workspace/explicit-userns path's local memory of how far a lease's durable
+/// `Allocated -> Bound` transition has progressed (CT-007 slice 3, piece 7c) — `launch_with` needs
+/// this to decide EXACTLY how to release/quarantine the lease after `run()` returns, since `bind`
+/// happens deep inside the run closure (not `launch_with` itself), which only ever BORROWS the
+/// lease, never returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LeaseBindState {
+    /// `bind` was never attempted, or it refused for a caller-fixable reason
+    /// (`InvalidContainerId`/`MarkerTooLarge`) that leaves the durable marker untouched — the lease
+    /// is genuinely still `Allocated`, so `release_unused()` is safe.
+    Allocated,
+    /// `bind` succeeded — the durable marker durably records this EXACT identity triple.
+    Bound {
+        container_id: String,
+        runsc_root_identity: (u64, u64),
+        cgroup_identity: (u64, u64),
+    },
+    /// `bind` failed for a reason that already poisoned the allocator
+    /// (`MarkerMismatch`/`Poisoned`) — the durable marker's phase is no longer trustworthy;
+    /// neither `release_unused()` nor `release()` may be called on it. The lease's own `Drop`
+    /// quarantines it, which is exactly the right outcome for an already-poisoned allocator.
+    Unreleasable,
+}
+
+/// Everything the Enabled workspace/explicit-userns path owns for the duration of ONE launch
+/// (CT-007 slice 3, piece 7c). `launch_with` owns this value for the whole call; only a mutable
+/// borrow crosses into the run closure (via [`RuntimeBinding::Enabled`]), so `launch_with` retains
+/// the workspace/lease across the closure call and can perform the exact cleanup this piece
+/// specifies once `run()` returns — regardless of whether it returned an outer `Err` (a pre-bind
+/// failure) or a [`RuntimeFinalization`] envelope.
+struct EnabledLaunchContext {
+    workspace: ManagedWorkspace,
+    lease: UserNamespaceLease,
+    bind_state: LeaseBindState,
+}
+
+/// Which runtime-binding capability a run closure was given for ONE launch (CT-007 slice 3, piece
+/// 7c) — `Rootless` carries nothing to bind; `Enabled` carries the mutable lease/bind-state
+/// capability plus the identity the lease's OCI mapping was validated against at construction
+/// time (re-revalidated again, live, immediately before the actual `bind` call — this value is
+/// what that later check compares against, not a substitute for it).
+enum RuntimeBinding<'a> {
+    Rootless,
+    Enabled {
+        expected_root_identity: (u64, u64),
+        context: &'a mut EnabledLaunchContext,
+    },
+}
+
+/// The single validated runtime-preparation handle threaded into the run closure (CT-007 slice 3,
+/// piece 7c). Constructing one calls [`require_oci_layout_matches_prepared_mode`], so downstream
+/// code (`run_and_capture`, `SpawnedRunsc`, `retire_container`, `finalize_runtime`) can never
+/// independently reconstruct — and potentially disagree on — the mode.
+struct RuntimePreparation<'a> {
+    prepared_mode: PreparedRuntimeMode,
+    mode: RunscInvocationMode,
+    binding: RuntimeBinding<'a>,
+}
+
+impl<'a> RuntimePreparation<'a> {
+    fn new(cfg: &OciConfig, binding: RuntimeBinding<'a>) -> Result<Self, String> {
+        let prepared_mode = match &binding {
+            RuntimeBinding::Rootless => PreparedRuntimeMode::Rootless,
+            RuntimeBinding::Enabled {
+                expected_root_identity,
+                context,
+            } => PreparedRuntimeMode::ExplicitUserNamespace {
+                config: context.lease.config(),
+                expected_root_identity: *expected_root_identity,
+            },
+        };
+        let mode = require_oci_layout_matches_prepared_mode(cfg, &prepared_mode)?;
+        Ok(RuntimePreparation {
+            prepared_mode,
+            mode,
+            binding,
+        })
+    }
+}
+
+/// Whether a [`DeleteWorkspaceError`] outcome PROVES the disk-backed workspace is genuinely gone
+/// (CT-007 slice 3, piece 7c — Sol's cleanup subtlety #1: reissuing the leased subordinate uid
+/// while the chowned workspace survives would violate isolation even though nothing ever
+/// executed). Pure decision logic, pulled out of [`delete_workspace_then_release_lease_if_absent`]
+/// (Sol's round-1 review: "generic-operation seams for the decision logic") so the FULL
+/// classification matrix — which delete outcomes prove absence, which don't, and what diagnostic
+/// each produces — is unit-testable with synthetic [`DeleteWorkspaceError`] values, without any
+/// real `WorkspaceManager`/Btrfs/`CAP_SYS_ADMIN` privilege at all.
+#[derive(Debug)]
+enum WorkspaceDeletionOutcome {
+    /// Disk absence is proven — safe to release the paired lease. `diagnostic` is `Some` only for
+    /// the `InternalInvariantViolated` case (disk absence still proven, but the corruption must
+    /// still be surfaced).
+    ProvenAbsent { diagnostic: Option<String> },
+    /// Disk absence is NOT proven — the paired lease must NOT be released.
+    NotProvenAbsent { diagnostic: String },
+}
+
+fn classify_workspace_deletion(
+    result: Result<(), DeleteWorkspaceError>,
+) -> WorkspaceDeletionOutcome {
+    match result {
+        Ok(()) => WorkspaceDeletionOutcome::ProvenAbsent { diagnostic: None },
+        Err(DeleteWorkspaceError::InternalInvariantViolated { reason }) => {
+            WorkspaceDeletionOutcome::ProvenAbsent {
+                diagnostic: Some(format!(
+                    "workspace delete succeeded despite an internal invariant violation: {reason}"
+                )),
+            }
+        }
+        Err(DeleteWorkspaceError::Storage(e)) => WorkspaceDeletionOutcome::NotProvenAbsent {
+            diagnostic: format!(
+                "workspace delete/sync failed ({e}) — the userns lease is left unreleased \
+                 (quarantined) since disk absence is not proven"
+            ),
+        },
+        Err(DeleteWorkspaceError::WrongManager { .. }) => {
+            WorkspaceDeletionOutcome::NotProvenAbsent {
+                diagnostic:
+                    "workspace delete refused (WrongManager — structurally unexpected) — the \
+                         userns lease is left unreleased (quarantined) since disk absence is not \
+                         proven"
+                        .to_string(),
+            }
+        }
+    }
+}
+
+/// Delete `workspace` (via the injected `delete_workspace` operation — Sol's round-1 review:
+/// "generic-operation seams for the decision logic") and release `lease` if (and only if)
+/// [`classify_workspace_deletion`] proves the disk-backed workspace is genuinely gone. Used for
+/// every pre-bind failure that has a real workspace+lease pair to clean up. Returns every
+/// diagnostic accumulated along the way — empty only if both steps succeeded cleanly.
+fn delete_workspace_then_release_lease_if_absent(
+    workspace: ManagedWorkspace,
+    lease: UserNamespaceLease,
+    delete_workspace: impl FnOnce(ManagedWorkspace) -> Result<(), DeleteWorkspaceError>,
+) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    match classify_workspace_deletion(delete_workspace(workspace)) {
+        WorkspaceDeletionOutcome::ProvenAbsent { diagnostic } => {
+            diagnostics.extend(diagnostic);
+            if let Err(e) = lease.release_unused() {
+                diagnostics.push(format!("releasing the unused userns lease failed: {e}"));
+            }
+        }
+        WorkspaceDeletionOutcome::NotProvenAbsent { diagnostic } => {
+            diagnostics.push(diagnostic);
+            drop(lease);
+        }
+    }
+    diagnostics
+}
+
+/// Join accumulated diagnostics onto a base message, `" AND "`-separated — the same
+/// compound-message shape [`dispose_run_failure`]/[`augment_run_failure_with_teardown`] already
+/// use elsewhere in this file.
+fn join_diagnostics(base: String, diagnostics: &[String]) -> String {
+    diagnostics
+        .iter()
+        .fold(base, |acc, d| format!("{acc} AND {d}"))
+}
+
+/// CT-007 slice 3, piece 7c: acquire capacity, a userns lease, and a real disk-backed workspace,
+/// then build the `ExplicitUserNamespaceWithWorkspace` OCI layout from them — the Enabled path's
+/// counterpart to `OciConfig::from_spec`'s plain Rootless construction. Every failure hands back a
+/// single accumulated diagnostic message; nothing is silently dropped without at least an attempt
+/// to release/quarantine it correctly (see the matrix in this function's own review history).
+fn acquire_enabled_workspace(
+    spec: &JobSpec,
+    profile: &HardeningProfile,
+    container_id: &str,
+    absolute_rootfs: PathBuf,
+    workspace_manager: &WorkspaceManager,
+    userns_allocator: &UserNamespaceAllocator,
+) -> Result<(OciConfig, EnabledLaunchContext), String> {
+    acquire_enabled_workspace_given(
+        spec,
+        profile,
+        container_id,
+        absolute_rootfs,
+        |bytes| workspace_manager.acquire_capacity(bytes),
+        || userns_allocator.lease(),
+        |job_key, quota, uid, gid, capacity| {
+            workspace_manager.create_workspace(job_key, quota, uid, gid, capacity)
+        },
+        |workspace| workspace_manager.delete_workspace(workspace),
+    )
+}
+
+/// The actual decision logic behind [`acquire_enabled_workspace`], taking the four external
+/// operations (capacity acquisition, userns leasing, workspace creation, and the workspace
+/// deletion used ONLY by this function's own post-creation-failure cleanup) as injectable closures
+/// (Sol's round-1 review: "generic-operation seams for the decision logic") — mirrors this file's
+/// established `_given` pattern. A closure still needs to return a REAL `CapacityLease`/
+/// `UserNamespaceLease`/`ManagedWorkspace` for its OWN success case (there is no fake-object
+/// constructor for any of them, deliberately), but a FAILURE case is freely constructible synthetic
+/// data — so this seam lets a test exercise e.g. "the userns lease is refused" or "workspace
+/// creation hits an `UnrecoverableLeak`" deterministically, without needing `CAP_SYS_ADMIN`/real
+/// Btrfs quota privilege for the specific operation under test. `delete_workspace` is `FnOnce`
+/// despite two syntactic call sites below — they are mutually exclusive match arms, so at most one
+/// ever actually runs.
+#[allow(clippy::too_many_arguments)]
+fn acquire_enabled_workspace_given(
+    spec: &JobSpec,
+    profile: &HardeningProfile,
+    container_id: &str,
+    absolute_rootfs: PathBuf,
+    acquire_capacity: impl FnOnce(u64) -> Result<CapacityLease, CapacityRefusal>,
+    lease_fn: impl FnOnce() -> Result<UserNamespaceLease, UserNamespaceRefusal>,
+    create_workspace: impl FnOnce(
+        &str,
+        u64,
+        u32,
+        u32,
+        CapacityLease,
+    ) -> Result<ManagedWorkspace, WorkspaceProvisionError>,
+    delete_workspace: impl FnOnce(ManagedWorkspace) -> Result<(), DeleteWorkspaceError>,
+) -> Result<(OciConfig, EnabledLaunchContext), String> {
+    let capacity = acquire_capacity(spec.limits.disk_bytes)
+        .map_err(|refusal| format!("workspace capacity refused: {refusal}"))?;
+    let lease = match lease_fn() {
+        Ok(lease) => lease,
+        Err(refusal) => {
+            capacity.release();
+            return Err(format!("userns lease refused: {refusal}"));
+        }
+    };
+    let workspace = match create_workspace(
+        container_id,
+        spec.limits.disk_bytes,
+        lease.host_uid(),
+        lease.host_gid(),
+        capacity,
+    ) {
+        Ok(workspace) => workspace,
+        Err(WorkspaceProvisionError::Refused(refusal)) => {
+            let message = format!("workspace creation refused: {refusal}");
+            refusal.into_capacity().release();
+            return Err(match lease.release_unused() {
+                Ok(()) => message,
+                Err(e) => {
+                    format!("{message} AND releasing the unused userns lease also failed: {e}")
+                }
+            });
+        }
+        Err(WorkspaceProvisionError::Storage(WorkspaceStorageError::UnrecoverableLeak {
+            path,
+            ..
+        })) => {
+            // Capacity was already abandoned internally (poisoning the workspace manager); the
+            // subvolume may still exist on disk, so the lease must NOT be released — drop it
+            // (quarantine) rather than risk reissuing this subordinate uid over live data.
+            drop(lease);
+            return Err(format!(
+                "workspace creation left an unrecoverable leak at {path:?} — the userns lease is \
+                 left unreleased (quarantined) since disk absence is not proven"
+            ));
+        }
+        Err(WorkspaceProvisionError::Storage(e)) => {
+            // A real attempt failed, but `WorkspaceManager`'s own rollback already proved no
+            // subvolume survives — capacity was already released internally.
+            let message = format!("workspace-storage provisioning failed: {e}");
+            return Err(match lease.release_unused() {
+                Ok(()) => message,
+                Err(release_error) => format!(
+                    "{message} AND releasing the unused userns lease also failed: {release_error}"
+                ),
+            });
+        }
+        Err(WorkspaceProvisionError::InternalInvariantViolated { reason, workspace }) => {
+            let diagnostics =
+                delete_workspace_then_release_lease_if_absent(*workspace, lease, delete_workspace);
+            return Err(join_diagnostics(
+                format!("workspace creation violated an internal invariant: {reason}"),
+                &diagnostics,
+            ));
+        }
+    };
+    let cfg = match OciConfig::from_spec(spec, profile).with_explicit_user_namespace_and_workspace(
+        lease.config(),
+        OciWorkspaceMount::from_managed_workspace(&workspace),
+        absolute_rootfs,
+    ) {
+        Ok(cfg) => cfg,
+        Err(reason) => {
+            let diagnostics =
+                delete_workspace_then_release_lease_if_absent(workspace, lease, delete_workspace);
+            return Err(join_diagnostics(
+                format!("building the explicit-userns workspace OCI layout failed: {reason}"),
+                &diagnostics,
+            ));
+        }
+    };
+    Ok((
+        cfg,
+        EnabledLaunchContext {
+            workspace,
+            lease,
+            bind_state: LeaseBindState::Allocated,
+        },
+    ))
+}
+
+/// CT-007 slice 3, piece 7c: clean up a real workspace+lease after a PRE-BIND failure (the run
+/// closure returned an outer `Err` before `run_and_capture` was ever called — the ONE path where
+/// `lease.bind()` may or may not have even been attempted). Consults the locally-recorded
+/// [`LeaseBindState`] to decide the correct disposition: `Allocated` deletes the workspace then
+/// releases the lease if disk absence is proven; `Unreleasable` never releases the lease (bind
+/// already poisoned/quarantined it) but still deletes the workspace if disk absence is proven.
+/// `Bound` should be structurally unreachable here (a successful bind means the runner always
+/// returns the `RuntimeFinalization` envelope, never an outer `Err`) — if it is ever reached anyway,
+/// BOTH the workspace and the lease are abandoned (never deleted, never released), since no
+/// finalization evidence exists proving the runtime cannot still access them.
+fn cleanup_pre_bind_failure(
+    context: EnabledLaunchContext,
+    workspace_manager: &WorkspaceManager,
+) -> Vec<String> {
+    let EnabledLaunchContext {
+        workspace,
+        lease,
+        bind_state,
+    } = context;
+    match bind_state {
+        LeaseBindState::Allocated => {
+            delete_workspace_then_release_lease_if_absent(workspace, lease, |w| {
+                workspace_manager.delete_workspace(w)
+            })
+        }
+        LeaseBindState::Unreleasable => {
+            // `bind()` itself already set `released = true` and poisoned the allocator for
+            // `MarkerMismatch`/`Poisoned` — dropping `lease` here is a genuine no-op (no
+            // duplicate incident; `Drop` sees `released == true` and does nothing). There is no
+            // `Allocated` marker left to `release_unused()` against, so never attempt to release
+            // it — but the workspace is still safe to delete (deletion never touches the lease's
+            // own durable marker) if disk absence can be proven.
+            drop(lease);
+            match classify_workspace_deletion(workspace_manager.delete_workspace(workspace)) {
+                WorkspaceDeletionOutcome::ProvenAbsent { diagnostic } => {
+                    diagnostic.into_iter().collect()
+                }
+                WorkspaceDeletionOutcome::NotProvenAbsent { diagnostic } => vec![diagnostic],
+            }
+        }
+        LeaseBindState::Bound { .. } => {
+            // STRUCTURALLY IMPOSSIBLE in correct code (Sol's round-1 review, blocker 2): a
+            // successful bind means `run_production_container_streaming` always returns the
+            // `RuntimeFinalization` envelope from that point on, never an outer `Err`. If this is
+            // ever reached anyway (a future regression), there is NO finalization evidence proving
+            // the runtime cannot still access the workspace — deleting the workspace or releasing/
+            // reissuing the subordinate uid would both be unsafe. Abandon BOTH: drop them, letting
+            // their own `Drop` poison the workspace manager and quarantine the lease, and ALWAYS
+            // surface this as an invariant violation, regardless of anything else.
+            drop(workspace);
+            drop(lease);
+            vec![
+                "an outer launch failure occurred AFTER a successful userns lease bind — this \
+                 should be structurally impossible; the workspace and lease are both abandoned \
+                 (quarantined) rather than acted on, since no finalization evidence exists \
+                 proving the runtime cannot still access them"
+                    .to_string(),
+            ]
+        }
+    }
+}
+
+/// CT-007 slice 3, piece 7c: the Enabled path's post-`Finalized` cleanup — validate the evidence
+/// against the LOCALLY recorded binding (never trust evidence alone; it must agree with what THIS
+/// process durably bound), mint a real [`UserNamespaceQuiescenceProof`], delete+sync the
+/// workspace, and only once disk absence is proven, release the bound lease. Returns `Ok(())`
+/// only if every step succeeded; any failure's message is a single diagnostic the caller applies
+/// to the ALREADY-SETTLED result via [`augment_settled_result_with_enabled_cleanup_failure`] —
+/// deliberately NOT folded into a [`RuntimeTeardownError`] (Sol's round-1 review, blocker 3: that
+/// would misleadingly claim "runtime teardown failed" for a failure in a different safety domain).
+fn settle_enabled_workspace_and_lease(
+    context: EnabledLaunchContext,
+    workspace_manager: &WorkspaceManager,
+    evidence: &RuntimeQuiescenceEvidence,
+) -> Result<(), String> {
+    let EnabledLaunchContext {
+        workspace,
+        lease,
+        bind_state,
+    } = context;
+    let LeaseBindState::Bound {
+        container_id,
+        runsc_root_identity,
+        cgroup_identity,
+    } = bind_state
+    else {
+        return Err(format!(
+            "the runtime finalized, but this lease's locally-recorded bind state was \
+             {bind_state:?} (not Bound) — refusing to trust evidence against an unrecorded binding"
+        ));
+    };
+    let expected_namespace = RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+        runsc_root_identity,
+    };
+    if evidence.container_id() != container_id || evidence.namespace() != expected_namespace {
+        return Err(format!(
+            "runtime quiescence evidence ({:?}, {:?}) does not match the recorded binding \
+             ({container_id:?}, {expected_namespace:?})",
+            evidence.container_id(),
+            evidence.namespace()
+        ));
+    }
+    if evidence.cgroup().cgroup_identity() != cgroup_identity {
+        return Err(format!(
+            "runtime quiescence evidence's cgroup identity {:?} does not match the recorded \
+             bind-time cgroup identity {cgroup_identity:?}",
+            evidence.cgroup().cgroup_identity()
+        ));
+    }
+    let proof = UserNamespaceQuiescenceProof::from_runtime_evidence(&lease, evidence)
+        .map_err(|e| format!("failed to mint a userns quiescence proof: {e}"))?;
+    match classify_workspace_deletion(workspace_manager.delete_workspace(workspace)) {
+        WorkspaceDeletionOutcome::ProvenAbsent { diagnostic } => {
+            if let Err(e) = lease.release(proof) {
+                let base = diagnostic.unwrap_or_else(|| "workspace deleted".to_string());
+                return Err(format!(
+                    "{base}, but releasing the userns lease also failed: {e}"
+                ));
+            }
+            match diagnostic {
+                Some(diagnostic) => Err(diagnostic),
+                None => Ok(()),
+            }
+        }
+        WorkspaceDeletionOutcome::NotProvenAbsent { diagnostic } => {
+            drop(lease);
+            Err(diagnostic)
+        }
+    }
+}
+
 /// Caller-facing configuration for [`GvisorBackend::try_new`] — mirrors [`WorkspaceIntegration`]'s
-/// shape but as INPUT (paths/params), not already-constructed managers. `pub(crate)` (not yet
-/// `pub`): promoted publicly once `launch_with` actually consumes the integration it configures —
-/// a public constructor accepting `Enabled` today would silently promise behavior no launch path
-/// yet enforces.
-#[allow(dead_code)]
-pub(crate) enum GvisorWorkspaceConfig {
+/// shape but as INPUT (paths/params), not already-constructed managers. CT-007 slice 3, piece 7c:
+/// `launch_with` now fully consumes `Enabled` (health checks, acquisition, durable bind, checked
+/// finalization, evidence-validated release) — this is `pub`, not `pub(crate)`, from this piece
+/// onward.
+pub enum GvisorWorkspaceConfig {
     Disabled,
     Enabled {
         /// Forwarded into `WorkspaceStorageMode::EphemeralDisk { base_dir, host_capacity_bytes }`.
@@ -1333,7 +1769,7 @@ pub(crate) enum GvisorWorkspaceConfig {
 
 /// Why [`GvisorBackend::try_new`] failed to construct an `Enabled` [`WorkspaceIntegration`].
 #[derive(Debug)]
-pub(crate) enum GvisorBackendInitError {
+pub enum GvisorBackendInitError {
     Workspace(WorkspaceManagerError),
     UserNamespace(UserNamespaceAllocatorError),
 }
@@ -1414,12 +1850,11 @@ impl GvisorBackend {
         }
     }
 
-    /// CT-007 slice 3, piece 4: the ONLY way to construct a backend with `Enabled` workspace/
-    /// user-namespace integration — `pub(crate)`, not yet `pub`, since no launch path consumes it
-    /// yet. Delegates to [`Self::try_new_with_builders`] with the REAL constructors; see that
-    /// method for the fixed construction-order contract.
-    #[allow(dead_code)]
-    pub(crate) fn try_new(
+    /// CT-007 slice 3: the ONLY way to construct a backend with `Enabled` workspace/user-namespace
+    /// integration. Piece 7c: `launch_with` fully consumes this integration now, so this
+    /// constructor is `pub`. Delegates to [`Self::try_new_with_builders`] with the REAL
+    /// constructors; see that method for the fixed construction-order contract.
+    pub fn try_new(
         registry: Arc<crate::asset_registry::GvisorAssetRegistry>,
         workspace_config: GvisorWorkspaceConfig,
         incident_sink: crate::workspace_manager::IncidentSink,
@@ -1546,6 +1981,7 @@ impl GvisorBackend {
             LaunchPermit,
             &Path,
             &str,
+            RuntimePreparation<'_>,
         )
             -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure>,
     {
@@ -1577,23 +2013,154 @@ impl GvisorBackend {
             .resolve(&spec.image)
             .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
 
+        // CT-007 slice 3, piece 7c: for `Enabled`, both managers must be independently healthy
+        // BEFORE `reserve` — no reservation or other resource exists yet, so either refusal is an
+        // ordinary pre-commit `Failed`.
+        if let WorkspaceIntegration::Enabled {
+            workspace_manager,
+            userns_allocator,
+        } = &self.workspace_integration
+        {
+            workspace_manager.check_health().map_err(|e| {
+                SandboxLaunchError::Failed(GvisorError::Runtime(format!(
+                    "workspace manager health check failed: {e}"
+                )))
+            })?;
+            userns_allocator.check_identity().map_err(|e| {
+                SandboxLaunchError::Failed(GvisorError::Runtime(format!(
+                    "userns allocator identity check failed: {e}"
+                )))
+            })?;
+        }
+
         let reserve = hooks
             .reserve(spec)
             .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
-        let cfg = OciConfig::from_spec(spec, &profile);
-        // CT-007 slice 3, piece 7a: generated HERE, not deep inside the run closure — the future
+        // CT-007 slice 3, piece 7a: generated HERE, not deep inside the run closure — the
         // `Enabled`-workspace path needs this same value before it ever calls `run`, to durably
-        // bind a `UserNamespaceLease` to it ahead of exec (piece 7c). Plain, not yet cryptographic
-        // or claim-derived (see piece 7c's naming-scheme work) — this piece only relocates WHERE
-        // the identifier is minted, not what it's derived from.
+        // bind a `UserNamespaceLease` to it ahead of exec (piece 7c), and (piece 7c) as the
+        // workspace's own `job_key` — already a safe, unique path component.
         let container_id = format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
+
+        // CT-007 slice 3, piece 7c: acquire capacity + a userns lease + a real workspace, and
+        // build the explicit-userns OCI layout from them — `Disabled` keeps the plain Rootless
+        // `cfg` unchanged. `enabled_context` is `Some` for the REST of this call's lifetime
+        // whenever `Enabled`, regardless of what happens later — it is only ever consumed (moved
+        // out of this `Option`) by the cleanup paths below, never dropped bare.
+        let mut enabled_context: Option<EnabledLaunchContext> = None;
+        let cfg = match &self.workspace_integration {
+            WorkspaceIntegration::Disabled => OciConfig::from_spec(spec, &profile),
+            WorkspaceIntegration::Enabled {
+                workspace_manager,
+                userns_allocator,
+            } => match acquire_enabled_workspace(
+                spec,
+                &profile,
+                &container_id,
+                verified_rootfs.path().to_path_buf(),
+                workspace_manager,
+                userns_allocator,
+            ) {
+                Ok((cfg, context)) => {
+                    enabled_context = Some(context);
+                    cfg
+                }
+                Err(message) => {
+                    // Sol's round-2 review: route through `dispose_run_failure` so a
+                    // `release_unused` failure COMPOUNDS with the original acquisition failure
+                    // (never silently replaces it via a bare `?`) — this acquisition failure
+                    // never spawned anything, so `Uncommitted` is the correct phase.
+                    return Err(self.dispose_run_failure(
+                        spec,
+                        hooks,
+                        &reserve,
+                        RunFailure::uncommitted(message),
+                    ));
+                }
+            },
+        };
+
+        // CT-007 slice 3, piece 7c: build the single validated `RuntimePreparation` — for
+        // `Enabled`, the runsc-root identity is revalidated HERE (live, immediately before use,
+        // never cached on `GvisorBackend`) to minimize the gap before the actual `bind` call
+        // (which re-revalidates it again, live, one more time right at that exact boundary).
+        let prep_result: Result<RuntimePreparation<'_>, String> = match &mut enabled_context {
+            None => RuntimePreparation::new(&cfg, RuntimeBinding::Rootless),
+            Some(context) => match revalidated_explicit_userns_root_identity() {
+                Ok(expected_root_identity) => RuntimePreparation::new(
+                    &cfg,
+                    RuntimeBinding::Enabled {
+                        expected_root_identity,
+                        context,
+                    },
+                ),
+                Err(reason) => Err(format!("runsc-root identity revalidation failed: {reason}")),
+            },
+        };
+        let prep = match prep_result {
+            Ok(prep) => prep,
+            Err(message) => {
+                let workspace_manager = match &self.workspace_integration {
+                    WorkspaceIntegration::Enabled {
+                        workspace_manager, ..
+                    } => Some(workspace_manager),
+                    WorkspaceIntegration::Disabled => None,
+                };
+                let mut message = match (enabled_context, workspace_manager) {
+                    (Some(context), Some(workspace_manager)) => {
+                        let diagnostics = cleanup_pre_bind_failure(context, workspace_manager);
+                        join_diagnostics(message, &diagnostics)
+                    }
+                    _ => message,
+                };
+                // CT-007 slice 3, piece 7c (Sol's round-1 review, blocker 1): a `release_unused`
+                // failure must AUGMENT this message, never silently replace it via a bare `?`.
+                if let Err(release_error) = hooks.release_unused(spec, &reserve) {
+                    message = format!(
+                        "{message} AND releasing the unused reservation also failed: \
+                         {release_error}"
+                    );
+                }
+                return Err(SandboxLaunchError::Failed(GvisorError::Runtime(message)));
+            }
+        };
+
         let launch_permit = match hooks.acquire_launch_permit(spec) {
             Ok(permit) => permit,
             Err(attribute_error) => {
-                hooks
-                    .release_unused(spec, &reserve)
-                    .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
-                return Err(SandboxLaunchError::Failed(attribute_error.into()));
+                let workspace_manager = match &self.workspace_integration {
+                    WorkspaceIntegration::Enabled {
+                        workspace_manager, ..
+                    } => Some(workspace_manager),
+                    WorkspaceIntegration::Disabled => None,
+                };
+                let cleanup_diagnostics = match (enabled_context, workspace_manager) {
+                    (Some(context), Some(workspace_manager)) => {
+                        cleanup_pre_bind_failure(context, workspace_manager)
+                    }
+                    _ => Vec::new(),
+                };
+                let release_result = hooks.release_unused(spec, &reserve);
+                // CT-007 slice 3, piece 7c (Sol's round-1 review, blocker 1 — the fix, applied
+                // without regressing the ORIGINAL `GvisorError` variant callers match on, e.g.
+                // `GvisorError::Hook`): only fall back to a compound `GvisorError::Runtime(..)`
+                // message when there is actually something to augment with; the common
+                // Disabled/nothing-else-failed case preserves `attribute_error`'s own variant
+                // exactly as before.
+                if cleanup_diagnostics.is_empty() && release_result.is_ok() {
+                    return Err(SandboxLaunchError::Failed(attribute_error.into()));
+                }
+                let mut message = join_diagnostics(
+                    GvisorError::from(attribute_error).to_string(),
+                    &cleanup_diagnostics,
+                );
+                if let Err(release_error) = release_result {
+                    message = format!(
+                        "{message} AND releasing the unused reservation also failed: \
+                         {release_error}"
+                    );
+                }
+                return Err(SandboxLaunchError::Failed(GvisorError::Runtime(message)));
             }
         };
         // Run the container + capture the REAL result (the ONE legitimate `runsc`-spawn site — the
@@ -1611,35 +2178,104 @@ impl GvisorBackend {
         // `report_retryable_attempt` transaction, which durably accounts usage AND requeues the exact
         // claim without emitting `job.done`. Returning a bare `Failed` here for a post-commit failure
         // under reporter ownership would silently discard the accounting the reporter exists to do.
-        let finalization = match run(
+        let outer_result = run(
             spec,
             &cfg,
             launch_permit,
             verified_rootfs.path(),
             &container_id,
-        ) {
-            Ok(finalization) => finalization,
+            prep,
+        );
+
+        let settled_result = match outer_result {
             Err(run_failure) => {
-                // A pre-cgroup failure (rootfs missing, mode mismatch, bundle staging, cgroup
-                // creation) — no runtime was ever prepared, so there is nothing to finalize, and
-                // (7c) no lease was ever bound.
+                // A pre-cgroup OR pre-bind failure (rootfs missing, mode mismatch, bundle staging,
+                // cgroup creation, identity drift, bind failure) — no runtime was ever prepared
+                // (or bind never durably committed), so there is nothing to finalize. `Bound` is
+                // structurally unreachable here (see `cleanup_pre_bind_failure`'s own doc).
+                let workspace_manager = match &self.workspace_integration {
+                    WorkspaceIntegration::Enabled {
+                        workspace_manager, ..
+                    } => Some(workspace_manager),
+                    WorkspaceIntegration::Disabled => None,
+                };
+                let cleanup_diagnostics = match (enabled_context, workspace_manager) {
+                    (Some(context), Some(workspace_manager)) => {
+                        cleanup_pre_bind_failure(context, workspace_manager)
+                    }
+                    _ => Vec::new(),
+                };
+                // CT-007 slice 3, piece 7c (Sol's round-1 review, blocker 1): every cleanup
+                // diagnostic is folded in — never `let _ = ...`-discarded — so a workspace-delete
+                // or lease-release failure here is never silently lost behind the original
+                // acquisition/preparation/bind failure.
+                let run_failure = cleanup_diagnostics
+                    .into_iter()
+                    .fold(run_failure, augment_run_failure_message);
                 return Err(self.dispose_run_failure(spec, hooks, &reserve, run_failure));
             }
+            Ok(finalization) => {
+                // CT-007 slice 3, piece 7c (Sol's round-1 review, blocker 3): workspace/lease
+                // cleanup is a SEPARATE safety domain from `finalize_runtime`'s own runtime-
+                // teardown checks — its outcome is captured here and applied to the ALREADY-
+                // SETTLED `Result` below, never folded back into a `RuntimeFinalization`/
+                // `RuntimeTeardownError` (which would misleadingly claim "runtime teardown
+                // failed" even when the runtime tore down perfectly cleanly).
+                let enabled_cleanup_failure = match (enabled_context, &finalization) {
+                    (Some(context), RuntimeFinalization::Finalized(finalized)) => {
+                        let workspace_manager = match &self.workspace_integration {
+                            WorkspaceIntegration::Enabled {
+                                workspace_manager, ..
+                            } => workspace_manager,
+                            WorkspaceIntegration::Disabled => {
+                                unreachable!("enabled_context is only Some when Enabled")
+                            }
+                        };
+                        settle_enabled_workspace_and_lease(
+                            context,
+                            workspace_manager,
+                            &finalized.evidence,
+                        )
+                        .err()
+                    }
+                    (Some(context), RuntimeFinalization::Failed { .. }) => {
+                        // Runtime finalization itself failed (no full quiescence evidence exists)
+                        // — never delete the workspace or release the lease; let both quarantine/
+                        // poison through their own existing `Drop` machinery.
+                        drop(context);
+                        None
+                    }
+                    (None, _) => None,
+                };
+
+                let settled = settle_finalization(
+                    finalization,
+                    |run: &ContainerRun| run.result.usage,
+                    discard_container_run_after_teardown_failure,
+                );
+                match enabled_cleanup_failure {
+                    None => settled,
+                    Some(diagnostic) => augment_settled_result_with_enabled_cleanup_failure(
+                        settled,
+                        |run: &ContainerRun| run.result.usage,
+                        // Sol's round-2 review: this run already finalized VALIDLY (namespace never
+                        // drifted) -- discard it directly via `discard_container_run`, never a
+                        // fabricated empty `RuntimeTeardownError` just to reuse the teardown-specific
+                        // entry point (that would violate its non-empty invariant AND misleadingly
+                        // imply a runtime-teardown failure that never happened).
+                        |run: ContainerRun| discard_container_run(run, false),
+                        diagnostic,
+                    ),
+                }
+            }
         };
-        // CT-007 slice 3, piece 7b: `self.workspace_integration` is always `Disabled` here, so
-        // there is no bound lease this evidence could release — settle immediately, discarding it.
-        // 7c: inspect `finalization`'s evidence BEFORE settling, to decide `lease.release(evidence)`
-        // vs. quarantine, rather than reaching this unconditional settle at all.
+
         let ContainerRun {
             child,
             bundle_dir,
             result,
             run_error,
-        } = match settle_finalization(
-            finalization,
-            |run: &ContainerRun| run.result.usage,
-            discard_container_run_after_teardown_failure,
-        ) {
+        } = match settled_result {
             Ok(container_run) => container_run,
             Err(run_failure) => {
                 return Err(self.dispose_run_failure(spec, hooks, &reserve, run_failure));
@@ -1764,9 +2400,13 @@ impl SandboxBackend for GvisorBackend {
         spec: &JobSpec,
         hooks: &RunnerHooks,
     ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
-        self.launch_with(spec, hooks, |spec, cfg, permit, rootfs, container_id| {
-            run_production_container(spec, cfg, permit, rootfs, container_id)
-        })
+        self.launch_with(
+            spec,
+            hooks,
+            |spec, cfg, permit, rootfs, container_id, prep| {
+                run_production_container(spec, cfg, permit, rootfs, container_id, prep)
+            },
+        )
     }
 
     fn launch_streaming(
@@ -1779,7 +2419,7 @@ impl SandboxBackend for GvisorBackend {
         self.launch_with(
             spec,
             hooks,
-            move |spec, cfg, permit, rootfs, container_id| {
+            move |spec, cfg, permit, rootfs, container_id, prep| {
                 run_production_container_streaming(
                     spec,
                     cfg,
@@ -1788,6 +2428,7 @@ impl SandboxBackend for GvisorBackend {
                     container_id,
                     Some(output),
                     cancellation,
+                    prep,
                 )
             },
         )
@@ -1845,6 +2486,7 @@ fn run_production_container(
     launch_permit: LaunchPermit,
     rootfs: &Path,
     container_id: &str,
+    prep: RuntimePreparation<'_>,
 ) -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure> {
     run_production_container_streaming(
         spec,
@@ -1854,9 +2496,80 @@ fn run_production_container(
         container_id,
         None,
         SandboxCancellation::new(),
+        prep,
     )
 }
 
+/// Durably bind `context`'s lease to `container_id`/`cgroup_identity`, classifying any bind
+/// failure into the correct [`LeaseBindState`] — extracted out of
+/// `run_production_container_streaming` as a deterministic `_given` seam: `revalidate_root_identity`
+/// stands in for the live `revalidated_explicit_userns_root_identity()` syscall, so this can be unit
+/// tested against a real [`UserNamespaceLease`] (cheap, no `CAP_SYS_ADMIN` needed) without depending
+/// on this host's actual runsc-root ownership. Never calls anything beyond `context.lease.bind` —
+/// the caller alone decides whether a bind failure means `run_and_capture` must never be reached.
+fn bind_enabled_lease_given(
+    lease: &mut UserNamespaceLease,
+    bind_state: &mut LeaseBindState,
+    expected_root_identity: (u64, u64),
+    container_id: &str,
+    cgroup_identity: (u64, u64),
+    revalidate_root_identity: impl FnOnce() -> Result<(u64, u64), String>,
+) -> Result<(), String> {
+    let current = revalidate_root_identity()?;
+    if current != expected_root_identity {
+        return Err(format!(
+            "runsc-root identity drifted before bind (expected {expected_root_identity:?}, \
+             found {current:?})"
+        ));
+    }
+    match lease.bind(container_id.to_string(), current, cgroup_identity) {
+        Ok(()) => {
+            *bind_state = LeaseBindState::Bound {
+                container_id: container_id.to_string(),
+                runsc_root_identity: current,
+                cgroup_identity,
+            };
+            Ok(())
+        }
+        Err(bind_error) => {
+            *bind_state = match bind_error {
+                UserNamespaceBindError::InvalidContainerId
+                | UserNamespaceBindError::MarkerTooLarge => LeaseBindState::Allocated,
+                UserNamespaceBindError::MarkerMismatch | UserNamespaceBindError::Poisoned => {
+                    LeaseBindState::Unreleasable
+                }
+            };
+            Err(format!("durable lease bind failed: {bind_error}"))
+        }
+    }
+}
+
+/// The exact composition boundary this piece's whole security property rests on: bind (if
+/// `Enabled`; a no-op for `Rootless`) and invoke `continuation` ONLY if that succeeds — a bind
+/// failure (or a live identity-drift refusal) must NEVER be followed by the capture/spawn
+/// continuation. Generic over `T` so this can be unit tested with a bare counting closure instead
+/// of `run_and_capture` — no real runsc spawn or privileged Btrfs involved (Sol's round-2 review).
+fn bind_then_continue<T>(
+    enabled: Option<(&mut UserNamespaceLease, &mut LeaseBindState, (u64, u64))>,
+    container_id: &str,
+    cgroup_identity: (u64, u64),
+    revalidate_root_identity: impl FnOnce() -> Result<(u64, u64), String>,
+    continuation: impl FnOnce() -> T,
+) -> Result<T, String> {
+    if let Some((lease, bind_state, expected_root_identity)) = enabled {
+        bind_enabled_lease_given(
+            lease,
+            bind_state,
+            expected_root_identity,
+            container_id,
+            cgroup_identity,
+            revalidate_root_identity,
+        )?;
+    }
+    Ok(continuation())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_production_container_streaming(
     spec: &JobSpec,
     cfg: &OciConfig,
@@ -1865,6 +2578,7 @@ fn run_production_container_streaming(
     container_id: &str,
     output: Option<Arc<dyn SandboxOutputSink>>,
     cancellation: SandboxCancellation,
+    mut prep: RuntimePreparation<'_>,
 ) -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure> {
     let bin = runsc_bin();
     // `rootfs` is the ALREADY-VERIFIED path `GvisorBackend::launch_with` resolved from `spec.image`
@@ -1883,14 +2597,10 @@ fn run_production_container_streaming(
             rootfs.display()
         )));
     }
-    // CT-007 slice 3, piece 7b (Sol's round-2 review, blocker 2): validated BEFORE staging anything
-    // — a disagreement between what `cfg` will actually execute and what checked
-    // deletion/finalization expects must refuse at zero cost, never execute under one mode while
-    // finalizing under another. 7b never constructs a non-Rootless prepared mode in production —
-    // 7c adds that constructor.
-    let prepared_mode = PreparedRuntimeMode::Rootless;
-    let mode = require_oci_layout_matches_prepared_mode(cfg, &prepared_mode)
-        .map_err(RunFailure::uncommitted)?;
+    // CT-007 slice 3, piece 7c: `prep` was already validated (`require_oci_layout_matches_prepared_mode`)
+    // by `launch_with` before this function was ever called — `mode` is the single value every
+    // downstream use below shares.
+    let mode = prep.mode;
 
     let bundle_dir = stage_production_bundle(cfg, rootfs).map_err(RunFailure::uncommitted)?;
 
@@ -1909,27 +2619,73 @@ fn run_production_container_streaming(
         }
     };
 
+    // CT-007 slice 3, piece 7c: durably bind the lease BEFORE ever calling `run_and_capture` —
+    // immediately after the cgroup exists (so `cgroup.identity()` is available), while nothing has
+    // spawned yet. Re-revalidates the runsc-root identity ONE MORE TIME, live, right at this exact
+    // boundary (minimizing the gap between "confirmed unchanged" and "durably bound to it") — the
+    // earlier read (in `launch_with`, building `PreparedRuntimeMode`) is what this compares against,
+    // never a substitute for this check. Sol's round-2 review: the bind-then-capture composition
+    // itself (never invoking the capture continuation after a failed/unconfirmed bind) is now
+    // `bind_then_continue` — a deterministic seam covering that exact security property with a bare
+    // counting closure, with no real runsc spawn involved.
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
     let redaction = RedactionPlan::for_job(spec);
-    let (result, child_retirement) = run_and_capture(
-        bin,
-        &bundle_dir,
+    let enabled = match &mut prep.binding {
+        RuntimeBinding::Rootless => None,
+        RuntimeBinding::Enabled {
+            expected_root_identity,
+            context,
+        } => Some((
+            &mut context.lease,
+            &mut context.bind_state,
+            *expected_root_identity,
+        )),
+    };
+    let bind_and_capture_result = bind_then_continue(
+        enabled,
         container_id,
-        timeout,
-        spec.limits.mem_bytes,
-        RunCaptureOptions {
-            stdin: None, // CI/agent jobs receive no stdin (the git-wire path supplies the body).
-            stdout_mode: StdoutMode::CappedHead,
-            cancellation: cancellation.as_atomic(),
-            output: output.map(|sink| StreamingOutput {
-                sink,
-                redaction: redaction.clone(),
-            }),
+        cgroup.identity(),
+        || {
+            revalidated_explicit_userns_root_identity()
+                .map_err(|reason| format!("runsc-root identity revalidation failed: {reason}"))
         },
-        Some(launch_permit),
-        mode,
-        &cgroup,
+        || {
+            run_and_capture(
+                bin,
+                &bundle_dir,
+                container_id,
+                timeout,
+                spec.limits.mem_bytes,
+                RunCaptureOptions {
+                    stdin: None, // CI/agent jobs receive no stdin (the git-wire path supplies the body).
+                    stdout_mode: StdoutMode::CappedHead,
+                    cancellation: cancellation.as_atomic(),
+                    output: output.map(|sink| StreamingOutput {
+                        sink,
+                        redaction: redaction.clone(),
+                    }),
+                },
+                Some(launch_permit),
+                mode,
+                &cgroup,
+            )
+        },
     );
+    let (result, child_retirement) = match bind_and_capture_result {
+        Ok(pair) => pair,
+        Err(message) => {
+            // Never call `run_and_capture` after a bind failure — no exec may ever follow a
+            // failed/unconfirmed bind. Checked-quiesce the cgroup nobody will use, and clean up
+            // the bundle, before surfacing the failure.
+            let _ = std::fs::remove_dir_all(&bundle_dir);
+            return Err(match cgroup.quiesce(RUNTIME_QUIESCE_TIMEOUT) {
+                Ok(_) => RunFailure::uncommitted(message),
+                Err(e) => RunFailure::uncommitted(format!(
+                    "{message} AND cgroup quiescence also failed ({e})"
+                )),
+            });
+        }
+    };
     let primary: Result<ContainerRun, RunFailure> = match result {
         Ok(outcome) => {
             let result = build_result(spec, &outcome, &redaction);
@@ -1960,7 +2716,7 @@ fn run_production_container_streaming(
         primary,
         bin,
         container_id,
-        &prepared_mode,
+        &prep.prepared_mode,
         cgroup,
         RUNTIME_QUIESCE_TIMEOUT,
         child_retirement,
@@ -2302,7 +3058,6 @@ static EXPLICIT_USERNS_POLICY: std::sync::OnceLock<ResolvedExplicitUsernsPolicy>
 /// `runsc_root_identity` to bind a lease to — refuses if `ExplicitUserNamespace` mode was never
 /// validated via [`preflight_explicit_userns_policy`], or if the state root no longer matches what
 /// was validated. `pub(crate)`, not yet called by any production path — that's piece 7c.
-#[allow(dead_code)]
 pub(crate) fn revalidated_explicit_userns_root_identity() -> Result<(u64, u64), String> {
     revalidated_explicit_userns_root_identity_given(EXPLICIT_USERNS_POLICY.get())
 }
@@ -2564,7 +3319,6 @@ fn delete_container(bin: &Path, container_id: &str, mode: RunscInvocationMode) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PreparedRuntimeMode {
     Rootless,
-    #[allow(dead_code)] // constructed starting in piece 7c.
     ExplicitUserNamespace {
         config: UserNamespaceConfig,
         /// The runsc state-root identity [`preflight_explicit_userns_policy`] validated at boot —
@@ -2611,23 +3365,52 @@ fn require_oci_layout_matches_prepared_mode(
 
 /// What [`RuntimeQuiescenceEvidence`] vouches for regarding the runsc state-root namespace: either
 /// there was none to check (`Rootless`), or the pinned state root's identity was re-confirmed
-/// unchanged immediately before minting this evidence.
+/// unchanged immediately before minting this evidence. `pub(crate)` (CT-007 slice 3, piece 7c) so
+/// [`crate::user_namespace::UserNamespaceQuiescenceProof::from_runtime_evidence`] can match on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RuntimeNamespaceQuiescence {
+pub(crate) enum RuntimeNamespaceQuiescence {
     Rootless,
     ExplicitUserNamespace { runsc_root_identity: (u64, u64) },
 }
 
 /// Non-forgeable (outside tests) proof that ONE runtime instance — its direct child process, its
 /// exact `container_id`, its runsc-state-root namespace (if any), and its [`MemoryCgroup`] — was
-/// independently checked torn down, produced ONLY by a successful [`finalize_runtime`]. This is
-/// the evidence [`crate::user_namespace::UserNamespaceQuiescenceProof`] will be minted from once
-/// 7c wires the `ExplicitUserNamespace` path to a real lease.
+/// independently checked torn down, produced ONLY by a successful [`finalize_runtime`]. `pub(crate)`
+/// (CT-007 slice 3, piece 7c) so [`crate::user_namespace::UserNamespaceQuiescenceProof::from_runtime_evidence`]
+/// can mint a real proof from it — fields stay private; only the accessors below are exposed, and
+/// `finalize_runtime` remains the sole production minting path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RuntimeQuiescenceEvidence {
+pub(crate) struct RuntimeQuiescenceEvidence {
     container_id: String,
     namespace: RuntimeNamespaceQuiescence,
     cgroup: CgroupQuiescenceEvidence,
+}
+
+impl RuntimeQuiescenceEvidence {
+    pub(crate) fn container_id(&self) -> &str {
+        &self.container_id
+    }
+
+    pub(crate) fn namespace(&self) -> RuntimeNamespaceQuiescence {
+        self.namespace
+    }
+
+    pub(crate) fn cgroup(&self) -> CgroupQuiescenceEvidence {
+        self.cgroup
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_for_tests(
+        container_id: String,
+        namespace: RuntimeNamespaceQuiescence,
+        cgroup: CgroupQuiescenceEvidence,
+    ) -> Self {
+        RuntimeQuiescenceEvidence {
+            container_id,
+            namespace,
+            cgroup,
+        }
+    }
 }
 
 /// One independent thing [`finalize_runtime`] found wrong. Deliberately NOT a single first-error
@@ -2837,7 +3620,6 @@ fn finalize_runtime_given(
 #[derive(Debug)]
 struct FinalizedRun<T> {
     primary: T,
-    #[allow(dead_code)] // consumed starting in piece 7c (feeds UserNamespaceQuiescenceProof).
     evidence: RuntimeQuiescenceEvidence,
 }
 
@@ -2878,6 +3660,29 @@ fn finalize_and_merge<T>(
     }
 }
 
+/// Append `extra` to an existing [`RunFailure`]'s message, preserving its exact phase/usage —
+/// mirrors [`GvisorBackend::dispose_run_failure`]'s established "augment, never replace"
+/// compound-message pattern, generalized (CT-007 slice 3, piece 7c, Sol's round-1 review, blocker
+/// 3) so every later augmentation (runtime teardown, workspace/lease cleanup, ...) shares ONE
+/// mechanism instead of each hand-rolling the same four-variant match.
+fn augment_run_failure_message(failure: RunFailure, extra: impl std::fmt::Display) -> RunFailure {
+    match failure {
+        RunFailure::Uncommitted { message } => RunFailure::Uncommitted {
+            message: format!("{message} AND {extra}"),
+        },
+        RunFailure::CommitOutcomeUnknown { message } => RunFailure::CommitOutcomeUnknown {
+            message: format!("{message} AND {extra}"),
+        },
+        RunFailure::CommittedButNotExecuted { message } => RunFailure::CommittedButNotExecuted {
+            message: format!("{message} AND {extra}"),
+        },
+        RunFailure::Executed { message, usage } => RunFailure::Executed {
+            message: format!("{message} AND {extra}"),
+            usage,
+        },
+    }
+}
+
 /// Append a teardown failure to an existing [`RunFailure`], preserving its exact phase/usage and
 /// its original message — mirrors [`GvisorBackend::dispose_run_failure`]'s established "augment,
 /// never replace" compound-message pattern, extended here to runtime-teardown failures.
@@ -2885,20 +3690,39 @@ fn augment_run_failure_with_teardown(
     failure: RunFailure,
     teardown: &RuntimeTeardownError,
 ) -> RunFailure {
-    match failure {
-        RunFailure::Uncommitted { message } => RunFailure::Uncommitted {
-            message: format!("{message} AND runtime teardown failed ({teardown})"),
-        },
-        RunFailure::CommitOutcomeUnknown { message } => RunFailure::CommitOutcomeUnknown {
-            message: format!("{message} AND runtime teardown failed ({teardown})"),
-        },
-        RunFailure::CommittedButNotExecuted { message } => RunFailure::CommittedButNotExecuted {
-            message: format!("{message} AND runtime teardown failed ({teardown})"),
-        },
-        RunFailure::Executed { message, usage } => RunFailure::Executed {
-            message: format!("{message} AND runtime teardown failed ({teardown})"),
-            usage,
-        },
+    augment_run_failure_message(failure, format!("runtime teardown failed ({teardown})"))
+}
+
+/// CT-007 slice 3, piece 7c (Sol's round-1 review, blocker 3): a workspace-deletion or
+/// userns-lease-release failure discovered AFTER `finalize_runtime` itself already succeeded is a
+/// SEPARATE safety domain from runtime teardown (container delete, cgroup quiescence) — folding it
+/// into [`RuntimeTeardownError`] would produce a misleading "runtime teardown failed" message even
+/// when the runtime tore down perfectly cleanly (or was never created at all, for a pre-permit
+/// failure). This shares the SAME augment-never-replace mechanics via
+/// [`augment_run_failure_message`], under its own distinct message, applied to an
+/// ALREADY-SETTLED `Result<S, RunFailure>` (i.e. after [`settle_finalization`] has already run, for
+/// the post-`Finalized` case — never folded back into a [`RuntimeFinalization`]).
+fn augment_settled_result_with_enabled_cleanup_failure<S>(
+    settled: Result<S, RunFailure>,
+    usage_of: impl FnOnce(&S) -> ResourceUsage,
+    on_discarded_success: impl FnOnce(S),
+    diagnostic: String,
+) -> Result<S, RunFailure> {
+    match settled {
+        Ok(success) => {
+            let usage = usage_of(&success);
+            on_discarded_success(success);
+            Err(RunFailure::executed(
+                format!(
+                    "workspace/userns-lease cleanup failed after a successful run: {diagnostic}"
+                ),
+                usage,
+            ))
+        }
+        Err(failure) => Err(augment_run_failure_message(
+            failure,
+            format!("workspace/userns-lease cleanup also failed: {diagnostic}"),
+        )),
     }
 }
 
@@ -2951,18 +3775,29 @@ fn settle_finalization<S>(
 /// namespace-identity drift, in which case the finalizer already determined the path-based `runsc
 /// delete`/`kill` this would perform is not safe to trust (acting on it here would be exactly the
 /// mistake `finalize_runtime` itself refused to make).
+/// Discard an owned [`ContainerRun`] that will never be returned to a caller as a success — best-
+/// effort kill (unless `skip_path_kill`, e.g. a confirmed namespace-identity drift where the child
+/// may not be safely killable via the ordinary path) and remove the staged bundle. Sol's round-2
+/// review: factored out of `discard_container_run_after_teardown_failure` so the Enabled workspace/
+/// lease cleanup path (a run that already finalized VALIDLY, but must still be discarded because a
+/// cleanup step failed afterward) can discard a `ContainerRun` without fabricating an invalid empty
+/// `RuntimeTeardownError` just to reuse that function's signature.
+fn discard_container_run(mut run: ContainerRun, skip_path_kill: bool) {
+    if !skip_path_kill {
+        let _ = run.child.kill();
+    }
+    let _ = std::fs::remove_dir_all(&run.bundle_dir);
+}
+
 fn discard_container_run_after_teardown_failure(
-    mut run: ContainerRun,
+    run: ContainerRun,
     teardown: &RuntimeTeardownError,
 ) {
     let namespace_drifted = teardown
         .issues
         .iter()
         .any(|issue| matches!(issue, RuntimeTeardownIssue::NamespaceIdentityDrifted(_)));
-    if !namespace_drifted {
-        let _ = run.child.kill();
-    }
-    let _ = std::fs::remove_dir_all(&run.bundle_dir);
+    discard_container_run(run, namespace_drifted);
 }
 
 /// Read the `runsc` process's cumulative CPU time (utime+stime) from `/proc/<pid>/stat`, in whole
@@ -5862,6 +6697,1192 @@ mod tests {
         );
     }
 
+    // ───── CT-007 slice 3, piece 7c: pure decision-logic tests (no real objects at all) ─────
+
+    #[test]
+    fn classify_workspace_deletion_ok_proves_absence_with_no_diagnostic() {
+        let outcome = classify_workspace_deletion(Ok(()));
+        assert!(matches!(
+            outcome,
+            WorkspaceDeletionOutcome::ProvenAbsent { diagnostic: None }
+        ));
+    }
+
+    #[test]
+    fn classify_workspace_deletion_internal_invariant_violated_proves_absence_but_surfaces_it() {
+        let outcome =
+            classify_workspace_deletion(Err(DeleteWorkspaceError::InternalInvariantViolated {
+                reason: "bookkeeping corruption".to_string(),
+            }));
+        match outcome {
+            WorkspaceDeletionOutcome::ProvenAbsent {
+                diagnostic: Some(diagnostic),
+            } => assert!(diagnostic.contains("bookkeeping corruption")),
+            other => {
+                panic!("expected ProvenAbsent with a diagnostic, got a different shape: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn classify_workspace_deletion_storage_failure_does_not_prove_absence() {
+        let outcome = classify_workspace_deletion(Err(DeleteWorkspaceError::Storage(
+            WorkspaceStorageError::ZeroQuota,
+        )));
+        assert!(matches!(
+            outcome,
+            WorkspaceDeletionOutcome::NotProvenAbsent { .. }
+        ));
+    }
+
+    #[test]
+    fn augment_settled_result_with_enabled_cleanup_failure_converts_a_clean_success_to_executed() {
+        let usage = ResourceUsage {
+            cpu_seconds: 3,
+            mem_byte_seconds: 4096,
+        };
+        let discarded = std::cell::Cell::new(false);
+        let result: Result<u64, RunFailure> = Ok(42);
+        let result = augment_settled_result_with_enabled_cleanup_failure(
+            result,
+            move |_: &u64| usage,
+            |value: u64| {
+                assert_eq!(value, 42);
+                discarded.set(true);
+            },
+            "workspace delete/sync failed".to_string(),
+        );
+        match result {
+            Err(RunFailure::Executed {
+                usage: got_usage,
+                message,
+            }) => {
+                assert_eq!(got_usage, usage);
+                assert!(message.contains("workspace/userns-lease cleanup failed"));
+                assert!(message.contains("workspace delete/sync failed"));
+            }
+            other => panic!("expected RunFailure::Executed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn augment_settled_result_with_enabled_cleanup_failure_augments_an_existing_failure() {
+        let original_usage = ResourceUsage {
+            cpu_seconds: 7,
+            mem_byte_seconds: 8192,
+        };
+        let result: Result<u64, RunFailure> =
+            Err(RunFailure::executed("original failure", original_usage));
+        let result = augment_settled_result_with_enabled_cleanup_failure(
+            result,
+            |_: &u64| panic!("usage_of must not be called when the primary already failed"),
+            |_: u64| panic!("on_discarded_success must not run when the primary already failed"),
+            "lease release failed".to_string(),
+        );
+        match result {
+            Err(RunFailure::Executed {
+                usage: got_usage,
+                message,
+            }) => {
+                assert_eq!(got_usage, original_usage);
+                assert!(message.contains("original failure"));
+                assert!(message.contains("workspace/userns-lease cleanup also failed"));
+                assert!(message.contains("lease release failed"));
+            }
+            other => panic!("expected an augmented RunFailure::Executed, got {other:?}"),
+        }
+    }
+
+    /// Integrated (not just pure-`classify_workspace_deletion`-level) coverage: a REAL lease flows
+    /// all the way through `delete_workspace_then_release_lease_if_absent` (the exact helper
+    /// `cleanup_pre_bind_failure`'s `Allocated` arm calls), with only the `delete_workspace`
+    /// operation injected as synthetic. `InternalInvariantViolated` means deletion actually
+    /// succeeded (capacity was released, subvolume gone) despite a bookkeeping bug -- disk absence
+    /// IS proven, so the real lease must still be releasable via `release_unused()`, and the
+    /// failure must still be surfaced as a diagnostic.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn delete_workspace_then_release_lease_if_absent_releases_a_real_lease_on_internal_invariant_violated(
+    ) {
+        let Some((workspace_manager, workspace_base)) =
+            real_workspace_manager_for_tests("integrated-invariant-violated")
+        else {
+            return;
+        };
+        let Some((userns_allocator, leases_dir)) =
+            real_userns_allocator_for_tests("integrated-invariant-violated")
+        else {
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            return;
+        };
+        let lease = userns_allocator
+            .lease()
+            .expect("a fresh allocator's first lease must succeed");
+        let capacity = workspace_manager
+            .acquire_capacity(8 << 20)
+            .expect("capacity must be available against a fresh 1 GiB ceiling");
+        let workspace = workspace_manager
+            .create_workspace(
+                "integrated-invariant-violated-job",
+                8 << 20,
+                lease.host_uid(),
+                lease.host_gid(),
+                capacity,
+            )
+            .expect("create_workspace must succeed against a real, privileged Btrfs backend");
+        let host_path = workspace.host_path().to_path_buf();
+
+        // Sol's round-2 review: a synthetic error alone would make the "disk absence proven"
+        // premise false (the real subvolume would still be sitting there) -- genuinely call the
+        // REAL `delete_workspace` first (so the subvolume really is gone and real capacity really
+        // is released), THEN report the synthetic `InternalInvariantViolated` as if some OTHER
+        // bookkeeping check inside a real `delete_workspace` call had separately failed atop an
+        // otherwise-successful deletion -- exactly the scenario this variant models.
+        let diagnostics = delete_workspace_then_release_lease_if_absent(workspace, lease, |w| {
+            workspace_manager.delete_workspace(w).expect(
+                "the real delete must succeed for this test to model a genuine invariant \
+                 violation atop an otherwise-successful deletion",
+            );
+            Err(DeleteWorkspaceError::InternalInvariantViolated {
+                reason: "synthetic bookkeeping corruption for this test".to_string(),
+            })
+        });
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "the failure must be surfaced: {diagnostics:?}"
+        );
+        assert!(diagnostics[0].contains("synthetic bookkeeping corruption"));
+        assert!(
+            !host_path.exists(),
+            "the real subvolume must genuinely be gone -- this variant's whole premise is that \
+             disk absence IS proven, just alongside a separately-surfaced bookkeeping failure"
+        );
+        assert!(
+            userns_allocator.is_healthy(),
+            "InternalInvariantViolated proves disk absence -- the real lease must have released \
+             cleanly, not been quarantined"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// The `Storage`/sync-failure counterpart: disk absence is NOT proven, so the real lease must
+    /// be left unreleased (dropped -- quarantined by `Drop`, never `release_unused()`), and the
+    /// failure must still be surfaced as a diagnostic.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn delete_workspace_then_release_lease_if_absent_quarantines_a_real_lease_on_a_storage_failure()
+    {
+        let Some((workspace_manager, workspace_base)) =
+            real_workspace_manager_for_tests("integrated-storage-failure")
+        else {
+            return;
+        };
+        let Some((userns_allocator, leases_dir)) =
+            real_userns_allocator_for_tests("integrated-storage-failure")
+        else {
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            return;
+        };
+        let lease = userns_allocator
+            .lease()
+            .expect("a fresh allocator's first lease must succeed");
+        let capacity = workspace_manager
+            .acquire_capacity(8 << 20)
+            .expect("capacity must be available against a fresh 1 GiB ceiling");
+        let workspace = workspace_manager
+            .create_workspace(
+                "integrated-storage-failure-job",
+                8 << 20,
+                lease.host_uid(),
+                lease.host_gid(),
+                capacity,
+            )
+            .expect("create_workspace must succeed against a real, privileged Btrfs backend");
+        let host_path = workspace.host_path().to_path_buf();
+
+        let diagnostics = delete_workspace_then_release_lease_if_absent(workspace, lease, |_w| {
+            Err(DeleteWorkspaceError::Storage(
+                WorkspaceStorageError::ZeroQuota,
+            ))
+        });
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "the failure must be surfaced: {diagnostics:?}"
+        );
+        assert!(diagnostics[0].contains("delete/sync failed"));
+        assert!(
+            !userns_allocator.is_healthy(),
+            "a Storage failure does NOT prove disk absence -- the real lease must be quarantined, \
+             never released"
+        );
+
+        drop(workspace_manager);
+        let sink2: crate::workspace_manager::IncidentSink =
+            Arc::new(|msg: &str| eprintln!("[piece7c workspace incident] {msg}"));
+        let fresh = WorkspaceManager::try_new(
+            WorkspaceStorageMode::EphemeralDisk {
+                base_dir: workspace_base.clone(),
+                host_capacity_bytes: 1 << 30,
+            },
+            sink2,
+        )
+        .expect("a fresh manager's own boot reconciliation must clean up the orphan and succeed");
+        assert!(!host_path.exists());
+        drop(fresh);
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    // ───────── CT-007 slice 3, piece 7c: acquire/cleanup/settle Enabled matrix ─────────
+    //
+    // These tests use REAL (not fabricated) `WorkspaceManager`/`UserNamespaceAllocator` instances
+    // — `ManagedWorkspace`/`CapacityLease`/`UserNamespaceLease` have no `#[cfg(test)]` bare
+    // constructors (deliberately: minting one for real is the whole point of the capability
+    // boundary), so exercising `acquire_enabled_workspace`/`cleanup_pre_bind_failure`/
+    // `settle_enabled_workspace_and_lease` at all requires real objects. Unlike
+    // `explicit_user_namespace_boots_through_the_real_production_run_path`, these do NOT depend on
+    // `preflight_explicit_userns_policy` (the runsc-root/binary hardening check that skips on this
+    // development host) — only on real Btrfs (this host has it) and a usable `/etc/subuid`/
+    // `/etc/subgid` range (also present here) — so they are NOT expected to skip on this host.
+
+    /// A real `WorkspaceManager` (open/lock/boot-reconciliation only — NO `create_workspace` call,
+    /// so no `CAP_SYS_ADMIN`/qgroup privilege is required). Sufficient for tests that never reach
+    /// past capacity acquisition (e.g. an exhausted-ceiling refusal).
+    #[cfg(feature = "test-support")]
+    fn real_workspace_manager_without_qgroup_probe_for_tests(
+        tag: &str,
+    ) -> Option<(WorkspaceManager, PathBuf)> {
+        // `std::env::temp_dir()` (`/tmp`) is frequently a separate tmpfs mount, not Btrfs — use a
+        // `$HOME`-rooted path instead, matching `workspace_manager.rs`'s own `btrfs_test_base`.
+        let mut base = std::env::home_dir().expect("HOME must be set for this test");
+        base.push(format!(
+            ".local/state/myelin-gvisor-piece7c-workspace-{tag}-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let sink: crate::workspace_manager::IncidentSink =
+            Arc::new(|msg: &str| eprintln!("[piece7c workspace incident] {msg}"));
+        match WorkspaceManager::try_new(
+            WorkspaceStorageMode::EphemeralDisk {
+                base_dir: base.clone(),
+                host_capacity_bytes: 1 << 30,
+            },
+            sink,
+        ) {
+            Ok(manager) => Some((manager, base)),
+            Err(e) => {
+                eprintln!(
+                    "[piece7c] SKIP: no real Btrfs+quota EphemeralDisk support on this host: {e}"
+                );
+                None
+            }
+        }
+    }
+
+    /// A real `WorkspaceManager`, additionally probed for the `CAP_SYS_ADMIN` privilege every real
+    /// `create_workspace` call needs (`btrfs qgroup limit`) — mirrors `workspace_manager.rs`'s own
+    /// `ephemeral_disk_available` gate. Use this (not the qgroup-probe-free variant above) for any
+    /// test that actually calls `acquire_enabled_workspace`/`create_workspace` to completion.
+    #[cfg(feature = "test-support")]
+    fn real_workspace_manager_for_tests(tag: &str) -> Option<(WorkspaceManager, PathBuf)> {
+        let mut base = std::env::home_dir().expect("HOME must be set for this test");
+        base.push(format!(
+            ".local/state/myelin-gvisor-piece7c-workspace-{tag}-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&base).ok()?;
+        match crate::workspace_storage::probe_qgroup_privilege(&base) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "[piece7c] SKIP: this test process lacks CAP_SYS_ADMIN for qgroup operations"
+                );
+                let _ = std::fs::remove_dir_all(&base);
+                return None;
+            }
+            Err(e) => {
+                eprintln!("[piece7c] SKIP: no real Btrfs+quota support on this host: {e}");
+                let _ = std::fs::remove_dir_all(&base);
+                return None;
+            }
+        }
+        let sink: crate::workspace_manager::IncidentSink =
+            Arc::new(|msg: &str| eprintln!("[piece7c workspace incident] {msg}"));
+        match WorkspaceManager::try_new(
+            WorkspaceStorageMode::EphemeralDisk {
+                base_dir: base.clone(),
+                host_capacity_bytes: 1 << 30,
+            },
+            sink,
+        ) {
+            Ok(manager) => Some((manager, base)),
+            Err(e) => {
+                eprintln!(
+                    "[piece7c] SKIP: no real Btrfs+quota EphemeralDisk support on this host: {e}"
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn real_userns_allocator_for_tests(tag: &str) -> Option<(UserNamespaceAllocator, PathBuf)> {
+        let leases_dir = std::env::temp_dir().join(format!(
+            "myelin-gvisor-piece7c-leases-{tag}-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        match UserNamespaceAllocator::try_new_for_tests(
+            leases_dir.clone(),
+            Path::new("/etc/subuid"),
+            Path::new("/etc/subgid"),
+            1,
+            Arc::new(|msg: &str| eprintln!("[piece7c userns incident] {msg}")),
+        ) {
+            Ok(allocator) => Some((allocator, leases_dir)),
+            Err(e) => {
+                eprintln!(
+                    "[piece7c] SKIP: no usable /etc/subuid|subgid range for this process's uid: {e}"
+                );
+                None
+            }
+        }
+    }
+
+    // ───────── CT-007 slice 3, piece 7c: `bind_enabled_lease_given` classification matrix ─────────
+    //
+    // `bind_enabled_lease_given` was extracted specifically so this matrix is coverable with a real
+    // (cheap, non-privileged) `UserNamespaceLease` and a bare `LeaseBindState` value — no
+    // `ManagedWorkspace`/`CAP_SYS_ADMIN` involved at all, unlike the acquire/settle tests above.
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn bind_enabled_lease_given_binds_and_records_bound_on_success() {
+        let Some((allocator, leases_dir)) = real_userns_allocator_for_tests("bind-ok") else {
+            return;
+        };
+        let mut lease = allocator
+            .lease()
+            .expect("a fresh allocator's first lease must succeed");
+        let mut bind_state = LeaseBindState::Allocated;
+        let expected_root_identity = (11, 22);
+        let cgroup_identity = (33, 44);
+        let result = bind_enabled_lease_given(
+            &mut lease,
+            &mut bind_state,
+            expected_root_identity,
+            "bind-ok-container",
+            cgroup_identity,
+            || Ok(expected_root_identity),
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            bind_state,
+            LeaseBindState::Bound {
+                container_id: "bind-ok-container".to_string(),
+                runsc_root_identity: expected_root_identity,
+                cgroup_identity,
+            }
+        );
+        let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+            "bind-ok-container".to_string(),
+            RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                runsc_root_identity: expected_root_identity,
+            },
+            CgroupQuiescenceEvidence::assert_for_tests(cgroup_identity),
+        );
+        let proof = UserNamespaceQuiescenceProof::from_runtime_evidence(&lease, &evidence)
+            .expect("a matching evidence must mint a proof");
+        lease
+            .release(proof)
+            .expect("release must succeed after a real bind");
+        assert!(allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// Never calls `lease.bind` at all when the live identity revalidation disagrees with what was
+    /// expected — this is exactly the check that lets the caller (`run_production_container_streaming`)
+    /// refuse BEFORE ever calling `run_and_capture`, without having mutated the lease or its durable
+    /// marker in any way.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn bind_enabled_lease_given_refuses_before_touching_the_lease_when_identity_drifted() {
+        let Some((allocator, leases_dir)) = real_userns_allocator_for_tests("bind-identity-drift")
+        else {
+            return;
+        };
+        let mut lease = allocator
+            .lease()
+            .expect("a fresh allocator's first lease must succeed");
+        let mut bind_state = LeaseBindState::Allocated;
+        let result = bind_enabled_lease_given(
+            &mut lease,
+            &mut bind_state,
+            (11, 22),
+            "bind-drift-container",
+            (33, 44),
+            || Ok((99, 99)), // the live revalidation disagrees with the expected identity.
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            bind_state,
+            LeaseBindState::Allocated,
+            "an identity-drift refusal must never touch bind_state -- the lease was never bound"
+        );
+        // The lease itself was never mutated -- it can still be released as a plain unused lease.
+        lease
+            .release_unused()
+            .expect("an un-bound, un-touched lease must still release cleanly");
+        assert!(allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn bind_enabled_lease_given_classifies_an_invalid_container_id_as_still_allocated() {
+        let Some((allocator, leases_dir)) = real_userns_allocator_for_tests("bind-invalid-id")
+        else {
+            return;
+        };
+        let mut lease = allocator
+            .lease()
+            .expect("a fresh allocator's first lease must succeed");
+        let mut bind_state = LeaseBindState::Allocated;
+        let expected_root_identity = (11, 22);
+        let result = bind_enabled_lease_given(
+            &mut lease,
+            &mut bind_state,
+            expected_root_identity,
+            "", // empty container_id -> UserNamespaceBindError::InvalidContainerId
+            (33, 44),
+            || Ok(expected_root_identity),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            bind_state,
+            LeaseBindState::Allocated,
+            "InvalidContainerId is a caller bug, not a global-trust failure -- nothing touched \
+             disk, so the lease remains safely Allocated and reusable"
+        );
+        lease.release_unused().expect(
+            "an Allocated lease untouched by a caller-bug refusal must still release cleanly",
+        );
+        assert!(allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn bind_enabled_lease_given_classifies_a_marker_mismatch_as_unreleasable() {
+        let Some((allocator, leases_dir)) = real_userns_allocator_for_tests("bind-marker-mismatch")
+        else {
+            return;
+        };
+        let mut lease = allocator
+            .lease()
+            .expect("a fresh allocator's first lease must succeed");
+        let expected_root_identity = (11, 22);
+        // Bind it once for real, durably transitioning the on-disk marker to Bound -- a SECOND
+        // bind attempt against the same lease will then find the marker no longer `Allocated`,
+        // which is exactly the `MarkerMismatch` path (poisoning the allocator).
+        lease
+            .bind(
+                "already-bound".to_string(),
+                expected_root_identity,
+                (33, 44),
+            )
+            .expect("the first bind against a fresh Allocated lease must succeed");
+        let mut bind_state = LeaseBindState::Bound {
+            container_id: "already-bound".to_string(),
+            runsc_root_identity: expected_root_identity,
+            cgroup_identity: (33, 44),
+        };
+        let result = bind_enabled_lease_given(
+            &mut lease,
+            &mut bind_state,
+            expected_root_identity,
+            "second-bind-attempt",
+            (55, 66),
+            || Ok(expected_root_identity),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            bind_state,
+            LeaseBindState::Unreleasable,
+            "MarkerMismatch means the on-disk state no longer agrees with this in-memory lease -- \
+             ambiguous and never safe to release"
+        );
+        assert!(
+            !allocator.is_healthy(),
+            "MarkerMismatch must globally poison the allocator (a global-trust failure, not a \
+             caller bug)"
+        );
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    // ───── CT-007 slice 3, piece 7c: `bind_then_continue` — the bind-then-capture composition ─────
+    //
+    // Sol's round-2 review: `bind_enabled_lease_given` proves the classification table is correct,
+    // but leaves the crucial decision -- never invoking the capture/spawn continuation after a
+    // failed/unconfirmed bind -- to its caller. These tests exercise that COMPOSITION directly with
+    // a bare counting closure standing in for `run_and_capture` -- no real runsc spawn, no
+    // privileged Btrfs, just a real (cheap) `UserNamespaceLease` where `Enabled` coverage needs one.
+
+    #[test]
+    fn bind_then_continue_always_invokes_the_continuation_when_rootless() {
+        let calls = std::cell::Cell::new(0u32);
+        let result = bind_then_continue(
+            None,
+            "rootless-container",
+            (33, 44),
+            || panic!("Rootless must never need to revalidate a root identity"),
+            || {
+                calls.set(calls.get() + 1);
+                "captured"
+            },
+        );
+        assert_eq!(result, Ok("captured"));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn bind_then_continue_invokes_the_continuation_exactly_once_after_a_successful_bind() {
+        let Some((allocator, leases_dir)) =
+            real_userns_allocator_for_tests("bind-then-continue-ok")
+        else {
+            return;
+        };
+        let mut lease = allocator
+            .lease()
+            .expect("a fresh allocator's first lease must succeed");
+        let mut bind_state = LeaseBindState::Allocated;
+        let expected_root_identity = (11, 22);
+        let calls = std::cell::Cell::new(0u32);
+        let result = bind_then_continue(
+            Some((&mut lease, &mut bind_state, expected_root_identity)),
+            "bind-then-continue-ok-container",
+            (33, 44),
+            || Ok(expected_root_identity),
+            || {
+                calls.set(calls.get() + 1);
+                "captured"
+            },
+        );
+        assert_eq!(result, Ok("captured"));
+        assert_eq!(
+            calls.get(),
+            1,
+            "a successful bind must invoke the continuation exactly once"
+        );
+        assert_eq!(
+            bind_state,
+            LeaseBindState::Bound {
+                container_id: "bind-then-continue-ok-container".to_string(),
+                runsc_root_identity: expected_root_identity,
+                cgroup_identity: (33, 44),
+            }
+        );
+        let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+            "bind-then-continue-ok-container".to_string(),
+            RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                runsc_root_identity: expected_root_identity,
+            },
+            CgroupQuiescenceEvidence::assert_for_tests((33, 44)),
+        );
+        let proof = UserNamespaceQuiescenceProof::from_runtime_evidence(&lease, &evidence)
+            .expect("a matching evidence must mint a proof");
+        lease
+            .release(proof)
+            .expect("release must succeed after a real bind");
+        assert!(allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// The security property this whole piece rests on: a live identity-drift refusal must leave
+    /// the continuation-call count at zero -- no exec may ever follow a failed/unconfirmed bind.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn bind_then_continue_never_invokes_the_continuation_when_identity_drifted() {
+        let Some((allocator, leases_dir)) =
+            real_userns_allocator_for_tests("bind-then-continue-drift")
+        else {
+            return;
+        };
+        let mut lease = allocator
+            .lease()
+            .expect("a fresh allocator's first lease must succeed");
+        let mut bind_state = LeaseBindState::Allocated;
+        let calls = std::cell::Cell::new(0u32);
+        let result = bind_then_continue(
+            Some((&mut lease, &mut bind_state, (11, 22))),
+            "bind-then-continue-drift-container",
+            (33, 44),
+            || Ok((99, 99)), // disagrees with the expected (11, 22).
+            || {
+                calls.set(calls.get() + 1);
+                "captured"
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            calls.get(),
+            0,
+            "an identity-drift refusal must NEVER invoke the capture/spawn continuation"
+        );
+        assert_eq!(bind_state, LeaseBindState::Allocated);
+        lease
+            .release_unused()
+            .expect("an un-bound, un-touched lease must still release cleanly");
+        assert!(allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// Same property, for a real durable bind failure (not merely a live-identity refusal).
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn bind_then_continue_never_invokes_the_continuation_on_a_real_bind_failure() {
+        let Some((allocator, leases_dir)) =
+            real_userns_allocator_for_tests("bind-then-continue-bind-fail")
+        else {
+            return;
+        };
+        let mut lease = allocator
+            .lease()
+            .expect("a fresh allocator's first lease must succeed");
+        let expected_root_identity = (11, 22);
+        let calls = std::cell::Cell::new(0u32);
+        let result = bind_then_continue(
+            Some((
+                &mut lease,
+                &mut LeaseBindState::Allocated,
+                expected_root_identity,
+            )),
+            "", // empty container_id -> UserNamespaceBindError::InvalidContainerId
+            (33, 44),
+            || Ok(expected_root_identity),
+            || {
+                calls.set(calls.get() + 1);
+                "captured"
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            calls.get(),
+            0,
+            "a real bind failure must NEVER invoke the capture/spawn continuation"
+        );
+        lease.release_unused().expect(
+            "an Allocated lease untouched by a caller-bug bind refusal must still release cleanly",
+        );
+        assert!(allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn acquire_enabled_workspace_then_settle_releases_cleanly_on_a_matching_evidence() {
+        let Some((workspace_manager, workspace_base)) =
+            real_workspace_manager_for_tests("acquire-settle-ok")
+        else {
+            return;
+        };
+        let Some((userns_allocator, leases_dir)) =
+            real_userns_allocator_for_tests("acquire-settle-ok")
+        else {
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            return;
+        };
+        let command_spec = spec(vec![]);
+        let profile = HardeningProfile::derive(&command_spec);
+        let container_id = "acquire-settle-ok-container";
+        let (cfg, mut context) = acquire_enabled_workspace(
+            &command_spec,
+            &profile,
+            container_id,
+            PathBuf::from("/abs/staged-rootfs"),
+            &workspace_manager,
+            &userns_allocator,
+        )
+        .expect("acquisition must succeed against a healthy real manager/allocator");
+        assert_eq!(
+            cfg.invocation_mode(),
+            RunscInvocationMode::ExplicitUserNamespace(context.lease.config())
+        );
+        assert_eq!(context.bind_state, LeaseBindState::Allocated);
+
+        // Simulate what `run_production_container_streaming` does: bind, THEN finalize.
+        let runsc_root_identity = (11, 22);
+        let cgroup_identity = (33, 44);
+        context
+            .lease
+            .bind(
+                container_id.to_string(),
+                runsc_root_identity,
+                cgroup_identity,
+            )
+            .expect("bind must succeed for a fresh Allocated lease");
+        context.bind_state = LeaseBindState::Bound {
+            container_id: container_id.to_string(),
+            runsc_root_identity,
+            cgroup_identity,
+        };
+        let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+            container_id.to_string(),
+            RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                runsc_root_identity,
+            },
+            CgroupQuiescenceEvidence::assert_for_tests(cgroup_identity),
+        );
+        settle_enabled_workspace_and_lease(context, &workspace_manager, &evidence)
+            .expect("settling a matching evidence against a Bound lease must succeed");
+        assert!(workspace_manager.is_healthy());
+        assert!(userns_allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn settle_enabled_workspace_and_lease_refuses_evidence_disagreeing_with_the_recorded_binding() {
+        let Some((workspace_manager, workspace_base)) =
+            real_workspace_manager_for_tests("settle-mismatch")
+        else {
+            return;
+        };
+        let Some((userns_allocator, leases_dir)) =
+            real_userns_allocator_for_tests("settle-mismatch")
+        else {
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            return;
+        };
+        let command_spec = spec(vec![]);
+        let profile = HardeningProfile::derive(&command_spec);
+        let container_id = "settle-mismatch-container";
+        let (_cfg, mut context) = acquire_enabled_workspace(
+            &command_spec,
+            &profile,
+            container_id,
+            PathBuf::from("/abs/staged-rootfs"),
+            &workspace_manager,
+            &userns_allocator,
+        )
+        .expect("acquisition must succeed");
+        let runsc_root_identity = (11, 22);
+        let cgroup_identity = (33, 44);
+        context
+            .lease
+            .bind(
+                container_id.to_string(),
+                runsc_root_identity,
+                cgroup_identity,
+            )
+            .expect("bind must succeed");
+        context.bind_state = LeaseBindState::Bound {
+            container_id: container_id.to_string(),
+            runsc_root_identity,
+            cgroup_identity,
+        };
+        let host_path = context.workspace.host_path().to_path_buf();
+        // Evidence claims a DIFFERENT cgroup identity than what was actually bound.
+        let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+            container_id.to_string(),
+            RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                runsc_root_identity,
+            },
+            CgroupQuiescenceEvidence::assert_for_tests((99, 99)),
+        );
+        let result = settle_enabled_workspace_and_lease(context, &workspace_manager, &evidence);
+        assert!(
+            result.is_err(),
+            "evidence disagreeing with the recorded binding must refuse, not silently release"
+        );
+        // Neither the workspace nor the lease were touched by `settle_enabled_workspace_and_lease`
+        // -- refusing dropped both, which poisons `workspace_manager` (real subvolume abandoned,
+        // exactly like `dropping_a_managed_workspace_without_deleting_poisons_the_manager_with_one_incident`
+        // in workspace_manager.rs) and quarantines the userns slot. The real subvolume is still on
+        // disk here; `remove_dir_all` CANNOT remove a Btrfs subvolume (it needs a privileged
+        // `btrfs subvolume delete`). Sol's review: exercise the ACTUAL claimed crash-recovery path
+        // instead of leaking it — drop the poisoned manager (releasing its lock), open a FRESH
+        // manager on the same base, and let ITS OWN boot-time reconciliation delete the orphan for
+        // real before `remove_dir_all` is safe to call on the (now subvolume-free) base directory.
+        assert!(
+            host_path.exists(),
+            "the abandoned subvolume must still be real and on disk"
+        );
+        drop(workspace_manager);
+        let sink2: crate::workspace_manager::IncidentSink =
+            Arc::new(|msg: &str| eprintln!("[piece7c workspace incident] {msg}"));
+        let fresh = WorkspaceManager::try_new(
+            WorkspaceStorageMode::EphemeralDisk {
+                base_dir: workspace_base.clone(),
+                host_capacity_bytes: 1 << 30,
+            },
+            sink2,
+        )
+        .expect("a fresh manager's own boot reconciliation must clean up the orphan and succeed");
+        assert!(fresh.is_healthy());
+        assert!(
+            !host_path.exists(),
+            "boot reconciliation must have deleted the abandoned subvolume for real"
+        );
+        drop(fresh);
+        // Quarantined userns markers are NEVER deleted by design (boot reconciliation only ever
+        // quarantines a surviving marker, never removes it) -- `leases_dir` holds only plain JSON
+        // marker files, not a Btrfs primitive, so `remove_dir_all` here is genuinely safe.
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// Sol's round-1 review, blocker 2: a `Bound` outer error is structurally impossible in correct
+    /// code (a successful bind means the runner always returns the `RuntimeFinalization` envelope
+    /// from that point on), but `cleanup_pre_bind_failure` must still handle it conservatively if a
+    /// future regression ever reaches it -- abandoning BOTH resources rather than acting on either,
+    /// and ALWAYS surfacing a non-empty invariant-violation diagnostic.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn cleanup_pre_bind_failure_abandons_both_resources_when_bind_state_is_bound() {
+        let Some((workspace_manager, workspace_base)) =
+            real_workspace_manager_for_tests("bound-abandons-both")
+        else {
+            return;
+        };
+        let Some((userns_allocator, leases_dir)) =
+            real_userns_allocator_for_tests("bound-abandons-both")
+        else {
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            return;
+        };
+        let command_spec = spec(vec![]);
+        let profile = HardeningProfile::derive(&command_spec);
+        let container_id = "bound-abandons-both-container";
+        let (_cfg, mut context) = acquire_enabled_workspace(
+            &command_spec,
+            &profile,
+            container_id,
+            PathBuf::from("/abs/staged-rootfs"),
+            &workspace_manager,
+            &userns_allocator,
+        )
+        .expect("acquisition must succeed");
+        let runsc_root_identity = (11, 22);
+        let cgroup_identity = (33, 44);
+        context
+            .lease
+            .bind(
+                container_id.to_string(),
+                runsc_root_identity,
+                cgroup_identity,
+            )
+            .expect("bind must succeed");
+        context.bind_state = LeaseBindState::Bound {
+            container_id: container_id.to_string(),
+            runsc_root_identity,
+            cgroup_identity,
+        };
+        let host_path = context.workspace.host_path().to_path_buf();
+
+        // The "structurally impossible" outer failure: some future regression calls the pre-bind
+        // cleanup path even though bind already durably succeeded.
+        let diagnostics = cleanup_pre_bind_failure(context, &workspace_manager);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "a Bound outer error must always surface exactly one invariant-violation diagnostic, \
+             never an empty vec: {diagnostics:?}"
+        );
+        assert!(diagnostics[0].contains("structurally impossible"));
+        assert!(
+            host_path.exists(),
+            "the workspace must be ABANDONED, not deleted, when bind_state was Bound"
+        );
+        assert!(
+            !workspace_manager.is_healthy(),
+            "abandoning the workspace without deleting it must poison the manager"
+        );
+        assert!(
+            !userns_allocator.is_healthy(),
+            "abandoning a Bound lease without releasing it must poison the allocator too"
+        );
+
+        // Clean up for real: drop the poisoned manager, let a fresh one's boot reconciliation
+        // delete the orphaned subvolume (never `remove_dir_all` on a real Btrfs subvolume).
+        drop(workspace_manager);
+        let sink2: crate::workspace_manager::IncidentSink =
+            Arc::new(|msg: &str| eprintln!("[piece7c workspace incident] {msg}"));
+        let fresh = WorkspaceManager::try_new(
+            WorkspaceStorageMode::EphemeralDisk {
+                base_dir: workspace_base.clone(),
+                host_capacity_bytes: 1 << 30,
+            },
+            sink2,
+        )
+        .expect("a fresh manager's own boot reconciliation must clean up the orphan and succeed");
+        assert!(!host_path.exists());
+        drop(fresh);
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn acquire_enabled_workspace_refuses_when_capacity_is_exhausted_and_touches_nothing_else() {
+        // Capacity is exhausted BEFORE `acquire_enabled_workspace` is ever called, so
+        // `create_workspace`'s `btrfs qgroup limit` step is never reached — no `CAP_SYS_ADMIN`
+        // needed, so this test runs (rather than skips) even without that privilege.
+        let Some((workspace_manager, workspace_base)) =
+            real_workspace_manager_without_qgroup_probe_for_tests("capacity-exhausted")
+        else {
+            return;
+        };
+        let Some((userns_allocator, leases_dir)) =
+            real_userns_allocator_for_tests("capacity-exhausted")
+        else {
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            return;
+        };
+        // Exhaust the 1 GiB ceiling with an unrelated hold, so `acquire_capacity` refuses cleanly
+        // BEFORE ever touching the userns allocator.
+        let holder = workspace_manager
+            .acquire_capacity(1 << 30)
+            .expect("the fresh manager's own full ceiling must be leasable once");
+        let mut command_spec = spec(vec![]);
+        command_spec.limits.disk_bytes = 1; // any nonzero request now exceeds the exhausted ceiling
+        let profile = HardeningProfile::derive(&command_spec);
+        let result = acquire_enabled_workspace(
+            &command_spec,
+            &profile,
+            "capacity-exhausted-container",
+            PathBuf::from("/abs/staged-rootfs"),
+            &workspace_manager,
+            &userns_allocator,
+        );
+        assert!(
+            result.is_err(),
+            "an exhausted ceiling must refuse acquisition"
+        );
+        assert!(
+            userns_allocator.quarantined_slots().is_empty(),
+            "acquire_enabled_workspace must never have leased (and left quarantined) a userns \
+             slot when capacity refused first: {:?}",
+            userns_allocator.quarantined_slots()
+        );
+        holder.release();
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// Sol's required-tests list: "userns refusal releases capacity." Uses the injectable
+    /// `_given` seam with a REAL capacity lease (from a real, lightweight manager — no
+    /// `CAP_SYS_ADMIN` needed for `acquire_capacity` itself) and a SYNTHETIC userns refusal (no
+    /// real allocator needed at all), proving the capacity lease is released back to the pool
+    /// rather than left dangling.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn acquire_enabled_workspace_given_releases_capacity_when_userns_lease_is_refused() {
+        let Some((workspace_manager, workspace_base)) =
+            real_workspace_manager_without_qgroup_probe_for_tests("userns-refused")
+        else {
+            return;
+        };
+        let command_spec = spec(vec![]);
+        let profile = HardeningProfile::derive(&command_spec);
+        let result = acquire_enabled_workspace_given(
+            &command_spec,
+            &profile,
+            "container-userns-refused",
+            PathBuf::from("/abs/staged-rootfs"),
+            |bytes| workspace_manager.acquire_capacity(bytes),
+            || Err(UserNamespaceRefusal::PoolExhausted { pool_size: 0 }),
+            |_, _, _, _, _| {
+                panic!("create_workspace must never run when the lease is refused first")
+            },
+            |_| panic!("delete_workspace must never run on this path"),
+        );
+        assert!(
+            result.is_err(),
+            "a refused userns lease must refuse acquisition"
+        );
+        // If capacity was genuinely released, the full ceiling is leasable again.
+        let holder = workspace_manager
+            .acquire_capacity(1 << 30)
+            .expect("capacity must have been released back to the pool after the userns refusal");
+        holder.release();
+        let _ = std::fs::remove_dir_all(&workspace_base);
+    }
+
+    /// Sol's required-tests list: "recoverable provisioning failure releases unused lease" and
+    /// "`UnrecoverableLeak` quarantines it." Both use a REAL capacity lease + REAL userns lease
+    /// (from a real, lightweight allocator — no privileged operation needed for `lease()` itself)
+    /// and a SYNTHETIC `create_workspace` failure, so neither needs `CAP_SYS_ADMIN`.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn acquire_enabled_workspace_given_releases_the_lease_on_a_recoverable_provisioning_failure() {
+        let Some((workspace_manager, workspace_base)) =
+            real_workspace_manager_without_qgroup_probe_for_tests("recoverable-storage-failure")
+        else {
+            return;
+        };
+        let Some((userns_allocator, leases_dir)) =
+            real_userns_allocator_for_tests("recoverable-storage-failure")
+        else {
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            return;
+        };
+        let command_spec = spec(vec![]);
+        let profile = HardeningProfile::derive(&command_spec);
+        let result = acquire_enabled_workspace_given(
+            &command_spec,
+            &profile,
+            "container-recoverable-failure",
+            PathBuf::from("/abs/staged-rootfs"),
+            |bytes| workspace_manager.acquire_capacity(bytes),
+            || userns_allocator.lease(),
+            |_, _, _, _, capacity: CapacityLease| {
+                // Mirrors the REAL `WorkspaceManager::create_workspace`'s own contract for a
+                // non-`UnrecoverableLeak` `Storage` error: "capacity was already released
+                // internally" — a synthetic closure standing in for it must honor the same
+                // contract, or this test would (as it initially did) observe an incident from
+                // `CapacityLease::drop` that has nothing to do with what's under test.
+                capacity.release();
+                Err(WorkspaceProvisionError::Storage(
+                    WorkspaceStorageError::ZeroQuota,
+                ))
+            },
+            |_| panic!("delete_workspace must never run — no workspace was ever created"),
+        );
+        assert!(
+            result.is_err(),
+            "a recoverable provisioning failure must refuse acquisition"
+        );
+        assert!(
+            userns_allocator.quarantined_slots().is_empty(),
+            "a recoverable failure must release_unused() the lease, not quarantine it: {:?}",
+            userns_allocator.quarantined_slots()
+        );
+        assert!(
+            workspace_manager.is_healthy(),
+            "a recoverable failure must leave the workspace manager healthy (capacity released \
+             cleanly, not abandoned)"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn acquire_enabled_workspace_given_quarantines_the_lease_on_an_unrecoverable_leak() {
+        let Some((workspace_manager, workspace_base)) =
+            real_workspace_manager_without_qgroup_probe_for_tests("unrecoverable-leak")
+        else {
+            return;
+        };
+        let Some((userns_allocator, leases_dir)) =
+            real_userns_allocator_for_tests("unrecoverable-leak")
+        else {
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            return;
+        };
+        let command_spec = spec(vec![]);
+        let profile = HardeningProfile::derive(&command_spec);
+        let result = acquire_enabled_workspace_given(
+            &command_spec,
+            &profile,
+            "container-unrecoverable-leak",
+            PathBuf::from("/abs/staged-rootfs"),
+            |bytes| workspace_manager.acquire_capacity(bytes),
+            || userns_allocator.lease(),
+            |_, _, _, _, _capacity| {
+                Err(WorkspaceProvisionError::Storage(
+                    WorkspaceStorageError::UnrecoverableLeak {
+                        path: PathBuf::from("/fake/leaked/path"),
+                        subvol_id: None,
+                        provisioning_error: "synthetic provisioning error".to_string(),
+                        cleanup_error: "synthetic cleanup error".to_string(),
+                    },
+                ))
+            },
+            |_| panic!("delete_workspace must never run — no workspace was ever created"),
+        );
+        assert!(
+            result.is_err(),
+            "an unrecoverable leak must refuse acquisition"
+        );
+        assert_eq!(
+            userns_allocator.quarantined_slots().len(),
+            1,
+            "an UnrecoverableLeak must quarantine (never release_unused()) the lease: {:?}",
+            userns_allocator.quarantined_slots()
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// Sol's required-tests list: "Enabled health checks precede reserve." Forces
+    /// `userns_allocator.check_identity()` to fail deterministically (replacing the leases dir it
+    /// locked at construction) — no real Btrfs/qgroup privilege needed — and proves `hooks.reserve`
+    /// was never called by the time `launch_with` refuses.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn enabled_health_checks_refuse_before_reserve_is_ever_called() {
+        let Some((userns_allocator, leases_dir)) =
+            real_userns_allocator_for_tests("health-precedes-reserve")
+        else {
+            return;
+        };
+        // Replace the leases dir AFTER construction so `check_identity()`'s re-stat disagrees with
+        // the identity it locked at construction time — a deterministic, real failure.
+        let replacement = leases_dir.with_extension("replacement");
+        std::fs::rename(&leases_dir, &replacement).unwrap();
+        std::fs::create_dir_all(&leases_dir).unwrap();
+        assert!(
+            userns_allocator.check_identity().is_err(),
+            "the replaced leases dir must make check_identity() fail"
+        );
+
+        let workspace_manager =
+            WorkspaceManager::try_new(WorkspaceStorageMode::Disabled, Arc::new(|_: &str| {}))
+                .unwrap();
+        let backend = GvisorBackend {
+            live: Mutex::new(std::collections::HashMap::new()),
+            registry: Some(test_registry()),
+            workspace_integration: WorkspaceIntegration::Enabled {
+                workspace_manager,
+                userns_allocator,
+            },
+        };
+        let reserve_called = Arc::new(AtomicBool::new(false));
+        let reserve_called_in_hook = reserve_called.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(move |spec: &JobSpec| {
+                reserve_called_in_hook.store(true, Ordering::SeqCst);
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let result = backend.launch(&spec(vec![]), &hooks);
+        assert!(
+            result.is_err(),
+            "a failed userns identity check must refuse the launch"
+        );
+        assert!(
+            !reserve_called.load(Ordering::SeqCst),
+            "hooks.reserve must never be called once an Enabled health check has failed"
+        );
+        let _ = std::fs::remove_dir_all(&leases_dir);
+        let _ = std::fs::remove_dir_all(&replacement);
+    }
+
     /// CT-007 slice 2's live pinned drill: an `OciConfig` with `ExplicitUserNamespace` actually
     /// boots through the REAL production `stage_production_bundle`/`run_and_capture` machinery
     /// (not a throwaway spike bundle) — proving the exact command-line/OCI-JSON contract this
@@ -6062,6 +8083,147 @@ mod tests {
         let _ = std::fs::remove_dir_all(&leases_dir);
     }
 
+    /// A registry mapping a fresh digest-pinned [`ImageRef`] to the REAL staged rootfs
+    /// [`crate::resolved_gvisor_rootfs`] uses — so a spec naming this image resolves, through the
+    /// real registry lookup `GvisorBackend::launch_with` performs, to the exact rootfs the drill
+    /// above already proves is runnable.
+    #[cfg(feature = "integration")]
+    fn real_userns_drill_registry(
+        rootfs: &Path,
+    ) -> Arc<crate::asset_registry::GvisorAssetRegistry> {
+        let digest = crate::canonical_tar::canonical_tree_sha256_hex(rootfs)
+            .expect("hash the real staged rootfs");
+        let image = ImageRef::pinned(format!("test.local/userns-drill@sha256:{digest}")).unwrap();
+        Arc::new(
+            crate::asset_registry::GvisorAssetRegistry::from_bindings(vec![
+                crate::asset_registry::RootfsAssetBinding {
+                    image,
+                    rootfs: rootfs.to_path_buf(),
+                },
+            ])
+            .expect("real rootfs binding verifies"),
+        )
+    }
+
+    /// The env var naming a pre-provisioned `leases_dir` this drill may use for the STRICT
+    /// production [`UserNamespaceAllocator::try_new`] path. Sol's round-3 review: production strict
+    /// mode requires the leaf to ALREADY EXIST (owned by this process's euid, mode `0700` or
+    /// stricter) with an ancestor chain NOT writable by us — no ordinary test process can either
+    /// create that leaf itself (see `harden_and_verify_leases_dir`'s own doc) OR fabricate a
+    /// non-writable-by-us ancestor without real privilege, so this MUST come from an operator's
+    /// install step (e.g. `sudo install -d -m 0700 -o "$(whoami)" /opt/myelin-test/userns-leases`),
+    /// never something this drill provisions itself.
+    #[cfg(feature = "integration")]
+    const USERNS_DRILL_LEASES_DIR_ENV: &str = "MYELIN_USERNS_DRILL_LEASES_DIR";
+
+    /// Sol's round-2 review (hard blocker for this activation commit, since `GvisorBackend::try_new`
+    /// is now `pub`): the promised end-to-end drill through the REAL public activation path —
+    /// `GvisorBackend::try_new(GvisorWorkspaceConfig::Enabled)` + `.launch(...)` — not merely manual
+    /// orchestration of the individual pieces (those already have their own dedicated unit coverage:
+    /// `bind_enabled_lease_given_*`, `finalize_runtime_*`, `gvisor_prod_exec_test`). This is the
+    /// integration proof layered above that deterministic coverage.
+    ///
+    /// Sol's round-3 review: an EARLIER version of this drill generated its own fresh `leases_dir`
+    /// under `std::env::temp_dir()` and treated `GvisorBackend::try_new(Enabled)`'s resulting
+    /// GUARANTEED refusal (the strict allocator constructor can never accept a caller-generated,
+    /// not-pre-provisioned leaf) as an ordinary host-dependent skip — making this drill an
+    /// UNCONDITIONAL skip everywhere, never actually proving anything. Fixed: the ONLY legitimate
+    /// skip condition now is `MYELIN_USERNS_DRILL_LEASES_DIR` being unset (this drill has no
+    /// business fabricating that directory itself — see the const's own doc). Once an operator HAS
+    /// supplied it, `GvisorBackend::try_new(Enabled)` is required to succeed (`.expect`, never a
+    /// caught-and-skipped error) — reaching this point means the host is asserted to be correctly
+    /// provisioned, so any further failure (construction OR `.launch()` itself) is a genuine
+    /// regression this drill exists to catch, not a skip. The externally provisioned leases
+    /// directory is NEVER removed by this drill (it is not this drill's to own or delete) — only the
+    /// workspace base_dir this drill creates for itself is cleaned up.
+    #[test]
+    #[cfg(feature = "integration")]
+    fn explicit_user_namespace_boots_through_the_real_enabled_backend_and_launch() {
+        if let Err(e) = preflight_explicit_userns_policy(
+            resolved_explicit_userns_helper_dir(),
+            resolved_explicit_userns_runsc_root(),
+        ) {
+            eprintln!(
+                "[explicit-userns activation drill] SKIP: preflight_explicit_userns_policy failed: {e}"
+            );
+            return;
+        }
+        let rootfs = crate::resolved_gvisor_rootfs();
+        if !rootfs.exists() {
+            eprintln!(
+                "[explicit-userns activation drill] SKIP: staged rootfs absent at {rootfs:?}"
+            );
+            return;
+        }
+        let leases_dir = match std::env::var(USERNS_DRILL_LEASES_DIR_ENV) {
+            Ok(value) if !value.is_empty() => PathBuf::from(value),
+            _ => {
+                eprintln!(
+                    "[explicit-userns activation drill] SKIP: {USERNS_DRILL_LEASES_DIR_ENV} is not \
+                     set — this drill needs an operator-provisioned leases directory satisfying the \
+                     STRICT production allocator contract (pre-existing, euid-owned, mode 0700 or \
+                     stricter, non-writable-by-us ancestor chain); it cannot fabricate one itself"
+                );
+                return;
+            }
+        };
+
+        let tag = format!("{}-{}", std::process::id(), unique_suffix());
+        let workspace_base_dir =
+            std::env::temp_dir().join(format!("myelin-userns-activation-workspace-{tag}"));
+        let incident_sink: crate::workspace_manager::IncidentSink =
+            Arc::new(|msg: &str| eprintln!("[explicit-userns activation drill incident] {msg}"));
+
+        let backend = GvisorBackend::try_new(
+            real_userns_drill_registry(&rootfs),
+            GvisorWorkspaceConfig::Enabled {
+                base_dir: workspace_base_dir.clone(),
+                host_capacity_bytes: 1 << 30,
+                leases_dir,
+                min_pool_size: 1,
+            },
+            incident_sink,
+        )
+        .expect(
+            "GvisorBackend::try_new(Enabled) must succeed once an operator-provisioned leases \
+             directory is configured -- reaching this point asserts the host IS correctly \
+             provisioned, so a construction failure here is a genuine regression",
+        );
+
+        // Bind the spec to the SAME image the registry above was just built for (not
+        // `fixture_image()`, which points at a different, throwaway fixture rootfs).
+        let digest = crate::canonical_tar::canonical_tree_sha256_hex(&rootfs)
+            .expect("hash the real staged rootfs");
+        let mut command_spec = spec(vec![]);
+        command_spec.image =
+            ImageRef::pinned(format!("test.local/userns-drill@sha256:{digest}")).unwrap();
+        command_spec.command = vec!["/bin/sh".into(), "-c".into(), "id".into()];
+
+        let launch = backend.launch(&command_spec, &ok_hooks()).expect(
+            "launch through the real Enabled activation path must succeed on a correctly \
+                      provisioned host",
+        );
+        assert_eq!(
+            launch.result.exit_code,
+            Some(0),
+            "the guest `id` command must exit 0, stderr: {}",
+            String::from_utf8_lossy(&launch.result.stderr)
+        );
+        assert!(!launch.result.timed_out);
+        let stdout = String::from_utf8_lossy(&launch.result.stdout);
+        assert!(
+            stdout.contains("uid=65534") && stdout.contains("gid=65534"),
+            "the guest must report uid/gid 65534 (mapped via the OCI uidMappings/gidMappings this \
+             slice emits) through the REAL Enabled activation path, got: {stdout:?}"
+        );
+        backend
+            .kill(&launch.handle)
+            .expect("kill must succeed to clean up the live-map entry after a completed run");
+
+        // The leases dir is externally owned (an operator's install step) -- never removed here.
+        let _ = std::fs::remove_dir_all(&workspace_base_dir);
+    }
+
     #[test]
     fn gvisor_launch_drives_four_guarantees_on_the_same_trait() {
         // The SAME SandboxBackend trait + the SAME hardening — the named-second backend.
@@ -6070,7 +8232,7 @@ mod tests {
             .launch_with(
                 &spec(vec![]),
                 &ok_hooks(),
-                |_spec, _cfg, permit, _rootfs, _container_id| {
+                |_spec, _cfg, permit, _rootfs, _container_id, _prep| {
                     permit
                         .commit_and_release()
                         .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
@@ -6098,7 +8260,7 @@ mod tests {
                 .launch_with(
                     &spec(vec![]),
                     &ok_hooks(),
-                    move |_spec, _cfg, permit, _rootfs, container_id| {
+                    move |_spec, _cfg, permit, _rootfs, container_id, _prep| {
                         seen.lock().unwrap().push(container_id.to_string());
                         permit
                             .commit_and_release()
@@ -6805,7 +8967,7 @@ mod tests {
         let r = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            |_spec, _cfg, _permit, _rootfs, _container_id| Ok(fake_finalization()),
+            |_spec, _cfg, _permit, _rootfs, _container_id, _prep| Ok(fake_finalization()),
         );
         assert!(matches!(
             r,
@@ -6833,7 +8995,7 @@ mod tests {
             .launch_with(
                 &spec(vec![]),
                 &hooks,
-                |_spec, _cfg, permit, _rootfs, _container_id| {
+                |_spec, _cfg, permit, _rootfs, _container_id, _prep| {
                     permit
                         .commit_and_release()
                         .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
@@ -6863,7 +9025,7 @@ mod tests {
         let result = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            |_spec, _cfg, permit, _rootfs, _container_id| {
+            |_spec, _cfg, permit, _rootfs, _container_id, _prep| {
                 permit
                     .commit_and_release()
                     .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
@@ -6901,7 +9063,7 @@ mod tests {
         let result = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            move |_spec, _cfg, _permit, _rootfs, _container_id| {
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
                 spawned_at.store(true, Ordering::SeqCst);
                 Ok(fake_finalization())
             },
@@ -6918,6 +9080,51 @@ mod tests {
                 mem_byte_seconds: 0,
             })
         );
+    }
+
+    /// Sol's round-1 review: "all pre-permit compound-error combinations" -- when final
+    /// attribution refuses AND releasing the now-unused reservation ALSO fails, the caller must see
+    /// BOTH messages, never just the attribution error silently swallowing the release failure (or
+    /// vice versa). Runs against `Disabled` (no privileged workspace needed) since this exercises
+    /// the message-compounding logic itself, which is identical regardless of workspace
+    /// integration -- `cleanup_diagnostics` is unconditionally empty for `Disabled`, so this proves
+    /// the OTHER two of the three compounding sources (attribution error + release failure) meet
+    /// correctly through the real `launch_with` code path, not just the pure `join_diagnostics`
+    /// helper in isolation.
+    #[test]
+    fn launch_permit_refusal_compounds_with_a_failing_reservation_release() {
+        let backend = GvisorBackend::new(test_registry());
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _h, _usage| {
+                Err(crate::HookError("settle backend unavailable".into()))
+            }),
+            Box::new(|_t| Err(crate::HookError("claim canceled".into()))),
+            Box::new(|_s| Ok(())),
+        );
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, _permit, _rootfs, _container_id, _prep| Ok(fake_finalization()),
+        );
+        match result {
+            Err(SandboxLaunchError::Failed(GvisorError::Runtime(message))) => {
+                assert!(
+                    message.contains("claim canceled"),
+                    "the original attribution refusal must survive: {message}"
+                );
+                assert!(
+                    message.contains("releasing the unused reservation also failed"),
+                    "the release failure must be compounded in, not lost: {message}"
+                );
+                assert!(
+                    message.contains("settle backend unavailable"),
+                    "the release failure's own text must be present verbatim: {message}"
+                );
+            }
+            other => panic!("expected a compound GvisorError::Runtime, got {other:?}"),
+        }
     }
 
     /// The pre-existing leak this fix closes: previously, ANY error from `run(...)` propagated
@@ -6955,7 +9162,7 @@ mod tests {
         let result = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            |_spec, _cfg, _permit, _rootfs, _container_id| {
+            |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
                 Err(RunFailure::uncommitted("injected uncommitted run failure"))
             },
         );
@@ -7009,7 +9216,7 @@ mod tests {
         let result = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            |_spec, _cfg, _permit, _rootfs, _container_id| {
+            |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
                 Err(RunFailure::commit_outcome_unknown(
                     "injected commit-outcome-unknown run failure",
                 ))
@@ -7050,7 +9257,7 @@ mod tests {
         let result = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            |_spec, _cfg, _permit, _rootfs, _container_id| {
+            |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
                 Err(RunFailure::committed_but_not_executed(
                     "injected committed-but-not-executed run failure",
                 ))
@@ -7098,7 +9305,7 @@ mod tests {
         let result = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            |_spec, _cfg, _permit, _rootfs, _container_id| {
+            |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
                 Err(RunFailure::committed_but_not_executed(
                     "injected committed-but-not-executed run failure",
                 ))
@@ -7149,7 +9356,7 @@ mod tests {
         let result = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            move |_spec, _cfg, _permit, _rootfs, _container_id| {
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
                 Err(RunFailure::executed(
                     "injected executed-phase run failure",
                     fallback_usage,
@@ -7195,7 +9402,7 @@ mod tests {
         let result = backend.launch_with(
             &spec(vec![]),
             &hooks,
-            move |_spec, _cfg, _permit, _rootfs, _container_id| {
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
                 Err(RunFailure::executed(
                     "injected executed-phase run failure",
                     fallback_usage,
@@ -7262,7 +9469,7 @@ mod tests {
         let result = backend.launch_with(
             &unregistered_spec,
             &hooks,
-            move |_spec, _cfg, _permit, _rootfs, _container_id| {
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
                 spawned_at.store(true, Ordering::SeqCst);
                 Ok(fake_finalization())
             },
@@ -7325,7 +9532,7 @@ mod tests {
         let result = backend.launch_with(
             &unregistered_spec,
             &hooks,
-            move |_spec, _cfg, _permit, _rootfs, _container_id| {
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
                 spawned_at.store(true, Ordering::SeqCst);
                 Ok(fake_finalization())
             },

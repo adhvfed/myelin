@@ -1136,9 +1136,6 @@ fn verify_leases_dir_leaf_strict(dir: &Path) -> Result<(), UserNamespaceAllocato
     Ok(())
 }
 
-/// A production constructor for this type does not exist yet (deliberately) — the `gvisor.rs`
-/// piece of slice 3 adds one, once `launch_with` has actual kill/delete/reap +
-/// `MemoryCgroup::quiesce()`-verified cgroup-quiescence evidence to construct it honestly from.
 /// Bound to the SAME [`LeaseNonce`] as the lease it is minted for, AND to the specific
 /// `container_id`/`runsc_root_identity`/`cgroup_identity` the lease was durably [`bound
 /// <UserNamespaceLease::bind>`](UserNamespaceLease::bind) to — `release` refuses (`ProofMismatch`)
@@ -1153,7 +1150,55 @@ pub struct UserNamespaceQuiescenceProof {
     cgroup_identity: (u64, u64),
 }
 
+/// Why [`UserNamespaceQuiescenceProof::from_runtime_evidence`] refused to mint a proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeEvidenceError {
+    /// The evidence's own namespace is [`crate::gvisor::RuntimeNamespaceQuiescence::Rootless`] — a
+    /// rootless run never had a runsc-root identity to check, so it can never honestly back a real
+    /// userns lease release.
+    RootlessEvidence,
+}
+
+impl std::fmt::Display for RuntimeEvidenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuntimeEvidenceError::RootlessEvidence => write!(
+                f,
+                "the runtime evidence is Rootless — it never had a runsc-root identity to check, \
+                 so it cannot back a userns lease release"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeEvidenceError {}
+
 impl UserNamespaceQuiescenceProof {
+    /// CT-007 slice 3, piece 7c: the ONE production constructor — mints a proof directly from a
+    /// genuine [`crate::gvisor::RuntimeQuiescenceEvidence`] (itself only ever produced by a
+    /// successful `finalize_runtime`), taking the nonce straight from `lease` so a caller can never
+    /// supply an arbitrary one (a caller-suppliable nonce would let ANY code mint a proof for ANY
+    /// lease it merely holds a reference to, not just the one that was actually checked-torn-down).
+    pub(crate) fn from_runtime_evidence(
+        lease: &UserNamespaceLease,
+        evidence: &crate::gvisor::RuntimeQuiescenceEvidence,
+    ) -> Result<Self, RuntimeEvidenceError> {
+        let runsc_root_identity = match evidence.namespace() {
+            crate::gvisor::RuntimeNamespaceQuiescence::Rootless => {
+                return Err(RuntimeEvidenceError::RootlessEvidence);
+            }
+            crate::gvisor::RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                runsc_root_identity,
+            } => runsc_root_identity,
+        };
+        Ok(UserNamespaceQuiescenceProof {
+            lease_nonce: lease.lease_nonce,
+            container_id: evidence.container_id().to_string(),
+            runsc_root_identity,
+            cgroup_identity: evidence.cgroup().cgroup_identity(),
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn assert_for_tests(
         lease_nonce: LeaseNonce,
@@ -2444,6 +2489,49 @@ mod tests {
         let lease_again = allocator.lease().unwrap();
         assert_eq!(lease_again.host_uid(), freed_uid);
         release_for_tests(lease_again);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ───────────────── CT-007 slice 3, piece 7c: from_runtime_evidence ─────────────────
+
+    #[test]
+    fn from_runtime_evidence_mints_a_matching_proof_and_releases() {
+        let (allocator, base, _log) = new_allocator_for_test("from-runtime-evidence-ok", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        lease
+            .bind("container-1".to_string(), (7, 8), (9, 10))
+            .expect("bind must succeed for a fresh Allocated lease");
+        let evidence = crate::gvisor::RuntimeQuiescenceEvidence::assert_for_tests(
+            "container-1".to_string(),
+            crate::gvisor::RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                runsc_root_identity: (7, 8),
+            },
+            crate::gvisor::CgroupQuiescenceEvidence::assert_for_tests((9, 10)),
+        );
+        let proof = UserNamespaceQuiescenceProof::from_runtime_evidence(&lease, &evidence)
+            .expect("matching ExplicitUserNamespace evidence must mint a proof");
+        lease
+            .release(proof)
+            .expect("release with the minted proof must succeed");
+        assert!(allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn from_runtime_evidence_refuses_rootless_evidence() {
+        let (allocator, base, _log) =
+            new_allocator_for_test("from-runtime-evidence-rootless", 1, 1);
+        let lease = allocator.lease().unwrap();
+        let evidence = crate::gvisor::RuntimeQuiescenceEvidence::assert_for_tests(
+            "container-1".to_string(),
+            crate::gvisor::RuntimeNamespaceQuiescence::Rootless,
+            crate::gvisor::CgroupQuiescenceEvidence::assert_for_tests((9, 10)),
+        );
+        let result = UserNamespaceQuiescenceProof::from_runtime_evidence(&lease, &evidence);
+        assert!(matches!(
+            result,
+            Err(RuntimeEvidenceError::RootlessEvidence)
+        ));
         let _ = std::fs::remove_dir_all(&base);
     }
 
