@@ -37,7 +37,6 @@ use crate::hardening::HardeningProfile;
 use crate::launch_gate::{DirectChildRetirement, SandboxCommand, SpawnPhase};
 use crate::redaction::RedactionPlan;
 use crate::runner::RetryableAttemptCause;
-use sha2::{Digest, Sha256};
 use crate::user_namespace::{
     CheckoutPreparationSession, PreparationQuiescenceProof, RunscInvocationMode,
     UserNamespaceAllocator, UserNamespaceAllocatorError, UserNamespaceBindError,
@@ -55,6 +54,7 @@ use crate::{
     SandboxLaunch, SandboxLaunchError, SandboxOutputSink, SandboxOutputStream, SandboxResult,
     TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
+use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::io;
 use std::io::{Read, Seek, Write};
