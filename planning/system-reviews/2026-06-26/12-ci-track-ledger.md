@@ -2275,3 +2275,42 @@ derivation) and 5b.3-2c (wiring the hook + failure disposition + blocker tests) 
 detailed level with Sol but not yet implemented. 5b.3-3 through 5b.3-7 remain scoped only at a
 task-description level. Task #20 (EROFS cargo-vendor asset) and the live-drill host-provisioning gap
 (previous entry) are both still open, unchanged by this entry's work.
+
+## 2026-07-27 — CT-007 slice 5b.3-2b landed: the durable checkout authority chain (Sol, design +
+## 3 review rounds)
+
+Closes the gap 5b.3-2a's hook shape was built to eventually enforce: nothing previously verified
+that a job's launched `JobSpec.workspace` (repo/commit) matched what its durable claim was
+originally authorized against. Committed `221e4535`.
+
+**What landed:**
+- `myelin_ci_sandbox::derive_checkout_authorization_scope(kind, &workspace)` — the one sanctioned
+  facade an external crate may use to derive a checkout scope, so the control-plane's authority side
+  and the sandbox's launch side can never silently diverge in how a workspace is parsed.
+- `CiJobRuntimeAuthorityRequest.checkout: Option<CheckoutAuthorizationScope>`, derived at both
+  construction sites (materialize time from `ci_run`, claim time from the manifest's per-job grant).
+- Digest versioning: `token_authority_digest` (v1) stays byte-frozen, sharing nothing with the new
+  logic; `token_authority_digest_v2` is a wholly separate encoder binding the checkout scope. Every
+  newly minted handle is v2; `verifies()` still accepts a legacy v1 handle for a compute-only
+  request (never for a checkout-bearing one — v1 never bound a checkout target).
+- Claim-time cross-check: `LockedManifestCiJobTokenIssuer::mint` now loads the durable `ci_job_spec`
+  row in the same locked tx and verifies its own identity (`ci_run_id`, `token_authority_handle`,
+  `idem_token`) plus workspace equality against the locked claim/run/manifest — the piece that
+  actually closes the launch-time substitution gap.
+
+**Sol's review, 3 rounds:** Round 1 found the durable launch template's own identity fields
+(`ci_run_id`, `token_authority_handle`) were being silently discarded (only `.spec` reached
+verification), self-referential v1/v2 "frozen encoding" tests (computed and compared via the same
+function), 3 integration test fixtures that wouldn't compile under `--features integration`, and
+several fixtures using abbreviated non-hex commit values that the new validation correctly rejects.
+Round 2 found the cross-tenant check's rationale was factually wrong — `CiDriveManifestV1::validate`
+already enforces `repo_ref`'s embedded tenant equals `manifest.tenant_id` via
+`validate_canonical_ref`, making the new check genuine defense-in-depth, not an independently
+reachable gap (doc corrected; a real full-chain test added showing `validate()` itself is what
+catches it) — and asked for direct `idem_token` divergence test coverage (added). Final round:
+cleared with no remaining blocker.
+
+**Still open:** 5b.3-2c (dynamic `repo:<id>#pull` capability derivation/minting in
+`ci_identity_adapter.rs`, plus real `CheckoutAuthorizationHook` wiring) is designed with Sol but not
+yet implemented — the fixed fields are otherwise unaffected. 5b.3-3 through 5b.3-7 remain scoped
+only at a task-description level. Task #20 and the live-drill host-provisioning gap are unchanged.
