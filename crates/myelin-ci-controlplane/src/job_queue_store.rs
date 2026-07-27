@@ -73,6 +73,7 @@ use crate::scheduler::CANCEL_SUPERSEDED_QUERY;
 use crate::scheduler::{
     EnqueueOutcome, Lane, AUTHORIZE_JOB_LAUNCH_QUERY, COMPLETE_JOB_QUERY, CONSUME_CLAIM_QUERY,
     HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY, READ_COMPLETION_DISPOSITION_QUERY,
+    VERIFY_JOB_LAUNCH_LIVE_QUERY,
 };
 
 // =================================================================================================
@@ -666,6 +667,48 @@ impl CiJobQueueStore {
             connection: Some(connection),
             lock_key,
         }))
+    }
+
+    /// **CT-007 slice 5b.3-2c: read-only sibling of [`Self::authorize_launch_retained`].** Checks
+    /// the EXACT SAME generation predicate ([`VERIFY_JOB_LAUNCH_LIVE_QUERY`], the same bound fields
+    /// in the same order) but never mutates `job_queue`/`ci_job` and never holds an advisory lock or
+    /// connection past this call. For the pre-Hop-A checkout-authorization hook, which must confirm
+    /// the durable claim is still live WITHOUT performing (or pre-empting) the real workload's
+    /// `leased -> running` CAS — that CAS remains `authorize_launch_retained`'s alone to commit.
+    pub(crate) async fn verify_launch_live(
+        &self,
+        claim: &CiJobLaunchClaim,
+    ) -> Result<bool, JobQueueStoreError> {
+        let job_id = parse_id("job_id", &claim.job_id)?;
+        let wf_run_id = parse_id("run_id", &claim.wf_run_id)?;
+        let claim_nonce = parse_id("claim_nonce", &claim.claim_nonce)?;
+        let tenant_id = claim.tenant_id.clone();
+        let region = claim.region.clone();
+        let lease_owner = claim.lease_owner.clone();
+        let lease_epoch = claim.lease_epoch;
+        let claim_started_at_epoch_secs = claim.claim_started_at_epoch_secs;
+        let claim_expires_at_epoch_secs = claim.claim_expires_at_epoch_secs;
+        let live = with_tenant_tx(&self.pool, &claim.tenant_id, &claim.region, move |conn| {
+            Box::pin(async move {
+                let row: Option<i32> = sqlx::query_scalar(VERIFY_JOB_LAUNCH_LIVE_QUERY)
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .bind(job_id)
+                    .bind(wf_run_id)
+                    .bind(&lease_owner)
+                    .bind(lease_epoch)
+                    .bind(claim_nonce)
+                    .bind(claim_started_at_epoch_secs)
+                    .bind(claim_expires_at_epoch_secs)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| PgError::Query(e.to_string()))?;
+                Ok(row.is_some())
+            })
+        })
+        .await
+        .map_err(JobQueueStoreError::from_pg)?;
+        Ok(live)
     }
 
     /// Claim CAS for the durable completion reporter. This is intentionally caller-transaction-only:

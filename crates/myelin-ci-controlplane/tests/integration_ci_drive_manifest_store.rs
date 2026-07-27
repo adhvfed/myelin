@@ -777,8 +777,62 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .unwrap()
     .resolve_with_authorization(
         pre_cas_signed,
-        Some(ci_job_authorization_context(&exact_claim)),
+        Some(ci_job_authorization_context(&exact_claim, Some(&checkout_scope()))),
     );
+    let launch_authorizer = second_identity.launch_authorizer();
+    // CT-007 slice 5b.3-2c (Sol's review): prove `authorize_checkout` against a REAL durable claim
+    // through a live PostgreSQL round-trip -- the fake claim gates only prove orchestration.
+    launch_authorizer
+        .authorize_checkout(&pre_cas_spec, &checkout_scope())
+        .expect("an exact live generation passes checkout authorization");
+    let (job_queue_state_before, ci_job_state_before): (String, String) = sqlx::query_as(
+        "SELECT q.state, j.state FROM job_queue q
+           JOIN ci_job j ON j.tenant_id = q.tenant_id AND j.region = q.region
+             AND j.job_id = q.job_id
+         WHERE q.tenant_id = $1 AND q.region = $2 AND q.job_id = $3::uuid",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[0].job_id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        (job_queue_state_before.as_str(), ci_job_state_before.as_str()),
+        ("leased", "queued"),
+        "checkout authorization must never advance either durable row"
+    );
+    // A canceled/ineligible `ci_job` surface must fail checkout authorization even though
+    // `job_queue` alone still says `leased` -- exactly the gap the read-only
+    // `VERIFY_JOB_LAUNCH_LIVE_QUERY` EXISTS join against `ci_job` closes (Sol's review). Flips
+    // `ci_job` to `cancelled` and immediately back so the rest of this test's `queued`/`running`
+    // assumptions for this row are undisturbed.
+    sqlx::query(
+        "UPDATE ci_job SET state = 'cancelled'
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[0].job_id)
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(
+        launch_authorizer
+            .authorize_checkout(&pre_cas_spec, &checkout_scope())
+            .is_err(),
+        "a canceled ci_job surface must fail checkout authorization even with a live job_queue row"
+    );
+    sqlx::query(
+        "UPDATE ci_job SET state = 'queued'
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+    )
+    .bind(&expected.tenant_id)
+    .bind(&expected.region)
+    .bind(&expected.jobs[0].job_id)
+    .execute(&admin)
+    .await
+    .unwrap();
     let runner_hooks = ci_runner_hooks(
         provider.clone(),
         second_identity.launch_authorizer(),
@@ -807,6 +861,12 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         region_store.reap(&expected.region).await.unwrap(),
         1,
         "the production reaper recovers the minted-but-not-launched lease"
+    );
+    assert!(
+        launch_authorizer
+            .authorize_checkout(&pre_cas_spec, &checkout_scope())
+            .is_err(),
+        "a stale/reaped generation must fail checkout authorization"
     );
     let reminted_lease = region_store
         .claim(
@@ -844,7 +904,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         .spec
         .resolve_with_authorization(
             signed.clone(),
-            Some(ci_job_authorization_context(&exact_claim)),
+            Some(ci_job_authorization_context(&exact_claim, Some(&checkout_scope()))),
         );
 
     let mut mutated_spec = spec.clone();
@@ -978,8 +1038,11 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         .spec
         .resolve_with_authorization(
             spawn_signed,
-            Some(ci_job_authorization_context(&exact_claim)),
+            Some(ci_job_authorization_context(&exact_claim, Some(&checkout_scope()))),
         );
+    launch_authorizer
+        .authorize_checkout(&spawn_spec, &checkout_scope())
+        .expect("the fresh reminted generation passes checkout authorization before real launch");
     let backend = GvisorBackend::new(test_registry());
     let launch = backend
         .launch(&spawn_spec, &runner_hooks)
@@ -1055,16 +1118,16 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .unwrap()
     .resolve_with_authorization(
         signed.clone(),
-        Some(ci_job_authorization_context(&refused_claim)),
+        Some(ci_job_authorization_context(&refused_claim, Some(&checkout_scope()))),
     );
     let crash_spec = launch_template(&expected, 2, &crash_claim.idem_token)
         .spec
-        .resolve_with_authorization(signed, Some(ci_job_authorization_context(&crash_claim)));
+        .resolve_with_authorization(signed, Some(ci_job_authorization_context(&crash_claim, Some(&checkout_scope()))));
     let mut cross_tenant_claim = refused_claim.clone();
     cross_tenant_claim.tenant_id = "manifest-other".into();
     let mut cross_tenant_spec = refused_spec.clone();
     cross_tenant_spec.run_token_authorization =
-        Some(ci_job_authorization_context(&cross_tenant_claim));
+        Some(ci_job_authorization_context(&cross_tenant_claim, Some(&checkout_scope())));
     assert!(
         runner_hooks.reserve(&cross_tenant_spec).is_err(),
         "caller-supplied cross-tenant scope never begins another tenant's reservation"
@@ -1074,7 +1137,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     stale_generation_claim.claim_nonce = "88888888-8888-8888-8888-888888888888".into();
     let mut stale_generation_spec = refused_spec.clone();
     stale_generation_spec.run_token_authorization =
-        Some(ci_job_authorization_context(&stale_generation_claim));
+        Some(ci_job_authorization_context(&stale_generation_claim, Some(&checkout_scope())));
     assert!(
         runner_hooks.reserve(&stale_generation_spec).is_err(),
         "a copied context for a nonexistent claim generation cannot begin the reservation"

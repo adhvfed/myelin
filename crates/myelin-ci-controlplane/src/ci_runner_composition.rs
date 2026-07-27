@@ -89,6 +89,7 @@ pub fn ci_runner_hooks(
     let begin = lifecycle.clone();
     let verify = lifecycle.clone();
     let release = lifecycle;
+    let checkout_authorizer = launch_authorizer.clone();
     RunnerHooks::new_with_launch_fence(
         CompletionSettlementOwner::TerminalReporter,
         Box::new(move |spec| begin.begin(spec)),
@@ -103,6 +104,12 @@ pub fn ci_runner_hooks(
                 .map_err(|_| HookError("mandatory sandbox isolation profile is unavailable".into()))
         }),
     )
+    // CT-007 slice 5b.3-2c: the real pre-Hop-A checkout-authorization hook, backed by the SAME
+    // `IdentityCiJobLaunchAuthorizer` the launch fence above uses (`authorize_checkout` shares its
+    // verification core with `authorize_retained`, so both stay backed by one implementation).
+    .with_checkout_authorization(Box::new(move |spec, scope| {
+        checkout_authorizer.authorize_checkout(spec, scope)
+    }))
 }
 
 /// Test-support job-local cancellation coordinator for Tier-P reservation crash probes.

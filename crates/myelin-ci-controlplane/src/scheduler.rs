@@ -255,6 +255,39 @@ WHERE surface.tenant_id = launched.tenant_id
   AND surface.state IN ('queued', 'leased')
 RETURNING surface.job_id";
 
+/// **CT-007 slice 5b.3-2c: the read-only sibling of [`AUTHORIZE_JOB_LAUNCH_QUERY`].** Same exact
+/// generation predicate (every bound parameter, in the same order), including the SAME `ci_job`
+/// surface-state gate the real CAS's second `UPDATE` enforces (Sol's review: the `job_queue`-only
+/// predicate alone let Hop A proceed for a missing, canceled, or otherwise surface-inconsistent job
+/// the real workload CAS would refuse) -- but a plain `SELECT`, no `UPDATE`, no state transition, no
+/// advisory-lock session dance. This is what the pre-Hop-A checkout-authorization hook uses to
+/// confirm the durable claim is still live WITHOUT performing the `leased -> running` CAS the real
+/// workload launch alone is allowed to commit. Bind: `$1 tenant`, `$2 region`, `$3 job`, `$4
+/// workflow run`, `$5 owner`, `$6 epoch`, `$7 nonce`, `$8 claim start`, `$9 claim expiry` (no `$10`
+/// -- there is no execution lease to install here).
+pub const VERIFY_JOB_LAUNCH_LIVE_QUERY: &str = "\
+SELECT 1
+FROM job_queue
+WHERE tenant_id = $1
+  AND region = $2
+  AND job_id = $3::uuid
+  AND run_id = $4::uuid
+  AND state = 'leased'
+  AND lease_owner = $5
+  AND lease_epoch = $6
+  AND claim_nonce = $7::uuid
+  AND EXTRACT(EPOCH FROM claim_started_at)::bigint = $8
+  AND EXTRACT(EPOCH FROM claim_expires_at)::bigint = $9
+  AND claim_expires_at > statement_timestamp()
+  AND completion_receipt IS NULL
+  AND EXISTS (
+    SELECT 1 FROM ci_job AS surface
+    WHERE surface.tenant_id = job_queue.tenant_id
+      AND surface.region = job_queue.region
+      AND surface.job_id = job_queue.job_id
+      AND surface.state IN ('queued', 'leased')
+  )";
+
 /// **The idempotent enqueue (arch 02 §2.1 / §3.2) — insert ONE schedulable `job_queue` row.** The
 /// durable equivalent of [`SchedulerState::enqueue`]: a job the run's `SCHEDULE_AND_RUN_JOB`
 /// activity dispatches becomes a `queued` row. Idempotent on the `jq_idem` unique
