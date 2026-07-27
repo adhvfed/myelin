@@ -1929,3 +1929,92 @@ RPCs the checkout transport calls into, but it is not itself the checkout client
   including the real Enabled-path drill.
 
 **Immediate next unit of work:** 5b.1 — the lease/binding state-machine extension. Not yet started.
+
+## 2026-07-27 — CT-007 slice 5b.1 landed: sequential preparation-session lease lifecycle (Sol, 4 review rounds)
+
+Slice 5b.1 (previous entry) is complete: `crates/myelin-ci-sandbox/src/user_namespace.rs` now
+supports a checkout-bearing job's identity visiting a preparation runtime BEFORE the real workload
+runs, without touching the existing single-runtime `Allocated -> Bound` path used by every
+non-checkout CI/agent job at all. Commit `495ee8b3`.
+
+**Shape:** `Allocated -> PreparationBound -> Prepared -> Bound` (the last transition, via the new
+`bind_workload`, produces the SAME `LeasePhaseV2::Bound` the ordinary `bind()` does, so every
+existing `release()`/final-settlement call site takes over unchanged). New durable
+`UserNamespaceLease` methods: `bind_preparation`, `confirm_prepared` (verifies a
+`PreparationQuiescenceProof` — a type distinct from the existing `UserNamespaceQuiescenceProof`),
+`release_prepared` (the `Prepared`-phase counterpart to `release_unused`), `bind_workload`. A new
+`CheckoutPreparationSession` capability wrapper (in-memory, `pub(crate)`-only) enforces correct
+transition order and binds itself to the SPECIFIC lease it started with, panicking on any
+out-of-order call or cross-lease substitution — defense in depth on top of the durable marker's
+own checks, which remain independently sufficient on their own.
+
+**A real schema-versioning gap found and fixed mid-review (Sol's round-1 review, point 4):** the
+first draft added the two new phases directly into the existing `schema_version: 1` marker shape.
+Sol caught that this breaks the codebase's own stated schema-versioning invariant (`schema_version`
+must fully determine the marker's shape) — a rollback to a pre-5b.1 binary encountering a
+`schema_version: 1` marker with a `PreparationBound`/`Prepared` phase its own 2-variant enum can't
+represent would misdiagnose "corrupt marker" instead of an honest "newer/unrecognized schema."
+Fixed by freezing the original 2-variant shape as `LeaseMarkerV1`/`LeasePhaseV1`
+(`schema_version` 1, read-only, boot-reconciliation-only) and introducing the 4-variant shape as
+`LeaseMarkerV2`/`LeasePhaseV2` (`schema_version` 2) — `lease()` (the one marker-minting call) always
+writes V2 going forward; every other lease method only ever reads/rewrites V2, since every ACTIVE
+lease this process itself issues is always V2. Boot reconciliation gained a matching second
+schema-dispatch arm. A dedicated test plants a real legacy V1 marker and proves it's still
+recognized/quarantined correctly, and that a freshly minted marker is always V2.
+
+**Three more real design gaps caught across the review, each fixed:**
+- **Session not bound to one lease (round 1):** the original session tracked only a phase, so a
+  session prepared with lease A could confirm/release/bind-workload using an unrelated lease B.
+  Fixed by carrying the lease's own nonce in `PreparationBound`/`Prepared` state and asserting it
+  against every passed lease; 2 `#[should_panic]` cross-lease-substitution tests added.
+- **`bind_workload` consumed the session on a retryable refusal (round 1):** the original by-value
+  signature destroyed the only preparation capability even on `InvalidContainerId`/`MarkerTooLarge`
+  — caller-fixable failures that leave the lease genuinely untouched. Fixed with `&mut self`; a
+  retry-survival test proves a corrected retry still reaches a real `release()`.
+- **`bind_workload`'s success handoff needed to be a real capability, not `Ok(())` (round 3):**
+  fixed with `WorkloadBindingIdentity` — private fields, no `Clone`, obtainable ONLY from a genuine
+  successful `bind_workload`, consumable ONLY via `into_parts()` — so the 5b.3 caller constructs
+  `LeaseBindState::Bound` from the exact durably-committed triple, never a separately-remembered
+  copy that could silently diverge.
+
+**Also fixed:** the session's `confirm_prepared` deliberately abandons (terminal `Unreleasable`) on
+ANY failure, including an ordinary wrong/mismatched proof — stricter than the raw
+`UserNamespaceLease::confirm_prepared` it wraps (which still leaves the marker genuinely untouched
+on a wrong proof, matching `release()`'s own established retry-tolerant precedent), since a real
+caller has exactly one proof-minting opportunity per real preparation run; a dedicated test proves
+the full disposition (allocator stays healthy, session becomes `Unreleasable`, a later correct
+proof cannot advance it, dropping the lease quarantines exactly its own slot). `confirm_prepared`
+returns a new dedicated `PreparationConfirmationError` rather than reusing
+`UserNamespaceReleaseError` (whose `ProofMismatch` doc specifically claims the lease is consumed —
+true for `release()`'s by-value signature, false for `confirm_prepared`'s `&mut self`).
+`UserNamespaceBindError`'s doc/Display generalized to cover all three binding callers (`bind`,
+`bind_preparation`, `bind_workload`) instead of hardcoding "Allocated -> Bound" language that was
+already false for two of the three. Deterministic failure coverage added for every duplicated
+durable operation: the three rewrite paths via a pre-planted `<marker>.tmp` colliding with
+`rewrite_marker_atomically`'s own `O_EXCL` create; `release_prepared`'s unlink ambiguity via a new
+`release_prepared_given` seam (an injectable unlink operation) rather than a chmod-based `EACCES`,
+which Sol flagged as non-deterministic under `CAP_DAC_OVERRIDE`. New types/methods are `pub(crate)`,
+not `pub`, so no external consumer of this crate can bypass `CheckoutPreparationSession`'s ordering.
+
+**Review process:** 4 rounds with Sol (gpt-5.6-sol), each finding genuine, concrete defects — not
+style preference. Round 1: the schema-version gap, session cross-lease binding, `bind_workload`
+retry-destruction, plus required deterministic-failure/legacy-marker/cross-lease test coverage.
+Round 2: the missing `WorkloadBindingIdentity` capability and the missing terminal-confirmation
+test, plus wording/visibility cleanups. Round 3: `WorkloadBindingIdentity` still forgeable via
+public `Clone`+fields; `UserNamespaceBindError`'s docs still named only `bind`/`bind_workload`, not
+`bind_preparation`. Round 4: cleared.
+
+**Verified, final round:** `cargo clippy -p myelin-ci-sandbox --all-targets` clean on all three
+feature combinations (none/`integration`/`integration,test-support`); `cargo build --workspace
+--locked` clean; `cargo clippy --workspace --all-targets` clean on both feature combinations;
+`myelin-lints` `lint-gate` clean (771 files, 0 violations); `rustfmt --check` clean; the module's
+own test suite: 62 → 84 tests (28 new), all passing; full `myelin-ci-sandbox` lib suite unaffected
+elsewhere.
+
+**Still open:** 5b.2 (the checkout-specific runtime: `CheckoutPreparationSpec`/`CheckoutTransport`/
+`CheckoutPreparationOutcome`/`PreparedCheckoutEvidence`, OCI shape, exact-commit-OID verification,
+checked finalization, a live helper drill — no workload activation yet) and 5b.3 (atomic composition
+into `launch_with`'s real sequence, including the real Enabled-path drill). Neither started. This
+slice's own `CheckoutPreparationSession`/`WorkloadBindingIdentity`/durable lease machinery is fully
+built and tested but not yet wired into `GvisorBackend`/`launch_with` — same deliberate deferral
+discipline as every earlier slice's own "not yet consumed" scaffolding.
