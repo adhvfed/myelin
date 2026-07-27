@@ -3985,6 +3985,15 @@ fn run_and_capture_impl(
     let mut sandbox_command = SandboxCommand::new(bin, launch_permit, watchdog_timeout)
         .map_err(|error| RunFailure::uncommitted(format!("prepare runsc launch gate: {error}")))?;
     let fenced = sandbox_command.is_fenced();
+    // A fenced command's stdin is ALWAYS a pipe (the gate script itself reads its release line from
+    // it) regardless of whether this caller has real bytes to feed the guest afterward — so a
+    // caller that does (the git-wire request body) must explicitly ask for that SAME pipe back once
+    // the gate releases, rather than have it closed for EOF the instant release happens (task #33's
+    // root cause: this call was previously missing entirely, so every fenced launch closed the pipe
+    // unconditionally and `child.stdin()` was always `None` by the time this function reached it).
+    if fenced && stdin.is_some() {
+        sandbox_command.return_stdin_to_caller_after_gate();
+    }
     {
         let cmd = sandbox_command.command_mut();
         apply_runsc_invocation_policy(cmd, mode).map_err(RunFailure::uncommitted)?;
