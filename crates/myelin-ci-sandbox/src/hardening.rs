@@ -393,7 +393,20 @@ impl HardeningProfile {
     /// job's [`EgressPolicy`] (default-deny, allowlist opt-in), with a NIC attached only when the
     /// allowlist is non-empty.
     pub fn derive(spec: &JobSpec) -> HardeningProfile {
-        let allowlist = spec.egress.allow.clone();
+        Self::for_execution(&spec.limits, &spec.egress)
+    }
+
+    /// CT-007 slice 5b.2: the shared derivation core beneath [`Self::derive`], usable by a caller
+    /// with real [`ResourceLimits`](crate::ResourceLimits)/[`EgressPolicy`](crate::EgressPolicy) but
+    /// no real `JobSpec` to derive one from — the checkout-preparation runtime is not a billed job
+    /// (building a throwaway `JobSpec` purely to get a profile would misleadingly suggest it goes
+    /// through job accounting, which it deliberately never does). Byte-identical logic to what
+    /// `derive` always computed; `derive` now delegates here rather than duplicating it.
+    pub(crate) fn for_execution(
+        limits: &crate::ResourceLimits,
+        egress: &crate::EgressPolicy,
+    ) -> HardeningProfile {
+        let allowlist = egress.allow.clone();
         let needs_nic = !allowlist.is_empty();
         HardeningProfile {
             egress_default_deny: true,
@@ -407,11 +420,11 @@ impl HardeningProfile {
             drop_all_caps: true,
             no_new_privileges: true,
             seccomp: true,
-            pids_max: spec.limits.pids_max,
+            pids_max: limits.pids_max,
             zero_swap: true,
             // The RAM-backed /tmp tmpfs ceiling (NOT the disk-backed ephemeral-workspace quota,
             // which is spec.limits.disk_bytes — that has no mount wiring yet, a later step).
-            scratch_quota_bytes: spec.limits.tmpfs_bytes,
+            scratch_quota_bytes: limits.tmpfs_bytes,
             ephemeral_one_job: true,
         }
     }

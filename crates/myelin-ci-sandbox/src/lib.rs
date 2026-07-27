@@ -733,11 +733,29 @@ fn validate_job_shape(image: &ImageRef, limits: &ResourceLimits) -> Result<(), S
             reference: image.reference.clone(),
         });
     }
+    // Delegates to the shared `ResourceLimits`-only validator (Sol's review: two independent
+    // copies of the SAME two checks would be free to drift) — the specific `SpecError` variant is
+    // still derived here, since the shared validator has no `JobSpec`-shaped error type to return.
+    validate_execution_limits(limits).map_err(|_| {
+        if limits.pids_max == 0 {
+            SpecError::NoPidsMax
+        } else {
+            SpecError::NoTimeout
+        }
+    })
+}
+
+/// The `ResourceLimits`-only half of [`validate_job_shape`]'s fail-closed non-negotiables
+/// (`pids_max`/`timeout_secs` MUST be set) — extracted (CT-007 slice 5b.2, Sol's review) so a
+/// caller with no `ImageRef` to validate (the checkout-preparation runtime, which is deliberately
+/// never a billed `JobSpec`) still enforces the SAME mandatory limits `JobSpec::new` would have,
+/// rather than silently skipping them by bypassing `JobSpec` entirely.
+pub(crate) fn validate_execution_limits(limits: &ResourceLimits) -> Result<(), String> {
     if limits.pids_max == 0 {
-        return Err(SpecError::NoPidsMax);
+        return Err("pids_max (fork-bomb ceiling) must be set (> 0)".to_string());
     }
     if limits.timeout_secs == 0 {
-        return Err(SpecError::NoTimeout);
+        return Err("timeout_secs must be set (> 0)".to_string());
     }
     Ok(())
 }

@@ -37,10 +37,11 @@ use crate::hardening::HardeningProfile;
 use crate::launch_gate::{DirectChildRetirement, SandboxCommand, SpawnPhase};
 use crate::redaction::RedactionPlan;
 use crate::runner::RetryableAttemptCause;
+use sha2::{Digest, Sha256};
 use crate::user_namespace::{
-    RunscInvocationMode, UserNamespaceAllocator, UserNamespaceAllocatorError,
-    UserNamespaceBindError, UserNamespaceConfig, UserNamespaceLease, UserNamespaceQuiescenceProof,
-    UserNamespaceRefusal,
+    CheckoutPreparationSession, PreparationQuiescenceProof, RunscInvocationMode,
+    UserNamespaceAllocator, UserNamespaceAllocatorError, UserNamespaceBindError,
+    UserNamespaceConfig, UserNamespaceLease, UserNamespaceQuiescenceProof, UserNamespaceRefusal,
 };
 use crate::workspace_manager::{
     CapacityLease, CapacityRefusal, DeleteWorkspaceError, ManagedWorkspace, WorkspaceManager,
@@ -54,8 +55,10 @@ use crate::{
     SandboxLaunch, SandboxLaunchError, SandboxOutputSink, SandboxOutputStream, SandboxResult,
     TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
+use std::ffi::CString;
 use std::io;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -509,15 +512,27 @@ impl OciConfig {
     /// Build the OCI config from a job + its derived hardening profile (the same profile the
     /// Firecracker backend enforces — backend-independent).
     pub fn from_spec(spec: &JobSpec, profile: &HardeningProfile) -> OciConfig {
+        Self::for_fixed_command(spec.command.clone(), spec.limits.mem_bytes, profile)
+    }
+
+    /// CT-007 slice 5b.2: the shared constructor beneath [`Self::from_spec`] for a caller with a
+    /// fixed guest command + real [`HardeningProfile`] but no real `JobSpec` to derive one from
+    /// (mirrors [`HardeningProfile::for_execution`]'s reasoning exactly) — the checkout-preparation
+    /// runtime's guest command is a fixed script, never a billed job's `spec.command`.
+    pub(crate) fn for_fixed_command(
+        command: Vec<String>,
+        mem_bytes: u64,
+        profile: &HardeningProfile,
+    ) -> OciConfig {
         OciConfig {
-            args: spec.command.clone(),
+            args: command,
             root_readonly: profile.read_only_root,
             drop_all_caps: profile.drop_all_caps,
             no_new_privileges: profile.no_new_privileges,
             seccomp: profile.seccomp,
             has_network: profile.network_device,
             pids_max: profile.pids_max,
-            mem_bytes: spec.limits.mem_bytes,
+            mem_bytes,
             // The hardening profile's scratch-tmpfs quota (= `spec.limits.tmpfs_bytes`).
             tmpfs_bytes: profile.scratch_quota_bytes,
             extra_env: Vec::new(),
@@ -4067,9 +4082,12 @@ fn run_and_capture_impl(
             executed_fallback_usage(mem_bytes, executed_at.elapsed(), None),
         ));
     }
-    let stdin_th = stdin.zip(stdin_pipe).map(|(bytes, mut si)| {
+    let stdin_th = stdin.zip(stdin_pipe).map(|(source, mut si)| {
         std::thread::spawn(move || {
-            let result = si.write_all(&bytes);
+            let result = match source {
+                StdinSource::Bytes(bytes) => si.write_all(&bytes),
+                StdinSource::File(mut file) => std::io::copy(&mut file, &mut si).map(|_| ()),
+            };
             // `si` drops here ⇒ the write end closes ⇒ the guest `git` sees EOF on its request body.
             result
         })
@@ -4249,10 +4267,22 @@ enum StdoutMode {
 }
 
 struct RunCaptureOptions<'a> {
-    stdin: Option<Vec<u8>>,
+    stdin: Option<StdinSource>,
     stdout_mode: StdoutMode,
     cancellation: &'a AtomicBool,
     output: Option<StreamingOutput>,
+}
+
+/// The one-shot source `run_and_capture` feeds to the guest's stdin (CT-007 slice 5b.2). `Bytes` is
+/// the pre-existing git-wire shape (the bounded request body, already resident in memory). `File` is
+/// new: the checkout-preparation runtime's prefetched pack lives in a bounded HOST TEMP FILE (never
+/// materialized as a second in-memory `Vec` alongside the one `run_git_wire_container` already reads
+/// it into) — the writer thread `io::copy`s it straight into the gated pipe. Neither variant is
+/// `Clone`; each is consumed exactly once by the writer thread `run_and_capture_impl` spawns.
+#[allow(dead_code)]
+enum StdinSource {
+    Bytes(Vec<u8>),
+    File(std::fs::File),
 }
 
 #[derive(Clone)]
@@ -4323,18 +4353,38 @@ fn drain_capped_streaming<R: Read>(
 /// sufficient: real-size clones come through whole, and an over-cap response fails loud rather than
 /// returning a truncated pack.
 fn drain_to_temp_file<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
+    use std::os::unix::fs::OpenOptionsExt;
     let path = std::env::temp_dir().join(format!(
         "myelin-gitwire-stdout-{}-{}",
         std::process::id(),
         unique_suffix()
     ));
     let _ = std::fs::remove_file(&path);
-    let mut file = match std::fs::File::create(&path) {
+    // CT-007 slice 5b.2 (Sol's review): this path now also stages the checkout-preparation transport's
+    // prefetched pack (a private source tree), not just CI/agent build logs -- `create_new` (never
+    // follows a pre-existing symlink at `path`, unlike the previous plain `File::create`) + an explicit
+    // `0600` (never a `File::create`-default, umask-dependent, commonly world-readable `0644`).
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
         Ok(f) => f,
         // If we cannot stage to disk, fall back to the in-RAM capped drain under the SAME generous cap
         // (still bounded, still reports truncation) rather than losing the deadlock-free pipe drain.
         Err(_) => return drain_capped(&mut r, cap),
     };
+    // Unlink immediately, through the retained fd (Sol's review) -- from here on this file is
+    // reachable ONLY via `file`, matching `tempfile_for_checkout_pack`'s own anonymous-by-path
+    // discipline, rather than staying path-visible for the whole capture. A failed unlink means it
+    // is NOT actually anonymous -- fall back to the in-RAM capped drain (same bound, same
+    // truncation reporting) rather than silently carrying wire content through a still
+    // path-reachable file.
+    if std::fs::remove_file(&path).is_err() {
+        return drain_capped(&mut r, cap);
+    }
     let mut written: usize = 0;
     let mut truncated = false;
     let mut chunk = [0u8; 64 * 1024];
@@ -4369,17 +4419,24 @@ fn drain_to_temp_file<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
         }
     }
     let _ = file.flush();
-    drop(file);
-    // Read the staged bytes back (≤ cap). A read-back failure is treated as truncated (fail-closed:
-    // the wire seam refuses rather than serving a short/empty pack).
-    let head = match std::fs::read(&path) {
+    // Read the staged bytes back through the SAME fd (Sol's review: never reopen by path for a
+    // second, independent access to what may be sensitive wire content) by seeking to the start. A
+    // read-back failure is treated as truncated (fail-closed: the wire seam refuses rather than
+    // serving a short/empty pack).
+    let head = match file
+        .seek(std::io::SeekFrom::Start(0))
+        .and_then(|_| {
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf)?;
+            Ok(buf)
+        }) {
         Ok(bytes) => bytes,
         Err(_) => {
             truncated = true;
             Vec::new()
         }
     };
-    let _ = std::fs::remove_file(&path);
+    // Already unlinked above -- `path` names nothing on disk; `file` simply drops.
     (head, truncated)
 }
 
@@ -5461,7 +5518,7 @@ fn run_git_wire_container(
         timeout,
         job.limits.mem_bytes,
         RunCaptureOptions {
-            stdin: Some(stdin),
+            stdin: Some(StdinSource::Bytes(stdin)),
             stdout_mode: StdoutMode::StreamToFile { bound: wire_cap },
             cancellation,
             output: None,
@@ -5518,12 +5575,13 @@ fn run_git_wire_container(
     )
 }
 
-/// Stage a CONFIG-ONLY OCI bundle (just `config.json`) for the git wire — the rootfs is referenced by
-/// the config's ABSOLUTE `root.path`, so no `rootfs` symlink is staged. Returns the bundle dir (removed
-/// on teardown).
-fn stage_git_wire_bundle(cfg: &OciConfig) -> Result<PathBuf, String> {
+/// Stage a CONFIG-ONLY OCI bundle (just `config.json`) — the rootfs is referenced by the config's
+/// ABSOLUTE `root.path`, so no `rootfs` symlink is staged. `label` only names the temp-dir prefix
+/// (for operator readability, e.g. `ps`/`ls /tmp` output) — it carries no security meaning. Returns
+/// the bundle dir (removed on teardown).
+fn stage_config_only_bundle(cfg: &OciConfig, label: &str) -> Result<PathBuf, String> {
     let bundle = std::env::temp_dir().join(format!(
-        "myelin-gitwire-bundle-{}-{}",
+        "myelin-{label}-bundle-{}-{}",
         std::process::id(),
         unique_suffix()
     ));
@@ -5532,6 +5590,1412 @@ fn stage_git_wire_bundle(cfg: &OciConfig) -> Result<PathBuf, String> {
     std::fs::write(bundle.join("config.json"), cfg.to_json())
         .map_err(|e| format!("write config.json: {e}"))?;
     Ok(bundle)
+}
+
+/// Stage a CONFIG-ONLY OCI bundle for the git wire — see [`stage_config_only_bundle`].
+fn stage_git_wire_bundle(cfg: &OciConfig) -> Result<PathBuf, String> {
+    stage_config_only_bundle(cfg, "gitwire")
+}
+
+// =================================================================================================
+// CT-007 slice 5b.2 — the checkout-specific runtime (design locked in with Sol, 2026-07-27, ledger
+// 12): a SEQUENCE of two sandboxed hops glued by the host, never a live inter-container pipe, never
+// `/repo` mounted into either the checkout container:
+//
+//   Hop A ([`fetch_checkout_pack`]): fetch exactly one commit's pack through the EXISTING,
+//   unchanged, already-hardened git-wire serving path (`GvisorBackend::launch_git_wire`) — a real,
+//   billed use of that path. `/repo` stays inside the git-wire server's own container, as today.
+//
+//   Hop B ([`run_checkout_preparation`]): a NEW, dedicated checkout-preparation container —
+//   `ExplicitUserNamespace` + the workspace mount (the lease's `PreparationBound` identity from
+//   slice 5b.1), NO `/repo`, no network, stdin = Hop A's prefetched pack file. This hop performs no
+//   `reserve`/`settle` of its own (there is no per-checkout job to reserve against); its measured
+//   usage is charged through the PARENT ATTEMPT's aggregate settlement in slice 5b.3, never
+//   silently free.
+// =================================================================================================
+
+/// The git object-format hex width a [`ExpectedGitCommitId`] was validated against. Local to this
+/// crate deliberately: `myelin-ci-sandbox`'s own `Cargo.toml` documents it as a leaf that depends
+/// ONLY on `myelin-tenancy`, with nothing in the production DAG depending back on it — pulling in
+/// `myelin-git` (a much higher-level crate) just for its `receive_pack::Oid`/`object_format::
+/// ObjectFormat` types would violate that documented boundary. This type carries only what the wire
+/// negotiation and the checkout script need: which hex width to expect/request, and which wire
+/// capability / `git init` flag that implies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum GitObjectFormat {
+    Sha1,
+    Sha256,
+}
+
+impl GitObjectFormat {
+    fn hex_width(self) -> usize {
+        match self {
+            GitObjectFormat::Sha1 => 40,
+            GitObjectFormat::Sha256 => 64,
+        }
+    }
+
+    /// The `object-format=<...>` wire capability token this format requires in the fetch request —
+    /// `None` for SHA-1 (omitting the capability entirely means SHA-1, the protocol default).
+    fn capability_token(self) -> Option<&'static str> {
+        match self {
+            GitObjectFormat::Sha1 => None,
+            GitObjectFormat::Sha256 => Some("object-format=sha256"),
+        }
+    }
+
+    /// The `git init --object-format=<...>` token (also matched against the advertisement's own
+    /// `object-format=` capability, when present).
+    fn init_token(self) -> &'static str {
+        match self {
+            GitObjectFormat::Sha1 => "sha1",
+            GitObjectFormat::Sha256 => "sha256",
+        }
+    }
+}
+
+/// A validated git commit id CT-007 will check out — exactly [`GitObjectFormat::hex_width`]
+/// lowercase-hex characters, never the all-zero null id (the protocol's delete/"nothing" sentinel,
+/// never a real checkout target). Deliberately NOT named `CommitOid`/built on a generic
+/// hash-agnostic string type (Sol's round-2 review): the object format is load-bearing here — it
+/// picks the wire capability AND the `git init` flag — so it is carried explicitly, never inferred
+/// silently downstream from a bare hex length.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ExpectedGitCommitId {
+    hex: String,
+    format: GitObjectFormat,
+}
+
+impl ExpectedGitCommitId {
+    #[allow(dead_code)]
+    pub(crate) fn new(hex: impl Into<String>, format: GitObjectFormat) -> Result<Self, String> {
+        let hex = hex.into();
+        if hex.len() != format.hex_width() {
+            return Err(format!(
+                "expected a {}-character lowercase-hex commit id for {format:?}, got {} \
+                 characters",
+                format.hex_width(),
+                hex.len()
+            ));
+        }
+        if !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(format!("commit id {hex:?} is not lowercase hex"));
+        }
+        if hex.bytes().all(|b| b == b'0') {
+            return Err(
+                "commit id is the all-zero null id -- never a valid checkout target".to_string(),
+            );
+        }
+        Ok(ExpectedGitCommitId { hex, format })
+    }
+
+    fn as_str(&self) -> &str {
+        &self.hex
+    }
+
+    fn format(&self) -> GitObjectFormat {
+        self.format
+    }
+}
+
+/// One raw pkt-line parsed from a git wire byte stream (CT-007 slice 5b.2's fetch/advertisement
+/// decoders).
+#[derive(Debug)]
+enum PktLine<'a> {
+    Flush,
+    Data(&'a [u8]),
+}
+
+/// Read exactly one pkt-line at `buf[*pos..]`, advancing `*pos` past it. Fail-closed (Sol's round-2
+/// review nailed down these exact bounds): a non-hex length header, a length in the reserved
+/// `0001`-`0003` range, a length exceeding git's own protocol maximum (65,520, i.e. `0xfff0`), or a
+/// header claiming more bytes than remain in `buf`, all refuse rather than guess.
+fn read_pkt_line<'a>(buf: &'a [u8], pos: &mut usize) -> Result<PktLine<'a>, String> {
+    let header = buf
+        .get(*pos..*pos + 4)
+        .ok_or_else(|| "truncated pkt-line length header".to_string())?;
+    let header_str = std::str::from_utf8(header)
+        .map_err(|_| "pkt-line length header is not ASCII hex".to_string())?;
+    let len = u16::from_str_radix(header_str, 16)
+        .map_err(|_| format!("pkt-line length header {header_str:?} is not valid hex"))?;
+    if len == 0 {
+        *pos += 4;
+        return Ok(PktLine::Flush);
+    }
+    if len < 4 {
+        return Err(format!(
+            "pkt-line length {len} is reserved (0001-0003 are invalid)"
+        ));
+    }
+    if len > 0xfff0 {
+        return Err(format!(
+            "pkt-line length {len} exceeds git's protocol maximum (65520)"
+        ));
+    }
+    let total = len as usize;
+    let payload = buf
+        .get(*pos + 4..*pos + total)
+        .ok_or_else(|| "pkt-line declares more bytes than the stream contains".to_string())?;
+    *pos += total;
+    Ok(PktLine::Data(payload))
+}
+
+/// Pkt-line-encode one payload (`0009done\n`): a 4-hex-digit length prefix counting itself, then the
+/// payload bytes verbatim.
+fn pkt_line_encode(payload: &str) -> Vec<u8> {
+    let mut v = format!("{:04x}", payload.len() + 4).into_bytes();
+    v.extend_from_slice(payload.as_bytes());
+    v
+}
+
+/// The result of parsing a v0 `upload-pack --advertise-refs` response (CT-007 slice 5b.2, Hop A step
+/// 1): whether `expected` is directly advertised as some ref's target, and whether the server offers
+/// `allow-reachable-sha1-in-want` (needed when it is NOT a direct tip — Sol's round-2 review: CI
+/// dispatch commonly targets a commit that is reachable but no longer an exact advertised tip by the
+/// time a queued attempt starts, and this codebase has no per-attempt ref to pin it with today).
+#[derive(Debug)]
+#[allow(dead_code)]
+struct ParsedAdvertisement {
+    directly_advertised: bool,
+    allows_reachable_want: bool,
+}
+
+/// Parse a v0 `upload-pack --advertise-refs` response. Sol's review hardened this beyond the
+/// original draft: the first ref line's capability section is now MANDATORY (a real repo's
+/// advertisement always has one; its absence is a malformed/spoofed response, not merely a
+/// capability-less repo), every capability THIS TRANSPORT'S fetch request always relies on
+/// (`shallow` — required by the `deepen 1` it always sends; `no-progress`; `ofs-delta`) must
+/// actually be advertised or the whole advertisement is refused, and the response must end EXACTLY
+/// at the terminating flush (trailing bytes refused, never silently ignored).
+#[allow(dead_code)]
+fn parse_upload_pack_advertisement(
+    response: &[u8],
+    expected: &ExpectedGitCommitId,
+) -> Result<ParsedAdvertisement, String> {
+    let mut pos = 0usize;
+    let mut directly_advertised = false;
+    let mut allows_reachable_want = false;
+    let mut has_shallow_cap = false;
+    let mut has_no_progress_cap = false;
+    let mut has_ofs_delta_cap = false;
+    let mut first_line = true;
+    loop {
+        match read_pkt_line(response, &mut pos)? {
+            PktLine::Flush => break,
+            PktLine::Data(data) => {
+                let (line, caps) = if first_line {
+                    match data.iter().position(|&b| b == 0) {
+                        Some(nul) => (&data[..nul], &data[nul + 1..]),
+                        None => {
+                            return Err(
+                                "advertisement's first ref line is missing a capability section \
+                                 (malformed or spoofed response)"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                } else {
+                    (data, &[][..])
+                };
+                first_line = false;
+                let line = std::str::from_utf8(line)
+                    .map_err(|_| "ref-advertisement line is not UTF-8".to_string())?;
+                let line = line.strip_suffix('\n').unwrap_or(line);
+                if let Some((oid, _refname)) = line.split_once(' ') {
+                    if oid == expected.as_str() {
+                        directly_advertised = true;
+                    }
+                }
+                if !caps.is_empty() {
+                    let caps_str = std::str::from_utf8(caps)
+                        .map_err(|_| "capability list is not UTF-8".to_string())?;
+                    for cap in caps_str.split_whitespace() {
+                        match cap {
+                            "allow-reachable-sha1-in-want" => allows_reachable_want = true,
+                            "shallow" => has_shallow_cap = true,
+                            "no-progress" => has_no_progress_cap = true,
+                            "ofs-delta" => has_ofs_delta_cap = true,
+                            _ => {}
+                        }
+                    }
+                    let advertised_format = caps_str
+                        .split_whitespace()
+                        .find_map(|c| c.strip_prefix("object-format="));
+                    match (advertised_format, expected.format()) {
+                        (None, GitObjectFormat::Sha1) | (Some("sha1"), GitObjectFormat::Sha1) => {}
+                        (Some("sha256"), GitObjectFormat::Sha256) => {}
+                        (advertised, wanted) => {
+                            return Err(format!(
+                                "server advertises object-format {advertised:?}, expected \
+                                 {wanted:?}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if pos != response.len() {
+        return Err(format!(
+            "trailing bytes after the advertisement's terminating flush ({} bytes)",
+            response.len() - pos
+        ));
+    }
+    if !has_shallow_cap {
+        return Err(
+            "server does not advertise `shallow` -- required for the `deepen 1` this transport \
+             always sends"
+                .to_string(),
+        );
+    }
+    if !has_no_progress_cap {
+        return Err("server does not advertise `no-progress`".to_string());
+    }
+    if !has_ofs_delta_cap {
+        return Err("server does not advertise `ofs-delta`".to_string());
+    }
+    Ok(ParsedAdvertisement {
+        directly_advertised,
+        allows_reachable_want,
+    })
+}
+
+/// What [`parse_checkout_fetch_response`] found about the shallow boundary.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct ParsedCheckoutFetch {
+    /// `true` iff the server reported `expected` itself as the shallow boundary (its parents were
+    /// not sent) — the checkout script must then seed `.git/shallow` with it before checkout.
+    shallow: bool,
+}
+
+/// Parse a v0 stateless-rpc `upload-pack` FETCH response for CT-007's single-shot
+/// `want <expected> ... / deepen 1 / (flush) / done` request, streaming the raw pack straight into
+/// `pack_out` under `pack_cap` bytes. Fail-closed at every step — Sol's round-2 review nailed down
+/// the EXACT accepted grammar for this one specialized request (never the general git-protocol
+/// grammar, which allows far more than this request ever produces):
+///
+/// ```text
+/// [PKT("shallow <expected>")]   -- at most one, only naming `expected`, no `unshallow`
+/// 0000                          -- the shallow-info section's flush -- ALWAYS present (a `deepen`
+///                                  request was sent), even for a root commit with zero lines
+/// PKT("NAK")                    -- exactly one -- no ACK (no `have` lines were ever sent)
+/// PACK...                       -- raw pack bytes, immediately, to EOF -- never scanned for
+/// ```
+///
+/// Anything else (an `ERR` line, a duplicate/foreign/`unshallow` declaration, an ACK, a
+/// missing/misplaced `PACK` signature, a response exceeding `pack_cap`) is refused.
+#[allow(dead_code)]
+fn parse_checkout_fetch_response(
+    response: &[u8],
+    expected: &ExpectedGitCommitId,
+    pack_out: &mut impl Write,
+    pack_cap: u64,
+) -> Result<ParsedCheckoutFetch, String> {
+    let mut pos = 0usize;
+    let mut shallow = false;
+    // -- shallow-info: zero or more shallow/unshallow lines, then EXACTLY ONE mandatory flush --
+    loop {
+        match read_pkt_line(response, &mut pos)? {
+            PktLine::Flush => break,
+            PktLine::Data(data) => {
+                let line = std::str::from_utf8(data)
+                    .map_err(|_| "shallow-info line is not UTF-8".to_string())?;
+                let line = line.strip_suffix('\n').unwrap_or(line);
+                if let Some(oid) = line.strip_prefix("shallow ") {
+                    if shallow {
+                        return Err("duplicate `shallow` line in shallow-info section".to_string());
+                    }
+                    if oid != expected.as_str() {
+                        return Err(format!(
+                            "shallow boundary names {oid:?}, expected {:?}",
+                            expected.as_str()
+                        ));
+                    }
+                    shallow = true;
+                } else if line.starts_with("unshallow ") {
+                    return Err(
+                        "unexpected `unshallow` line -- this is a fresh, non-shallow fetch"
+                            .to_string(),
+                    );
+                } else if let Some(msg) = line.strip_prefix("ERR ") {
+                    return Err(format!("upload-pack refused: {msg}"));
+                } else {
+                    return Err(format!("unexpected line in shallow-info section: {line:?}"));
+                }
+            }
+        }
+    }
+    // -- negotiation: exactly one NAK line, no flush after it --
+    match read_pkt_line(response, &mut pos)? {
+        PktLine::Data(data) => {
+            let line = std::str::from_utf8(data)
+                .map_err(|_| "negotiation line is not UTF-8".to_string())?;
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            if let Some(msg) = line.strip_prefix("ERR ") {
+                return Err(format!("upload-pack refused: {msg}"));
+            }
+            if line != "NAK" {
+                return Err(format!(
+                    "expected a single NAK (no `have` lines were sent), got {line:?}"
+                ));
+            }
+        }
+        PktLine::Flush => return Err("unexpected flush where NAK was expected".to_string()),
+    }
+    // -- pack: everything remaining, starting with the literal 4-byte "PACK" magic --
+    let pack = response
+        .get(pos..)
+        .ok_or_else(|| "response ended before any pack data".to_string())?;
+    if pack.len() as u64 > pack_cap {
+        return Err(format!(
+            "pack response ({} bytes) exceeds the {pack_cap}-byte cap",
+            pack.len()
+        ));
+    }
+    if pack.len() < 4 || &pack[..4] != b"PACK" {
+        return Err(format!(
+            "expected the raw pack to begin immediately with 'PACK' at byte {pos}, found {:?}",
+            pack.get(..4.min(pack.len()))
+        ));
+    }
+    pack_out
+        .write_all(pack)
+        .map_err(|e| format!("write pack to bounded output: {e}"))?;
+    Ok(ParsedCheckoutFetch { shallow })
+}
+
+/// A one-shot, file-backed, ALREADY-VERIFIED-FRAMED pack artifact from Hop A (Sol's round-1 review,
+/// point 3): never a `Vec<u8>` — a real repo's pack can be many MiB, and the git-wire response was
+/// already materialized once by `launch_git_wire`'s own capture path, so a second in-memory copy
+/// here would be pure waste. Not `Clone` — it is consumed exactly once, by [`StdinSource::File`], the
+/// moment the checkout-preparation container spawns.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct PrefetchedCheckoutPack {
+    file: std::fs::File,
+    /// `true` iff Hop A's response reported the wanted commit itself as the shallow boundary — the
+    /// checkout script seeds `.git/shallow` with it before checkout iff this is set.
+    shallow: bool,
+}
+
+/// CT-007 slice 5b.2, Hop A: fetch exactly one commit's pack through the EXISTING, unchanged,
+/// already-hardened git-wire serving path (`GvisorBackend::launch_git_wire`) — a REAL, billed use of
+/// that path (it reserves/settles through `hooks` exactly like any other git-wire caller). Never
+/// touches `/repo` itself — that stays inside the git-wire server's own already-hardened container.
+///
+/// Uses a DEDICATED per-invocation `-c uploadpack.allowReachableSHA1InWant=true` (Sol's round-2
+/// review) rather than reconfiguring the general serving path: CI/merge-queue dispatch commonly
+/// targets a commit that is reachable but no longer an exact advertised ref tip by the time a queued
+/// attempt starts (ordinary queue delay), and this codebase has no per-attempt ref to pin it with
+/// today. The flow: parse the advertisement; if `expected` is a direct tip, proceed; otherwise
+/// require the advertisement to actually offer `allow-reachable-sha1-in-want` (never silently
+/// assume the `-c` was honored); send the exact `want`; let `upload-pack` itself perform the
+/// reachability check and refuse if the commit is no longer reachable.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) fn fetch_checkout_pack(
+    backend: &GvisorBackend,
+    hooks: &RunnerHooks,
+    root: &Path,
+    tenant: &str,
+    region: &str,
+    repo: &str,
+    expected: &ExpectedGitCommitId,
+    limits: ResourceLimits,
+    run_token: RunTokenCredential,
+    meter_to: MeterTarget,
+    idem_token: IdemToken,
+) -> Result<PrefetchedCheckoutPack, CheckoutPreparationError> {
+    let allow_reachable = vec![
+        "-c".to_string(),
+        "uploadpack.allowReachableSHA1InWant=true".to_string(),
+    ];
+
+    let mut advertise_argv = allow_reachable.clone();
+    advertise_argv.extend([
+        "upload-pack".to_string(),
+        "--stateless-rpc".to_string(),
+        "--advertise-refs".to_string(),
+    ]);
+    let advertise_spec = GitWireSpec::for_repo(
+        root,
+        tenant,
+        region,
+        repo,
+        advertise_argv,
+        Vec::new(),
+        Vec::new(),
+        None,
+        limits,
+        run_token.clone(),
+        meter_to.clone(),
+        IdemToken(format!("{}:checkout-advertise", idem_token.0)),
+    )
+    .map_err(|e| CheckoutPreparationError::Refused(format!("build advertise-refs spec: {e}")))?;
+    let advertisement = backend
+        .launch_git_wire(&advertise_spec, hooks)
+        .map_err(|e| CheckoutPreparationError::Refused(format!("advertise-refs: {e}")))?;
+    // Sol's review: `launch_git_wire`'s `SandboxLaunch` handle is a live entry in `backend.live`
+    // (plus a staged bundle dir) until `backend.kill` retires it -- every path below (success OR
+    // parse refusal) must retire it EXACTLY ONCE, never leak it. Compute the parse result into a
+    // local first, kill unconditionally, THEN propagate -- so a `?` can never skip the kill.
+    let advertise_parse_result = (|| {
+        if !advertisement.result.passed() {
+            return Err(format!(
+                "advertise-refs did not pass (exit={:?} timed_out={}, stderr: {})",
+                advertisement.result.exit_code,
+                advertisement.result.timed_out,
+                String::from_utf8_lossy(&advertisement.result.stderr)
+            ));
+        }
+        parse_upload_pack_advertisement(&advertisement.result.stdout, expected)
+    })();
+    let kill_result = backend.kill(&advertisement.handle);
+    // Sol's review: NEVER let a parse error's `?` propagate before a simultaneous `kill` error is
+    // even inspected -- a real runtime leak must not be silently hidden behind whichever failure
+    // happened to be checked first.
+    let parsed = match (advertise_parse_result, kill_result) {
+        (Ok(parsed), Ok(())) => parsed,
+        (Ok(parsed), Err(kill_error)) => {
+            return Err(CheckoutPreparationError::Refused(format!(
+                "advertise-refs parsed successfully ({parsed:?}) but retiring its sandbox handle \
+                 failed ({kill_error}) -- a live runsc container/bundle may have leaked"
+            )));
+        }
+        (Err(parse_error), Ok(())) => {
+            return Err(CheckoutPreparationError::Refused(format!(
+                "parse advertisement: {parse_error}"
+            )));
+        }
+        (Err(parse_error), Err(kill_error)) => {
+            return Err(CheckoutPreparationError::Refused(format!(
+                "parse advertisement failed ({parse_error}) AND retiring its sandbox handle also \
+                 failed ({kill_error}) -- a live runsc container/bundle may have leaked"
+            )));
+        }
+    };
+    if !parsed.directly_advertised && !parsed.allows_reachable_want {
+        return Err(CheckoutPreparationError::Refused(
+            "expected commit is not an advertised ref tip AND the server did not offer \
+             allow-reachable-sha1-in-want -- refusing rather than sending an unreachable want"
+                .to_string(),
+        ));
+    }
+
+    let mut capabilities = "no-progress ofs-delta".to_string();
+    if let Some(token) = expected.format().capability_token() {
+        capabilities.push(' ');
+        capabilities.push_str(token);
+    }
+    let mut request = pkt_line_encode(&format!("want {} {capabilities}\n", expected.as_str()));
+    request.extend_from_slice(&pkt_line_encode("deepen 1\n"));
+    request.extend_from_slice(b"0000");
+    request.extend_from_slice(&pkt_line_encode("done\n"));
+
+    let mut fetch_argv = allow_reachable;
+    fetch_argv.extend(["upload-pack".to_string(), "--stateless-rpc".to_string()]);
+    let fetch_spec = GitWireSpec::for_repo(
+        root,
+        tenant,
+        region,
+        repo,
+        fetch_argv,
+        request,
+        Vec::new(),
+        None,
+        limits,
+        run_token,
+        meter_to,
+        IdemToken(format!("{}:checkout-fetch", idem_token.0)),
+    )
+    .map_err(|e| CheckoutPreparationError::Refused(format!("build fetch spec: {e}")))?;
+    // Sol's review: stage the pack artifact BEFORE launching the fetch, never after -- a
+    // `tempfile_for_checkout_pack` failure between a successful launch and this point would
+    // otherwise leak that launch's live `backend.live` entry + bundle dir with no path back to it.
+    let mut pack_file = tempfile_for_checkout_pack()
+        .map_err(|e| CheckoutPreparationError::Refused(format!("stage pack artifact: {e}")))?;
+    let fetched = backend
+        .launch_git_wire(&fetch_spec, hooks)
+        .map_err(|e| CheckoutPreparationError::Refused(format!("fetch: {e}")))?;
+    // Same leak/guest-failure fix as the advertisement call above: retire the fetch launch's live
+    // handle EXACTLY ONCE, on every path, never skipped by an early `?`. A `kill` failure is not
+    // silently discarded (Sol's review) -- a live runsc container/bundle may have leaked, which
+    // matters even when parsing itself succeeded.
+    let fetch_parse_result = if !fetched.result.passed() {
+        Err(format!(
+            "fetch did not pass (exit={:?} timed_out={}, stderr: {})",
+            fetched.result.exit_code,
+            fetched.result.timed_out,
+            String::from_utf8_lossy(&fetched.result.stderr)
+        ))
+    } else {
+        parse_checkout_fetch_response(&fetched.result.stdout, expected, &mut pack_file, limits.disk_bytes)
+    };
+    let kill_result = backend.kill(&fetched.handle);
+    // Same combine-don't-lose-either-error fix as the advertisement block above.
+    let parsed_fetch = match (fetch_parse_result, kill_result) {
+        (Ok(parsed), Ok(())) => parsed,
+        (Ok(parsed), Err(kill_error)) => {
+            return Err(CheckoutPreparationError::Refused(format!(
+                "fetch parsed successfully ({parsed:?}) but retiring its sandbox handle failed \
+                 ({kill_error}) -- a live runsc container/bundle may have leaked"
+            )));
+        }
+        (Err(parse_error), Ok(())) => {
+            return Err(CheckoutPreparationError::Refused(format!(
+                "parse fetch response: {parse_error}"
+            )));
+        }
+        (Err(parse_error), Err(kill_error)) => {
+            return Err(CheckoutPreparationError::Refused(format!(
+                "parse fetch response failed ({parse_error}) AND retiring its sandbox handle also \
+                 failed ({kill_error}) -- a live runsc container/bundle may have leaked"
+            )));
+        }
+    };
+    pack_file
+        .flush()
+        .map_err(|e| CheckoutPreparationError::Refused(format!("flush pack artifact: {e}")))?;
+    let mut pack_file = pack_file
+        .into_inner()
+        .map_err(|e| CheckoutPreparationError::Refused(format!("finish pack artifact: {e}")))?;
+    pack_file
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| CheckoutPreparationError::Refused(format!("rewind pack artifact: {e}")))?;
+    Ok(PrefetchedCheckoutPack {
+        file: pack_file,
+        shallow: parsed_fetch.shallow,
+    })
+}
+
+/// A fresh, `O_CLOEXEC` host temp file to stream Hop A's pack into (removed from the directory the
+/// instant it's created — an unlinked, anonymous-by-path file the process's own fd keeps alive for
+/// exactly as long as it is needed, never left behind on any early-return path).
+#[allow(dead_code)]
+fn tempfile_for_checkout_pack() -> io::Result<std::io::BufWriter<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = std::env::temp_dir().join(format!(
+        "myelin-checkout-pack-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    // `create_new` (== `O_CREAT|O_EXCL`) refuses if ANYTHING already exists at `path` (including a
+    // symlink) rather than following it -- this is what actually prevents the raced-symlink issue,
+    // not merely the unlink below. `mode(0o600)` (Sol's review) makes the file owner-only from
+    // creation instead of depending on umask, since it carries a real source pack.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    // Unlink immediately: from this point on the file is reachable ONLY through this process's own
+    // fd, never a second path-based open. A failed unlink means it is NOT actually anonymous
+    // despite this function's contract -- propagate the failure (Sol's review) rather than
+    // silently carrying a private pack through a still-path-reachable file.
+    std::fs::remove_file(&path)?;
+    Ok(std::io::BufWriter::new(file))
+}
+
+/// CT-007 slice 5b.2: the checkout-specific analogue of [`GitWireSpec`] — carries only what the
+/// checkout-preparation container needs: the exact commit to check out, Hop A's already-fetched
+/// pack, and execution limits. Deliberately NO `run_token`/`meter_to`/`idem_token` (nothing here is
+/// billed against job accounting on its own — see [`run_checkout_preparation`]'s doc) and NO
+/// `OciWorkspaceMount`/`UserNamespaceConfig` (Sol's round-2 review: those are derived by the
+/// executor directly from the REAL `ManagedWorkspace`/`UserNamespaceLease` being transitioned, never
+/// from caller-supplied values that could silently name a different workspace/identity than the
+/// capabilities actually in hand).
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct CheckoutPreparationSpec {
+    expected_commit: ExpectedGitCommitId,
+    pack: PrefetchedCheckoutPack,
+    limits: ResourceLimits,
+}
+
+impl CheckoutPreparationSpec {
+    /// Fallible (Sol's review): bypassing `JobSpec` for this path also bypassed its mandatory
+    /// `pids_max`/`timeout_secs` validation — this constructor enforces the SAME
+    /// [`crate::validate_execution_limits`] check `JobSpec::new` would have, rather than silently
+    /// accepting a zero fork-bomb ceiling or an infinite timeout.
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        expected_commit: ExpectedGitCommitId,
+        pack: PrefetchedCheckoutPack,
+        limits: ResourceLimits,
+    ) -> Result<Self, String> {
+        crate::validate_execution_limits(&limits)?;
+        Ok(CheckoutPreparationSpec {
+            expected_commit,
+            pack,
+            limits,
+        })
+    }
+}
+
+/// The final, externally-meaningful result of a successful CT-007 checkout-preparation run — minted
+/// ONLY once the preparation runtime's teardown was independently proven (`confirm_prepared`
+/// succeeded, so the session is durably `Prepared`) AND the checkout itself was independently
+/// verified (the in-guest `rev-parse`/`diff-index --quiet` confirmation line, AND the host's own
+/// untrusted-fd `.git/HEAD` re-read) to be EXACTLY the expected commit — never merely "the container
+/// exited 0." Fields are private; the only production constructor is [`run_checkout_preparation`].
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct PreparedCheckoutEvidence {
+    commit_hex: String,
+    tree_oid: String,
+    /// Host-computed SHA-256 hex digest of the checked-out workspace's `Cargo.lock` (ledger 12's
+    /// locked slice-5b contract) — slice 6's cargo-vendor EROFS asset is keyed off this.
+    cargo_lock_sha256_hex: String,
+    preparation_usage: ResourceUsage,
+}
+
+impl PreparedCheckoutEvidence {
+    #[allow(dead_code)]
+    pub(crate) fn commit_hex(&self) -> &str {
+        &self.commit_hex
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn tree_oid(&self) -> &str {
+        &self.tree_oid
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn cargo_lock_sha256_hex(&self) -> &str {
+        &self.cargo_lock_sha256_hex
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn preparation_usage(&self) -> ResourceUsage {
+        self.preparation_usage
+    }
+}
+
+/// Every way CT-007 slice 5b.2's checkout-preparation runtime can fail to produce a
+/// [`PreparedCheckoutEvidence`] (Sol's round-1 review, points 4/5). Distinguishes disposition along
+/// the same axis [`RunFailure`] already established for the billed paths: `Refused` is genuinely
+/// free (nothing ever spawned); every other variant carries the REAL measured usage a 5b.3 caller
+/// must still fold into the parent attempt's aggregate settlement, never treat as free.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum CheckoutPreparationError {
+    /// Refused before the preparation runtime ever spawned (bad transport/spec, Hop A itself
+    /// failed, or `bind_preparation` failed on a caller-fixable ground) — the lease/session are
+    /// untouched, and there is no usage to account.
+    Refused(String),
+    /// `bind_preparation`/`confirm_prepared` poisoned the lease/session on a non-caller-fixable
+    /// ground. `usage` is `None` iff this happened before any spawn attempt (a `bind_preparation`
+    /// poisoning) — `Some` iff it happened after (a `confirm_prepared` poisoning, which can only
+    /// occur after the container actually ran).
+    Unreleasable {
+        message: String,
+        usage: Option<ResourceUsage>,
+    },
+    /// The preparation container ran, but [`finalize_runtime`] could not independently prove its
+    /// teardown — `confirm_prepared` was never attempted (there is no valid proof to mint), so the
+    /// session is STILL `PreparationBound`, forcing permanent quarantine on reconciliation, exactly
+    /// like the non-checkout workload path.
+    TeardownUnproven {
+        message: String,
+        usage: ResourceUsage,
+    },
+    /// Teardown was independently proven (`confirm_prepared` succeeded — the session is durably
+    /// `Prepared`) but the checkout itself was wrong: a non-zero exit, a malformed/mismatched
+    /// confirmation line, or the host's own independent `.git/HEAD` re-check disagreed. The
+    /// workspace is provably garbage but the LEASE is fine — the caller should delete the workspace
+    /// and call `session.release_prepared(lease)`, never quarantine the identity.
+    RejectedAfterQuiescence {
+        message: String,
+        usage: ResourceUsage,
+    },
+}
+
+impl std::fmt::Display for CheckoutPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckoutPreparationError::Refused(m) => write!(f, "checkout preparation refused: {m}"),
+            CheckoutPreparationError::Unreleasable { message, .. } => {
+                write!(f, "checkout preparation lease/session poisoned: {message}")
+            }
+            CheckoutPreparationError::TeardownUnproven { message, .. } => {
+                write!(f, "checkout preparation teardown unproven: {message}")
+            }
+            CheckoutPreparationError::RejectedAfterQuiescence { message, .. } => {
+                write!(f, "checkout rejected after proven teardown: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CheckoutPreparationError {}
+
+/// The FIXED checkout-preparation guest script (CT-007 slice 5b.2; Sol's round-2 review), invoked as
+/// `sh -c CHECKOUT_PREPARATION_SCRIPT sh <oid> <object-format> <shallow: 0|1>` — the dynamic values
+/// reach the guest ONLY as positional parameters, never string-interpolated into the script text
+/// itself (the same discipline [`RECEIVE_PACK_INGEST_SCRIPT`] already established, generalized to a
+/// script that actually takes arguments).
+///
+/// - `set -eu` + `umask 077`: abort on any error/unset var; every file this script creates is
+///   owner-only.
+/// - Refuses if `/workspace` is not already empty (defense in depth — `WorkspaceManager` is
+///   expected to always hand over a fresh subvolume, but this script never trusts that silently).
+/// - `git init` with `--object-format` for the wanted hash width, and `core.hooksPath=/dev/null` +
+///   an empty `--template=` — a `checkout` can invoke `post-checkout`; nothing here trusts a
+///   default template's hook samples.
+/// - Seeds `.git/shallow` with the wanted oid iff Hop A's fetch reported it as the shallow boundary.
+/// - `git index-pack --stdin --strict`, never `--fix-thin` (a fresh, empty repo has no external
+///   bases to repair a thin pack with) and never any `thin-pack`/side-band capability was requested.
+/// - Compares command-substitution results with `test "$(...)" = "..."` (never trusts a bare exit
+///   code alone) both for object presence-before-checkout and for HEAD after a detached checkout.
+/// - Refuses (ledger 12's locked slice-5b contract) if the wanted commit's tree contains any
+///   gitlink (mode `160000`) entry — this transport never fetches submodule repositories, so a
+///   superproject with unpopulated submodules would silently build wrong; checked via
+///   `git ls-tree -r` BEFORE checkout, so nothing is ever written for a shape this transport can't
+///   honestly support.
+/// - Refreshes the index and requires `diff-index --quiet` against the wanted commit's tree (the
+///   worktree must be byte-identical to what the commit records, not merely "some file is there").
+/// - Emits exactly one final line, `<commit-oid> <tree-oid>\n`, under a tiny stdout footprint — the
+///   ONLY thing `run_checkout_preparation` reads back besides the exit code.
+#[allow(dead_code)]
+const CHECKOUT_PREPARATION_SCRIPT: &str = "set -eu
+umask 077
+export HOME=/tmp
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_EXEC_PATH=/usr/lib/git-core
+oid=\"$1\"
+format=\"$2\"
+shallow=\"$3\"
+cd /workspace
+if [ -n \"$(ls -A .)\" ]; then
+  echo 'workspace is not empty before checkout' 1>&2
+  exit 1
+fi
+git -c core.hooksPath=/dev/null init -q --template= \"--object-format=$format\"
+if [ \"$shallow\" = \"1\" ]; then
+  printf '%s\\n' \"$oid\" > .git/shallow
+fi
+git index-pack --stdin --strict 1>&2
+test \"$(git rev-parse --verify \"$oid^{commit}\")\" = \"$oid\"
+tree_listing=\"$(git ls-tree -r \"$oid\")\" || { echo 'git ls-tree failed' 1>&2; exit 1; }
+if printf '%s\\n' \"$tree_listing\" | grep -q '^160000 commit'; then
+  gitlink_grep_status=0
+else
+  gitlink_grep_status=$?
+fi
+if [ \"$gitlink_grep_status\" -eq 0 ]; then
+  echo 'gitlinks (submodules) are not supported by this checkout transport' 1>&2
+  exit 1
+elif [ \"$gitlink_grep_status\" -ne 1 ]; then
+  echo 'gitlink check itself failed (unexpected grep exit status)' 1>&2
+  exit 1
+fi
+git -c core.hooksPath=/dev/null checkout -q --detach \"$oid\"
+test \"$(git rev-parse --verify HEAD)\" = \"$oid\"
+git update-index -q --refresh
+git diff-index --quiet \"$oid\" --
+tree=\"$(git rev-parse --verify \"$oid^{tree}\")\"
+printf '%s %s\\n' \"$oid\" \"$tree\"
+";
+
+/// The gitlink-detection portion of [`CHECKOUT_PREPARATION_SCRIPT`], duplicated verbatim (minus the
+/// surrounding checkout machinery) so it is directly testable via real host `git`+`sh` — no gVisor
+/// needed, since this only exercises shell/git logic, never sandboxing. KEEP IN SYNC with the same
+/// lines in `CHECKOUT_PREPARATION_SCRIPT` (invoked the same way: `sh -c ... sh <oid>`); emits `ok`
+/// on success so a test can also confirm the positive (no-gitlinks) path actually ran to completion.
+#[cfg(test)]
+const GITLINK_CHECK_SNIPPET_FOR_TESTS: &str = "set -eu
+oid=\"$1\"
+tree_listing=\"$(git ls-tree -r \"$oid\")\" || { echo 'git ls-tree failed' 1>&2; exit 1; }
+if printf '%s\\n' \"$tree_listing\" | grep -q '^160000 commit'; then
+  gitlink_grep_status=0
+else
+  gitlink_grep_status=$?
+fi
+if [ \"$gitlink_grep_status\" -eq 0 ]; then
+  echo 'gitlinks (submodules) are not supported by this checkout transport' 1>&2
+  exit 1
+elif [ \"$gitlink_grep_status\" -ne 1 ]; then
+  echo 'gitlink check itself failed (unexpected grep exit status)' 1>&2
+  exit 1
+fi
+echo ok
+";
+
+/// Parse the checkout script's one confirmation line (`<commit-oid> <tree-oid>\n`) — refuses
+/// anything else (extra fields, a mismatched commit, a malformed tree oid) rather than trusting the
+/// guest's exit code alone.
+#[allow(dead_code)]
+fn parse_checkout_confirmation_line(
+    stdout: &[u8],
+    expected: &ExpectedGitCommitId,
+) -> Result<String, String> {
+    let text = std::str::from_utf8(stdout)
+        .map_err(|_| "checkout confirmation output is not UTF-8".to_string())?;
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    let mut parts = line.split(' ');
+    let commit = parts
+        .next()
+        .ok_or_else(|| "checkout confirmation output is empty".to_string())?;
+    let tree = parts
+        .next()
+        .ok_or_else(|| "checkout confirmation output is missing the tree oid".to_string())?;
+    if parts.next().is_some() {
+        return Err(format!(
+            "checkout confirmation output has unexpected extra fields: {line:?}"
+        ));
+    }
+    if commit != expected.as_str() {
+        return Err(format!(
+            "checkout confirmation reports commit {commit:?}, expected {:?}",
+            expected.as_str()
+        ));
+    }
+    let width = expected.format().hex_width();
+    if tree.len() != width
+        || !tree
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(format!(
+            "checkout confirmation tree oid {tree:?} is not valid {width}-char hex"
+        ));
+    }
+    Ok(tree.to_string())
+}
+
+/// Open a REGULAR file, by name, relative to `dir_fd`, with `O_NOFOLLOW` — a symlinked name fails to
+/// open at all (`ELOOP`), and anything opened that is NOT a regular file (a FIFO/device/socket a
+/// guest process could have created in its own writable workspace) is refused after the open.
+#[allow(dead_code)]
+fn open_regular_file_no_follow(dir_fd: RawFd, name: &CString) -> io::Result<std::fs::File> {
+    // SAFETY: `dir_fd` is a valid, open directory file descriptor for the duration of this call;
+    // `name` is a NUL-terminated component name. `O_NONBLOCK` is load-bearing (Sol's review): a
+    // guest process (which fully owns its own writable workspace) could plant a FIFO named `HEAD`
+    // — a plain `O_RDONLY` open on a FIFO with no writer BLOCKS the caller indefinitely, before the
+    // `is_file()` check below is ever reached. `O_NONBLOCK` makes `openat` return immediately
+    // instead; a regular file's read behavior is unaffected by the flag.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by a successful `openat` above and is not owned elsewhere.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Host-side, FD-safe re-verification of a checked-out workspace's HEAD (Sol's round-2 review point
+/// 3): the guest's own `rev-parse`/`diff-index` claims are NOT independently trusted alone. Walks
+/// `<workspace>/.git` via `openat(O_NOFOLLOW)` at every component (never a path-based `std::fs::read`
+/// that could follow a guest-planted symlink), and requires `.git` to be a real directory and
+/// `.git/HEAD` a bounded regular file containing EXACTLY `<expected-oid>\n` — HEAD must be detached
+/// (the checkout script never leaves a symbolic ref), so no symbolic-ref resolution is implemented or
+/// needed. Never invokes host `git` over the guest-written repository (the guest already fully owns
+/// interpreting its own object store; this check only re-reads one small, bounded file by exact
+/// content).
+#[allow(dead_code)]
+fn verify_workspace_head_no_follow(
+    workspace_host_path: &Path,
+    expected: &ExpectedGitCommitId,
+) -> Result<(), String> {
+    let path_c = CString::new(workspace_host_path.as_os_str().as_encoded_bytes())
+        .map_err(|e| format!("workspace path contains an interior NUL: {e}"))?;
+    // SAFETY: standard POSIX flags on a NUL-free path; the workspace directory is host-provisioned
+    // (`WorkspaceManager` already created it) and this open follows no untrusted symlink.
+    let workspace_fd = unsafe {
+        libc::open(
+            path_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if workspace_fd < 0 {
+        return Err(format!(
+            "open workspace directory: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `workspace_fd` was just returned by a successful `open` above and is not owned
+    // elsewhere.
+    let workspace_fd = unsafe { OwnedFd::from_raw_fd(workspace_fd) };
+    let git_name = CString::new(".git").expect("no interior NUL");
+    let git_fd = crate::dirlock::open_dir_component_no_follow(workspace_fd.as_raw_fd(), &git_name)
+        .map_err(|e| format!(".git is not a real directory (or is a symlink): {e}"))?;
+    let head_name = CString::new("HEAD").expect("no interior NUL");
+    let mut head_file = open_regular_file_no_follow(git_fd.as_raw_fd(), &head_name)
+        .map_err(|e| format!(".git/HEAD is not a real regular file (or is a symlink): {e}"))?;
+    // Bound the ACTUAL READ (Sol's review), not merely a preceding `metadata().len()` check — a
+    // stat-then-read is a check-then-act gap in general, and the enforcement must live in the read
+    // itself. A detached HEAD file is `<40-or-64 hex>\n` -- at most 65 bytes; reading one MORE than
+    // the generous 128-byte bound below is enough to detect "there is more data than expected"
+    // directly from the read, never from an unbounded `read_to_string`.
+    let mut buf = Vec::new();
+    std::io::Read::by_ref(&mut head_file)
+        .take(129)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read .git/HEAD: {e}"))?;
+    if buf.len() > 128 {
+        return Err(format!(
+            ".git/HEAD is implausibly large (>= {} bytes)",
+            buf.len()
+        ));
+    }
+    let content =
+        String::from_utf8(buf).map_err(|_| ".git/HEAD content is not UTF-8".to_string())?;
+    let expected_line = format!("{}\n", expected.as_str());
+    if content != expected_line {
+        return Err(format!(
+            ".git/HEAD content {content:?} does not exactly match the expected detached commit \
+             {expected_line:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The bound on `Cargo.lock`'s hashed size — generous for even a very large Cargo workspace lockfile,
+/// never unbounded.
+const CARGO_LOCK_HASH_BOUND: u64 = 16 * 1024 * 1024;
+
+/// Host-side, FD-safe hash of the checked-out workspace's `Cargo.lock` (ledger 12's locked slice-5b
+/// contract: "hashes the materialized `Cargo.lock`" so [`PreparedCheckoutEvidence`] can carry the
+/// digest slice 6's cargo-vendor EROFS asset keys off of). Opened relative to the workspace
+/// directory with `O_NOFOLLOW` (mirrors [`verify_workspace_head_no_follow`]'s own discipline — never
+/// a guest-planted symlink), and required to be a real regular file under
+/// [`CARGO_LOCK_HASH_BOUND`] bytes. Host-COMPUTED, never a guest-reported hash: this digest becomes
+/// a downstream cache/asset key, so it must be independently authoritative, the same reasoning that
+/// makes `HEAD` itself host-re-read rather than merely trusted from the guest's own confirmation
+/// line. Absence, a non-regular-file, or exceeding the bound are all refusals — this checkout
+/// transport exists for Cargo-workspace CI jobs, so a missing `Cargo.lock` is a real failure, never
+/// silently "no digest."
+fn hash_workspace_cargo_lock_no_follow(workspace_host_path: &Path) -> Result<String, String> {
+    let path_c = CString::new(workspace_host_path.as_os_str().as_encoded_bytes())
+        .map_err(|e| format!("workspace path contains an interior NUL: {e}"))?;
+    // SAFETY: standard POSIX flags on a NUL-free path; the workspace directory is host-provisioned
+    // and this open follows no untrusted symlink.
+    let workspace_fd = unsafe {
+        libc::open(
+            path_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if workspace_fd < 0 {
+        return Err(format!(
+            "open workspace directory: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `workspace_fd` was just returned by a successful `open` above and is not owned
+    // elsewhere.
+    let workspace_fd = unsafe { OwnedFd::from_raw_fd(workspace_fd) };
+    let name = CString::new("Cargo.lock").expect("no interior NUL");
+    let mut file = open_regular_file_no_follow(workspace_fd.as_raw_fd(), &name).map_err(|e| {
+        format!("Cargo.lock is not present as a real regular file (or is a symlink): {e}")
+    })?;
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut chunk)
+            .map_err(|e| format!("read Cargo.lock: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > CARGO_LOCK_HASH_BOUND {
+            return Err(format!(
+                "Cargo.lock exceeds the {CARGO_LOCK_HASH_BOUND}-byte bound"
+            ));
+        }
+        hasher.update(&chunk[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    Ok(hex)
+}
+
+/// The measured [`ResourceUsage`] of one `RunscOutcome` — the SAME derivation [`build_result`] uses,
+/// extracted so the checkout-preparation path (which has no real `JobSpec` to hand `build_result`,
+/// by design — see [`run_checkout_preparation`]'s doc) can compute it from a bare `mem_bytes` value.
+#[allow(dead_code)]
+fn usage_from_runsc_outcome(mem_bytes: u64, o: &RunscOutcome) -> ResourceUsage {
+    let wall_secs_ceil = o.wall.as_secs() + u64::from(o.wall.subsec_nanos() > 0);
+    let cpu_seconds = o.cpu_seconds.filter(|c| *c > 0).unwrap_or(wall_secs_ceil);
+    ResourceUsage {
+        cpu_seconds,
+        mem_byte_seconds: mem_bytes.saturating_mul(wall_secs_ceil),
+    }
+}
+
+/// CT-007 slice 5b.2, Hop B: run the checkout-preparation runtime for an ALREADY-ACQUIRED
+/// [`ManagedWorkspace`] + [`UserNamespaceLease`] + [`CheckoutPreparationSession`] (slice 5b.1's
+/// types) — the resource-reservation choreography (acquiring those in the first place, and the real
+/// workload's own `LaunchPermit` afterward) is slice 5b.3's job, not this function's.
+///
+/// This IS a real, measured sandbox execution: it performs no `reserve`/`settle` of its own (there
+/// is no per-checkout job to reserve against), but its usage is charged through the PARENT
+/// ATTEMPT's aggregate settlement in slice 5b.3 — see [`CheckoutPreparationError`]'s `usage` fields,
+/// which carry the REAL measured cost on every post-spawn failure, never silently free.
+///
+/// Uses an internally-minted [`LaunchPermit::immediate`] (never one supplied by the caller) so the
+/// preparation container still runs through the SAME mechanical launch-gate + watchdog every other
+/// `runsc` spawn does, without performing the workload's own durable launch CAS (Sol's round-1
+/// review: `launch_permit: None` would have skipped the gate/watchdog ENTIRELY, not merely the CAS).
+///
+/// Ordering (Sol's round-1 review, the load-bearing property): `session.confirm_prepared` is called
+/// the moment teardown is independently proven, REGARDLESS of whether the checkout itself succeeded
+/// — an ordinary corrupt pack or a wrong checked-out tree must never force permanent quarantine of a
+/// lease whose runtime genuinely tore down cleanly. Only AFTER that durable transition does this
+/// function check the command's exit status, the guest's own confirmation line, and the host's
+/// independent `.git/HEAD` re-read; any of those failing returns
+/// [`CheckoutPreparationError::RejectedAfterQuiescence`] with the session left `Prepared` — the
+/// slice 5b.3 caller must then delete the workspace and call `session.release_prepared`, never
+/// quarantine the identity.
+#[allow(dead_code)]
+pub(crate) fn run_checkout_preparation(
+    lease: &mut UserNamespaceLease,
+    session: &mut CheckoutPreparationSession,
+    workspace: &ManagedWorkspace,
+    spec: CheckoutPreparationSpec,
+) -> Result<PreparedCheckoutEvidence, CheckoutPreparationError> {
+    let bin = runsc_bin();
+    let rootfs = resolved_gvisor_git_rootfs();
+    if !rootfs.exists() {
+        return Err(CheckoutPreparationError::Refused(format!(
+            "staged gVisor git rootfs absent: {} (the checkout runtime REQUIRES a real `git` in \
+             the guest, same as the git wire)",
+            rootfs.display()
+        )));
+    }
+    let root_abs = std::fs::canonicalize(&rootfs).unwrap_or_else(|_| rootfs.clone());
+    let userns = lease.config();
+    let workspace_mount = OciWorkspaceMount::from_managed_workspace(workspace);
+
+    let profile = HardeningProfile::for_execution(&spec.limits, &EgressPolicy::deny_all());
+    // Sol's review: bypassing `JobSpec`/`launch_git_command`'s own `.assert_enforced()` call for
+    // this path would silently skip the fail-closed check that the derived profile is ACTUALLY
+    // fully in force (egress default-deny, read-only root, caps dropped, etc.) before anything
+    // spawns -- assert it here too, exactly like every other production launch path does.
+    profile
+        .assert_enforced()
+        .map_err(CheckoutPreparationError::Refused)?;
+    let command = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        CHECKOUT_PREPARATION_SCRIPT.to_string(),
+        "sh".to_string(),
+        spec.expected_commit.as_str().to_string(),
+        spec.expected_commit.format().init_token().to_string(),
+        if spec.pack.shallow { "1" } else { "0" }.to_string(),
+    ];
+    let cfg = OciConfig::for_fixed_command(command, spec.limits.mem_bytes, &profile)
+        .with_explicit_user_namespace_and_workspace(userns, workspace_mount, root_abs)
+        .map_err(CheckoutPreparationError::Refused)?;
+
+    // Revalidate the runsc-root identity live, immediately before it is baked into
+    // `PreparedRuntimeMode` — same pattern as the ordinary workload path's `RuntimeBinding::Enabled`
+    // construction (`launch_with`), re-revalidated again below, right at the actual bind boundary.
+    let expected_root_identity = revalidated_explicit_userns_root_identity()
+        .map_err(|reason| {
+            CheckoutPreparationError::Refused(format!(
+                "runsc-root identity revalidation failed: {reason}"
+            ))
+        })?;
+    let prepared_mode = PreparedRuntimeMode::ExplicitUserNamespace {
+        config: userns,
+        expected_root_identity,
+    };
+    let mode = require_oci_layout_matches_prepared_mode(&cfg, &prepared_mode)
+        .map_err(CheckoutPreparationError::Refused)?;
+
+    let bundle_dir = stage_config_only_bundle(&cfg, "checkout")
+        .map_err(CheckoutPreparationError::Refused)?;
+
+    // CT-003b (SI-017): the out-of-band memory cgroup, established BEFORE anything durably commits.
+    let cgroup = match MemoryCgroup::create(spec.limits.mem_bytes) {
+        Ok(cgroup) => cgroup,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&bundle_dir);
+            return Err(CheckoutPreparationError::Refused(e));
+        }
+    };
+    let container_id = format!(
+        "myelin-checkout-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    );
+
+    // Durably bind `session`/`lease` to the preparation runtime BEFORE ever calling
+    // `run_and_capture` -- immediately after the cgroup exists (so `cgroup.identity()` is
+    // available), while nothing has spawned yet. Sol's review (a real bug, not merely a doc
+    // mismatch): the EARLIER revalidation above only seeds `prepared_mode`/`mode` -- it must NOT
+    // be reused as the value actually bound. Re-revalidate AGAIN, live, right at this exact
+    // boundary (mirrors `bind_enabled_lease_given`'s established two-check pattern precisely: the
+    // earlier read is what THIS fresh one is compared against, never a substitute for it), and
+    // bind the FRESH value -- a drift between the two refuses here, with the lease/session still
+    // completely untouched.
+    let current_root_identity = match revalidated_explicit_userns_root_identity() {
+        Ok(identity) => identity,
+        Err(reason) => {
+            let _ = cgroup.quiesce(RUNTIME_QUIESCE_TIMEOUT);
+            let _ = std::fs::remove_dir_all(&bundle_dir);
+            return Err(CheckoutPreparationError::Refused(format!(
+                "runsc-root identity revalidation failed before bind: {reason}"
+            )));
+        }
+    };
+    if current_root_identity != expected_root_identity {
+        let _ = cgroup.quiesce(RUNTIME_QUIESCE_TIMEOUT);
+        let _ = std::fs::remove_dir_all(&bundle_dir);
+        return Err(CheckoutPreparationError::Refused(format!(
+            "runsc-root identity drifted before bind (expected {expected_root_identity:?}, found \
+             {current_root_identity:?})"
+        )));
+    }
+    if let Err(bind_error) = session.bind_preparation(
+        lease,
+        container_id.clone(),
+        current_root_identity,
+        cgroup.identity(),
+    ) {
+        let _ = cgroup.quiesce(RUNTIME_QUIESCE_TIMEOUT);
+        let _ = std::fs::remove_dir_all(&bundle_dir);
+        return Err(match bind_error {
+            UserNamespaceBindError::InvalidContainerId | UserNamespaceBindError::MarkerTooLarge => {
+                CheckoutPreparationError::Refused(format!("bind_preparation: {bind_error}"))
+            }
+            UserNamespaceBindError::MarkerMismatch | UserNamespaceBindError::Poisoned => {
+                CheckoutPreparationError::Unreleasable {
+                    message: format!("bind_preparation: {bind_error}"),
+                    usage: None,
+                }
+            }
+        });
+    }
+
+    let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
+    let (result, child_retirement) = run_and_capture(
+        bin,
+        &bundle_dir,
+        &container_id,
+        timeout,
+        spec.limits.mem_bytes,
+        RunCaptureOptions {
+            stdin: Some(StdinSource::File(spec.pack.file)),
+            stdout_mode: StdoutMode::CappedHead,
+            cancellation: &NEVER_CANCELLED,
+            output: None,
+        },
+        Some(LaunchPermit::immediate()),
+        mode,
+        &cgroup,
+    );
+    let finalization = finalize_and_merge(
+        result,
+        bin,
+        &container_id,
+        &prepared_mode,
+        cgroup,
+        RUNTIME_QUIESCE_TIMEOUT,
+        child_retirement,
+    );
+    let outcome = evaluate_checkout_finalization(
+        finalization,
+        lease,
+        session,
+        spec.limits.mem_bytes,
+        &spec.expected_commit,
+        workspace.host_path(),
+    );
+    let _ = std::fs::remove_dir_all(&bundle_dir);
+    outcome
+}
+
+/// The decision logic behind [`run_checkout_preparation`]'s ENTIRE post-spawn disposition (Sol's
+/// review: extracted so it is unit-testable against synthetic [`RuntimeFinalization`]/
+/// [`RuntimeQuiescenceEvidence`] values, without any real `runsc` spawn at all). Implements the
+/// exact ordering Sol's round-1 review specified as load-bearing:
+///
+/// 1. If teardown could not be independently proven (`RuntimeFinalization::Failed`),
+///    `confirm_prepared` is NEVER attempted — the session stays durably `PreparationBound`,
+///    forcing permanent quarantine on reconciliation (`TeardownUnproven`).
+/// 2. Otherwise, mint the [`PreparationQuiescenceProof`] and call `session.confirm_prepared`
+///    UNCONDITIONALLY — regardless of the guest's exit code or confirmation line. An ordinary
+///    corrupt pack or wrong checkout must never force permanent quarantine of a lease whose
+///    runtime genuinely tore down cleanly.
+/// 3. ONLY once `session` is durably `Prepared` does this check the guest's exit status, its
+///    confirmation line, and the host's independent `.git/HEAD` re-read. Any disagreement here is
+///    `RejectedAfterQuiescence` — the session is left `Prepared` (the caller must delete the
+///    workspace and call `session.release_prepared`, never quarantine the identity).
+fn evaluate_checkout_finalization(
+    finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>>,
+    lease: &mut UserNamespaceLease,
+    session: &mut CheckoutPreparationSession,
+    mem_bytes: u64,
+    expected_commit: &ExpectedGitCommitId,
+    workspace_host_path: &Path,
+) -> Result<PreparedCheckoutEvidence, CheckoutPreparationError> {
+    fn usage_of(primary: &Result<RunscOutcome, RunFailure>, mem_bytes: u64) -> ResourceUsage {
+        match primary {
+            Ok(outcome) => usage_from_runsc_outcome(mem_bytes, outcome),
+            Err(RunFailure::Executed { usage, .. }) => *usage,
+            Err(_) => ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            },
+        }
+    }
+
+    let (primary, evidence) = match finalization {
+        RuntimeFinalization::Finalized(FinalizedRun { primary, evidence }) => (primary, evidence),
+        RuntimeFinalization::Failed { primary, teardown } => {
+            let usage = usage_of(&primary, mem_bytes);
+            return Err(CheckoutPreparationError::TeardownUnproven {
+                message: format!(
+                    "runtime teardown could not be independently proven ({teardown}); primary \
+                     run outcome: {}",
+                    describe_run_primary(&primary)
+                ),
+                usage,
+            });
+        }
+    };
+
+    let proof = match PreparationQuiescenceProof::from_runtime_evidence(lease, &evidence) {
+        Ok(proof) => proof,
+        Err(reason) => {
+            let usage = usage_of(&primary, mem_bytes);
+            return Err(CheckoutPreparationError::TeardownUnproven {
+                message: format!("could not mint a preparation quiescence proof: {reason}"),
+                usage,
+            });
+        }
+    };
+    if let Err(confirm_error) = session.confirm_prepared(lease, proof) {
+        let usage = usage_of(&primary, mem_bytes);
+        return Err(CheckoutPreparationError::Unreleasable {
+            message: format!("confirm_prepared: {confirm_error}"),
+            usage: Some(usage),
+        });
+    }
+
+    // Teardown is independently proven AND durably confirmed (`session` is now `Prepared`). ONLY
+    // now do we look at whether the checkout itself was actually right.
+    let outcome = match primary {
+        Ok(outcome) => outcome,
+        Err(failure) => {
+            let usage = match &failure {
+                RunFailure::Executed { usage, .. } => *usage,
+                _ => ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0,
+                },
+            };
+            return Err(CheckoutPreparationError::RejectedAfterQuiescence {
+                message: format!("the run itself failed: {failure}"),
+                usage,
+            });
+        }
+    };
+    let usage = usage_from_runsc_outcome(mem_bytes, &outcome);
+    if outcome.timed_out {
+        return Err(CheckoutPreparationError::RejectedAfterQuiescence {
+            message: "the checkout container timed out".to_string(),
+            usage,
+        });
+    }
+    // Sol's review: a truncated confirmation line or a stream/output error must ALSO be treated as
+    // a semantic failure (never silently trusted as if the (possibly incomplete) captured stdout
+    // were the guest's real, complete output) — checked here, AFTER `confirm_prepared` already ran.
+    if outcome.stdout_truncated {
+        return Err(CheckoutPreparationError::RejectedAfterQuiescence {
+            message: "the checkout confirmation output was truncated (exceeded its capture bound)"
+                .to_string(),
+            usage,
+        });
+    }
+    if let Some(stream_error) = &outcome.stream_error {
+        return Err(CheckoutPreparationError::RejectedAfterQuiescence {
+            message: format!("a stream/output error occurred during the checkout run: {stream_error}"),
+            usage,
+        });
+    }
+    if outcome.exit != Some(0) {
+        return Err(CheckoutPreparationError::RejectedAfterQuiescence {
+            message: format!(
+                "the checkout script exited {:?} (stderr: {})",
+                outcome.exit,
+                String::from_utf8_lossy(&outcome.stderr)
+            ),
+            usage,
+        });
+    }
+    let tree_oid = match parse_checkout_confirmation_line(&outcome.stdout, expected_commit) {
+        Ok(tree) => tree,
+        Err(reason) => {
+            return Err(CheckoutPreparationError::RejectedAfterQuiescence {
+                message: reason,
+                usage,
+            })
+        }
+    };
+    if let Err(reason) = verify_workspace_head_no_follow(workspace_host_path, expected_commit) {
+        return Err(CheckoutPreparationError::RejectedAfterQuiescence {
+            message: format!("host-side HEAD re-verification disagreed: {reason}"),
+            usage,
+        });
+    }
+    let cargo_lock_sha256_hex = match hash_workspace_cargo_lock_no_follow(workspace_host_path) {
+        Ok(hex) => hex,
+        Err(reason) => {
+            return Err(CheckoutPreparationError::RejectedAfterQuiescence {
+                message: format!("could not hash the materialized Cargo.lock: {reason}"),
+                usage,
+            })
+        }
+    };
+
+    Ok(PreparedCheckoutEvidence {
+        commit_hex: expected_commit.as_str().to_string(),
+        tree_oid,
+        cargo_lock_sha256_hex,
+        preparation_usage: usage,
+    })
+}
+
+/// A short, human-readable description of a checkout run's primary disposition, for a
+/// `TeardownUnproven` diagnostic message — never the sole basis for any decision.
+#[allow(dead_code)]
+fn describe_run_primary(primary: &Result<RunscOutcome, RunFailure>) -> String {
+    match primary {
+        Ok(outcome) => format!(
+            "exit={:?} timed_out={} stderr={:?}",
+            outcome.exit,
+            outcome.timed_out,
+            String::from_utf8_lossy(&outcome.stderr)
+        ),
+        Err(failure) => failure.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -8126,6 +9590,17 @@ mod tests {
     #[cfg(feature = "integration")]
     const USERNS_DRILL_LEASES_DIR_ENV: &str = "MYELIN_USERNS_DRILL_LEASES_DIR";
 
+    /// Sol's review (CT-007 slice 5b.2's live drill): this drill and the checkout-preparation live
+    /// drill (`checkout_preparation_5b2::checkout_preparation_runs_end_to_end_through_real_git_wire_and_runsc`)
+    /// share the SAME operator-provisioned `leases_dir` and may run concurrently under `cargo
+    /// test`'s default parallelism — the allocator's own directory lock is a PER-PROCESS lifetime
+    /// lock (see `UserNamespaceAllocator`'s own doc), not a per-call one, so two independent
+    /// `UserNamespaceAllocator::try_new` calls against the same directory in the SAME test binary
+    /// process would race nondeterministically. Both drills acquire this before touching
+    /// `leases_dir` at all, so only one is ever mid-flight.
+    #[cfg(feature = "integration")]
+    static USERNS_DRILL_LEASES_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Sol's round-2 review (hard blocker for this activation commit, since `GvisorBackend::try_new`
     /// is now `pub`): the promised end-to-end drill through the REAL public activation path —
     /// `GvisorBackend::try_new(GvisorWorkspaceConfig::Enabled)` + `.launch(...)` — not merely manual
@@ -8149,6 +9624,11 @@ mod tests {
     #[test]
     #[cfg(feature = "integration")]
     fn explicit_user_namespace_boots_through_the_real_enabled_backend_and_launch() {
+        // Serializes against the checkout-preparation live drill, which shares the SAME
+        // operator-provisioned `leases_dir` (see `USERNS_DRILL_LEASES_DIR_LOCK`'s own doc).
+        let _leases_dir_guard = USERNS_DRILL_LEASES_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Err(e) = preflight_explicit_userns_policy(
             resolved_explicit_userns_helper_dir(),
             resolved_explicit_userns_runsc_root(),
@@ -10283,6 +11763,1549 @@ mod tests {
                 assert!(message.contains("runtime teardown failed"));
             }
             other => panic!("expected an augmented RunFailure::Executed, got {other:?}"),
+        }
+    }
+
+    // =============================================================================================
+    // CT-007 slice 5b.2 — the checkout-specific runtime. Deterministic coverage for the pure
+    // decoder/validation/script-parsing logic (no real `runsc`/gVisor needed for any of these).
+    // =============================================================================================
+    mod checkout_preparation_5b2 {
+        use super::*;
+
+        fn sha1_oid(byte: u8) -> String {
+            format!("{:02x}", byte).repeat(20)
+        }
+
+        #[test]
+        fn expected_git_commit_id_accepts_a_valid_sha1_oid() {
+            let oid = sha1_oid(0xab);
+            let id = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            assert_eq!(id.as_str(), oid);
+            assert_eq!(id.format(), GitObjectFormat::Sha1);
+        }
+
+        #[test]
+        fn expected_git_commit_id_accepts_a_valid_sha256_oid() {
+            let oid = "a".repeat(64);
+            let id = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha256).unwrap();
+            assert_eq!(id.as_str(), oid);
+        }
+
+        #[test]
+        fn expected_git_commit_id_refuses_the_wrong_width() {
+            let err = ExpectedGitCommitId::new("a".repeat(64), GitObjectFormat::Sha1).unwrap_err();
+            assert!(err.contains("40-character"));
+        }
+
+        #[test]
+        fn expected_git_commit_id_refuses_non_hex() {
+            let err =
+                ExpectedGitCommitId::new("g".repeat(40), GitObjectFormat::Sha1).unwrap_err();
+            assert!(err.contains("not lowercase hex"));
+        }
+
+        #[test]
+        fn expected_git_commit_id_refuses_uppercase_hex() {
+            let err =
+                ExpectedGitCommitId::new("A".repeat(40), GitObjectFormat::Sha1).unwrap_err();
+            assert!(err.contains("not lowercase hex"));
+        }
+
+        #[test]
+        fn expected_git_commit_id_refuses_the_all_zero_null_id() {
+            let err = ExpectedGitCommitId::new("0".repeat(40), GitObjectFormat::Sha1).unwrap_err();
+            assert!(err.contains("all-zero null id"));
+        }
+
+        #[test]
+        fn sha256_format_requests_the_object_format_capability() {
+            assert_eq!(GitObjectFormat::Sha1.capability_token(), None);
+            assert_eq!(
+                GitObjectFormat::Sha256.capability_token(),
+                Some("object-format=sha256")
+            );
+        }
+
+        // ---- pkt-line reader ----
+
+        #[test]
+        fn read_pkt_line_reads_flush() {
+            let mut pos = 0;
+            assert!(matches!(
+                read_pkt_line(b"0000rest", &mut pos).unwrap(),
+                PktLine::Flush
+            ));
+            assert_eq!(pos, 4);
+        }
+
+        #[test]
+        fn read_pkt_line_reads_data() {
+            let encoded = pkt_line_encode("NAK");
+            let mut pos = 0;
+            match read_pkt_line(&encoded, &mut pos).unwrap() {
+                PktLine::Data(d) => assert_eq!(d, b"NAK"),
+                PktLine::Flush => panic!("expected data"),
+            }
+            assert_eq!(pos, encoded.len());
+        }
+
+        #[test]
+        fn read_pkt_line_refuses_reserved_lengths() {
+            for reserved in ["0001", "0002", "0003"] {
+                let mut pos = 0;
+                let err = read_pkt_line(reserved.as_bytes(), &mut pos).unwrap_err();
+                assert!(err.contains("reserved"), "reserved length {reserved} refused");
+            }
+        }
+
+        #[test]
+        fn read_pkt_line_refuses_lengths_beyond_the_protocol_maximum() {
+            let mut pos = 0;
+            let err = read_pkt_line(b"ffff", &mut pos).unwrap_err();
+            assert!(err.contains("protocol maximum"));
+        }
+
+        #[test]
+        fn read_pkt_line_refuses_a_truncated_header() {
+            let mut pos = 0;
+            assert!(read_pkt_line(b"00", &mut pos).is_err());
+        }
+
+        #[test]
+        fn read_pkt_line_refuses_a_declared_length_beyond_the_buffer() {
+            let mut pos = 0;
+            assert!(read_pkt_line(b"00ffshort", &mut pos).is_err());
+        }
+
+        #[test]
+        fn read_pkt_line_refuses_non_hex_header() {
+            let mut pos = 0;
+            assert!(read_pkt_line(b"zzzzrest", &mut pos).is_err());
+        }
+
+        // ---- advertisement parser ----
+
+        fn advertisement(first_line: &str, extra_refs: &[&str]) -> Vec<u8> {
+            let mut buf = pkt_line_encode(first_line);
+            for line in extra_refs {
+                buf.extend(pkt_line_encode(line));
+            }
+            buf.extend_from_slice(b"0000");
+            buf
+        }
+
+        #[test]
+        fn advertisement_parser_finds_a_directly_advertised_oid() {
+            let oid = sha1_oid(0x11);
+            let first = format!("{oid} refs/heads/main\0no-progress ofs-delta shallow\n");
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let parsed = parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected)
+                .unwrap();
+            assert!(parsed.directly_advertised);
+        }
+
+        #[test]
+        fn advertisement_parser_checks_every_ref_line_not_just_the_first() {
+            let oid = sha1_oid(0x22);
+            let first = format!("{} refs/heads/main\0no-progress ofs-delta shallow\n", sha1_oid(0x33));
+            let second = format!("{oid} refs/heads/other\n");
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let parsed =
+                parse_upload_pack_advertisement(&advertisement(&first, &[&second]), &expected)
+                    .unwrap();
+            assert!(parsed.directly_advertised);
+        }
+
+        #[test]
+        fn advertisement_parser_reports_allow_reachable_capability() {
+            let oid = sha1_oid(0x44);
+            let first = format!(
+                "{} refs/heads/main\0no-progress ofs-delta shallow allow-reachable-sha1-in-want\n",
+                sha1_oid(0x55)
+            );
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let parsed = parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected)
+                .unwrap();
+            assert!(!parsed.directly_advertised);
+            assert!(parsed.allows_reachable_want);
+        }
+
+        #[test]
+        fn advertisement_parser_ignores_the_empty_repo_pseudo_ref() {
+            let oid = sha1_oid(0x66);
+            let first = format!(
+                "{} capabilities^{{}}\0no-progress ofs-delta shallow\n",
+                "0".repeat(40)
+            );
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let parsed = parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected)
+                .unwrap();
+            assert!(!parsed.directly_advertised);
+        }
+
+        #[test]
+        fn advertisement_parser_refuses_an_object_format_mismatch() {
+            let oid = sha1_oid(0x76);
+            let first = format!(
+                "{} refs/heads/main\0no-progress ofs-delta shallow object-format=sha256\n",
+                sha1_oid(0x77)
+            );
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let err =
+                parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected).unwrap_err();
+            assert!(err.contains("object-format"));
+        }
+
+        #[test]
+        fn advertisement_parser_refuses_a_first_line_with_no_capability_section() {
+            let oid = sha1_oid(0x78);
+            let first = format!("{} refs/heads/main\n", sha1_oid(0x79));
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let err =
+                parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected).unwrap_err();
+            assert!(err.contains("missing a capability section"));
+        }
+
+        #[test]
+        fn advertisement_parser_refuses_a_missing_required_capability() {
+            let oid = sha1_oid(0x7a);
+            let first = format!("{} refs/heads/main\0no-progress ofs-delta\n", sha1_oid(0x7b));
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let err =
+                parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected).unwrap_err();
+            assert!(err.contains("does not advertise `shallow`"));
+        }
+
+        #[test]
+        fn advertisement_parser_refuses_trailing_bytes_after_the_terminating_flush() {
+            let oid = sha1_oid(0x7c);
+            let first = format!(
+                "{} refs/heads/main\0no-progress ofs-delta shallow\n",
+                sha1_oid(0x7d)
+            );
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let mut response = advertisement(&first, &[]);
+            response.extend_from_slice(b"garbage-after-flush");
+            let err = parse_upload_pack_advertisement(&response, &expected).unwrap_err();
+            assert!(err.contains("trailing bytes"));
+        }
+
+        // ---- fetch-response parser ----
+
+        fn fetch_response(shallow_lines: &[String], negotiation: &str, pack: &[u8]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            for line in shallow_lines {
+                buf.extend(pkt_line_encode(line));
+            }
+            buf.extend_from_slice(b"0000");
+            buf.extend(pkt_line_encode(negotiation));
+            buf.extend_from_slice(pack);
+            buf
+        }
+
+        fn fake_pack(payload: &[u8]) -> Vec<u8> {
+            let mut pack = b"PACK".to_vec();
+            pack.extend_from_slice(payload);
+            pack
+        }
+
+        #[test]
+        fn fetch_response_parses_the_happy_path_with_no_shallow_line() {
+            let oid = sha1_oid(0x88);
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let pack = fake_pack(b"root-commit-pack-bytes");
+            let response = fetch_response(&[], "NAK", &pack);
+            let mut out = Vec::new();
+            let parsed =
+                parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap();
+            assert!(!parsed.shallow);
+            assert_eq!(out, pack);
+        }
+
+        #[test]
+        fn fetch_response_parses_the_happy_path_with_a_matching_shallow_line() {
+            let oid = sha1_oid(0x99);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let pack = fake_pack(b"shallow-pack-bytes");
+            let response = fetch_response(&[format!("shallow {oid}\n")], "NAK", &pack);
+            let mut out = Vec::new();
+            let parsed =
+                parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap();
+            assert!(parsed.shallow);
+            assert_eq!(out, pack);
+        }
+
+        #[test]
+        fn fetch_response_refuses_a_shallow_line_naming_a_foreign_oid() {
+            let oid = sha1_oid(0xaa);
+            let other = sha1_oid(0xbb);
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let response = fetch_response(
+                &[format!("shallow {other}\n")],
+                "NAK",
+                &fake_pack(b"x"),
+            );
+            let mut out = Vec::new();
+            let err =
+                parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+            assert!(err.contains("shallow boundary names"));
+        }
+
+        #[test]
+        fn fetch_response_refuses_a_duplicate_shallow_line() {
+            let oid = sha1_oid(0xcc);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let response = fetch_response(
+                &[format!("shallow {oid}\n"), format!("shallow {oid}\n")],
+                "NAK",
+                &fake_pack(b"x"),
+            );
+            let mut out = Vec::new();
+            let err =
+                parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+            assert!(err.contains("duplicate"));
+        }
+
+        #[test]
+        fn fetch_response_refuses_an_unshallow_line() {
+            let oid = sha1_oid(0xdd);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let response = fetch_response(
+                &[format!("unshallow {oid}\n")],
+                "NAK",
+                &fake_pack(b"x"),
+            );
+            let mut out = Vec::new();
+            let err =
+                parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+            assert!(err.contains("unshallow"));
+        }
+
+        #[test]
+        fn fetch_response_refuses_an_err_line_in_shallow_info() {
+            let oid = sha1_oid(0xee);
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let response = fetch_response(
+                &["ERR upload-pack: not our ref\n".to_string()],
+                "NAK",
+                &fake_pack(b"x"),
+            );
+            let mut out = Vec::new();
+            let err =
+                parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+            assert!(err.contains("not our ref"));
+        }
+
+        #[test]
+        fn fetch_response_refuses_an_ack_where_nak_is_expected() {
+            let oid = sha1_oid(0xff);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let response = fetch_response(&[], &format!("ACK {oid}"), &fake_pack(b"x"));
+            let mut out = Vec::new();
+            let err =
+                parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+            assert!(err.contains("expected a single NAK"));
+        }
+
+        #[test]
+        fn fetch_response_refuses_a_missing_pack_signature() {
+            let oid = sha1_oid(0x12);
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let response = fetch_response(&[], "NAK", b"NOTAPACK...");
+            let mut out = Vec::new();
+            let err =
+                parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+            assert!(err.contains("PACK"));
+        }
+
+        #[test]
+        fn fetch_response_refuses_a_response_exceeding_the_cap() {
+            let oid = sha1_oid(0x34);
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let pack = fake_pack(&[0u8; 100]);
+            let response = fetch_response(&[], "NAK", &pack);
+            let mut out = Vec::new();
+            let err = parse_checkout_fetch_response(&response, &expected, &mut out, 10)
+                .unwrap_err();
+            assert!(err.contains("exceeds"));
+        }
+
+        #[test]
+        fn fetch_response_refuses_a_flush_where_nak_is_expected() {
+            let oid = sha1_oid(0x56);
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let mut response = b"0000".to_vec(); // shallow-info flush
+            response.extend_from_slice(b"0000"); // a second flush instead of NAK
+            let mut out = Vec::new();
+            let err =
+                parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+            assert!(err.contains("unexpected flush"));
+        }
+
+        // ---- confirmation-line parser ----
+
+        #[test]
+        fn confirmation_line_parses_the_happy_path() {
+            let commit = sha1_oid(0x78);
+            let tree = sha1_oid(0x9a);
+            let expected = ExpectedGitCommitId::new(commit.clone(), GitObjectFormat::Sha1).unwrap();
+            let line = format!("{commit} {tree}\n");
+            let got = parse_checkout_confirmation_line(line.as_bytes(), &expected).unwrap();
+            assert_eq!(got, tree);
+        }
+
+        #[test]
+        fn confirmation_line_refuses_a_mismatched_commit() {
+            let commit = sha1_oid(0xbc);
+            let other = sha1_oid(0xde);
+            let tree = sha1_oid(0xf0);
+            let expected = ExpectedGitCommitId::new(commit, GitObjectFormat::Sha1).unwrap();
+            let line = format!("{other} {tree}\n");
+            let err = parse_checkout_confirmation_line(line.as_bytes(), &expected).unwrap_err();
+            assert!(err.contains("reports commit"));
+        }
+
+        #[test]
+        fn confirmation_line_refuses_a_malformed_tree_oid() {
+            let commit = sha1_oid(0x13);
+            let expected = ExpectedGitCommitId::new(commit.clone(), GitObjectFormat::Sha1).unwrap();
+            let line = format!("{commit} not-hex\n");
+            let err = parse_checkout_confirmation_line(line.as_bytes(), &expected).unwrap_err();
+            assert!(err.contains("not valid"));
+        }
+
+        #[test]
+        fn confirmation_line_refuses_extra_fields() {
+            let commit = sha1_oid(0x24);
+            let tree = sha1_oid(0x35);
+            let expected = ExpectedGitCommitId::new(commit.clone(), GitObjectFormat::Sha1).unwrap();
+            let line = format!("{commit} {tree} extra\n");
+            let err = parse_checkout_confirmation_line(line.as_bytes(), &expected).unwrap_err();
+            assert!(err.contains("extra fields"));
+        }
+
+        #[test]
+        fn confirmation_line_refuses_empty_output() {
+            let commit = sha1_oid(0x46);
+            let expected = ExpectedGitCommitId::new(commit, GitObjectFormat::Sha1).unwrap();
+            let err = parse_checkout_confirmation_line(b"", &expected).unwrap_err();
+            assert!(err.contains("missing the tree oid"));
+        }
+
+        // ---- CheckoutPreparationSpec limits validation (Sol's review: bypassing JobSpec must not
+        // also bypass its mandatory pids_max/timeout_secs validation) ----
+
+        fn valid_limits_for_tests() -> ResourceLimits {
+            ResourceLimits {
+                cpu_millis: 1000,
+                mem_bytes: 256 << 20,
+                disk_bytes: 1 << 30,
+                tmpfs_bytes: 64 << 20,
+                pids_max: 64,
+                timeout_secs: 60,
+            }
+        }
+
+        fn fake_pack_for_tests() -> PrefetchedCheckoutPack {
+            PrefetchedCheckoutPack {
+                file: tempfile_for_checkout_pack()
+                    .unwrap()
+                    .into_inner()
+                    .unwrap(),
+                shallow: false,
+            }
+        }
+
+        #[test]
+        fn checkout_preparation_spec_new_refuses_zero_pids_max() {
+            let pack = fake_pack_for_tests();
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xc1), GitObjectFormat::Sha1).unwrap();
+            let mut limits = valid_limits_for_tests();
+            limits.pids_max = 0;
+            let err = CheckoutPreparationSpec::new(expected, pack, limits).unwrap_err();
+            assert!(err.contains("pids_max"));
+        }
+
+        #[test]
+        fn checkout_preparation_spec_new_refuses_zero_timeout() {
+            let pack = fake_pack_for_tests();
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xc2), GitObjectFormat::Sha1).unwrap();
+            let mut limits = valid_limits_for_tests();
+            limits.timeout_secs = 0;
+            let err = CheckoutPreparationSpec::new(expected, pack, limits).unwrap_err();
+            assert!(err.contains("timeout_secs"));
+        }
+
+        #[test]
+        fn checkout_preparation_spec_new_accepts_valid_limits() {
+            let pack = fake_pack_for_tests();
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xc3), GitObjectFormat::Sha1).unwrap();
+            CheckoutPreparationSpec::new(expected, pack, valid_limits_for_tests())
+                .expect("valid limits must be accepted");
+        }
+
+        // ---- checkout script gitlink detection (real host git+sh, no gVisor needed) ----
+
+        fn drill_git_ok(args: &[&str], cwd: &Path) {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("run host git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        fn drill_git_rev_parse_head(cwd: &Path) -> String {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(cwd)
+                .output()
+                .expect("git rev-parse HEAD");
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        fn run_gitlink_check(repo: &Path, oid: &str) -> std::process::Output {
+            Command::new("sh")
+                .arg("-c")
+                .arg(GITLINK_CHECK_SNIPPET_FOR_TESTS)
+                .arg("sh")
+                .arg(oid)
+                .current_dir(repo)
+                .output()
+                .expect("run sh -c <gitlink check snippet>")
+        }
+
+        #[test]
+        fn checkout_script_gitlink_check_passes_a_clean_commit() {
+            let repo = temp_dir_for("gitlink-check-clean");
+            drill_git_ok(&["init", "-q", "-b", "main"], &repo);
+            drill_git_ok(&["config", "user.email", "t@t.t"], &repo);
+            drill_git_ok(&["config", "user.name", "t"], &repo);
+            std::fs::write(repo.join("f.txt"), b"hi\n").unwrap();
+            drill_git_ok(&["add", "f.txt"], &repo);
+            drill_git_ok(
+                &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "clean"],
+                &repo,
+            );
+            let oid = drill_git_rev_parse_head(&repo);
+            let output = run_gitlink_check(&repo, &oid);
+            assert!(
+                output.status.success(),
+                "a clean commit must pass: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
+            let _ = std::fs::remove_dir_all(&repo);
+        }
+
+        #[test]
+        fn checkout_script_gitlink_check_refuses_a_gitlink() {
+            let repo = temp_dir_for("gitlink-check-refuses");
+            drill_git_ok(&["init", "-q", "-b", "main"], &repo);
+            drill_git_ok(&["config", "user.email", "t@t.t"], &repo);
+            drill_git_ok(&["config", "user.name", "t"], &repo);
+            std::fs::write(repo.join("f.txt"), b"hi\n").unwrap();
+            drill_git_ok(&["add", "f.txt"], &repo);
+            drill_git_ok(
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    "160000,1111111111111111111111111111111111111111,sub",
+                ],
+                &repo,
+            );
+            drill_git_ok(
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "has a gitlink",
+                ],
+                &repo,
+            );
+            let oid = drill_git_rev_parse_head(&repo);
+            let output = run_gitlink_check(&repo, &oid);
+            assert!(!output.status.success(), "a commit with a gitlink must be refused");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("gitlinks"));
+            let _ = std::fs::remove_dir_all(&repo);
+        }
+
+        #[test]
+        fn checkout_script_gitlink_check_fails_closed_when_ls_tree_itself_fails() {
+            let repo = temp_dir_for("gitlink-check-ls-tree-fails");
+            drill_git_ok(&["init", "-q", "-b", "main"], &repo);
+            // No commits exist at all -- `git ls-tree -r <oid>` on a bogus/absent oid must itself
+            // fail, and that failure must be treated as a hard error, NEVER silently read as "no
+            // gitlinks found" (the exact bug being fixed: a grep exit status of 1 means "no match
+            // in real output", not "the upstream command produced nothing because it failed").
+            let bogus_oid = "0".repeat(40);
+            let output = run_gitlink_check(&repo, &bogus_oid);
+            assert!(!output.status.success(), "an ls-tree failure must be a hard failure");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("git ls-tree failed"),
+                "must fail on the ls-tree error, never silently pass as 'no gitlinks': stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let _ = std::fs::remove_dir_all(&repo);
+        }
+
+        // ---- host-side FD-safe HEAD verification ----
+
+        fn temp_dir_for(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "myelin-checkout-headcheck-{name}-{}-{}",
+                std::process::id(),
+                unique_suffix()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn verify_workspace_head_accepts_an_exact_match() {
+            let ws = temp_dir_for("ok");
+            let oid = sha1_oid(0x57);
+            std::fs::create_dir_all(ws.join(".git")).unwrap();
+            std::fs::write(ws.join(".git/HEAD"), format!("{oid}\n")).unwrap();
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            verify_workspace_head_no_follow(&ws, &expected).unwrap();
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[test]
+        fn verify_workspace_head_refuses_a_mismatch() {
+            let ws = temp_dir_for("mismatch");
+            let oid = sha1_oid(0x68);
+            let other = sha1_oid(0x79);
+            std::fs::create_dir_all(ws.join(".git")).unwrap();
+            std::fs::write(ws.join(".git/HEAD"), format!("{other}\n")).unwrap();
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let err = verify_workspace_head_no_follow(&ws, &expected).unwrap_err();
+            assert!(err.contains("does not exactly match"));
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[test]
+        fn verify_workspace_head_refuses_a_symlinked_git_directory() {
+            let ws = temp_dir_for("symlink-git");
+            let real = temp_dir_for("symlink-git-target");
+            std::fs::write(real.join("HEAD"), "irrelevant\n").unwrap();
+            std::os::unix::fs::symlink(&real, ws.join(".git")).unwrap();
+            let oid = sha1_oid(0x8a);
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let err = verify_workspace_head_no_follow(&ws, &expected).unwrap_err();
+            assert!(err.contains(".git is not a real directory"));
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&real);
+        }
+
+        #[test]
+        fn verify_workspace_head_refuses_a_symlinked_head_file() {
+            let ws = temp_dir_for("symlink-head");
+            std::fs::create_dir_all(ws.join(".git")).unwrap();
+            let oid = sha1_oid(0x9b);
+            let real_head = ws.join(".git/REAL_HEAD");
+            std::fs::write(&real_head, format!("{oid}\n")).unwrap();
+            std::os::unix::fs::symlink(&real_head, ws.join(".git/HEAD")).unwrap();
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let err = verify_workspace_head_no_follow(&ws, &expected).unwrap_err();
+            assert!(err.contains(".git/HEAD is not a real regular file"));
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[test]
+        fn verify_workspace_head_refuses_a_fifo_without_blocking() {
+            // Sol's review: a guest process fully owns its writable workspace and could plant a
+            // FIFO named `HEAD` with no writer. Before the fix, `open_regular_file_no_follow`'s
+            // plain `O_RDONLY` open would block forever here. Run the check on a background thread
+            // with a bounded wait so a REGRESSION fails this test loudly (instead of hanging the
+            // whole suite) rather than passing by accident.
+            let ws = temp_dir_for("fifo-head");
+            std::fs::create_dir_all(ws.join(".git")).unwrap();
+            let head_path = ws.join(".git/HEAD");
+            let head_c = CString::new(head_path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: `head_c` is a NUL-free path under a directory this test just created; `mkfifo`
+            // creates a FIFO special file at that path with mode 0600.
+            let rc = unsafe { libc::mkfifo(head_c.as_ptr(), 0o600) };
+            assert_eq!(rc, 0, "mkfifo must succeed: {}", io::Error::last_os_error());
+            let oid = sha1_oid(0x9c);
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let ws_for_thread = ws.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = verify_workspace_head_no_follow(&ws_for_thread, &expected);
+                let _ = tx.send(result);
+            });
+            let result = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("verify_workspace_head_no_follow must not block on a guest-planted FIFO");
+            let err = result.unwrap_err();
+            assert!(err.contains(".git/HEAD is not a real regular file"));
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[test]
+        fn verify_workspace_head_refuses_an_implausibly_large_head_file() {
+            let ws = temp_dir_for("oversized-head");
+            std::fs::create_dir_all(ws.join(".git")).unwrap();
+            std::fs::write(ws.join(".git/HEAD"), "a".repeat(9000)).unwrap();
+            let oid = sha1_oid(0xac);
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let err = verify_workspace_head_no_follow(&ws, &expected).unwrap_err();
+            assert!(err.contains("implausibly large"));
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[test]
+        fn verify_workspace_head_refuses_a_missing_git_directory() {
+            let ws = temp_dir_for("no-git");
+            let oid = sha1_oid(0xbd);
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let err = verify_workspace_head_no_follow(&ws, &expected).unwrap_err();
+            assert!(err.contains(".git is not a real directory"));
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        // ---- host-side FD-safe Cargo.lock hashing ----
+
+        #[test]
+        fn hash_workspace_cargo_lock_computes_a_real_sha256() {
+            let ws = temp_dir_for("cargo-lock-ok");
+            std::fs::write(ws.join("Cargo.lock"), b"lockfile bytes").unwrap();
+            let hex = hash_workspace_cargo_lock_no_follow(&ws).unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(b"lockfile bytes");
+            let expected_hex = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            assert_eq!(hex, expected_hex);
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[test]
+        fn hash_workspace_cargo_lock_refuses_absence() {
+            let ws = temp_dir_for("cargo-lock-absent");
+            let err = hash_workspace_cargo_lock_no_follow(&ws).unwrap_err();
+            assert!(err.contains("Cargo.lock is not present"));
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[test]
+        fn hash_workspace_cargo_lock_refuses_a_symlink() {
+            let ws = temp_dir_for("cargo-lock-symlink");
+            let real = temp_dir_for("cargo-lock-symlink-target");
+            std::fs::write(real.join("real-lock"), b"lockfile bytes").unwrap();
+            std::os::unix::fs::symlink(real.join("real-lock"), ws.join("Cargo.lock")).unwrap();
+            let err = hash_workspace_cargo_lock_no_follow(&ws).unwrap_err();
+            assert!(err.contains("Cargo.lock is not present"));
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&real);
+        }
+
+        // ---- CT-007 slice 5b.2 live drill (Sol's review, round 3): real git-wire (Hop A) + real
+        // runsc/OCI/userns/workspace (Hop B), end to end. Mirrors
+        // `explicit_user_namespace_boots_through_the_real_enabled_backend_and_launch`'s exact
+        // skip/hard-fail gating contract: the ONLY legitimate skip conditions are the listed
+        // absent capabilities; once all are present, ANY construction or execution failure is a
+        // genuine regression (never caught-and-skipped).
+
+        #[cfg(feature = "integration")]
+        fn drill_runsc_bin() -> Option<String> {
+            let bin = std::env::var("MYELIN_RUNSC_BIN").unwrap_or_else(|_| "runsc".to_string());
+            if bin.contains('/') {
+                return Path::new(&bin).exists().then_some(bin);
+            }
+            let path = std::env::var("PATH").ok()?;
+            for dir in path.split(':') {
+                if Path::new(dir).join(&bin).exists() {
+                    return Some(bin);
+                }
+            }
+            None
+        }
+
+        #[cfg(feature = "integration")]
+        fn drill_copy_file(src: &Path, dst: &Path) {
+            if let Some(p) = dst.parent() {
+                std::fs::create_dir_all(p).expect("mkdir -p");
+            }
+            std::fs::copy(src, dst).unwrap_or_else(|e| panic!("copy {src:?} -> {dst:?}: {e}"));
+        }
+
+        #[cfg(feature = "integration")]
+        fn drill_stage_lib(rootfs: &Path, soname: &str, host_path: &str) {
+            let real = std::fs::canonicalize(host_path).unwrap_or_else(|_| PathBuf::from(host_path));
+            let real_name = real.file_name().unwrap().to_string_lossy().to_string();
+            for libdir in ["usr/lib", "lib"] {
+                let dst_real = rootfs.join(libdir).join(&real_name);
+                drill_copy_file(&real, &dst_real);
+                let link = rootfs.join(libdir).join(soname);
+                let _ = std::fs::remove_file(&link);
+                std::os::unix::fs::symlink(&real_name, &link).expect("soname symlink");
+            }
+        }
+
+        /// Stage a git-bearing rootfs from the busybox base (mirrors
+        /// `tests/git_wire_prod_exec_test.rs`'s own staging recipe — that file's staging cannot be
+        /// reused directly since it runs in a SEPARATE test-binary process from this crate's own
+        /// `#[cfg(test)] mod tests`, so the `MYELIN_GVISOR_GIT_ROOTFS` env var / `OnceLock` it sets
+        /// never crosses process boundaries).
+        #[cfg(feature = "integration")]
+        fn drill_stage_git_rootfs(base: &Path) -> PathBuf {
+            let staged = std::env::temp_dir().join(format!(
+                "myelin-checkout-drill-git-rootfs-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&staged);
+            let st = Command::new("cp")
+                .arg("-a")
+                .arg(format!("{}/.", base.display()))
+                .arg(&staged)
+                .status()
+                .expect("cp -a base rootfs");
+            assert!(st.success(), "cp -a base rootfs failed");
+            drill_copy_file(Path::new("/usr/bin/git"), &staged.join("usr/bin/git"));
+            drill_stage_lib(&staged, "libpcre2-8.so.0", "/usr/lib/libpcre2-8.so.0");
+            drill_stage_lib(&staged, "libz-ng.so.2", "/usr/lib/libz-ng.so.2");
+            let core = staged.join("usr/lib/git-core");
+            std::fs::create_dir_all(&core).expect("mkdir git-core");
+            for helper in ["git-upload-pack", "git-receive-pack"] {
+                let link = core.join(helper);
+                let _ = std::fs::remove_file(&link);
+                std::os::unix::fs::symlink("../../bin/git", &link)
+                    .expect("git-core helper symlink");
+            }
+            std::fs::create_dir_all(staged.join("repo")).expect("mkdir /repo mount point");
+            std::fs::create_dir_all(staged.join("quarantine")).expect("mkdir /quarantine mount point");
+            staged
+        }
+
+        #[cfg(feature = "integration")]
+        fn drill_git_rootfs() -> Option<PathBuf> {
+            static STAGED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+            STAGED
+                .get_or_init(|| {
+                    let base = resolved_gvisor_rootfs();
+                    if !base.exists() {
+                        return None;
+                    }
+                    let staged = drill_stage_git_rootfs(&base);
+                    std::env::set_var(ENV_GVISOR_GIT_ROOTFS, &staged);
+                    Some(staged)
+                })
+                .clone()
+        }
+
+        #[cfg(feature = "integration")]
+        fn drill_run_git(args: &[&str], cwd: Option<&Path>) {
+            let mut c = Command::new("git");
+            c.args(args);
+            if let Some(d) = cwd {
+                c.current_dir(d);
+            }
+            let out = c.output().expect("run host git");
+            assert!(
+                out.status.success(),
+                "host git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        #[cfg(feature = "integration")]
+        fn drill_rev_parse(cwd: &Path, rev: &str) -> String {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(cwd)
+                .output()
+                .expect("git rev-parse");
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// Create a REAL bare repo with TWO commits; return `(older_oid, newer_oid)`. The drill
+        /// requests the OLDER (non-tip) commit — Sol's suggestion: this is the ONE fixture shape
+        /// that actually exercises `allow-reachable-sha1-in-want` (it is reachable but not an
+        /// advertised ref tip) and the shallow boundary (a real, non-root commit truncated at
+        /// depth 1), not merely the trivial "want the HEAD tip" case.
+        #[cfg(feature = "integration")]
+        fn drill_make_repo_with_two_commits(
+            root: &Path,
+            tenant: &str,
+            region: &str,
+            repo: &str,
+        ) -> (String, String) {
+            let bare = resolve_bare_repo_path(root, tenant, region, repo).expect("resolve bare path");
+            std::fs::create_dir_all(bare.parent().unwrap()).expect("mkdir repo parent");
+            drill_run_git(&["init", "-q", "--bare", &bare.to_string_lossy()], None);
+            let work = root.join("work");
+            std::fs::create_dir_all(&work).expect("mkdir work");
+            drill_run_git(&["init", "-q", "-b", "main"], Some(&work));
+            drill_run_git(&["config", "user.email", "t@t.t"], Some(&work));
+            drill_run_git(&["config", "user.name", "t"], Some(&work));
+            // A `Cargo.lock` is committed too -- `run_checkout_preparation` requires one present
+            // (it hashes the materialized `Cargo.lock`, ledger 12's locked slice-5b contract).
+            std::fs::write(work.join("Cargo.lock"), b"# drill fixture lockfile\n").unwrap();
+            std::fs::write(work.join("f.txt"), b"first\n").unwrap();
+            drill_run_git(&["add", "Cargo.lock", "f.txt"], Some(&work));
+            drill_run_git(
+                &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "first"],
+                Some(&work),
+            );
+            let older = drill_rev_parse(&work, "HEAD");
+            std::fs::write(work.join("f.txt"), b"second\n").unwrap();
+            drill_run_git(&["add", "f.txt"], Some(&work));
+            drill_run_git(
+                &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "second"],
+                Some(&work),
+            );
+            let newer = drill_rev_parse(&work, "HEAD");
+            drill_run_git(&["push", "-q", &bare.to_string_lossy(), "main"], Some(&work));
+            (older, newer)
+        }
+
+        #[test]
+        #[cfg(feature = "integration")]
+        fn checkout_preparation_runs_end_to_end_through_real_git_wire_and_runsc() {
+            // Serializes against the Enabled activation drill -- both share the SAME
+            // operator-provisioned `leases_dir` (see `USERNS_DRILL_LEASES_DIR_LOCK`'s own doc).
+            let _leases_dir_guard = USERNS_DRILL_LEASES_DIR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(_runsc) = drill_runsc_bin() else {
+                eprintln!("[checkout live drill] SKIP: `runsc` is not on PATH");
+                return;
+            };
+            if let Err(e) = preflight_explicit_userns_policy(
+                resolved_explicit_userns_helper_dir(),
+                resolved_explicit_userns_runsc_root(),
+            ) {
+                eprintln!(
+                    "[checkout live drill] SKIP: preflight_explicit_userns_policy failed: {e}"
+                );
+                return;
+            }
+            let Some(git_rootfs) = drill_git_rootfs() else {
+                eprintln!(
+                    "[checkout live drill] SKIP: base rootfs absent -- cannot stage a git-bearing \
+                     rootfs"
+                );
+                return;
+            };
+            let leases_dir = match std::env::var(USERNS_DRILL_LEASES_DIR_ENV) {
+                Ok(value) if !value.is_empty() => PathBuf::from(value),
+                _ => {
+                    eprintln!(
+                        "[checkout live drill] SKIP: {USERNS_DRILL_LEASES_DIR_ENV} is not set -- \
+                         needs an operator-provisioned leases directory, same STRICT contract as \
+                         the Enabled activation drill (pre-existing, euid-owned, mode 0700 or \
+                         stricter, non-writable-by-us ancestor chain)"
+                    );
+                    return;
+                }
+            };
+
+            // ---- a REAL bare repo, two commits ----
+            let tag = format!("{}-{}", std::process::id(), unique_suffix());
+            let root = std::env::temp_dir().join(format!("myelin-checkout-drill-repo-{tag}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("mkdir drill repo root");
+            let (older_oid, _newer_oid) =
+                drill_make_repo_with_two_commits(&root, "acme", "fr-par", "widgets");
+
+            // ---- Hop A: fetch the OLDER (non-tip) commit's pack through the REAL git-wire path ----
+            let git_backend = GvisorBackend::new(test_registry());
+            let hooks = ok_hooks();
+            let expected = ExpectedGitCommitId::new(older_oid.clone(), GitObjectFormat::Sha1)
+                .expect("older_oid is valid 40-hex");
+            let checkout_limits = ResourceLimits {
+                cpu_millis: 1000,
+                mem_bytes: 256 << 20,
+                disk_bytes: 256 << 20,
+                tmpfs_bytes: 64 << 20,
+                pids_max: 128,
+                timeout_secs: 60,
+            };
+            let run_token = RunTokenCredential::new("drill-bearer", "drill-jti", 3600)
+                .expect("a non-empty bearer/jti/positive ttl must construct");
+            let meter_to = MeterTarget {
+                reserve_id: "checkout-drill".to_string(),
+            };
+            let pack = fetch_checkout_pack(
+                &git_backend,
+                &hooks,
+                &root,
+                "acme",
+                "fr-par",
+                "widgets",
+                &expected,
+                checkout_limits,
+                run_token,
+                meter_to,
+                IdemToken(format!("checkout-drill-{tag}")),
+            )
+            .expect(
+                "fetch_checkout_pack must succeed once runsc/rootfs/repo prerequisites are \
+                 configured -- reaching this point asserts the host IS correctly provisioned, so \
+                 a failure here is a genuine regression",
+            );
+
+            // ---- acquire a REAL workspace + userns lease (the same acquisition machinery
+            // `launch_with`'s Enabled path uses) ----
+            let mut workspace_base_dir =
+                std::env::home_dir().expect("HOME must be set for this test");
+            workspace_base_dir.push(format!(".local/state/myelin-checkout-drill-workspace-{tag}"));
+            let incident_sink: crate::workspace_manager::IncidentSink =
+                Arc::new(|msg: &str| eprintln!("[checkout live drill incident] {msg}"));
+            let enabled_backend = GvisorBackend::try_new(
+                real_userns_drill_registry(&git_rootfs),
+                GvisorWorkspaceConfig::Enabled {
+                    base_dir: workspace_base_dir.clone(),
+                    host_capacity_bytes: 1 << 30,
+                    leases_dir,
+                    min_pool_size: 1,
+                },
+                incident_sink,
+            )
+            .expect(
+                "GvisorBackend::try_new(Enabled) must succeed once an operator-provisioned \
+                 leases directory is configured",
+            );
+            let job_spec = spec(vec![]);
+            let profile = HardeningProfile::derive(&job_spec);
+            let container_id = format!("myelin-checkout-drill-{tag}");
+            let (workspace_manager, userns_allocator) = match &enabled_backend.workspace_integration
+            {
+                WorkspaceIntegration::Enabled {
+                    workspace_manager,
+                    userns_allocator,
+                } => (workspace_manager, userns_allocator),
+                WorkspaceIntegration::Disabled => {
+                    panic!("try_new(Enabled) must produce an Enabled workspace_integration")
+                }
+            };
+            let (_discarded_cfg, mut context) = acquire_enabled_workspace(
+                &job_spec,
+                &profile,
+                &container_id,
+                git_rootfs.clone(),
+                workspace_manager,
+                userns_allocator,
+            )
+            .expect("acquiring a real workspace + userns lease must succeed on a healthy host");
+
+            // ---- Hop B: run the REAL checkout-preparation container ----
+            let checkout_spec = CheckoutPreparationSpec::new(expected, pack, checkout_limits)
+                .expect("valid limits must construct a CheckoutPreparationSpec");
+            let mut session = CheckoutPreparationSession::new();
+            let evidence = run_checkout_preparation(
+                &mut context.lease,
+                &mut session,
+                &context.workspace,
+                checkout_spec,
+            )
+            .expect(
+                "run_checkout_preparation must succeed once runsc/rootfs/workspace/lease \
+                 prerequisites are configured -- reaching this point asserts the host IS \
+                 correctly provisioned, so any failure here is a genuine regression",
+            );
+
+            assert_eq!(evidence.commit_hex(), older_oid);
+            assert!(
+                !evidence.cargo_lock_sha256_hex().is_empty(),
+                "the drill repo's Cargo.lock must have been hashed"
+            );
+
+            // ---- cleanup: delete the workspace BEFORE releasing the lease (Sol's review: the
+            // central identity invariant is that the subordinate uid/gid is never released/
+            // reallocated while its chowned workspace still exists) ----
+            let EnabledLaunchContext { workspace, lease, .. } = context;
+            workspace_manager
+                .delete_workspace(workspace)
+                .expect("delete_workspace must succeed after a real, proven-clean checkout run");
+            session
+                .release_prepared(lease)
+                .expect("release_prepared must succeed after a real, proven-clean checkout run");
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&workspace_base_dir);
+        }
+
+        // ---- usage accounting ----
+
+        #[test]
+        fn usage_from_runsc_outcome_ceils_wall_clock_and_floors_cpu_from_proc() {
+            let outcome = RunscOutcome {
+                exit: Some(0),
+                timed_out: false,
+                stdout: Vec::new(),
+                stdout_truncated: false,
+                stderr: Vec::new(),
+                wall: Duration::from_millis(1500),
+                cpu_seconds: None,
+                stream_error: None,
+            };
+            let usage = usage_from_runsc_outcome(1 << 20, &outcome);
+            assert_eq!(usage.cpu_seconds, 2); // 1.5s wall, ceiled
+            assert_eq!(usage.mem_byte_seconds, (1 << 20) * 2);
+        }
+
+        // ---- orchestration ordering (Sol's round-2 review: deterministic seams for the
+        // properties a live drill alone wouldn't pin down repeatably) ----
+        //
+        // `evaluate_checkout_finalization` is `run_checkout_preparation`'s ENTIRE post-spawn
+        // decision logic, extracted specifically so these run against synthetic
+        // `RuntimeFinalization`/`RuntimeQuiescenceEvidence` values -- no real `runsc` spawn
+        // anywhere below. A real (cheap, non-privileged) `UserNamespaceLease` still requires a
+        // real `/etc/subuid`/`/etc/subgid` range for this process's uid (`test-support` feature).
+
+        #[cfg(feature = "test-support")]
+        fn real_lease_for_eval_test(tag: &str) -> Option<(UserNamespaceAllocator, PathBuf)> {
+            real_userns_allocator_for_tests(tag)
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn evaluate_checkout_finalization_never_confirms_when_teardown_is_unproven() {
+            let Some((allocator, leases_dir)) =
+                real_lease_for_eval_test("eval-teardown-unproven")
+            else {
+                eprintln!("[checkout eval test] SKIP: no usable /etc/subuid|subgid range");
+                return;
+            };
+            let mut lease = allocator.lease().unwrap();
+            let mut session = CheckoutPreparationSession::new();
+            session
+                .bind_preparation(&mut lease, "c1".to_string(), (11, 11), (22, 22))
+                .expect("bind_preparation must succeed");
+            let finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>> =
+                RuntimeFinalization::Failed {
+                    primary: Ok(outcome(b"whatever the guest printed", b"")),
+                    teardown: RuntimeTeardownError {
+                        issues: vec![RuntimeTeardownIssue::Cgroup(
+                            CgroupQuiescenceError::StillPopulated {
+                                waited: Duration::from_secs(1),
+                            },
+                        )],
+                    },
+                };
+            let ws = temp_dir_for("teardown-unproven-ws");
+            let expected =
+                ExpectedGitCommitId::new(sha1_oid(0xa1), GitObjectFormat::Sha1).unwrap();
+            let result =
+                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            match result {
+                Err(CheckoutPreparationError::TeardownUnproven { .. }) => {}
+                other => panic!("expected TeardownUnproven, got {other:?}"),
+            }
+            // Behavioral proof `confirm_prepared` was NEVER attempted: the session must still be
+            // EXACTLY `PreparationBound` -- confirming it now (with the same identity
+            // `bind_preparation` durably wrote) must succeed. Had this function wrongly already
+            // confirmed/poisoned it, this would panic (wrong state) or refuse (already Prepared/
+            // Unreleasable).
+            let nonce = lease.nonce_for_tests();
+            session
+                .confirm_prepared(
+                    &mut lease,
+                    PreparationQuiescenceProof::assert_for_tests(
+                        nonce,
+                        "c1".to_string(),
+                        (11, 11),
+                        (22, 22),
+                    ),
+                )
+                .expect(
+                    "session must still be PreparationBound -- confirm_prepared was never \
+                     attempted on a teardown-unproven finalization",
+                );
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&leases_dir);
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn evaluate_checkout_finalization_confirms_before_checking_exit_status() {
+            let Some((allocator, leases_dir)) = real_lease_for_eval_test("eval-bad-exit") else {
+                eprintln!("[checkout eval test] SKIP: no usable /etc/subuid|subgid range");
+                return;
+            };
+            let mut lease = allocator.lease().unwrap();
+            let mut session = CheckoutPreparationSession::new();
+            session
+                .bind_preparation(&mut lease, "c2".to_string(), (33, 33), (44, 44))
+                .expect("bind_preparation must succeed");
+            let mut bad_outcome = outcome(b"", b"checkout script failed");
+            bad_outcome.exit = Some(1);
+            let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+                "c2".to_string(),
+                RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: (33, 33),
+                },
+                CgroupQuiescenceEvidence::assert_for_tests((44, 44)),
+            );
+            let finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>> =
+                RuntimeFinalization::Finalized(FinalizedRun {
+                    primary: Ok(bad_outcome),
+                    evidence,
+                });
+            let ws = temp_dir_for("bad-exit-ws");
+            let expected =
+                ExpectedGitCommitId::new(sha1_oid(0xa2), GitObjectFormat::Sha1).unwrap();
+            let result =
+                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            match result {
+                Err(CheckoutPreparationError::RejectedAfterQuiescence { .. }) => {}
+                other => panic!("expected RejectedAfterQuiescence, got {other:?}"),
+            }
+            // Behavioral proof teardown WAS confirmed despite the semantic (exit-code) failure:
+            // the session must have reached `Prepared` -- `release_prepared` panics otherwise.
+            session.release_prepared(lease).expect(
+                "session must have reached Prepared -- confirm_prepared must run before the \
+                 exit-status check, regardless of its outcome",
+            );
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&leases_dir);
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn evaluate_checkout_finalization_rejects_a_truncated_confirmation_line() {
+            let Some((allocator, leases_dir)) = real_lease_for_eval_test("eval-stdout-truncated")
+            else {
+                eprintln!("[checkout eval test] SKIP: no usable /etc/subuid|subgid range");
+                return;
+            };
+            let mut lease = allocator.lease().unwrap();
+            let mut session = CheckoutPreparationSession::new();
+            session
+                .bind_preparation(&mut lease, "c2t".to_string(), (34, 34), (45, 45))
+                .expect("bind_preparation must succeed");
+            let mut truncated_outcome = outcome(b"partial-line-that-got-cut", b"");
+            truncated_outcome.exit = Some(0);
+            truncated_outcome.stdout_truncated = true;
+            let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+                "c2t".to_string(),
+                RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: (34, 34),
+                },
+                CgroupQuiescenceEvidence::assert_for_tests((45, 45)),
+            );
+            let finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>> =
+                RuntimeFinalization::Finalized(FinalizedRun {
+                    primary: Ok(truncated_outcome),
+                    evidence,
+                });
+            let ws = temp_dir_for("stdout-truncated-ws");
+            let expected =
+                ExpectedGitCommitId::new(sha1_oid(0xb1), GitObjectFormat::Sha1).unwrap();
+            let result =
+                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            match result {
+                Err(CheckoutPreparationError::RejectedAfterQuiescence { message, .. }) => {
+                    assert!(message.contains("truncated"));
+                }
+                other => panic!("expected RejectedAfterQuiescence, got {other:?}"),
+            }
+            session.release_prepared(lease).expect(
+                "session must have reached Prepared despite the truncated confirmation output",
+            );
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&leases_dir);
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn evaluate_checkout_finalization_rejects_a_stream_error() {
+            let Some((allocator, leases_dir)) = real_lease_for_eval_test("eval-stream-error")
+            else {
+                eprintln!("[checkout eval test] SKIP: no usable /etc/subuid|subgid range");
+                return;
+            };
+            let mut lease = allocator.lease().unwrap();
+            let mut session = CheckoutPreparationSession::new();
+            session
+                .bind_preparation(&mut lease, "c2s".to_string(), (35, 35), (46, 46))
+                .expect("bind_preparation must succeed");
+            let mut stream_error_outcome = outcome(b"whatever was captured before the error", b"");
+            stream_error_outcome.exit = Some(0);
+            stream_error_outcome.stream_error = Some("durable log sink write failed".to_string());
+            let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+                "c2s".to_string(),
+                RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: (35, 35),
+                },
+                CgroupQuiescenceEvidence::assert_for_tests((46, 46)),
+            );
+            let finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>> =
+                RuntimeFinalization::Finalized(FinalizedRun {
+                    primary: Ok(stream_error_outcome),
+                    evidence,
+                });
+            let ws = temp_dir_for("stream-error-ws");
+            let expected =
+                ExpectedGitCommitId::new(sha1_oid(0xb2), GitObjectFormat::Sha1).unwrap();
+            let result =
+                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            match result {
+                Err(CheckoutPreparationError::RejectedAfterQuiescence { message, .. }) => {
+                    assert!(message.contains("durable log sink write failed"));
+                }
+                other => panic!("expected RejectedAfterQuiescence, got {other:?}"),
+            }
+            session
+                .release_prepared(lease)
+                .expect("session must have reached Prepared despite the stream error");
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&leases_dir);
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn evaluate_checkout_finalization_confirms_before_checking_the_confirmation_line() {
+            let Some((allocator, leases_dir)) = real_lease_for_eval_test("eval-bad-confirm-line")
+            else {
+                eprintln!("[checkout eval test] SKIP: no usable /etc/subuid|subgid range");
+                return;
+            };
+            let mut lease = allocator.lease().unwrap();
+            let mut session = CheckoutPreparationSession::new();
+            session
+                .bind_preparation(&mut lease, "c3".to_string(), (55, 55), (66, 66))
+                .expect("bind_preparation must succeed");
+            let mut ok_exit_bad_output = outcome(b"not the expected confirmation line\n", b"");
+            ok_exit_bad_output.exit = Some(0);
+            let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+                "c3".to_string(),
+                RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: (55, 55),
+                },
+                CgroupQuiescenceEvidence::assert_for_tests((66, 66)),
+            );
+            let finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>> =
+                RuntimeFinalization::Finalized(FinalizedRun {
+                    primary: Ok(ok_exit_bad_output),
+                    evidence,
+                });
+            let ws = temp_dir_for("bad-confirm-line-ws");
+            let expected =
+                ExpectedGitCommitId::new(sha1_oid(0xa3), GitObjectFormat::Sha1).unwrap();
+            let result =
+                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            match result {
+                Err(CheckoutPreparationError::RejectedAfterQuiescence { .. }) => {}
+                other => panic!("expected RejectedAfterQuiescence, got {other:?}"),
+            }
+            session.release_prepared(lease).expect(
+                "session must have reached Prepared despite the bad confirmation line",
+            );
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&leases_dir);
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn evaluate_checkout_finalization_confirms_before_checking_the_host_head_reread() {
+            let Some((allocator, leases_dir)) = real_lease_for_eval_test("eval-bad-host-head")
+            else {
+                eprintln!("[checkout eval test] SKIP: no usable /etc/subuid|subgid range");
+                return;
+            };
+            let mut lease = allocator.lease().unwrap();
+            let mut session = CheckoutPreparationSession::new();
+            session
+                .bind_preparation(&mut lease, "c4".to_string(), (77, 77), (88, 88))
+                .expect("bind_preparation must succeed");
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xa4), GitObjectFormat::Sha1).unwrap();
+            let tree = sha1_oid(0xa5);
+            let mut good_exit_good_line =
+                outcome(format!("{} {tree}\n", expected.as_str()).as_bytes(), b"");
+            good_exit_good_line.exit = Some(0);
+            let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+                "c4".to_string(),
+                RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: (77, 77),
+                },
+                CgroupQuiescenceEvidence::assert_for_tests((88, 88)),
+            );
+            let finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>> =
+                RuntimeFinalization::Finalized(FinalizedRun {
+                    primary: Ok(good_exit_good_line),
+                    evidence,
+                });
+            // The host-side workspace disagrees with what the guest claimed (a different oid) --
+            // this must still be caught AFTER confirm_prepared already ran.
+            let ws = temp_dir_for("bad-host-head-ws");
+            std::fs::create_dir_all(ws.join(".git")).unwrap();
+            std::fs::write(ws.join(".git/HEAD"), format!("{}\n", sha1_oid(0xa6))).unwrap();
+            let result =
+                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            match result {
+                Err(CheckoutPreparationError::RejectedAfterQuiescence { message, .. }) => {
+                    assert!(message.contains("host-side HEAD re-verification disagreed"));
+                }
+                other => panic!("expected RejectedAfterQuiescence, got {other:?}"),
+            }
+            session
+                .release_prepared(lease)
+                .expect("session must have reached Prepared despite the host HEAD disagreement");
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&leases_dir);
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn evaluate_checkout_finalization_confirms_before_checking_for_cargo_lock() {
+            let Some((allocator, leases_dir)) = real_lease_for_eval_test("eval-missing-cargo-lock")
+            else {
+                eprintln!("[checkout eval test] SKIP: no usable /etc/subuid|subgid range");
+                return;
+            };
+            let mut lease = allocator.lease().unwrap();
+            let mut session = CheckoutPreparationSession::new();
+            session
+                .bind_preparation(&mut lease, "c4b".to_string(), (78, 78), (89, 89))
+                .expect("bind_preparation must succeed");
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xb3), GitObjectFormat::Sha1).unwrap();
+            let tree = sha1_oid(0xb4);
+            let mut good_exit_good_line =
+                outcome(format!("{} {tree}\n", expected.as_str()).as_bytes(), b"");
+            good_exit_good_line.exit = Some(0);
+            let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+                "c4b".to_string(),
+                RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: (78, 78),
+                },
+                CgroupQuiescenceEvidence::assert_for_tests((89, 89)),
+            );
+            let finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>> =
+                RuntimeFinalization::Finalized(FinalizedRun {
+                    primary: Ok(good_exit_good_line),
+                    evidence,
+                });
+            // HEAD matches, but there is NO Cargo.lock -- this must still be caught (as a semantic
+            // rejection, AFTER confirm_prepared already ran), never silently produce evidence with
+            // no digest.
+            let ws = temp_dir_for("missing-cargo-lock-ws");
+            std::fs::create_dir_all(ws.join(".git")).unwrap();
+            std::fs::write(ws.join(".git/HEAD"), format!("{}\n", expected.as_str())).unwrap();
+            let result =
+                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            match result {
+                Err(CheckoutPreparationError::RejectedAfterQuiescence { message, .. }) => {
+                    assert!(message.contains("could not hash the materialized Cargo.lock"));
+                }
+                other => panic!("expected RejectedAfterQuiescence, got {other:?}"),
+            }
+            session
+                .release_prepared(lease)
+                .expect("session must have reached Prepared despite the missing Cargo.lock");
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&leases_dir);
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn evaluate_checkout_finalization_mints_evidence_on_full_agreement() {
+            let Some((allocator, leases_dir)) = real_lease_for_eval_test("eval-happy-path") else {
+                eprintln!("[checkout eval test] SKIP: no usable /etc/subuid|subgid range");
+                return;
+            };
+            let mut lease = allocator.lease().unwrap();
+            let mut session = CheckoutPreparationSession::new();
+            session
+                .bind_preparation(&mut lease, "c5".to_string(), (99, 99), (100, 100))
+                .expect("bind_preparation must succeed");
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xa7), GitObjectFormat::Sha1).unwrap();
+            let tree = sha1_oid(0xa8);
+            let mut good_exit_good_line =
+                outcome(format!("{} {tree}\n", expected.as_str()).as_bytes(), b"");
+            good_exit_good_line.exit = Some(0);
+            let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+                "c5".to_string(),
+                RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: (99, 99),
+                },
+                CgroupQuiescenceEvidence::assert_for_tests((100, 100)),
+            );
+            let finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>> =
+                RuntimeFinalization::Finalized(FinalizedRun {
+                    primary: Ok(good_exit_good_line),
+                    evidence,
+                });
+            let ws = temp_dir_for("happy-path-ws");
+            std::fs::create_dir_all(ws.join(".git")).unwrap();
+            std::fs::write(ws.join(".git/HEAD"), format!("{}\n", expected.as_str())).unwrap();
+            std::fs::write(ws.join("Cargo.lock"), b"# fake lockfile content\n").unwrap();
+            let result =
+                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            let prepared_evidence = result.expect("full agreement must mint PreparedCheckoutEvidence");
+            assert_eq!(prepared_evidence.commit_hex(), expected.as_str());
+            assert_eq!(prepared_evidence.tree_oid(), tree);
+            let mut hasher = Sha256::new();
+            hasher.update(b"# fake lockfile content\n");
+            let expected_hex = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            assert_eq!(prepared_evidence.cargo_lock_sha256_hex(), expected_hex);
+            session
+                .release_prepared(lease)
+                .expect("session must have reached Prepared on the happy path");
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&leases_dir);
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn evaluate_checkout_finalization_is_unreleasable_when_confirm_prepared_disagrees() {
+            let Some((allocator, leases_dir)) = real_lease_for_eval_test("eval-confirm-mismatch")
+            else {
+                eprintln!("[checkout eval test] SKIP: no usable /etc/subuid|subgid range");
+                return;
+            };
+            let mut lease = allocator.lease().unwrap();
+            let mut session = CheckoutPreparationSession::new();
+            session
+                .bind_preparation(&mut lease, "c6".to_string(), (111, 111), (122, 122))
+                .expect("bind_preparation must succeed");
+            // The "evidence" names a DIFFERENT cgroup identity than what was durably bound --
+            // `confirm_prepared` must refuse (`ProofDisagreesWithMarker`), not silently accept it.
+            let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+                "c6".to_string(),
+                RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: (111, 111),
+                },
+                CgroupQuiescenceEvidence::assert_for_tests((999, 999)),
+            );
+            let finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>> =
+                RuntimeFinalization::Finalized(FinalizedRun {
+                    primary: Ok(outcome(b"whatever", b"")),
+                    evidence,
+                });
+            let ws = temp_dir_for("confirm-mismatch-ws");
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xa9), GitObjectFormat::Sha1).unwrap();
+            let result =
+                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            match result {
+                Err(CheckoutPreparationError::Unreleasable { usage, .. }) => {
+                    assert!(usage.is_some(), "a post-spawn Unreleasable must carry measured usage");
+                }
+                other => panic!("expected Unreleasable, got {other:?}"),
+            }
+            assert!(session.is_unreleasable());
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&leases_dir);
         }
     }
 }
