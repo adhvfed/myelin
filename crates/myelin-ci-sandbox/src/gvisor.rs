@@ -5614,94 +5614,10 @@ fn stage_git_wire_bundle(cfg: &OciConfig) -> Result<PathBuf, String> {
 //   silently free.
 // =================================================================================================
 
-/// The git object-format hex width a [`ExpectedGitCommitId`] was validated against. Local to this
-/// crate deliberately: `myelin-ci-sandbox`'s own `Cargo.toml` documents it as a leaf that depends
-/// ONLY on `myelin-tenancy`, with nothing in the production DAG depending back on it — pulling in
-/// `myelin-git` (a much higher-level crate) just for its `receive_pack::Oid`/`object_format::
-/// ObjectFormat` types would violate that documented boundary. This type carries only what the wire
-/// negotiation and the checkout script need: which hex width to expect/request, and which wire
-/// capability / `git init` flag that implies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum GitObjectFormat {
-    Sha1,
-    Sha256,
-}
-
-impl GitObjectFormat {
-    fn hex_width(self) -> usize {
-        match self {
-            GitObjectFormat::Sha1 => 40,
-            GitObjectFormat::Sha256 => 64,
-        }
-    }
-
-    /// The `object-format=<...>` wire capability token this format requires in the fetch request —
-    /// `None` for SHA-1 (omitting the capability entirely means SHA-1, the protocol default).
-    fn capability_token(self) -> Option<&'static str> {
-        match self {
-            GitObjectFormat::Sha1 => None,
-            GitObjectFormat::Sha256 => Some("object-format=sha256"),
-        }
-    }
-
-    /// The `git init --object-format=<...>` token (also matched against the advertisement's own
-    /// `object-format=` capability, when present).
-    fn init_token(self) -> &'static str {
-        match self {
-            GitObjectFormat::Sha1 => "sha1",
-            GitObjectFormat::Sha256 => "sha256",
-        }
-    }
-}
-
-/// A validated git commit id CT-007 will check out — exactly [`GitObjectFormat::hex_width`]
-/// lowercase-hex characters, never the all-zero null id (the protocol's delete/"nothing" sentinel,
-/// never a real checkout target). Deliberately NOT named `CommitOid`/built on a generic
-/// hash-agnostic string type (Sol's round-2 review): the object format is load-bearing here — it
-/// picks the wire capability AND the `git init` flag — so it is carried explicitly, never inferred
-/// silently downstream from a bare hex length.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) struct ExpectedGitCommitId {
-    hex: String,
-    format: GitObjectFormat,
-}
-
-impl ExpectedGitCommitId {
-    #[allow(dead_code)]
-    pub(crate) fn new(hex: impl Into<String>, format: GitObjectFormat) -> Result<Self, String> {
-        let hex = hex.into();
-        if hex.len() != format.hex_width() {
-            return Err(format!(
-                "expected a {}-character lowercase-hex commit id for {format:?}, got {} \
-                 characters",
-                format.hex_width(),
-                hex.len()
-            ));
-        }
-        if !hex
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(format!("commit id {hex:?} is not lowercase hex"));
-        }
-        if hex.bytes().all(|b| b == b'0') {
-            return Err(
-                "commit id is the all-zero null id -- never a valid checkout target".to_string(),
-            );
-        }
-        Ok(ExpectedGitCommitId { hex, format })
-    }
-
-    fn as_str(&self) -> &str {
-        &self.hex
-    }
-
-    fn format(&self) -> GitObjectFormat {
-        self.format
-    }
-}
+// `GitObjectFormat`/`ExpectedGitCommitId` moved to `crate::workspace_intent` (CT-007 slice 5b.3-1,
+// Sol's review): backend-independent semantics the intent parser needs too, so they must not live
+// in a backend-specific module.
+use crate::workspace_intent::{ExpectedGitCommitId, GitObjectFormat};
 
 /// One raw pkt-line parsed from a git wire byte stream (CT-007 slice 5b.2's fetch/advertisement
 /// decoders).
