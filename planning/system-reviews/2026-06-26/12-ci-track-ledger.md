@@ -2158,3 +2158,55 @@ principle since `PreparedCheckoutEvidence` carries the `Cargo.lock` digest it ne
 but still gated behind 5b.3 landing a real materialized checkout in production). And the live-drill
 infrastructure gap noted above (host provisioning for a genuine green execution, not just an honest
 skip).
+
+## 2026-07-27 — host provisioning attempt for the live drills: got further, found the exact
+## remaining wall, declined to cross it
+
+With sudo authorized for host setup, provisioned real infrastructure for the two live drills
+(`explicit_user_namespace_boots_through_the_real_enabled_backend_and_launch` and 5b.2's new
+`checkout_preparation_runs_end_to_end_through_real_git_wire_and_runsc`): copied the exact
+pinned-digest `runsc` binary to `/usr/local/bin/runsc` (root-owned, satisfying
+`harden_explicit_userns_runsc_binary`'s non-writable-ancestor-chain requirement — the prior
+`~/.local/bin/runsc` install lived under the user's own home dir, which the strict policy correctly
+refuses to anchor on); created `/opt/myelin/runsc-root` and `/opt/myelin/userns-leases` (euid-owned,
+mode 0700, under the root-owned `/opt/myelin` — the exact contract `harden_explicit_userns_runsc_root`
+and the strict `UserNamespaceAllocator::try_new` require). Both drills now clear EVERY gate they
+previously skipped at (`preflight_explicit_userns_policy`, the staged git rootfs, the leases
+directory) and reach real `runsc`/OCI/userns/workspace-acquisition code.
+
+**The wall both drills now hit identically:** `WorkspaceManager`'s real Btrfs subvolume provisioning
+calls `btrfs qgroup limit`, which fails `Operation not permitted` — this process lacks
+`CAP_SYS_ADMIN` for quota operations. Confirmed this is NOT specific to the new checkout drill: the
+PRE-EXISTING Enabled activation drill hits the byte-identical failure. It is also not a surprise or a
+product defect — `workspace_storage.rs`'s own `full_privileged_lifecycle_create_quota_verify_exceed_
+delete_sync` test already probes for exactly this and skips gracefully when absent; the two
+higher-level drills simply don't have that same probe-and-skip for this ONE specific dimension (they
+check `runsc`/policy/leases-dir presence, not Btrfs privilege).
+
+**Why this wasn't pushed through:** granting the compiled TEST BINARY `cap_sys_admin` via `setcap`
+(mirroring the documented `myelin-runner` systemd `AmbientCapabilities=CAP_SYS_ADMIN` pattern) did
+NOT help — Linux file capabilities do not propagate across `exec` into a child process unless ambient
+capabilities are explicitly raised beforehand, and `WorkspaceManager` invokes `btrfs` as a genuinely
+separate child process. The capability would need to live on `/usr/bin/btrfs` itself to take effect —
+but that grants CAP_SYS_ADMIN to EVERY invocation of `btrfs` by EVERY user on this shared dev host,
+permanently, until explicitly removed — a materially larger and harder-to-reverse change than
+anything done so far this session, and not something "use sudo as needed" was read to authorize
+unilaterally. Declined; the test binary's capability was stripped back off immediately after
+confirming it didn't help.
+
+**Cleanup:** both drill runs left a real, `CAP_SYS_ADMIN`-requiring Btrfs subvolume+qgroup behind
+(their own `WorkspaceManager` incident log says so explicitly — "manual reconciliation required, do
+not retry silently"). All three leaked subvolumes (two from the checkout drill's probe, one from the
+re-confirmation run against the pre-existing drill) were deleted via `sudo btrfs subvolume delete`;
+their now-empty parent directories removed. The provisioned `/usr/local/bin/runsc`, `/opt/myelin/
+runsc-root`, and `/opt/myelin/userns-leases` are left in place (harmless, reusable by a future session
+that does grant `/usr/bin/btrfs` the capability, or that runs the drills inside the already-documented
+`myelin-runner` systemd context instead). Two userns-lease slots are now permanently quarantined in
+`/opt/myelin/userns-leases` from these probe runs — expected, harmless (the allocator simply issues
+higher-numbered slots going forward), not touched further.
+
+Full `myelin-ci-sandbox` suite reconfirmed green afterward (459 passed) with no lingering effects from
+the provisioning/cleanup. **Now open, for whoever picks up real live-drill execution:** either grant
+`/usr/bin/btrfs` `cap_sys_admin` system-wide (an explicit, standalone decision — not bundled into a
+future feature commit), or run the drills inside the `myelin-runner` systemd service context that
+already carries `AmbientCapabilities=CAP_SYS_ADMIN` per `scripts/install-ci-runner-host.sh`.
