@@ -1467,3 +1467,126 @@ own `workspace_manager`/`user_namespace_allocator` fields and the deferred
 own genuine strict-path live drill per the operational debt above). Neither `EphemeralDisk` nor
 `ExplicitUserNamespace` is constructed anywhere outside test/drill code yet; `runner_bind.rs` remains
 untouched.
+
+## 2026-07-27 — CT-007 slice 3 landed: `Enabled` workspace/userns lifecycle wired into `launch_with` (Sol, pieces 7a–7c)
+
+Slice 3 of the agreed 4-slice `workspace_storage.rs` → `gvisor.rs` integration (both prior entries,
+above) is complete, split into three committed pieces:
+
+- **Piece 7a** (`aa339e7f`): `container_id` generation and the `runsc_root` identity revalidation
+  moved UP into `launch_with` itself (previously buried inside the run closure), since the `Enabled`
+  path needs both values before it can durably bind a lease — ahead of any actual binding logic.
+- **Piece 7b** (`6678031b`): checked runtime finalization — `RuntimeQuiescenceEvidence`/
+  `RuntimeFinalization`/`finalize_runtime` replace the old best-effort `runsc delete`/`cgroup.cleanup()`
+  pair with a VERIFIED teardown (confirmed container delete, confirmed cgroup quiescence, confirmed
+  namespace identity unchanged) whose failure now changes the disposition `launch_with` sees, instead
+  of being silently swallowed. Fixed a real pre-existing leak in the same pass: a bundle directory
+  from a successful run that was later converted to a failure (teardown found an issue) was never
+  removed. Still Rootless-only — `WorkspaceIntegration::Enabled` remained unconsumed.
+- **Piece 7c** (`726e7e6a`, this entry's main subject): `launch_with` now fully consumes `Enabled` —
+  health checks before `reserve`, capacity+lease+workspace acquisition, a durable lease `bind()`
+  immediately after cgroup creation (and ONLY there — never before, never followed by
+  `run_and_capture` on a bind failure), evidence-validated workspace deletion before lease release on
+  clean finalization, and conservative abandonment of BOTH resources on the structurally-impossible
+  post-bind outer failure. `GvisorWorkspaceConfig`/`GvisorBackendInitError`/`GvisorBackend::try_new`
+  are `pub` as of this piece — the first commit where a caller of the public `gvisor` module can
+  actually construct and run the `Enabled` path.
+
+**Key new types/functions (piece 7c, `gvisor.rs`):** `LeaseBindState` (`Allocated`/
+`Bound{container_id, runsc_root_identity, cgroup_identity}`/`Unreleasable`) — `launch_with`'s own
+durable-bind-progress memory, since the actual `bind()` call happens one frame down inside
+`run_production_container_streaming`. `EnabledLaunchContext` (owns `ManagedWorkspace` +
+`UserNamespaceLease` + `bind_state`) and `RuntimeBinding`/`RuntimePreparation` (validates the OCI
+layout agrees with the prepared mode via `require_oci_layout_matches_prepared_mode` before any
+downstream code can act on it). `bind_enabled_lease_given` and `bind_then_continue` — the bind
+classification and bind-then-capture composition, both deliberately decoupled from
+`EnabledLaunchContext`/`RuntimePreparation` (taking a bare `&mut UserNamespaceLease`/
+`&mut LeaseBindState` instead) specifically so they are unit-testable against a real, cheap lease
+with NO privileged Btrfs object required. `classify_workspace_deletion` /
+`delete_workspace_then_release_lease_if_absent` / `cleanup_pre_bind_failure` /
+`settle_enabled_workspace_and_lease` implement Sol's full pre-bind/post-finalize disposition matrix
+(capacity refusal releases nothing else; recoverable provisioning failure releases the lease;
+`Storage(UnrecoverableLeak)` quarantines it; `DeleteWorkspaceError::InternalInvariantViolated` proves
+disk absence and still releases the lease while surfacing the bookkeeping error; a `Storage`/sync
+failure proves nothing and retains the lease). `augment_run_failure_message` /
+`augment_settled_result_with_enabled_cleanup_failure` keep workspace/lease cleanup failures a
+SEPARATE safety domain from `RuntimeTeardownError` (never fabricating a fake teardown issue just to
+reuse its plumbing) while still compounding into the primary result — a clean success becomes
+`Executed` with its measured usage; an existing failure keeps its exact phase/usage and gains the
+diagnostic. `discard_container_run(run, skip_path_kill)` factored out of
+`discard_container_run_after_teardown_failure` so the enabled-cleanup discard path has a real,
+non-fabricated entry point. `UserNamespaceQuiescenceProof::from_runtime_evidence` (`user_namespace.rs`)
+is the first production constructor for this type — takes the nonce directly from the lease (never
+caller-suppliable) and refuses `Rootless` evidence.
+
+**Design/review process:** design discussed with Sol before implementation (locked: bind immediately
+after cgroup creation with no `SandboxCommand` callback; delete-before-release ordering; workspace
+cleanup as a separate safety domain; one commit for the whole activation, never a half-wired
+intermediate state). Piece 7c itself then went through 4 adversarial rounds:
+
+- **Round 1 (4 blockers):** pre-permit cleanup failures were silently discarded/replaced instead of
+  compounded (fixed via `dispose_run_failure`/`augment_run_failure_message` reuse everywhere);
+  `Bound` and `Unreleasable` were incorrectly handled identically in `cleanup_pre_bind_failure` (split
+  into three arms, `Bound` now ALWAYS abandons both and ALWAYS surfaces an invariant-violation
+  diagnostic); workspace cleanup was folded into `RuntimeTeardownError` (a domain conflation —
+  extracted into the generic `augment_run_failure_message`/`augment_settled_result_with_enabled_cleanup_failure`
+  pair instead); the `Enabled` constructor remained `pub(crate)` with stale "not yet consumed"
+  comments despite this being the activation commit (promoted to `pub`).
+- **Round 2 (2 code blockers + 2 coverage gaps):** the acquisition-failure Err arm still lost its
+  original error to a bare `?` on `release_unused` (fixed via `dispose_run_failure` reuse); the
+  Enabled-cleanup discard path fabricated an invalid empty `RuntimeTeardownError` just to reuse
+  `discard_container_run_after_teardown_failure`'s signature (fixed by extracting
+  `discard_container_run` as its own real entry point); no test proved a bind failure actually
+  prevents the capture continuation (fixed via the new `bind_then_continue` seam + 4 tests using a
+  bare counting closure); and — flagged as a hard blocker for THIS activation commit specifically,
+  since `try_new` is now `pub` — no test exercised the real `GvisorBackend::try_new(Enabled)` +
+  `.launch()` path at all.
+- **Round 3 (1 blocker):** the new live drill's own `leases_dir` was self-generated under
+  `std::env::temp_dir()`, which the STRICT production `UserNamespaceAllocator::try_new` can NEVER
+  accept (it requires a pre-provisioned, euid-owned, mode-0700-or-stricter leaf under a
+  non-writable-by-us ancestor chain) — making the drill catch-and-skip a GUARANTEED refusal on every
+  host, an unconditional skip that proved nothing. Fixed via a `MYELIN_USERNS_DRILL_LEASES_DIR` env
+  var: the drill now skips ONLY when that's unset (it has no business fabricating the directory
+  itself — that's a real operator install step), and once set, requires `try_new(Enabled)` to
+  succeed outright (no more catching arbitrary constructor errors) — reaching that point asserts a
+  correctly-provisioned host, so any further failure is a genuine regression. Also fixed a stale doc
+  comment on `cleanup_pre_bind_failure` that still described the pre-round-1 Bound-treated-like-
+  Unreleasable behavior.
+- **Round 4: cleared to commit**, no remaining blockers.
+
+**Verification, final round:** `cargo build`/`cargo clippy --all-targets -D warnings` clean across
+no-features / `--features integration` / `--features integration,test-support`; `rustfmt --check`
+clean; full `myelin-ci-sandbox` lib suite: 357 tests pass (124 in the `gvisor` module alone, up from
+99 at the end of piece 7b); `gvisor_prod_exec_test` 6/6, `escape_drill_gvisor_test` 1/1, and
+`escape_prod_path_test`'s gvisor half all green; `cargo build --workspace` + `cargo clippy --workspace
+--all-targets -D warnings` clean; `myelin-lints` `lint-gate` clean (771 files, 0 violations); `runsc
+list` shows no leaked containers, host disk healthy (771G free of 1.9T). `git_wire_prod_exec_test`
+still shows only the SAME pre-existing, already-tracked "runsc stdin pipe unavailable" flake (task
+#33, confirmed unrelated across every check this slice). One NEW unrelated finding this slice:
+`escape_prod_path_test::firecracker_production_launch_contains_the_corpus_non_root` fails on this
+host — confirmed unrelated to this slice (no Firecracker code touched), an environment gap worth its
+own investigation, not chased here.
+
+**Operational debt carried forward (by explicit agreement with Sol, mirroring slices 1/2's own
+accepted gaps):** this development host lacks `CAP_SYS_ADMIN`, so every test that needs a REAL,
+privileged `ManagedWorkspace` (`create_workspace`, needing `btrfs qgroup limit`) skips gracefully here
+— the full acquire/bind/settle state machine against a genuinely privileged host has never run on
+this machine; only the deterministic `_given`/decoupled seams (`bind_enabled_lease_given`,
+`bind_then_continue`, `classify_workspace_deletion`, `delete_workspace_then_release_lease_if_absent`
+with an injected `delete_workspace` operation) are proven to run for real here. Separately, the new
+`explicit_user_namespace_boots_through_the_real_enabled_backend_and_launch` live drill (through the
+real `GvisorBackend::try_new(Enabled)` + `.launch()`) is genuinely runnable — the code compiles and
+type-checks against the real production signatures, and its skip condition is now narrow and correct
+— but it has NOT actually been exercised to a real pass anywhere yet: this session has neither root
+to provision the `MYELIN_USERNS_DRILL_LEASES_DIR` fixture the strict allocator constructor requires,
+nor `CAP_SYS_ADMIN` for the workspace half. **Before slice 4 can claim the `Enabled` path is
+live-proven, someone with root on a correctly provisioned host must actually run this drill to a real
+pass** — this is the same class of gap slice 2 named for its own strict-path drill, now extended to
+the fully-wired activation path.
+
+**Still open:** slice 4 (production activation + drills — enabling `EphemeralDisk`/
+`ExplicitUserNamespace` for real traffic, the genuine live-proof run named above, and the slice-1/2
+leaked-Btrfs-subvolume + strict-runsc-path drills those slices deferred). `runner_bind.rs` remains
+untouched. The pre-existing `git_ref_updated_provider_consumer_wire_shape_round_trips`/git-wire
+stdin-pipe flakes (tasks #33) and the newly-noted Firecracker corpus-launch failure remain
+unaddressed, tracked separately from this CI track's own scope.
