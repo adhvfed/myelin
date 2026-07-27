@@ -117,6 +117,20 @@ const PROJECT_ID: &str = "44444444-4444-8444-8444-444444444444";
 const PRIMARY_JOB_ID: &str = "33333333-3333-8333-8333-333333333333";
 const REFUSED_JOB_ID: &str = "66666666-6666-8666-8666-666666666666";
 const CRASH_JOB_ID: &str = "aaaaaaaa-aaaa-8aaa-aaaa-aaaaaaaaaaaa";
+const REPO_REF: &str = "myelin://manifest-live/git/repo/core";
+const COMMIT_OID: &str = "deadbeef00deadbeef00deadbeef00deadbeef00";
+
+fn checkout_scope() -> myelin_ci_sandbox::CheckoutAuthorizationScope {
+    myelin_ci_sandbox::derive_checkout_authorization_scope(
+        JobKind::Ci,
+        &WorkspaceSpec {
+            repo_ref: Some(REPO_REF.into()),
+            commit: Some(COMMIT_OID.into()),
+        },
+    )
+    .unwrap()
+    .expect("a real repo_ref + commit pair must derive Some(scope)")
+}
 
 fn reserve_handle(job_id: &str, digest_byte: char) -> String {
     format!(
@@ -149,11 +163,12 @@ fn authority() -> CiJobRuntimeAuthorityRequest {
             pids_max: 128,
             timeout_secs: 600,
         },
+        checkout: Some(checkout_scope()),
     }
 }
 
 fn manifest() -> CiDriveManifestV1 {
-    let repo_ref = "myelin://manifest-live/git/repo/core".to_string();
+    let repo_ref = REPO_REF.to_string();
     let authority = authority();
     CiDriveManifestV1 {
         schema_version: 1,
@@ -172,7 +187,7 @@ fn manifest() -> CiDriveManifestV1 {
         workflow_code_hash: authority.workflow_code_hash.clone(),
         authority_policy_revision: authority.policy_revision.clone(),
         repo_ref: repo_ref.clone(),
-        commit_oid: "deadbeef".into(),
+        commit_oid: COMMIT_OID.into(),
         run_ref: "myelin://manifest-live/ci/run/22222222-2222-8222-8222-222222222222".into(),
         started_at: "2026-07-21T12:34:56.000000Z".into(),
         trust_tier: CiManifestTrustTierV1::Trusted,
@@ -202,7 +217,7 @@ fn manifest() -> CiDriveManifestV1 {
                 limits: authority.limits.clone(),
                 workspace: CiManifestWorkspaceV1 {
                     repo_ref: repo_ref.clone(),
-                    commit_oid: "deadbeef".into(),
+                    commit_oid: COMMIT_OID.into(),
                     read_only_root: true,
                     tmpfs_scratch: true,
                 },
@@ -231,7 +246,7 @@ fn manifest() -> CiDriveManifestV1 {
                 limits: authority.limits.clone(),
                 workspace: CiManifestWorkspaceV1 {
                     repo_ref: repo_ref.clone(),
-                    commit_oid: "deadbeef".into(),
+                    commit_oid: COMMIT_OID.into(),
                     read_only_root: true,
                     tmpfs_scratch: true,
                 },
@@ -260,7 +275,7 @@ fn manifest() -> CiDriveManifestV1 {
                 limits: authority.limits,
                 workspace: CiManifestWorkspaceV1 {
                     repo_ref,
-                    commit_oid: "deadbeef".into(),
+                    commit_oid: COMMIT_OID.into(),
                     read_only_root: true,
                     tmpfs_scratch: true,
                 },

@@ -10,18 +10,21 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use myelin_ci_sandbox::RunTokenCredential;
+use myelin_ci_sandbox::{derive_checkout_authorization_scope, JobKind, RunTokenCredential};
 use myelin_storage::{with_tenant_tx_error, PgError};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::PgPool;
 
-use crate::ci_drive_manifest::{CiDriveManifestStore, CiDriveManifestV1, CiManifestTrustTierV1};
+use crate::ci_drive_manifest::{
+    CiDriveManifestStore, CiDriveManifestV1, CiManifestTrustTierV1, CiManifestWorkspaceV1,
+};
 use crate::ci_launch_authority::{CiJobRuntimeAuthorityRequest, ManifestBoundCiJobTokenAuthority};
 use crate::ci_manifest_job_runner::{
     CiJobTokenIssueError, CiJobTokenIssuer, CiJobTokenRequest, MAX_CI_JOB_TOKEN_TTL_SECS,
 };
 use crate::ci_run_store::{CiRunRecord, CiRunStore};
 use crate::job_queue_store::{CiJobQueueStore, LockedJobClaim};
+use crate::job_spec_store::{CiJobSpecStore, DurableCiJobLaunchTemplate};
 
 /// The narrow Identity-facing mint seam. Implementations receive only server-reconstructed durable
 /// authority plus the exact live claim. They must be exact-retry stable while the deterministic
@@ -81,6 +84,7 @@ impl CiJobTokenIssuer for LockedManifestCiJobTokenIssuer {
                 Region(region.clone()),
             )
             .map_err(|_| refused("claim scope is invalid"))?;
+            let job_spec_store = CiJobSpecStore::with_pg(self.pool.clone());
             let credential_minter = self.credential_minter.clone();
 
             with_tenant_tx_error(&self.pool, &tenant, &region, move |connection| {
@@ -117,7 +121,22 @@ impl CiJobTokenIssuer for LockedManifestCiJobTokenIssuer {
                         .await
                         .map_err(|_| refused("immutable CI manifest authority is unavailable"))?
                         .ok_or_else(|| refused("immutable CI manifest authority is absent"))?;
-                    let authority = authority_from_durable_claim(&request, &run, &manifest)?;
+                    // CT-007 slice 5b.3-2b: load the durable `ci_job_spec` row in this SAME locked
+                    // tx and cross-check its `workspace` against what the manifest granted this job
+                    // — closing the gap where nothing previously verified that the `JobSpec` a
+                    // launch will actually execute agrees with what was authorized.
+                    let launch_template = job_spec_store
+                        .get_launch_template_on_conn(
+                            connection,
+                            &request.tenant_id,
+                            &request.job_id,
+                        )
+                        .await
+                        .map_err(|_| {
+                            refused("durable ci_job_spec launch template is unavailable")
+                        })?;
+                    let authority =
+                        authority_from_durable_claim(&request, &run, &manifest, &launch_template)?;
                     if locked_claim.stage.as_deref() != Some(authority.stage.as_str())
                         || locked_claim.trust_tier != authority.trust_tier
                     {
@@ -167,6 +186,7 @@ fn authority_from_durable_claim(
     claim: &CiJobTokenRequest,
     run: &CiRunRecord,
     manifest: &CiDriveManifestV1,
+    launch_template: &DurableCiJobLaunchTemplate,
 ) -> Result<CiJobRuntimeAuthorityRequest, CiJobTokenIssueError> {
     manifest
         .validate()
@@ -196,6 +216,23 @@ fn authority_from_durable_claim(
     if job.token_authority_handle != claim.token_authority_handle {
         return Err(refused("claimed token authority differs from the manifest"));
     }
+    // CT-007 slice 5b.3-2b, Sol's review: the durable `ci_job_spec` row carries its OWN
+    // authority-identity fields (`ci_run_id`, `token_authority_handle`) alongside the dispatched
+    // `spec` -- verify BOTH against the same run/manifest/claim identity this function already
+    // locked, not just the spec's workspace. A row whose wrapper identity diverged from its own
+    // spec (or from the run/claim/manifest already verified above) is refused before it can ever
+    // reach the credential minter.
+    if launch_template.ci_run_id != run.run_id
+        || launch_template.token_authority_handle != job.token_authority_handle
+        || launch_template.spec.idem_token.0 != claim.idem_token
+    {
+        return Err(refused(
+            "durable ci_job_spec launch template identity differs from the locked claim/run/manifest",
+        ));
+    }
+    let checkout = checkout_scope_for_manifest_job(&job.workspace)?;
+    verify_checkout_scope_tenant(&checkout, &run.tenant_id)?;
+    verify_dispatched_spec_matches_granted_workspace(&launch_template.spec, &job.workspace)?;
     let snapshot = myelin_refs::parse_scoped(&manifest.source_snapshot_ref)
         .map_err(|_| refused("manifest source snapshot authority is invalid"))?;
     let source_snapshot_digest = snapshot
@@ -219,6 +256,7 @@ fn authority_from_durable_claim(
         workflow_code_hash: manifest.workflow_code_hash.clone(),
         policy_revision: manifest.authority_policy_revision.clone(),
         limits: job.limits.clone(),
+        checkout,
     };
     if !ManifestBoundCiJobTokenAuthority::verifies(&authority, &claim.token_authority_handle) {
         return Err(refused(
@@ -226,6 +264,70 @@ fn authority_from_durable_claim(
         ));
     }
     Ok(authority)
+}
+
+/// CT-007 slice 5b.3-2b: derive the checkout scope the manifest GRANTED this job, via the sandbox's
+/// own [`derive_checkout_authorization_scope`] facade only (never hand-parsed here) — the exact
+/// same derivation `checkout_scope_for_run` used at materialize time, so a claim-time digest
+/// recomputation can only ever agree or disagree with the materialize-time one for a genuine reason
+/// (a real divergence in the underlying repo_ref/commit_oid), never because the two sites parse
+/// differently.
+fn checkout_scope_for_manifest_job(
+    granted_workspace: &CiManifestWorkspaceV1,
+) -> Result<Option<myelin_ci_sandbox::CheckoutAuthorizationScope>, CiJobTokenIssueError> {
+    let workspace = myelin_ci_sandbox::WorkspaceSpec {
+        repo_ref: Some(granted_workspace.repo_ref.clone()),
+        commit: Some(granted_workspace.commit_oid.clone()),
+    };
+    derive_checkout_authorization_scope(JobKind::Ci, &workspace)
+        .map_err(|_| refused("manifest-granted checkout target is invalid"))
+}
+
+/// CT-007 slice 5b.3-2b: refuse a checkout scope whose repo-ref ArtifactRef encodes a DIFFERENT
+/// tenant than the durable `ci_run`'s own tenant. This is DEFENSE IN DEPTH, not an independently
+/// reachable authorization gap (Sol's correction of an earlier, inaccurate doc claim here):
+/// `CiDriveManifestV1::validate`'s `validate_canonical_ref("repo_ref", ..., &self.tenant_id, "git",
+/// "repo")` already requires `manifest.repo_ref`'s OWN embedded tenant to equal `manifest.tenant_id`,
+/// and `authority_from_durable_claim` separately requires `manifest.tenant_id == run.tenant_id` — so
+/// for any manifest that already passes `validate()`, this branch can never actually fire; a
+/// cross-tenant repo_ref is refused earlier, by `validate()` itself. Kept anyway as an explicit,
+/// directly-testable second check on the exact property this slice cares about (never trusting the
+/// checkout scope's tenant without comparison), so a future change that weakens or removes the
+/// `validate()` guarantee does not silently reopen this gap unnoticed.
+fn verify_checkout_scope_tenant(
+    checkout: &Option<myelin_ci_sandbox::CheckoutAuthorizationScope>,
+    run_tenant_id: &str,
+) -> Result<(), CiJobTokenIssueError> {
+    if let Some(scope) = checkout {
+        if scope.tenant().0 != run_tenant_id {
+            return Err(refused(
+                "checkout scope tenant differs from the durable CI run tenant",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// CT-007 slice 5b.3-2b: verify the durable `ci_job_spec` row's `workspace` — what a launch will
+/// ACTUALLY execute — is byte-identical to what the manifest GRANTED this job. Before this slice,
+/// nothing checked this; `ci_manifest_job_runner.rs` copies the manifest's `workspace` verbatim when
+/// it persists the dispatch, so this should always hold in the happy path, but a claim-time check
+/// closes the gap for any future write path (bug or otherwise) that could let the two diverge.
+fn verify_dispatched_spec_matches_granted_workspace(
+    dispatched_spec: &myelin_ci_sandbox::JobSpecTemplate,
+    granted_workspace: &CiManifestWorkspaceV1,
+) -> Result<(), CiJobTokenIssueError> {
+    if dispatched_spec.kind != JobKind::Ci
+        || dispatched_spec.workspace.repo_ref.as_deref()
+            != Some(granted_workspace.repo_ref.as_str())
+        || dispatched_spec.workspace.commit.as_deref()
+            != Some(granted_workspace.commit_oid.as_str())
+    {
+        return Err(refused(
+            "dispatched ci_job_spec workspace differs from the manifest-granted workspace",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_minted_credential(
@@ -275,6 +377,71 @@ mod tests {
     const PIPELINE_ID: &str = "44444444-4444-4444-4444-444444444444";
     const JOB_ID: &str = "55555555-5555-5555-5555-555555555555";
 
+    /// The fixed checkout target `run()`/`manifest_and_claim()` always grant.
+    fn default_granted_workspace() -> CiManifestWorkspaceV1 {
+        let run = run();
+        CiManifestWorkspaceV1 {
+            repo_ref: run.repo_ref.unwrap(),
+            commit_oid: run.commit_oid.unwrap(),
+            read_only_root: true,
+            tmpfs_scratch: true,
+        }
+    }
+
+    /// The durable `ci_job_spec` row's complete wrapper — spec plus the two authority-identity
+    /// fields (`ci_run_id`, `token_authority_handle`) `authority_from_durable_claim` now ALSO
+    /// verifies (Sol's review) — for a `claim` whose `token_authority_handle`/`ci_run_id` this
+    /// template must agree with to pass.
+    fn launch_template_for(
+        claim: &CiJobTokenRequest,
+        granted_workspace: &CiManifestWorkspaceV1,
+    ) -> DurableCiJobLaunchTemplate {
+        DurableCiJobLaunchTemplate {
+            spec: dispatched_spec_for(granted_workspace),
+            ci_run_id: claim.ci_run_id.clone(),
+            token_authority_handle: claim.token_authority_handle.clone(),
+        }
+    }
+
+    fn default_launch_template(claim: &CiJobTokenRequest) -> DurableCiJobLaunchTemplate {
+        launch_template_for(claim, &default_granted_workspace())
+    }
+
+    /// A minimal, valid [`myelin_ci_sandbox::JobSpecTemplate`] whose `workspace` matches
+    /// `granted_workspace` exactly — the durable `ci_job_spec` row's dispatched spec, standing in
+    /// for what `ci_manifest_job_runner.rs` actually persists at dispatch time.
+    fn dispatched_spec_for(
+        granted_workspace: &CiManifestWorkspaceV1,
+    ) -> myelin_ci_sandbox::JobSpecTemplate {
+        myelin_ci_sandbox::JobSpecTemplate {
+            kind: JobKind::Ci,
+            image: myelin_ci_sandbox::ImageRef {
+                reference: format!("registry.example/runner@sha256:{}", "c".repeat(64)),
+            },
+            command: vec!["true".into()],
+            env: Vec::new(),
+            secret_refs: Vec::new(),
+            egress: myelin_ci_sandbox::EgressPolicy::default(),
+            limits: myelin_ci_sandbox::ResourceLimits {
+                cpu_millis: 1_000,
+                mem_bytes: 256 * 1024 * 1024,
+                disk_bytes: 1024 * 1024 * 1024,
+                tmpfs_bytes: 1024 * 1024 * 1024,
+                pids_max: 128,
+                timeout_secs: 600,
+            },
+            workspace: myelin_ci_sandbox::WorkspaceSpec {
+                repo_ref: Some(granted_workspace.repo_ref.clone()),
+                commit: Some(granted_workspace.commit_oid.clone()),
+            },
+            trust_tier: myelin_ci_sandbox::TrustTier::Trusted,
+            meter_to: myelin_ci_sandbox::MeterTarget {
+                reserve_id: "reserve:test".into(),
+            },
+            idem_token: myelin_ci_sandbox::IdemToken("idem:test".into()),
+        }
+    }
+
     fn limits() -> CiManifestLimitsV1 {
         CiManifestLimitsV1 {
             cpu_millis: 1_000,
@@ -294,7 +461,7 @@ mod tests {
             pipeline_id: PIPELINE_ID.into(),
             wf_run_id: WF_RUN_ID.into(),
             repo_ref: Some("myelin://acme/git/repo/myelin".into()),
-            commit_oid: Some("0123456789abcdef".into()),
+            commit_oid: Some("0123456789abcdef0123456789abcdef01234567".into()),
             cause_event_id: None,
             cause_depth: 0,
             caused_by: None,
@@ -311,6 +478,13 @@ mod tests {
     fn manifest_and_claim() -> (CiDriveManifestV1, CiJobTokenRequest) {
         let run = run();
         let snapshot_digest = format!("blake3:{}", "a".repeat(64));
+        let granted_workspace = CiManifestWorkspaceV1 {
+            repo_ref: run.repo_ref.clone().unwrap(),
+            commit_oid: run.commit_oid.clone().unwrap(),
+            read_only_root: true,
+            tmpfs_scratch: true,
+        };
+        let checkout = checkout_scope_for_manifest_job(&granted_workspace).unwrap();
         let authority = CiJobRuntimeAuthorityRequest {
             tenant_id: run.tenant_id.clone(),
             region: run.region.clone(),
@@ -327,6 +501,7 @@ mod tests {
             workflow_code_hash: format!("blake3:{}", "d".repeat(64)),
             policy_revision: "linux-small-v1:1".into(),
             limits: limits(),
+            checkout,
         };
         let token_authority_handle = ManifestBoundCiJobTokenAuthority::handle_for(&authority);
         let manifest = CiDriveManifestV1 {
@@ -367,8 +542,8 @@ mod tests {
                 egress_allow: Vec::new(),
                 limits: limits(),
                 workspace: CiManifestWorkspaceV1 {
-                    repo_ref: run.repo_ref.clone().unwrap(),
-                    commit_oid: run.commit_oid.clone().unwrap(),
+                    repo_ref: granted_workspace.repo_ref.clone(),
+                    commit_oid: granted_workspace.commit_oid.clone(),
                     read_only_root: true,
                     tmpfs_scratch: true,
                 },
@@ -419,7 +594,9 @@ mod tests {
     fn reconstructs_and_verifies_the_complete_manifest_bound_authority() {
         let run = run();
         let (manifest, claim) = manifest_and_claim();
-        let authority = authority_from_durable_claim(&claim, &run, &manifest).unwrap();
+        let authority =
+            authority_from_durable_claim(&claim, &run, &manifest, &default_launch_template(&claim))
+                .unwrap();
         assert_eq!(authority.project_id, PROJECT_ID);
         assert_eq!(
             authority.source_snapshot_digest,
@@ -436,7 +613,13 @@ mod tests {
         let run = run();
         let (manifest, mut claim) = manifest_and_claim();
         claim.token_authority_handle = format!("ci-token-authority:v1:{}", "0".repeat(64));
-        assert!(authority_from_durable_claim(&claim, &run, &manifest).is_err());
+        assert!(authority_from_durable_claim(
+            &claim,
+            &run,
+            &manifest,
+            &default_launch_template(&claim)
+        )
+        .is_err());
     }
 
     #[test]
@@ -445,19 +628,43 @@ mod tests {
 
         let mut changed_run = run();
         changed_run.project_id = "88888888-8888-8888-8888-888888888888".into();
-        assert!(authority_from_durable_claim(&claim, &changed_run, &manifest).is_err());
+        assert!(authority_from_durable_claim(
+            &claim,
+            &changed_run,
+            &manifest,
+            &default_launch_template(&claim)
+        )
+        .is_err());
 
         let mut changed_trigger = run();
         changed_trigger.trigger_kind = "manual".into();
-        assert!(authority_from_durable_claim(&claim, &changed_trigger, &manifest).is_err());
+        assert!(authority_from_durable_claim(
+            &claim,
+            &changed_trigger,
+            &manifest,
+            &default_launch_template(&claim)
+        )
+        .is_err());
 
         let mut changed_workflow = manifest.clone();
         changed_workflow.workflow_code_hash = format!("blake3:{}", "e".repeat(64));
-        assert!(authority_from_durable_claim(&claim, &run(), &changed_workflow).is_err());
+        assert!(authority_from_durable_claim(
+            &claim,
+            &run(),
+            &changed_workflow,
+            &default_launch_template(&claim)
+        )
+        .is_err());
 
         let mut changed_limits = manifest;
         changed_limits.jobs[0].limits.cpu_millis += 1;
-        assert!(authority_from_durable_claim(&claim, &run(), &changed_limits).is_err());
+        assert!(authority_from_durable_claim(
+            &claim,
+            &run(),
+            &changed_limits,
+            &default_launch_template(&claim)
+        )
+        .is_err());
     }
 
     #[test]
@@ -465,11 +672,23 @@ mod tests {
         let (manifest, claim) = manifest_and_claim();
         let mut terminal = run();
         terminal.state = "succeeded".into();
-        assert!(authority_from_durable_claim(&claim, &terminal, &manifest).is_err());
+        assert!(authority_from_durable_claim(
+            &claim,
+            &terminal,
+            &manifest,
+            &default_launch_template(&claim)
+        )
+        .is_err());
 
         let mut divergent = run();
         divergent.trust_tier = "untrusted_fork".into();
-        assert!(authority_from_durable_claim(&claim, &divergent, &manifest).is_err());
+        assert!(authority_from_durable_claim(
+            &claim,
+            &divergent,
+            &manifest,
+            &default_launch_template(&claim)
+        )
+        .is_err());
     }
 
     #[test]
@@ -477,7 +696,13 @@ mod tests {
         let run = run();
         let (manifest, mut claim) = manifest_and_claim();
         claim.job_id = "77777777-7777-7777-7777-777777777777".into();
-        assert!(authority_from_durable_claim(&claim, &run, &manifest).is_err());
+        assert!(authority_from_durable_claim(
+            &claim,
+            &run,
+            &manifest,
+            &default_launch_template(&claim)
+        )
+        .is_err());
     }
 
     #[test]
@@ -548,5 +773,230 @@ mod tests {
                 "missing claim-lock fragment: {fragment}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // CT-007 slice 5b.3-2b: the checkout-authority blocker-test list Sol required before landing.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn refuses_a_dispatched_spec_whose_repo_was_substituted() {
+        let (manifest, claim) = manifest_and_claim();
+        let mut substituted = default_granted_workspace();
+        substituted.repo_ref = "myelin://acme/git/repo/other".into();
+        let launch_template = launch_template_for(&claim, &substituted);
+        assert!(authority_from_durable_claim(&claim, &run(), &manifest, &launch_template).is_err());
+    }
+
+    #[test]
+    fn refuses_a_dispatched_spec_whose_commit_was_substituted() {
+        let (manifest, claim) = manifest_and_claim();
+        let mut substituted = default_granted_workspace();
+        substituted.commit_oid = "f".repeat(40);
+        let launch_template = launch_template_for(&claim, &substituted);
+        assert!(authority_from_durable_claim(&claim, &run(), &manifest, &launch_template).is_err());
+    }
+
+    #[test]
+    fn verify_checkout_scope_tenant_is_a_pure_defense_in_depth_check() {
+        // A pure-function unit test of `verify_checkout_scope_tenant`'s own contract, called
+        // directly (bypassing the full manifest/claim chain entirely). Per Sol's correction: this
+        // branch is NOT independently reachable through `authority_from_durable_claim` for any
+        // manifest that already passes `CiDriveManifestV1::validate` (see that function's doc) --
+        // this test exists to pin the helper's own behavior, not to prove a reachable gap.
+        let scope = myelin_ci_sandbox::derive_checkout_authorization_scope(
+            JobKind::Ci,
+            &myelin_ci_sandbox::WorkspaceSpec {
+                repo_ref: Some("myelin://globex/git/repo/core".into()),
+                commit: Some("a".repeat(40)),
+            },
+        )
+        .unwrap();
+        assert!(verify_checkout_scope_tenant(&scope, "acme").is_err());
+        assert!(verify_checkout_scope_tenant(&scope, "globex").is_ok());
+        assert!(verify_checkout_scope_tenant(&None, "acme").is_ok());
+    }
+
+    #[test]
+    fn full_chain_refuses_a_cross_tenant_repo_ref_via_manifest_validate() {
+        // The full-chain proof Sol asked for: a manifest whose `repo_ref` (and, to keep `job.workspace`
+        // consistent with it, the job's own workspace) names a DIFFERENT tenant than `manifest.tenant_id`
+        // is refused by `authority_from_durable_claim` -- not via `verify_checkout_scope_tenant` (which
+        // never gets a chance to run), but because `CiDriveManifestV1::validate`'s
+        // `validate_canonical_ref("repo_ref", ..., &self.tenant_id, "git", "repo")` refuses it first.
+        let (mut manifest, claim) = manifest_and_claim();
+        manifest.repo_ref = "myelin://globex/git/repo/core".into();
+        manifest.jobs[0].workspace.repo_ref = manifest.repo_ref.clone();
+        let launch_template = launch_template_for(&claim, &manifest.jobs[0].workspace);
+        assert!(manifest.validate().is_err());
+        assert!(authority_from_durable_claim(&claim, &run(), &manifest, &launch_template).is_err());
+    }
+
+    #[test]
+    fn refuses_a_launch_template_whose_idem_token_diverges() {
+        let (manifest, claim) = manifest_and_claim();
+        let mut launch_template = default_launch_template(&claim);
+        launch_template.spec.idem_token = myelin_ci_sandbox::IdemToken("some-other-idem".into());
+        assert!(authority_from_durable_claim(&claim, &run(), &manifest, &launch_template).is_err());
+    }
+
+    #[test]
+    fn refuses_a_launch_template_whose_durable_ci_run_id_diverges() {
+        let (manifest, claim) = manifest_and_claim();
+        let mut launch_template = default_launch_template(&claim);
+        launch_template.ci_run_id = "99999999-9999-9999-9999-999999999999".into();
+        assert!(authority_from_durable_claim(&claim, &run(), &manifest, &launch_template).is_err());
+    }
+
+    #[test]
+    fn refuses_a_launch_template_whose_durable_token_authority_handle_diverges() {
+        let (manifest, claim) = manifest_and_claim();
+        let mut launch_template = default_launch_template(&claim);
+        launch_template.token_authority_handle = "ci-token-authority:v2:tampered".into();
+        assert!(authority_from_durable_claim(&claim, &run(), &manifest, &launch_template).is_err());
+    }
+
+    #[test]
+    fn v1_and_v2_digests_never_collide_for_the_same_request() {
+        let (manifest, claim) = manifest_and_claim();
+        let authority = authority_from_durable_claim(
+            &claim,
+            &run(),
+            &manifest,
+            &default_launch_template(&claim),
+        )
+        .unwrap();
+        let v1 = format!(
+            "ci-token-authority:v1:{}",
+            crate::ci_launch_authority::token_authority_digest(&authority)
+        );
+        let v2 = ManifestBoundCiJobTokenAuthority::handle_for(&authority);
+        assert!(v2.starts_with("ci-token-authority:v2:"));
+        assert_ne!(v1, v2);
+    }
+
+    /// A fully literal, fixed authority request — never built from `run()`/`manifest_and_claim()`,
+    /// so nothing here can silently drift if those shared fixtures change.
+    fn golden_compute_authority() -> CiJobRuntimeAuthorityRequest {
+        CiJobRuntimeAuthorityRequest {
+            tenant_id: "golden-tenant".into(),
+            region: "golden-region".into(),
+            ci_run_id: "10101010-1010-1010-1010-101010101010".into(),
+            wf_run_id: "20202020-2020-2020-2020-202020202020".into(),
+            project_id: "30303030-3030-3030-3030-303030303030".into(),
+            job_id: "40404040-4040-4040-4040-404040404040".into(),
+            stage: "golden-stage".into(),
+            concrete_name: "golden-job".into(),
+            trigger_kind: "push".into(),
+            trust_tier: "trusted".into(),
+            source_snapshot_digest: "0".repeat(64),
+            workflow_definition_version: 42,
+            workflow_code_hash: "1".repeat(64),
+            policy_revision: "linux-small-v1:1".into(),
+            limits: CiManifestLimitsV1 {
+                cpu_millis: 1_000,
+                mem_bytes: 268_435_456,
+                disk_bytes: 1_073_741_824,
+                pids_max: 128,
+                timeout_secs: 600,
+            },
+            checkout: None,
+        }
+    }
+
+    fn golden_checkout_scope() -> myelin_ci_sandbox::CheckoutAuthorizationScope {
+        myelin_ci_sandbox::derive_checkout_authorization_scope(
+            JobKind::Ci,
+            &myelin_ci_sandbox::WorkspaceSpec {
+                repo_ref: Some("myelin://golden-tenant/git/repo/widgets".into()),
+                commit: Some("2".repeat(40)),
+            },
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn golden_checkout_authority() -> CiJobRuntimeAuthorityRequest {
+        CiJobRuntimeAuthorityRequest {
+            checkout: Some(golden_checkout_scope()),
+            ..golden_compute_authority()
+        }
+    }
+
+    /// External golden pin (Sol's review): a self-referential test that computes the expected value
+    /// via the same function it's testing stays green even if the encoding silently drifts. This
+    /// test instead hard-codes the digest's OUTPUT for a fixed, fully literal request as a plain
+    /// string literal, captured once and frozen here — any future change to what
+    /// `token_authority_digest`/`token_authority_digest_v2` hash (field order, domain, framing) will
+    /// change the computed value and fail this assertion, regardless of what the implementation
+    /// itself currently believes is correct.
+    #[test]
+    fn golden_v1_digest_for_a_fixed_compute_request_is_pinned() {
+        let digest =
+            crate::ci_launch_authority::token_authority_digest(&golden_compute_authority());
+        assert_eq!(
+            digest.to_string(),
+            "711d75a4042e7b755def20feda38c19c896cdaee32c5a7c33fe5253ae50eafb0"
+        );
+    }
+
+    #[test]
+    fn golden_v2_digest_for_a_fixed_compute_request_is_pinned() {
+        let handle = ManifestBoundCiJobTokenAuthority::handle_for(&golden_compute_authority());
+        assert_eq!(
+            handle,
+            "ci-token-authority:v2:7075eca6be655f765d28f4acdb51070cd7ac34826fbcc35be7b18214c94829f9"
+        );
+    }
+
+    #[test]
+    fn golden_v2_digest_for_a_fixed_checkout_request_is_pinned() {
+        let handle = ManifestBoundCiJobTokenAuthority::handle_for(&golden_checkout_authority());
+        assert_eq!(
+            handle,
+            "ci-token-authority:v2:aba79c69d035437e665480ce1d08e529d5d51dcf87f4204d071bb9207aa14dea"
+        );
+    }
+
+    #[test]
+    fn a_legacy_v1_handle_still_verifies_for_a_compute_only_request() {
+        let (manifest, claim) = manifest_and_claim();
+        let mut authority = authority_from_durable_claim(
+            &claim,
+            &run(),
+            &manifest,
+            &default_launch_template(&claim),
+        )
+        .unwrap();
+        authority.checkout = None;
+        let legacy_v1_handle = format!(
+            "ci-token-authority:v1:{}",
+            crate::ci_launch_authority::token_authority_digest(&authority)
+        );
+        assert!(ManifestBoundCiJobTokenAuthority::verifies(
+            &authority,
+            &legacy_v1_handle
+        ));
+    }
+
+    #[test]
+    fn a_legacy_v1_handle_is_refused_outright_for_a_checkout_bearing_request() {
+        let (manifest, claim) = manifest_and_claim();
+        let authority = authority_from_durable_claim(
+            &claim,
+            &run(),
+            &manifest,
+            &default_launch_template(&claim),
+        )
+        .unwrap();
+        assert!(authority.checkout.is_some());
+        let legacy_v1_handle = format!(
+            "ci-token-authority:v1:{}",
+            crate::ci_launch_authority::token_authority_digest(&authority)
+        );
+        assert!(!ManifestBoundCiJobTokenAuthority::verifies(
+            &authority,
+            &legacy_v1_handle
+        ));
     }
 }
