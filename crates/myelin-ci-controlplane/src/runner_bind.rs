@@ -54,8 +54,9 @@ use std::time::Duration;
 use myelin_ci_sandbox::asset_registry::{GvisorAssetRegistry, RootfsAssetBinding};
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    resolved_gvisor_rootfs, resolved_gvisor_rust_rootfs, ImageRef, JobSpec, LeaseStore, QueuedJob,
-    RunnerError, RunnerHooks, TrustTier, LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
+    derive_checkout_authorization_scope, resolved_gvisor_rootfs, resolved_gvisor_rust_rootfs,
+    ImageRef, JobKind, JobSpec, LeaseStore, QueuedJob, RunnerError, RunnerHooks, TrustTier,
+    LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_storage::s3blob::S3BlobStore;
 use myelin_tenancy::{Region, TenantId};
@@ -746,7 +747,13 @@ fn durable_spec_resolver_with_issuer(
             claim_expires_at_epoch_secs: leased.claim_expires_at_epoch_secs,
         };
         request.validate().map_err(|e| e.to_string())?;
-        let authorization = ci_job_authorization_context(&request);
+        // CT-007 slice 5b.3-2c: derive the checkout scope from the SAME already-loaded, immutable
+        // `launch.spec.workspace` the claim-time issuer itself locked and validated this row
+        // against (5b.3-2b) -- via the ONE sanctioned facade, so this can never parse differently
+        // than what was actually authorized.
+        let checkout = derive_checkout_authorization_scope(JobKind::Ci, &launch.spec.workspace)
+            .map_err(|e| e.to_string())?;
+        let authorization = ci_job_authorization_context(&request, checkout.as_ref());
         let run_token = bridge(&rt, token_issuer.mint(request)).map_err(|e| e.to_string())?;
         validate_run_token(&run_token, &launch.token_authority_handle).map_err(|e| e.0)?;
         Ok(launch

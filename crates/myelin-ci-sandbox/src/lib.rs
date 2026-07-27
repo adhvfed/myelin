@@ -480,6 +480,13 @@ pub struct CiJobAuthorizationContext {
     pub claim_started_at_epoch_secs: i64,
     pub claim_expires_at_epoch_secs: i64,
     pub required_capabilities: Vec<String>,
+    /// CT-007 slice 5b.3-2c: the checkout target this job's durable claim was minted against, when
+    /// it has one. `required_capabilities`' dynamic `repo:<ref>#pull` entry proves repo-READ
+    /// authority but not the exact COMMIT — a substituted commit from the same repo would still
+    /// carry that same capability, so a launch hook must separately re-derive the checkout scope
+    /// from the in-hand `JobSpec.workspace` and require it to equal this field exactly (Sol's
+    /// review).
+    pub checkout_scope: Option<CheckoutAuthorizationScope>,
 }
 
 impl RunTokenCredential {
@@ -2181,6 +2188,7 @@ mod tests {
             claim_started_at_epoch_secs: 1_785_000_000,
             claim_expires_at_epoch_secs: 1_785_000_030,
             required_capabilities: vec!["job.launch".into()],
+            checkout_scope: None,
         });
         spec.run_token_authorization = Some(expected.clone());
         backend.launch(&spec, &hooks).unwrap();
