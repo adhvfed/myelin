@@ -2384,6 +2384,15 @@ impl UserNamespaceAllocator {
     /// a test process, so the strict-ownership check is skipped) and a leases dir under a
     /// writable-by-us temp directory (so the parent-not-writable check is also skipped — a test
     /// cannot set up a root-owned parent without privilege this session may not have).
+    ///
+    /// Retries a bounded number of times on `AlreadyLocked` (task #75, Sol's root-cause read):
+    /// under `cargo test`'s default parallelism, an unrelated concurrent test's `Command::spawn()`
+    /// can transiently inherit ANOTHER test's directory-lock fd during the fork-to-exec window
+    /// (before `O_CLOEXEC` takes effect at `exec`). A same-test drop-then-immediately-reopen that
+    /// races that window can spuriously see the lock as still held. This is a TEST-ONLY affordance
+    /// — the real, process-lifetime allocator (`try_new`) must keep failing closed on the first
+    /// `AlreadyLocked`, since in production that error means a second real runner process, not a
+    /// transient fork-window artifact.
     #[cfg(test)]
     pub(crate) fn try_new_for_tests(
         leases_dir: PathBuf,
@@ -2392,14 +2401,24 @@ impl UserNamespaceAllocator {
         min_pool_size: u32,
         incident_sink: IncidentSink,
     ) -> Result<Self, UserNamespaceAllocatorError> {
-        Self::try_new_impl(
-            leases_dir,
-            subuid_path,
-            subgid_path,
-            min_pool_size,
-            false,
-            incident_sink,
-        )
+        const MAX_ATTEMPTS: u32 = 20;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::try_new_impl(
+                leases_dir.clone(),
+                subuid_path,
+                subgid_path,
+                min_pool_size,
+                false,
+                incident_sink.clone(),
+            ) {
+                Err(UserNamespaceAllocatorError::AlreadyLocked { .. }) if attempt < MAX_ATTEMPTS => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("loop always returns on its final attempt");
     }
 
     /// Construct the allocator: refuse a privileged (uid/gid 0) runner; parse+validate BOTH
