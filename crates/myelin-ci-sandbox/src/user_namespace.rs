@@ -89,7 +89,7 @@
 //! markers instead of a lifetime directory lock).
 //!
 //! Each outstanding lease is backed by a DURABLE marker file (`slot-<NNNNNNNNNN>.json`,
-//! [`LeaseMarkerV1`], mode `0600`) — written `O_CREAT|O_EXCL|O_NOFOLLOW`, `fsync`'d, then the
+//! [`LeaseMarkerV2`], mode `0600`) — written `O_CREAT|O_EXCL|O_NOFOLLOW`, `fsync`'d, then the
 //! locked directory FD itself `fsync`'d, so a crash between "decided to allocate" and "process
 //! exited" can never lose the record. Boot-time reconciliation NEVER deletes a surviving marker —
 //! a runner process can die while its `runsc`, sentry, or gofer descendant remains alive, so the
@@ -412,6 +412,7 @@ fn runner_instance_id() -> RunnerInstanceId {
 }
 
 const LEASE_MARKER_SCHEMA_V1: u32 = 1;
+const LEASE_MARKER_SCHEMA_V2: u32 = 2;
 
 /// The MINIMAL shape read first out of a marker's raw JSON — deliberately just enough to
 /// dispatch on `schema_version`, and deliberately NEVER `serde_json::Value` (which cannot
@@ -422,8 +423,16 @@ struct SchemaPeek {
     schema_version: u32,
 }
 
-/// The durable, versioned content of one lease marker file. `#[serde(deny_unknown_fields)]` so an
-/// unexpected extra field is treated as corruption rather than silently ignored.
+/// FROZEN legacy shape (CT-007 slice 3) — read-only from this point forward. Every ACTIVE lease
+/// this process ever mints is written as [`LeaseMarkerV2`] (`lease()` never writes this shape
+/// again); this type exists solely so boot reconciliation can still recognize and quarantine a
+/// `schema_version: 1` marker left behind by a PRE-5b.1 binary without misreading it as V2 (or
+/// vice versa) — see [`LeaseMarkerV2`]'s own doc for why a new phase shape required a genuine
+/// version bump rather than growing this type in place (Sol's review, 2026-07-27: reusing
+/// `schema_version: 1` for a 4-variant phase shape would mean an OLDER binary's own 2-variant
+/// `LeasePhaseV1` could encounter a `PreparationBound`/`Prepared` JSON value under a
+/// `schema_version` it believes it fully understands, producing a confusing "corrupt marker"
+/// diagnosis instead of an honest "unrecognized/newer schema" refusal).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LeaseMarkerV1 {
@@ -432,9 +441,40 @@ struct LeaseMarkerV1 {
     runner_instance_id: RunnerInstanceId,
     host_uid: u32,
     host_gid: u32,
-    /// Diagnostic ONLY — never relied on for safety.
     created_at_unix_secs: u64,
     phase: LeasePhaseV1,
+}
+
+/// FROZEN legacy phase shape — see [`LeaseMarkerV1`]'s doc. Never constructed by production code
+/// after this slice; only ever read at boot reconciliation for a marker surviving from before it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum LeasePhaseV1 {
+    Allocated,
+    Bound {
+        container_id: String,
+        runsc_root_identity: (u64, u64),
+        cgroup_identity: (u64, u64),
+    },
+}
+
+/// The durable, versioned content of one lease marker file. `#[serde(deny_unknown_fields)]` so an
+/// unexpected extra field is treated as corruption rather than silently ignored. CT-007 slice 5b.1
+/// bumped this to schema_version 2 (see [`LeaseMarkerV1`]'s doc for why) — `lease()` is the ONE
+/// place that mints a brand new marker, and it always writes THIS shape; every other method in
+/// `impl UserNamespaceLease` therefore only ever reads/rewrites a V2 marker for any lease `this
+/// process itself` issued, never a V1 one (V1 markers are boot-reconciliation-only artifacts from
+/// an older binary, always already quarantined and never touched again by any bind/release call).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeaseMarkerV2 {
+    schema_version: u32,
+    lease_nonce: LeaseNonce,
+    runner_instance_id: RunnerInstanceId,
+    host_uid: u32,
+    host_gid: u32,
+    /// Diagnostic ONLY — never relied on for safety.
+    created_at_unix_secs: u64,
+    phase: LeasePhaseV2,
 }
 
 /// `Allocated`: a slot has been reserved but never associated with any container —
@@ -446,9 +486,38 @@ struct LeaseMarkerV1 {
 /// fields bolted onto one struct, which would let nonsensical partial combinations exist (e.g. a
 /// `container_id` with no cgroup identity). [`UserNamespaceLease::release`] is the only way to
 /// give one of THESE up, and only against a matching quiescence proof.
+///
+/// `Bound` specifically tracks the identity of the FINAL settlement/workload runtime this lease is
+/// billed against — NOT every preparatory runtime that may have used this identity first. A
+/// checkout-bearing job's lease instead visits `PreparationBound` and `Prepared` FIRST (CT-007
+/// slice 5b.1), durably recording that the identity was exposed to a preparation runtime before
+/// the workload ever runs — a crash between the two runs must never be able to erase that fact and
+/// let boot reconciliation mistake the slot for one that was never actually used.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-enum LeasePhaseV1 {
+enum LeasePhaseV2 {
     Allocated,
+    /// Durably associated, via [`UserNamespaceLease::bind_preparation`], with a checkout
+    /// PREPARATION runtime (never the billed workload). [`UserNamespaceLease::confirm_prepared`]
+    /// is the only way to move on from this phase, and only against a matching preparation
+    /// quiescence proof for this EXACT identity.
+    PreparationBound {
+        container_id: String,
+        runsc_root_identity: (u64, u64),
+        cgroup_identity: (u64, u64),
+    },
+    /// The preparation runtime named above was durably proven fully torn down
+    /// (`confirm_prepared` verified a matching quiescence proof) before this identity is ever
+    /// exposed to the real workload. Retains the preparation runtime's own identity purely as
+    /// crash-recovery/audit evidence of what ran — never re-checked once this phase is reached.
+    /// [`UserNamespaceLease::bind_workload`] is the only forward transition (to `Bound`);
+    /// [`UserNamespaceLease::release_prepared`] is the only way to give this identity up WITHOUT a
+    /// workload ever running (e.g. a failure between checkout and workload launch permit
+    /// acquisition) — never [`UserNamespaceLease::release_unused`], which requires `Allocated`.
+    Prepared {
+        preparation_container_id: String,
+        preparation_runsc_root_identity: (u64, u64),
+        preparation_cgroup_identity: (u64, u64),
+    },
     Bound {
         container_id: String,
         runsc_root_identity: (u64, u64),
@@ -687,6 +756,61 @@ impl std::fmt::Display for UserNamespaceReleaseError {
     }
 }
 
+impl std::error::Error for UserNamespaceReleaseError {}
+
+/// A [`UserNamespaceLease::confirm_prepared`] refusal. Deliberately a DISTINCT type from
+/// [`UserNamespaceReleaseError`] (Sol's review, 2026-07-27) rather than a reused one:
+/// `UserNamespaceReleaseError::ProofMismatch`'s own doc states the lease is consumed by the call
+/// that produced it, which is true for [`UserNamespaceLease::release`] (`self` by value) but false
+/// for `confirm_prepared` (`&mut self` — the lease remains usable, e.g. to retry with a corrected
+/// proof, or to call [`UserNamespaceLease::release_prepared`] later). Reusing the release-side type
+/// would have made that documented consumption claim wrong for half its callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreparationConfirmationError {
+    /// The supplied [`PreparationQuiescenceProof`] was not minted for THIS lease. `confirm_prepared`
+    /// takes `&mut self` — the lease is NOT consumed; the caller may retry with the correct proof.
+    ProofMismatch,
+    /// The durable marker no longer matches this lease's own identity (nonce/host_uid/host_gid) —
+    /// a global-trust failure, POISONS the whole allocator.
+    MarkerMismatch,
+    /// The durable marker genuinely belongs to this lease, but its phase disagrees with the
+    /// supplied proof — either it was never `PreparationBound` at all, or is `PreparationBound` to
+    /// a different runtime identity than the proof claims. An ordinary wrong proof, NOT corruption:
+    /// the marker is left untouched (a preparation runtime this proof doesn't vouch for may still
+    /// be alive), and the caller may retry `confirm_prepared` with the correct proof.
+    ProofDisagreesWithMarker,
+    /// The durable rewrite to `Prepared` itself had an ambiguous outcome (serialize/write/fsync/
+    /// rename failure) — POISONS the whole allocator (the on-disk phase is no longer provably
+    /// `PreparationBound`, but also not provably `Prepared`).
+    Poisoned,
+}
+
+impl std::fmt::Display for PreparationConfirmationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PreparationConfirmationError::ProofMismatch => write!(
+                f,
+                "the supplied preparation quiescence proof was not minted for this lease"
+            ),
+            PreparationConfirmationError::MarkerMismatch => write!(
+                f,
+                "the durable marker no longer matches this lease's own identity"
+            ),
+            PreparationConfirmationError::ProofDisagreesWithMarker => write!(
+                f,
+                "the durable marker belongs to this lease but its phase disagrees with the \
+                 supplied preparation proof"
+            ),
+            PreparationConfirmationError::Poisoned => write!(
+                f,
+                "confirming preparation quiescence had an ambiguous outcome"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PreparationConfirmationError {}
+
 /// Invoked on any critical incident (boot-time quarantine of a surviving marker; an abandoned
 /// lease's `Drop`). Never invoked while any internal lock is held, always wrapped in
 /// `catch_unwind`.
@@ -922,7 +1046,7 @@ fn unlinkat_marker(dir_fd: RawFd, name: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// The maximum bytes this module ever trusts a single marker file to contain — a `LeaseMarkerV1`
+/// The maximum bytes this module ever trusts a single marker file to contain — a `LeaseMarkerV2`
 /// serializes to well under this; anything past it is itself grounds for suspicion, not merely an
 /// oversized read.
 const MAX_MARKER_BYTES: usize = 4096;
@@ -1215,26 +1339,90 @@ impl UserNamespaceQuiescenceProof {
     }
 }
 
-/// Why [`UserNamespaceLease::bind`] failed — the durable `Allocated` → `Bound` transition.
+/// CT-007 slice 5b.1: the checkout-preparation counterpart to [`UserNamespaceQuiescenceProof`] —
+/// bound to the SAME [`LeaseNonce`] and to the specific preparation-runtime identity the lease was
+/// durably [`bound <UserNamespaceLease::bind_preparation>`](UserNamespaceLease::bind_preparation)
+/// to. [`UserNamespaceLease::confirm_prepared`] refuses (`ProofMismatch`) any proof whose nonce
+/// disagrees, and refuses (`ProofDisagreesWithMarker`) any proof whose runtime identity disagrees
+/// with what the durable marker's own `PreparationBound` phase records — deliberately a DISTINCT
+/// type from `UserNamespaceQuiescenceProof`, not a reused/aliased one, so a caller can never pass a
+/// real WORKLOAD quiescence proof to `confirm_prepared` (or vice versa) and have it type-check.
+pub(crate) struct PreparationQuiescenceProof {
+    lease_nonce: LeaseNonce,
+    container_id: String,
+    runsc_root_identity: (u64, u64),
+    cgroup_identity: (u64, u64),
+}
+
+impl PreparationQuiescenceProof {
+    /// CT-007 slice 5b.1: the ONE production constructor — mints a proof directly from a genuine
+    /// [`crate::gvisor::RuntimeQuiescenceEvidence`] for the PREPARATION runtime, taking the nonce
+    /// straight from `lease` for the same reason `UserNamespaceQuiescenceProof::from_runtime_evidence`
+    /// does (a caller-suppliable nonce would let any code mint a proof for any lease it merely holds
+    /// a reference to). Not yet called outside tests — its real production caller (the checkout
+    /// preparation runtime's own finalize path) is slice 5b.2's job, mirroring slice 1's own
+    /// precedent of leaving a not-yet-consumed production seam unwired rather than forced in early.
+    #[allow(dead_code)]
+    pub(crate) fn from_runtime_evidence(
+        lease: &UserNamespaceLease,
+        evidence: &crate::gvisor::RuntimeQuiescenceEvidence,
+    ) -> Result<Self, RuntimeEvidenceError> {
+        let runsc_root_identity = match evidence.namespace() {
+            crate::gvisor::RuntimeNamespaceQuiescence::Rootless => {
+                return Err(RuntimeEvidenceError::RootlessEvidence);
+            }
+            crate::gvisor::RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                runsc_root_identity,
+            } => runsc_root_identity,
+        };
+        Ok(PreparationQuiescenceProof {
+            lease_nonce: lease.lease_nonce,
+            container_id: evidence.container_id().to_string(),
+            runsc_root_identity,
+            cgroup_identity: evidence.cgroup().cgroup_identity(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_for_tests(
+        lease_nonce: LeaseNonce,
+        container_id: String,
+        runsc_root_identity: (u64, u64),
+        cgroup_identity: (u64, u64),
+    ) -> Self {
+        PreparationQuiescenceProof {
+            lease_nonce,
+            container_id,
+            runsc_root_identity,
+            cgroup_identity,
+        }
+    }
+}
+
+/// Why a durable binding transition failed — shared by [`UserNamespaceLease::bind`] (`Allocated`
+/// -> `Bound`), [`UserNamespaceLease::bind_preparation`] (`Allocated` -> `PreparationBound`), and
+/// [`UserNamespaceLease::bind_workload`] (`Prepared` -> `Bound`). Messages below deliberately say
+/// "required source phase" and "target marker," never naming a specific phase on either side,
+/// since both differ per caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserNamespaceBindError {
-    /// The durable marker no longer matches this lease's own identity in the `Allocated` phase
-    /// (already `Bound`, or corrupted, or externally tampered with) — a global-trust failure,
+    /// The durable marker no longer matches this lease's own identity in its required source
+    /// phase (already past it, corrupted, or externally tampered with) — a global-trust failure,
     /// POISONS the whole allocator.
     MarkerMismatch,
-    /// The durable rewrite itself had an ambiguous outcome (serialize/write/fsync/rename failure)
-    /// — POISONS the whole allocator (the on-disk phase is no longer provably `Allocated`, but
-    /// also not provably `Bound`).
+    /// The durable binding rewrite itself had an ambiguous outcome (serialize/write/fsync/rename
+    /// failure) — POISONS the whole allocator (the on-disk phase is no longer provably its
+    /// required source phase, but also not provably its target phase).
     Poisoned,
     /// `container_id` is empty, exceeds [`MAX_CONTAINER_ID_LEN`], or contains a character outside
     /// the safe subset — a caller bug, NOT a global-trust failure. Refused before touching disk at
-    /// all: does NOT poison, and the lease is left exactly as it was (still `Allocated`, still
-    /// usable — the caller may retry `bind` with a corrected id).
+    /// all: does NOT poison, and the lease is left exactly as it was (still in its required source
+    /// phase, still usable — the caller may retry with a corrected id).
     InvalidContainerId,
-    /// The serialized `Bound` marker would exceed [`MAX_MARKER_BYTES`] — writing it would produce
+    /// The serialized target marker would exceed [`MAX_MARKER_BYTES`] — writing it would produce
     /// a marker `read_and_verify_marker`/boot reconciliation can never parse back, permanently
     /// bricking this slot. Refused before any disk write is attempted: does NOT poison, and the
-    /// lease is left exactly as it was (still `Allocated`, still usable).
+    /// lease is left exactly as it was (still in its required source phase, still usable).
     MarkerTooLarge,
 }
 
@@ -1243,20 +1431,19 @@ impl std::fmt::Display for UserNamespaceBindError {
         match self {
             UserNamespaceBindError::MarkerMismatch => write!(
                 f,
-                "the durable marker no longer matches this lease's own identity in the \
-                 Allocated phase"
+                "the durable marker no longer matches this lease's own identity in its \
+                 required source phase"
             ),
-            UserNamespaceBindError::Poisoned => write!(
-                f,
-                "the durable Allocated -> Bound rewrite had an ambiguous outcome"
-            ),
+            UserNamespaceBindError::Poisoned => {
+                write!(f, "the durable binding transition had an ambiguous outcome")
+            }
             UserNamespaceBindError::InvalidContainerId => write!(
                 f,
                 "container_id is empty, too long, or contains a character outside the safe subset"
             ),
             UserNamespaceBindError::MarkerTooLarge => write!(
                 f,
-                "the serialized Bound marker would exceed the maximum marker size"
+                "the serialized target marker would exceed the maximum marker size"
             ),
         }
     }
@@ -1343,14 +1530,14 @@ impl UserNamespaceLease {
         let name = marker_file_name(self.slot);
         let current = read_and_verify_marker(self.shared.dir_fd(), &name)
             .ok()
-            .and_then(|content| serde_json::from_str::<LeaseMarkerV1>(&content).ok())
+            .and_then(|content| serde_json::from_str::<LeaseMarkerV2>(&content).ok())
             .filter(|marker| {
-                marker.schema_version == LEASE_MARKER_SCHEMA_V1
+                marker.schema_version == LEASE_MARKER_SCHEMA_V2
                     && marker.lease_nonce == self.lease_nonce
                     && marker.runner_instance_id == self.runner_instance_id
                     && marker.host_uid == self.host_uid
                     && marker.host_gid == self.host_gid
-                    && marker.phase == LeasePhaseV1::Allocated
+                    && marker.phase == LeasePhaseV2::Allocated
             });
         let Some(marker) = current else {
             self.released = true; // avoid a redundant abandonment incident from Drop on top.
@@ -1361,8 +1548,8 @@ impl UserNamespaceLease {
             ));
             return Err(UserNamespaceBindError::MarkerMismatch);
         };
-        let bound_marker = LeaseMarkerV1 {
-            phase: LeasePhaseV1::Bound {
+        let bound_marker = LeaseMarkerV2 {
+            phase: LeasePhaseV2::Bound {
                 container_id,
                 runsc_root_identity,
                 cgroup_identity,
@@ -1400,6 +1587,355 @@ impl UserNamespaceLease {
         }
     }
 
+    /// CT-007 slice 5b.1: durably transition this lease from `Allocated` to `PreparationBound`,
+    /// associating it with a checkout PREPARATION runtime instance — the counterpart to [`Self::bind`]
+    /// for the preparation phase of a checkout-bearing job. Deliberately a SEPARATE method (not a
+    /// parameterized `bind`) so the already-hardened `bind`/`release`/`release_unused` call sites for
+    /// the ordinary (non-checkout) single-runtime path stay byte-for-byte untouched. Same precondition
+    /// as `bind` (current durable phase must be `Allocated`) and the same refusal/poisoning shape.
+    pub(crate) fn bind_preparation(
+        &mut self,
+        container_id: String,
+        runsc_root_identity: (u64, u64),
+        cgroup_identity: (u64, u64),
+    ) -> Result<(), UserNamespaceBindError> {
+        if !is_valid_container_id(&container_id) {
+            return Err(UserNamespaceBindError::InvalidContainerId);
+        }
+        let name = marker_file_name(self.slot);
+        let current = read_and_verify_marker(self.shared.dir_fd(), &name)
+            .ok()
+            .and_then(|content| serde_json::from_str::<LeaseMarkerV2>(&content).ok())
+            .filter(|marker| {
+                marker.schema_version == LEASE_MARKER_SCHEMA_V2
+                    && marker.lease_nonce == self.lease_nonce
+                    && marker.runner_instance_id == self.runner_instance_id
+                    && marker.host_uid == self.host_uid
+                    && marker.host_gid == self.host_gid
+                    && marker.phase == LeasePhaseV2::Allocated
+            });
+        let Some(marker) = current else {
+            self.released = true;
+            self.shared.poison(format!(
+                "binding slot {} (host_uid={}) to a preparation runtime: the durable marker no \
+                 longer matches this lease's own identity in the Allocated phase — treating as a \
+                 global-trust failure",
+                self.slot, self.host_uid
+            ));
+            return Err(UserNamespaceBindError::MarkerMismatch);
+        };
+        let bound_marker = LeaseMarkerV2 {
+            phase: LeasePhaseV2::PreparationBound {
+                container_id,
+                runsc_root_identity,
+                cgroup_identity,
+            },
+            ..marker
+        };
+        let marker_json = match serde_json::to_string(&bound_marker) {
+            Ok(json) => json,
+            Err(e) => {
+                self.released = true;
+                self.shared.poison(format!(
+                    "binding slot {} (host_uid={}) to a preparation runtime: failed to serialize \
+                     the PreparationBound marker: {e}",
+                    self.slot, self.host_uid
+                ));
+                return Err(UserNamespaceBindError::Poisoned);
+            }
+        };
+        if marker_json.len() > MAX_MARKER_BYTES {
+            return Err(UserNamespaceBindError::MarkerTooLarge);
+        }
+        match rewrite_marker_atomically(self.shared.dir_fd(), &name, marker_json.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.released = true;
+                self.shared.poison(format!(
+                    "binding slot {} (host_uid={}) to a preparation runtime: failed to durably \
+                     rewrite the marker to PreparationBound ({e}) — the on-disk phase is now \
+                     ambiguous",
+                    self.slot, self.host_uid
+                ));
+                Err(UserNamespaceBindError::Poisoned)
+            }
+        }
+    }
+
+    /// CT-007 slice 5b.1: durably transition this lease from `PreparationBound` to `Prepared`,
+    /// verifying `proof` was minted for THIS lease AND for the SAME preparation-runtime identity the
+    /// durable marker's `PreparationBound` phase records — the preparation-phase counterpart to
+    /// [`Self::release`]'s proof verification, except this REWRITES the marker (retaining the
+    /// identity as evidence) instead of unlinking it, since the lease's identity is about to be
+    /// reused by the real workload, not given back to the pool.
+    pub(crate) fn confirm_prepared(
+        &mut self,
+        proof: PreparationQuiescenceProof,
+    ) -> Result<(), PreparationConfirmationError> {
+        if proof.lease_nonce != self.lease_nonce {
+            return Err(PreparationConfirmationError::ProofMismatch);
+        }
+        let name = marker_file_name(self.slot);
+        let marker = read_and_verify_marker(self.shared.dir_fd(), &name)
+            .ok()
+            .and_then(|content| serde_json::from_str::<LeaseMarkerV2>(&content).ok());
+        let base_identity_matches = marker.as_ref().is_some_and(|marker| {
+            marker.schema_version == LEASE_MARKER_SCHEMA_V2
+                && marker.lease_nonce == self.lease_nonce
+                && marker.runner_instance_id == self.runner_instance_id
+                && marker.host_uid == self.host_uid
+                && marker.host_gid == self.host_gid
+        });
+        if !base_identity_matches {
+            self.released = true;
+            self.shared.poison(format!(
+                "confirming preparation quiescence for slot {} (host_uid={}): the durable marker \
+                 no longer matches this lease's own identity (schema/nonce/runner/host_uid/ \
+                 host_gid) — treating as a global-trust failure",
+                self.slot, self.host_uid
+            ));
+            return Err(PreparationConfirmationError::MarkerMismatch);
+        }
+        let Some(marker) = marker else {
+            unreachable!("base_identity_matches is only true when marker is Some");
+        };
+        let phase_matches_proof = marker.phase
+            == LeasePhaseV2::PreparationBound {
+                container_id: proof.container_id.clone(),
+                runsc_root_identity: proof.runsc_root_identity,
+                cgroup_identity: proof.cgroup_identity,
+            };
+        if !phase_matches_proof {
+            // Genuinely belongs to this lease, but was never PreparationBound at all, or is
+            // PreparationBound to a different identity than the proof claims — an ordinary wrong
+            // proof, not corruption. Leave `self.released` false so Drop quarantines only this one
+            // lease (never a global poison) — and, critically, do NOT touch the marker: a
+            // preparation runtime this proof does not vouch for may still be alive.
+            return Err(PreparationConfirmationError::ProofDisagreesWithMarker);
+        }
+        let (
+            preparation_container_id,
+            preparation_runsc_root_identity,
+            preparation_cgroup_identity,
+        ) = match &marker.phase {
+            LeasePhaseV2::PreparationBound {
+                container_id,
+                runsc_root_identity,
+                cgroup_identity,
+            } => (container_id.clone(), *runsc_root_identity, *cgroup_identity),
+            _ => unreachable!("phase_matches_proof only true for PreparationBound"),
+        };
+        let prepared_marker = LeaseMarkerV2 {
+            phase: LeasePhaseV2::Prepared {
+                preparation_container_id,
+                preparation_runsc_root_identity,
+                preparation_cgroup_identity,
+            },
+            ..marker
+        };
+        let marker_json = match serde_json::to_string(&prepared_marker) {
+            Ok(json) => json,
+            Err(e) => {
+                self.released = true;
+                self.shared.poison(format!(
+                    "confirming preparation quiescence for slot {} (host_uid={}): failed to \
+                     serialize the Prepared marker: {e}",
+                    self.slot, self.host_uid
+                ));
+                return Err(PreparationConfirmationError::Poisoned);
+            }
+        };
+        if marker_json.len() > MAX_MARKER_BYTES {
+            self.released = true;
+            self.shared.poison(format!(
+                "confirming preparation quiescence for slot {} (host_uid={}): the serialized \
+                 Prepared marker would exceed the maximum marker size",
+                self.slot, self.host_uid
+            ));
+            return Err(PreparationConfirmationError::Poisoned);
+        }
+        match rewrite_marker_atomically(self.shared.dir_fd(), &name, marker_json.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.released = true;
+                self.shared.poison(format!(
+                    "confirming preparation quiescence for slot {} (host_uid={}): failed to \
+                     durably rewrite the marker to Prepared ({e}) — the on-disk phase is now \
+                     ambiguous",
+                    self.slot, self.host_uid
+                ));
+                Err(PreparationConfirmationError::Poisoned)
+            }
+        }
+    }
+
+    /// CT-007 slice 5b.1: release a lease that reached `Prepared` (a real preparation runtime ran
+    /// and was proven torn down) but whose real workload never launched (e.g. a failure acquiring
+    /// the workload's launch permit) — the `Prepared`-phase counterpart to [`Self::release_unused`].
+    /// Needs no additional quiescence proof (the preparation runtime's teardown was already proven
+    /// by [`Self::confirm_prepared`]), but DOES require the durable marker to STILL be `Prepared`:
+    /// if it is already `Bound`, this is the WRONG release path (use [`Self::release`] with a real
+    /// workload quiescence proof instead), and refuses (`MarkerMismatch`, POISONING the whole
+    /// allocator) rather than silently unlinking a marker whose `Bound` runtime evidence a caller
+    /// might still need. Deliberately distinct from `release_unused`, which requires `Allocated` —
+    /// calling `release_unused` on a `Prepared` lease would (correctly) refuse for the same reason.
+    pub(crate) fn release_prepared(self) -> Result<(), UserNamespaceReleaseError> {
+        self.release_prepared_given(unlinkat_marker)
+    }
+
+    /// The deterministic-failure-testable seam behind [`Self::release_prepared`]: `unlink` is
+    /// exactly [`unlinkat_marker`] in production, or an injected failure in tests — a real
+    /// permission-based `EACCES` is not reliably reproducible across every environment this suite
+    /// might run in (e.g. a process carrying `CAP_DAC_OVERRIDE` bypasses the DAC check entirely),
+    /// so the ambiguous-unlink-outcome disposition is proven via this seam instead.
+    fn release_prepared_given(
+        mut self,
+        unlink: impl FnOnce(RawFd, &str) -> io::Result<()>,
+    ) -> Result<(), UserNamespaceReleaseError> {
+        let name = marker_file_name(self.slot);
+        let marker_matches = read_and_verify_marker(self.shared.dir_fd(), &name)
+            .ok()
+            .and_then(|content| serde_json::from_str::<LeaseMarkerV2>(&content).ok())
+            .map(|marker| {
+                marker.schema_version == LEASE_MARKER_SCHEMA_V2
+                    && marker.lease_nonce == self.lease_nonce
+                    && marker.runner_instance_id == self.runner_instance_id
+                    && marker.host_uid == self.host_uid
+                    && marker.host_gid == self.host_gid
+                    && matches!(marker.phase, LeasePhaseV2::Prepared { .. })
+            })
+            .unwrap_or(false);
+        if !marker_matches {
+            self.released = true;
+            self.shared.poison(format!(
+                "release_prepared on slot {} (host_uid={}): the durable marker is not (or no \
+                 longer) Prepared matching this lease's own identity — either it was already \
+                 Bound (use release() with a real workload quiescence proof instead), never \
+                 reached Prepared at all, or the on-disk state has diverged; treating as a \
+                 global-trust failure",
+                self.slot, self.host_uid
+            ));
+            return Err(UserNamespaceReleaseError::MarkerMismatch);
+        }
+        match unlink(self.shared.dir_fd(), &name) {
+            Ok(()) => match self.shared.fsync_locked_dir() {
+                Ok(()) => {
+                    self.released = true;
+                    let removed = self.shared.lock_state().active_slots.remove(&self.slot);
+                    if !removed {
+                        let reason = format!(
+                            "release_prepared on slot {} (host_uid={}): its marker was durably \
+                             unlinked but active_slots did not contain it — a bookkeeping \
+                             invariant was violated",
+                            self.slot, self.host_uid
+                        );
+                        self.shared.poison(reason.clone());
+                        return Err(UserNamespaceReleaseError::InternalInvariantViolated {
+                            reason,
+                        });
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    self.released = true;
+                    self.shared.poison(format!(
+                        "release_prepared on slot {} (host_uid={}): marker unlinked but syncing \
+                         the leases directory failed ({e}) — the release outcome is ambiguous",
+                        self.slot, self.host_uid
+                    ));
+                    Err(UserNamespaceReleaseError::Poisoned)
+                }
+            },
+            Err(e) => {
+                self.released = true;
+                self.shared.poison(format!(
+                    "release_prepared on slot {} (host_uid={}): failed to unlink its marker ({e}) \
+                     — the release outcome is ambiguous",
+                    self.slot, self.host_uid
+                ));
+                Err(UserNamespaceReleaseError::Poisoned)
+            }
+        }
+    }
+
+    /// CT-007 slice 5b.1: durably transition this lease from `Prepared` to `Bound`, associating it
+    /// with the REAL WORKLOAD runtime instance — the checkout-bearing-job counterpart to
+    /// [`Self::bind`], which instead requires (and is still used for) an `Allocated` current phase.
+    /// Requires the durable marker to STILL be `Prepared` (refuses `MarkerMismatch`, POISONING the
+    /// whole allocator, otherwise) — deliberately does NOT re-check anything about the PREPARATION
+    /// identity recorded in that `Prepared` phase: once preparation is durably proven torn down, only
+    /// the fact that this exact lease reached `Prepared` matters, not which specific preparation
+    /// runtime achieved it. On success, the marker's phase is the SAME `LeasePhaseV2::Bound` the
+    /// ordinary non-checkout `bind()` produces, so every existing `release()`/final-settlement call
+    /// site handles a checkout-bearing job's workload identically, with zero changes.
+    pub(crate) fn bind_workload(
+        &mut self,
+        container_id: String,
+        runsc_root_identity: (u64, u64),
+        cgroup_identity: (u64, u64),
+    ) -> Result<(), UserNamespaceBindError> {
+        if !is_valid_container_id(&container_id) {
+            return Err(UserNamespaceBindError::InvalidContainerId);
+        }
+        let name = marker_file_name(self.slot);
+        let current = read_and_verify_marker(self.shared.dir_fd(), &name)
+            .ok()
+            .and_then(|content| serde_json::from_str::<LeaseMarkerV2>(&content).ok())
+            .filter(|marker| {
+                marker.schema_version == LEASE_MARKER_SCHEMA_V2
+                    && marker.lease_nonce == self.lease_nonce
+                    && marker.runner_instance_id == self.runner_instance_id
+                    && marker.host_uid == self.host_uid
+                    && marker.host_gid == self.host_gid
+                    && matches!(marker.phase, LeasePhaseV2::Prepared { .. })
+            });
+        let Some(marker) = current else {
+            self.released = true;
+            self.shared.poison(format!(
+                "binding slot {} (host_uid={}) to a workload runtime: the durable marker no \
+                 longer matches this lease's own identity in the Prepared phase — treating as a \
+                 global-trust failure",
+                self.slot, self.host_uid
+            ));
+            return Err(UserNamespaceBindError::MarkerMismatch);
+        };
+        let bound_marker = LeaseMarkerV2 {
+            phase: LeasePhaseV2::Bound {
+                container_id,
+                runsc_root_identity,
+                cgroup_identity,
+            },
+            ..marker
+        };
+        let marker_json = match serde_json::to_string(&bound_marker) {
+            Ok(json) => json,
+            Err(e) => {
+                self.released = true;
+                self.shared.poison(format!(
+                    "binding slot {} (host_uid={}) to a workload runtime: failed to serialize the \
+                     Bound marker: {e}",
+                    self.slot, self.host_uid
+                ));
+                return Err(UserNamespaceBindError::Poisoned);
+            }
+        };
+        if marker_json.len() > MAX_MARKER_BYTES {
+            return Err(UserNamespaceBindError::MarkerTooLarge);
+        }
+        match rewrite_marker_atomically(self.shared.dir_fd(), &name, marker_json.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.released = true;
+                self.shared.poison(format!(
+                    "binding slot {} (host_uid={}) to a workload runtime: failed to durably \
+                     rewrite the marker to Bound ({e}) — the on-disk phase is now ambiguous",
+                    self.slot, self.host_uid
+                ));
+                Err(UserNamespaceBindError::Poisoned)
+            }
+        }
+    }
+
     /// CT-007 slice 3: release a lease that was NEVER [`bound <Self::bind>`](Self::bind) to any
     /// runtime — a pre-spawn failure, a refused launch permit, or any other path where this
     /// lease's identity was never actually exposed to a container. Needs NO quiescence proof
@@ -1415,14 +1951,14 @@ impl UserNamespaceLease {
         let name = marker_file_name(self.slot);
         let marker_matches = read_and_verify_marker(self.shared.dir_fd(), &name)
             .ok()
-            .and_then(|content| serde_json::from_str::<LeaseMarkerV1>(&content).ok())
+            .and_then(|content| serde_json::from_str::<LeaseMarkerV2>(&content).ok())
             .map(|marker| {
-                marker.schema_version == LEASE_MARKER_SCHEMA_V1
+                marker.schema_version == LEASE_MARKER_SCHEMA_V2
                     && marker.lease_nonce == self.lease_nonce
                     && marker.runner_instance_id == self.runner_instance_id
                     && marker.host_uid == self.host_uid
                     && marker.host_gid == self.host_gid
-                    && marker.phase == LeasePhaseV1::Allocated
+                    && marker.phase == LeasePhaseV2::Allocated
             })
             .unwrap_or(false);
         if !marker_matches {
@@ -1502,13 +2038,13 @@ impl UserNamespaceLease {
         let name = marker_file_name(self.slot);
         let marker = read_and_verify_marker(self.shared.dir_fd(), &name)
             .ok()
-            .and_then(|content| serde_json::from_str::<LeaseMarkerV1>(&content).ok());
+            .and_then(|content| serde_json::from_str::<LeaseMarkerV2>(&content).ok());
         // Split in two: does the durable marker even BELONG to this lease (base identity — real
         // corruption/tampering if not, a global-trust failure), versus does its PHASE agree with
         // what the proof claims (an ordinary wrong-proof-for-a-valid-lease situation if not, no
         // different in kind from the nonce-mismatch case above — never a global poison).
         let base_identity_matches = marker.as_ref().is_some_and(|marker| {
-            marker.schema_version == LEASE_MARKER_SCHEMA_V1
+            marker.schema_version == LEASE_MARKER_SCHEMA_V2
                 && marker.lease_nonce == self.lease_nonce
                 && marker.runner_instance_id == self.runner_instance_id
                 && marker.host_uid == self.host_uid
@@ -1526,7 +2062,7 @@ impl UserNamespaceLease {
         }
         let phase_matches_proof = marker.as_ref().is_some_and(|marker| {
             marker.phase
-                == LeasePhaseV1::Bound {
+                == LeasePhaseV2::Bound {
                     container_id: proof.container_id.clone(),
                     runsc_root_identity: proof.runsc_root_identity,
                     cgroup_identity: proof.cgroup_identity,
@@ -1597,6 +2133,216 @@ impl Drop for UserNamespaceLease {
     }
 }
 
+/// CT-007 slice 5b.1: this session's own in-memory view of a checkout-bearing job's two-phase
+/// lease lifecycle, kept STRICTLY in lockstep with the durable marker's own phase
+/// (`LeasePhaseV2::PreparationBound`/`Prepared`). This is defense in depth ON TOP OF the durable
+/// checks each `UserNamespaceLease` method already performs — not a replacement for them: even a
+/// caller who forgets this session entirely and calls the lease's own methods directly still gets
+/// the exact same durable-marker safety. What THIS type adds is that a caller cannot reorder or
+/// skip a transition and have it silently no-op or panic somewhere deep inside `UserNamespaceLease`
+/// with no earlier, cheaper signal — calling a transition out of this session's own expected order
+/// is a caller bug (this module's own orchestration code is the only caller), so it panics
+/// immediately, before ever touching the lease or its durable marker.
+///
+/// Slice 5b.1 deliberately does not wire this into `GvisorBackend`/`launch_with` yet (mirroring
+/// slice 1's own precedent: a real production consumer is a LATER slice's job) — `#[allow(dead_code)]`
+/// here and on its methods below is temporary and expected to be removed once 5b.3 adds that
+/// consumer, not a sign this is unreachable code.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct CheckoutPreparationSession {
+    state: CheckoutPreparationSessionState,
+}
+
+/// The exact identity triple a [`CheckoutPreparationSession::bind_workload`] call just durably
+/// committed to `Bound` — minted only on success, from the SAME values the durable rewrite wrote,
+/// never separately re-derived. Fields are deliberately private and this type is NOT `Clone`: the
+/// only way to obtain one is a genuine successful `bind_workload`, and the only way to consume one
+/// is [`Self::into_parts`], so it can never be forged or duplicated elsewhere in the crate. The
+/// 5b.3 caller constructs `LeaseBindState::Bound` from the parts this yields, so the two can never
+/// silently diverge.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // temporary, see CheckoutPreparationSession's own doc above.
+pub(crate) struct WorkloadBindingIdentity {
+    container_id: String,
+    runsc_root_identity: (u64, u64),
+    cgroup_identity: (u64, u64),
+}
+
+#[allow(dead_code)] // temporary, see CheckoutPreparationSession's own doc above.
+impl WorkloadBindingIdentity {
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (String, (u64, u64), (u64, u64)) {
+        (
+            self.container_id,
+            self.runsc_root_identity,
+            self.cgroup_identity,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // temporary, see CheckoutPreparationSession's own doc above.
+enum CheckoutPreparationSessionState {
+    NotStarted,
+    PreparationBound { lease_nonce: LeaseNonce },
+    Prepared { lease_nonce: LeaseNonce },
+    Done,
+    Unreleasable,
+}
+
+#[allow(dead_code)] // temporary, see CheckoutPreparationSession's own doc above.
+impl CheckoutPreparationSession {
+    pub(crate) fn new() -> Self {
+        CheckoutPreparationSession {
+            state: CheckoutPreparationSessionState::NotStarted,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_unreleasable(&self) -> bool {
+        self.state == CheckoutPreparationSessionState::Unreleasable
+    }
+
+    /// Durably bind `lease` to the preparation runtime. Panics if this session has already left
+    /// `NotStarted` (a caller bug — `bind_preparation` must be called at most once, first).
+    pub(crate) fn bind_preparation(
+        &mut self,
+        lease: &mut UserNamespaceLease,
+        container_id: String,
+        runsc_root_identity: (u64, u64),
+        cgroup_identity: (u64, u64),
+    ) -> Result<(), UserNamespaceBindError> {
+        assert_eq!(
+            self.state,
+            CheckoutPreparationSessionState::NotStarted,
+            "bind_preparation called out of order (session state was {:?})",
+            self.state
+        );
+        let lease_nonce = lease.lease_nonce;
+        match lease.bind_preparation(container_id, runsc_root_identity, cgroup_identity) {
+            Ok(()) => {
+                self.state = CheckoutPreparationSessionState::PreparationBound { lease_nonce };
+                Ok(())
+            }
+            // Caller-fixable, and the lease is provably untouched (still Allocated) — leave this
+            // session at `NotStarted` so a caller may correct the input and retry.
+            Err(e @ UserNamespaceBindError::InvalidContainerId)
+            | Err(e @ UserNamespaceBindError::MarkerTooLarge) => Err(e),
+            // MarkerMismatch/Poisoned already poisoned the allocator and marked the lease
+            // released/abandoned on the lease's own side — mirror that here.
+            Err(e) => {
+                self.state = CheckoutPreparationSessionState::Unreleasable;
+                Err(e)
+            }
+        }
+    }
+
+    /// Durably confirm the preparation runtime's proven teardown, transitioning `lease` from
+    /// `PreparationBound` to `Prepared`. Panics if this session is not currently `PreparationBound`.
+    pub(crate) fn confirm_prepared(
+        &mut self,
+        lease: &mut UserNamespaceLease,
+        proof: PreparationQuiescenceProof,
+    ) -> Result<(), PreparationConfirmationError> {
+        let CheckoutPreparationSessionState::PreparationBound { lease_nonce } = self.state else {
+            panic!(
+                "confirm_prepared called out of order (session state was {:?})",
+                self.state
+            );
+        };
+        assert_eq!(
+            lease_nonce, lease.lease_nonce,
+            "confirm_prepared called with a lease different from the one this session was bound \
+             to by bind_preparation"
+        );
+        match lease.confirm_prepared(proof) {
+            Ok(()) => {
+                self.state = CheckoutPreparationSessionState::Prepared { lease_nonce };
+                Ok(())
+            }
+            // Sol's review: unlike the raw lease API (where the marker is left genuinely
+            // untouched, so a caller COULD retry with a corrected proof), THIS session offers no
+            // retry for ANY confirm_prepared failure, including an ordinary wrong/mismatched
+            // proof — a real caller has exactly one proof-minting opportunity per real
+            // preparation run (from the one RuntimeQuiescenceEvidence that run produced), so a
+            // later "correct" proof isn't a real scenario worth the risk of reasoning about;
+            // abandon the slot/workspace instead of leaving that door open.
+            Err(e) => {
+                self.state = CheckoutPreparationSessionState::Unreleasable;
+                Err(e)
+            }
+        }
+    }
+
+    /// Release `lease` after a proven-`Prepared` session whose real workload never launched (e.g.
+    /// a failure acquiring the workload's own launch permit). Panics if this session is not
+    /// currently `Prepared`. Consumes `self`: there is nothing further a `CheckoutPreparationSession`
+    /// can do once its lease is given up.
+    pub(crate) fn release_prepared(
+        self,
+        lease: UserNamespaceLease,
+    ) -> Result<(), UserNamespaceReleaseError> {
+        let CheckoutPreparationSessionState::Prepared { lease_nonce } = self.state else {
+            panic!(
+                "release_prepared called out of order (session state was {:?})",
+                self.state
+            );
+        };
+        assert_eq!(
+            lease_nonce, lease.lease_nonce,
+            "release_prepared called with a lease different from the one this session was bound to"
+        );
+        lease.release_prepared()
+    }
+
+    /// Durably bind `lease` to the real workload runtime, transitioning it from `Prepared` to
+    /// `Bound` — the same `LeasePhaseV2::Bound` the ordinary non-checkout path produces, so every
+    /// existing final-settlement call site takes over unchanged from here. Panics if this session
+    /// is not currently `Prepared`, or if `lease` is not the SAME lease this session was bound to.
+    /// On success, returns a [`WorkloadBindingIdentity`] minted from the EXACT triple the durable
+    /// rewrite just committed — the caller constructs `LeaseBindState::Bound` from this returned
+    /// value, never by separately re-deriving/cloning the arguments passed in here, so the
+    /// in-memory bookkeeping can never silently diverge from what was actually written to disk.
+    pub(crate) fn bind_workload(
+        &mut self,
+        lease: &mut UserNamespaceLease,
+        container_id: String,
+        runsc_root_identity: (u64, u64),
+        cgroup_identity: (u64, u64),
+    ) -> Result<WorkloadBindingIdentity, UserNamespaceBindError> {
+        let CheckoutPreparationSessionState::Prepared { lease_nonce } = self.state else {
+            panic!(
+                "bind_workload called out of order (session state was {:?})",
+                self.state
+            );
+        };
+        assert_eq!(
+            lease_nonce, lease.lease_nonce,
+            "bind_workload called with a lease different from the one this session was bound to"
+        );
+        match lease.bind_workload(container_id.clone(), runsc_root_identity, cgroup_identity) {
+            Ok(()) => {
+                self.state = CheckoutPreparationSessionState::Done;
+                Ok(WorkloadBindingIdentity {
+                    container_id,
+                    runsc_root_identity,
+                    cgroup_identity,
+                })
+            }
+            // Caller-fixable, and the lease is provably still Prepared and untouched — leave this
+            // session at Prepared so a caller may correct the input and retry (Sol's review: the
+            // original by-value signature destroyed the only preparation capability even here).
+            Err(e @ UserNamespaceBindError::InvalidContainerId)
+            | Err(e @ UserNamespaceBindError::MarkerTooLarge) => Err(e),
+            Err(e) => {
+                self.state = CheckoutPreparationSessionState::Unreleasable;
+                Err(e)
+            }
+        }
+    }
+}
+
 /// The persistent per-process owner of subordinate-uid/gid-slot admission and leasing.
 /// `GvisorBackend` will hold one starting in slice 3 (this slice deliberately does not wire it in).
 pub struct UserNamespaceAllocator {
@@ -1662,10 +2408,11 @@ impl UserNamespaceAllocator {
     /// symlink, owned by this process, mode `0700` or stricter, and — in `strict` mode — a parent
     /// this process cannot rename/replace it from); enforce `min_pool_size`; acquire the
     /// process-lifetime lock; then scan it via the LOCKED FD (never a second path-based open) —
-    /// every surviving valid, slot-consistent V1 marker is QUARANTINED (never deleted, never
-    /// reissued) with an incident reported per marker; any unrecognized/unparseable/non-regular/
-    /// slot-inconsistent entry POISONS CONSTRUCTION ITSELF (returns `Err`, never a
-    /// partially-trusted `Ok`).
+    /// every surviving valid, slot-consistent marker (schema_version 1, the frozen legacy 2-variant
+    /// shape, OR schema_version 2, the current 4-variant shape — see `LeaseMarkerV1`/`LeaseMarkerV2`)
+    /// is QUARANTINED (never deleted, never reissued) with an incident reported per marker; any
+    /// unrecognized/unparseable/non-regular/slot-inconsistent entry, or any OTHER schema_version,
+    /// POISONS CONSTRUCTION ITSELF (returns `Err`, never a partially-trusted `Ok`).
     fn try_new_impl(
         leases_dir: PathBuf,
         subuid_path: &Path,
@@ -1820,6 +2567,11 @@ impl UserNamespaceAllocator {
                 }
             })?;
             match peek.schema_version {
+                // CT-007 slice 5b.1: a legacy 2-variant marker from a pre-5b.1 binary. Never
+                // written by this code (see `LeaseMarkerV1`'s own doc) — recognized here purely so
+                // it quarantines cleanly instead of falling into the `other` arm's "unrecognized
+                // schema_version" refusal, which would incorrectly suggest this is a NEWER, not
+                // OLDER, format this binary cannot understand.
                 v if v == LEASE_MARKER_SCHEMA_V1 => {
                     let marker: LeaseMarkerV1 = serde_json::from_str(&content).map_err(|e| {
                         UserNamespaceAllocatorError::CorruptLeaseMarker {
@@ -1859,6 +2611,65 @@ impl UserNamespaceAllocator {
                     let phase_desc = match &marker.phase {
                         LeasePhaseV1::Allocated => "Allocated".to_string(),
                         LeasePhaseV1::Bound { container_id, .. } => {
+                            format!("Bound (container_id={container_id:?})")
+                        }
+                    };
+                    incidents.push(format!(
+                        "boot reconciliation: slot {slot} (host_uid={}, host_gid={}) has a \
+                         surviving legacy schema_version=1 {phase_desc} marker from runner \
+                         instance {:?} — quarantined, will never be reissued by this allocator \
+                         instance",
+                        marker.host_uid, marker.host_gid, marker.runner_instance_id
+                    ));
+                }
+                v if v == LEASE_MARKER_SCHEMA_V2 => {
+                    let marker: LeaseMarkerV2 = serde_json::from_str(&content).map_err(|e| {
+                        UserNamespaceAllocatorError::CorruptLeaseMarker {
+                            path: entry.path(),
+                            reason: format!(
+                                "marker claims schema_version=2 but does not parse as \
+                                 LeaseMarkerV2: {e}"
+                            ),
+                        }
+                    })?;
+                    if slot >= pool_size {
+                        return Err(UserNamespaceAllocatorError::CorruptLeaseMarker {
+                            path: entry.path(),
+                            reason: format!(
+                                "marker names slot {slot}, outside the current pool size \
+                                 {pool_size} — subordinate-range configuration likely changed \
+                                 incompatibly since this marker was written"
+                            ),
+                        });
+                    }
+                    let expected_uid = uid_range.start + slot;
+                    let expected_gid = gid_range.start + slot;
+                    if marker.host_uid != expected_uid || marker.host_gid != expected_gid {
+                        return Err(UserNamespaceAllocatorError::CorruptLeaseMarker {
+                            path: entry.path(),
+                            reason: format!(
+                                "marker for slot {slot} names host_uid={}, host_gid={}, but the \
+                                 CURRENT subordinate ranges imply host_uid={expected_uid}, \
+                                 host_gid={expected_gid} for this slot — the range start likely \
+                                 changed since this marker was written; refusing to guess which \
+                                 identity is authoritative",
+                                marker.host_uid, marker.host_gid
+                            ),
+                        });
+                    }
+                    quarantined.insert(slot);
+                    let phase_desc = match &marker.phase {
+                        LeasePhaseV2::Allocated => "Allocated".to_string(),
+                        LeasePhaseV2::PreparationBound { container_id, .. } => {
+                            format!("PreparationBound (container_id={container_id:?})")
+                        }
+                        LeasePhaseV2::Prepared {
+                            preparation_container_id,
+                            ..
+                        } => format!(
+                            "Prepared (preparation_container_id={preparation_container_id:?})"
+                        ),
+                        LeasePhaseV2::Bound { container_id, .. } => {
                             format!("Bound (container_id={container_id:?})")
                         }
                     };
@@ -2047,8 +2858,8 @@ impl UserNamespaceAllocator {
                     return Err(UserNamespaceRefusal::Poisoned { reason });
                 }
             };
-            let marker = LeaseMarkerV1 {
-                schema_version: LEASE_MARKER_SCHEMA_V1,
+            let marker = LeaseMarkerV2 {
+                schema_version: LEASE_MARKER_SCHEMA_V2,
                 lease_nonce,
                 runner_instance_id: self.runner_instance_id,
                 host_uid,
@@ -2057,7 +2868,7 @@ impl UserNamespaceAllocator {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
-                phase: LeasePhaseV1::Allocated,
+                phase: LeasePhaseV2::Allocated,
             };
             let marker_json = match serde_json::to_string(&marker) {
                 Ok(json) => json,
@@ -2964,7 +3775,7 @@ mod tests {
 
     /// Sol's round-1 review: no existing test proved a surviving `Bound` marker (as opposed to an
     /// `Allocated` one) parses and quarantines correctly at boot — the boot-reconciliation loop
-    /// deserializes `LeaseMarkerV1` regardless of phase, but nothing exercised the `Bound` arm.
+    /// deserializes `LeaseMarkerV2` regardless of phase, but nothing exercised the `Bound` arm.
     #[test]
     fn a_bound_lease_survives_reopening_and_is_quarantined() {
         let base = test_base("bound-marker-survives-reboot");
@@ -3014,6 +3825,81 @@ mod tests {
             "the leaked slot's host_uid must never be reissued"
         );
         release_for_tests(lease2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's review, 2026-07-27: a marker written by a PRE-5b.1 binary (the frozen, 2-variant
+    /// `schema_version: 1` shape) must still be recognized and quarantined cleanly by THIS code —
+    /// proving the schema version bump didn't break reading genuinely old markers, only writing
+    /// them (this process never writes schema_version 1 again; see `LeaseMarkerV1`'s own doc).
+    #[test]
+    fn a_legacy_schema_v1_bound_marker_survives_reopening_and_is_quarantined() {
+        let base = test_base("legacy-v1-marker-survives-reboot");
+        std::fs::create_dir_all(&base).unwrap();
+        let leases_dir = base.join("leases");
+        let subuid = base.join("subuid");
+        let subgid = base.join("subgid");
+        write_subordinate_file(&subuid, 100_000, 5);
+        write_subordinate_file(&subgid, 200_000, 5);
+        create_hardened_leases_dir(&leases_dir);
+        let legacy_marker = LeaseMarkerV1 {
+            schema_version: LEASE_MARKER_SCHEMA_V1,
+            lease_nonce: LeaseNonce(1),
+            runner_instance_id: RunnerInstanceId(1),
+            host_uid: 100_000,
+            host_gid: 200_000,
+            created_at_unix_secs: 0,
+            phase: LeasePhaseV1::Bound {
+                container_id: "pre-5b1-container".to_string(),
+                runsc_root_identity: (7, 8),
+                cgroup_identity: (9, 10),
+            },
+        };
+        let legacy_marker_path = leases_dir.join(marker_file_name(0));
+        std::fs::write(
+            &legacy_marker_path,
+            serde_json::to_string(&legacy_marker).unwrap(),
+        )
+        .unwrap();
+        // `read_and_verify_marker` requires owner-only permissions; match what the real
+        // `rewrite_marker_atomically` creates its own tmp files with (0600), since the default
+        // umask-applied mode from a plain `std::fs::write` is group/other-readable.
+        std::fs::set_permissions(&legacy_marker_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+
+        let (sink, log) = recording_sink();
+        let allocator = UserNamespaceAllocator::try_new_for_tests(
+            leases_dir.clone(),
+            &subuid,
+            &subgid,
+            1,
+            sink,
+        )
+        .unwrap();
+        assert!(
+            allocator.is_healthy(),
+            "a legacy schema_version=1 marker must parse successfully at boot, not be treated as \
+             corrupt"
+        );
+        assert!(allocator.quarantined_slots().contains(&0));
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("legacy schema_version=1")
+                && m.contains("Bound")
+                && m.contains("pre-5b1-container")));
+        // A freshly minted lease (necessarily a DIFFERENT slot -- slot 0 stays quarantined forever)
+        // must always be written as V2 going forward.
+        let fresh = allocator.lease().unwrap();
+        let fresh_marker: String =
+            std::fs::read_to_string(leases_dir.join(marker_file_name(fresh.host_uid() - 100_000)))
+                .unwrap();
+        assert!(
+            fresh_marker.contains("\"schema_version\":2"),
+            "every NEW marker this process mints must be schema_version 2, never 1 again"
+        );
+        release_for_tests(fresh);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3208,14 +4094,14 @@ mod tests {
         write_subordinate_file(&subuid, 100_000, 2);
         write_subordinate_file(&subgid, 200_000, 2);
         create_hardened_leases_dir(&leases_dir);
-        let marker = LeaseMarkerV1 {
-            schema_version: LEASE_MARKER_SCHEMA_V1,
+        let marker = LeaseMarkerV2 {
+            schema_version: LEASE_MARKER_SCHEMA_V2,
             lease_nonce: LeaseNonce(1),
             runner_instance_id: RunnerInstanceId(1),
             host_uid: 100_005,
             host_gid: 200_005,
             created_at_unix_secs: 0,
-            phase: LeasePhaseV1::Allocated,
+            phase: LeasePhaseV2::Allocated,
         };
         std::fs::write(
             leases_dir.join(marker_file_name(5)),
@@ -3249,14 +4135,14 @@ mod tests {
         write_subordinate_file(&subuid, 100_005, 5);
         write_subordinate_file(&subgid, 200_005, 5);
         create_hardened_leases_dir(&leases_dir);
-        let marker = LeaseMarkerV1 {
-            schema_version: LEASE_MARKER_SCHEMA_V1,
+        let marker = LeaseMarkerV2 {
+            schema_version: LEASE_MARKER_SCHEMA_V2,
             lease_nonce: LeaseNonce(1),
             runner_instance_id: RunnerInstanceId(1),
             host_uid: 100_000,
             host_gid: 200_000,
             created_at_unix_secs: 0,
-            phase: LeasePhaseV1::Allocated,
+            phase: LeasePhaseV2::Allocated,
         };
         std::fs::write(
             leases_dir.join(marker_file_name(0)),
@@ -3581,14 +4467,14 @@ mod tests {
         let leases_dir = base.join("leases");
         // Plant a marker for slot 0 directly — bypassing `lease()` entirely, so this allocator's
         // own `active_slots`/`quarantined_slots` bookkeeping knows nothing about it.
-        let marker = LeaseMarkerV1 {
-            schema_version: LEASE_MARKER_SCHEMA_V1,
+        let marker = LeaseMarkerV2 {
+            schema_version: LEASE_MARKER_SCHEMA_V2,
             lease_nonce: LeaseNonce(1),
             runner_instance_id: RunnerInstanceId(1),
             host_uid: 100_000,
             host_gid: 200_000,
             created_at_unix_secs: 0,
-            phase: LeasePhaseV1::Allocated,
+            phase: LeasePhaseV2::Allocated,
         };
         std::fs::write(
             leases_dir.join(marker_file_name(0)),
@@ -3669,6 +4555,810 @@ mod tests {
         assert!(
             !allocator.is_healthy(),
             "an externally deleted marker must poison the whole allocator, not just this slot"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- CT-007 slice 5b.1: the checkout preparation-phase lease lifecycle ---
+
+    #[test]
+    fn bind_preparation_succeeds_from_allocated_and_transitions_to_preparation_bound() {
+        let (allocator, base, _log) = new_allocator_for_test("prep-bind-ok", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        lease
+            .bind_preparation("prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed for a fresh Allocated lease");
+        assert!(allocator.is_healthy());
+        // `bind_workload` (which requires Prepared, not PreparationBound) must refuse here — the
+        // ordinary confirm_prepared step was skipped.
+        let result = lease.bind_workload("workload-container".to_string(), (3, 3), (4, 4));
+        assert_eq!(result, Err(UserNamespaceBindError::MarkerMismatch));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bind_preparation_refuses_a_lease_that_is_already_preparation_bound() {
+        let (allocator, base, _log) = new_allocator_for_test("prep-bind-twice", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        lease
+            .bind_preparation("prep-1".to_string(), (1, 1), (1, 1))
+            .expect("first bind_preparation must succeed");
+        let result = lease.bind_preparation("prep-2".to_string(), (2, 2), (2, 2));
+        assert_eq!(result, Err(UserNamespaceBindError::MarkerMismatch));
+        assert!(
+            !allocator.is_healthy(),
+            "a second bind_preparation attempt on an already-PreparationBound marker must poison \
+             the allocator"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bind_preparation_refuses_an_oversized_container_id_without_rewriting_the_marker() {
+        let (allocator, base, _log) = new_allocator_for_test("prep-bind-oversized-id", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let marker_path = base.join("leases").join(marker_file_name(0));
+        let before = std::fs::read_to_string(&marker_path).unwrap();
+        let oversized_id = "x".repeat(MAX_CONTAINER_ID_LEN + 1);
+        let result = lease.bind_preparation(oversized_id, (1, 1), (1, 1));
+        assert_eq!(result, Err(UserNamespaceBindError::InvalidContainerId));
+        let after = std::fs::read_to_string(&marker_path).unwrap();
+        assert_eq!(
+            before, after,
+            "an invalid container_id must be refused before any disk write is attempted"
+        );
+        assert!(
+            allocator.is_healthy(),
+            "an oversized container_id is a caller bug, not a global-trust failure"
+        );
+        lease
+            .release_unused()
+            .expect("the lease is still Allocated and usable after the refused bind_preparation");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's review: the new bind_preparation/confirm_prepared/bind_workload methods each copy
+    /// bind()/release()'s own "the durable rewrite itself had an ambiguous outcome" disposition,
+    /// but nothing exercised that copied path for real. `rewrite_marker_atomically`'s `openat(...,
+    /// O_EXCL)` on its `<marker>.tmp` staging file is the deterministic way in: pre-creating that
+    /// exact file makes the real rewrite fail immediately with `EEXIST`, with no race required.
+    #[test]
+    fn bind_preparation_poisons_on_an_ambiguous_rewrite_failure() {
+        let (allocator, base, _log) = new_allocator_for_test("prep-bind-rewrite-fails", 1, 1);
+        let leases_dir = base.join("leases");
+        let mut lease = allocator.lease().unwrap();
+        std::fs::write(
+            leases_dir.join(format!("{}.tmp", marker_file_name(0))),
+            b"stray tmp file blocking the real rewrite's O_EXCL create",
+        )
+        .unwrap();
+        let result = lease.bind_preparation("prep-container".to_string(), (1, 1), (2, 2));
+        assert_eq!(result, Err(UserNamespaceBindError::Poisoned));
+        assert!(
+            !allocator.is_healthy(),
+            "an ambiguous durable rewrite outcome must poison the whole allocator"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn confirm_prepared_poisons_on_an_ambiguous_rewrite_failure() {
+        let (allocator, base, _log) =
+            new_allocator_for_test("confirm-prepared-rewrite-fails", 1, 1);
+        let leases_dir = base.join("leases");
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        lease
+            .bind_preparation("prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        std::fs::write(
+            leases_dir.join(format!("{}.tmp", marker_file_name(0))),
+            b"stray tmp file blocking the real rewrite's O_EXCL create",
+        )
+        .unwrap();
+        let result = lease.confirm_prepared(PreparationQuiescenceProof::assert_for_tests(
+            nonce,
+            "prep-container".to_string(),
+            (1, 1),
+            (2, 2),
+        ));
+        assert_eq!(result, Err(PreparationConfirmationError::Poisoned));
+        assert!(
+            !allocator.is_healthy(),
+            "an ambiguous durable rewrite outcome must poison the whole allocator"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bind_workload_poisons_on_an_ambiguous_rewrite_failure() {
+        let (allocator, base, _log) = new_allocator_for_test("bind-workload-rewrite-fails", 1, 1);
+        let leases_dir = base.join("leases");
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        lease
+            .bind_preparation("prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        lease
+            .confirm_prepared(PreparationQuiescenceProof::assert_for_tests(
+                nonce,
+                "prep-container".to_string(),
+                (1, 1),
+                (2, 2),
+            ))
+            .expect("confirm_prepared must succeed");
+        std::fs::write(
+            leases_dir.join(format!("{}.tmp", marker_file_name(0))),
+            b"stray tmp file blocking the real rewrite's O_EXCL create",
+        )
+        .unwrap();
+        let result = lease.bind_workload("workload-container".to_string(), (3, 3), (4, 4));
+        assert_eq!(result, Err(UserNamespaceBindError::Poisoned));
+        assert!(
+            !allocator.is_healthy(),
+            "an ambiguous durable rewrite outcome must poison the whole allocator"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's review: `release_prepared`'s unlink/sync ambiguity disposition, exercised through the
+    /// `release_prepared_given` seam with an injected failure rather than a real permission
+    /// change — a chmod-based `EACCES` is not reliably reproducible in every environment this
+    /// suite might run in (a process carrying `CAP_DAC_OVERRIDE` bypasses the DAC check entirely),
+    /// so this seam proves the disposition deterministically instead.
+    #[test]
+    fn release_prepared_poisons_on_an_ambiguous_unlink_failure() {
+        let (allocator, base, _log) = new_allocator_for_test("release-prepared-unlink-fails", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        lease
+            .bind_preparation("prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        lease
+            .confirm_prepared(PreparationQuiescenceProof::assert_for_tests(
+                nonce,
+                "prep-container".to_string(),
+                (1, 1),
+                (2, 2),
+            ))
+            .expect("confirm_prepared must succeed");
+        let result = lease.release_prepared_given(|_dir_fd, _name| {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        });
+        assert_eq!(result, Err(UserNamespaceReleaseError::Poisoned));
+        assert!(
+            !allocator.is_healthy(),
+            "an ambiguous unlink outcome must poison the whole allocator"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn confirm_prepared_succeeds_and_transitions_to_prepared() {
+        let (allocator, base, _log) = new_allocator_for_test("confirm-prepared-ok", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        lease
+            .bind_preparation("prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        lease
+            .confirm_prepared(PreparationQuiescenceProof::assert_for_tests(
+                nonce,
+                "prep-container".to_string(),
+                (1, 1),
+                (2, 2),
+            ))
+            .expect("confirm_prepared must succeed with a matching proof");
+        assert!(allocator.is_healthy());
+        // Now genuinely Prepared: bind_workload must succeed, producing the ordinary Bound phase.
+        lease
+            .bind_workload("workload-container".to_string(), (3, 3), (4, 4))
+            .expect("bind_workload must succeed once genuinely Prepared");
+        lease
+            .release(UserNamespaceQuiescenceProof::assert_for_tests(
+                nonce,
+                "workload-container".to_string(),
+                (3, 3),
+                (4, 4),
+            ))
+            .expect("ordinary release() must accept a workload identity reached via bind_workload");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn confirm_prepared_refuses_a_proof_whose_identity_disagrees_with_the_marker() {
+        let (allocator, base, _log) = new_allocator_for_test("confirm-prepared-wrong-id", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        lease
+            .bind_preparation("real-prep".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        let result = lease.confirm_prepared(PreparationQuiescenceProof::assert_for_tests(
+            nonce,
+            "different-prep".to_string(), // right nonce, WRONG preparation-bound identity
+            (1, 1),
+            (2, 2),
+        ));
+        assert_eq!(
+            result,
+            Err(PreparationConfirmationError::ProofDisagreesWithMarker)
+        );
+        assert!(
+            allocator.is_healthy(),
+            "a proof with the wrong preparation-bound identity is an ordinary wrong proof, not \
+             corruption — it must NOT poison the whole allocator, and the marker must be left \
+             untouched since a preparation runtime this proof doesn't vouch for may still be alive"
+        );
+        // Retry with the CORRECT proof must still succeed — proving the marker was untouched.
+        lease
+            .confirm_prepared(PreparationQuiescenceProof::assert_for_tests(
+                nonce,
+                "real-prep".to_string(),
+                (1, 1),
+                (2, 2),
+            ))
+            .expect("confirm_prepared with the correct proof must still succeed after a refusal");
+        lease
+            .release_prepared()
+            .expect("release_prepared must succeed for a genuinely Prepared lease");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn confirm_prepared_refuses_a_proof_with_the_wrong_nonce() {
+        let (allocator, base, _log) = new_allocator_for_test("confirm-prepared-wrong-nonce", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        lease
+            .bind_preparation("prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        let wrong_nonce = LeaseNonce(lease.nonce_for_tests().0.wrapping_add(1));
+        let result = lease.confirm_prepared(PreparationQuiescenceProof::assert_for_tests(
+            wrong_nonce,
+            "prep-container".to_string(),
+            (1, 1),
+            (2, 2),
+        ));
+        assert_eq!(result, Err(PreparationConfirmationError::ProofMismatch));
+        assert!(
+            allocator.is_healthy(),
+            "a wrong-nonce proof must not poison the allocator or touch this lease's own marker"
+        );
+        // The marker is untouched (still PreparationBound) — nothing to release from this phase
+        // except with the correct proof (covered by a dedicated test above); dropping here is an
+        // ordinary abandonment, not a leak.
+        drop(lease);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn release_prepared_succeeds_after_confirm_prepared_and_frees_the_slot() {
+        let (allocator, base, _log) = new_allocator_for_test("release-prepared-ok", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        let freed_uid = lease.host_uid();
+        lease
+            .bind_preparation("prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        lease
+            .confirm_prepared(PreparationQuiescenceProof::assert_for_tests(
+                nonce,
+                "prep-container".to_string(),
+                (1, 1),
+                (2, 2),
+            ))
+            .expect("confirm_prepared must succeed");
+        lease
+            .release_prepared()
+            .expect("release_prepared must succeed for a genuinely Prepared lease");
+        assert!(allocator.is_healthy());
+        let lease_again = allocator.lease().unwrap();
+        assert_eq!(
+            lease_again.host_uid(),
+            freed_uid,
+            "release_prepared must genuinely free the slot for reuse"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn release_prepared_refuses_a_lease_still_only_preparation_bound() {
+        let (allocator, base, _log) = new_allocator_for_test("release-prepared-too-early", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        lease
+            .bind_preparation("prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        // confirm_prepared was never called — the marker is PreparationBound, not Prepared.
+        let result = lease.release_prepared();
+        assert_eq!(result, Err(UserNamespaceReleaseError::MarkerMismatch));
+        assert!(
+            !allocator.is_healthy(),
+            "release_prepared on a marker that is only PreparationBound (a runtime may still be \
+             live) must poison the whole allocator, never silently unlink"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn release_prepared_refuses_a_lease_already_bound_to_workload() {
+        let (allocator, base, _log) = new_allocator_for_test("release-prepared-too-late", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        lease
+            .bind_preparation("prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        lease
+            .confirm_prepared(PreparationQuiescenceProof::assert_for_tests(
+                nonce,
+                "prep-container".to_string(),
+                (1, 1),
+                (2, 2),
+            ))
+            .expect("confirm_prepared must succeed");
+        lease
+            .bind_workload("workload-container".to_string(), (3, 3), (4, 4))
+            .expect("bind_workload must succeed");
+        let result = lease.release_prepared();
+        assert_eq!(result, Err(UserNamespaceReleaseError::MarkerMismatch));
+        assert!(
+            !allocator.is_healthy(),
+            "release_prepared on a marker already Bound to the real workload must poison the \
+             allocator — use release() with a real workload quiescence proof instead"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bind_workload_refuses_a_lease_still_only_preparation_bound() {
+        let (allocator, base, _log) = new_allocator_for_test("bind-workload-too-early", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        lease
+            .bind_preparation("prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        let result = lease.bind_workload("workload-container".to_string(), (3, 3), (4, 4));
+        assert_eq!(result, Err(UserNamespaceBindError::MarkerMismatch));
+        assert!(
+            !allocator.is_healthy(),
+            "bind_workload on a marker that is only PreparationBound (never durably Prepared) \
+             must poison the allocator"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bind_workload_refuses_a_lease_that_was_never_prepared() {
+        let (allocator, base, _log) = new_allocator_for_test("bind-workload-never-prepared", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        // Still plain Allocated — never even entered the preparation phase.
+        let result = lease.bind_workload("workload-container".to_string(), (1, 1), (2, 2));
+        assert_eq!(result, Err(UserNamespaceBindError::MarkerMismatch));
+        assert!(!allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_preparation_bound_lease_survives_reopening_and_is_quarantined() {
+        let base = test_base("prep-bound-marker-survives-reboot");
+        std::fs::create_dir_all(&base).unwrap();
+        let leases_dir = base.join("leases");
+        let subuid = base.join("subuid");
+        let subgid = base.join("subgid");
+        write_subordinate_file(&subuid, 100_000, 5);
+        write_subordinate_file(&subgid, 200_000, 5);
+
+        let (sink, _log) = recording_sink();
+        let allocator = UserNamespaceAllocator::try_new_for_tests(
+            leases_dir.clone(),
+            &subuid,
+            &subgid,
+            1,
+            sink,
+        )
+        .unwrap();
+        let mut lease = allocator.lease().unwrap();
+        let leaked_uid = lease.host_uid();
+        lease
+            .bind_preparation("crashed-prep-container".to_string(), (7, 8), (9, 10))
+            .expect("bind_preparation must succeed for a fresh Allocated lease");
+        drop(lease); // abandoned mid-preparation — its PreparationBound marker survives on disk.
+        drop(allocator);
+
+        let (sink2, log2) = recording_sink();
+        let reopened =
+            UserNamespaceAllocator::try_new_for_tests(leases_dir, &subuid, &subgid, 1, sink2)
+                .unwrap();
+        assert!(
+            reopened.is_healthy(),
+            "a surviving PreparationBound marker must parse successfully at boot, not be treated \
+             as corrupt"
+        );
+        assert!(reopened.quarantined_slots().contains(&0));
+        assert!(log2
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("PreparationBound") && m.contains("crashed-prep-container")));
+        let lease2 = reopened.lease().unwrap();
+        assert_ne!(
+            lease2.host_uid(),
+            leaked_uid,
+            "the leaked slot's host_uid must never be reissued"
+        );
+        release_for_tests(lease2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_prepared_lease_survives_reopening_and_is_quarantined() {
+        let base = test_base("prepared-marker-survives-reboot");
+        std::fs::create_dir_all(&base).unwrap();
+        let leases_dir = base.join("leases");
+        let subuid = base.join("subuid");
+        let subgid = base.join("subgid");
+        write_subordinate_file(&subuid, 100_000, 5);
+        write_subordinate_file(&subgid, 200_000, 5);
+
+        let (sink, _log) = recording_sink();
+        let allocator = UserNamespaceAllocator::try_new_for_tests(
+            leases_dir.clone(),
+            &subuid,
+            &subgid,
+            1,
+            sink,
+        )
+        .unwrap();
+        let mut lease = allocator.lease().unwrap();
+        let leaked_uid = lease.host_uid();
+        let nonce = lease.nonce_for_tests();
+        lease
+            .bind_preparation("crashed-prep-container".to_string(), (7, 8), (9, 10))
+            .expect("bind_preparation must succeed");
+        lease
+            .confirm_prepared(PreparationQuiescenceProof::assert_for_tests(
+                nonce,
+                "crashed-prep-container".to_string(),
+                (7, 8),
+                (9, 10),
+            ))
+            .expect("confirm_prepared must succeed");
+        drop(lease); // abandoned between preparation and the real workload — Prepared survives.
+        drop(allocator);
+
+        let (sink2, log2) = recording_sink();
+        let reopened =
+            UserNamespaceAllocator::try_new_for_tests(leases_dir, &subuid, &subgid, 1, sink2)
+                .unwrap();
+        assert!(
+            reopened.is_healthy(),
+            "a surviving Prepared marker must parse successfully at boot, not be treated as corrupt"
+        );
+        assert!(reopened.quarantined_slots().contains(&0));
+        assert!(log2
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("Prepared") && m.contains("crashed-prep-container")));
+        let lease2 = reopened.lease().unwrap();
+        assert_ne!(
+            lease2.host_uid(),
+            leaked_uid,
+            "the leaked slot's host_uid must never be reissued"
+        );
+        release_for_tests(lease2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- CheckoutPreparationSession: the capability wrapper enforcing correct ordering ---
+
+    #[test]
+    fn checkout_preparation_session_happy_path_produces_a_workload_bound_lease() {
+        let (allocator, base, _log) = new_allocator_for_test("session-happy-path", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        let mut session = CheckoutPreparationSession::new();
+        session
+            .bind_preparation(&mut lease, "prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        session
+            .confirm_prepared(
+                &mut lease,
+                PreparationQuiescenceProof::assert_for_tests(
+                    nonce,
+                    "prep-container".to_string(),
+                    (1, 1),
+                    (2, 2),
+                ),
+            )
+            .expect("confirm_prepared must succeed");
+        session
+            .bind_workload(&mut lease, "workload-container".to_string(), (3, 3), (4, 4))
+            .expect("bind_workload must succeed");
+        // From here on the SAME ordinary release() the non-checkout path uses takes over unchanged.
+        lease
+            .release(UserNamespaceQuiescenceProof::assert_for_tests(
+                nonce,
+                "workload-container".to_string(),
+                (3, 3),
+                (4, 4),
+            ))
+            .expect(
+                "ordinary release() must accept a workload-bound identity reached via a session",
+            );
+        assert!(allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's review: a session's transition methods must validate the SUPPLIED lease against the
+    /// SPECIFIC one it was bound to by `bind_preparation` — otherwise a session prepared with
+    /// lease A could confirm/release/bind-workload using an entirely independent lease B.
+    #[test]
+    #[should_panic(expected = "confirm_prepared called with a lease different from the one")]
+    fn checkout_preparation_session_confirm_prepared_refuses_a_substituted_lease() {
+        let (allocator, base, _log) = new_allocator_for_test("session-cross-lease-confirm", 2, 2);
+        let mut lease_a = allocator.lease().unwrap();
+        let mut lease_b = allocator.lease().unwrap();
+        let nonce_b = lease_b.nonce_for_tests();
+        let mut session = CheckoutPreparationSession::new();
+        session
+            .bind_preparation(&mut lease_a, "prep-a".to_string(), (1, 1), (1, 1))
+            .expect("bind_preparation on lease_a must succeed");
+        // lease_b independently reaches PreparationBound too, entirely outside this session.
+        lease_b
+            .bind_preparation("prep-b".to_string(), (2, 2), (2, 2))
+            .expect("bind_preparation on lease_b must succeed");
+        // The session was bound to lease_a -- using lease_b here must panic, never silently
+        // operate on the wrong lease's durable marker.
+        let _ = session.confirm_prepared(
+            &mut lease_b,
+            PreparationQuiescenceProof::assert_for_tests(
+                nonce_b,
+                "prep-b".to_string(),
+                (2, 2),
+                (2, 2),
+            ),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[should_panic(expected = "bind_workload called with a lease different from the one")]
+    fn checkout_preparation_session_bind_workload_refuses_a_substituted_lease() {
+        let (allocator, base, _log) = new_allocator_for_test("session-cross-lease-workload", 2, 2);
+        let mut lease_a = allocator.lease().unwrap();
+        let mut lease_b = allocator.lease().unwrap();
+        let nonce_a = lease_a.nonce_for_tests();
+        let nonce_b = lease_b.nonce_for_tests();
+        let mut session = CheckoutPreparationSession::new();
+        session
+            .bind_preparation(&mut lease_a, "prep-a".to_string(), (1, 1), (1, 1))
+            .expect("bind_preparation on lease_a must succeed");
+        session
+            .confirm_prepared(
+                &mut lease_a,
+                PreparationQuiescenceProof::assert_for_tests(
+                    nonce_a,
+                    "prep-a".to_string(),
+                    (1, 1),
+                    (1, 1),
+                ),
+            )
+            .expect("confirm_prepared on lease_a must succeed");
+        // lease_b independently reaches Prepared too, entirely outside this session.
+        lease_b
+            .bind_preparation("prep-b".to_string(), (2, 2), (2, 2))
+            .expect("bind_preparation on lease_b must succeed");
+        lease_b
+            .confirm_prepared(PreparationQuiescenceProof::assert_for_tests(
+                nonce_b,
+                "prep-b".to_string(),
+                (2, 2),
+                (2, 2),
+            ))
+            .expect("confirm_prepared on lease_b must succeed");
+        // The session was bound to lease_a -- using lease_b here must panic.
+        let _ = session.bind_workload(&mut lease_b, "workload".to_string(), (3, 3), (3, 3));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's review: the ORIGINAL by-value `bind_workload` destroyed the only preparation
+    /// capability even on a caller-fixable, retryable refusal. Proves the fixed `&mut self`
+    /// signature keeps the session (and the underlying lease) usable for a corrected retry.
+    #[test]
+    fn checkout_preparation_session_bind_workload_survives_a_retryable_refusal() {
+        let (allocator, base, _log) = new_allocator_for_test("session-workload-retry", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        let mut session = CheckoutPreparationSession::new();
+        session
+            .bind_preparation(&mut lease, "prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        session
+            .confirm_prepared(
+                &mut lease,
+                PreparationQuiescenceProof::assert_for_tests(
+                    nonce,
+                    "prep-container".to_string(),
+                    (1, 1),
+                    (2, 2),
+                ),
+            )
+            .expect("confirm_prepared must succeed");
+        let oversized_id = "x".repeat(MAX_CONTAINER_ID_LEN + 1);
+        let refused = session.bind_workload(&mut lease, oversized_id, (3, 3), (4, 4));
+        assert_eq!(refused, Err(UserNamespaceBindError::InvalidContainerId));
+        assert!(
+            !session.is_unreleasable(),
+            "a retryable bind_workload refusal must not abandon the session"
+        );
+        // Retry with a corrected id must still succeed, proving the session AND the underlying
+        // lease were both left genuinely usable.
+        session
+            .bind_workload(&mut lease, "workload-container".to_string(), (3, 3), (4, 4))
+            .expect("bind_workload must succeed on a corrected retry");
+        lease
+            .release(UserNamespaceQuiescenceProof::assert_for_tests(
+                nonce,
+                "workload-container".to_string(),
+                (3, 3),
+                (4, 4),
+            ))
+            .expect("ordinary release() must accept the workload identity reached on retry");
+        assert!(allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn checkout_preparation_session_release_prepared_path() {
+        let (allocator, base, _log) = new_allocator_for_test("session-release-prepared", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        let mut session = CheckoutPreparationSession::new();
+        session
+            .bind_preparation(&mut lease, "prep-container".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        session
+            .confirm_prepared(
+                &mut lease,
+                PreparationQuiescenceProof::assert_for_tests(
+                    nonce,
+                    "prep-container".to_string(),
+                    (1, 1),
+                    (2, 2),
+                ),
+            )
+            .expect("confirm_prepared must succeed");
+        session
+            .release_prepared(lease)
+            .expect("release_prepared via the session must succeed for a genuinely Prepared lease");
+        assert!(allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[should_panic(expected = "bind_preparation called out of order")]
+    fn checkout_preparation_session_bind_preparation_twice_panics() {
+        let (allocator, base, _log) = new_allocator_for_test("session-bind-prep-twice", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let mut session = CheckoutPreparationSession::new();
+        session
+            .bind_preparation(&mut lease, "prep-1".to_string(), (1, 1), (1, 1))
+            .expect("first bind_preparation must succeed");
+        let _ = session.bind_preparation(&mut lease, "prep-2".to_string(), (2, 2), (2, 2));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[should_panic(expected = "confirm_prepared called out of order")]
+    fn checkout_preparation_session_confirm_prepared_before_bind_preparation_panics() {
+        let (allocator, base, _log) = new_allocator_for_test("session-confirm-too-early", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        let mut session = CheckoutPreparationSession::new();
+        let _ = session.confirm_prepared(
+            &mut lease,
+            PreparationQuiescenceProof::assert_for_tests(
+                nonce,
+                "prep-container".to_string(),
+                (1, 1),
+                (2, 2),
+            ),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[should_panic(expected = "bind_workload called out of order")]
+    fn checkout_preparation_session_bind_workload_before_prepared_panics() {
+        let (allocator, base, _log) = new_allocator_for_test("session-workload-too-early", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let mut session = CheckoutPreparationSession::new();
+        let _ = session.bind_workload(&mut lease, "workload".to_string(), (1, 1), (2, 2));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn checkout_preparation_session_marks_unreleasable_on_a_poisoning_bind_preparation_failure() {
+        let (allocator, base, _log) = new_allocator_for_test("session-marks-unreleasable", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        // Bind the underlying lease directly (bypassing the session entirely) so the marker is
+        // already PreparationBound by the time a FRESH session's own bind_preparation call runs
+        // against it — that call must then hit MarkerMismatch (a poisoning outcome).
+        lease
+            .bind_preparation("already-there".to_string(), (9, 9), (9, 9))
+            .expect("planting the PreparationBound state directly must succeed");
+        let mut session = CheckoutPreparationSession::new();
+        let result = session.bind_preparation(&mut lease, "prep-2".to_string(), (2, 2), (2, 2));
+        assert_eq!(result, Err(UserNamespaceBindError::MarkerMismatch));
+        assert!(session.is_unreleasable());
+        assert!(!allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sol's review: the session's stricter no-retry `confirm_prepared` policy needs its own
+    /// direct test proving the FULL terminal disposition -- an ordinary wrong proof still leaves
+    /// the ALLOCATOR globally healthy (it's not corruption), but the SESSION itself becomes
+    /// permanently `Unreleasable`, a later correct proof cannot advance it (the destructuring
+    /// match on the session's own state panics rather than silently re-attempting), and dropping
+    /// the still-outstanding lease quarantines exactly its one slot.
+    #[test]
+    fn checkout_preparation_session_confirm_prepared_wrong_proof_is_a_terminal_abandonment() {
+        let (allocator, base, _log) =
+            new_allocator_for_test("session-confirm-wrong-proof-terminal", 1, 1);
+        let mut lease = allocator.lease().unwrap();
+        let nonce = lease.nonce_for_tests();
+        let leaked_uid = lease.host_uid();
+        let mut session = CheckoutPreparationSession::new();
+        session
+            .bind_preparation(&mut lease, "real-prep".to_string(), (1, 1), (2, 2))
+            .expect("bind_preparation must succeed");
+        let wrong_proof_result = session.confirm_prepared(
+            &mut lease,
+            PreparationQuiescenceProof::assert_for_tests(
+                nonce,
+                "different-prep".to_string(), // right nonce, WRONG preparation-bound identity
+                (1, 1),
+                (2, 2),
+            ),
+        );
+        assert_eq!(
+            wrong_proof_result,
+            Err(PreparationConfirmationError::ProofDisagreesWithMarker)
+        );
+        assert!(
+            allocator.is_healthy(),
+            "an ordinary wrong proof at the raw lease level must not poison the allocator"
+        );
+        assert!(
+            session.is_unreleasable(),
+            "the SESSION must terminally abandon on ANY confirm_prepared failure, unlike the raw \
+             lease API it wraps"
+        );
+        // A later CORRECT proof must not be able to advance this session -- the destructuring
+        // match on session state panics because the session is Unreleasable, not PreparationBound.
+        let correct_proof_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.confirm_prepared(
+                &mut lease,
+                PreparationQuiescenceProof::assert_for_tests(
+                    nonce,
+                    "real-prep".to_string(),
+                    (1, 1),
+                    (2, 2),
+                ),
+            )
+        }));
+        assert!(
+            correct_proof_attempt.is_err(),
+            "a later correct proof must never be able to advance a terminally abandoned session"
+        );
+        drop(lease); // abandoned -- never released after the session gave up on it.
+        assert!(
+            allocator
+                .quarantined_slots()
+                .contains(&(leaked_uid - 100_000)),
+            "dropping the still-outstanding lease must quarantine exactly its own slot"
+        );
+        assert!(
+            allocator.is_healthy(),
+            "abandoning one lease must not poison the whole allocator"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
