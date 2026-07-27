@@ -1577,16 +1577,73 @@ with an injected `delete_workspace` operation) are proven to run for real here. 
 `explicit_user_namespace_boots_through_the_real_enabled_backend_and_launch` live drill (through the
 real `GvisorBackend::try_new(Enabled)` + `.launch()`) is genuinely runnable — the code compiles and
 type-checks against the real production signatures, and its skip condition is now narrow and correct
-— but it has NOT actually been exercised to a real pass anywhere yet: this session has neither root
-to provision the `MYELIN_USERNS_DRILL_LEASES_DIR` fixture the strict allocator constructor requires,
-nor `CAP_SYS_ADMIN` for the workspace half. **Before slice 4 can claim the `Enabled` path is
-live-proven, someone with root on a correctly provisioned host must actually run this drill to a real
-pass** — this is the same class of gap slice 2 named for its own strict-path drill, now extended to
-the fully-wired activation path.
+— **UPDATE 2026-07-27: this has since been exercised to a real, reproducible pass — see the dated
+entry below.** The gap as originally written (no root, no `CAP_SYS_ADMIN`) was accurate at the time;
+it no longer is.
 
-**Still open:** slice 4 (production activation + drills — enabling `EphemeralDisk`/
-`ExplicitUserNamespace` for real traffic, the genuine live-proof run named above, and the slice-1/2
-leaked-Btrfs-subvolume + strict-runsc-path drills those slices deferred). `runner_bind.rs` remains
-untouched. The pre-existing `git_ref_updated_provider_consumer_wire_shape_round_trips`/git-wire
-stdin-pipe flakes (tasks #33) and the newly-noted Firecracker corpus-launch failure remain
-unaddressed, tracked separately from this CI track's own scope.
+**Still open:** slice 4's CODE-side wiring (`runner_bind.rs` constructing `GvisorBackend::try_new(..,
+GvisorWorkspaceConfig::Enabled { .. }, ..)` instead of `::new(..)`, `main.rs`'s
+`preflight_runner_host()` additionally calling `preflight_explicit_userns_policy`), and the slice-1/2
+leaked-Btrfs-subvolume + strict-runsc-path drills those slices deferred. The pre-existing
+`git_ref_updated_provider_consumer_wire_shape_round_trips`/git-wire stdin-pipe flakes (task #33) and
+the newly-noted Firecracker corpus-launch failure remain unaddressed, tracked separately from this CI
+track's own scope.
+
+## 2026-07-27 — the `Enabled` activation path live-proven for real; host-provisioning artifacts landed
+
+The operational debt the slice-3 entry above named — "someone with root on a correctly provisioned
+host must actually run this drill to a real pass" — is closed. With the user's explicit, repeated
+sudo authorization this session, the full `explicit_user_namespace_boots_through_the_real_enabled_
+backend_and_launch` drill was run to a genuine, reproducible pass (multiple consecutive runs, zero
+leaked Btrfs subvolumes/qgroups/lease markers each time): real subvolume creation, real `btrfs qgroup
+limit`, real `chown` to the job's userns-mapped uid/gid, real memory cgroup creation, a real durable
+lease bind, a real `runsc` container boot under the explicit user-namespace mapping (guest reporting
+`uid=65534`/`gid=65534` as expected), and clean teardown/workspace-deletion/lease-release.
+
+Getting there surfaced real, previously-undiscovered host-provisioning requirements beyond what the
+piece 7c code review alone could find (none of these are code bugs — all are deployment-shape facts
+about running this specific `CAP_SYS_ADMIN`/explicit-userns combination for real):
+
+- The pinned `runsc` binary and its explicit-userns state-root must live under a genuinely root-owned,
+  ancestor-immutable path — this development host's usual `~/.local/bin/runsc` fails
+  `harden_explicit_userns_runsc_binary` precisely as designed. Relocated to `/opt/myelin/bin/runsc`
+  (root:root 0755) with a separate `/opt/myelin/gvisor-runsc-root` state-root leaf, same digest,
+  confirmed matching the pinned `PINNED_EXPLICIT_USERNS_RUNSC_SHA256_HEX`.
+- Granting `CAP_SYS_ADMIN` via `setcap` on the compiled TEST BINARY does not work: per
+  `capabilities(7)`, executing a binary that carries its own file capabilities clears the process's
+  ambient capability set entirely, so the capability never reaches the `btrfs`/`chown` children it
+  spawns — confirmed by direct reproduction (a minimal Rust binary with no file capabilities of its
+  own DID propagate ambient `CAP_SYS_ADMIN` to a `btrfs qgroup limit` child correctly; the exact same
+  code compiled into the real, previously-`setcap`'d test binary did not, until the leftover file
+  capability was removed). The correct mechanism is `AmbientCapabilities=` on a systemd unit (or
+  `systemd-run --property=AmbientCapabilities=`), which was not previously used anywhere in this repo.
+- `CAP_CHOWN` is a SEPARATE capability from `CAP_SYS_ADMIN`, needed for the ownership handoff to the
+  job's userns-mapped uid/gid — easy to miss since only `CAP_SYS_ADMIN` was anticipated from the
+  Btrfs qgroup requirement alone.
+- Restricting `CapabilityBoundingSet` to just the two capabilities above breaks `runsc`'s
+  `newuidmap`/`newgidmap` setuid-root escalation outright (`newuidmap failed: ... operation not
+  permitted`) — a setuid-root exec can never gain a capability outside the CALLING process's bounding
+  set, so the bounding set must stay at its default (full) rather than being narrowed alongside
+  `AmbientCapabilities`.
+- `MemoryCgroup::create`'s sibling-cgroup design needs real cgroup v2 delegation
+  (`Delegate=memory`+`DelegateSubgroup=supervisor`), and the `+memory` `cgroup.subtree_control` write
+  this requires MUST happen from the unit's `ExecStart`, never `ExecStartPre` — the identical write
+  from `ExecStartPre` deterministically fails the entire unit's startup with `Failed to spawn
+  executor: Device or resource busy` (a systemd/kernel cgroup-v2 ordering interaction confirmed by
+  direct, repeated, isolated reproduction), while the same write from `ExecStart` (once the process
+  has already settled into its final `supervisor/` location) succeeds every time.
+
+**New artifacts:** `scripts/install-ci-runner-host.sh` (idempotent host provisioning — service
+account, pinned-binary placement, directory shapes — following `docs/edge-deployment.md`'s existing
+path conventions), `deploy/systemd/myelin-ci-controlplane.service` (the first systemd unit in this
+repo, encoding every finding above), `docs/ci-runner-deployment.md` (the operator-facing runbook,
+including a copy-pasteable recipe for re-running the live drill against a real host without
+installing the service). Also fixed a real bug the drill's own workspace_base_dir hit:
+`std::env::temp_dir()` (`/tmp`) is frequently tmpfs, not Btrfs — rooted under `$HOME/.local/state`
+instead, matching every other real `WorkspaceManager` fixture in the file.
+
+**Still open (unchanged from above):** the CODE-side wiring in `runner_bind.rs`/`main.rs` that would
+make any of this reachable through the real `ci-controlplane` binary rather than the test drill.
+Once that lands, this session's host-provisioning artifacts should need no further changes — they
+were validated against the exact `GvisorBackend::try_new(Enabled)` + `.launch()` call shape that
+wiring will use.
