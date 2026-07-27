@@ -1860,3 +1860,72 @@ failure (reconfirmed via `git stash` against clean HEAD to fail identically — 
 
 **Now open:** slice 5b — the dedicated in-gVisor checkout preparation run using this now-repaired
 git-wire transport (task #60), per Sol's architecture correction recorded in the entry above.
+
+## 2026-07-27 — slice 5b design locked in with Sol: two job-side runtimes, a new checkout-specific
+## path, NOT a `GitWireSpec` extension
+
+Consulted Sol on how the checkout preparation run composes with what already exists before writing
+any code. Two real architectural questions came up during research, both resolved:
+
+**Two `runsc run` invocations per checkout-bearing job, not one.** A same-container "checkout then
+exec workload" wrapper was explicitly rejected: it would let the workload's durable launch CAS
+commit before checkout is proven, turn a checkout failure into an executed workload attempt, make
+repository/token/transport authority hard to revoke before `exec`, and remove the host's ability to
+independently verify preparation before workload code begins. The real lifecycle for a
+checkout-bearing job: reserve aggregate resources + acquire workspace/userns identity → run a
+dedicated checkout-preparation container (its own internal preparation gate/watchdog, mechanically
+similar to today's immediate-permit gate — NOT the durable launch-permit CAS, since this run isn't
+itself billable CI work) → check its exit status/exact-commit result/complete runtime quiescence →
+only then acquire the REAL workload's `LaunchPermit` → run the workload in a second container →
+checked-add `checkout usage + workload usage` into one final settlement → delete the workspace →
+release/quarantine the identity. Checkout is NOT free/uncounted: it's attacker-influenced CPU/I/O/
+wall-time/disk activity, so the SAME reservation must cover both phases, and a failure once
+preparation has actually executed needs its own distinct preparation-attempt result — it must not
+masquerade as either an `Uncommitted` zero-usage failure or a workload `Executed` result.
+
+**Consequence found during this design pass: the current lease-bind model can't simply be reused
+across two runtimes.** `LeaseBindState`'s `Allocated`/`Bound{container_id, runsc_root_identity,
+cgroup_identity}` model durably binds ONE lease to ONE exact runtime identity — two sequential
+containers can't honestly share it as-is. Slice 5b needs an extended sequential session lifecycle:
+`Allocated → PreparationBound{prep identity} → Prepared{preparation quiescence proven} →
+WorkloadBound{workload identity} → releasable (after workload quiescence + workspace deletion)`. The
+subordinate uid/gid identity and the Btrfs workspace stay stable across both runs; the container/
+cgroup identities do not, and must never overlap. Key dispositions: preparation teardown unproven →
+quarantine both lease and workspace, never start the workload; preparation proven but a later
+pre-workload failure → delete the workspace, then release from `Prepared`; workload bound → the
+existing evidence-backed final-release matrix applies, now additionally conditioned on the recorded
+successful preparation transition; the subordinate identity must never be released/reallocated
+between the two runs while its chowned workspace still exists.
+
+**Rejected: extending `GitWireSpec`/reusing `run_git_wire_container`, or bind-mounting `/repo` into
+either runtime.** `GitWireSpec`/`GitWireMounts` are server-side smart-protocol concepts (`/repo` is
+bare storage, stdin/stdout are bounded RPC transport, the command SERVES `upload-pack`/
+`receive-pack`) with their own distinct authority/accounting lifecycle — conflating "serve a clone
+to an external client" with "a CI job's own internal checkout" is the same class of concern-
+conflation earlier reviews already caught (the `iam`/`identity` taxonomy bug; folding workspace
+cleanup into `RuntimeTeardownError`). Bind-mounting `/repo` into the checkout helper (or the
+workload) was separately rejected: it would leave bare-repo storage reachable inside the same
+container as the workload, bypassing the scoped job-token boundary entirely. New, dedicated types
+instead: `CheckoutPreparationSpec` / `CheckoutTransport` / `CheckoutPreparationOutcome` /
+`PreparedCheckoutEvidence` — the last mintable only once the scoped transport resolved the requested
+repository, checked-out `HEAD` equals the exact requested commit OID, the checkout destination is
+the managed `/workspace`, the helper exited successfully, AND the helper runtime was fully finalized/
+quiesced (also expected to carry the observed `Cargo.lock` digest, for slice 6's vendor-asset
+composition). Reuse only the LOWER-level machinery: OCI mount serialization, explicit-userns mode
+validation, cgroup creation/identity, `run_and_capture`, checked runtime finalization, bounded
+output/error handling — never `run_git_wire_container` itself, never `GitWireMounts` as the checkout
+mount contract. The existing `launch_git_wire` may still implement the SERVER side of individual
+RPCs the checkout transport calls into, but it is not itself the checkout client.
+
+**Agreed commit boundaries for slice 5b (not started as of this entry):**
+- **5b.1 — sequential preparation session:** extend the durable lease/binding state machine above +
+  introduce the aggregate preparation/workload usage result types. Exhaustively test every state
+  transition and quarantine disposition WITHOUT running any real git command yet.
+- **5b.2 — checkout runtime:** the checkout-specific spec, transport seam, OCI shape, preparation
+  gate, exact-OID verification, and checked finalization, plus a live helper drill. No workload
+  activation wired in yet.
+- **5b.3 — atomic composition:** integrate both phases into `launch_with`'s real sequence (reserve →
+  prepare → verify/quiesce → acquire workload permit → workload → aggregate settle/release),
+  including the real Enabled-path drill.
+
+**Immediate next unit of work:** 5b.1 — the lease/binding state-machine extension. Not yet started.
