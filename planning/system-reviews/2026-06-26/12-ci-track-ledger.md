@@ -2210,3 +2210,68 @@ the provisioning/cleanup. **Now open, for whoever picks up real live-drill execu
 `/usr/bin/btrfs` `cap_sys_admin` system-wide (an explicit, standalone decision — not bundled into a
 future feature commit), or run the drills inside the `myelin-runner` systemd service context that
 already carries `AmbientCapabilities=CAP_SYS_ADMIN` per `scripts/install-ci-runner-host.sh`.
+
+## 2026-07-27 — CT-007 slice 5b.3-1 landed, 5b.3-2a landed (Sol, 3 review rounds), task #75 flaky
+## test root-caused and fixed
+
+**5b.3-1 — `WorkspaceIntent`/`ValidatedCheckoutRequest` (`workspace_intent.rs`, new module,
+committed `22fa82dd`):** derives a job's checkout intent from `JobSpec.workspace: WorkspaceSpec
+{ repo_ref, commit }`, backend-independent (deliberately not in `gvisor.rs`). `(None, None)` →
+`Compute`; `(Some, Some)` → `Checkout` (CI-only); mixed is refused. Validates `repo_ref` via
+`myelin_refs::parse_scoped` (requiring `subsystem == "git"`, `type_ == "repo"`, no `sub`), and
+`commit` via a new `ExpectedGitCommitId::parse_exact` (infers SHA-1/40-char vs SHA-256/64-char from
+width). Named `ValidatedCheckoutRequest`, not `ResolvedCheckoutRequest` — Sol's correction: no
+storage-path resolution or authorization has happened at this stage, only syntactic validation.
+Sol's round-1 review caught 2 issues: keep `artifact_ref` as the typed `myelin_events::ArtifactRef`
+rather than re-stringified (fixed), and a Cargo.toml DAG-position comment whose rewritten history was
+inaccurate (fixed — the crate genuinely began with only the `myelin-tenancy` edge and gained further
+individually-justified deps later, rather than the comment having been wrong from the start).
+
+**5b.3-2a — sandbox-side `CheckoutAuthorizationScope`/`CheckoutAuthorizationProof` + hook shape
+(committed `db065848`):** the pre-Hop-A checkout-authorization hook plumbing (the real control-plane
+authority chain is 5b.3-2b/2c, not yet started). `CheckoutAuthorizationScope` is a narrow read-only
+DTO (tenant/repo_ref/repo_id/commit) handed to a new `RunnerHooks.checkout_authorization` hook,
+`None` by default on both existing constructors (every call site byte-unchanged).
+`CheckoutAuthorizationProof` is an unforgeable, one-shot capability binding the exact scope AND the
+`run_token.jti` it was checked against. Took 3 Sol review rounds to land:
+- Round 2 found 3 blockers: `CheckoutAuthorizationScope`'s fields were publicly constructible
+  (redundant tenant/repo_ref/repo_id and commit_hex/commit_format pairs could disagree) — fixed with
+  private fields + a `pub(crate)` constructor + read-only accessors. `GitObjectFormat` was duplicated
+  (one copy in `workspace_intent.rs`, a drifting mirror in `lib.rs`) — fixed to one definition,
+  re-exported. `CheckoutAuthorizationProof::into_scope()` stripped the proof into a freely-clonable
+  scope, defeating the one-shot guarantee — fixed by binding `run_token_jti` into the proof and
+  replacing `into_scope()` with borrowing-only accessors, with 5b.3-3's Hop A required to consume the
+  whole proof by value.
+- Round 3 (a genuine, non-obvious Rust semantics catch) found that `CheckoutAuthorizationProof`,
+  even with private fields, was STILL forgeable via a bare struct literal from `gvisor.rs` — because
+  Rust's privacy rules make a private field visible to every DESCENDANT module of its defining
+  module, and every module in this crate (including `gvisor.rs`) is a descendant of the crate root.
+  Defining the proof at the crate root therefore gave `gvisor.rs` full construction rights despite
+  the "private" fields. Fixed by moving the proof and `RunnerHooks::authorize_checkout`'s
+  implementation into a brand-new private SIBLING module (`checkout_authorization.rs`, a child of
+  the crate root like `gvisor.rs`, but not an ancestor of it) — `gvisor.rs` can name and consume the
+  minted proof but can no longer construct or destructure one directly. Also fixed 3 rustdoc
+  public-to-private intra-doc links this surfaced under `cargo doc -D warnings` (the crate has other,
+  unrelated pre-existing rustdoc failures — confirmed untouched by this change).
+- Final round: cleared with no remaining blocker. Sol's standing note for 5b.3-3: Hop A must accept
+  `CheckoutAuthorizationProof` by value and validate/use its bound `run_token_jti`; no scope-only or
+  borrowed-proof alternate entry point.
+
+**Task #75 — flaky `user_namespace` "survives reopening and is quarantined" tests, root-caused and
+fixed:** an intermittent `AlreadyLocked` failure (~1-in-4 to 1-in-6 full-suite `cargo test` runs,
+pre-existing since 5b.1, not introduced this session). Sol's root-cause read: under `cargo test`'s
+default parallelism, an unrelated concurrent test's `Command::spawn()` can transiently inherit
+another test's directory-lock fd during the fork-to-exec window (before `O_CLOEXEC` takes effect at
+`exec`); a same-test drop-then-immediately-reopen racing that window can spuriously observe the lock
+as still held. Fixed with a bounded, test-only retry (up to 20 attempts, 5ms apart) on `AlreadyLocked`
+in `UserNamespaceAllocator::try_new_for_tests` — the real, process-lifetime production constructor
+(`try_new`) is untouched and still fails closed on the first `AlreadyLocked`, since in production that
+error means a genuine second runner process, not a transient fork-window artifact. Verified with 8
+full-suite runs + 25 targeted `user_namespace` runs, 0 failures (committed `12a78a72`).
+
+**Still open:** 5b.3-2b (the real control-plane authority chain — v2 digest, claim-time cross-check
+loading `ci_job_spec`, `CiJobAuthorizationContext.checkout` field, exact-repo capability grant
+derivation) and 5b.3-2c (wiring the hook + failure disposition + blocker tests) are designed at a
+detailed level with Sol but not yet implemented. 5b.3-3 through 5b.3-7 remain scoped only at a
+task-description level. Task #20 (EROFS cargo-vendor asset) and the live-drill host-provisioning gap
+(previous entry) are both still open, unchanged by this entry's work.
