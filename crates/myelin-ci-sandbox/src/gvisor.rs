@@ -8169,8 +8169,13 @@ mod tests {
         };
 
         let tag = format!("{}-{}", std::process::id(), unique_suffix());
-        let workspace_base_dir =
-            std::env::temp_dir().join(format!("myelin-userns-activation-workspace-{tag}"));
+        // `std::env::temp_dir()` (`/tmp`) is frequently a separate tmpfs mount, not Btrfs — use a
+        // `$HOME`-rooted path instead, matching every other real `WorkspaceManager` fixture in this
+        // file (e.g. `real_workspace_manager_for_tests`).
+        let mut workspace_base_dir = std::env::home_dir().expect("HOME must be set for this test");
+        workspace_base_dir.push(format!(
+            ".local/state/myelin-userns-activation-workspace-{tag}"
+        ));
         let incident_sink: crate::workspace_manager::IncidentSink =
             Arc::new(|msg: &str| eprintln!("[explicit-userns activation drill incident] {msg}"));
 
