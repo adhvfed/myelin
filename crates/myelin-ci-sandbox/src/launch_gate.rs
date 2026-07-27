@@ -29,6 +29,24 @@ IFS= read -r myelin_launch_gate || exit 125
 exec "$@"
 "#;
 
+/// What happens to the launch-gate pipe's write end, held by the parent, once the release byte has
+/// been written and the guard's `exec "$@"` is free to run. The SAME pipe that carries the
+/// gate-release line is also the exec'd runtime's inherited stdin — for a caller with nothing
+/// further to say (every CI/agent job), the pipe must be closed immediately so the guest sees EOF
+/// on an empty stdin, exactly as intended. A caller that needs to feed real bytes to the guest
+/// AFTER release (the git-wire request body) must ask to have the SAME live pipe handed back
+/// instead, via [`SandboxCommand::return_stdin_to_caller_after_gate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PostGateStdin {
+    /// Close the pipe the instant the release byte lands (the default/legacy behavior).
+    #[default]
+    Close,
+    /// Hand the still-open pipe back to the caller via [`SandboxChild::stdin`], but only once
+    /// `ownership.release()` has actually succeeded -- see `spawn()`'s own ordering comment for why
+    /// restoring it any earlier would risk a hung `wait()` on a release failure.
+    ReturnToCaller,
+}
+
 /// Command whose fenced form cannot exec its runtime until the durable launch CAS commits. `None`
 /// is reserved for paths such as git-wire that have no durable scheduler claim.
 pub(crate) struct SandboxCommand {
@@ -41,6 +59,7 @@ pub(crate) struct SandboxCommand {
     cgroup_kill: Option<File>,
     watchdog_timeout: Option<Duration>,
     fenced: bool,
+    post_gate_stdin: PostGateStdin,
 }
 
 impl SandboxCommand {
@@ -66,6 +85,7 @@ impl SandboxCommand {
                 cgroup_kill: None,
                 watchdog_timeout: None,
                 fenced: false,
+                post_gate_stdin: PostGateStdin::Close,
             });
         };
         let watchdog_timeout = watchdog_timeout
@@ -97,6 +117,7 @@ impl SandboxCommand {
             cgroup_kill: None,
             watchdog_timeout: Some(watchdog_timeout),
             fenced: true,
+            post_gate_stdin: PostGateStdin::Close,
         })
     }
 
@@ -106,6 +127,19 @@ impl SandboxCommand {
 
     pub(crate) fn is_fenced(&self) -> bool {
         self.fenced
+    }
+
+    /// Ask that the launch-gate pipe's write end be handed back (via [`SandboxChild::stdin`])
+    /// instead of closed once the release byte lands and durable ownership is released -- for a
+    /// caller (git-wire) that needs to feed real bytes into the guest's stdin after the gate opens.
+    /// Panics on an unfenced command: there is no gate pipe to retain (see `PostGateStdin`'s doc for
+    /// the "why can only a fenced command have anything to retain" reasoning).
+    pub(crate) fn return_stdin_to_caller_after_gate(&mut self) {
+        assert!(
+            self.fenced,
+            "only a fenced sandbox command has a launch-gate pipe to retain"
+        );
+        self.post_gate_stdin = PostGateStdin::ReturnToCaller;
     }
 
     /// Give the liveness watchdog a kernel-owned whole-cgroup kill switch. gVisor may create
@@ -233,6 +267,11 @@ impl SandboxCommand {
             );
             drop(self.ready_read.take());
             if let Err(error) = ready_result {
+                // Explicit EOF backstop, same reasoning as every other failure branch below: even
+                // though the guard hasn't been released yet (so it's still blocked on its own
+                // `read -r`), closing our write end before the kill/wait gives the guard an
+                // independent way to unblock and exit if the process-group signal is ever missed.
+                drop(gate);
                 kill_process_group(group_id);
                 let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
                 return Err(SpawnFailure::uncommitted(
@@ -247,6 +286,7 @@ impl SandboxCommand {
             let ownership = match permit.commit() {
                 Ok(ownership) => ownership,
                 Err(error) => {
+                    drop(gate);
                     kill_process_group(group_id);
                     let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
                     // The CAS returned an error, but that does NOT prove nothing committed: the
@@ -266,6 +306,7 @@ impl SandboxCommand {
             let ownership = match ownership.validate() {
                 Ok(ownership) => ownership,
                 Err(error) => {
+                    drop(gate);
                     kill_process_group(group_id);
                     let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
                     // The CAS DID commit (durably); the runtime is being killed before exec — the
@@ -283,6 +324,7 @@ impl SandboxCommand {
             // syscall or this whole call has returned.
             let release_at = Instant::now();
             if let Err(error) = gate.write_all(b"launch\n") {
+                drop(gate);
                 kill_process_group(group_id);
                 let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
                 // Committed, but the guard never even read the release byte — still no exec. The
@@ -294,19 +336,49 @@ impl SandboxCommand {
                 ));
             }
             executed_at = Some(release_at);
-            drop(gate);
-            if let Err(error) = ownership.release() {
-                kill_process_group(group_id);
-                let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
-                // The gate byte WAS written above — the guard's `exec "$@"` may already be
-                // running by the time this specific release call failed. Treat as a real (if
-                // botched) execution: the caller must account conservative fallback usage, never
-                // charge zero for it.
-                return Err(SpawnFailure::executed(
-                    format!("release durable launch ownership after sandbox exec handoff: {error}"),
-                    executed_at.expect("executed_at was just set above"),
-                    child_retirement,
-                ));
+            // `gate` must not be restored into `child.stdin` until `ownership.release()` has
+            // actually succeeded — restoring it any earlier would leave an open writer inside
+            // `child` on the release-failure path below: if the best-effort `kill_process_group`
+            // failed to actually stop the runtime, `child.wait()` could then hang behind a guest
+            // still waiting for EOF on a pipe this function itself kept open.
+            match self.post_gate_stdin {
+                PostGateStdin::Close => {
+                    drop(gate);
+                    if let Err(error) = ownership.release() {
+                        // The gate byte WAS written above — the guard's `exec "$@"` may already be
+                        // running by the time this specific release call failed. Treat as a real
+                        // (if botched) execution: the caller must account conservative fallback
+                        // usage, never charge zero for it.
+                        kill_process_group(group_id);
+                        let child_retirement =
+                            DirectChildRetirement::from_wait_result(child.wait());
+                        return Err(SpawnFailure::executed(
+                            format!(
+                                "release durable launch ownership after sandbox exec handoff: {error}"
+                            ),
+                            executed_at.expect("executed_at was just set above"),
+                            child_retirement,
+                        ));
+                    }
+                }
+                PostGateStdin::ReturnToCaller => match ownership.release() {
+                    Ok(()) => child.stdin = Some(gate),
+                    Err(error) => {
+                        // Independent EOF backstop before the kill/wait below, same reasoning as
+                        // every earlier branch: don't rely solely on the process-group signal.
+                        drop(gate);
+                        kill_process_group(group_id);
+                        let child_retirement =
+                            DirectChildRetirement::from_wait_result(child.wait());
+                        return Err(SpawnFailure::executed(
+                            format!(
+                                "release durable launch ownership after sandbox exec handoff: {error}"
+                            ),
+                            executed_at.expect("executed_at was just set above"),
+                            child_retirement,
+                        ));
+                    }
+                },
             }
         }
 
@@ -1025,5 +1097,220 @@ mod tests {
             !marker.exists(),
             "runtime survived loss of its owning runner process"
         );
+    }
+
+    // --- task #33 regression coverage: PostGateStdin (retain-vs-close the launch-gate pipe) ---
+
+    #[test]
+    fn default_fenced_mode_closes_stdin_and_delivers_immediate_eof() {
+        let marker = marker_path("default-close-eof");
+        let permit = LaunchPermit::retained(|| Ok(crate::LaunchOwnership::immediate()));
+        // `cat` blocks until it observes EOF on stdin; if the guest's stdin were still open (the
+        // pre-fix bug's mirror image — never closing it at all — is not what we're guarding here,
+        // but proving termination proves EOF arrived promptly, not that the guest hung reading).
+        let command = marker_command(&marker, "cat > \"$1\"", permit);
+        let mut child = command.spawn().expect("durable commit releases runtime");
+        assert!(
+            child.stdin().is_none(),
+            "default (Close) mode must not expose a stdin pipe to the caller"
+        );
+        wait_for_exit(&mut child);
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"",
+            "guest must have seen immediate EOF on an unretained fenced stdin"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn retained_mode_returns_exactly_one_live_stdin_pipe() {
+        let marker = marker_path("retained-live-pipe");
+        let permit = LaunchPermit::retained(|| Ok(crate::LaunchOwnership::immediate()));
+        let mut command = marker_command(&marker, "cat > \"$1\"", permit);
+        command.return_stdin_to_caller_after_gate();
+        let mut child = command.spawn().expect("durable commit releases runtime");
+        let pipe = child
+            .stdin()
+            .take()
+            .expect("retained mode must hand back exactly one live stdin pipe");
+        assert!(
+            child.stdin().is_none(),
+            "the pipe must not still be duplicated inside the child after being taken once"
+        );
+        drop(pipe);
+        wait_for_exit(&mut child);
+        let _ = std::fs::remove_file(marker);
+    }
+
+    fn assert_retained_stdin_roundtrip(label: &str, payload: &[u8]) {
+        let marker = marker_path(label);
+        let permit = LaunchPermit::retained(|| Ok(crate::LaunchOwnership::immediate()));
+        let mut command = marker_command(&marker, "cat > \"$1\"", permit);
+        command.return_stdin_to_caller_after_gate();
+        let mut child = command.spawn().expect("durable commit releases runtime");
+        let mut pipe = child
+            .stdin()
+            .take()
+            .expect("retained mode must hand back a live stdin pipe");
+        pipe.write_all(payload)
+            .expect("writing the request payload must succeed");
+        drop(pipe); // closes the write end -> delivers EOF, exactly gvisor.rs's own pattern
+        wait_for_exit(&mut child);
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            payload,
+            "payload must arrive byte-exact after the shell gate consumed only its own release line"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn retained_stdin_payload_with_embedded_newlines_arrives_byte_exact() {
+        assert_retained_stdin_roundtrip("retained-newlines", b"line one\nline two\n\nline four\n");
+    }
+
+    #[test]
+    fn retained_stdin_payload_that_looks_like_another_release_line_arrives_byte_exact() {
+        // Proves the shell gate's `read -r` consumed exactly ITS OWN release line and nothing of
+        // this payload's own leading "launch\n" text is swallowed as a second release.
+        assert_retained_stdin_roundtrip("retained-launch-prefix", b"launch\nrest of the body");
+    }
+
+    #[test]
+    fn retained_stdin_payload_with_nul_bytes_arrives_byte_exact() {
+        assert_retained_stdin_roundtrip("retained-nul", b"before\0after\0\0end");
+    }
+
+    #[test]
+    fn retained_stdin_empty_payload_delivers_immediate_eof() {
+        assert_retained_stdin_roundtrip("retained-empty", b"");
+    }
+
+    #[test]
+    fn retained_mode_requested_but_lost_post_commit_ownership_never_exposes_stdin() {
+        let marker = marker_path("retained-ownership-lost");
+        let permit = LaunchPermit::retained(|| {
+            Ok(crate::LaunchOwnership::retained(|| {
+                Err(HookError("injected session ownership loss".into()))
+            }))
+        });
+        let mut command = marker_command(&marker, "cat > \"$1\"", permit);
+        command.return_stdin_to_caller_after_gate();
+        let start = Instant::now();
+        let error = command.spawn().expect_err(
+            "lost post-commit ownership must refuse gate release even in retained mode",
+        );
+        // Same structural argument as the commit-failure test below: a failed `spawn()` never
+        // returns a `SandboxChild`, so there is no way to reach a stdin handle here regardless of
+        // the requested `PostGateStdin` policy.
+        assert_eq!(error.phase(), SpawnPhase::CommittedButNotExecuted);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a retained-mode validation failure must return promptly"
+        );
+        assert!(
+            !marker.exists(),
+            "runtime executed after launch ownership was lost in retained mode"
+        );
+    }
+
+    #[test]
+    fn retained_mode_requested_but_failed_commit_never_exposes_stdin() {
+        let marker = marker_path("retained-commit-failed");
+        let marker_at_commit = marker.clone();
+        let permit = LaunchPermit::retained(move || {
+            assert!(!marker_at_commit.exists(), "runtime executed before commit");
+            Err(HookError("injected commit failure".into()))
+        });
+        let mut command = marker_command(&marker, "cat > \"$1\"", permit);
+        command.return_stdin_to_caller_after_gate();
+        let error = command
+            .spawn()
+            .expect_err("failed commit must refuse launch even in retained mode");
+        // A failed `spawn()` never returns a `SandboxChild` at all, so there is structurally no way
+        // to reach a stdin handle here — this asserts the retained-mode request didn't change the
+        // pre-existing commit-failure phase/behavior in any way.
+        assert_eq!(error.phase(), SpawnPhase::CommitOutcomeUnknown);
+        assert!(!marker.exists(), "failed commit executed the runtime");
+    }
+
+    #[test]
+    fn failed_post_gate_release_in_retained_mode_drops_stdin_and_returns_promptly() {
+        let marker = marker_path("retained-release-failed");
+        let permit = LaunchPermit::retained(|| {
+            Ok(crate::LaunchOwnership::retained(|| {
+                Ok(crate::ValidatedLaunchOwnership::retained(|| {
+                    Err(HookError("injected post-gate unlock failure".into()))
+                }))
+            }))
+        });
+        let mut command = marker_command(
+            &marker,
+            "sleep 0.25; printf escaped > \"$1\"; sleep 5",
+            permit,
+        );
+        command.return_stdin_to_caller_after_gate();
+        let start = Instant::now();
+        let error = command
+            .spawn()
+            .expect_err("post-gate ownership release failure must kill the runtime");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a retained-mode release failure must return promptly, not hang behind an open pipe"
+        );
+        assert_eq!(error.phase(), SpawnPhase::Executed);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !marker.exists(),
+            "runtime survived a failed post-gate ownership release in retained mode"
+        );
+    }
+
+    #[test]
+    fn watchdog_kills_a_runtime_blocked_reading_retained_stdin() {
+        let marker = marker_path("retained-watchdog");
+        let permit = LaunchPermit::retained(|| Ok(crate::LaunchOwnership::immediate()));
+        // A longer deadline than `independent_boottime_deadline_kills_runtime_without_runner_
+        // progress`'s 100ms -- that test only needs the deadline to beat a `sleep`, but this one
+        // also needs the shell to reliably start and touch its marker before the deadline fires
+        // (checked below), so a tighter window risks scheduler flakiness under load.
+        let mut command =
+            SandboxCommand::new("/bin/sh", Some(permit), Some(Duration::from_millis(750))).unwrap();
+        command.return_stdin_to_caller_after_gate();
+        command
+            .command_mut()
+            .arg("-c")
+            // Blocks forever reading stdin (the caller below never writes or drops its handle) —
+            // only the independent watchdog deadline can end this. Touches the marker up front so
+            // a later existence check can't be confused with "the shell never even started".
+            .arg("touch \"$1\"; cat > /dev/null")
+            .arg("myelin-retained-watchdog-runtime")
+            .arg(&marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().expect("durable commit releases runtime");
+        let pipe = child
+            .stdin()
+            .take()
+            .expect("retained mode must hand back a live stdin pipe");
+        // Confirm the guest actually started (and is therefore genuinely blocked in `cat`, not
+        // just slow to schedule) BEFORE relying on the watchdog to end it below.
+        let started_deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < started_deadline,
+                "the guest never even started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Deliberately held open (not written to, not dropped) until after the exit check — proving
+        // the watchdog, not stdin EOF, is what ends a runtime blocked reading a retained pipe.
+        // `wait_for_exit`'s own internal 2-second deadline is the real proof here: it panics if the
+        // guest never exits, which is exactly what would happen if the watchdog failed to fire
+        // against a runtime blocked reading a pipe we deliberately never close.
+        wait_for_exit(&mut child);
+        drop(pipe);
+        let _ = std::fs::remove_file(marker);
     }
 }
