@@ -124,7 +124,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         .find("let signal_task = tokio::spawn(async move")
         .expect("OS signals must be consumed into the intake latch during bootstrap");
     let executor_preflight = source
-        .find("if let Err(error) = preflight_runner_host()")
+        .find("match prepare_runner_host() {")
         .expect("runner activation must preflight its exact executor before database bootstrap");
     let bootstrap = source
         .find("PgBootstrap::connect(platform_config, DEFAULT_MAX_CONNECTIONS)")
@@ -384,6 +384,31 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(!source.contains("PgCiPipelineStarter::new"));
     assert!(source.contains("InvalidRunnerSetting(String)"));
     assert!(source.contains("NonUnicodeRunnerSetting(OsString)"));
+    // CT-007 slice 4: the workspace-activation level is a SEPARATE opt-in gate layered on top of
+    // MYELIN_CI_RUNNER, parsed/preflighted exactly once, and its owned result -- never a second
+    // environment read -- is what reaches CiRunnerLoop::new.
+    assert!(source.contains("InvalidWorkspaceMode(String)"));
+    assert!(source.contains("NonUnicodeWorkspaceMode(OsString)"));
+    assert!(source.contains("\"MYELIN_CI_WORKSPACE_MODE\""));
+    assert!(source.contains("fn parse_workspace_activation_given("));
+    assert!(source.contains("fn prepare_runner_host_given("));
+    assert!(source.contains("gvisor_workspace_config"));
+    let workspace_prep = source
+        .find("let gvisor_workspace_config = if runner_host_requested {")
+        .expect("workspace activation must be parsed/preflighted exactly once, before bootstrap");
+    let workspace_construction = source
+        .find("gvisor_workspace_config\n                .expect(")
+        .expect("the preflighted workspace configuration must be passed into CiRunnerLoop::new");
+    assert!(
+        workspace_prep < bootstrap,
+        "workspace-activation preparation must precede PostgreSQL bootstrap, exactly like the \
+         rootless executor preflight it now wraps"
+    );
+    assert!(
+        bootstrap < workspace_construction,
+        "CiRunnerLoop::new must consume the ALREADY-preflighted configuration parsed before \
+         bootstrap, never re-derive it from a second, later environment read"
+    );
     assert!(!source.contains("std::env::var(\"MYELIN_CI_RUNNER\").ok()"));
     assert!(source.contains("ci_job_queue_store(provider.db_pool().clone())"));
     assert!(source.contains("scheduler_provider.region_queue_store()"));

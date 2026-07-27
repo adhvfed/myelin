@@ -99,6 +99,10 @@ pub enum CiRunnerHostFailure {
     WorkflowExitedEarly,
     RunnerExitedEarly,
     DrainTimedOut,
+    /// CT-007 slice 4: `GvisorBackend::try_new` refused the preflighted `GvisorWorkspaceConfig`
+    /// before the runner ever attempted a claim. An expected, diagnosable operational failure, not
+    /// a panic -- the detailed cause is already logged on the runner thread itself.
+    SandboxBackendInitializationFailed,
 }
 
 impl std::fmt::Display for CiRunnerHostFailure {
@@ -122,6 +126,9 @@ impl std::fmt::Display for CiRunnerHostFailure {
             Self::WorkflowExitedEarly => "Flow recovery lane exited before shutdown",
             Self::RunnerExitedEarly => "sandbox runner exited before shutdown",
             Self::DrainTimedOut => "runner host exceeded its process-fatal graceful-drain deadline",
+            Self::SandboxBackendInitializationFailed => {
+                "sandbox backend initialization refused the preflighted workspace configuration"
+            }
         };
         f.write_str(message)
     }
@@ -490,6 +497,9 @@ fn classify_runner_lane(
         Ok(Ok(CiRunnerLoopExit::TerminalReportFailed)) => {
             Some(CiRunnerHostFailure::TerminalReportFailed)
         }
+        Ok(Ok(CiRunnerLoopExit::SandboxBackendInitializationFailed)) => {
+            Some(CiRunnerHostFailure::SandboxBackendInitializationFailed)
+        }
         Ok(Err(_)) => Some(CiRunnerHostFailure::RunnerThreadPanicked),
         Err(_) => Some(CiRunnerHostFailure::RunnerJoinTaskPanicked),
     }
@@ -662,6 +672,46 @@ mod tests {
             classify_runner_lane(Ok(Ok(CiRunnerLoopExit::TerminalReportFailed)), false),
             Some(CiRunnerHostFailure::TerminalReportFailed)
         );
+    }
+
+    /// CT-007 slice 4: a sandbox-backend construction refusal (the preflighted
+    /// `GvisorWorkspaceConfig` no longer matches what `GvisorBackend::try_new` finds on the
+    /// runner thread) must behave exactly like every other static runner refusal --
+    /// mirrors `static_runner_refusal_stops_async_intake_and_surfaces`.
+    #[tokio::test]
+    async fn sandbox_backend_initialization_failure_stops_async_intake_and_surfaces() {
+        let async_lanes_stopped = Arc::new(AtomicUsize::new(0));
+        let starter_stopped = async_lanes_stopped.clone();
+        let workflow_stopped = async_lanes_stopped.clone();
+        let handle = start_lanes(
+            CiRunnerHostConfig::for_test(Duration::from_secs(1)),
+            move |shutdown| async move {
+                wait_for_shutdown(shutdown).await;
+                starter_stopped.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            move |shutdown| async move {
+                wait_for_shutdown(shutdown).await;
+                workflow_stopped.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            |_shutdown| {
+                std::thread::Builder::new()
+                    .name("ci-runner-host-test".into())
+                    .spawn(|| CiRunnerLoopExit::SandboxBackendInitializationFailed)
+            },
+        )
+        .unwrap();
+        let failure = wait_for_ci_runner_host_failure(handle.failure_receiver()).await;
+        assert_eq!(
+            failure,
+            CiRunnerHostFailure::SandboxBackendInitializationFailed
+        );
+        assert_eq!(
+            handle.shutdown().await,
+            Err(CiRunnerHostFailure::SandboxBackendInitializationFailed)
+        );
+        assert_eq!(async_lanes_stopped.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

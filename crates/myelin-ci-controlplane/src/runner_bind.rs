@@ -346,6 +346,12 @@ pub struct CiRunnerLoop {
     // INSIDE the run driver on the dedicated runner thread (the LogPipeline is non-Send).
     pool: sqlx::postgres::PgPool,
     s3: myelin_config::S3Config,
+    /// CT-007 slice 4: the OWNED, already-preflighted workspace-activation level (`main`'s
+    /// `prepare_runner_host` parsed and preflighted this exact value before PostgreSQL bootstrap —
+    /// see that function's own doc). A MANDATORY constructor parameter, not an optional builder
+    /// (Sol's design review): this is security-sensitive composition state, so omitting it must be
+    /// a compile error, not a silent default.
+    gvisor_workspace_config: myelin_ci_sandbox::gvisor::GvisorWorkspaceConfig,
 }
 
 /// Terminal reason returned by the owned runner thread.
@@ -360,6 +366,12 @@ pub enum CiRunnerLoopExit {
     /// A launched job could not co-commit its terminal report/accounting. The durable claim remains
     /// recoverable, but accepting more work would accumulate completed, unsettled jobs.
     TerminalReportFailed,
+    /// CT-007 slice 4: `GvisorBackend::try_new` refused the preflighted `gvisor_workspace_config`
+    /// (e.g. the `WorkspaceManager`/`UserNamespaceAllocator` construction that only happens HERE,
+    /// on this dedicated thread, found the host no longer matches what `main`'s preflight observed).
+    /// This is an expected, diagnosable operational failure (Sol's design review) — never a panic —
+    /// surfaced before a single claim is ever attempted.
+    SandboxBackendInitializationFailed,
 }
 
 impl CiRunnerLoop {
@@ -372,6 +384,10 @@ impl CiRunnerLoop {
     /// `s3` back the live log sink (CT-004f sub-step 5): the OLTP pool writes the `log_segment`/
     /// `log_anchor` index + the `ci.log.available` outbox pointer; `s3` is the CAS the sealed log
     /// segments flush to (the same shared pool + object store the rest of the control plane uses).
+    /// `gvisor_workspace_config` (CT-007 slice 4) is the OWNED, already-preflighted workspace-
+    /// activation level `main`'s `prepare_runner_host` produced before PostgreSQL bootstrap — a
+    /// MANDATORY parameter (never an optional builder default) since this is security-sensitive
+    /// sandbox composition state.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         worker_id: impl Into<String>,
@@ -387,6 +403,7 @@ impl CiRunnerLoop {
         hooks: RunnerHooks,
         pool: sqlx::postgres::PgPool,
         s3: myelin_config::S3Config,
+        gvisor_workspace_config: myelin_ci_sandbox::gvisor::GvisorWorkspaceConfig,
     ) -> CiRunnerLoop {
         CiRunnerLoop {
             worker_id: worker_id.into(),
@@ -402,6 +419,7 @@ impl CiRunnerLoop {
             hooks,
             pool,
             s3,
+            gvisor_workspace_config,
             idle_backoff: Duration::from_millis(500),
             error_backoff: Duration::from_secs(2),
         }
@@ -484,11 +502,40 @@ impl CiRunnerLoop {
             hooks,
             pool,
             s3,
+            gvisor_workspace_config,
             idle_backoff,
             error_backoff,
         } = self;
 
-        let backend = GvisorBackend::new(production_gvisor_registry());
+        // CT-007 slice 4: the ONE real construction of the security-load-bearing managers
+        // (`WorkspaceManager`/`UserNamespaceAllocator`) `GvisorWorkspaceConfig::Enabled` names --
+        // `main`'s `prepare_runner_host` already preflighted this exact configuration before
+        // PostgreSQL bootstrap, but construction itself only happens HERE, on this dedicated
+        // thread (mirroring `production_gvisor_registry()`'s own "verify once, at runner startup"
+        // shape). A failure here is an expected, diagnosable operational failure (Sol's design
+        // review) -- never a panic -- surfaced as a typed loop exit before a single claim is ever
+        // attempted, so `CiRunnerHost` can trigger its own coordinated shutdown exactly as it does
+        // for every other lane failure.
+        let incident_sink: myelin_ci_sandbox::workspace_manager::IncidentSink = {
+            let worker_id = worker_id.clone();
+            Arc::new(move |message: &str| {
+                eprintln!("ci-runner[{worker_id}]: GVISOR SECURITY INCIDENT: {message}");
+            })
+        };
+        let backend = match GvisorBackend::try_new(
+            production_gvisor_registry(),
+            gvisor_workspace_config,
+            incident_sink,
+        ) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!(
+                    "ci-runner[{worker_id}]: sandbox backend initialization FAILED (fail-closed, \
+                     no claim attempted): {error}"
+                );
+                return CiRunnerLoopExit::SandboxBackendInitializationFailed;
+            }
+        };
         // CT-004f sub-step 5: the LIVE log sink (was the `CountingFirehose` stub). Built HERE on the
         // dedicated runner thread because the per-job `LogPipeline` is non-Send (its firehose uses Rc);
         // the pool + rt handle are cheap Clones. Captured guest stdout/stderr → redacted at the sandbox

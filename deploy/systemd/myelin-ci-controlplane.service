@@ -45,19 +45,27 @@ Environment=MYELIN_RUNSC_BIN=/opt/myelin/bin/runsc
 Environment=MYELIN_GVISOR_ROOTFS=/opt/myelin/rootfs
 Environment=MYELIN_GVISOR_RUST_ROOTFS=/opt/myelin/rust-rootfs
 
-# --- Explicit-userns + EphemeralDisk workspace activation (CT-007 slice 4 — NOT YET WIRED) ---
+# --- Explicit-userns + EphemeralDisk workspace activation (CT-007 slice 4) ---
 # scripts/install-ci-runner-host.sh already provisions the host-side directories these name
-# (/opt/myelin/gvisor-runsc-root, /var/lib/myelin/userns-leases, /var/lib/myelin/ci-workspaces), and
-# the values below are exactly what a correctly-provisioned host expects — but
-# crates/myelin-ci-controlplane/src/runner_bind.rs:~491 still constructs `GvisorBackend::new(...)`
-# (Disabled workspace integration) rather than `GvisorBackend::try_new(..., GvisorWorkspaceConfig::
-# Enabled { .. }, ..)`, and crates/myelin-ci-controlplane/src/main.rs's `preflight_runner_host()` does
-# not yet call `preflight_explicit_userns_policy`. Uncomment these once that code change lands —
-# until then they are inert (read by nothing).
-# Environment=MYELIN_EXPLICIT_USERNS_RUNSC_ROOT=/opt/myelin/gvisor-runsc-root
-# Environment=MYELIN_EXPLICIT_USERNS_HELPER_DIR=/usr/bin
-# Environment=MYELIN_USERNS_LEASES_DIR=/var/lib/myelin/userns-leases
-# Environment=MYELIN_CI_WORKSPACES_DIR=/var/lib/myelin/ci-workspaces
+# (/opt/myelin/gvisor-runsc-root, /var/lib/myelin/userns-leases, /var/lib/myelin/ci-workspaces). This
+# unit ships with the Enabled cutover as the canonical target posture; delete this whole block (or
+# set MYELIN_CI_WORKSPACE_MODE=disabled / leave it unset) to run the rootless base above instead.
+# MYELIN_CI_WORKSPACE_MODE gates this whole block: unset or `disabled` keeps the rootless base above
+# as the entire runner (these five variables are then read by nothing); `enabled` requires every one
+# of the four paths/capacity below (crates/myelin-ci-controlplane/src/main.rs's
+# `parse_workspace_activation_given` refuses startup if any is missing, malformed, or relative) and
+# activates ExplicitUserNamespace + disk-backed per-job workspaces via
+# `GvisorBackend::try_new(..., GvisorWorkspaceConfig::Enabled { .. }, ..)`.
+Environment=MYELIN_CI_WORKSPACE_MODE=enabled
+Environment=MYELIN_EXPLICIT_USERNS_RUNSC_ROOT=/opt/myelin/gvisor-runsc-root
+Environment=MYELIN_EXPLICIT_USERNS_HELPER_DIR=/usr/bin
+Environment=MYELIN_USERNS_LEASES_DIR=/var/lib/myelin/userns-leases
+Environment=MYELIN_CI_WORKSPACES_DIR=/var/lib/myelin/ci-workspaces
+# No default — the aggregate disk ceiling for /var/lib/myelin/ci-workspaces is a site-specific
+# storage-layout decision (how much of the host's Btrfs volume this runner may commit to job
+# workspaces). 21474836480 (20 GiB) below is an EXAMPLE for a modest single-runner host; size it to
+# the actual volume this unit's ci-workspaces directory lives on.
+Environment=MYELIN_CI_WORKSPACE_CAPACITY_BYTES=21474836480
 
 EnvironmentFile=/etc/myelin/ci-controlplane.env
 

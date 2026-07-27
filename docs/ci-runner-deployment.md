@@ -10,22 +10,28 @@ scope here.
 
 ## Two activation levels
 
-**Rootless (works today).** The runner boots every guest with `runsc --rootless`, no host
-capabilities beyond an ordinary unprivileged process. This is what `MYELIN_CI_RUNNER=1` activates as
-of this writing — `crates/myelin-ci-controlplane/src/runner_bind.rs`'s `GvisorBackend::new(...)`
-call constructs a `Disabled`-workspace-integration backend.
+Both levels are `MYELIN_CI_RUNNER=1` — a second, independent env var,
+`MYELIN_CI_WORKSPACE_MODE`, selects between them (`crates/myelin-ci-controlplane/src/main.rs`'s
+`parse_workspace_activation_given`, parsed and preflighted exactly once at startup, before any
+PostgreSQL bootstrap):
 
-**Explicit user-namespace + `EphemeralDisk` workspaces (CT-007 slice 4 — host prerequisites ready,
-code wiring still open).** Each job gets its own real subordinate uid/gid mapping (`UserNamespaceLease`)
-and a real Btrfs-quota'd scratch subvolume (`ManagedWorkspace`) instead of an unbounded host-backed
-`/tmp`. The HOST-side provisioning this needs (directories, the pinned `runsc` binary's placement,
-the `CAP_SYS_ADMIN`/`CAP_CHOWN` grants, and cgroup delegation) is what this doc and
-`scripts/install-ci-runner-host.sh` set up. The
-CODE-side wiring — `runner_bind.rs` constructing `GvisorBackend::try_new(.., GvisorWorkspaceConfig::
-Enabled { .. }, ..)` instead of `::new(..)`, and `main.rs`'s `preflight_runner_host()` additionally
-calling `preflight_explicit_userns_policy` — has not landed yet (see
-`planning/system-reviews/2026-06-26/12-ci-track-ledger.md`'s slice-3 entry, "still open: slice 4").
-Provisioning the host now means that code change is the ONLY remaining step once it's written.
+**Rootless (`MYELIN_CI_WORKSPACE_MODE` unset or `disabled`).** The runner boots every guest with
+`runsc --rootless`, no host capabilities beyond an ordinary unprivileged process —
+`runner_bind.rs`'s `GvisorBackend::try_new(..., GvisorWorkspaceConfig::Disabled, ...)` call.
+
+**Explicit user-namespace + `EphemeralDisk` workspaces (`MYELIN_CI_WORKSPACE_MODE=enabled`, CT-007
+slice 4).** Each job gets its own real subordinate uid/gid mapping (`UserNamespaceLease`) and a real
+Btrfs-quota'd scratch subvolume (`ManagedWorkspace`) instead of an unbounded host-backed `/tmp`. This
+mode requires four additional variables — `MYELIN_EXPLICIT_USERNS_RUNSC_ROOT`,
+`MYELIN_USERNS_LEASES_DIR`, `MYELIN_CI_WORKSPACES_DIR`, `MYELIN_CI_WORKSPACE_CAPACITY_BYTES` (a
+positive integer byte count with no default — an operator/storage-layout decision; see the systemd
+unit's `Environment=` block for a worked example) — plus an optional
+`MYELIN_EXPLICIT_USERNS_HELPER_DIR` (defaults to `/usr/bin`, where `newuidmap`/`newgidmap` live).
+Startup refuses loudly if `enabled` is set and any of the four required variables is missing,
+empty, non-absolute, or (for the capacity) not a positive integer — never a silent fallback to
+`Disabled`. The HOST-side provisioning this needs (directories, the pinned `runsc` binary's
+placement, the `CAP_SYS_ADMIN`/`CAP_CHOWN` grants, and cgroup delegation) is what this doc and
+`scripts/install-ci-runner-host.sh` set up.
 
 ## Provisioning the host
 
@@ -130,9 +136,12 @@ sudo systemctl enable --now myelin-ci-controlplane
 Populate `/etc/myelin/ci-controlplane.env` (root-readable, `0600`) with the rest of
 `ci-controlplane`'s required configuration (`DATABASE_URL`, `DATABASE_MIGRATION_URL`,
 `MYELIN_CELL_ID`, etc.) — the unit's own `Environment=` lines cover only the gVisor-runner-specific
-variables. The explicit-userns/`EphemeralDisk` variables in the unit are commented out and
-documented as inert until the `runner_bind.rs`/`main.rs` wiring above lands; uncomment them at that
-point, not before (there is nothing to read them yet).
+variables. The checked-in unit represents the `MYELIN_CI_WORKSPACE_MODE=enabled` cutover as the
+canonical target posture (explicit-userns + `EphemeralDisk` workspaces) — its
+`MYELIN_CI_WORKSPACE_CAPACITY_BYTES` value is the one number in that block you should actually
+change per host, sized to the volume `MYELIN_CI_WORKSPACES_DIR` lives on. If you want the rootless
+base only, delete or comment out the workspace-activation `Environment=` block (the six lines from
+`MYELIN_CI_WORKSPACE_MODE` down) before installing.
 
 ## Verifying the host without installing the service
 
