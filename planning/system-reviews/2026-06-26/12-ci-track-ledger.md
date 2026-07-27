@@ -1647,3 +1647,69 @@ make any of this reachable through the real `ci-controlplane` binary rather than
 Once that lands, this session's host-provisioning artifacts should need no further changes — they
 were validated against the exact `GvisorBackend::try_new(Enabled)` + `.launch()` call shape that
 wiring will use.
+
+## 2026-07-27 — CT-007 slice 4 landed: production activation wired (Sol, 2 review rounds)
+
+The "still open" item directly above is closed: `ci-controlplane` now actually constructs
+`GvisorBackend::try_new(GvisorWorkspaceConfig::Enabled { .. })` in production, gated behind a new,
+independent `MYELIN_CI_WORKSPACE_MODE` env var (separate from `MYELIN_CI_RUNNER`, which only gates
+whether the runner host exists at all). Commit `42a240a0`.
+
+**Shape (designed with Sol before writing code, per this track's standing process for a change that
+activates a new production code path):** `MYELIN_CI_WORKSPACE_MODE` parses strictly — unset/
+`disabled` → `Disabled` (the rootless base, unchanged from before this slice); `enabled` → requires
+four absolute-path/positive-integer variables (`MYELIN_EXPLICIT_USERNS_RUNSC_ROOT`,
+`MYELIN_USERNS_LEASES_DIR`, `MYELIN_CI_WORKSPACES_DIR`, `MYELIN_CI_WORKSPACE_CAPACITY_BYTES`, no
+default for capacity — an operator/storage-layout decision) plus an optional
+`MYELIN_EXPLICIT_USERNS_HELPER_DIR` (defaults to `/usr/bin`); anything else refuses loudly, never a
+silent downgrade to `Disabled`. Parsed and preflighted exactly once in `main()`, before PostgreSQL
+bootstrap, and carried as one owned value all the way to `CiRunnerLoop::new` (a new mandatory
+constructor parameter) — activation can never diverge between what was preflighted and what the
+runner thread constructs against. `min_pool_size` is fixed at 1 (`RunnerAgent::run_one` performs
+exactly one synchronous launch at a time; a larger pool would be arbitrary slack). Preflight order is
+explicit-userns first, then the always-required rootless preflight, with the explicit-userns step
+short-circuiting the rootless one on failure. Backend-construction failure is a new typed,
+non-panicking `CiRunnerLoopExit::SandboxBackendInitializationFailed` /
+`CiRunnerHostFailure::SandboxBackendInitializationFailed`, surfaced through the existing
+`classify_runner_lane` path exactly like every other runner-lane failure — never a `process::exit` on
+the runner thread. The construction incident sink is a plain `eprintln!` naming the worker id.
+
+**What review round 2 caught (both fixed before commit):** the original env-parsing seam accepted
+every `Enabled`-only variable as an already-evaluated `Result`, so the Disabled/unset-mode test could
+only prove the parser *ignored* an already-read (poisoned) value — not that it never read the real
+environment variable at all. Fixed by making those five reads lazy (`impl FnOnce() -> Result<...>`
+closures, only invoked once mode resolves to `enabled`), with a new test that hands the parser a
+panicking closure for every Enabled-only argument in Disabled/unset mode — if the parser ever called
+one, the test panics rather than merely asserting a value. Also: the optional helper-dir variable
+silently defaulted to `/usr/bin` for an explicitly empty value (only `NotPresent` should default) and
+its relative-path case was untested; both fixed, and the relative-path test now covers all four
+Enabled-only directories individually, not just `runsc_root`. A required host-failure-propagation
+test for the new `SandboxBackendInitializationFailed` variant was also added, mirroring the existing
+`static_runner_refusal_stops_async_intake_and_surfaces` shape.
+
+**Deployment artifacts updated in the same commit:** `deploy/systemd/myelin-ci-controlplane.service`
+now ships the `MYELIN_CI_WORKSPACE_MODE=enabled` block uncommented as the checked-in unit's canonical
+target posture (an operator wanting rootless-only deletes that block before installing);
+`docs/ci-runner-deployment.md`'s "Two activation levels" and "Installing the service" sections
+describe the landed contract instead of a still-pending one.
+
+**Verification:** `cargo build -p myelin-ci-controlplane --all-targets`; `cargo clippy
+-p myelin-ci-controlplane -p myelin-ci-sandbox --all-targets -- -D warnings`; `cargo build
+--workspace`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo run -p myelin-lints
+--bin lint-gate` (771 files, 0 violations); `cargo test -p myelin-ci-controlplane --lib` (455
+passed); `cargo test -p myelin-ci-controlplane --test production_pg_bootstrap_source` (5 passed,
+extended with two new ordering assertions proving activation is parsed/preflighted before bootstrap
+and that the preflighted config, not a fresh env read, reaches `CiRunnerLoop::new`).
+
+Aside, unrelated to this slice: the lib suite briefly showed one failure in
+`production_gvisor_registry_tests` (a `DigestMismatch` on the pinned `linux-small-v1-rootfs`).
+Root-caused (via `git stash` + a re-hash excluding the offending path) as an empty `workspace/`
+directory left inside the canonical staged rootfs at `~/.local/share/gvisor-assets/rootfs` by an
+earlier real `runsc` run against the live default path during this session's own slice-3
+host-provisioning verification — not a code issue, not part of this commit. Removed.
+
+**Now open:** CT-007's pre-registered cutover floor (ledger entry near the top of this file) still
+needs steps 3–4 — the complete mapped graph passing on one real Myelin commit through the actual
+self-hosted instance, twice, with no GitHub execution and no manual green. That is real production
+dogfood infrastructure and higher blast radius than anything in this slice; per the standing
+instruction, it needs an explicit check-in before proceeding, not an autonomous continuation.
