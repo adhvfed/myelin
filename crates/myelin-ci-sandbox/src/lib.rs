@@ -409,6 +409,28 @@ pub struct WorkspaceSpec {
     pub commit: Option<String>,
 }
 
+/// CT-007 slice 5b.3-2b: the ONLY sanctioned way an external crate (the control-plane authority
+/// chain) may derive a job's checkout-authorization scope from its `kind`/`workspace`. Wraps the
+/// private `workspace_intent` module's parsing/validation (Sol's review: an external caller must
+/// never duplicate those rules itself, nor see the private `WorkspaceIntent`/
+/// `ValidatedCheckoutRequest` types directly). `Ok(None)` for an ordinary compute job (`workspace`
+/// sets neither field); `Ok(Some(scope))` for a syntactically-valid checkout-bearing job; `Err` for
+/// a malformed `workspace` (mixed `Some`/`None`, an unparseable `repo_ref`, or a malformed
+/// `commit`). This performs ONLY the same syntactic validation `derive_workspace_intent` always did
+/// — no authority, tenant, or repo-read check; callers still need their own cross-check against
+/// durable authority state before trusting the result for anything security-relevant.
+pub fn derive_checkout_authorization_scope(
+    kind: JobKind,
+    workspace: &WorkspaceSpec,
+) -> Result<Option<CheckoutAuthorizationScope>, String> {
+    match workspace_intent::derive_workspace_intent(kind, workspace)? {
+        workspace_intent::WorkspaceIntent::Compute => Ok(None),
+        workspace_intent::WorkspaceIntent::Checkout(request) => {
+            Ok(Some(request.to_authorization_scope()))
+        }
+    }
+}
+
 /// The per-job attenuated run token reference (`mint_run_token`, contract 4.7) — guarantee #2.
 /// Carries the token's `jti`/handle, not the token material.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2016,6 +2038,44 @@ mod tests {
             Box::new(|_t| Ok(())),
             Box::new(|_s| Ok(())),
         )
+    }
+
+    #[test]
+    fn derive_checkout_authorization_scope_is_none_for_an_ordinary_compute_workspace() {
+        let workspace = WorkspaceSpec {
+            repo_ref: None,
+            commit: None,
+        };
+        assert_eq!(
+            derive_checkout_authorization_scope(JobKind::Agent, &workspace).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn derive_checkout_authorization_scope_derives_the_exact_scope_for_a_valid_checkout_workspace()
+    {
+        let workspace = WorkspaceSpec {
+            repo_ref: Some("myelin://acme/git/repo/widgets".to_string()),
+            commit: Some("a".repeat(40)),
+        };
+        let scope = derive_checkout_authorization_scope(JobKind::Ci, &workspace)
+            .unwrap()
+            .expect("a full repo_ref + commit pair must derive Some(scope)");
+        assert_eq!(scope.tenant().0, "acme");
+        assert_eq!(scope.repo_ref().0, "myelin://acme/git/repo/widgets");
+        assert_eq!(scope.repo_id(), "widgets");
+        assert_eq!(scope.commit_hex(), "a".repeat(40));
+        assert_eq!(scope.commit_format(), GitObjectFormat::Sha1);
+    }
+
+    #[test]
+    fn derive_checkout_authorization_scope_refuses_a_malformed_workspace() {
+        let mixed = WorkspaceSpec {
+            repo_ref: Some("myelin://acme/git/repo/widgets".to_string()),
+            commit: None,
+        };
+        assert!(derive_checkout_authorization_scope(JobKind::Ci, &mixed).is_err());
     }
 
     fn checkout_scope() -> CheckoutAuthorizationScope {

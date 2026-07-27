@@ -451,6 +451,7 @@ mod tests {
                 pids_max: 128,
                 timeout_secs: 30,
             },
+            checkout: None,
         }
     }
 

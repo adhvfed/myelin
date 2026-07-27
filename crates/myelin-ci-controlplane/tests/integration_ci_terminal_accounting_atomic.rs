@@ -24,9 +24,10 @@ use myelin_ci_controlplane::{
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    resolved_gvisor_rootfs, CompletionClaim, CompletionSettlementOwner, CountingFirehose, ImageRef,
-    ResourceUsage, RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome,
-    RunnerAgent, TerminalReport, TerminalReporter, TrustTier, LINUX_SMALL_V1_ROOTFS_SHA256,
+    derive_checkout_authorization_scope, resolved_gvisor_rootfs, CompletionClaim,
+    CompletionSettlementOwner, CountingFirehose, ImageRef, JobKind, ResourceUsage,
+    RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome, RunnerAgent,
+    TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::{IdMinter, MonotonicMinter};
@@ -144,7 +145,7 @@ fn manifest(
         workflow_code_hash: workflow_code_hash.into(),
         authority_policy_revision: "ci-policy:2026-07-21".into(),
         repo_ref: format!("myelin://{tenant}/git/repo/core"),
-        commit_oid: "deadbeef".into(),
+        commit_oid: "deadbeef00deadbeef00deadbeef00deadbeef00".into(),
         run_ref: format!("myelin://{tenant}/ci/run/{ci_run}"),
         started_at: "2026-07-21T12:34:56.000000Z".into(),
         trust_tier: CiManifestTrustTierV1::Trusted,
@@ -172,7 +173,7 @@ fn manifest(
                 },
                 workspace: CiManifestWorkspaceV1 {
                     repo_ref: format!("myelin://{tenant}/git/repo/core"),
-                    commit_oid: "deadbeef".into(),
+                    commit_oid: "deadbeef00deadbeef00deadbeef00deadbeef00".into(),
                     read_only_root: true,
                     tmpfs_scratch: true,
                 },
@@ -207,7 +208,7 @@ fn manifest(
                 },
                 workspace: CiManifestWorkspaceV1 {
                     repo_ref: format!("myelin://{tenant}/git/repo/core"),
-                    commit_oid: "deadbeef".into(),
+                    commit_oid: "deadbeef00deadbeef00deadbeef00deadbeef00".into(),
                     read_only_root: true,
                     tmpfs_scratch: true,
                 },
@@ -241,6 +242,14 @@ fn manifest(
             workflow_code_hash: workflow_code_hash.into(),
             policy_revision: "ci-policy:2026-07-21".into(),
             limits: executable.limits.clone(),
+            checkout: derive_checkout_authorization_scope(
+                JobKind::Ci,
+                &WorkspaceSpec {
+                    repo_ref: Some(executable.workspace.repo_ref.clone()),
+                    commit: Some(executable.workspace.commit_oid.clone()),
+                },
+            )
+            .unwrap(),
         });
     manifest
 }
@@ -397,7 +406,7 @@ async fn run_reporter_scenario(
             cause_depth: 0,
             caused_by: None,
             repo_ref: Some(format!("myelin://{}/git/repo/core", tenant.0)),
-            commit_oid: Some("deadbeef".into()),
+            commit_oid: Some("deadbeef00deadbeef00deadbeef00deadbeef00".into()),
             triggered_by: None,
         })
         .await

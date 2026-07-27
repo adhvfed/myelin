@@ -11,6 +11,7 @@ use myelin_ci_controlplane::{
     CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, CiManifestLimitsV1,
     PgTierPCiJobBudgetReservation, LINUX_SMALL_V1_POLICY_REVISION,
 };
+use myelin_ci_sandbox::{derive_checkout_authorization_scope, JobKind, WorkspaceSpec};
 use myelin_storage::{reserve_settle_durable_migrations, with_tenant_tx, PgError, PgMigrator};
 use sqlx::{Executor, PgPool, Row};
 
@@ -64,6 +65,14 @@ fn request(tenant: &str, run_suffix: u8, job_suffix: u8) -> CiJobRuntimeAuthorit
             pids_max: 128,
             timeout_secs: 600,
         },
+        checkout: derive_checkout_authorization_scope(
+            JobKind::Ci,
+            &WorkspaceSpec {
+                repo_ref: Some(format!("myelin://{tenant}/git/repo/core")),
+                commit: Some("deadbeef00deadbeef00deadbeef00deadbeef00".into()),
+            },
+        )
+        .unwrap(),
     }
 }
 
