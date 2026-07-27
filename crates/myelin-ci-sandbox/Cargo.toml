@@ -21,11 +21,22 @@ publish = false
 #     here (agent_job(...)) so the agent fabric (AG-P8/P-226) dispatches onto THIS exact runner.
 #
 # DAG POSITION (a documented, NAMED leaf consumer, exactly like myelin-git / myelin-issues /
-# myelin-notif / myelin-chat): it sits ABOVE the shared glue crates — it depends ONLY on
-# myelin-tenancy (the frozen Region partition type the FleetProvider trait names) and NOTHING in
-# the production library DAG depends back on it. It is therefore OUTSIDE the eleven-crate library
-# DAG modelled by `myelin-substrate::crate_graph` (substrate_is_root() / identity_is_sink() are
-# preserved — a subsystem crate is the graph's terminal consumer, not a node in it).
+# myelin-notif / myelin-chat): it sits ABOVE the shared glue crates and NOTHING in the production
+# library DAG depends back on it. It is therefore OUTSIDE the eleven-crate library DAG modelled by
+# `myelin-substrate::crate_graph` (substrate_is_root() / identity_is_sink() are preserved — a
+# subsystem crate is the graph's terminal consumer, not a node in it). This crate BEGAN with only
+# the myelin-tenancy edge (the frozen Region partition type the FleetProvider trait names) and has
+# since gained further, individually-justified acyclic dependencies as real needs arose: the shared
+# glue crates myelin-refs/myelin-events (job.done ArtifactRefs, the ci.* event taxonomy, and now
+# also `workspace_intent.rs`'s `myelin_refs::parse_scoped` validation of a checkout-bearing job's
+# `repo_ref`), and the standalone terminal-DAG-consumer substrate crates myelin-flow/myelin-notif
+# (each justified individually at its own entry below — none of them has an edge back to this
+# crate). CORRECTION (CT-007 slice 5b.3-1, Sol's review): an earlier version of this paragraph
+# claimed the crate "depends ONLY on myelin-tenancy" — that WAS accurate when originally written
+# (git history confirms it predated the other dependencies); it simply was never updated as those
+# were added. The invariant this paragraph protects — a leaf consumer, never a subsystem crate like
+# myelin-git, with nothing depending back — still holds; only the "ONLY myelin-tenancy" headline had
+# gone stale.
 #
 # DB-FREE / VM-FREE BY DEFAULT: this crate touches NO DB / object-store / cache / bus contract.
 # CI-P2 (P-237) adds the Firecracker default backend + the gVisor named-second backend + the
@@ -51,6 +62,9 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-flow = { path = "../myelin-flow" }
 # The `job.done` signal payload is references-not-payloads `ArtifactRef`s (§3.4) — the terminal
 # report carries result refs (the `ci.log.available` pointer + artifact refs), never a PII body.
+# ALSO (CT-007 slice 5b.3-1): `workspace_intent.rs` calls `myelin_refs::parse_scoped` directly to
+# validate a checkout-bearing job's `WorkspaceSpec.repo_ref` (subsystem/type/no-#sub, canonical
+# tenant/repo-id extraction) — the SAME already-justified edge, no new dependency.
 myelin-refs = { path = "../myelin-refs" }
 # CI's `ci.*` event taxonomy (EB-27 / P-327, M4 — `events.rs` + `replay.rs`) registers its complete
 # token list against the Bus grammar + provides CI's `ReindexSource` body. NON-TEST code now, so

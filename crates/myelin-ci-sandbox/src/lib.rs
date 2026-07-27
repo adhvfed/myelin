@@ -75,6 +75,7 @@ pub mod runner;
 pub mod self_hosted;
 pub mod snapshot_pool;
 pub mod user_namespace;
+mod workspace_intent;
 pub mod workspace_manager;
 pub mod workspace_storage;
 
@@ -399,7 +400,11 @@ pub struct WorkspaceSpec {
     /// The `ArtifactRef` of the repo to check out (a reference, not data), or `None` for an
     /// agent `compute` job that needs no checkout.
     pub repo_ref: Option<String>,
-    /// The commit/ref to check out (content-addressed).
+    /// The EXACT commit object id to check out (CT-007 slice 5b.3-1 — corrected stale doc: this is
+    /// NOT a ref name or an abbreviated hash; `crate::workspace_intent::derive_workspace_intent`
+    /// requires a full 40-character (SHA-1) or 64-character (SHA-256) lowercase-hex object id,
+    /// content-addressed and non-ambiguous, since it becomes the wire `want` this crate's own
+    /// checkout-preparation transport fetches).
     pub commit: Option<String>,
 }
 
