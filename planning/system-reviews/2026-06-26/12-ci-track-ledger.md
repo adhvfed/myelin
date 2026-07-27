@@ -1713,3 +1713,150 @@ needs steps 3–4 — the complete mapped graph passing on one real Myelin commi
 self-hosted instance, twice, with no GitHub execution and no manual green. That is real production
 dogfood infrastructure and higher blast radius than anything in this slice; per the standing
 instruction, it needs an explicit check-in before proceeding, not an autonomous continuation.
+
+## 2026-07-27 — check-in received; re-scoped steps 3-4 against the honest gate-2 floor; design correction with Sol on the checkout mechanism
+
+The founder gave explicit go-ahead to continue autonomously with Sol toward steps 3-4. Before
+attempting them, re-grounded against `ci-workload-inventory.toml`/`runner-assets.toml`: steps 3-4
+require ALL 12 GitHub jobs mapped and passing as one graph, and today only 1 of 12
+(`build-test-clippy`) has any progress at all, still `capability-smoke` not `capability-proven`.
+Steps 3-4 are not yet reachable; the honest next concrete unit is finishing `build-test-clippy`'s
+own vertical slice (per the 2026-07-25 reviewer redirection: one job fully end-to-end before
+Node/browser/Docker work for the other 11 rows starts).
+
+**Design consultation with Sol on the remaining shape of that slice.** Sol's initial recommended
+sequence (5a exact-commit materializer → 5b bind into `launch_with` → 6 cargo-vendor EROFS asset →
+7 dependency mount + env/cwd propagation → 8 direct capability proof + resource sizing → 9 real
+dispatch activation) was corrected on its own first slice once the concrete implementation
+architecture was researched and put to Sol directly:
+
+**Rejected: a host-side exact-commit Git-tree materializer.** The original slice-5a design
+(walk the commit's tree via `myelin-git`/git2, write it fd-relative/no-follow into the prepared
+Btrfs workspace on the HOST, entirely independent of gVisor) would require either promoting
+`myelin-ci-sandbox`'s `myelin-git` dependency from dev-only to a real production edge, or adding a
+new host-side Git-tree-walking API surface reachable from the CI runner. Sol's correction: this
+silently replaces the codebase's existing, deliberate boundary — CI checkout is supposed to go
+through the SCOPED JOB-TOKEN GIT WIRE (the same transport CT-006's git-wire work already hardened),
+never through the runner opening Git's bare-repository storage directly. A host-side materializer
+would let a malicious repository path/symlink get interpreted by host code before the sandbox ever
+exists; the git-wire path confines that entirely to the guest mount namespace, where the host never
+interprets repository paths at all.
+
+**Corrected sequencing:**
+- **Slice 5a (revised): fix the git-wire transport reliability prerequisite.** Task #33's
+  pre-existing "runsc stdin pipe unavailable" flake is now a hard blocker, not a side issue — the
+  checkout mechanism depends on the exact transport that flake lives in. Root-cause and fix it for
+  real: prove bounded bidirectional git smart-protocol transport through the production git-wire
+  path across empty input, early EOF, client disconnect, large pack data, timeout, cancellation,
+  and checked teardown, with no leaked runsc container/cgroup on any path.
+- **Slice 5b: a dedicated in-gVisor checkout preparation run.** Mounts only the prepared writable
+  workspace; runs as the mapped non-root uid/gid; authenticates with the scoped job token without
+  the bearer ever touching argv/env-logs/remote-url/`.git/config`; fetches the exact commit oid and
+  checks it out detached; disables hooks/global config/credential persistence/smudge-clean
+  filters/submodule recursion; rejects gitlinks before admitting the workspace; verifies `HEAD`
+  equals the requested oid; hashes the materialized `Cargo.lock`; confirms checked teardown before
+  the real workload's launch permit is acquired; follows the existing 7c cleanup-matrix rules
+  (release/settle/quarantine) on any failure path.
+- **Slice 6 (unchanged): the cargo-vendor EROFS asset** — keyed by `Cargo.lock` hash, built via
+  `cargo vendor --locked --versioned-dirs` from a clean verified checkout, a deterministic
+  (fixed-timestamp/UUID) `mkfs.erofs` image built twice and required byte-identical, promoted via
+  the same atomic immutable-version-directory pattern as the rootfs assets, with drift caught at
+  three boundaries (commit lint on `Cargo.lock` hash, startup verification of the staged EROFS
+  bytes/mount identity, and a per-launch re-hash of the materialized `Cargo.lock` before permit
+  commit).
+- **Slice 7 (unchanged): dependency mount + real env/cwd propagation.** A fixed read-only
+  `/opt/myelin/cargo-vendor` mount (`ro,nosuid,nodev`); a trusted, runtime-constructed Cargo
+  home/config forcing offline mode (never repository-authored); `CARGO_TARGET_DIR=/workspace/target`;
+  `OciConfig::from_spec` finally consuming validated `spec.env` (currently ignored); `process.cwd`
+  derived as `/workspace` for checkout-bearing jobs, `/` for compute jobs (never caller-selectable);
+  reserved runtime-owned variable names (`PATH`/`HOME`/`CARGO_HOME`/`CARGO_TARGET_DIR`); the real
+  GitHub job's env propagated (`CARGO_TERM_COLOR`/`CARGO_INCREMENTAL`/`RUSTFLAGS`/`RUSTDOCFLAGS`).
+  Noted as larger than `gvisor.rs` alone: the authored-job/resolved-plan/launch-authority schema
+  layers don't carry env values today even though `JobSpec` does — those need to carry requested env
+  through to server-authority validation, not let authored TOML bypass it.
+- **Slice 8 (unchanged): direct capability proof + resource sizing.** Run the real three-command
+  workload (`cargo build --workspace --locked && cargo test --workspace --locked && cargo clippy
+  --workspace --all-targets -D warnings`) against a clean checkout + verified vendor asset + offline
+  Cargo, first with generous limits while measuring peak memory/disk/pids/CPU/wall time, then rerun
+  from a clean workspace at final documented limits with headroom. Also resolves a real toolchain-
+  parity gap found during this design pass: GitHub's job requests floating `stable` while
+  `linux-rust-v1` is pinned to Rust 1.82 — both sides need pinning to the same explicit version
+  before this can honestly count as proof.
+- **Slice 9 (unchanged): real dispatch activation.** A committed `.myelin/ci.toml` job naming the
+  digest-pinned asset and the exact three-command workload, with env/dependency-asset/source-commit/
+  measured-limits flowing through the REAL path (`PipelineStarter` → resolved plan → runtime
+  authority → durable manifest/spec → runner poll loop → the `Enabled` `GvisorBackend`), a real exact
+  commit dispatched through it, and the real check/log projection reporting the result. A direct
+  `GvisorBackend` test call (slice 8) is necessary but insufficient for `capability-proven` — this is
+  the honest minimum, and gate 3 (all 12 jobs as one graph) does not own this missing per-job
+  dispatch machinery.
+
+**Immediate next unit of work:** slice 5a as revised — root-cause and fix task #33 (the git-wire
+"runsc stdin pipe unavailable" flake), since slice 5b's entire checkout mechanism depends on that
+exact transport. Not yet started as of this entry.
+
+## 2026-07-27 — task #33 root-caused and fixed: the git-wire "runsc stdin pipe unavailable" failure was a real, dated regression, not a flake (Sol, 2 review rounds)
+
+Slice 5a as revised (previous entry): task #33 is closed. Not a flake — a real, always-reproducible
+bug in the launch-gate seam, silent until a specific prior commit exposed it.
+
+**Root cause.** `SandboxCommand::spawn()` (`launch_gate.rs`)'s fenced branch always `child.stdin.
+take()`s the child's stdin pipe to write the gate-release byte, then unconditionally `drop(gate)`
+right after — permanently closing that pipe's write end inside `spawn()` itself, so `SandboxChild::
+stdin()` returned `None` for every fenced launch, full stop. Commit `ceb0d297a` ("R4.2: fence
+durable sandbox launch", 2026-07-23) introduced this; it was harmless as long as the only fenced
+launches were CI/agent jobs (which always pass `stdin: None`). Commit `30854984` ("CT-007: fix the
+pre-existing ContainerRun reserve/settle leak", 2026-07-26 — this same track's own prior work)
+threaded a real launch permit through git-wire for the first time, making ITS launches fenced too —
+and git-wire is exactly the caller that needs to pipe the stateless-rpc request body into the
+guest's stdin AFTER the gate releases. Reproduced live before any fix: 3/4 tests in
+`git_wire_prod_exec_test.rs` failed with exactly "runsc stdin pipe unavailable"; confirmed via
+`git stash` that the base commit fails identically (a real, dated regression, not environmental).
+
+**Fix, designed with Sol before writing code.** A new `PostGateStdin` enum (`Close` default /
+`ReturnToCaller`) on `SandboxCommand`, set via `return_stdin_to_caller_after_gate()` (asserts
+fenced). `spawn()`'s fenced branch now defers closing/restoring the pipe until AFTER
+`ownership.release()` succeeds — restoring it any earlier would leave an open writer inside `child`
+on a release-failure path, where a failed best-effort `kill_process_group` could then let
+`child.wait()` hang behind a guest still waiting for EOF on a pipe this function itself kept open.
+Every earlier failure branch (readiness-wait, `permit.commit()`, `ownership.validate()`, the
+gate-write itself, and the post-gate release failure) now explicitly `drop(gate)` before its
+kill/wait call, as an independent EOF backstop rather than relying solely on the process-group
+signal. `gvisor.rs` calls the new setter exactly when `fenced && stdin.is_some()` — the same
+condition it already computes today.
+
+**Review process:** 2 rounds with Sol. Round 1 confirmed the design and the fix mechanically, but
+found 2 real defects: the rustdoc referenced a nonexistent `LaunchPermitOwnership::release` type
+(fixed to plain text); and the required test list was short one case —
+`ownership.validate()` failure in retained mode (added, mirroring the existing
+`lost_post_commit_ownership_kills_guard_before_runtime_execution` test, asserting
+`SpawnPhase::CommittedButNotExecuted`, no exposed stdin, and a prompt return). Also took 2
+non-blocking recommendations: reworded a comment ("today's only behavior" → "the default/legacy
+behavior"), and hardened the new watchdog test against scheduler flakiness (100ms → 750ms deadline,
+plus an explicit poll-for-the-guest-actually-started step before relying on the watchdog). Round 2:
+**cleared to commit**, with two acknowledged non-blocking nits (a stale "test above" cross-reference
+that should say "below" — fixed directly; and a noted, accepted timing looseness in the watchdog
+test that Sol judged acceptable given the repo's existing timing-test precedent).
+
+**Tests added (10, all in `launch_gate.rs`'s existing `mod tests`, file total 7→17):** default
+Close still returns no stdin + immediate EOF; retained mode returns exactly one live pipe (and
+taking it twice yields `None` the second time); byte-exact payload round-trip for embedded
+newlines, a payload whose own leading bytes spell `launch\n` (proving the shell gate's `read -r`
+consumed only its OWN release line), NUL bytes, and an empty payload; failed commit in retained
+mode never exposes stdin; failed `ownership.validate()` in retained mode never exposes stdin;
+failed post-gate `ownership.release()` in retained mode drops stdin and returns promptly (elapsed
+< 2s asserted); a watchdog kills a runtime genuinely blocked reading a deliberately-never-closed
+retained pipe.
+
+**Verified:** all 4 `git_wire_prod_exec_test.rs` tests pass (were 3/4 failing before this fix,
+identically reproduced via `git stash` against the pre-fix tree); all 17 `launch_gate.rs` unit
+tests pass; `cargo clippy -p myelin-ci-sandbox --all-targets` clean on both feature-flag
+combinations; `cargo build --workspace --locked` clean; `cargo clippy --workspace --all-targets`
+clean on both feature-flag combinations; `myelin-lints` `lint-gate` clean (771 files, 0
+violations); `rustfmt --check` clean on both touched files; full `myelin-ci-sandbox`
+`--all-targets --features integration` suite green (337 lib tests + every integration file) except
+the SAME pre-existing, already-tracked `firecracker_production_launch_contains_the_corpus_non_root`
+failure (reconfirmed via `git stash` against clean HEAD to fail identically — unrelated to this fix).
+
+**Now open:** slice 5b — the dedicated in-gVisor checkout preparation run using this now-repaired
+git-wire transport (task #60), per Sol's architecture correction recorded in the entry above.
