@@ -1,0 +1,110 @@
+# systemd unit for the `ci-controlplane` binary (crates/myelin-ci-controlplane) running the CI
+# runner lane. See docs/ci-runner-deployment.md for the full host-provisioning story; run
+# scripts/install-ci-runner-host.sh BEFORE enabling this unit.
+#
+# Install:
+#   sudo cp deploy/systemd/myelin-ci-controlplane.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now myelin-ci-controlplane
+#
+# The full app config (DATABASE_URL, DATABASE_MIGRATION_URL, MYELIN_CELL_ID, etc. — see
+# crates/myelin-ci-controlplane/src/main.rs) is NOT duplicated here; store it in the EnvironmentFile
+# below, alongside the gVisor-runner-specific variables this unit documents directly.
+#
+# Every directive below (capabilities, cgroup delegation) was validated end-to-end against
+# `crates/myelin-ci-sandbox/src/gvisor.rs`'s real `explicit_user_namespace_boots_through_the_real_
+# enabled_backend_and_launch` drill — see docs/ci-runner-deployment.md's "Granting CAP_SYS_ADMIN/
+# CAP_CHOWN" and "Cgroup v2 delegation" sections for exactly how, and why each of the less-obvious
+# lines is there.
+
+[Unit]
+Description=Myelin CI control plane (runner lane)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=myelin-runner
+Group=myelin-runner
+# See the `Delegate=`/`DelegateSubgroup=` block below for why this wraps the real binary instead of
+# invoking it directly — TL;DR: the `+memory` `cgroup.subtree_control` write MUST happen from
+# `ExecStart`, never `ExecStartPre` (confirmed directly: identical `ExecStartPre` content
+# deterministically fails unit startup with "Failed to spawn executor: Device or resource busy",
+# while the exact same write from `ExecStart` succeeds every time — a systemd/kernel cgroup-v2
+# ordering interaction during a delegated unit's OWN startup, not a permissions issue). `exec` (not
+# a plain subshell) replaces this shell with the real binary so systemd's MainPID/signal tracking is
+# unaffected.
+ExecStart=/bin/sh -c 'CG="/sys/fs/cgroup$(sed -n "s#^0::##p" /proc/self/cgroup)"; echo +memory > "$CG/../cgroup.subtree_control"; exec /opt/myelin/bin/ci-controlplane'
+
+# --- Rootless gVisor base (already wired, works today) ---
+Environment=MYELIN_CI_RUNNER=1
+Environment=MYELIN_RUNSC_BIN=/opt/myelin/bin/runsc
+# MYELIN_GVISOR_ROOTFS / MYELIN_GVISOR_RUST_ROOTFS: point at the digest-pinned rootfs assets
+# `production_gvisor_registry()` (crates/myelin-ci-controlplane/src/runner_bind.rs) verifies at
+# startup. Staged via scripts/build-rust-rootfs.sh / the equivalent linux-small-v1 asset build.
+Environment=MYELIN_GVISOR_ROOTFS=/opt/myelin/rootfs
+Environment=MYELIN_GVISOR_RUST_ROOTFS=/opt/myelin/rust-rootfs
+
+# --- Explicit-userns + EphemeralDisk workspace activation (CT-007 slice 4 — NOT YET WIRED) ---
+# scripts/install-ci-runner-host.sh already provisions the host-side directories these name
+# (/opt/myelin/gvisor-runsc-root, /var/lib/myelin/userns-leases, /var/lib/myelin/ci-workspaces), and
+# the values below are exactly what a correctly-provisioned host expects — but
+# crates/myelin-ci-controlplane/src/runner_bind.rs:~491 still constructs `GvisorBackend::new(...)`
+# (Disabled workspace integration) rather than `GvisorBackend::try_new(..., GvisorWorkspaceConfig::
+# Enabled { .. }, ..)`, and crates/myelin-ci-controlplane/src/main.rs's `preflight_runner_host()` does
+# not yet call `preflight_explicit_userns_policy`. Uncomment these once that code change lands —
+# until then they are inert (read by nothing).
+# Environment=MYELIN_EXPLICIT_USERNS_RUNSC_ROOT=/opt/myelin/gvisor-runsc-root
+# Environment=MYELIN_EXPLICIT_USERNS_HELPER_DIR=/usr/bin
+# Environment=MYELIN_USERNS_LEASES_DIR=/var/lib/myelin/userns-leases
+# Environment=MYELIN_CI_WORKSPACES_DIR=/var/lib/myelin/ci-workspaces
+
+EnvironmentFile=/etc/myelin/ci-controlplane.env
+
+# --- CAP_SYS_ADMIN + CAP_CHOWN for the workspace lifecycle (needed only once EphemeralDisk is
+# enabled above): `workspace_storage.rs` shells out to `/usr/bin/btrfs` for `qgroup limit`,
+# `subvolume delete`, and `sync` (CAP_SYS_ADMIN), and to `/usr/bin/chown` to hand a fresh workspace
+# to the job's own userns-mapped uid/gid (CAP_CHOWN — a distinct capability, easy to miss since
+# CAP_SYS_ADMIN does NOT imply it). Delivered via AmbientCapabilities so both propagate to this
+# service's `btrfs`/`chown` child processes WITHOUT modifying the shared system binaries (the
+# alternative, `setcap cap_sys_admin+ep /usr/bin/btrfs`, would grant that capability to EVERY
+# process on the host able to execute it).
+#
+# Do NOT also restrict CapabilityBoundingSet to just these two capabilities. `runsc`'s explicit
+# user-namespace mode execs `newuidmap`/`newgidmap` (setuid-root helpers) to write the uid/gid
+# mapping; a setuid-root exec can never gain a capability outside the CALLING process's bounding
+# set, so narrowing it here breaks that escalation with an opaque `newuidmap failed: fork/exec
+# ... operation not permitted` — this was hit and confirmed directly. Leave CapabilityBoundingSet
+# at systemd's default (the full set); AmbientCapabilities alone already keeps what this process
+# itself actively wields to exactly CAP_SYS_ADMIN/CAP_CHOWN.
+AmbientCapabilities=CAP_SYS_ADMIN CAP_CHOWN
+# MUST stay false: same newuidmap/newgidmap concern as above — `NoNewPrivileges=true` (a common
+# systemd hardening default) makes the kernel ignore their setuid bit on exec entirely, silently
+# breaking every ExplicitUserNamespace launch regardless of the bounding set. Do not "harden" this
+# away.
+NoNewPrivileges=false
+
+# --- Cgroup v2 delegation for MemoryCgroup::create's per-job sandbox cgroups ---
+# `MemoryCgroup::create` (gvisor.rs) creates each job's memory-bounding cgroup as a SIBLING of this
+# process's own cgroup, requiring this process to have write access to its OWN cgroup's PARENT
+# directory with `memory` already enabled in that parent's `cgroup.subtree_control`.
+# `DelegateSubgroup=supervisor` places the actual service process one level below the delegated
+# boundary (in a `supervisor/` subgroup) specifically so that boundary itself — this process's
+# cgroup's parent — is the thing delegated to `myelin-runner`, leaving room for sibling cgroups
+# beside `supervisor/`. `Delegate=memory` chowns that boundary to this unit but does NOT itself
+# populate its `cgroup.subtree_control` (confirmed directly: without the `ExecStart` write above,
+# the delegated boundary reports as owned by `myelin-runner` yet an EMPTY `cgroup.subtree_control`,
+# so `supervisor/cgroup.controllers` shows no `memory` and `MemoryCgroup::create` fails closed with
+# `Permission denied`) — this is a genuinely separate step, not automatic, hence the explicit write
+# in `ExecStart` above (see that line's own comment for why it CANNOT live in `ExecStartPre`).
+Delegate=memory
+DelegateSubgroup=supervisor
+
+Restart=on-failure
+RestartSec=5
+# The harness drains gracefully on SIGTERM (see myelin_substrate::serve_until_shutdown); give it
+# real headroom above the runner's own in-flight-job drain deadline.
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target
