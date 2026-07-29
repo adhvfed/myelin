@@ -2362,3 +2362,69 @@ the live drill through the public launch path) remain scoped only at a task-desc
 of the checkout-authorization plumbing landed in 5b.3-2a/2b/2c is actually INVOKED by a real launch
 yet (the hook is configured but nothing calls it until 5b.3-3+ wires Hop A through it). Task #20 and
 the live-drill host-provisioning gap (two entries up) are unchanged.
+
+## 2026-07-29 — CT-007 slice 5b.3-3 landed: parent-attempt Hop A git-wire transport (Sol, design +
+## 4 review rounds)
+
+`fetch_checkout_pack` (Hop A) is now refactored into a parent-attempt-native transport that can run
+its two nested git-wire executions (advertise-refs, fetch) entirely within an outer attempt's own
+reserve/settle cycle, instead of opening its own independent one — the structural double-reserve
+hazard ledger 12 flagged when 5b.3-3 was scoped. NOT yet wired into `launch_with` (that's 5b.3-6,
+deliberately deferred per the design) — this slice lands only the transport itself and its test
+coverage.
+
+**What landed:**
+- `build_git_wire_job`/`build_git_wire_oci_config` — the standalone billed path
+  (`launch_git_command`) and the new parent-attempt transport now share the SAME hooks-free
+  job/config construction; `launch_git_command`'s own hooks-dependent checks stay interleaved in the
+  exact same relative order as before (confirmed behavior-preserving — all 440 pre-existing tests
+  unchanged throughout).
+- `run_git_wire_container_raw` — the pre-settlement half of `run_git_wire_container`, returning the
+  structured `RuntimeFinalization` (or, for genuine pre-finalize failures, a bare `RunFailure`)
+  instead of the standalone path's already-collapsed `Result`. Paired with a `BundleCleanupProof`
+  (`Result<(), String>`) carried OUTSIDE the `RunFailure`/`RuntimeTeardownError` machinery (both are
+  shared with every other `finalize_and_merge` caller in the file — widening either was out of
+  scope) — `Err` whenever this function's own best-effort bundle-dir cleanup couldn't be verified.
+- `fetch_checkout_pack_within_parent_attempt` — takes no `RunnerHooks`/`MeterTarget`/`IdemToken`/
+  workload `LaunchPermit`; consumes the one-shot `CheckoutAuthorizationProof` by value and verifies
+  its scope + run-token generation against the request BEFORE spawning anything; drives both hops
+  with `LaunchPermit::immediate()`; fully retires each child+bundle itself.
+- `CheckoutTransportError` — `Refused` (nothing spawned) / `Failed` (usage safely settleable) /
+  `TeardownUnproven` (teardown or cleanup not independently proven) / `UsageUnrepresentable`
+  (checked-add overflow; carries `teardown_unproven: bool` as an orthogonal fact, never collapsed
+  into one variant choice).
+- Fixed a real pre-existing leak found along the way: `stage_config_only_bundle` (shared by git-wire
+  and Hop B's `run_checkout_preparation`) could leave its just-created directory behind if writing
+  `config.json` failed — now best-effort cleaned up, reported via `StageBundleError::leaked`.
+
+**Sol's review, 4 rounds — every round found real, substantive issues, none rubber-stamped:**
+- Round 1: a non-passing/timed-out guest execution with syntactically valid output could be accepted
+  as success (no `passed()` check); the executor seam collapsed genuine teardown-unproven outcomes
+  into ordinary `RunFailure` before the parent-attempt code ever saw them; the overflow disposition
+  silently discarded a simultaneous retirement failure and mislabeled the result; `usage_before ==
+  zero` was used as a "no prior hop ran" marker, conflating a numeric fact with a phase fact (a
+  completed hop can genuinely measure zero usage).
+- Round 2: pre-finalization bundle-cleanup failures (cgroup-creation-failure arm, and the
+  `run_and_capture`-returned-`Err` arm that still flows through `finalize_and_merge`) were still
+  silently discarded, so a first-hop failure could map to the free `Refused` even when a bundle
+  leaked; usage-representability and teardown-proof were treated as one choice instead of orthogonal
+  facts; a finalization failure's message reported only the teardown problem, dropping a
+  simultaneous non-passing/truncated/stream-errored guest result.
+- Round 3: `CommitOutcomeUnknown` (an already-unreachable case under an immediate permit) still
+  erased a real, independent teardown failure by returning ordinary `Failed`; `BundleCleanupProof`
+  was enforced only on the error side of the result, leaving a type-level (never currently
+  production-reachable) gap where an `Ok` finalization paired with a failed cleanup proof would
+  silently drop the cleanup fact.
+- Round 4: cleared — both fixes confirmed correct, diff independently verified against the worktree.
+
+**Test coverage:** grew from the original 13 to 21 tests in the new `checkout_transport_5b3_3`
+module (deterministic executor-injection throughout — real runsc/git-rootfs integration is 5b.3-7).
+Full sweep clean each round: `cargo test -p myelin-ci-sandbox --lib` (461 passed, 0 failed),
+`cargo clippy` `-D warnings` on both default and `--features integration`, `cargo check --workspace
+--tests`.
+
+**Still open:** 5b.3-4 through 5b.3-7 (durable pre-workload usage across the launch-CAS ambiguity
+window; honest terminal dispositions for preparation-only outcomes; composing the full sequence into
+`launch_with`; the live drill through the public launch path) remain scoped only at a
+task-description level. The parent-attempt transport landed here is not yet called from anywhere —
+5b.3-6 wires it in. Task #20 and the live-drill host-provisioning gap are unchanged.
