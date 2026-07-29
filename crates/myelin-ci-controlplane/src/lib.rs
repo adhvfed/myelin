@@ -1077,8 +1077,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            44,
-            "all 18 tables, three ci_run forward ALTERs, 8 concurrent indexes, the ledger validator, 4 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, 3 ci_run/workflow discovery grants, and 1 scheduler ci_job reap-reset grant are present"
+            48,
+            "all 20 tables, three ci_run forward ALTERs, 8 concurrent indexes, the ledger validator, 4 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, 3 ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, and 1 scheduler prelaunch-usage reap grant are present"
         );
         assert!(
             spec.consumers.is_empty(),
