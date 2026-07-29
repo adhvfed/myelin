@@ -48,11 +48,11 @@ use crate::workspace_manager::{
 };
 use crate::workspace_storage::WorkspaceStorageError;
 use crate::{
-    drain_capped, CompletionSettlementOwner, EgressPolicy, HookError, IdemToken, ImageRef, JobKind,
-    JobSpec, LaunchPermit, MeterTarget, ReserveHandle, ResourceLimits, ResourceUsage,
-    RunTokenCredential, RunnerHooks, SandboxBackend, SandboxCancellation, SandboxHandle,
-    SandboxLaunch, SandboxLaunchError, SandboxOutputSink, SandboxOutputStream, SandboxResult,
-    TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
+    drain_capped, CheckoutAuthorizationProof, CompletionSettlementOwner, EgressPolicy, HookError,
+    IdemToken, ImageRef, JobKind, JobSpec, LaunchPermit, MeterTarget, ReserveHandle,
+    ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend,
+    SandboxCancellation, SandboxHandle, SandboxLaunch, SandboxLaunchError, SandboxOutputSink,
+    SandboxOutputStream, SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
@@ -5229,43 +5229,7 @@ impl GvisorBackend {
         command: Vec<String>,
         cancellation: &AtomicBool,
     ) -> Result<SandboxLaunch, WireError> {
-        if cancellation.load(Ordering::Acquire) {
-            return Err(WireError::Runtime(
-                "Git wire launch cancelled by process shutdown".into(),
-            ));
-        }
-        // Bound the request body BEFORE anything spawns (a client cannot force unbounded host buffering).
-        if spec.stdin.len() > WIRE_STDIN_BOUND {
-            return Err(WireError::StdinTooLarge {
-                len: spec.stdin.len(),
-                cap: WIRE_STDIN_BOUND,
-            });
-        }
-        // Symlink-path defence in depth (CT-006b 4a): the resolved repo MUST be a real directory under
-        // the canonicalized root before it is bind-mounted (a symlinked `<repo>.git`/component cannot
-        // make the RO mount follow out of the tenant tree). REFUSED here, before any container spawns.
-        assert_repo_under_root(&spec.root, &spec.repo_host_path)?;
-        // Build the internal hardened JobSpec so the git wire inherits the SAME profile + guarantees as
-        // every CI/agent job (the image is a placeholder — gVisor runs the staged rootfs, not an image).
-        let image = ImageRef::pinned(
-            "sandbox/git-wire@sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .map_err(|e| WireError::Runtime(e.to_string()))?;
-        let job = JobSpec::new(
-            JobKind::Ci,
-            image,
-            command,
-            vec![],
-            vec![],
-            EgressPolicy::deny_all(), // a serve needs no egress (egress-deny / no-netns).
-            spec.limits,
-            WorkspaceSpec::default(),
-            TrustTier::Trusted,
-            spec.run_token.clone(),
-            spec.meter_to.clone(),
-            spec.idem_token.clone(),
-        )
-        .map_err(|e| WireError::Runtime(e.to_string()))?;
+        let job = build_git_wire_job(spec, command, cancellation)?;
 
         // The git wire is a direct synchronous API call (an HTTP-shaped request/response), NOT a
         // `RunnerAgent`-mediated job with a terminal reporter parked above it. There is no
@@ -5284,22 +5248,7 @@ impl GvisorBackend {
 
         // Derive the isolation/config posture before the final mutable launch boundary.
         hooks.enforce_isolation_floor(&job)?;
-        let profile = HardeningProfile::derive(&job);
-        profile.assert_enforced().map_err(WireError::Hardening)?;
-
-        // The staged rootfs is referenced by an ABSOLUTE `root.path` (no symlink — required alongside
-        // the host bind mounts). Canonicalize so the path is absolute; an absent rootfs is caught
-        // (fail-closed) in `run_git_wire_container`.
-        let rootfs = resolved_gvisor_git_rootfs();
-        let root_abs = std::fs::canonicalize(&rootfs).unwrap_or_else(|_| rootfs.clone());
-        let cfg = OciConfig::from_spec(&job, &profile)
-            .with_extra_env(spec.env.clone())
-            .with_rootless_host_mounts(
-                root_abs,
-                spec.repo_host_path.clone(),
-                spec.quarantine_host_path.clone(),
-            )
-            .map_err(WireError::Runtime)?;
+        let (cfg, rootfs) = build_git_wire_oci_config(&job, spec)?;
         let reserve = hooks.reserve(&job)?;
         // Thread the REAL launch permit through to `run_and_capture` (Sol's fix): the old
         // `hooks.attribute(&job)` eagerly committed-and-released attribution HERE, before any
@@ -5397,6 +5346,83 @@ impl GvisorBackend {
     }
 }
 
+/// Shared, hooks-free git-wire request validation + `JobSpec` construction (CT-007 slice 5b.3-3):
+/// the piece [`GvisorBackend::launch_git_command`] (the standalone, billed git-wire path) and the
+/// parent-attempt Hop A transport ([`fetch_checkout_pack_within_parent_attempt`]) both need
+/// identically, with NO reserve/permit/settle of any kind. An `Err` here means nothing has spawned —
+/// both callers can treat it as genuinely free.
+fn build_git_wire_job(
+    spec: &GitWireSpec,
+    command: Vec<String>,
+    cancellation: &AtomicBool,
+) -> Result<JobSpec, WireError> {
+    if cancellation.load(Ordering::Acquire) {
+        return Err(WireError::Runtime(
+            "Git wire launch cancelled by process shutdown".into(),
+        ));
+    }
+    // Bound the request body BEFORE anything spawns (a client cannot force unbounded host buffering).
+    if spec.stdin.len() > WIRE_STDIN_BOUND {
+        return Err(WireError::StdinTooLarge {
+            len: spec.stdin.len(),
+            cap: WIRE_STDIN_BOUND,
+        });
+    }
+    // Symlink-path defence in depth (CT-006b 4a): the resolved repo MUST be a real directory under
+    // the canonicalized root before it is bind-mounted (a symlinked `<repo>.git`/component cannot
+    // make the RO mount follow out of the tenant tree). REFUSED here, before any container spawns.
+    assert_repo_under_root(&spec.root, &spec.repo_host_path)?;
+    // Build the internal hardened JobSpec so the git wire inherits the SAME profile + guarantees as
+    // every CI/agent job (the image is a placeholder — gVisor runs the staged rootfs, not an image).
+    let image = ImageRef::pinned(
+        "sandbox/git-wire@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    )
+    .map_err(|e| WireError::Runtime(e.to_string()))?;
+    JobSpec::new(
+        JobKind::Ci,
+        image,
+        command,
+        vec![],
+        vec![],
+        EgressPolicy::deny_all(), // a serve needs no egress (egress-deny / no-netns).
+        spec.limits,
+        WorkspaceSpec::default(),
+        TrustTier::Trusted,
+        spec.run_token.clone(),
+        spec.meter_to.clone(),
+        spec.idem_token.clone(),
+    )
+    .map_err(|e| WireError::Runtime(e.to_string()))
+}
+
+/// Shared, hooks-free hardening-profile derivation + OCI config construction (CT-007 slice 5b.3-3) —
+/// the other half of [`build_git_wire_job`]'s split, separated only so the standalone path can still
+/// interleave its own `hooks`-dependent `enforce_isolation_floor` check between the two (byte-identical
+/// check ORDER to before this extraction). Returns the config plus the resolved (possibly-absent;
+/// `run_git_wire_container` fails closed on that) rootfs path.
+fn build_git_wire_oci_config(
+    job: &JobSpec,
+    spec: &GitWireSpec,
+) -> Result<(OciConfig, PathBuf), WireError> {
+    let profile = HardeningProfile::derive(job);
+    profile.assert_enforced().map_err(WireError::Hardening)?;
+
+    // The staged rootfs is referenced by an ABSOLUTE `root.path` (no symlink — required alongside
+    // the host bind mounts). Canonicalize so the path is absolute; an absent rootfs is caught
+    // (fail-closed) in `run_git_wire_container`.
+    let rootfs = resolved_gvisor_git_rootfs();
+    let root_abs = std::fs::canonicalize(&rootfs).unwrap_or_else(|_| rootfs.clone());
+    let cfg = OciConfig::from_spec(job, &profile)
+        .with_extra_env(spec.env.clone())
+        .with_rootless_host_mounts(
+            root_abs,
+            spec.repo_host_path.clone(),
+            spec.quarantine_host_path.clone(),
+        )
+        .map_err(WireError::Runtime)?;
+    Ok((cfg, rootfs))
+}
+
 /// Dispose of a post-reserve [`RunFailure`] from `run_git_wire_container` into the correct
 /// [`WireError`], settling/releasing the reservation along the way wherever that is safe.
 /// `CommitOutcomeUnknown` still settles/releases NOTHING here, same as gVisor's own
@@ -5469,14 +5495,76 @@ fn run_git_wire_container(
     cancellation: &AtomicBool,
     launch_permit: LaunchPermit,
 ) -> Result<(ContainerRun, bool), RunFailure> {
+    // The standalone billed path drops the second tuple element (Sol's round-3 review: "the
+    // standalone wrapper may collapse it back for compatibility") — its own `hooks.release_unused`
+    // contract already only ever attempted best-effort bundle cleanup, never independently verified
+    // it, so this is byte-identical to its prior behavior.
+    let (finalization, _bundle_cleanup_proof) =
+        run_git_wire_container_raw(job, cfg, stdin, rootfs, cancellation, launch_permit);
+    settle_finalization(
+        finalization?,
+        |(run, _): &(ContainerRun, bool)| run.result.usage,
+        |(run, _): (ContainerRun, bool), teardown| {
+            discard_container_run_after_teardown_failure(run, teardown)
+        },
+    )
+}
+
+/// A git-wire hop's pre-settlement outcome: `Finalized` means teardown was independently proven
+/// (whichever way the hop's own `Result` came out); `Failed` means teardown itself could not be
+/// proven, alongside whatever the hop's own `Result` was. Named (rather than inlined) purely to keep
+/// clippy's `type_complexity` lint quiet — the meaning is exactly [`RuntimeFinalization`]'s.
+type GitWireHopFinalization = RuntimeFinalization<Result<(ContainerRun, bool), RunFailure>>;
+
+/// Whether [`run_git_wire_container_raw`]'s OWN bundle-dir cleanup — on every path that removes it
+/// BEFORE the caller ever sees a live [`ContainerRun`] to retire itself — was independently proven
+/// (CT-007 slice 5b.3-3, Sol's round-3 review, blocker 1). `Ok(())` covers BOTH "nothing was ever
+/// created" and "removal verified"; `Err` means a bundle directory may still be sitting on disk with
+/// nobody now responsible for it. Deliberately carried OUTSIDE `RunFailure`/`RuntimeTeardownError`
+/// rather than folded into either: both are shared with EVERY other `finalize_and_merge`/
+/// `settle_finalization` caller in this file, and widening either just to carry this one
+/// git-wire-specific fact would ripple into unrelated callers for no benefit. The standalone billed
+/// path ([`run_git_wire_container`]) simply drops this value (see its own doc); the parent-attempt
+/// transport must not — an unproven value there forces a `TeardownUnproven` disposition regardless of
+/// what the `RunFailure`/`RuntimeFinalization` half would otherwise say.
+type BundleCleanupProof = Result<(), String>;
+
+/// The pre-settlement half of [`run_git_wire_container`] (CT-007 slice 5b.3-3, Sol's review, blocker
+/// 2): identical body, but returns the [`RuntimeFinalization`] BEFORE `settle_finalization` collapses
+/// it into a bare `Result<(ContainerRun, bool), RunFailure>` — a collapse that is lossy for a caller
+/// that needs to distinguish "the run failed for its own reason" from "the run's own result was fine
+/// but teardown itself could not be independently proven." The standalone path
+/// ([`run_git_wire_container`], above) never needed that distinction (it always settles/releases
+/// through `hooks` either way) — the parent-attempt Hop A transport does, since a teardown-unproven
+/// outcome must surface as [`CheckoutTransportError::TeardownUnproven`], never silently folded into
+/// an ordinary `Failed`. Outer `Result` mirrors [`run_production_container_streaming`]'s established
+/// shape: a pre-finalize failure (absent rootfs, bad OCI layout, bundle staging, cgroup creation) is
+/// unconditionally `Uncommitted` — `finalize_runtime` was never reached, so there is no teardown
+/// question to represent at all. The paired [`BundleCleanupProof`] (Sol's round-3 review, blocker 1)
+/// is `Ok(())` whenever nothing needed removing yet or removal was verified, `Err` whenever THIS
+/// function's own best-effort bundle-dir cleanup could not be confirmed.
+fn run_git_wire_container_raw(
+    job: &JobSpec,
+    cfg: &OciConfig,
+    stdin: Vec<u8>,
+    rootfs: &Path,
+    cancellation: &AtomicBool,
+    launch_permit: LaunchPermit,
+) -> (
+    Result<GitWireHopFinalization, RunFailure>,
+    BundleCleanupProof,
+) {
     let bin = runsc_bin();
     if !rootfs.exists() {
-        return Err(RunFailure::uncommitted(format!(
-            "staged gVisor git rootfs absent: {} (the git wire REQUIRES a real `git` in the guest — \
-             stage a git-bearing rootfs and point {ENV_GVISOR_GIT_ROOTFS} at it; see \
-             tests/git_wire_prod_exec_test.rs)",
-            rootfs.display()
-        )));
+        return (
+            Err(RunFailure::uncommitted(format!(
+                "staged gVisor git rootfs absent: {} (the git wire REQUIRES a real `git` in the \
+                 guest — stage a git-bearing rootfs and point {ENV_GVISOR_GIT_ROOTFS} at it; see \
+                 tests/git_wire_prod_exec_test.rs)",
+                rootfs.display()
+            ))),
+            Ok(()), // nothing was ever staged
+        );
     }
     // CT-007 slice 3, piece 7b (Sol's round-3 review): validated BEFORE staging anything, exactly
     // like the production path — `run_git_wire_container`'s own signature does not structurally
@@ -5484,13 +5572,25 @@ fn run_git_wire_container(
     // this invariant must be enforced here, not merely true by convention. 7b never constructs a
     // non-Rootless prepared mode in production — 7c adds that constructor.
     let prepared_mode = PreparedRuntimeMode::Rootless;
-    let mode = require_oci_layout_matches_prepared_mode(cfg, &prepared_mode)
-        .map_err(RunFailure::uncommitted)?;
+    let mode = match require_oci_layout_matches_prepared_mode(cfg, &prepared_mode) {
+        Ok(mode) => mode,
+        Err(e) => return (Err(RunFailure::uncommitted(e)), Ok(())), // nothing was ever staged
+    };
 
     // Stage a config-only bundle: `cfg`'s `root.path` is the ABSOLUTE staged rootfs (set by
     // `launch_git_wire`), so no `rootfs` symlink is staged (a symlinked root.path + a host bind mount
     // makes the rootless gofer fail to start the sandbox; an absolute root.path + bind mount works).
-    let bundle_dir = stage_git_wire_bundle(cfg).map_err(RunFailure::uncommitted)?;
+    let bundle_dir = match stage_git_wire_bundle(cfg) {
+        Ok(dir) => dir,
+        Err(e) => {
+            let cleanup_proof = if e.leaked {
+                Err(e.message.clone())
+            } else {
+                Ok(())
+            };
+            return (Err(RunFailure::uncommitted(e.message)), cleanup_proof);
+        }
+    };
     let container_id = format!("myelin-gitwire-{}-{}", std::process::id(), unique_suffix());
 
     // CT-007 slice 3, piece 7b: cgroup ownership hoisted up here (see
@@ -5499,8 +5599,9 @@ fn run_git_wire_container(
     let cgroup = match MemoryCgroup::create(job.limits.mem_bytes) {
         Ok(cgroup) => cgroup,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&bundle_dir);
-            return Err(RunFailure::uncommitted(e));
+            let cleanup_proof = std::fs::remove_dir_all(&bundle_dir)
+                .map_err(|re| format!("bundle dir {bundle_dir:?} removal failed: {re}"));
+            return (Err(RunFailure::uncommitted(e)), cleanup_proof);
         }
     };
 
@@ -5527,73 +5628,109 @@ fn run_git_wire_container(
         mode,
         &cgroup,
     );
-    let primary: Result<(ContainerRun, bool), RunFailure> = match result {
-        Ok(outcome) => {
-            let stdout_truncated = outcome.stdout_truncated;
-            // The git-wire path's stdout is the git smart-transport packfile/protocol stream
-            // (StreamToFile), NOT job LOG output — it never reaches the durable log pipeline, and
-            // masking arbitrary bytes in a binary packfile would corrupt it. So this path NEVER
-            // redacts (an explicit `none()`, not `for_job`) — a deliberate distinction that matters
-            // the day CI-1 injection makes `for_job` non-empty. Boundary redaction is a LOG-path
-            // concern (the CappedHead capture in `run_production_container`), not a transport-path
-            // concern.
-            let result = build_result(job, &outcome, &RedactionPlan::none());
-            Ok((
-                ContainerRun {
-                    child: Box::new(SpawnedRunsc {
-                        bin,
-                        container_id: container_id.clone(),
-                        mode,
-                    }),
-                    bundle_dir,
-                    result,
-                    run_error: outcome.stream_error,
-                },
-                stdout_truncated,
-            ))
-        }
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&bundle_dir);
-            Err(e)
-        }
-    };
-    let finalization = finalize_and_merge(
-        primary,
-        bin,
-        &container_id,
-        &prepared_mode,
-        cgroup,
-        RUNTIME_QUIESCE_TIMEOUT,
-        child_retirement,
-    );
-    settle_finalization(
-        finalization,
-        |(run, _): &(ContainerRun, bool)| run.result.usage,
-        |(run, _): (ContainerRun, bool), teardown| {
-            discard_container_run_after_teardown_failure(run, teardown)
-        },
+    let (primary, cleanup_proof): (Result<(ContainerRun, bool), RunFailure>, BundleCleanupProof) =
+        match result {
+            Ok(outcome) => {
+                let stdout_truncated = outcome.stdout_truncated;
+                // The git-wire path's stdout is the git smart-transport packfile/protocol stream
+                // (StreamToFile), NOT job LOG output — it never reaches the durable log pipeline, and
+                // masking arbitrary bytes in a binary packfile would corrupt it. So this path NEVER
+                // redacts (an explicit `none()`, not `for_job`) — a deliberate distinction that matters
+                // the day CI-1 injection makes `for_job` non-empty. Boundary redaction is a LOG-path
+                // concern (the CappedHead capture in `run_production_container`), not a transport-path
+                // concern.
+                let result = build_result(job, &outcome, &RedactionPlan::none());
+                (
+                    Ok((
+                        ContainerRun {
+                            child: Box::new(SpawnedRunsc {
+                                bin,
+                                container_id: container_id.clone(),
+                                mode,
+                            }),
+                            bundle_dir,
+                            result,
+                            run_error: outcome.stream_error,
+                        },
+                        stdout_truncated,
+                    )),
+                    // The bundle dir now lives on inside `ContainerRun` for the caller to retire —
+                    // nothing was removed here, so there is nothing yet to (dis)prove.
+                    Ok(()),
+                )
+            }
+            Err(e) => {
+                let cleanup_proof = std::fs::remove_dir_all(&bundle_dir)
+                    .map_err(|re| format!("bundle dir {bundle_dir:?} removal failed: {re}"));
+                (Err(e), cleanup_proof)
+            }
+        };
+    (
+        Ok(finalize_and_merge(
+            primary,
+            bin,
+            &container_id,
+            &prepared_mode,
+            cgroup,
+            RUNTIME_QUIESCE_TIMEOUT,
+            child_retirement,
+        )),
+        cleanup_proof,
     )
+}
+
+/// A [`stage_config_only_bundle`] failure (CT-007 slice 5b.3-3, Sol's round-3 review): `message` is
+/// the failure text; `leaked` is `true` iff a bundle directory may still exist on disk despite the
+/// failure — this function's own best-effort cleanup of ITS OWN partially-staged directory could not
+/// be verified. `false` means either nothing was ever created, or it was verified removed.
+struct StageBundleError {
+    message: String,
+    leaked: bool,
+}
+
+impl std::fmt::Display for StageBundleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
 }
 
 /// Stage a CONFIG-ONLY OCI bundle (just `config.json`) — the rootfs is referenced by the config's
 /// ABSOLUTE `root.path`, so no `rootfs` symlink is staged. `label` only names the temp-dir prefix
 /// (for operator readability, e.g. `ps`/`ls /tmp` output) — it carries no security meaning. Returns
-/// the bundle dir (removed on teardown).
-fn stage_config_only_bundle(cfg: &OciConfig, label: &str) -> Result<PathBuf, String> {
+/// the bundle dir (removed on teardown). Sol's round-3 review: previously, a `config.json` write
+/// failure left the just-created directory behind unconditionally — now best-effort cleaned up, with
+/// the outcome reported via [`StageBundleError::leaked`] rather than silently discarded.
+fn stage_config_only_bundle(cfg: &OciConfig, label: &str) -> Result<PathBuf, StageBundleError> {
     let bundle = std::env::temp_dir().join(format!(
         "myelin-{label}-bundle-{}-{}",
         std::process::id(),
         unique_suffix()
     ));
     let _ = std::fs::remove_dir_all(&bundle);
-    std::fs::create_dir_all(&bundle).map_err(|e| format!("create bundle dir {bundle:?}: {e}"))?;
-    std::fs::write(bundle.join("config.json"), cfg.to_json())
-        .map_err(|e| format!("write config.json: {e}"))?;
+    std::fs::create_dir_all(&bundle).map_err(|e| StageBundleError {
+        message: format!("create bundle dir {bundle:?}: {e}"),
+        leaked: false, // create_dir_all failing never leaves a NEW directory behind
+    })?;
+    if let Err(e) = std::fs::write(bundle.join("config.json"), cfg.to_json()) {
+        return Err(match std::fs::remove_dir_all(&bundle) {
+            Ok(()) => StageBundleError {
+                message: format!("write config.json: {e}"),
+                leaked: false,
+            },
+            Err(cleanup_err) => StageBundleError {
+                message: format!(
+                    "write config.json: {e} AND cleaning up the partially-staged bundle dir also \
+                     failed: {cleanup_err}"
+                ),
+                leaked: true,
+            },
+        });
+    }
     Ok(bundle)
 }
 
 /// Stage a CONFIG-ONLY OCI bundle for the git wire — see [`stage_config_only_bundle`].
-fn stage_git_wire_bundle(cfg: &OciConfig) -> Result<PathBuf, String> {
+fn stage_git_wire_bundle(cfg: &OciConfig) -> Result<PathBuf, StageBundleError> {
     stage_config_only_bundle(cfg, "gitwire")
 }
 
@@ -6090,6 +6227,804 @@ pub(crate) fn fetch_checkout_pack(
     })
 }
 
+/// The outcome of a successful parent-attempt Hop A transport (CT-007 slice 5b.3-3): the fetched
+/// pack plus the REAL measured usage across BOTH nested git-wire executions (advertise + fetch),
+/// checked-summed. Never settled here — the caller (5b.3-6's `launch_with` splice) folds this into
+/// the ONE aggregate settlement for the whole attempt, alongside Hop B's and the workload's own usage.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct ParentAttemptCheckoutTransportOutcome {
+    pack: PrefetchedCheckoutPack,
+    usage: ResourceUsage,
+}
+
+impl ParentAttemptCheckoutTransportOutcome {
+    #[allow(dead_code)]
+    pub(crate) fn into_parts(self) -> (PrefetchedCheckoutPack, ResourceUsage) {
+        (self.pack, self.usage)
+    }
+}
+
+/// Every way the parent-attempt Hop A transport (5b.3-3) can fail. Deliberately NOT
+/// [`CheckoutPreparationError`] (Hop B's own error type): a Hop A failure AFTER the advertisement run
+/// has already consumed measurable, non-free resources, and reusing `CheckoutPreparationError::Refused`
+/// here would silently discard that usage.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum CheckoutTransportError {
+    /// Refused before anything spawned for the WHOLE transport (a proof/scope/token-generation
+    /// mismatch, or a malformed request) — there is no usage to account.
+    Refused { message: String },
+    /// A real execution ran and failed (a non-passing exit, a malformed wire response, an
+    /// unreachable want, or output that exceeded the wire cap) — `usage` carries everything
+    /// measured up through the point of failure and must still be folded into the parent attempt's
+    /// aggregate settlement, never treated as free.
+    Failed {
+        message: String,
+        usage: ResourceUsage,
+    },
+    /// A real execution ran, but this function could not independently prove the nested container
+    /// was fully retired (child killed AND bundle removed, OR `finalize_runtime`'s own OS-level
+    /// teardown checks) — `usage` still carries everything measured. The caller must treat this as a
+    /// genuine teardown-unproven condition, never silently discard the possibly-leaked resources.
+    TeardownUnproven {
+        message: String,
+        usage: ResourceUsage,
+    },
+    /// Real, measured usage occurred (Sol's review, blocker 3), but the exact total can no longer be
+    /// honestly represented (a checked `ResourceUsage` addition overflowed). `usage` is the LAST
+    /// EXACT total this function could still prove (never a wrapped/truncated/best-guess value) —
+    /// distinct from `Failed` precisely because `Failed.usage` is a contract the caller may safely
+    /// settle, and an overflowed total is NOT safely settleable as-is. This is an
+    /// accounting/reconciliation failure, not an ordinary transport failure. `teardown_unproven`
+    /// (Sol's round-3 review) is an ORTHOGONAL fact, never collapsed into this one variant's choice:
+    /// usage-representability and teardown-proof are independent axes, and 5b.3-6 must be able to act
+    /// on both (whether it's safe to settle at all, AND whether resources might still be live).
+    UsageUnrepresentable {
+        message: String,
+        usage: ResourceUsage,
+        teardown_unproven: bool,
+    },
+}
+
+impl std::fmt::Display for CheckoutTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckoutTransportError::Refused { message } => {
+                write!(f, "checkout transport refused: {message}")
+            }
+            CheckoutTransportError::Failed { message, .. } => {
+                write!(f, "checkout transport failed: {message}")
+            }
+            CheckoutTransportError::TeardownUnproven { message, .. } => {
+                write!(f, "checkout transport teardown unproven: {message}")
+            }
+            CheckoutTransportError::UsageUnrepresentable {
+                message,
+                teardown_unproven,
+                ..
+            } => {
+                write!(
+                    f,
+                    "checkout transport usage unrepresentable (teardown_unproven={teardown_unproven}): {message}"
+                )
+            }
+        }
+    }
+}
+
+/// Checked (never wrapping/saturating) `ResourceUsage` aggregation (Sol's review, section B): an
+/// overflow is a loud accounting/reconciliation failure, never a silently wrapped/truncated total.
+fn checked_add_usage(a: ResourceUsage, b: ResourceUsage) -> Result<ResourceUsage, String> {
+    Ok(ResourceUsage {
+        cpu_seconds: a.cpu_seconds.checked_add(b.cpu_seconds).ok_or_else(|| {
+            "cpu_seconds overflow aggregating checkout transport usage".to_string()
+        })?,
+        mem_byte_seconds: a
+            .mem_byte_seconds
+            .checked_add(b.mem_byte_seconds)
+            .ok_or_else(|| {
+                "mem_byte_seconds overflow aggregating checkout transport usage".to_string()
+            })?,
+    })
+}
+
+/// Fully retire ONE nested git-wire container the parent-attempt transport spawned: kill the
+/// (already-exited) child and remove its bundle dir. Unlike [`GvisorBackend::kill`] (which discards a
+/// `remove_dir_all` failure with `let _ =`, relying on `self.live` to let a LATER `kill()` retry), this
+/// function has no such registry to fall back on: it never registers into `self.live` at all (Sol's
+/// review — the parent-attempt transport returns no live backend handle), so a removal failure here is
+/// the ONLY signal the caller ever gets that a bundle may have leaked. Never silently discarded.
+fn retire_parent_attempt_hop(
+    mut child: Box<dyn RunscChild + Send>,
+    bundle_dir: &Path,
+) -> Result<(), String> {
+    let kill_result = child.kill();
+    let remove_result = std::fs::remove_dir_all(bundle_dir);
+    match (kill_result, remove_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(e)) => Err(format!("bundle dir {bundle_dir:?} removal failed: {e}")),
+        (Err(e), Ok(())) => Err(format!("child kill failed: {e}")),
+        (Err(ke), Err(re)) => Err(format!(
+            "child kill failed ({ke}) AND bundle dir {bundle_dir:?} removal also failed ({re})"
+        )),
+    }
+}
+
+/// A [`RunFailure`] from a nested hop whose teardown WAS independently proven fine (either it never
+/// reached `finalize_runtime` at all — genuinely `Uncommitted` — or `finalize_runtime` succeeded),
+/// converted with `usage_before` (measured by PRIOR hops in this same transport) folded in.
+/// `prior_hop_completed` (Sol's review, blocker 4) is an EXPLICIT phase fact, never inferred from
+/// `usage_before == 0` — a hop can genuinely execute with zero measured usage, and that must still be
+/// `Failed`, never misreported as the free `Refused`. `LaunchPermit::immediate()`'s commit closure can
+/// never itself fail, so `CommitOutcomeUnknown` is unreachable in practice here — Sol's review:
+/// represent it as a loud invariant-violation `Failed`, never silently assumed away, never mislabeled
+/// as a teardown question it has nothing to do with.
+fn map_hop_run_failure(
+    run_failure: RunFailure,
+    usage_before: ResourceUsage,
+    prior_hop_completed: bool,
+) -> CheckoutTransportError {
+    let message = run_failure.to_string();
+    match run_failure {
+        RunFailure::Uncommitted { .. } => {
+            if prior_hop_completed {
+                CheckoutTransportError::Failed {
+                    message,
+                    usage: usage_before,
+                }
+            } else {
+                CheckoutTransportError::Refused { message }
+            }
+        }
+        RunFailure::CommitOutcomeUnknown { .. } => CheckoutTransportError::Failed {
+            message: format!(
+                "internal invariant violated (an immediate launch permit's commit closure cannot \
+                 fail, so this should be unreachable): {message}"
+            ),
+            usage: usage_before,
+        },
+        RunFailure::CommittedButNotExecuted { .. } => CheckoutTransportError::Failed {
+            message,
+            usage: usage_before,
+        },
+        RunFailure::Executed {
+            usage: hop_usage, ..
+        } => match checked_add_usage(usage_before, hop_usage) {
+            Ok(total) => CheckoutTransportError::Failed {
+                message,
+                usage: total,
+            },
+            Err(overflow) => CheckoutTransportError::UsageUnrepresentable {
+                message: format!(
+                    "{message} (usage aggregation overflowed combining a hop that DID execute: \
+                     {overflow})"
+                ),
+                usage: usage_before,
+                // This branch is only ever reached via `Finalized(primary: Err(Executed))` — never
+                // the bare pre-finalize outer `Err` (`run_git_wire_container_raw` never produces
+                // `Executed` before `finalize_and_merge`) — so teardown WAS independently proven here.
+                teardown_unproven: false,
+            },
+        },
+    }
+}
+
+/// Every reason a git-wire hop's OWN result disqualifies it from being treated as a clean success
+/// (Sol's round-3 review, blocker 3): shared between the ordinary success path
+/// ([`run_one_git_wire_hop_within_parent_attempt`]) and [`map_hop_finalization_failure`]'s
+/// `primary: Ok` branch, so a non-passing/truncated/stream-errored run is NEVER silently reduced to
+/// "just" a teardown problem when both are true simultaneously.
+fn hop_result_failure_reasons(
+    result: &SandboxResult,
+    truncated: bool,
+    run_error: &Option<String>,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !result.passed() {
+        reasons.push(format!(
+            "guest execution did not pass (exit={:?} timed_out={})",
+            result.exit_code, result.timed_out
+        ));
+    }
+    if truncated {
+        reasons.push("response exceeded the wire cap".to_string());
+    }
+    if let Some(run_error_message) = run_error {
+        reasons.push(run_error_message.clone());
+    }
+    reasons
+}
+
+/// A hop whose `finalize_runtime` genuinely could NOT prove teardown (Sol's review, blocker 2) —
+/// `primary` is the hop's own `Result<(ContainerRun, bool), RunFailure>` from BEFORE finalization
+/// collapsed it, `teardown` is the independent teardown failure. Teardown ambiguity is orthogonal to
+/// whatever `primary` says: even a `primary` that itself failed for an unrelated reason still leaves
+/// teardown genuinely unproven, and that must never be silently downgraded to an ordinary `Failed`.
+/// When `primary` is `Ok`, this function ALSO performs the best-effort discard `run_git_wire_container`
+/// would otherwise have owned (kill + remove bundle) — mirroring
+/// [`discard_container_run_after_teardown_failure`], simplified because git-wire's `prepared_mode` is
+/// always `Rootless` (the namespace-identity-drift skip that function handles never applies here).
+/// Sol's round-3 review, blocker 3: the `Ok` branch also folds in [`hop_result_failure_reasons`] —
+/// previously it reported ONLY the teardown problem, silently dropping a simultaneous non-passing
+/// exit / truncation / stream error.
+fn map_hop_finalization_failure(
+    primary: Result<(ContainerRun, bool), RunFailure>,
+    teardown: RuntimeTeardownError,
+    usage_before: ResourceUsage,
+) -> CheckoutTransportError {
+    match primary {
+        Ok((run, truncated)) => {
+            let hop_usage = run.result.usage;
+            let reasons = hop_result_failure_reasons(&run.result, truncated, &run.run_error);
+            let ContainerRun {
+                child, bundle_dir, ..
+            } = run;
+            let discard_result = retire_parent_attempt_hop(child, &bundle_dir);
+            let mut parts = Vec::new();
+            if !reasons.is_empty() {
+                parts.push(reasons.join("; "));
+            }
+            parts.push(format!(
+                "runtime teardown could not be proven after a completed run: {teardown}"
+            ));
+            if let Err(discard_error) = &discard_result {
+                parts.push(format!("best-effort discard also failed ({discard_error})"));
+            }
+            let message = parts.join(" AND ");
+            match checked_add_usage(usage_before, hop_usage) {
+                Ok(total) => CheckoutTransportError::TeardownUnproven {
+                    message,
+                    usage: total,
+                },
+                Err(overflow) => CheckoutTransportError::UsageUnrepresentable {
+                    message: format!("{message} (usage aggregation overflowed: {overflow})"),
+                    usage: usage_before,
+                    teardown_unproven: true,
+                },
+            }
+        }
+        Err(run_failure) => {
+            let combined = augment_run_failure_with_teardown(run_failure, &teardown);
+            match combined {
+                RunFailure::Uncommitted { message }
+                | RunFailure::CommittedButNotExecuted { message } => {
+                    CheckoutTransportError::TeardownUnproven {
+                        message,
+                        usage: usage_before,
+                    }
+                }
+                RunFailure::CommitOutcomeUnknown { message } => {
+                    // Sol's round-4 review: this branch is reached from `RuntimeFinalization::Failed`
+                    // — teardown was ALREADY independently NOT proven, regardless of how impossible
+                    // the accompanying commit ambiguity is. Reporting ordinary `Failed` here would
+                    // erase that real, independent teardown failure — never downgrade it.
+                    CheckoutTransportError::TeardownUnproven {
+                        message: format!(
+                            "internal invariant violated (an immediate launch permit's commit \
+                             closure cannot fail, so this should be unreachable): {message}"
+                        ),
+                        usage: usage_before,
+                    }
+                }
+                RunFailure::Executed {
+                    message,
+                    usage: hop_usage,
+                } => match checked_add_usage(usage_before, hop_usage) {
+                    Ok(total) => CheckoutTransportError::TeardownUnproven {
+                        message,
+                        usage: total,
+                    },
+                    Err(overflow) => CheckoutTransportError::UsageUnrepresentable {
+                        message: format!("{message} (usage aggregation overflowed: {overflow})"),
+                        usage: usage_before,
+                        teardown_unproven: true,
+                    },
+                },
+            }
+        }
+    }
+}
+
+/// The raw per-hop git-wire executor the parent-attempt transport drives twice (advertise, then
+/// fetch) — mirrors [`run_git_wire_container_raw`]'s signature exactly (Sol's review, blocker 2: the
+/// executor must hand back the STRUCTURED [`RuntimeFinalization`], not the standalone path's already-
+/// collapsed `Result<(ContainerRun, bool), RunFailure>`, so a teardown-unproven outcome can be told
+/// apart from an ordinary run failure). Production always passes [`run_git_wire_container_raw`]
+/// itself; tests inject a deterministic fake so the transport's aggregation/error-mapping logic is
+/// verifiable without a real `runsc` binary (the true runsc/git-rootfs integration is 5b.3-7).
+type GitWireHopExecutor<'a> = &'a dyn Fn(
+    &JobSpec,
+    &OciConfig,
+    Vec<u8>,
+    &Path,
+    &AtomicBool,
+    LaunchPermit,
+) -> (
+    Result<GitWireHopFinalization, RunFailure>,
+    BundleCleanupProof,
+);
+
+/// If `bundle_cleanup` proves nothing (Sol's round-3 review, blocker 1), the hop's own result can no
+/// longer mean "genuinely nothing left behind" — upgrade whatever disposition `mapped` would
+/// otherwise be into one that says so, folding the cleanup failure's text in. This TRUMPS
+/// `Refused`/`Failed` entirely (an unproven bundle can never be reported as free or ordinary); for an
+/// already-more-severe disposition (`TeardownUnproven`/`UsageUnrepresentable`) it only adds the extra
+/// fact, never downgrades. A no-op whenever `bundle_cleanup` is `Ok(())` (the overwhelmingly common
+/// case — nothing to add).
+fn force_teardown_unproven_if_cleanup_unproven(
+    mapped: CheckoutTransportError,
+    bundle_cleanup: &BundleCleanupProof,
+    usage_before: ResourceUsage,
+) -> CheckoutTransportError {
+    let Err(cleanup_error) = bundle_cleanup else {
+        return mapped;
+    };
+    let note = format!("a bundle directory could not be proven removed: {cleanup_error}");
+    match mapped {
+        CheckoutTransportError::Refused { message } => CheckoutTransportError::TeardownUnproven {
+            message: format!("{message} AND {note}"),
+            usage: usage_before,
+        },
+        CheckoutTransportError::Failed { message, usage } => {
+            CheckoutTransportError::TeardownUnproven {
+                message: format!("{message} AND {note}"),
+                usage,
+            }
+        }
+        CheckoutTransportError::TeardownUnproven { message, usage } => {
+            CheckoutTransportError::TeardownUnproven {
+                message: format!("{message} AND {note}"),
+                usage,
+            }
+        }
+        CheckoutTransportError::UsageUnrepresentable { message, usage, .. } => {
+            CheckoutTransportError::UsageUnrepresentable {
+                message: format!("{message} AND {note}"),
+                usage,
+                teardown_unproven: true,
+            }
+        }
+    }
+}
+
+/// The post-`execute()` half of [`run_one_git_wire_hop_within_parent_attempt`] — factored out purely
+/// so its caller can uniformly apply [`force_teardown_unproven_if_cleanup_unproven`] to WHATEVER
+/// `CheckoutTransportError` this produces, via one `.map_err(...)`, rather than needing to thread the
+/// bundle-cleanup adjustment into every individual early return below.
+fn handle_git_wire_hop_finalization(
+    finalization_result: Result<GitWireHopFinalization, RunFailure>,
+    usage_before: ResourceUsage,
+    prior_hop_completed: bool,
+) -> Result<(SandboxResult, ResourceUsage), CheckoutTransportError> {
+    let finalization = finalization_result.map_err(|run_failure| {
+        map_hop_run_failure(run_failure, usage_before, prior_hop_completed)
+    })?;
+
+    let (run, truncated) = match finalization {
+        RuntimeFinalization::Finalized(FinalizedRun { primary, .. }) => {
+            primary.map_err(|run_failure| {
+                map_hop_run_failure(run_failure, usage_before, prior_hop_completed)
+            })?
+        }
+        RuntimeFinalization::Failed { primary, teardown } => {
+            return Err(map_hop_finalization_failure(
+                primary,
+                teardown,
+                usage_before,
+            ));
+        }
+    };
+
+    let ContainerRun {
+        child,
+        bundle_dir,
+        result,
+        run_error,
+    } = run;
+    let new_total = match checked_add_usage(usage_before, result.usage) {
+        Ok(total) => total,
+        Err(overflow) => {
+            let discard_result = retire_parent_attempt_hop(child, &bundle_dir);
+            let message = format!("usage aggregation overflowed after this hop: {overflow}");
+            return Err(CheckoutTransportError::UsageUnrepresentable {
+                message: match &discard_result {
+                    Ok(()) => message,
+                    Err(discard_error) => {
+                        format!("{message} AND best-effort discard also failed ({discard_error})")
+                    }
+                },
+                usage: usage_before,
+                // Teardown (container delete + cgroup quiescence) was ALREADY independently proven
+                // by the time we reach here (we are inside the `Finalized` arm) — only THIS
+                // function's own retirement discard is in question, tracked separately below.
+                teardown_unproven: discard_result.is_err(),
+            });
+        }
+    };
+
+    // Sol's review, blocker 1: a nonzero-exit or timed-out guest execution with otherwise
+    // syntactically valid stdout must never be accepted as a successful transport — the standalone
+    // path (`fetch_checkout_pack`, via `SandboxLaunch.result.passed()`) already enforces this; this
+    // path must too.
+    let reasons = hop_result_failure_reasons(&result, truncated, &run_error);
+
+    if !reasons.is_empty() {
+        let combined_reason = reasons.join("; ");
+        return Err(match retire_parent_attempt_hop(child, &bundle_dir) {
+            Ok(()) => CheckoutTransportError::Failed {
+                message: combined_reason,
+                usage: new_total,
+            },
+            Err(teardown_error) => CheckoutTransportError::TeardownUnproven {
+                message: format!(
+                    "{combined_reason} AND retiring its sandbox container also failed \
+                     ({teardown_error})"
+                ),
+                usage: new_total,
+            },
+        });
+    }
+
+    match retire_parent_attempt_hop(child, &bundle_dir) {
+        Ok(()) => Ok((result, new_total)),
+        Err(teardown_error) => Err(CheckoutTransportError::TeardownUnproven {
+            message: teardown_error,
+            usage: new_total,
+        }),
+    }
+}
+
+/// Run ONE git-wire hop entirely within the parent attempt's own bookkeeping (CT-007 slice 5b.3-3):
+/// builds the hardened job/config via the SAME [`build_git_wire_job`]/[`build_git_wire_oci_config`]
+/// preparation the standalone billed path uses, executes it with an IMMEDIATE launch permit (never a
+/// real durable fence — there is no separate reservation for this hop to commit against), and
+/// unconditionally retires the container (kill + remove bundle dir) before returning — this function
+/// never leaves a live handle or bundle behind on any path. Returns the hop's `SandboxResult` (for the
+/// caller's own wire-protocol parsing) plus the RUNNING total usage (`usage_before` + this hop's own,
+/// checked). `prior_hop_completed` is Sol's review, blocker 4 — an explicit phase fact the caller
+/// supplies (never inferred from `usage_before`). Sol's round-3 review, blocker 1: `execute`'s paired
+/// [`BundleCleanupProof`] is checked against the FINAL disposition, regardless of which branch below
+/// produced it — an unproven pre-finalization bundle cleanup forces `TeardownUnproven`, never a free
+/// `Refused`.
+fn run_one_git_wire_hop_within_parent_attempt(
+    hop_spec: &GitWireSpec,
+    command: Vec<String>,
+    cancellation: &AtomicBool,
+    usage_before: ResourceUsage,
+    prior_hop_completed: bool,
+    execute: GitWireHopExecutor,
+) -> Result<(SandboxResult, ResourceUsage), CheckoutTransportError> {
+    let refuse_or_fail = |message: String| {
+        if prior_hop_completed {
+            CheckoutTransportError::Failed {
+                message,
+                usage: usage_before,
+            }
+        } else {
+            CheckoutTransportError::Refused { message }
+        }
+    };
+    let job = build_git_wire_job(hop_spec, command, cancellation)
+        .map_err(|e| refuse_or_fail(e.to_string()))?;
+    let (cfg, rootfs) =
+        build_git_wire_oci_config(&job, hop_spec).map_err(|e| refuse_or_fail(e.to_string()))?;
+
+    let (finalization_result, bundle_cleanup_proof) = execute(
+        &job,
+        &cfg,
+        hop_spec.stdin.clone(),
+        &rootfs,
+        cancellation,
+        LaunchPermit::immediate(),
+    );
+
+    // Sol's round-4 review: match the COMPLETE `(result, cleanup_proof)` pair, not just the error
+    // side — an unproven `bundle_cleanup_proof` must force `TeardownUnproven` even when
+    // `handle_git_wire_hop_finalization` itself returns `Ok`. Production never actually produces this
+    // combination today (a hop only reaches `Ok` via the success path, which performs its OWN
+    // verified retirement — see `retire_parent_attempt_hop` inside that function — so its bundle is
+    // ALWAYS proven removed by the time `Ok` is returned), but the executor's TYPE permits it, and the
+    // "regardless of branch" guarantee this function documents must be structural, not incidental.
+    match handle_git_wire_hop_finalization(finalization_result, usage_before, prior_hop_completed) {
+        Ok(success) => match &bundle_cleanup_proof {
+            Ok(()) => Ok(success),
+            Err(cleanup_error) => {
+                let (_, new_total) = success;
+                Err(CheckoutTransportError::TeardownUnproven {
+                    message: format!(
+                        "the hop otherwise succeeded, but a bundle directory could not be proven \
+                         removed: {cleanup_error}"
+                    ),
+                    usage: new_total,
+                })
+            }
+        },
+        Err(e) => Err(force_teardown_unproven_if_cleanup_unproven(
+            e,
+            &bundle_cleanup_proof,
+            usage_before,
+        )),
+    }
+}
+
+/// A synthetic [`MeterTarget`] for the two nested git-wire hops the parent-attempt transport spawns.
+/// Never used for reserve/settle (this transport never calls `hooks.reserve`/`hooks.settle_completed`
+/// at all — see [`fetch_checkout_pack_within_parent_attempt`]'s own doc) — only present because
+/// `JobSpec::new` mandates a value structurally.
+fn synthetic_parent_attempt_meter_target() -> MeterTarget {
+    MeterTarget {
+        reserve_id: "checkout-transport-within-parent-attempt".to_string(),
+    }
+}
+
+/// A synthetic, per-hop-unique [`IdemToken`] — same rationale as
+/// [`synthetic_parent_attempt_meter_target`]: `JobSpec::new` mandates one, but this transport never
+/// reserves/dedups against it.
+fn synthetic_parent_attempt_idem_token(label: &str) -> IdemToken {
+    IdemToken(format!("checkout-transport-{label}-{}", unique_suffix()))
+}
+
+/// CT-007 slice 5b.3-3: the parent-attempt Hop A transport. Unlike [`fetch_checkout_pack`] (the
+/// standalone, billed git-wire caller — unchanged, still reserves/settles through `hooks` exactly as
+/// before), this function takes NO `RunnerHooks`, `MeterTarget`, `IdemToken`, or workload
+/// `LaunchPermit`: it is meant to run entirely INSIDE an outer `launch_with` attempt that has already
+/// reserved once for the whole attempt (5b.3-6 wires the call site). It consumes the one-shot
+/// [`CheckoutAuthorizationProof`] by value, verifies its scope and run-token generation against THIS
+/// request BEFORE spawning anything, drives both nested git-wire executions with
+/// `LaunchPermit::immediate()`, and fully retires each child+bundle itself — it returns no
+/// `SandboxLaunch`/live backend handle, and never reserves, settles, releases, or calls the real
+/// workload CAS. See [`CheckoutTransportError`] for how a mid-transport failure still carries the
+/// real usage already measured; the caller (5b.3-4/5/6) decides how that pre-workload usage survives
+/// and settles.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) fn fetch_checkout_pack_within_parent_attempt(
+    root: &Path,
+    tenant: &str,
+    region: &str,
+    repo: &str,
+    expected: &ExpectedGitCommitId,
+    limits: ResourceLimits,
+    run_token: RunTokenCredential,
+    proof: CheckoutAuthorizationProof,
+    cancellation: &AtomicBool,
+) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
+    fetch_checkout_pack_within_parent_attempt_given(
+        root,
+        tenant,
+        region,
+        repo,
+        expected,
+        limits,
+        run_token,
+        proof,
+        cancellation,
+        &|job, cfg, stdin, rootfs, cancellation, permit| {
+            run_git_wire_container_raw(job, cfg, stdin, rootfs, cancellation, permit)
+        },
+    )
+}
+
+/// Deterministic `_given` seam for [`fetch_checkout_pack_within_parent_attempt`] (this codebase's
+/// established convention, e.g. `finalize_runtime_given`): `execute` stands in for
+/// `run_git_wire_container_raw` so tests can drive the aggregation/error-mapping logic without
+/// spawning a real `runsc` binary. The true runsc/git-rootfs integration is exercised by 5b.3-7's live
+/// drill.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+fn fetch_checkout_pack_within_parent_attempt_given(
+    root: &Path,
+    tenant: &str,
+    region: &str,
+    repo: &str,
+    expected: &ExpectedGitCommitId,
+    limits: ResourceLimits,
+    run_token: RunTokenCredential,
+    proof: CheckoutAuthorizationProof,
+    cancellation: &AtomicBool,
+    execute: GitWireHopExecutor,
+) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
+    // Verify the proof's scope AND the exact token generation it was checked against, against THIS
+    // parent attempt's own request, BEFORE spawning anything (Sol's design, point A): a proof minted
+    // for a different repo/commit/token-generation must never authorize a substituted transport.
+    let scope = proof.scope();
+    if proof.run_token_jti() != run_token.jti {
+        return Err(CheckoutTransportError::Refused {
+            message: format!(
+                "checkout authorization proof was minted against run-token jti {:?}, but this \
+                 transport is running under jti {:?} -- refusing before any spawn",
+                proof.run_token_jti(),
+                run_token.jti
+            ),
+        });
+    }
+    if scope.tenant().0 != tenant {
+        return Err(CheckoutTransportError::Refused {
+            message: format!(
+                "checkout authorization proof was minted for tenant {:?}, but this transport is \
+                 requesting tenant {tenant:?}",
+                scope.tenant().0
+            ),
+        });
+    }
+    if scope.repo_id() != repo {
+        return Err(CheckoutTransportError::Refused {
+            message: format!(
+                "checkout authorization proof was minted for repo {:?}, but this transport is \
+                 requesting repo {repo:?}",
+                scope.repo_id()
+            ),
+        });
+    }
+    if scope.commit_hex() != expected.as_str() || scope.commit_format() != expected.format() {
+        return Err(CheckoutTransportError::Refused {
+            message: format!(
+                "checkout authorization proof was minted for commit {:?} ({:?}), but this \
+                 transport is requesting {:?} ({:?})",
+                scope.commit_hex(),
+                scope.commit_format(),
+                expected.as_str(),
+                expected.format()
+            ),
+        });
+    }
+
+    let zero = ResourceUsage {
+        cpu_seconds: 0,
+        mem_byte_seconds: 0,
+    };
+    let allow_reachable = vec![
+        "-c".to_string(),
+        "uploadpack.allowReachableSHA1InWant=true".to_string(),
+    ];
+
+    // ---- Hop A step 1: advertise-refs ----
+    let mut advertise_argv = allow_reachable.clone();
+    advertise_argv.extend([
+        "upload-pack".to_string(),
+        "--stateless-rpc".to_string(),
+        "--advertise-refs".to_string(),
+    ]);
+    let advertise_spec = GitWireSpec::for_repo(
+        root,
+        tenant,
+        region,
+        repo,
+        advertise_argv,
+        Vec::new(),
+        Vec::new(),
+        None,
+        limits,
+        run_token.clone(),
+        synthetic_parent_attempt_meter_target(),
+        synthetic_parent_attempt_idem_token("checkout-advertise"),
+    )
+    .map_err(|e| CheckoutTransportError::Refused {
+        message: format!("build advertise-refs spec: {e}"),
+    })?;
+    let mut advertise_command = Vec::with_capacity(advertise_spec.git_argv.len() + 2);
+    advertise_command.push("git".to_string());
+    advertise_command.extend(advertise_spec.git_argv.iter().cloned());
+    advertise_command.push(WIRE_REPO_MOUNT.to_string());
+
+    let (advertise_result, usage_after_advertise) = run_one_git_wire_hop_within_parent_attempt(
+        &advertise_spec,
+        advertise_command,
+        cancellation,
+        zero,
+        false, // this is the FIRST hop of the whole transport -- nothing has run yet.
+        execute,
+    )?;
+
+    let advertise_parsed = parse_upload_pack_advertisement(&advertise_result.stdout, expected)
+        .map_err(|e| CheckoutTransportError::Failed {
+            message: format!("parse advertisement: {e}"),
+            usage: usage_after_advertise,
+        })?;
+    if !advertise_parsed.directly_advertised && !advertise_parsed.allows_reachable_want {
+        return Err(CheckoutTransportError::Failed {
+            message: "expected commit is not an advertised ref tip AND the server did not offer \
+                      allow-reachable-sha1-in-want -- refusing rather than sending an unreachable \
+                      want"
+                .to_string(),
+            usage: usage_after_advertise,
+        });
+    }
+
+    let mut capabilities = "no-progress ofs-delta".to_string();
+    if let Some(token) = expected.format().capability_token() {
+        capabilities.push(' ');
+        capabilities.push_str(token);
+    }
+    let mut request = pkt_line_encode(&format!("want {} {capabilities}\n", expected.as_str()));
+    request.extend_from_slice(&pkt_line_encode("deepen 1\n"));
+    request.extend_from_slice(b"0000");
+    request.extend_from_slice(&pkt_line_encode("done\n"));
+
+    // ---- Hop A step 2: fetch ----
+    let mut fetch_argv = allow_reachable;
+    fetch_argv.extend(["upload-pack".to_string(), "--stateless-rpc".to_string()]);
+    let fetch_spec = GitWireSpec::for_repo(
+        root,
+        tenant,
+        region,
+        repo,
+        fetch_argv,
+        request,
+        Vec::new(),
+        None,
+        limits,
+        run_token,
+        synthetic_parent_attempt_meter_target(),
+        synthetic_parent_attempt_idem_token("checkout-fetch"),
+    )
+    .map_err(|e| CheckoutTransportError::Failed {
+        message: format!("build fetch spec: {e}"),
+        usage: usage_after_advertise,
+    })?;
+    let mut fetch_command = Vec::with_capacity(fetch_spec.git_argv.len() + 2);
+    fetch_command.push("git".to_string());
+    fetch_command.extend(fetch_spec.git_argv.iter().cloned());
+    fetch_command.push(WIRE_REPO_MOUNT.to_string());
+
+    // Stage the pack artifact BEFORE launching the fetch (same reasoning as `fetch_checkout_pack`):
+    // a staging failure here must still carry the advertisement's already-measured usage, never
+    // silently drop it.
+    let mut pack_file =
+        tempfile_for_checkout_pack().map_err(|e| CheckoutTransportError::Failed {
+            message: format!("stage pack artifact: {e}"),
+            usage: usage_after_advertise,
+        })?;
+
+    let (fetch_result, usage_after_fetch) = run_one_git_wire_hop_within_parent_attempt(
+        &fetch_spec,
+        fetch_command,
+        cancellation,
+        usage_after_advertise,
+        true, // the advertisement hop above already completed.
+        execute,
+    )?;
+
+    let parsed_fetch = parse_checkout_fetch_response(
+        &fetch_result.stdout,
+        expected,
+        &mut pack_file,
+        limits.disk_bytes,
+    )
+    .map_err(|e| CheckoutTransportError::Failed {
+        message: format!("parse fetch response: {e}"),
+        usage: usage_after_fetch,
+    })?;
+
+    pack_file
+        .flush()
+        .map_err(|e| CheckoutTransportError::Failed {
+            message: format!("flush pack artifact: {e}"),
+            usage: usage_after_fetch,
+        })?;
+    let mut pack_file = pack_file
+        .into_inner()
+        .map_err(|e| CheckoutTransportError::Failed {
+            message: format!("finish pack artifact: {e}"),
+            usage: usage_after_fetch,
+        })?;
+    pack_file
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| CheckoutTransportError::Failed {
+            message: format!("rewind pack artifact: {e}"),
+            usage: usage_after_fetch,
+        })?;
+
+    Ok(ParentAttemptCheckoutTransportOutcome {
+        pack: PrefetchedCheckoutPack {
+            file: pack_file,
+            shallow: parsed_fetch.shallow,
+        },
+        usage: usage_after_fetch,
+    })
+}
+
 /// A fresh, `O_CLOEXEC` host temp file to stream Hop A's pack into (removed from the directory the
 /// instant it's created — an unlinked, anonymous-by-path file the process's own fd keeps alive for
 /// exactly as long as it is needed, never left behind on any early-return path).
@@ -6202,9 +7137,12 @@ impl PreparedCheckoutEvidence {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) enum CheckoutPreparationError {
-    /// Refused before the preparation runtime ever spawned (bad transport/spec, Hop A itself
-    /// failed, or `bind_preparation` failed on a caller-fixable ground) — the lease/session are
-    /// untouched, and there is no usage to account.
+    /// Refused before the preparation runtime itself ever spawned (bad transport/spec, or
+    /// `bind_preparation` failed on a caller-fixable ground) — the lease/session are untouched, and
+    /// there is no usage to account. Hop A's own failures are NOT necessarily free: once its
+    /// advertisement run has executed, a Hop A failure surfaces as [`CheckoutTransportError`]
+    /// (5b.3-3), which carries the real usage already measured — never collapsed into this `Refused`
+    /// variant, which would silently discard it.
     Refused(String),
     /// `bind_preparation`/`confirm_prepared` poisoned the lease/session on a non-caller-fixable
     /// ground. `usage` is `None` iff this happened before any spawn attempt (a `bind_preparation`
@@ -6645,7 +7583,7 @@ pub(crate) fn run_checkout_preparation(
         .map_err(CheckoutPreparationError::Refused)?;
 
     let bundle_dir = stage_config_only_bundle(&cfg, "checkout")
-        .map_err(CheckoutPreparationError::Refused)?;
+        .map_err(|e| CheckoutPreparationError::Refused(e.message))?;
 
     // CT-003b (SI-017): the out-of-band memory cgroup, established BEFORE anything durably commits.
     let cgroup = match MemoryCgroup::create(spec.limits.mem_bytes) {
@@ -13222,6 +14160,1517 @@ mod tests {
             assert!(session.is_unreleasable());
             let _ = std::fs::remove_dir_all(&ws);
             let _ = std::fs::remove_dir_all(&leases_dir);
+        }
+
+        // =========================================================================================
+        // CT-007 slice 5b.3-3 — the parent-attempt Hop A transport. Deterministic coverage via an
+        // injected executor (`GitWireHopExecutor`) — no real `runsc` binary needed for this refactor
+        // slice (the true runsc/git-rootfs integration is 5b.3-7's live drill).
+        // =========================================================================================
+        mod checkout_transport_5b3_3 {
+            use super::*;
+            use crate::CheckoutAuthorizationScope;
+
+            const TENANT: &str = "acme";
+            const REGION: &str = "fr-par";
+            const REPO: &str = "widgets";
+
+            /// A real (not symlinked) bare-repo directory under a fresh root, matching exactly what
+            /// `resolve_bare_repo_path`/`assert_repo_under_root` require — both hops resolve the SAME
+            /// path, so this is staged once per test.
+            fn staged_repo_root() -> PathBuf {
+                let root = temp_dir_for("5b3-3-root");
+                std::fs::create_dir_all(root.join(TENANT).join(REGION).join(format!("{REPO}.git")))
+                    .unwrap();
+                root
+            }
+
+            fn checkout_limits() -> ResourceLimits {
+                ResourceLimits {
+                    cpu_millis: 1000,
+                    mem_bytes: 256 << 20,
+                    disk_bytes: 1 << 20,
+                    tmpfs_bytes: 64 << 20,
+                    pids_max: 64,
+                    timeout_secs: 60,
+                }
+            }
+
+            fn parent_attempt_scope(
+                commit_hex: &str,
+                format: GitObjectFormat,
+            ) -> CheckoutAuthorizationScope {
+                CheckoutAuthorizationScope::new(
+                    myelin_tenancy::TenantId(TENANT.to_string()),
+                    myelin_events::ArtifactRef(format!("myelin://{TENANT}/git/repo/{REPO}")),
+                    REPO.to_string(),
+                    commit_hex.to_string(),
+                    format,
+                )
+            }
+
+            fn minted_proof_for(
+                scope: CheckoutAuthorizationScope,
+                jti: &str,
+            ) -> CheckoutAuthorizationProof {
+                let hooks =
+                    ok_hooks().with_checkout_authorization(Box::new(|_spec, _scope| Ok(())));
+                let job = JobSpec::new(
+                    JobKind::Ci,
+                    fixture_image(),
+                    vec!["true".to_string()],
+                    vec![],
+                    vec![],
+                    EgressPolicy::deny_all(),
+                    checkout_limits(),
+                    WorkspaceSpec::default(),
+                    TrustTier::Trusted,
+                    RunTokenCredential::new("bearer", jti, 300).unwrap(),
+                    MeterTarget {
+                        reserve_id: "r".to_string(),
+                    },
+                    IdemToken("idem-mint".to_string()),
+                )
+                .unwrap();
+                hooks.authorize_checkout(&job, scope).unwrap()
+            }
+
+            fn fake_hop_container_run(stdout: Vec<u8>, usage: ResourceUsage) -> ContainerRun {
+                ContainerRun {
+                    child: Box::new(FakeRunsc),
+                    bundle_dir: temp_dir_for("5b3-3-hop"),
+                    result: SandboxResult {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        usage,
+                        stdout,
+                        stderr: Vec::new(),
+                    },
+                    run_error: None,
+                }
+            }
+
+            struct FailingKillRunsc;
+            impl RunscChild for FailingKillRunsc {
+                fn kill(&mut self) -> Result<(), String> {
+                    Err("simulated kill failure".to_string())
+                }
+                fn wait(&mut self) -> Result<i32, String> {
+                    Ok(0)
+                }
+            }
+
+            fn fake_hop_container_run_with_unkillable_child(
+                stdout: Vec<u8>,
+                usage: ResourceUsage,
+            ) -> ContainerRun {
+                ContainerRun {
+                    child: Box::new(FailingKillRunsc),
+                    bundle_dir: temp_dir_for("5b3-3-hop-unkillable"),
+                    result: SandboxResult {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        usage,
+                        stdout,
+                        stderr: Vec::new(),
+                    },
+                    run_error: None,
+                }
+            }
+
+            /// A step still returns the simple pre-finalization shape — `scripted_executor` below
+            /// auto-wraps a successful step into a `RuntimeFinalization::Finalized` (teardown proven
+            /// fine), matching what every EXISTING test needs. Tests that specifically need to
+            /// exercise a genuine teardown-unproven `RuntimeFinalization::Failed` (Sol's review,
+            /// blocker 2) build a `BoxedHopExecutor` closure directly instead of going through this
+            /// helper (see `production_shaped_teardown_failure_is_reported_as_teardown_unproven`).
+            type ScriptedStep =
+                Box<dyn FnOnce() -> Result<(ContainerRun, bool), RunFailure> + Send>;
+
+            /// A boxed stand-in for [`GitWireHopExecutor`] (a bare `&dyn Fn` can't be returned from a
+            /// function that also owns the closure's captures) — test call sites pass `&*executor`.
+            type BoxedHopExecutor = Box<
+                dyn Fn(
+                    &JobSpec,
+                    &OciConfig,
+                    Vec<u8>,
+                    &Path,
+                    &AtomicBool,
+                    LaunchPermit,
+                ) -> (
+                    Result<GitWireHopFinalization, RunFailure>,
+                    BundleCleanupProof,
+                ),
+            >;
+
+            /// A canned, always-fine teardown proof for the auto-wrapped `Finalized` case —
+            /// `RuntimeNamespaceQuiescence::Rootless` since git-wire's `prepared_mode` is always
+            /// `Rootless` (never `ExplicitUserNamespace`).
+            fn fake_quiescence_evidence() -> RuntimeQuiescenceEvidence {
+                RuntimeQuiescenceEvidence::assert_for_tests(
+                    "5b3-3-test-container".to_string(),
+                    RuntimeNamespaceQuiescence::Rootless,
+                    CgroupQuiescenceEvidence::assert_for_tests((1, 1)),
+                )
+            }
+
+            /// Scripts exactly `steps.len()` executor calls, one scripted outcome each, in order.
+            /// Returns the executor closure plus a handle to the number of REMAINING (not yet
+            /// consumed) steps, so a test can assert exactly the scripted count of calls happened.
+            /// Panics if invoked more times than scripted (Sol's review: "exactly two ... executions").
+            fn scripted_executor(
+                steps: Vec<ScriptedStep>,
+            ) -> (BoxedHopExecutor, Arc<Mutex<usize>>) {
+                let remaining = Arc::new(Mutex::new(steps.len()));
+                let remaining_for_closure = Arc::clone(&remaining);
+                let queue = Mutex::new(std::collections::VecDeque::from(steps));
+                let f = move |_job: &JobSpec,
+                              _cfg: &OciConfig,
+                              _stdin: Vec<u8>,
+                              _rootfs: &Path,
+                              _cancellation: &AtomicBool,
+                              _permit: LaunchPermit| {
+                    let mut queue = queue.lock().unwrap();
+                    let step = queue
+                        .pop_front()
+                        .expect("executor invoked more times than scripted");
+                    *remaining_for_closure.lock().unwrap() = queue.len();
+                    let finalization_result = match step() {
+                        Ok((run, truncated)) => Ok(RuntimeFinalization::Finalized(FinalizedRun {
+                            primary: Ok((run, truncated)),
+                            evidence: fake_quiescence_evidence(),
+                        })),
+                        Err(run_failure) => Err(run_failure),
+                    };
+                    // Bundle cleanup is never in question for these auto-wrapped scripted steps —
+                    // dedicated tests for an unproven bundle cleanup build a `BoxedHopExecutor`
+                    // directly instead (see `bundle_cleanup_failure_forces_teardown_unproven`).
+                    (finalization_result, Ok(()))
+                };
+                (Box::new(f), remaining)
+            }
+
+            fn panics_if_called_executor() -> (BoxedHopExecutor, Arc<Mutex<usize>>) {
+                scripted_executor(vec![])
+            }
+
+            fn advertisement_bytes(oid: &str) -> Vec<u8> {
+                advertisement(
+                    &format!("{oid} refs/heads/main\0no-progress ofs-delta shallow\n"),
+                    &[],
+                )
+            }
+
+            fn fetch_response_bytes(payload: &[u8]) -> Vec<u8> {
+                fetch_response(&[], "NAK", &fake_pack(payload))
+            }
+
+            // ---- proof verification happens BEFORE any spawn ----
+
+            #[test]
+            fn proof_with_wrong_run_token_jti_refuses_before_any_spawn() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xc1);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof = minted_proof_for(
+                    parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                    "jti-minted-against",
+                );
+                let run_token =
+                    RunTokenCredential::new("bearer", "jti-actually-running-as", 300).unwrap();
+                let (executor, _remaining) = panics_if_called_executor();
+                let cancellation = AtomicBool::new(false);
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert!(matches!(err, CheckoutTransportError::Refused { .. }));
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn proof_with_wrong_tenant_refuses_before_any_spawn() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xc2);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let scope = CheckoutAuthorizationScope::new(
+                    myelin_tenancy::TenantId("someone-else".to_string()),
+                    myelin_events::ArtifactRef(
+                        "myelin://someone-else/git/repo/widgets".to_string(),
+                    ),
+                    REPO.to_string(),
+                    oid.clone(),
+                    GitObjectFormat::Sha1,
+                );
+                let proof = minted_proof_for(scope, "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+                let (executor, _remaining) = panics_if_called_executor();
+                let cancellation = AtomicBool::new(false);
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert!(matches!(err, CheckoutTransportError::Refused { .. }));
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn proof_with_wrong_repo_refuses_before_any_spawn() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xc3);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let scope = CheckoutAuthorizationScope::new(
+                    myelin_tenancy::TenantId(TENANT.to_string()),
+                    myelin_events::ArtifactRef("myelin://acme/git/repo/other-repo".to_string()),
+                    "other-repo".to_string(),
+                    oid.clone(),
+                    GitObjectFormat::Sha1,
+                );
+                let proof = minted_proof_for(scope, "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+                let (executor, _remaining) = panics_if_called_executor();
+                let cancellation = AtomicBool::new(false);
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert!(matches!(err, CheckoutTransportError::Refused { .. }));
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn proof_with_wrong_commit_refuses_before_any_spawn() {
+                let root = staged_repo_root();
+                let minted_oid = sha1_oid(0xc4);
+                let requested_oid = sha1_oid(0xc5);
+                let expected =
+                    ExpectedGitCommitId::new(requested_oid, GitObjectFormat::Sha1).unwrap();
+                let proof = minted_proof_for(
+                    parent_attempt_scope(&minted_oid, GitObjectFormat::Sha1),
+                    "jti-1",
+                );
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+                let (executor, _remaining) = panics_if_called_executor();
+                let cancellation = AtomicBool::new(false);
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert!(matches!(err, CheckoutTransportError::Refused { .. }));
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- happy path ----
+
+            #[test]
+            fn happy_path_executes_exactly_two_immediate_gated_hops_and_checked_adds_usage() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd1);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 3,
+                    mem_byte_seconds: 7,
+                };
+                let fetch_usage = ResourceUsage {
+                    cpu_seconds: 11,
+                    mem_byte_seconds: 13,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                let fetch_bytes = fetch_response_bytes(b"pack-payload");
+                let (executor, remaining) = scripted_executor(vec![
+                    Box::new({
+                        let bytes = advertise_bytes.clone();
+                        move || Ok((fake_hop_container_run(bytes, advertise_usage), false))
+                    }),
+                    Box::new({
+                        let bytes = fetch_bytes.clone();
+                        move || Ok((fake_hop_container_run(bytes, fetch_usage), false))
+                    }),
+                ]);
+                let cancellation = AtomicBool::new(false);
+
+                let outcome = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .expect("scripted happy path must succeed");
+                assert_eq!(
+                    *remaining.lock().unwrap(),
+                    0,
+                    "exactly the two scripted hops must run, no more no less"
+                );
+                let (_pack, usage) = outcome.into_parts();
+                assert_eq!(
+                    usage,
+                    ResourceUsage {
+                        cpu_seconds: 14,
+                        mem_byte_seconds: 20,
+                    },
+                    "success must checked-add advertisement + fetch usage"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- every failure point retains usage already incurred ----
+
+            #[test]
+            fn advertisement_parse_failure_retains_advertisement_usage() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd2);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 9,
+                };
+                let (executor, remaining) = scripted_executor(vec![Box::new(move || {
+                    Ok((
+                        fake_hop_container_run(
+                            b"not a valid advertisement".to_vec(),
+                            advertise_usage,
+                        ),
+                        false,
+                    ))
+                })]);
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    *remaining.lock().unwrap(),
+                    0,
+                    "the advertisement hop must still run"
+                );
+                match err {
+                    CheckoutTransportError::Failed { usage, .. } => {
+                        assert_eq!(usage, advertise_usage);
+                    }
+                    other => panic!("expected Failed, got {other:?}"),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn fetch_pre_spawn_failure_retains_advertisement_usage() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd3);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 9,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                let (executor, remaining) = scripted_executor(vec![
+                    Box::new({
+                        let bytes = advertise_bytes.clone();
+                        move || Ok((fake_hop_container_run(bytes, advertise_usage), false))
+                    }),
+                    Box::new(|| Err(RunFailure::uncommitted("simulated fetch pre-spawn failure"))),
+                ]);
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    *remaining.lock().unwrap(),
+                    0,
+                    "both hops must have been attempted"
+                );
+                match err {
+                    CheckoutTransportError::Failed { usage, .. } => {
+                        assert_eq!(
+                            usage, advertise_usage,
+                            "an Uncommitted fetch failure must still retain the advertisement's \
+                             already-measured usage, never report it as free"
+                        );
+                    }
+                    other => panic!("expected Failed, got {other:?}"),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn fetch_post_spawn_executed_failure_retains_advertisement_plus_fetch_usage() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd4);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 9,
+                };
+                let fetch_failure_usage = ResourceUsage {
+                    cpu_seconds: 2,
+                    mem_byte_seconds: 4,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                let (executor, remaining) = scripted_executor(vec![
+                    Box::new({
+                        let bytes = advertise_bytes.clone();
+                        move || Ok((fake_hop_container_run(bytes, advertise_usage), false))
+                    }),
+                    Box::new(move || {
+                        Err(RunFailure::executed(
+                            "simulated fetch post-spawn failure",
+                            fetch_failure_usage,
+                        ))
+                    }),
+                ]);
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert_eq!(*remaining.lock().unwrap(), 0);
+                match err {
+                    CheckoutTransportError::Failed { usage, .. } => {
+                        assert_eq!(
+                            usage,
+                            ResourceUsage {
+                                cpu_seconds: advertise_usage.cpu_seconds
+                                    + fetch_failure_usage.cpu_seconds,
+                                mem_byte_seconds: advertise_usage.mem_byte_seconds
+                                    + fetch_failure_usage.mem_byte_seconds,
+                            }
+                        );
+                    }
+                    other => panic!("expected Failed, got {other:?}"),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- arithmetic overflow refuses loudly ----
+
+            #[test]
+            fn usage_aggregation_overflow_refuses_loudly() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd5);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                // Advertisement alone doesn't overflow (usage_before starts at zero) — the overflow
+                // must occur when the FETCH hop's own usage is checked-added onto the advertisement's
+                // already-measured `u64::MAX`.
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: u64::MAX,
+                    mem_byte_seconds: 1,
+                };
+                let fetch_usage = ResourceUsage {
+                    cpu_seconds: 1,
+                    mem_byte_seconds: 1,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                let fetch_bytes = fetch_response_bytes(b"pack-payload");
+                let (executor, remaining) = scripted_executor(vec![
+                    Box::new(move || {
+                        Ok((
+                            fake_hop_container_run(advertise_bytes, advertise_usage),
+                            false,
+                        ))
+                    }),
+                    Box::new(move || Ok((fake_hop_container_run(fetch_bytes, fetch_usage), false))),
+                ]);
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    *remaining.lock().unwrap(),
+                    0,
+                    "both hops must have run before the overflow is detected"
+                );
+                // Overflow happens folding the fetch hop's own usage onto the advertisement's
+                // already-measured `u64::MAX` — refused loudly (never wrapped/saturated) rather than
+                // silently reporting a wrapped-around total.
+                match err {
+                    CheckoutTransportError::UsageUnrepresentable {
+                        message,
+                        usage,
+                        teardown_unproven,
+                    } => {
+                        assert!(message.contains("overflow"), "message was: {message}");
+                        assert_eq!(
+                            usage, advertise_usage,
+                            "on overflow, the last exact provable total is the pre-overflow total"
+                        );
+                        assert!(
+                            !teardown_unproven,
+                            "teardown was independently proven fine here; only usage broke"
+                        );
+                    }
+                    other => panic!(
+                        "expected UsageUnrepresentable carrying an overflow message, got {other:?}"
+                    ),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- teardown-unproven is distinct and still carries usage ----
+
+            #[test]
+            fn kill_failure_on_a_successful_hop_yields_teardown_unproven_and_retains_usage() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd6);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 9,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                let (executor, remaining) = scripted_executor(vec![Box::new(move || {
+                    Ok((
+                        fake_hop_container_run_with_unkillable_child(
+                            advertise_bytes,
+                            advertise_usage,
+                        ),
+                        false,
+                    ))
+                })]);
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    *remaining.lock().unwrap(),
+                    0,
+                    "only the one scripted (advertisement) hop must have run"
+                );
+                match err {
+                    CheckoutTransportError::TeardownUnproven { usage, message } => {
+                        assert_eq!(usage, advertise_usage);
+                        assert!(message.contains("kill"), "message was: {message}");
+                    }
+                    other => panic!("expected TeardownUnproven, got {other:?}"),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn truncated_output_combined_with_kill_failure_preserves_both_messages() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd7);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 9,
+                };
+                let (executor, remaining) = scripted_executor(vec![Box::new(move || {
+                    Ok((
+                        fake_hop_container_run_with_unkillable_child(Vec::new(), advertise_usage),
+                        true, // stdout_truncated
+                    ))
+                })]);
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    *remaining.lock().unwrap(),
+                    0,
+                    "only the one scripted (advertisement) hop must have run"
+                );
+                match err {
+                    CheckoutTransportError::TeardownUnproven { usage, message } => {
+                        assert_eq!(usage, advertise_usage);
+                        assert!(message.contains("wire cap"), "message was: {message}");
+                        assert!(message.contains("kill"), "message was: {message}");
+                    }
+                    other => {
+                        panic!("expected TeardownUnproven combining both failures, got {other:?}")
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn run_error_combined_with_kill_failure_preserves_both_messages() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd8);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 9,
+                };
+                let (executor, remaining) = scripted_executor(vec![Box::new(move || {
+                    let mut run =
+                        fake_hop_container_run_with_unkillable_child(Vec::new(), advertise_usage);
+                    run.run_error = Some("simulated stream error".to_string());
+                    Ok((run, false))
+                })]);
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    *remaining.lock().unwrap(),
+                    0,
+                    "only the one scripted (advertisement) hop must have run"
+                );
+                match err {
+                    CheckoutTransportError::TeardownUnproven { usage, message } => {
+                        assert_eq!(usage, advertise_usage);
+                        assert!(
+                            message.contains("simulated stream error"),
+                            "message was: {message}"
+                        );
+                        assert!(message.contains("kill"), "message was: {message}");
+                    }
+                    other => {
+                        panic!("expected TeardownUnproven combining both failures, got {other:?}")
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- no live handle or bundle remains after return, on ANY path ----
+
+            #[test]
+            fn successful_transport_leaves_no_bundle_dirs_behind() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd9);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_bytes = advertisement_bytes(&oid);
+                let fetch_bytes = fetch_response_bytes(b"pack-payload");
+                let advertise_bundle_dir = temp_dir_for("5b3-3-tracked-advertise-bundle");
+                let fetch_bundle_dir = temp_dir_for("5b3-3-tracked-fetch-bundle");
+                let advertise_bundle_dir_check = advertise_bundle_dir.clone();
+                let fetch_bundle_dir_check = fetch_bundle_dir.clone();
+                let usage = ResourceUsage {
+                    cpu_seconds: 1,
+                    mem_byte_seconds: 1,
+                };
+                let (executor, _remaining) = scripted_executor(vec![
+                    Box::new(move || {
+                        Ok((
+                            ContainerRun {
+                                child: Box::new(FakeRunsc),
+                                bundle_dir: advertise_bundle_dir,
+                                result: SandboxResult {
+                                    exit_code: Some(0),
+                                    timed_out: false,
+                                    usage,
+                                    stdout: advertise_bytes,
+                                    stderr: Vec::new(),
+                                },
+                                run_error: None,
+                            },
+                            false,
+                        ))
+                    }),
+                    Box::new(move || {
+                        Ok((
+                            ContainerRun {
+                                child: Box::new(FakeRunsc),
+                                bundle_dir: fetch_bundle_dir,
+                                result: SandboxResult {
+                                    exit_code: Some(0),
+                                    timed_out: false,
+                                    usage,
+                                    stdout: fetch_bytes,
+                                    stderr: Vec::new(),
+                                },
+                                run_error: None,
+                            },
+                            false,
+                        ))
+                    }),
+                ]);
+                let cancellation = AtomicBool::new(false);
+
+                fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .expect("scripted happy path must succeed");
+
+                assert!(
+                    !advertise_bundle_dir_check.exists(),
+                    "the advertisement hop's bundle dir must be removed by return time"
+                );
+                assert!(
+                    !fetch_bundle_dir_check.exists(),
+                    "the fetch hop's bundle dir must be removed by return time"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- Sol's round-1 review, blocker 1: a non-passing guest execution must never be
+            // accepted just because its stdout happens to parse ----
+
+            #[test]
+            fn not_passed_advertisement_is_never_accepted_as_success() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xda);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 9,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                let (executor, remaining) = scripted_executor(vec![Box::new(move || {
+                    let mut run = fake_hop_container_run(advertise_bytes, advertise_usage);
+                    run.result.exit_code = Some(1);
+                    Ok((run, false))
+                })]);
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert_eq!(*remaining.lock().unwrap(), 0);
+                match err {
+                    CheckoutTransportError::Failed { message, usage } => {
+                        assert!(message.contains("did not pass"), "message was: {message}");
+                        assert_eq!(usage, advertise_usage);
+                    }
+                    other => panic!("expected Failed, got {other:?}"),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn not_passed_fetch_is_never_accepted_as_success() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xdb);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 9,
+                };
+                let fetch_usage = ResourceUsage {
+                    cpu_seconds: 2,
+                    mem_byte_seconds: 4,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                let fetch_bytes = fetch_response_bytes(b"pack-payload");
+                let (executor, remaining) = scripted_executor(vec![
+                    Box::new(move || {
+                        Ok((
+                            fake_hop_container_run(advertise_bytes, advertise_usage),
+                            false,
+                        ))
+                    }),
+                    Box::new(move || {
+                        let mut run = fake_hop_container_run(fetch_bytes, fetch_usage);
+                        run.result.timed_out = true;
+                        Ok((run, false))
+                    }),
+                ]);
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert_eq!(*remaining.lock().unwrap(), 0);
+                match err {
+                    CheckoutTransportError::Failed { message, usage } => {
+                        assert!(message.contains("did not pass"), "message was: {message}");
+                        assert_eq!(
+                            usage,
+                            ResourceUsage {
+                                cpu_seconds: advertise_usage.cpu_seconds + fetch_usage.cpu_seconds,
+                                mem_byte_seconds: advertise_usage.mem_byte_seconds
+                                    + fetch_usage.mem_byte_seconds,
+                            }
+                        );
+                    }
+                    other => panic!("expected Failed, got {other:?}"),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- Sol's round-1 review, blocker 2: a genuine production-shaped teardown-unproven
+            // outcome (RuntimeFinalization::Failed) must never be collapsed into an ordinary Failed ----
+
+            #[test]
+            fn production_shaped_teardown_failure_is_reported_as_teardown_unproven() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xdc);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 9,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                let bundle_dir = temp_dir_for("5b3-3-teardown-failed-bundle");
+                let bundle_dir_check = bundle_dir.clone();
+                let run = ContainerRun {
+                    child: Box::new(FakeRunsc),
+                    bundle_dir,
+                    result: SandboxResult {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        usage: advertise_usage,
+                        stdout: advertise_bytes,
+                        stderr: Vec::new(),
+                    },
+                    run_error: None,
+                };
+                let slot = Mutex::new(Some((
+                    Ok(RuntimeFinalization::Failed {
+                        primary: Ok((run, false)),
+                        teardown: RuntimeTeardownError {
+                            issues: vec![RuntimeTeardownIssue::ContainerNotConfirmedDeleted(
+                                "simulated: runsc delete did not confirm".to_string(),
+                            )],
+                        },
+                    }),
+                    Ok(()),
+                )));
+                let executor: BoxedHopExecutor = Box::new(
+                    move |_job: &JobSpec,
+                          _cfg: &OciConfig,
+                          _stdin: Vec<u8>,
+                          _rootfs: &Path,
+                          _cancellation: &AtomicBool,
+                          _permit: LaunchPermit| {
+                        slot.lock()
+                            .unwrap()
+                            .take()
+                            .expect("executor invoked more times than scripted (single-shot)")
+                    },
+                );
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                match err {
+                    CheckoutTransportError::TeardownUnproven { usage, message } => {
+                        assert_eq!(usage, advertise_usage);
+                        assert!(
+                            message.contains("could not be proven"),
+                            "message was: {message}"
+                        );
+                        assert!(
+                            message.contains("did not confirm"),
+                            "message was: {message}"
+                        );
+                    }
+                    other => panic!("expected TeardownUnproven, got {other:?}"),
+                }
+                assert!(
+                    !bundle_dir_check.exists(),
+                    "the discarded run's bundle dir must still be removed by this function itself, \
+                     since production's own settle_finalization is never reached on this path"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- Sol's round-1 review, blocker 4: numerical usage is not a lifecycle marker ----
+
+            #[test]
+            fn zero_usage_advertisement_then_fetch_pre_spawn_failure_is_still_failed_not_refused() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xdd);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                // A completed advertisement hop with GENUINELY ZERO measured usage -- distinct from
+                // "no hop ran yet." A prior implementation compared `usage_before == zero` to decide
+                // Refused-vs-Failed, which would have misclassified this exact case.
+                let zero_advertise_usage = ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                let (executor, remaining) = scripted_executor(vec![
+                    Box::new(move || {
+                        Ok((
+                            fake_hop_container_run(advertise_bytes, zero_advertise_usage),
+                            false,
+                        ))
+                    }),
+                    Box::new(|| Err(RunFailure::uncommitted("simulated fetch pre-spawn failure"))),
+                ]);
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert_eq!(*remaining.lock().unwrap(), 0);
+                match err {
+                    CheckoutTransportError::Failed { usage, .. } => {
+                        assert_eq!(
+                            usage, zero_advertise_usage,
+                            "a completed-but-zero-usage advertisement followed by a fetch failure \
+                             must still be Failed, never Refused"
+                        );
+                    }
+                    other => panic!(
+                        "expected Failed (never Refused, even though usage is numerically zero), \
+                         got {other:?}"
+                    ),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- Sol's round-3 review, blocker 1: an unproven pre-finalization bundle cleanup
+            // must never be silently reported as the free `Refused` ----
+
+            #[test]
+            fn bundle_cleanup_failure_forces_teardown_unproven_even_on_the_first_hop() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xde);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                // Simulates a pre-finalization failure (e.g. cgroup creation) whose OWN best-effort
+                // bundle-dir removal also failed -- nothing ever executed (genuinely `Uncommitted`,
+                // first hop), yet the bundle cleanup itself could not be proven.
+                let slot = Mutex::new(Some((
+                    Err(RunFailure::uncommitted("simulated cgroup creation failure")),
+                    Err("simulated bundle dir removal failure".to_string()),
+                )));
+                let executor: BoxedHopExecutor = Box::new(
+                    move |_job: &JobSpec,
+                          _cfg: &OciConfig,
+                          _stdin: Vec<u8>,
+                          _rootfs: &Path,
+                          _cancellation: &AtomicBool,
+                          _permit: LaunchPermit| {
+                        slot.lock()
+                            .unwrap()
+                            .take()
+                            .expect("executor invoked more times than scripted (single-shot)")
+                    },
+                );
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                match err {
+                    CheckoutTransportError::TeardownUnproven { usage, message } => {
+                        assert_eq!(
+                            usage,
+                            ResourceUsage {
+                                cpu_seconds: 0,
+                                mem_byte_seconds: 0,
+                            },
+                            "nothing ever executed -- zero is the honest total"
+                        );
+                        assert!(
+                            message.contains("bundle directory could not be proven removed"),
+                            "message was: {message}"
+                        );
+                        assert!(
+                            message.contains("simulated bundle dir removal failure"),
+                            "message was: {message}"
+                        );
+                    }
+                    other => panic!(
+                        "expected TeardownUnproven (an unproven bundle cleanup must never be \
+                         reported as the free Refused, even on the very first hop), got {other:?}"
+                    ),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- Sol's round-3 review, blocker 3: a finalization failure must not mask a
+            // simultaneous guest-result failure ----
+
+            #[test]
+            fn non_passing_result_inside_a_teardown_failure_preserves_both_reasons() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xdf);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 9,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                let bundle_dir = temp_dir_for("5b3-3-teardown-failed-non-passing-bundle");
+                let run = ContainerRun {
+                    child: Box::new(FakeRunsc),
+                    bundle_dir,
+                    result: SandboxResult {
+                        exit_code: Some(1), // did NOT pass
+                        timed_out: false,
+                        usage: advertise_usage,
+                        stdout: advertise_bytes,
+                        stderr: Vec::new(),
+                    },
+                    run_error: None,
+                };
+                let slot = Mutex::new(Some((
+                    Ok(RuntimeFinalization::Failed {
+                        primary: Ok((run, false)),
+                        teardown: RuntimeTeardownError {
+                            issues: vec![RuntimeTeardownIssue::ContainerNotConfirmedDeleted(
+                                "simulated: runsc delete did not confirm".to_string(),
+                            )],
+                        },
+                    }),
+                    Ok(()),
+                )));
+                let executor: BoxedHopExecutor = Box::new(
+                    move |_job: &JobSpec,
+                          _cfg: &OciConfig,
+                          _stdin: Vec<u8>,
+                          _rootfs: &Path,
+                          _cancellation: &AtomicBool,
+                          _permit: LaunchPermit| {
+                        slot.lock()
+                            .unwrap()
+                            .take()
+                            .expect("executor invoked more times than scripted (single-shot)")
+                    },
+                );
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                match err {
+                    CheckoutTransportError::TeardownUnproven { usage, message } => {
+                        assert_eq!(usage, advertise_usage);
+                        assert!(
+                            message.contains("did not pass"),
+                            "the guest's own non-passing result must survive, message was: {message}"
+                        );
+                        assert!(
+                            message.contains("could not be proven"),
+                            "the teardown failure must ALSO survive, message was: {message}"
+                        );
+                    }
+                    other => {
+                        panic!("expected TeardownUnproven combining both facts, got {other:?}")
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- Sol's round-4 review, blocker 1: CommitOutcomeUnknown inside a genuine teardown
+            // failure must not erase it ----
+
+            #[test]
+            fn commit_outcome_unknown_inside_a_teardown_failure_is_still_teardown_unproven() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xe0);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let slot = Mutex::new(Some((
+                    Ok(RuntimeFinalization::Failed {
+                        primary: Err(RunFailure::commit_outcome_unknown(
+                            "simulated commit-outcome ambiguity",
+                        )),
+                        teardown: RuntimeTeardownError {
+                            issues: vec![RuntimeTeardownIssue::ContainerNotConfirmedDeleted(
+                                "simulated: runsc delete did not confirm".to_string(),
+                            )],
+                        },
+                    }),
+                    Ok(()),
+                )));
+                let executor: BoxedHopExecutor = Box::new(
+                    move |_job: &JobSpec,
+                          _cfg: &OciConfig,
+                          _stdin: Vec<u8>,
+                          _rootfs: &Path,
+                          _cancellation: &AtomicBool,
+                          _permit: LaunchPermit| {
+                        slot.lock()
+                            .unwrap()
+                            .take()
+                            .expect("executor invoked more times than scripted (single-shot)")
+                    },
+                );
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                match err {
+                    CheckoutTransportError::TeardownUnproven { usage, message } => {
+                        assert_eq!(
+                            usage,
+                            ResourceUsage {
+                                cpu_seconds: 0,
+                                mem_byte_seconds: 0,
+                            }
+                        );
+                        assert!(
+                            message.contains("internal invariant violated"),
+                            "message was: {message}"
+                        );
+                        assert!(
+                            message.contains("did not confirm"),
+                            "the independent teardown failure must survive, message was: {message}"
+                        );
+                    }
+                    other => panic!(
+                        "expected TeardownUnproven (a real independent teardown failure must never \
+                         be erased by an accompanying should-be-impossible commit ambiguity), got \
+                         {other:?}"
+                    ),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- Sol's round-4 review, blocker 2: an unproven bundle cleanup must force
+            // TeardownUnproven even when the hop's own result is Ok ----
+
+            #[test]
+            fn bundle_cleanup_failure_forces_teardown_unproven_even_on_an_otherwise_successful_hop()
+            {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xe1);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 9,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                let run = ContainerRun {
+                    child: Box::new(FakeRunsc),
+                    bundle_dir: temp_dir_for("5b3-3-contradictory-seam-bundle"),
+                    result: SandboxResult {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        usage: advertise_usage,
+                        stdout: advertise_bytes,
+                        stderr: Vec::new(),
+                    },
+                    run_error: None,
+                };
+                // A structurally-permitted but production-never-produces-this combination (Sol's
+                // round-4 review): the finalization result is a clean success, yet the paired
+                // `BundleCleanupProof` is `Err` -- the executor type allows this even though the real
+                // `run_git_wire_container_raw` never returns it (its success path only ever pairs `Ok`
+                // finalization with `Ok(())` cleanup, since nothing is removed on that path yet).
+                let slot = Mutex::new(Some((
+                    Ok(RuntimeFinalization::Finalized(FinalizedRun {
+                        primary: Ok((run, false)),
+                        evidence: fake_quiescence_evidence(),
+                    })),
+                    Err("simulated bundle dir removal failure".to_string()),
+                )));
+                let executor: BoxedHopExecutor = Box::new(
+                    move |_job: &JobSpec,
+                          _cfg: &OciConfig,
+                          _stdin: Vec<u8>,
+                          _rootfs: &Path,
+                          _cancellation: &AtomicBool,
+                          _permit: LaunchPermit| {
+                        slot.lock()
+                            .unwrap()
+                            .take()
+                            .expect("executor invoked more times than scripted (single-shot)")
+                    },
+                );
+                let cancellation = AtomicBool::new(false);
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    &*executor,
+                )
+                .unwrap_err();
+                match err {
+                    CheckoutTransportError::TeardownUnproven { usage, message } => {
+                        assert_eq!(usage, advertise_usage);
+                        assert!(
+                            message.contains("otherwise succeeded"),
+                            "message was: {message}"
+                        );
+                        assert!(
+                            message.contains("simulated bundle dir removal failure"),
+                            "message was: {message}"
+                        );
+                    }
+                    other => panic!(
+                        "expected TeardownUnproven (an unproven bundle cleanup must never be \
+                         silently discarded just because finalization itself returned Ok), got \
+                         {other:?}"
+                    ),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
         }
     }
 }
