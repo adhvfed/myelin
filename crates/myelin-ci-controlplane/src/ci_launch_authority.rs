@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use crate::ci_pipeline_driver::{
     TIER_P_OPERATIONAL_PRICING_REVISION, TIER_P_OPERATIONAL_RESERVATION_PREFIX,
+    TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX,
 };
 use crate::{
     ci_job_id_v2, CiExecutionProfileV1, CiJobAccountingPricer, CiJobLaunchGrantV1,
@@ -227,11 +228,20 @@ impl CiJobBudgetReservationProvider for PgTierPCiJobBudgetReservation {
     }
 }
 
+/// CT-007 slice 5b.3-4a.1b: fields are named `v1_*` (not just `handle`/`amount`) because this type
+/// is now shared with `v2` replay-decision code elsewhere in this module -- but this struct itself
+/// carries ONLY `v1` data. Sol's round-1 review: an earlier draft also eagerly computed a `v2`
+/// candidate here under the provider's CURRENT policy on every batch, even though nothing writes
+/// `v2` this slice -- that meant a fresh `v1` write (or an exact `v1` replay) could fail solely
+/// because unrelated, unused `v2` ceiling arithmetic overflowed for the current policy. `v2`
+/// candidates are computed ONLY where actually needed: lazily, inside `replay_v2_batch`, using a
+/// policy reconstructed from an already-durable row's own embedded descriptor -- never eagerly, and
+/// never under "whatever the provider happens to be configured with right now".
 #[derive(Clone)]
 struct PreparedOperationalReservation {
     request: CiJobRuntimeAuthorityRequest,
-    handle: String,
-    amount: i64,
+    v1_handle: String,
+    v1_amount: i64,
 }
 
 fn prepare_operational_batch(
@@ -274,18 +284,18 @@ fn prepare_operational_batch(
     }
     let batch_digest = operational_batch_digest(&validated);
     let mut prepared = Vec::with_capacity(validated.len());
-    for (request, amount) in validated {
+    for (request, v1_amount) in validated {
         let request_digest =
             runtime_authority_digest(CI_OPERATIONAL_RESERVATION_V1_DOMAIN, &request);
-        let handle = format!(
+        let v1_handle = format!(
             "{TIER_P_OPERATIONAL_RESERVATION_PREFIX}{}:{batch_digest}:{}:{request_digest}",
             request.ci_run_id, request.job_id
         );
-        validate_handle("reserve", &handle)?;
+        validate_handle("reserve", &v1_handle)?;
         prepared.push(PreparedOperationalReservation {
             request,
-            handle,
-            amount,
+            v1_handle,
+            v1_amount,
         });
     }
     Ok(prepared)
@@ -302,6 +312,111 @@ fn operational_batch_digest(validated: &[(CiJobRuntimeAuthorityRequest, i64)]) -
         hasher.update(&amount.to_be_bytes());
     }
     hasher.finalize()
+}
+
+/// CT-007 slice 5b.3-4a.1b: the `v2` sibling of [`operational_batch_digest`] -- recomputes each
+/// per-request `v2` digest internally from `(request, policy)` rather than accepting it as an input,
+/// for the same reason [`operational_reservation_digest_v2`] does: no authority encoder accepts an
+/// independently forgeable derived fact.
+fn operational_batch_digest_v2(
+    validated: &[(&CiJobRuntimeAuthorityRequest, i64)],
+    policy: &CiAttemptBudgetPolicy,
+) -> Result<blake3::Hash, CiLaunchAuthorityError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CI_OPERATIONAL_BATCH_V2_DOMAIN);
+    hasher.update(&(validated.len() as u64).to_be_bytes());
+    for (request, amount) in validated {
+        hasher.update(operational_reservation_digest_v2(request, policy)?.as_bytes());
+        hasher.update(&amount.to_be_bytes());
+    }
+    Ok(hasher.finalize())
+}
+
+/// The plain-text `a<N>` segment embedded in a durable `v2` handle for `max_parent_attempts` -- kept
+/// alongside the revision tag so a reader can reconstruct the exact policy an already-durable row
+/// was minted under (CT-007 slice 5b.3-4a.1b), never the provider's currently configured value.
+fn attempts_handle_tag(max_parent_attempts: NonZeroU32) -> String {
+    format!("a{}", max_parent_attempts.get())
+}
+
+/// The inverse of [`attempts_handle_tag`]. Returns `None` for anything that isn't an `a` followed by
+/// a positive integer -- an unrecognized or zero value must refuse replay, never guess or clamp.
+fn parse_attempts_handle_tag(tag: &str) -> Option<NonZeroU32> {
+    let digits = tag.strip_prefix('a')?;
+    let value: u32 = digits.parse().ok()?;
+    NonZeroU32::new(value)
+}
+
+struct V2Candidate {
+    handle: String,
+    amount: i64,
+}
+
+/// The `v2` handle+amount every request in `requests` would durably mint under exactly `policy` --
+/// factored out of [`prepare_operational_batch`] (CT-007 slice 5b.3-4a.1b) so replay validation can
+/// call it a SECOND time with a policy reconstructed from an already-durable row's own embedded
+/// descriptor, never the provider's currently configured policy, which may have since changed.
+fn build_v2_candidates(
+    requests: &[CiJobRuntimeAuthorityRequest],
+    policy: &CiAttemptBudgetPolicy,
+) -> Result<Vec<V2Candidate>, CiLaunchAuthorityError> {
+    let amounts = requests
+        .iter()
+        .map(|request| operational_reservation_amount_v2(request, policy))
+        .collect::<Result<Vec<i64>, _>>()?;
+    let pairs = requests
+        .iter()
+        .zip(amounts.iter())
+        .map(|(request, amount)| (request, *amount))
+        .collect::<Vec<_>>();
+    let batch_digest_v2 = operational_batch_digest_v2(&pairs, policy)?;
+    let attempts_tag = attempts_handle_tag(policy.max_parent_attempts());
+    let budget_tag = policy.revision().handle_tag();
+    requests
+        .iter()
+        .zip(amounts)
+        .map(|(request, amount)| {
+            let request_digest_v2 = operational_reservation_digest_v2(request, policy)?;
+            let handle = format!(
+                "{TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX}{}:{budget_tag}:{attempts_tag}:{batch_digest_v2}:{}:{request_digest_v2}",
+                request.ci_run_id, request.job_id
+            );
+            Ok(V2Candidate { handle, amount })
+        })
+        .collect()
+}
+
+/// The fields embedded in a durable `v2` handle after its prefix, parsed back apart. Used ONLY
+/// during replay (CT-007 slice 5b.3-4a.1b) to recover which policy an already-durable row was
+/// minted under -- never trusted on its own; the caller must still recompute the expected candidate
+/// from these parsed fields and compare it byte-for-byte against the durable row.
+struct ParsedV2Handle {
+    revision: CiAttemptBudgetRevision,
+    max_parent_attempts: NonZeroU32,
+}
+
+/// Parses `<run_id>:<budget_tag>:<attempts_tag>:<batch_digest>:<job_id>:<request_digest>` (the
+/// suffix after [`TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX`]). Returns `None` for any handle that
+/// doesn't have exactly this shape or carries an unrecognized revision/attempts tag -- malformed or
+/// forward-versioned handles must refuse replay, never be guessed at.
+fn parse_v2_handle(handle: &str) -> Option<ParsedV2Handle> {
+    let suffix = handle.strip_prefix(TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX)?;
+    let mut parts = suffix.split(':');
+    let _run_id = parts.next()?;
+    let budget_tag = parts.next()?;
+    let attempts_tag = parts.next()?;
+    let _batch_digest = parts.next()?;
+    let _job_id = parts.next()?;
+    let _request_digest = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let revision = CiAttemptBudgetRevision::from_handle_tag(budget_tag)?;
+    let max_parent_attempts = parse_attempts_handle_tag(attempts_tag)?;
+    Some(ParsedV2Handle {
+        revision,
+        max_parent_attempts,
+    })
 }
 
 /// Reserve the maximum CPU-seconds plus memory-GiB-seconds the server-owned limits can consume.
@@ -350,58 +465,48 @@ async fn reserve_operational_batch_on_conn(
         .await
         .map_err(pg_query)?;
 
-    let run_prefix = format!(
+    let v1_run_prefix = format!(
         "{TIER_P_OPERATIONAL_RESERVATION_PREFIX}{}:",
+        prepared[0].request.ci_run_id
+    );
+    let v2_run_prefix = format!(
+        "{TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX}{}:",
         prepared[0].request.ci_run_id
     );
     let rows = sqlx::query(
         "SELECT run_id, reserved FROM cost_reservation \
-         WHERE tenant_id = $1 AND region = $2 AND run_id LIKE ($3 || '%')",
+         WHERE tenant_id = $1 AND region = $2 \
+           AND (run_id LIKE ($3 || '%') OR run_id LIKE ($4 || '%'))",
     )
     .bind(tenant_id)
     .bind(region)
-    .bind(run_prefix)
+    .bind(&v1_run_prefix)
+    .bind(&v2_run_prefix)
     .fetch_all(&mut *conn)
     .await
     .map_err(pg_query)?;
-    if !rows.is_empty() {
-        let expected = prepared
-            .iter()
-            .map(|item| (item.handle.as_str(), item.amount))
-            .collect::<BTreeMap<_, _>>();
-        let mut durable = BTreeMap::new();
-        for row in rows {
+    let rows = rows
+        .into_iter()
+        .map(|row| {
             let handle = row.try_get::<String, _>("run_id").map_err(pg_row)?;
             let amount = row.try_get::<i64, _>("reserved").map_err(pg_row)?;
-            if durable.insert(handle, amount).is_some() {
-                return Ok(Err(refused(
-                    "operational reservation run has duplicate durable authority",
-                )));
-            }
-        }
-        let exact = durable.len() == expected.len()
-            && durable
-                .iter()
-                .all(|(handle, amount)| expected.get(handle.as_str()) == Some(amount));
-        if exact {
-            return Ok(Ok(prepared
-                .iter()
-                .map(|item| item.handle.clone())
-                .collect()));
-        }
-        return Ok(Err(refused(
-            "operational reservation run authority diverged from its durable batch",
-        )));
+            Ok::<_, PgError>((handle, amount))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(result) = resolve_durable_replay(rows, &v1_run_prefix, &v2_run_prefix, prepared) {
+        return Ok(result);
     }
 
     let active: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cost_reservation \
          WHERE tenant_id = $1 AND region = $2 \
-           AND run_id LIKE ($3 || '%') AND state IN ('reserved', 'inflight')",
+           AND (run_id LIKE ($3 || '%') OR run_id LIKE ($4 || '%')) \
+           AND state IN ('reserved', 'inflight')",
     )
     .bind(tenant_id)
     .bind(region)
     .bind(TIER_P_OPERATIONAL_RESERVATION_PREFIX)
+    .bind(TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX)
     .fetch_one(&mut *conn)
     .await
     .map_err(pg_query)?;
@@ -416,6 +521,7 @@ async fn reserve_operational_batch_on_conn(
         )));
     }
 
+    // Fresh writes stay `v1` this slice (CT-007 slice 5b.3-4a.1c activates the `v2` writer).
     for item in prepared {
         sqlx::query(
             "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state) \
@@ -423,16 +529,129 @@ async fn reserve_operational_batch_on_conn(
         )
         .bind(tenant_id)
         .bind(region)
-        .bind(&item.handle)
-        .bind(item.amount)
+        .bind(&item.v1_handle)
+        .bind(item.v1_amount)
         .execute(&mut *conn)
         .await
         .map_err(pg_query)?;
     }
     Ok(Ok(prepared
         .iter()
-        .map(|item| item.handle.clone())
+        .map(|item| item.v1_handle.clone())
         .collect()))
+}
+
+/// The pure replay/divergence decision over already-fetched durable rows (CT-007 slice 5b.3-4a.1b) --
+/// factored out of [`reserve_operational_batch_on_conn`] so every branch (exact `v1` replay, exact
+/// `v2` replay, mixed-version refusal, tampered/partial/divergent refusal) is directly unit-testable
+/// without a database. Returns `None` when there is nothing durable for this run yet (the caller
+/// should proceed to the active-ceiling check and a fresh `v1` insert); `Some(Ok(handles))` or
+/// `Some(Err(_))` otherwise.
+fn resolve_durable_replay(
+    rows: Vec<(String, i64)>,
+    v1_run_prefix: &str,
+    v2_run_prefix: &str,
+    prepared: &[PreparedOperationalReservation],
+) -> Option<Result<Vec<String>, CiLaunchAuthorityError>> {
+    if rows.is_empty() {
+        return None;
+    }
+    // A durable run may hold `v1` OR `v2` rows (never both -- a batch is written entirely under
+    // one version), so split by prefix before replaying either.
+    let mut durable_v1 = BTreeMap::new();
+    let mut durable_v2 = BTreeMap::new();
+    for (handle, amount) in rows {
+        let bucket = if handle.starts_with(v1_run_prefix) {
+            &mut durable_v1
+        } else if handle.starts_with(v2_run_prefix) {
+            &mut durable_v2
+        } else {
+            return Some(Err(refused(
+                "operational reservation run authority matched neither known prefix",
+            )));
+        };
+        if bucket.insert(handle, amount).is_some() {
+            return Some(Err(refused(
+                "operational reservation run has duplicate durable authority",
+            )));
+        }
+    }
+    if !durable_v1.is_empty() && !durable_v2.is_empty() {
+        return Some(Err(refused(
+            "operational reservation run mixes v1 and v2 durable authority",
+        )));
+    }
+    if !durable_v1.is_empty() {
+        let expected = prepared
+            .iter()
+            .map(|item| (item.v1_handle.as_str(), item.v1_amount))
+            .collect::<BTreeMap<_, _>>();
+        let exact = durable_v1.len() == expected.len()
+            && durable_v1
+                .iter()
+                .all(|(handle, amount)| expected.get(handle.as_str()) == Some(amount));
+        if exact {
+            return Some(Ok(prepared
+                .iter()
+                .map(|item| item.v1_handle.clone())
+                .collect()));
+        }
+        return Some(Err(refused(
+            "operational reservation run authority diverged from its durable batch",
+        )));
+    }
+    Some(replay_v2_batch(prepared, &durable_v2))
+}
+
+/// Validates an exact acknowledgement-loss replay against durably-found `v2` rows (CT-007 slice
+/// 5b.3-4a.1b). The durable rows may have been minted under an OLDER policy than the provider's
+/// CURRENTLY configured one, so this recovers the actual policy from the rows' own embedded
+/// descriptor instead -- a `v2` batch created under one attempt cap must still replay correctly
+/// after the provider is reconfigured with another.
+fn replay_v2_batch(
+    prepared: &[PreparedOperationalReservation],
+    durable_v2: &BTreeMap<String, i64>,
+) -> Result<Vec<String>, CiLaunchAuthorityError> {
+    let mut descriptor: Option<(CiAttemptBudgetRevision, NonZeroU32)> = None;
+    for handle in durable_v2.keys() {
+        let parsed = parse_v2_handle(handle)
+            .ok_or_else(|| refused("operational reservation v2 durable handle is unparseable"))?;
+        let this = (parsed.revision, parsed.max_parent_attempts);
+        match descriptor {
+            None => descriptor = Some(this),
+            Some(previous) if previous == this => {}
+            Some(_) => {
+                return Err(refused(
+                    "operational reservation v2 durable rows disagree on budget policy descriptor",
+                ));
+            }
+        }
+    }
+    let (revision, max_parent_attempts) =
+        descriptor.expect("durable_v2 is non-empty, checked by the caller");
+    let reconstructed_policy = CiAttemptBudgetPolicy::new(revision, max_parent_attempts);
+
+    let requests: Vec<CiJobRuntimeAuthorityRequest> =
+        prepared.iter().map(|item| item.request.clone()).collect();
+    let candidates = build_v2_candidates(&requests, &reconstructed_policy)?;
+    let expected = candidates
+        .iter()
+        .map(|candidate| (candidate.handle.as_str(), candidate.amount))
+        .collect::<BTreeMap<_, _>>();
+
+    let exact = durable_v2.len() == expected.len()
+        && durable_v2
+            .iter()
+            .all(|(handle, amount)| expected.get(handle.as_str()) == Some(amount));
+    if !exact {
+        return Err(refused(
+            "operational reservation run authority diverged from its durable v2 batch",
+        ));
+    }
+    Ok(candidates
+        .into_iter()
+        .map(|candidate| candidate.handle)
+        .collect())
 }
 
 fn valid_machine_token(value: &str) -> bool {
@@ -881,15 +1100,15 @@ fn refused(detail: &str) -> CiLaunchAuthorityError {
 /// Named execution counts within one checkout-bearing parent attempt — never a bare `4` scattered
 /// through the ceiling math. Hop A's two nested git-wire executions (advertise-refs, fetch) plus Hop
 /// B's one checkout-materialization run, additive with the workload's own one execution.
-#[allow(dead_code)]
 const CHECKOUT_TRANSPORT_EXECUTIONS: u64 = 2;
-#[allow(dead_code)]
 const CHECKOUT_MATERIALIZATION_EXECUTIONS: u64 = 1;
-#[allow(dead_code)]
 const WORKLOAD_EXECUTIONS: u64 = 1;
 
-#[allow(dead_code)]
 const CI_OPERATIONAL_RESERVATION_V2_DOMAIN: &[u8] = b"myelin.ci.operational-reservation.v2\0";
+/// CT-007 slice 5b.3-4a.1b: the `v2` sibling of [`CI_OPERATIONAL_BATCH_V1_DOMAIN`], used by
+/// [`operational_batch_digest_v2`] so a `v2` batch's aggregate digest can never collide with a `v1`
+/// batch's, even over an identical set of per-request digests.
+const CI_OPERATIONAL_BATCH_V2_DOMAIN: &[u8] = b"myelin.ci.operational-reservation-batch.v2\0";
 
 /// The revision of the attempt-budget CALCULATION topology/algorithm a `v2` reservation was priced
 /// under — distinct from [`CiAttemptBudgetPolicy::max_parent_attempts`] (a policy VALUE), this
@@ -897,7 +1116,6 @@ const CI_OPERATIONAL_RESERVATION_V2_DOMAIN: &[u8] = b"myelin.ci.operational-rese
 /// separately into the `v2` digest so a future topology change (e.g. Hop B splitting into two
 /// executions) can never silently collide with today's `V1` revision's handles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum CiAttemptBudgetRevision {
     V1,
 }
@@ -906,6 +1124,25 @@ impl CiAttemptBudgetRevision {
     fn tag(self) -> u8 {
         match self {
             CiAttemptBudgetRevision::V1 => 1,
+        }
+    }
+
+    /// The plain-text segment embedded in a durable `v2` handle (CT-007 slice 5b.3-4a.1b) so a
+    /// reader can recover which topology revision priced an already-durable row without trusting
+    /// the provider's CURRENTLY configured revision -- an old row must replay under the revision it
+    /// was actually written with, even if production has since moved on.
+    fn handle_tag(self) -> &'static str {
+        match self {
+            CiAttemptBudgetRevision::V1 => "budget-v1",
+        }
+    }
+
+    /// The inverse of [`Self::handle_tag`]. Returns `None` for anything not durably minted by this
+    /// binary's known revisions -- an unrecognized tag must refuse replay, never guess.
+    fn from_handle_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "budget-v1" => Some(CiAttemptBudgetRevision::V1),
+            _ => None,
         }
     }
 }
@@ -961,7 +1198,6 @@ impl CiAttemptBudgetPolicy {
 /// through every intermediate aggregation, converting to operational units exactly once, at the end
 /// ([`operational_reservation_amount_v2`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 struct ResourceCeiling {
     cpu_seconds: u64,
     mem_byte_seconds: u64,
@@ -986,7 +1222,6 @@ impl ResourceCeiling {
 /// dimensions (never combined/converted here). Mirrors `v1`'s [`operational_reservation_amount`]
 /// CPU/memory formulas exactly (same inputs, same validation), but returns the two dimensions
 /// separately instead of one pre-converted `i64`.
-#[allow(dead_code)]
 fn raw_execution_ceiling(
     limits: &CiManifestLimitsV1,
 ) -> Result<ResourceCeiling, CiLaunchAuthorityError> {
@@ -1021,7 +1256,6 @@ fn raw_execution_ceiling(
 /// executions) + Hop B (1) + the workload (1) for a checkout-bearing job. Checkout presence is
 /// derived ONLY from `request.checkout` (Sol's review: never a caller-supplied bool, which could
 /// disagree with the authority request and under-reserve it).
-#[allow(dead_code)]
 fn parent_attempt_ceiling(
     request: &CiJobRuntimeAuthorityRequest,
 ) -> Result<ResourceCeiling, CiLaunchAuthorityError> {
@@ -1036,7 +1270,6 @@ fn parent_attempt_ceiling(
 
 /// The complete raw ceiling a job may durably accrue across every parent attempt its budget policy
 /// allows — [`parent_attempt_ceiling`] times `policy.max_parent_attempts`, checked.
-#[allow(dead_code)]
 fn job_lifetime_ceiling(
     request: &CiJobRuntimeAuthorityRequest,
     policy: &CiAttemptBudgetPolicy,
@@ -1051,7 +1284,6 @@ fn job_lifetime_ceiling(
 /// units. Extracted as its own function (Sol's round-2 review) so both overflow boundaries — the
 /// `checked_add` and the `i64` range check — are directly testable without needing to construct
 /// realistic-looking `CiManifestLimitsV1`/policy inputs that happen to trigger each one.
-#[allow(dead_code)]
 fn operational_amount_from_ceiling(
     ceiling: ResourceCeiling,
 ) -> Result<i64, CiLaunchAuthorityError> {
@@ -1065,7 +1297,6 @@ fn operational_amount_from_ceiling(
 
 /// `v2`'s final conversion to operational units — aggregate raw dimensions first
 /// ([`job_lifetime_ceiling`]), convert exactly once via [`operational_amount_from_ceiling`].
-#[allow(dead_code)]
 fn operational_reservation_amount_v2(
     request: &CiJobRuntimeAuthorityRequest,
     policy: &CiAttemptBudgetPolicy,
@@ -1086,7 +1317,6 @@ fn operational_reservation_amount_v2(
 /// `policy` rather than accepting them as caller-supplied parameters — no authority encoder may
 /// accept independently forgeable derived facts; a caller could otherwise pass ceilings that
 /// disagree with the request/policy they claim to describe.
-#[allow(dead_code)]
 fn operational_reservation_digest_v2(
     request: &CiJobRuntimeAuthorityRequest,
     policy: &CiAttemptBudgetPolicy,
@@ -1450,6 +1680,471 @@ mod tests {
             };
             let err = operational_amount_from_ceiling(ceiling).unwrap_err();
             assert!(err.0.contains("exceeds"), "message was: {}", err.0);
+        }
+    }
+
+    /// CT-007 slice 5b.3-4a.1b: dual-version replay-compatibility tests. `resolve_durable_replay`
+    /// and `replay_v2_batch` are pure, synchronous, in-memory decision functions -- no database
+    /// required -- so every branch (exact v1/v2 replay, mixed-version refusal, tampered/partial
+    /// divergence, policy-descriptor disagreement, replay surviving a provider reconfiguration) is
+    /// covered here directly. Live-database coverage (active-ceiling counting across both prefixes,
+    /// a real INSERT/SELECT round trip) lives in `tests/integration_ci_operational_reservation.rs`.
+    mod handle_replay_5b3_4a1b {
+        use super::*;
+
+        fn fixture_request(job_id: &str) -> CiJobRuntimeAuthorityRequest {
+            CiJobRuntimeAuthorityRequest {
+                tenant_id: "acme".into(),
+                region: "fr-par".into(),
+                ci_run_id: "55555555-5555-5555-5555-555555555555".into(),
+                wf_run_id: "66666666-6666-6666-6666-666666666666".into(),
+                project_id: "77777777-7777-7777-7777-777777777777".into(),
+                job_id: job_id.into(),
+                stage: "build".into(),
+                concrete_name: "build".into(),
+                trigger_kind: "push".into(),
+                trust_tier: "trusted".into(),
+                source_snapshot_digest: "digest-fixture".into(),
+                workflow_definition_version: 3,
+                workflow_code_hash: "code-hash-fixture".into(),
+                policy_revision: LINUX_SMALL_V1_POLICY_REVISION.into(),
+                limits: linux_small_limits(),
+                checkout: None,
+            }
+        }
+
+        fn fixture_batch() -> Vec<CiJobRuntimeAuthorityRequest> {
+            vec![
+                fixture_request("88888888-8888-8888-8888-888888888881"),
+                fixture_request("88888888-8888-8888-8888-888888888882"),
+            ]
+        }
+
+        fn checkout_scope_fixture() -> CheckoutAuthorizationScope {
+            myelin_ci_sandbox::derive_checkout_authorization_scope(
+                myelin_ci_sandbox::JobKind::Ci,
+                &myelin_ci_sandbox::WorkspaceSpec {
+                    repo_ref: Some("myelin://acme/git/repo/widgets".into()),
+                    commit: Some("a".repeat(40)),
+                },
+            )
+            .unwrap()
+            .unwrap()
+        }
+
+        fn prefixes(ci_run_id: &str) -> (String, String) {
+            (
+                format!("{TIER_P_OPERATIONAL_RESERVATION_PREFIX}{ci_run_id}:"),
+                format!("{TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX}{ci_run_id}:"),
+            )
+        }
+
+        #[test]
+        fn no_durable_rows_returns_none_so_the_caller_proceeds_to_a_fresh_write() {
+            let requests = fixture_batch();
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            assert!(
+                resolve_durable_replay(Vec::new(), &v1_prefix, &v2_prefix, &prepared).is_none()
+            );
+        }
+
+        #[test]
+        fn exact_v1_replay_still_returns_v1_handles() {
+            let requests = fixture_batch();
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let rows: Vec<(String, i64)> = prepared
+                .iter()
+                .map(|item| (item.v1_handle.clone(), item.v1_amount))
+                .collect();
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let result = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect("exact v1 replay must succeed");
+            let expected: Vec<String> =
+                prepared.iter().map(|item| item.v1_handle.clone()).collect();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn v1_divergent_amount_refuses() {
+            let requests = fixture_batch();
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let mut rows: Vec<(String, i64)> = prepared
+                .iter()
+                .map(|item| (item.v1_handle.clone(), item.v1_amount))
+                .collect();
+            rows[0].1 += 1;
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let err = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect_err("tampered v1 amount must refuse");
+            assert!(err.0.contains("diverged"), "message was: {}", err.0);
+        }
+
+        #[test]
+        fn exact_v2_replay_returns_the_persisted_v2_handles() {
+            let requests = fixture_batch();
+            let policy = CiAttemptBudgetPolicy::production();
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let candidates = build_v2_candidates(&requests, &policy).unwrap();
+            let rows: Vec<(String, i64)> = candidates
+                .iter()
+                .map(|candidate| (candidate.handle.clone(), candidate.amount))
+                .collect();
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let result = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect("exact v2 replay must succeed");
+            let expected: Vec<String> = candidates
+                .into_iter()
+                .map(|candidate| candidate.handle)
+                .collect();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn tampered_v2_amount_refuses() {
+            let requests = fixture_batch();
+            let policy = CiAttemptBudgetPolicy::production();
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let candidates = build_v2_candidates(&requests, &policy).unwrap();
+            let mut rows: Vec<(String, i64)> = candidates
+                .iter()
+                .map(|candidate| (candidate.handle.clone(), candidate.amount))
+                .collect();
+            rows[0].1 += 1;
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let err = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect_err("tampered v2 amount must refuse");
+            assert!(err.0.contains("diverged"), "message was: {}", err.0);
+        }
+
+        #[test]
+        fn tampered_v2_handle_digest_refuses() {
+            let requests = fixture_batch();
+            let policy = CiAttemptBudgetPolicy::production();
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let candidates = build_v2_candidates(&requests, &policy).unwrap();
+            let mut rows: Vec<(String, i64)> = candidates
+                .iter()
+                .map(|candidate| (candidate.handle.clone(), candidate.amount))
+                .collect();
+            // Flip the trailing hex character of the first row's digest suffix. It still PARSES
+            // (the revision/attempts tags are untouched) but no longer matches any recomputed
+            // candidate's handle string.
+            let mut chars: Vec<char> = rows[0].0.chars().collect();
+            let last = chars.len() - 1;
+            chars[last] = if chars[last] == '0' { '1' } else { '0' };
+            rows[0].0 = chars.into_iter().collect();
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let err = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect_err("tampered digest must refuse");
+            assert!(err.0.contains("diverged"), "message was: {}", err.0);
+        }
+
+        #[test]
+        fn mixed_v1_and_v2_rows_for_one_run_refuse() {
+            let requests = fixture_batch();
+            let policy = CiAttemptBudgetPolicy::production();
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let v2_candidates = build_v2_candidates(&requests, &policy).unwrap();
+            let rows = vec![
+                (prepared[0].v1_handle.clone(), prepared[0].v1_amount),
+                (v2_candidates[1].handle.clone(), v2_candidates[1].amount),
+            ];
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let err = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect_err("mixed versions must refuse");
+            assert!(err.0.contains("mixes v1 and v2"), "message was: {}", err.0);
+        }
+
+        #[test]
+        fn v2_rows_disagreeing_on_policy_descriptor_refuse() {
+            let requests = fixture_batch();
+            let policy_a = CiAttemptBudgetPolicy::production();
+            let policy_b = CiAttemptBudgetPolicy::new(
+                CiAttemptBudgetRevision::V1,
+                NonZeroU32::new(3).unwrap(),
+            );
+            let candidates_a = build_v2_candidates(&requests, &policy_a).unwrap();
+            let candidates_b = build_v2_candidates(&requests, &policy_b).unwrap();
+            let rows = vec![
+                (candidates_a[0].handle.clone(), candidates_a[0].amount),
+                (candidates_b[1].handle.clone(), candidates_b[1].amount),
+            ];
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let err = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect_err("disagreeing descriptors must refuse");
+            assert!(
+                err.0.contains("disagree on budget policy descriptor"),
+                "message was: {}",
+                err.0
+            );
+        }
+
+        #[test]
+        fn v2_batch_replays_correctly_under_a_non_default_written_policy() {
+            // The durable rows were minted under a NON-default policy (3 attempts). Replay must
+            // recover that from the rows' own embedded descriptor -- `prepared` carries no policy
+            // at all any more (Sol's round-2 review: `prepare_operational_batch` must never touch
+            // `v2` arithmetic eagerly), so there is nothing here for replay to fall back to except
+            // what it parses from the durable handles themselves.
+            let requests = fixture_batch();
+            let written_policy = CiAttemptBudgetPolicy::new(
+                CiAttemptBudgetRevision::V1,
+                NonZeroU32::new(3).unwrap(),
+            );
+            let candidates = build_v2_candidates(&requests, &written_policy).unwrap();
+            let rows: Vec<(String, i64)> = candidates
+                .iter()
+                .map(|candidate| (candidate.handle.clone(), candidate.amount))
+                .collect();
+
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let result = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect("must replay under the policy the rows were actually written with");
+            let expected: Vec<String> = candidates
+                .into_iter()
+                .map(|candidate| candidate.handle)
+                .collect();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn fresh_v1_preparation_succeeds_even_when_a_v2_calculation_would_overflow() {
+            // Sol's round-2 review: an earlier draft eagerly computed a v2 candidate inside
+            // `prepare_operational_batch` under the provider's current policy, so a fresh v1 write
+            // could fail purely because unused v2 ceiling arithmetic overflowed. `limits` below is
+            // exactly the fixture the existing `job_lifetime_ceiling_overflow_refuses_loudly` test
+            // uses to trigger that v2 overflow under the checkout-4x times production's 5-attempt
+            // multiplier (mem_bytes = u64::MAX / 15, so 20x overflows u64) -- proving v1 preparation
+            // never even evaluates that arithmetic.
+            let mut request = fixture_request("88888888-8888-8888-8888-888888888881");
+            request.limits.mem_bytes = u64::MAX / 15;
+            request.limits.timeout_secs = 1;
+            request.checkout = Some(checkout_scope_fixture());
+            assert!(
+                operational_reservation_amount_v2(&request, &CiAttemptBudgetPolicy::production())
+                    .is_err(),
+                "fixture must actually trigger a v2 overflow under the production policy"
+            );
+
+            let prepared = prepare_operational_batch("fr-par", 10, vec![request])
+                .expect("v1 preparation must never evaluate v2 arithmetic, let alone fail from it");
+            assert_eq!(prepared.len(), 1);
+        }
+
+        #[test]
+        fn exact_v1_replay_succeeds_even_when_a_v2_calculation_would_overflow() {
+            let mut request = fixture_request("88888888-8888-8888-8888-888888888881");
+            request.limits.mem_bytes = u64::MAX / 15;
+            request.limits.timeout_secs = 1;
+            request.checkout = Some(checkout_scope_fixture());
+            let requests = vec![request];
+
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let rows: Vec<(String, i64)> = prepared
+                .iter()
+                .map(|item| (item.v1_handle.clone(), item.v1_amount))
+                .collect();
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let result = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect("v1 replay must never evaluate v2 arithmetic, let alone fail from it");
+            assert_eq!(result, vec![prepared[0].v1_handle.clone()]);
+        }
+
+        #[test]
+        fn exact_v2_replay_succeeds_under_a_safe_written_policy_when_production_would_overflow() {
+            // Same overflow-triggering limits as above, but replayed as a v2 batch written under a
+            // SAFE (1-attempt) policy instead of production's 5-attempt one. Proves replay recomputes
+            // strictly under the policy parsed from the durable rows -- never under
+            // `CiAttemptBudgetPolicy::production()`, which this test never even hands to replay.
+            let mut request = fixture_request("88888888-8888-8888-8888-888888888881");
+            request.limits.mem_bytes = u64::MAX / 15;
+            request.limits.timeout_secs = 1;
+            request.checkout = Some(checkout_scope_fixture());
+            let requests = vec![request];
+
+            assert!(
+                operational_reservation_amount_v2(
+                    &requests[0],
+                    &CiAttemptBudgetPolicy::production()
+                )
+                .is_err(),
+                "fixture must actually trigger a v2 overflow under the production policy"
+            );
+            let safe_policy = CiAttemptBudgetPolicy::new(
+                CiAttemptBudgetRevision::V1,
+                NonZeroU32::new(1).unwrap(),
+            );
+            assert!(
+                operational_reservation_amount_v2(&requests[0], &safe_policy).is_ok(),
+                "fixture must NOT overflow under the safe policy used to write these durable rows"
+            );
+
+            let candidates = build_v2_candidates(&requests, &safe_policy).unwrap();
+            let rows: Vec<(String, i64)> = candidates
+                .iter()
+                .map(|candidate| (candidate.handle.clone(), candidate.amount))
+                .collect();
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let result = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect("v2 replay must succeed under the policy it was actually written with");
+            let expected: Vec<String> = candidates
+                .into_iter()
+                .map(|candidate| candidate.handle)
+                .collect();
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn partial_v2_batch_refuses() {
+            // One durable row for a two-job batch: the module's design narrative promises "partial
+            // divergence" refuses, but nothing previously exercised it directly for v2.
+            let requests = fixture_batch();
+            let policy = CiAttemptBudgetPolicy::production();
+            let candidates = build_v2_candidates(&requests, &policy).unwrap();
+            let rows = vec![(candidates[0].handle.clone(), candidates[0].amount)];
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let err = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect_err("a partial v2 batch must refuse, never partially replay");
+            assert!(err.0.contains("diverged"), "message was: {}", err.0);
+        }
+
+        #[test]
+        fn golden_v2_batch_digest_for_a_fixed_two_job_batch_is_pinned() {
+            // External golden vector (Sol's round-2 review): the per-request
+            // `operational_reservation_digest_v2` is already pinned by the 4a.1a goldens, but the
+            // BATCH framing (domain, cardinality, ordering, amount) is new to this slice and was
+            // previously only exercised by generating expectations through `build_v2_candidates`
+            // itself -- a tautology. These are computed once and pasted as literals (never compared
+            // via the same function under test).
+            let requests = fixture_batch();
+            let policy = CiAttemptBudgetPolicy::production();
+            let candidates = build_v2_candidates(&requests, &policy).unwrap();
+            assert_eq!(
+                candidates[0].handle,
+                "ci-reserve:v2:55555555-5555-5555-5555-555555555555:budget-v1:a5:1be02316af6d18a5375d858afaafba500d7d3ee3fc9a3ee2f41a29463f7879e9:88888888-8888-8888-8888-888888888881:681727ec3c89359a8cf69a95741a3a28b168fc058f124de03d68f681c8b34007"
+            );
+            assert_eq!(candidates[0].amount, 3_750);
+            assert_eq!(
+                candidates[1].handle,
+                "ci-reserve:v2:55555555-5555-5555-5555-555555555555:budget-v1:a5:1be02316af6d18a5375d858afaafba500d7d3ee3fc9a3ee2f41a29463f7879e9:88888888-8888-8888-8888-888888888882:a7f2a99c7a388abbae3f691c6946ac0ef51c5967bde5c28742f9f71192ee194e"
+            );
+            assert_eq!(candidates[1].amount, 3_750);
+        }
+
+        #[test]
+        fn unparseable_v2_handle_refuses_replay() {
+            let requests = fixture_batch();
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let rows = vec![(format!("{v2_prefix}not-enough-segments"), 100i64)];
+            let err = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect_err("unparseable handle must refuse");
+            assert!(err.0.contains("unparseable"), "message was: {}", err.0);
+        }
+
+        #[test]
+        fn row_matching_neither_prefix_refuses() {
+            let requests = fixture_batch();
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let rows = vec![("nonsense-run-id".to_string(), 1i64)];
+            let err = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect_err("must refuse");
+            assert!(err.0.contains("matched neither"), "message was: {}", err.0);
+        }
+
+        #[test]
+        fn duplicate_durable_v2_handle_refuses() {
+            let requests = fixture_batch();
+            let policy = CiAttemptBudgetPolicy::production();
+            let prepared = prepare_operational_batch("fr-par", 10, requests.clone()).unwrap();
+            let candidates = build_v2_candidates(&requests, &policy).unwrap();
+            let rows = vec![
+                (candidates[0].handle.clone(), candidates[0].amount),
+                (candidates[0].handle.clone(), candidates[0].amount),
+            ];
+            let (v1_prefix, v2_prefix) = prefixes(&requests[0].ci_run_id);
+            let err = resolve_durable_replay(rows, &v1_prefix, &v2_prefix, &prepared)
+                .expect("durable rows present")
+                .expect_err("duplicate rows must refuse");
+            assert!(err.0.contains("duplicate"), "message was: {}", err.0);
+        }
+
+        #[test]
+        fn attempts_handle_tag_round_trips() {
+            let n = NonZeroU32::new(7).unwrap();
+            assert_eq!(parse_attempts_handle_tag(&attempts_handle_tag(n)), Some(n));
+        }
+
+        #[test]
+        fn attempts_handle_tag_rejects_garbage_and_zero() {
+            assert_eq!(parse_attempts_handle_tag("a0"), None);
+            assert_eq!(parse_attempts_handle_tag("5"), None);
+            assert_eq!(parse_attempts_handle_tag("aX"), None);
+            assert_eq!(parse_attempts_handle_tag(""), None);
+        }
+
+        #[test]
+        fn budget_revision_handle_tag_round_trips() {
+            assert_eq!(
+                CiAttemptBudgetRevision::from_handle_tag(CiAttemptBudgetRevision::V1.handle_tag()),
+                Some(CiAttemptBudgetRevision::V1)
+            );
+        }
+
+        #[test]
+        fn budget_revision_handle_tag_rejects_unknown() {
+            assert_eq!(CiAttemptBudgetRevision::from_handle_tag("budget-v2"), None);
+            assert_eq!(CiAttemptBudgetRevision::from_handle_tag(""), None);
+        }
+
+        #[test]
+        fn parse_v2_handle_round_trips_a_real_candidate() {
+            let requests = fixture_batch();
+            let policy = CiAttemptBudgetPolicy::production();
+            let candidates = build_v2_candidates(&requests, &policy).unwrap();
+            let parsed =
+                parse_v2_handle(&candidates[0].handle).expect("must parse a real candidate");
+            assert_eq!(parsed.revision, policy.revision());
+            assert_eq!(parsed.max_parent_attempts, policy.max_parent_attempts());
+        }
+
+        #[test]
+        fn parse_v2_handle_rejects_wrong_prefix() {
+            assert!(parse_v2_handle("ci-reserve:v1:run:budget-v1:a5:batch:job:digest").is_none());
+        }
+
+        #[test]
+        fn parse_v2_handle_rejects_wrong_arity() {
+            assert!(parse_v2_handle("ci-reserve:v2:run:budget-v1:a5:batch:job").is_none());
+            assert!(
+                parse_v2_handle("ci-reserve:v2:run:budget-v1:a5:batch:job:digest:extra").is_none()
+            );
+        }
+
+        #[test]
+        fn parse_v2_handle_rejects_unknown_tags() {
+            assert!(parse_v2_handle("ci-reserve:v2:run:budget-v9:a5:batch:job:digest").is_none());
+            assert!(parse_v2_handle("ci-reserve:v2:run:budget-v1:aX:batch:job:digest").is_none());
+            assert!(parse_v2_handle("ci-reserve:v2:run:budget-v1:a0:batch:job:digest").is_none());
         }
     }
 

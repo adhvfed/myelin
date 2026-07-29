@@ -116,7 +116,12 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
         .unwrap();
     let runtime = pinned_pool(&app_url(), &schema).await;
 
-    let provider = PgTierPCiJobBudgetReservation::new(runtime.clone(), "fr-par", 4).unwrap();
+    let provider = PgTierPCiJobBudgetReservation::new(
+        runtime.clone(),
+        "fr-par",
+        4,
+    )
+    .unwrap();
     let batch = vec![request("personal", 1, 1), request("personal", 1, 2)];
 
     // Concurrent acknowledgement-loss retries serialize on the tenant lock. One transaction
@@ -179,7 +184,12 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
 
     // One still-inflight reservation plus a fresh two-job batch exceeds a ceiling of two. The
     // complete new batch is refused and leaves no rows.
-    let tight = PgTierPCiJobBudgetReservation::new(runtime.clone(), "fr-par", 2).unwrap();
+    let tight = PgTierPCiJobBudgetReservation::new(
+        runtime.clone(),
+        "fr-par",
+        2,
+    )
+    .unwrap();
     let before = reservation_rows(&admin, "personal").await.len();
     let error = tight
         .reserve_batch(vec![request("personal", 2, 3), request("personal", 2, 4)])
@@ -190,7 +200,12 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
 
     // Different fresh runs contend under the same tenant ceiling. The advisory lock makes the
     // capacity decision serial: exactly one complete two-job batch commits, never both.
-    let race_provider = PgTierPCiJobBudgetReservation::new(runtime.clone(), "fr-par", 2).unwrap();
+    let race_provider = PgTierPCiJobBudgetReservation::new(
+        runtime.clone(),
+        "fr-par",
+        2,
+    )
+    .unwrap();
     let race_a = vec![
         request("capacity-race", 4, 9),
         request("capacity-race", 4, 10),
@@ -227,7 +242,12 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
         )
         .await
         .unwrap();
-    let crash_provider = PgTierPCiJobBudgetReservation::new(runtime.clone(), "fr-par", 4).unwrap();
+    let crash_provider = PgTierPCiJobBudgetReservation::new(
+        runtime.clone(),
+        "fr-par",
+        4,
+    )
+    .unwrap();
     assert!(crash_provider
         .reserve_batch(crash_batch.clone())
         .await
@@ -266,6 +286,82 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
     .await
     .unwrap();
     assert_eq!(visible, 2);
+
+    runtime.close().await;
+    admin.close().await;
+    bootstrap
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+    bootstrap.close().await;
+}
+
+/// CT-007 slice 5b.3-4a.1b: the active-reservation-ceiling COUNT must treat a durable `ci-reserve:v2:...`
+/// row as counting against the SAME tenant ceiling as `ci-reserve:v1:...` rows, even though this slice's
+/// writer still only ever mints `v1` handles. Manually insert one `v2`-shaped row to simulate a future
+/// writer, then prove a fresh `v1` batch request is refused once the ceiling is exhausted by it alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_v2_reservation_row_counts_toward_the_v1_batch_ceiling() {
+    let schema = format!(
+        "ci_operational_reservation_v2_ceiling_{}",
+        std::process::id()
+    );
+    let bootstrap = pinned_pool(&admin_url(), "public").await;
+    bootstrap
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+    bootstrap
+        .execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .unwrap();
+    let admin = pinned_pool(&admin_url(), &schema).await;
+    PgMigrator::apply(&admin, &reserve_settle_durable_migrations())
+        .await
+        .unwrap();
+    admin
+        .execute(format!("GRANT USAGE ON SCHEMA {schema} TO myelin_app").as_str())
+        .await
+        .unwrap();
+    admin
+        .execute("GRANT SELECT, INSERT, UPDATE ON cost_reservation TO myelin_app")
+        .await
+        .unwrap();
+    let runtime = pinned_pool(&app_url(), &schema).await;
+
+    let tenant = "v2-ceiling-tenant";
+    let v2_run_id = "ci-reserve:v2:90000000-0000-0000-0000-000000000001:budget:trusted:\
+                     40000000-0000-0000-0000-000000000099:deadbeef";
+    sqlx::query(
+        "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state) \
+         VALUES ($1, 'fr-par', $2, 500, 'reserved')",
+    )
+    .bind(tenant)
+    .bind(v2_run_id)
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let provider = PgTierPCiJobBudgetReservation::new(
+        runtime.clone(),
+        "fr-par",
+        1,
+    )
+    .unwrap();
+    let error = provider
+        .reserve_batch(vec![request(tenant, 9, 50)])
+        .await
+        .unwrap_err();
+    assert!(
+        error.0.contains("ceiling is exhausted"),
+        "the pre-existing v2 row alone already saturates a ceiling of 1: {}",
+        error.0
+    );
+    assert_eq!(
+        reservation_rows(&admin, tenant).await,
+        vec![(v2_run_id.into(), 500, "reserved".into())],
+        "the refused v1 batch leaves no new row and the v2 row untouched"
+    );
 
     runtime.close().await;
     admin.close().await;

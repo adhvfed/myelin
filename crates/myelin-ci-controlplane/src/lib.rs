@@ -89,10 +89,10 @@ pub use ci_identity_adapter::{
     CI_JOB_PRINCIPAL_ID, CI_JOB_REQUIRED_CAPABILITIES,
 };
 pub use ci_launch_authority::{
-    CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority,
-    ManifestBoundCiJobTokenAuthority, PgTierPCiJobBudgetReservation, TierPOperationalCiJobPricer,
-    LINUX_SMALL_V1_POLICY_REVISION, LINUX_SMALL_V1_RUNNER_LABELS,
-    TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
+    CiAttemptBudgetPolicy, CiAttemptBudgetRevision, CiJobBudgetReservationProvider,
+    CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority, ManifestBoundCiJobTokenAuthority,
+    PgTierPCiJobBudgetReservation, TierPOperationalCiJobPricer, LINUX_SMALL_V1_POLICY_REVISION,
+    LINUX_SMALL_V1_RUNNER_LABELS, TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
 };
 pub use ci_manifest_job_runner::{
     register_durable_ci_manifest_pipeline, CiJobTokenIssueError, CiJobTokenIssuer,

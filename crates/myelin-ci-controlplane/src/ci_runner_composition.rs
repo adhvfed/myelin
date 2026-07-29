@@ -333,7 +333,8 @@ fn valid_machine_token(value: &str) -> bool {
 }
 
 fn valid_reserve_handle(value: &str) -> bool {
-    value.starts_with(crate::ci_pipeline_driver::TIER_P_OPERATIONAL_RESERVATION_PREFIX)
+    (value.starts_with(crate::ci_pipeline_driver::TIER_P_OPERATIONAL_RESERVATION_PREFIX)
+        || value.starts_with(crate::ci_pipeline_driver::TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX))
         && value.len() <= 512
         && !value.chars().any(char::is_control)
 }
@@ -754,7 +755,7 @@ fn valid_cell_id(cell_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_cell_id;
+    use super::{valid_cell_id, valid_reserve_handle};
 
     #[test]
     fn cell_id_is_canonical_before_durable_root_lookup() {
@@ -764,5 +765,23 @@ mod tests {
         assert!(!valid_cell_id("cell-eu-1 "));
         assert!(!valid_cell_id("cell-\neu-1"));
         assert!(!valid_cell_id(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn reserve_handle_accepts_both_v1_and_v2_prefixes() {
+        // CT-007 slice 5b.3-4a.1b: the inbound reservation-scope format validator must recognize a
+        // `v2` handle exactly as readily as a `v1` one -- otherwise every `v2`-reserved job would be
+        // refused at claim time before it ever reaches the launch hook.
+        assert!(valid_reserve_handle("ci-reserve:v1:run:batch:job:item"));
+        assert!(valid_reserve_handle(
+            "ci-reserve:v2:run:budget-v1:a5:batch:job:item"
+        ));
+        assert!(!valid_reserve_handle("ci-reserve:v3:run:job"));
+        assert!(!valid_reserve_handle("reserve:job"));
+        assert!(!valid_reserve_handle(&format!(
+            "ci-reserve:v2:{}",
+            "x".repeat(600)
+        )));
+        assert!(!valid_reserve_handle("ci-reserve:v2:run:job\ncontrol"));
     }
 }

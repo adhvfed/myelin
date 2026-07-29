@@ -2502,3 +2502,96 @@ clean diff.
 activation), then 5b.3-4a.2 (the durable prelaunch-usage journal itself) and 5b.3-4b (reaper/
 reconciliation/settlement consumers) all remain. 5b.3-5 through 5b.3-7 and the rest of ledger 12's
 open items are unchanged.
+
+---
+
+## 2026-07-29 — CT-007 slice 5b.3-4a.1b landed: `v2` reservation-handle read-side compatibility
+(Sol, design + 2 review rounds) — every existing `v1`-only consumer now recognizes `ci-reserve:v2:`;
+fresh writes still mint only `v1`, unchanged
+
+Design check-in with Sol before implementing surfaced that "recognize both prefixes" alone is not
+enough for genuine dual-version replay: a `v2` batch's durable ceiling depends on
+`CiAttemptBudgetPolicy` (revision + `max_parent_attempts`), and if that policy is ever revised
+(e.g. `max_parent_attempts` changed from 5 to something else), a reader that recomputes an expected
+`v2` candidate under its OWN currently-configured policy would never match an older durable row
+minted under the policy that was live when it was written — breaking exact acknowledgement-loss
+replay. Sol's design: embed the policy descriptor in the plain-text handle itself
+(`ci-reserve:v2:<run_id>:<budget_tag>:<attempts_tag>:<batch_digest>:<job_id>:<request_digest>`, e.g.
+`...:budget-v1:a5:...`) so replay can recover the EXACT policy a durable row was minted under from
+the row alone, never from "whatever the provider is configured with right now."
+
+**What landed** (six production consumers widened, all confirmed exhaustive by Sol — no other place
+in the codebase assumes a `v1`-only reservation handle):
+
+1. `ci_pipeline_driver.rs`: new `TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX` constant.
+   `validate_reservation_pricing_policy`'s gate now skips only if a handle matches NEITHER prefix
+   (the zero-markup pricing formula underneath was already prefix-agnostic).
+2. `ci_run_supersession.rs`: `settle_cancelled_job`'s hard refusal (previously: any non-`v1` handle
+   could never settle at all) now accepts either prefix. `cancel_stale_queued_on_conn`'s
+   `cost_reservation` attachment check now also matches a `v2`-shaped row.
+3. `ci_runner_composition.rs`: `valid_reserve_handle` (the inbound claim-time format validator) now
+   accepts either prefix.
+4. `ci_launch_authority.rs` — the core of this slice:
+   - `reserve_operational_batch_on_conn`'s replay-lookup query now searches both prefixes; the
+     decision logic (split-by-version, refuse-if-mixed, replay-v1-unchanged, or hand off to `v2`)
+     was factored into a new pure, synchronous, database-free `resolve_durable_replay` function so
+     every branch is directly unit-testable.
+   - `replay_v2_batch` parses every durable `v2` handle, requires them to all agree on the SAME
+     embedded policy descriptor (refuses "disagree on budget policy descriptor" otherwise),
+     reconstructs a `CiAttemptBudgetPolicy` from that parsed descriptor, and recomputes the expected
+     candidate set to check for exact/tampered/partial divergence — the same rigor `v1` replay
+     already had.
+   - The active-reservation-ceiling COUNT query now counts rows matching either prefix together.
+   - Fresh writes are UNCHANGED: still insert only `v1` handles. `PreparedOperationalReservation`
+     carries no `v2` data at all this slice.
+
+**Sol's round-1 review found a real bug in the first draft:** an earlier version had
+`prepare_operational_batch` EAGERLY compute a `v2` candidate under the provider's current policy on
+every batch (intended as groundwork for 4a.1c's writer switch). Sol caught that this meant a FRESH
+`v1` write — or even an exact `v1` REPLAY — could fail purely because unrelated, never-written `v2`
+ceiling arithmetic overflowed for the current policy, before any durable row was even read. Fixed by
+removing all eager `v2` computation from `prepare_operational_batch` entirely; `v2` candidates are
+now computed ONLY lazily, inside `replay_v2_batch`, using a policy reconstructed from an
+already-durable row's own descriptor — never the "current" policy, which no longer exists as a
+concept anywhere in this slice at all (the writer-activation policy field/constructor param move to
+4a.1c). Round 1 also required an external (non-tautological) golden vector for the new `v2` batch
+digest framing (added, computed once via a deliberately-wrong-placeholder-then-paste-panic-output
+technique) and a dedicated partial-batch refusal test (the module doc had claimed this was covered;
+it wasn't, now is). Round 2: cleared, no remaining blockers.
+
+**Test coverage:** 32 new tests total. `ci_launch_authority.rs`'s new `handle_replay_5b3_4a1b`
+module (27 tests): handle-format parse/round-trip + every malformed-input rejection, and the full
+`resolve_durable_replay`/`replay_v2_batch` matrix — exact v1/v2 replay, tampered amount, tampered
+digest, mixed-version refusal, disagreeing-policy-descriptor refusal, partial-batch refusal,
+duplicate-row refusal, replay surviving a non-default written policy, the external golden batch
+vector, and the three overflow-isolation regressions Sol required (fresh `v1` prep succeeds, exact
+`v1` replay succeeds, and exact `v2` replay under a safe written policy succeeds — all using limits
+that make `operational_reservation_amount_v2` under `CiAttemptBudgetPolicy::production()` overflow,
+proving none of those three paths ever evaluates that arithmetic). Plus 1 unit test each in
+`ci_pipeline_driver_tests.rs` (pricing gate) and `ci_runner_composition.rs` (handle validator), and
+3 new integration tests against live Postgres: a cancelled job with a `v2` handle reaches real
+settlement (`integration_ci_terminal_accounting_atomic.rs`), a `v2`-attached stale-queued run is
+refused cancellation rather than silently superseded (`integration_pg_ci_pipeline_starter.rs`), and
+a manually-inserted `v2` row counts against the same tenant ceiling as `v1` rows
+(`integration_ci_operational_reservation.rs`).
+
+While building the stale-queued-cancellation test, found and fixed (test-only, not introduced by
+this slice) a pre-existing bug in `integration_pg_ci_pipeline_starter.rs`'s fixtures: they hardcoded
+`commit_oid = 'deadbeef'` (8 chars), which the already-committed production checkout validation (CT-007
+slice 5b.3-2, commit `221e4535`) rejects as not a valid 40/64-char hex commit id. Fixed with a
+40-char `TEST_COMMIT_OID` constant used everywhere the old literal was.
+
+Full sweep: `cargo test -p myelin-ci-controlplane --lib` → 527 passed, 0 failed (500 pre-existing +
+27 new). The 3 new integration tests plus every pre-existing test in the 3 files they were added to
+pass against live Postgres. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+clean. `cargo check --workspace --tests --all-features` clean. rustfmt applied cleanly to
+`ci_launch_authority.rs` and the two operational-reservation/pipeline-starter test files (confirmed
+no pre-existing skew via a `git stash` baseline check first); `integration_ci_terminal_accounting_atomic.rs`
+has known pre-existing rustfmt-version skew unrelated to this change (same baseline check) — left
+untouched, with the new test intentionally matching that file's existing style.
+
+**Still open:** 5b.3-4a.1c (writer activation — inject/store `CiAttemptBudgetPolicy` in the
+provider again, this time as the small, already-reviewed switch selecting the `v2` candidate for
+fresh batches), then 5b.3-4a.2 (the durable prelaunch-usage journal itself) and 5b.3-4b (reaper/
+reconciliation/settlement consumers). 5b.3-5 through 5b.3-7 and the rest of ledger 12's open items
+are unchanged.

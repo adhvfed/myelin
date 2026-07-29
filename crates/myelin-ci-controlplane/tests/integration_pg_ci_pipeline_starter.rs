@@ -15,17 +15,18 @@ use myelin_ci_controlplane::{
     CiExecutionProfileV1, CiExecutionRequestV1, CiJobLaunchClaim, CiJobLaunchGrantV1,
     CiJobQueueStore, CiJobSpecStore, CiLaunchAuthorityError, CiLaunchAuthorityMaterializer,
     CiLaunchAuthorityV1, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
-    CiWorkflowDefinitionPin, DurableCiJobLaunchTemplate, DurableEnqueue, GrantedCiJobV1, Lane,
-    PgCiPipelineStarter, PgCiRunStarterFactory, PgCiRunStarterPoller, PreparedRunPlanV2,
-    ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome, ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL,
-    ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
-    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
-    BUMP_CHECK_ATTEMPT_SQL, CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
-    CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_ACCOUNTING_DDL,
-    CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL,
-    CREATE_CI_RUN_CHECK_ATTEMPT_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
+    CiRunSupersessionError, CiWorkflowDefinitionPin, DurableCiJobLaunchTemplate, DurableEnqueue,
+    GrantedCiJobV1, Lane, PgCiPipelineStarter, PgCiRunStarterFactory, PgCiRunStarterPoller,
+    PgCiStarterError, PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
+    ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
+    ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
+    ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
+    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, BUMP_CHECK_ATTEMPT_SQL, CI_JOB_RUN_LEDGER_INDEX,
+    CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL,
+    CREATE_CI_JOB_ACCOUNTING_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+    CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_CHECK_ATTEMPT_DDL, CREATE_CI_RUN_DDL,
+    CREATE_JOB_QUEUE_DDL,
 };
 use myelin_ci_sandbox::{
     CompletionClaim, EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpecTemplate,
@@ -49,6 +50,12 @@ use sqlx::{Executor, PgPool};
 
 const BODY_HASH: &str = "blake3:ci-pg-body-v1";
 const BODY_HASH_V2: &str = "blake3:ci-pg-body-v2";
+/// A syntactically valid (40-hex-char, SHA-1-shaped) placeholder commit id. The real production
+/// launch authority (`checkout_scope_for_run` in `ci_launch_authority.rs`) requires a full
+/// 40-character (SHA-1) or 64-character (SHA-256) lowercase-hex commit object id and refuses
+/// anything shorter (e.g. the old `"deadbeef"` placeholder), so every fixture that may reach that
+/// real authority must use this instead.
+const TEST_COMMIT_OID: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 static AUTHORITY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 struct PausingBlobStore {
@@ -366,13 +373,15 @@ async fn insert_run(
          repo_ref, commit_oid, cause_event_id, cause_depth, caused_by, definition_snapshot, trigger_kind, trust_tier, state, correlation_id) \
          VALUES ($1, 'fr-par', $2::uuid, '22222222-2222-2222-2222-222222222222'::uuid, \
          '33333333-3333-3333-3333-333333333333'::uuid, $3::uuid, \
-         'myelin://' || $1 || '/git/repo/core', 'deadbeef', 'trigger-' || $2, 1, 'session:test', $4, \
+         'myelin://' || $1 || '/git/repo/core', $5, \
+         'trigger-' || $2, 1, 'session:test', $4, \
          'push', 'trusted', 'queued', 'corr-' || $2)",
     )
     .bind(tenant)
     .bind(run_id)
     .bind(wf_run_id)
     .bind(snapshot)
+    .bind(TEST_COMMIT_OID)
     .execute(admin)
     .await
     .expect("insert queued ci_run");
@@ -408,7 +417,8 @@ async fn insert_pr_run(
          trigger_kind, concurrency_group, pr_head_generation, trust_tier, state, correlation_id) \
          VALUES ($1, 'fr-par', $2::uuid, '22222222-2222-2222-2222-222222222222'::uuid, \
          '33333333-3333-3333-3333-333333333333'::uuid, $3::uuid, \
-         'myelin://' || $1 || '/git/repo/core', 'deadbeef', 'trigger-' || $2, 1, \
+         'myelin://' || $1 || '/git/repo/core', $7, \
+         'trigger-' || $2, 1, \
          'session:test', $4, 'pull_request', $5, $6, 'trusted', 'queued', 'corr-' || $2)",
     )
     .bind(tenant)
@@ -417,6 +427,7 @@ async fn insert_pr_run(
     .bind(snapshot)
     .bind(group)
     .bind(generation)
+    .bind(TEST_COMMIT_OID)
     .execute(admin)
     .await
     .expect("insert queued PR ci_run");
@@ -431,7 +442,7 @@ async fn reserve_test_attempts(admin: &PgPool, tenant: &str, run_id: &str) {
             .bind(tenant)
             .bind("fr-par")
             .bind(&repo_ref)
-            .bind("deadbeef")
+            .bind(TEST_COMMIT_OID)
             .bind(context)
             .bind(run_id)
             .fetch_one(admin)
@@ -440,13 +451,14 @@ async fn reserve_test_attempts(admin: &PgPool, tenant: &str, run_id: &str) {
         sqlx::query(
             "INSERT INTO ci_run_check_attempt \
              (tenant_id,region,run_id,repo_ref,commit_oid,context,run_attempt) \
-             VALUES ($1,'fr-par',$2,$3,'deadbeef',$4,$5)",
+             VALUES ($1,'fr-par',$2,$3,$6,$4,$5)",
         )
         .bind(tenant)
         .bind(run_id)
         .bind(&repo_ref)
         .bind(context)
         .bind(attempt)
+        .bind(TEST_COMMIT_OID)
         .execute(admin)
         .await
         .expect("persist test run-scoped check attempt");
@@ -780,7 +792,7 @@ async fn assert_initial_checks(admin: &PgPool, tenant: &str, run_id: &str, attem
         );
         assert_eq!(payload["tenant"], tenant);
         assert_eq!(payload["repo"], format!("myelin://{tenant}/git/repo/core"));
-        assert_eq!(payload["commit_oid"], "deadbeef");
+        assert_eq!(payload["commit_oid"], TEST_COMMIT_OID);
         assert_eq!(
             payload["context"],
             serde_json::json!({
@@ -3595,6 +3607,292 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .to_string()
         .contains("active workflow selection does not equal pinned version 1"));
     assert_atomic_started(&admin, "tenant_fresh_old_pin", run_old_pin, false, false).await;
+    })
+    .await;
+}
+
+/// A queued PR run superseded by a newer generation is normally cancelled cleanly, exactly like the
+/// `delayed_run` scenario above: nothing has attached launch, workflow, or accounting authority to it,
+/// so `cancel_stale_queued_on_conn` finds it untouched and closes it out. Here a `ci-reserve:v2:`-shaped
+/// `cost_reservation` row is attached to the stale run before the starter observes it. That must trip
+/// the same corruption guard the zero-attachment case never reaches: `cancel_stale_queued_on_conn`
+/// refuses the cancellation with `CorruptState` (surfaced through `run_once()` as
+/// `PgCiStarterError::Supersession`) instead of returning the clean `StartQueuedOutcome::Superseded`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_v2_reservation_prevents_stale_queued_cancellation() {
+    let schema = format!("ci_pg_starter_v2res_{}", std::process::id());
+    let bare = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url())
+        .await
+        .expect("connect schema setup");
+    bare.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .expect("drop stale schema");
+    bare.execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .expect("create schema");
+    let cleanup_bare = bare.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_bare, &schema_for_cleanup, move || async move {
+        let admin = pool_on(&admin_url(), &schema).await;
+        PgMigrator::apply(&admin, &foundation_migrations())
+            .await
+            .expect("foundation migrations");
+        PgMigrator::apply(&admin, &reserve_settle_durable_migrations())
+            .await
+            .expect("durable reservation migrations");
+        PgMigrator::apply_validated(
+            &admin,
+            &flow_migrations(),
+            &HotTables::declare(["workflow_run"]),
+        )
+        .await
+        .expect("flow migrations");
+        admin.execute(CREATE_CI_RUN_DDL).await.expect("ci_run DDL");
+        admin
+            .execute(ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL)
+            .await
+            .expect("ci_run causal provenance migration");
+        admin
+            .execute(ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL)
+            .await
+            .expect("ci_run concurrency identity migration");
+        admin
+            .execute(ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL)
+            .await
+            .expect("ci_run PR ordering authority migration");
+        sqlx::raw_sql(CREATE_CI_DRIVE_MANIFEST_DDL)
+            .execute(&admin)
+            .await
+            .expect("ci_drive_manifest DDL");
+        admin.execute(CREATE_CI_JOB_DDL).await.expect("ci_job DDL");
+        admin
+            .execute(CREATE_JOB_QUEUE_DDL)
+            .await
+            .expect("job_queue DDL");
+        admin
+            .execute("CREATE UNIQUE INDEX jq_idem ON job_queue (tenant_id, idem_token)")
+            .await
+            .expect("job_queue dispatch idempotency index");
+        for ddl in [
+            ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
+            ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
+            ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+            ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+        ] {
+            admin
+                .execute(ddl)
+                .await
+                .expect("job_queue launch-authority migration");
+        }
+        admin
+            .execute(CREATE_CI_JOB_SPEC_DDL)
+            .await
+            .expect("ci_job_spec DDL");
+        admin
+            .execute(ALTER_CI_JOB_SPEC_ADD_STAGE_DDL)
+            .await
+            .expect("ci_job_spec stage migration");
+        admin
+            .execute(CREATE_CI_COST_EVENT_DDL)
+            .await
+            .expect("ci_cost_event DDL");
+        sqlx::raw_sql(CREATE_CI_JOB_ACCOUNTING_DDL)
+            .execute(&admin)
+            .await
+            .expect("ci_job_accounting DDL");
+        admin
+            .execute(ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL)
+            .await
+            .expect("ci_job_accounting skipped migration");
+        admin
+            .execute(CREATE_CHECK_ATTEMPT_DDL)
+            .await
+            .expect("check_attempt DDL");
+        sqlx::raw_sql(CREATE_CI_RUN_CHECK_ATTEMPT_DDL)
+            .execute(&admin)
+            .await
+            .expect("ci_run_check_attempt DDL");
+        admin
+            .execute(CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL)
+            .await
+            .expect("ci_job run-ledger concurrent index DDL");
+        admin
+            .execute("SELECT myelin_make_tenant_scoped('ci_run')")
+            .await
+            .expect("force RLS on ci_run");
+        admin
+            .execute("SELECT myelin_make_tenant_scoped('ci_drive_manifest')")
+            .await
+            .expect("force RLS on ci_drive_manifest");
+        admin
+            .execute("SELECT myelin_make_tenant_scoped('ci_job')")
+            .await
+            .expect("force RLS on ci_job");
+        admin
+            .execute("SELECT myelin_make_tenant_scoped('check_attempt')")
+            .await
+            .expect("force RLS on check_attempt");
+        admin
+            .execute("SELECT myelin_make_tenant_scoped('ci_run_check_attempt')")
+            .await
+            .expect("force RLS on ci_run_check_attempt");
+        for table in [
+            "job_queue",
+            "ci_job_spec",
+            "ci_cost_event",
+            "ci_job_accounting",
+        ] {
+            admin
+                .execute(format!("SELECT myelin_make_tenant_scoped('{table}')").as_str())
+                .await
+                .expect("force RLS on supersession table");
+        }
+        admin
+            .execute(format!("GRANT USAGE ON SCHEMA {schema} TO myelin_app").as_str())
+            .await
+            .expect("grant schema");
+        admin
+            .execute(format!("GRANT ALL ON ALL TABLES IN SCHEMA {schema} TO myelin_app").as_str())
+            .await
+            .expect("grant tables");
+        admin
+            .execute("REVOKE UPDATE, DELETE ON ci_drive_manifest FROM myelin_app")
+            .await
+            .expect("manifest remains insert-only after broad test setup grant");
+        let app = pool_on(&app_url(), &schema).await;
+        let blobs = Arc::new(FsBlobStore::new());
+        let mut ledger_config = MyelinConfig::dev();
+        ledger_config.database_url = admin_url();
+        ledger_config.region = "fr-par".into();
+        let supersession_ledger =
+            DurableCostLedger::new(SubstrateProvider::connect(ledger_config, 1).await.unwrap());
+
+        let register = flow_executor(&admin, "tenant_a");
+        tokio::task::block_in_place(|| {
+            register
+                .register_definition(CI_PIPELINE_WF_TYPE, 1, BODY_HASH)
+                .expect("register immutable workflow definition");
+        });
+
+        // The same PR-supersession fixture as `delayed_run` above: a queued generation-1 run becomes
+        // stale once a newer generation-2 head is running.
+        let pr_tenant = "tenant_pr_v2_reservation_guard";
+        let pr_group = "pr:core:99";
+        let old_run = "10000000-0000-0000-0000-000000000901";
+        let old_wf = "20000000-0000-0000-0000-000000000901";
+        let new_run = "10000000-0000-0000-0000-000000000902";
+        let new_wf = "20000000-0000-0000-0000-000000000902";
+        let pr_factory = ci_run_starter_factory(
+            app.clone(),
+            Region("fr-par".into()),
+            blobs.clone(),
+            tokio::runtime::Handle::current(),
+            supersession_ledger.clone(),
+        )
+        .unwrap();
+        let pr_starter = pr_factory
+            .starter_for(
+                TenantId(pr_tenant.into()),
+                CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+            )
+            .unwrap();
+        insert_pr_run(
+            &admin,
+            blobs.as_ref(),
+            pr_tenant,
+            old_run,
+            old_wf,
+            pr_group,
+            Some(1),
+            true,
+        )
+        .await;
+        assert!(matches!(
+            pr_starter.run_once().await.unwrap(),
+            StartQueuedOutcome::Started { run_id, .. } if run_id == old_run
+        ));
+        insert_pr_run(
+            &admin,
+            blobs.as_ref(),
+            pr_tenant,
+            new_run,
+            new_wf,
+            pr_group,
+            Some(2),
+            true,
+        )
+        .await;
+        assert!(matches!(
+            pr_starter.run_once().await.unwrap(),
+            StartQueuedOutcome::Started { run_id, .. } if run_id == new_run
+        ));
+
+        // A stale generation-1 arrival, same shape as `delayed_run`, would normally be cancelled cleanly
+        // because nothing has attached launch/workflow/accounting authority to it. Attach a v2 operational
+        // reservation to it before the starter observes it: `cancel_stale_queued_on_conn`'s "nothing
+        // attached" guard must now refuse the cancellation instead of closing the run out.
+        let stale_run = "10000000-0000-0000-0000-000000000900";
+        let stale_wf = "20000000-0000-0000-0000-000000000900";
+        insert_pr_run(
+            &admin,
+            blobs.as_ref(),
+            pr_tenant,
+            stale_run,
+            stale_wf,
+            pr_group,
+            Some(1),
+            false,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state) \
+         VALUES ($1, 'fr-par', $2, 1, 'reserved')",
+        )
+        .bind(pr_tenant)
+        .bind(format!(
+            "ci-reserve:v2:{stale_run}:budget-v1:a1:batch:job:{}",
+            "d".repeat(64)
+        ))
+        .execute(&admin)
+        .await
+        .expect("attach a v2 operational reservation to the stale queued run");
+        let error = pr_starter
+            .run_once()
+            .await
+            .expect_err("an attached v2 reservation must block stale-queued cancellation");
+        assert!(
+            matches!(
+                error,
+                PgCiStarterError::Supersession(CiRunSupersessionError::CorruptState(_))
+            ),
+            "unexpected error shape: {error:?}"
+        );
+        let stale_state: String =
+            sqlx::query_scalar("SELECT state FROM ci_run WHERE tenant_id=$1 AND run_id=$2::uuid")
+                .bind(pr_tenant)
+                .bind(stale_run)
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+        assert_eq!(
+            stale_state, "queued",
+            "the refused cancellation must leave the stale run's lifecycle untouched"
+        );
+        let reservation_still_present: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM cost_reservation \
+          WHERE tenant_id=$1 AND run_id LIKE ('ci-reserve:v2:' || $2 || ':%'))",
+        )
+        .bind(pr_tenant)
+        .bind(stale_run)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert!(
+            reservation_still_present,
+            "the refused cancellation must not have touched the attached reservation"
+        );
     })
     .await;
 }

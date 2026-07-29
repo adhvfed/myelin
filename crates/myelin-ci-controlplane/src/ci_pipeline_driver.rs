@@ -600,9 +600,15 @@ pub struct PricedCiJobUsage {
     pub memory_markup: MinorUnits,
 }
 
-/// Frozen Tier-P settlement policy paired with `ci-reserve:v1:` reservation authority.
+/// Frozen Tier-P settlement policy. Paired with both `ci-reserve:v1:` and (CT-007 slice 5b.3-4a.1b)
+/// `ci-reserve:v2:` reservation authority -- `v2` only changes the reservation-amount topology and
+/// durable handle shape, never the zero-markup settlement policy itself.
 pub const TIER_P_OPERATIONAL_PRICING_REVISION: &str = "tier-p-operational:v1";
 pub(crate) const TIER_P_OPERATIONAL_RESERVATION_PREFIX: &str = "ci-reserve:v1:";
+/// CT-007 slice 5b.3-4a.1b: the `v2` reservation-handle prefix (parent-attempt budget authority,
+/// design locked with Sol 2026-07-29). Same Tier-P pricing revision and zero-markup settlement
+/// policy as `v1` -- only the reservation-amount topology and durable handle shape differ.
+pub(crate) const TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX: &str = "ci-reserve:v2:";
 const PRICING_GIB_BYTES: u64 = 1_073_741_824;
 
 /// A fail-closed pricing refusal. Values and authority handles are deliberately absent.
@@ -639,7 +645,9 @@ pub(crate) fn validate_reservation_pricing_policy(
     usage: ResourceUsage,
     priced: &PricedCiJobUsage,
 ) -> Result<(), CiJobPricingError> {
-    if !reserve_handle.starts_with(TIER_P_OPERATIONAL_RESERVATION_PREFIX) {
+    if !reserve_handle.starts_with(TIER_P_OPERATIONAL_RESERVATION_PREFIX)
+        && !reserve_handle.starts_with(TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX)
+    {
         return Ok(());
     }
     let memory_gb_seconds = usage.mem_byte_seconds.div_ceil(PRICING_GIB_BYTES);
