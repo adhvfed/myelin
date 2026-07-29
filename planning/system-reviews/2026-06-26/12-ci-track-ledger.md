@@ -2428,3 +2428,77 @@ window; honest terminal dispositions for preparation-only outcomes; composing th
 `launch_with`; the live drill through the public launch path) remain scoped only at a
 task-description level. The parent-attempt transport landed here is not yet called from anywhere —
 5b.3-6 wires it in. Task #20 and the live-drill host-provisioning gap are unchanged.
+
+## 2026-07-29 — CT-007 slice 5b.3-4a.1a landed: `v2` operational-reservation budget-authority
+## machinery (Sol, design + 2 review rounds) — pure calculator/digest-encoder, NOT wired into any
+## live reservation path yet
+
+Designing 5b.3-4 (durable pre-workload usage across the launch-CAS ambiguity window) with Sol
+surfaced that the problem is bigger than a journal: a checkout-bearing parent attempt now runs FOUR
+sequential sandboxed executions (Hop A's advertise-refs + fetch, Hop B's checkout-materialization,
+then the workload) against the SAME single `v1` reservation, which was only ever sized for one. Sol's
+design: don't divide the existing per-container `limits` four ways (would silently weaken every
+individual execution's own ceiling) — add a separate, ADDITIVE parent-attempt budget instead, via a
+new versioned `v2` reservation policy. This also exposed that job retries have no existing cap at all
+(reservations are job-scoped, but `lease_epoch`/`retry_attempts` can accumulate without limit) — Sol
+recommended a finite, explicit, digest-bound `max_parent_attempts` policy constant. The user's call:
+**5, and configurable** — implemented as a `CiAttemptBudgetPolicy` struct field (`production()` = 5),
+matching this codebase's existing convention for policy constants (no env-var/per-tenant config
+mechanism exists anywhere in this crate or its siblings to imitate instead — verified before
+implementing, not assumed).
+
+Given the scope (this is a live billing/capacity-reservation change to a system with real traffic,
+not a self-contained refactor), the user was asked explicitly how to proceed rather than continuing
+under standing autonomy alone; they confirmed: proceed with the full scope, apply a
+production-capable-at-scale lens when unsure.
+
+**What landed (5b.3-4a.1a only — the pure machinery, genuinely inert, confirmed via the dead_code
+compiler check that nothing calls any of it yet):**
+- `CiAttemptBudgetRevision::V1` / `CiAttemptBudgetPolicy{revision, max_parent_attempts: NonZeroU32}`
+  — `production()` = V1 + 5. A "parent attempt" is a durably-begun claim generation: before Hop A for
+  a checkout job, before workload launch itself for a compute job (which gets the SAME 5-attempt
+  ceiling despite having no Hop A/B preparation at all — 5b.3-4a.2 must enforce the cap for both
+  shapes).
+- `ResourceCeiling{cpu_seconds, mem_byte_seconds}` — raw dimensions kept separate; `v1`'s own
+  `operational_reservation_amount` combines them into one pre-converted `i64` at the first step, `v2`
+  stays in raw dimensions through every intermediate aggregation and converts to operational units
+  exactly ONCE, at the very end (`operational_amount_from_ceiling`).
+- `raw_execution_ceiling` (mirrors `v1`'s own formula) → `parent_attempt_ceiling` (derives checkout
+  presence ONLY from `request.checkout`, never a caller-supplied bool; named execution counts
+  `CHECKOUT_TRANSPORT_EXECUTIONS=2`/`CHECKOUT_MATERIALIZATION_EXECUTIONS=1`/`WORKLOAD_EXECUTIONS=1`,
+  never a bare `4`) → `job_lifetime_ceiling` (× `max_parent_attempts`) → `operational_reservation_amount_v2`.
+- `operational_reservation_digest_v2` — a wholly separate encoder from `runtime_authority_digest`
+  (byte-frozen, still shared by the `v1` batch domain), mirroring `token_authority_digest_v2`'s
+  checkout-hashing pattern, additionally binding the budget-policy revision, `max_parent_attempts`,
+  and the resulting ceilings — derives its ceiling inputs INTERNALLY from `request`/`policy` rather
+  than accepting them as parameters (Sol's round-1 review: no authority encoder may accept
+  independently forgeable derived facts).
+
+**Sol's review, 2 rounds:** Round 1 found the digest function originally accepted caller-supplied
+ceilings (a forgery risk — fixed by deriving them internally and returning `Result`), the final
+pricing conversion lacked direct overflow-boundary tests (fixed by extracting
+`operational_amount_from_ceiling` and testing both the `checked_add` overflow and the `i64`-range
+overflow directly, since forcing them through the full realistic-limits pipeline was impractical),
+and a doc correction (a "parent attempt" must cover compute jobs too, not just checkout preparation).
+Round 2: cleared — 17/17 tests pass, `v1` completely byte-frozen (a hardcoded golden digest vector
+proves it), two golden `v2` vectors (compute + checkout) pinned.
+
+Sol also corrected the planned sequencing: activation splits further into **5b.3-4a.1b**
+(compatibility/read-support only — every existing `v1`-only consumer in `ci_launch_authority.rs`
+audited and made to recognize both prefixes; fresh writes stay `v1`) landing BEFORE **5b.3-4a.1c**
+(writer activation — `PgTierPCiJobBudgetReservation` actually writes `v2` for fresh batches), so
+every reader understands `v2` before any writer creates it — needed because keeping the existing
+advisory lock key is necessary but not sufficient for safe rolling deployment (an old binary can't
+discover or count `v2` rows after acquiring that lock, even though the lock still serializes it
+against a new binary correctly).
+
+**Test coverage:** 17 new tests in `ci_launch_authority.rs`'s new `v2_budget_authority_5b3_4a1a`
+module. Full sweep clean: `cargo test -p myelin-ci-controlplane --lib` (500 passed, 0 failed — 483
+pre-existing + 17 new), `cargo clippy` `-D warnings`, `cargo check --workspace --tests`. This file had
+no pre-existing rustfmt skew (confirmed via a clean baseline check), so rustfmt ran directly with a
+clean diff.
+
+**Still open:** 5b.3-4a.1b (replay-compatibility read-side audit) through 5b.3-4a.1c (writer
+activation), then 5b.3-4a.2 (the durable prelaunch-usage journal itself) and 5b.3-4b (reaper/
+reconciliation/settlement consumers) all remain. 5b.3-5 through 5b.3-7 and the rest of ledger 12's
+open items are unchanged.
