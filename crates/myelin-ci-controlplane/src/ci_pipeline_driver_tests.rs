@@ -498,6 +498,38 @@ fn tier_p_reservation_structurally_requires_its_exact_operational_settlement_pol
 }
 
 #[test]
+fn tier_p_v2_reservation_gate_requires_the_same_exact_settlement_policy_as_v1() {
+    // CT-007 slice 5b.3-4a.1b: `v2` handles are still Tier-P operational -- same zero-markup
+    // pricing formula, only the reservation-amount topology differs -- so the gate must widen to
+    // recognize the `v2` prefix rather than silently skip validation for `v2`-handled jobs.
+    let usage = ResourceUsage {
+        cpu_seconds: 17,
+        mem_byte_seconds: 3 * 1_073_741_824 + 1,
+    };
+    let priced = PricedCiJobUsage {
+        pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
+        memory_gb_seconds: 4,
+        cpu_wholesale: MinorUnits(17),
+        cpu_markup: MinorUnits::ZERO,
+        memory_wholesale: MinorUnits(4),
+        memory_markup: MinorUnits::ZERO,
+    };
+    let v2_handle = "ci-reserve:v2:run:budget-v1:a5:batch:job:item";
+    assert_eq!(
+        validate_reservation_pricing_policy(v2_handle, usage, &priced),
+        Ok(())
+    );
+
+    let mut tampered = priced.clone();
+    tampered.cpu_markup = MinorUnits(1);
+    assert_eq!(
+        validate_reservation_pricing_policy(v2_handle, usage, &tampered),
+        Err(CiJobPricingError::InvalidOutput),
+        "a v2 handle must still enforce zero markup, not bypass validation"
+    );
+}
+
+#[test]
 fn retry_attempt_accrual_is_fixed_size_and_projects_exact_usage() {
     let accrual = serde_json::json!({
         "version": 1,

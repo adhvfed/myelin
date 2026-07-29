@@ -29,6 +29,7 @@ use crate::ci_pipeline_driver::{
     close_cancelled_run_if_accounted, decode_retry_attempt_usage, priced_cost_rows,
     validate_reservation_pricing_policy, DurableCiJobAccounting,
     TIER_P_OPERATIONAL_PRICING_REVISION, TIER_P_OPERATIONAL_RESERVATION_PREFIX,
+    TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX,
 };
 use crate::{
     CiCostEventStore, CiDriveManifestStore, CiJobAccountingPricer, CiJobAccountingRecord,
@@ -225,7 +226,8 @@ impl PgCiRunSupersession {
                              WHERE tenant_id = $1 AND region = $2 AND ci_run_id = $3::uuid) \
                  OR EXISTS (SELECT 1 FROM cost_reservation \
                              WHERE tenant_id = $1 AND region = $2 \
-                               AND run_id LIKE ('ci-reserve:v1:' || $3::text || ':%'))",
+                               AND (run_id LIKE ('ci-reserve:v1:' || $3::text || ':%') \
+                                    OR run_id LIKE ('ci-reserve:v2:' || $3::text || ':%')))",
         )
         .bind(&self.tenant.0)
         .bind(&self.region.0)
@@ -709,6 +711,9 @@ impl PgCiRunSupersession {
         if !job
             .reserve_handle
             .starts_with(TIER_P_OPERATIONAL_RESERVATION_PREFIX)
+            && !job
+                .reserve_handle
+                .starts_with(TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX)
         {
             return Err(CiRunSupersessionError::Settlement);
         }

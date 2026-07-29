@@ -1453,3 +1453,197 @@ async fn retry_and_supersession_are_safe_in_both_commit_orders() {
     run_reporter_scenario(true, false, false).await;
     run_reporter_scenario(true, true, false).await;
 }
+
+/// CT-007 slice 5b.3-4a.1b: `settle_cancelled_job` must recognize a `ci-reserve:v2:...` handle
+/// exactly like the existing `ci-reserve:v1:...` handle and reach real Storage settlement, not the
+/// `CiRunSupersessionError::Settlement` refusal a pre-slice handle shape would hit. This never
+/// launches the job (no `job_queue` row is seeded at all), so `cancel_running_on_conn` takes its
+/// `None` queue-lifecycle arm and settles a full refund against the untouched `inflight` reservation
+/// — the same shape the `retry_then_supersession` v1 scenario above proves, minus the retry/launch
+/// machinery that scenario needs for its OWN assertions but this one does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
+    let schema = format!("ci_accounting_{}_v2_settle", std::process::id());
+    let bootstrap = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url())
+        .await
+        .expect("connect to create isolated schema");
+    bootstrap
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+    bootstrap
+        .execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .unwrap();
+    let cleanup_bootstrap = bootstrap.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(&cleanup_bootstrap, &schema_for_cleanup, move || async move {
+        let pool = isolated_pool(&schema).await;
+        PgMigrator::apply(&pool, &foundation_migrations())
+            .await
+            .unwrap();
+        PgMigrator::apply(&pool, &identity_durable_migrations())
+            .await
+            .unwrap();
+        PgMigrator::apply(&pool, &cell_root_durable_migrations())
+            .await
+            .unwrap();
+        PgMigrator::apply_validated(
+            &pool,
+            &flow_migrations(),
+            &HotTables::declare(["workflow_run"]),
+        )
+        .await
+        .unwrap();
+        PgMigrator::apply(&pool, &reserve_settle_durable_migrations())
+            .await
+            .unwrap();
+        PgMigrator::apply_validated(
+            &pool,
+            &ci_controlplane_migrations(),
+            &ci_controlplane_hot_tables(),
+        )
+        .await
+        .unwrap();
+
+        let tenant = TenantId::from_token("accounting-v2-tenant");
+        let region = Region::new("fr-par");
+        let wf_run = "41111111-1111-8111-8111-111111111111";
+        let ci_run = "42222222-2222-8222-8222-222222222222";
+        let job = "43333333-3333-8333-8333-333333333333";
+        let skipped_job = "47777777-7777-8777-8777-777777777777";
+        let v2_reserve_handle = format!("ci-reserve:v2:{ci_run}:batch:{job}:item");
+
+        let ci_runs = ci_run_store_factory(pool.clone());
+        ci_runs
+            .insert_ci_run(&CiRunInsert {
+                tenant_id: tenant.0.clone(),
+                region: region.0.clone(),
+                run_id: ci_run.into(),
+                project_id: "55555555-5555-8555-8555-555555555555".into(),
+                pipeline_id: "66666666-6666-8666-8666-666666666666".into(),
+                wf_run_id: wf_run.into(),
+                definition_snapshot: format!("blake3:{}", "a".repeat(64)),
+                trigger_kind: "push".into(),
+                concurrency_group: None,
+                pr_head_generation: None,
+                trust_tier: "trusted".into(),
+                state: "queued".into(),
+                correlation_id: "accounting-v2-live".into(),
+                cause_event_id: Some("trigger-accounting-v2-live".into()),
+                cause_depth: 0,
+                caused_by: None,
+                repo_ref: Some(format!("myelin://{}/git/repo/core", tenant.0)),
+                commit_oid: Some("deadbeef00deadbeef00deadbeef00deadbeef00".into()),
+                triggered_by: None,
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE ci_run SET state = 'running' WHERE tenant_id = $1 AND run_id = $2::uuid")
+            .bind(&tenant.0)
+            .bind(ci_run)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_run (
+               tenant_id, region, run_id, wf_type, wf_version, input, state, correlation_id,
+               depth, partition, idem_key
+             ) VALUES ($1, $2, $3, 'ci.pipeline', 1, '[]'::jsonb, 'running', $3, 0, 0, \
+               'accounting-v2-live')",
+        )
+        .bind(&tenant.0)
+        .bind(&region.0)
+        .bind(wf_run)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let manifest_store =
+            CiDriveManifestStore::new(pool.clone(), tenant.clone(), region.clone()).unwrap();
+        let production_definition = ci_manifest_pipeline_definition();
+        let mut drive_manifest = manifest(
+            &tenant.0,
+            &region.0,
+            wf_run,
+            ci_run,
+            job,
+            skipped_job,
+            production_definition.code_hash(),
+        );
+        drive_manifest.jobs.truncate(1);
+        drive_manifest.check_attempts.remove("package");
+        drive_manifest.jobs[0].reserve_handle = v2_reserve_handle.clone();
+        manifest_store.insert(&drive_manifest).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
+             VALUES ($1, $2, $3, 100, 'inflight')",
+        )
+        .bind(&tenant.0)
+        .bind(&region.0)
+        .bind(&v2_reserve_handle)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut config = MyelinConfig::dev();
+        config.database_url = scoped_url(&admin_url(), &schema);
+        config.region = region.0.clone();
+        let provider = SubstrateProvider::connect(config, 4).await.unwrap();
+        let ledger = DurableCostLedger::new(provider.clone());
+
+        let supersession = PgCiRunSupersession::new(
+            pool.clone(),
+            ledger.clone(),
+            tenant.clone(),
+            region.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        supersession
+            .cancel_running_for_test(ci_run, wf_run)
+            .await
+            .expect(
+                "settle_cancelled_job must accept a v2-shaped reserve handle and reach real \
+                 settlement, not the pre-slice Settlement refusal",
+            );
+
+        let accounting: (bool, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT skipped, cpu_seconds, mem_byte_seconds, billed_minor_units, refunded_minor_units
+             FROM ci_job_accounting WHERE job_id = $1::uuid",
+        )
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            accounting,
+            (true, 0, 0, 0, 100),
+            "the never-launched v2-reserved job settles a full refund, same as the v1 shape"
+        );
+        let reservation_state: String =
+            sqlx::query_scalar("SELECT state FROM cost_reservation WHERE run_id = $1")
+                .bind(&v2_reserve_handle)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reservation_state, "settled");
+        let cost_events: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM cost_event WHERE run_id = $1")
+                .bind(&v2_reserve_handle)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cost_events, 2, "both metered units settle, exactly like v1");
+
+        drop(pool);
+        bootstrap
+            .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+            .await
+            .unwrap();
+    })
+    .await;
+}
