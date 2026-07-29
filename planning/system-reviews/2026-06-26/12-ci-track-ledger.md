@@ -2595,3 +2595,72 @@ provider again, this time as the small, already-reviewed switch selecting the `v
 fresh batches), then 5b.3-4a.2 (the durable prelaunch-usage journal itself) and 5b.3-4b (reaper/
 reconciliation/settlement consumers). 5b.3-5 through 5b.3-7 and the rest of ledger 12's open items
 are unchanged.
+
+---
+
+## 2026-07-29 — CT-007 slice 5b.3-4a.1c landed: `v2` writer activation, gated OFF in production
+(Sol, design + 1 review round) — fresh batches can now genuinely mint `v2` handles; the production
+composition root stays pinned to `v1` pending a deliberate, separately-tracked fleet-convergence flip
+
+Design check-in with Sol before implementing: the original task sketch (written before 4a.1b's
+round-1 bug) proposed a unified version-tagged `PreparedOperationalReservation`. Sol agreed the
+simpler shape established by 4a.1b's fix — `PreparedOperationalReservation` stays `v1`-only forever;
+`v2` candidates are computed lazily, only exactly where needed — should carry through unchanged.
+Sol also flagged a real rollout-safety gap: writing `v2` is only safe once every reader in the fleet
+already understands it (4a.1b deployed everywhere), and a preceding commit landing is NOT the same
+guarantee as fleet convergence during a rolling deploy. Since this codebase has no config/feature-
+flag mechanism, the fix is a new `OperationalReservationWriteVersion` enum (`V1`/`V2`) the provider
+stores explicitly; the production composition root in `lib.rs` passes `V1` deliberately, with a
+comment explaining the gate must be flipped in its own commit once convergence is confirmed. The
+writer is fully implemented and tested here; it is simply not live yet.
+
+**What landed:**
+- `build_v2_candidates` now calls `validate_handle` internally on every candidate before returning,
+  so the complete batch is validated before any candidate is usable (Sol's requirement).
+- `reserve_operational_batch_on_conn` gained `budget_policy`/`write_version` params. The advisory
+  lock, replay-lookup query, and `resolve_durable_replay` dispatch are completely UNCHANGED — durable
+  `v1` replay and durable `v2` replay (via reconstructed policy) never touch `write_version` or the
+  current `budget_policy`. Only in the genuinely-fresh branch (no durable rows, ceiling check passed)
+  does it branch: `V1` keeps today's insert; `V2` calls `build_v2_candidates` for the first time in
+  the whole call and inserts those instead. The complete candidate `Vec` is built before any INSERT
+  starts, so a `v2` overflow anywhere in a fresh batch refuses atomically with zero rows written.
+
+**Sol's one review round** found no correctness blockers, only a stale doc comment (fixed —
+`PreparedOperationalReservation`'s doc now correctly names both live `v2` call sites: the fresh-write
+branch under the current policy, and durable replay under a reconstructed one) and a test-naming
+nit (`a_manually_seeded_v1_batch...` renamed to `an_existing_v1_batch...` since it seeds via a real
+`V1`-configured provider, not manual SQL — stronger evidence than the old name implied). Sol
+confirmed the `v1` literal gate is sufficient enforcement (no alternate production composition root
+found that could enable `V2`) but that the later flip must stay its own explicitly-tracked commit.
+
+**Test coverage:** the existing `tier_p_operational_reservation_is_atomic_retry_stable_and_bounded`
+megatest's four providers now all use `OperationalReservationWriteVersion::V2`, exercising the real
+writer end-to-end — handle-prefix and amount assertions flipped to `v2` (15,000, since the fixture's
+jobs are checkout-bearing under production's 5-attempt policy vs. `v1`'s 750), and the crash-
+injection trigger's `LIKE` pattern updated to match `v2`'s handle shape (otherwise it would silently
+stop firing and stop testing the rollback path at all). Three new dedicated integration tests:
+`an_existing_v1_batch_replays_unchanged_through_a_v2_writing_provider` (durable-row precedence over
+the provider's write setting), `v2_written_under_one_policy_replays_correctly_under_a_differently_configured_provider`
+(replay recovers the ORIGINAL embedded policy, not the replaying provider's current one), and
+`fresh_v2_overflow_leaves_zero_rows` (atomicity on a genuinely fresh overflowing batch). The prior
+4a.1b ceiling-counting test still passes unchanged.
+
+Full sweep: `cargo test -p myelin-ci-controlplane --lib` → 527 passed (unchanged — no new unit tests
+needed; the interesting logic here is the async DB-touching branch selection, covered by
+integration tests instead). `integration_ci_operational_reservation.rs` now has 5 tests, all passing
+against live Postgres; the other two integration files from 4a.1b (`v2` settlement, `v2` stale-
+queued-cancellation refusal) still pass unchanged since they use the production composition root,
+which stays gated at `v1`. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+clean. `cargo check --workspace --tests --all-features` clean. rustfmt applied cleanly (confirmed no
+pre-existing skew via a `git stash` baseline check first) — caught and reverted one mistake mid-
+session where running `rustfmt` directly on `lib.rs` in write mode (the crate root) had also
+reformatted the unrelated, pre-existing-skewed `job_queue_region.rs` as a side effect; reverted that
+file specifically before finishing. Lesson for future rustfmt passes in this crate: never run
+`rustfmt` (write mode) directly on `lib.rs` or any other crate-root file — it silently traverses and
+rewrites the WHOLE module tree; always target the specific file(s) actually changed.
+
+**Still open:** 5b.3-4a.2 (the durable prelaunch-usage journal itself: `ci_job_prelaunch_usage`
+table, write-ahead `begin`/`complete`/reaper-`seal` state machine) and 5b.3-4b (reaper/reconciliation/
+settlement consumers of that journal) remain. The `v1`→`v2` fleet-convergence flip in `lib.rs` is a
+separate, explicitly-tracked follow-up once deployment safety is confirmed — not yet scheduled as a
+ledger task. 5b.3-5 through 5b.3-7 and the rest of ledger 12's open items are unchanged.
