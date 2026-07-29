@@ -8,7 +8,8 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
-    CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, CiManifestLimitsV1,
+    CiAttemptBudgetPolicy, CiAttemptBudgetRevision, CiJobBudgetReservationProvider,
+    CiJobRuntimeAuthorityRequest, CiManifestLimitsV1, OperationalReservationWriteVersion,
     PgTierPCiJobBudgetReservation, LINUX_SMALL_V1_POLICY_REVISION,
 };
 use myelin_ci_sandbox::{derive_checkout_authorization_scope, JobKind, WorkspaceSpec};
@@ -120,6 +121,8 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
         runtime.clone(),
         "fr-par",
         4,
+        CiAttemptBudgetPolicy::production(),
+        OperationalReservationWriteVersion::V2,
     )
     .unwrap();
     let batch = vec![request("personal", 1, 1), request("personal", 1, 2)];
@@ -136,12 +139,15 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
     assert_ne!(first[0], first[1]);
     assert!(first
         .iter()
-        .all(|handle| handle.starts_with("ci-reserve:v1:10000000-0000-0000-0000-000000000001:")));
+        .all(|handle| handle.starts_with("ci-reserve:v2:10000000-0000-0000-0000-000000000001:")));
     let rows = reservation_rows(&admin, "personal").await;
     assert_eq!(rows.len(), 2);
-    assert!(rows
-        .iter()
-        .all(|(_, amount, state)| *amount == 750 && state == "reserved"));
+    // CT-007 slice 5b.3-4a.1c: fresh batches now mint v2 for real, so the reservation amount covers
+    // the full parent-attempt*max_attempts budget (checkout job, production policy) instead of one
+    // v1 workload execution's ceiling (750).
+    assert!(rows.iter().all(|(run_id, amount, state)| *amount == 15_000
+        && state == "reserved"
+        && run_id.starts_with("ci-reserve:v2:")));
 
     // A later replay recovers the same authority even after lifecycle advancement; it does not
     // create a second reservation or try to rewind settled work.
@@ -188,6 +194,8 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
         runtime.clone(),
         "fr-par",
         2,
+        CiAttemptBudgetPolicy::production(),
+        OperationalReservationWriteVersion::V2,
     )
     .unwrap();
     let before = reservation_rows(&admin, "personal").await.len();
@@ -204,6 +212,8 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
         runtime.clone(),
         "fr-par",
         2,
+        CiAttemptBudgetPolicy::production(),
+        OperationalReservationWriteVersion::V2,
     )
     .unwrap();
     let race_a = vec![
@@ -229,7 +239,7 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
         .execute(
             "CREATE FUNCTION fail_second_operational_reservation() RETURNS trigger \
              LANGUAGE plpgsql AS $$ BEGIN \
-               IF NEW.run_id LIKE 'ci-reserve:v1:%:40000000-0000-0000-0000-000000000006:%' \
+               IF NEW.run_id LIKE 'ci-reserve:v2:%:40000000-0000-0000-0000-000000000006:%' \
                THEN RAISE EXCEPTION 'injected mid-batch failure'; END IF; RETURN NEW; END $$",
         )
         .await
@@ -246,6 +256,8 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
         runtime.clone(),
         "fr-par",
         4,
+        CiAttemptBudgetPolicy::production(),
+        OperationalReservationWriteVersion::V2,
     )
     .unwrap();
     assert!(crash_provider
@@ -346,6 +358,8 @@ async fn a_v2_reservation_row_counts_toward_the_v1_batch_ceiling() {
         runtime.clone(),
         "fr-par",
         1,
+        CiAttemptBudgetPolicy::production(),
+        OperationalReservationWriteVersion::V1,
     )
     .unwrap();
     let error = provider
@@ -361,6 +375,231 @@ async fn a_v2_reservation_row_counts_toward_the_v1_batch_ceiling() {
         reservation_rows(&admin, tenant).await,
         vec![(v2_run_id.into(), 500, "reserved".into())],
         "the refused v1 batch leaves no new row and the v2 row untouched"
+    );
+
+    runtime.close().await;
+    admin.close().await;
+    bootstrap
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+    bootstrap.close().await;
+}
+
+/// CT-007 slice 5b.3-4a.1c: a run that already has durable `v1` rows must keep replaying `v1`
+/// exactly, even when the provider handling the retry is configured to WRITE `v2` for fresh
+/// batches -- durable precedence, not the provider's current write setting, decides what replays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_existing_v1_batch_replays_unchanged_through_a_v2_writing_provider() {
+    let schema = format!(
+        "ci_operational_reservation_v1_precedence_{}",
+        std::process::id()
+    );
+    let bootstrap = pinned_pool(&admin_url(), "public").await;
+    bootstrap
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+    bootstrap
+        .execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .unwrap();
+    let admin = pinned_pool(&admin_url(), &schema).await;
+    PgMigrator::apply(&admin, &reserve_settle_durable_migrations())
+        .await
+        .unwrap();
+    admin
+        .execute(format!("GRANT USAGE ON SCHEMA {schema} TO myelin_app").as_str())
+        .await
+        .unwrap();
+    admin
+        .execute("GRANT SELECT, INSERT, UPDATE ON cost_reservation TO myelin_app")
+        .await
+        .unwrap();
+    let runtime = pinned_pool(&app_url(), &schema).await;
+
+    let batch = vec![
+        request("v1-precedence", 6, 20),
+        request("v1-precedence", 6, 21),
+    ];
+
+    let v1_writer = PgTierPCiJobBudgetReservation::new(
+        runtime.clone(),
+        "fr-par",
+        4,
+        CiAttemptBudgetPolicy::production(),
+        OperationalReservationWriteVersion::V1,
+    )
+    .unwrap();
+    let seeded = v1_writer.reserve_batch(batch.clone()).await.unwrap();
+    assert!(seeded
+        .iter()
+        .all(|handle| handle.starts_with("ci-reserve:v1:")));
+    assert_eq!(reservation_rows(&admin, "v1-precedence").await.len(), 2);
+
+    let v2_writer = PgTierPCiJobBudgetReservation::new(
+        runtime.clone(),
+        "fr-par",
+        4,
+        CiAttemptBudgetPolicy::production(),
+        OperationalReservationWriteVersion::V2,
+    )
+    .unwrap();
+    let replayed = v2_writer.reserve_batch(batch).await.unwrap();
+    assert_eq!(
+        replayed, seeded,
+        "an existing v1 batch must replay unchanged"
+    );
+    assert_eq!(
+        reservation_rows(&admin, "v1-precedence").await.len(),
+        2,
+        "a v2-writing provider must not insert a second row for an already-durable v1 run"
+    );
+
+    runtime.close().await;
+    admin.close().await;
+    bootstrap
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+    bootstrap.close().await;
+}
+
+/// CT-007 slice 5b.3-4a.1c: a `v2` batch written under one attempt policy must still replay
+/// correctly through a provider configured with a DIFFERENT policy -- replay recovers the policy
+/// from the durable handle's own descriptor, never from whatever the replaying provider is
+/// currently configured with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_written_under_one_policy_replays_correctly_under_a_differently_configured_provider() {
+    let schema = format!(
+        "ci_operational_reservation_v2_policy_drift_{}",
+        std::process::id()
+    );
+    let bootstrap = pinned_pool(&admin_url(), "public").await;
+    bootstrap
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+    bootstrap
+        .execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .unwrap();
+    let admin = pinned_pool(&admin_url(), &schema).await;
+    PgMigrator::apply(&admin, &reserve_settle_durable_migrations())
+        .await
+        .unwrap();
+    admin
+        .execute(format!("GRANT USAGE ON SCHEMA {schema} TO myelin_app").as_str())
+        .await
+        .unwrap();
+    admin
+        .execute("GRANT SELECT, INSERT, UPDATE ON cost_reservation TO myelin_app")
+        .await
+        .unwrap();
+    let runtime = pinned_pool(&app_url(), &schema).await;
+
+    let batch = vec![
+        request("v2-policy-drift", 7, 30),
+        request("v2-policy-drift", 7, 31),
+    ];
+
+    let written_policy = CiAttemptBudgetPolicy::new(
+        CiAttemptBudgetRevision::V1,
+        std::num::NonZeroU32::new(3).unwrap(),
+    );
+    let original_writer = PgTierPCiJobBudgetReservation::new(
+        runtime.clone(),
+        "fr-par",
+        4,
+        written_policy,
+        OperationalReservationWriteVersion::V2,
+    )
+    .unwrap();
+    let written = original_writer.reserve_batch(batch.clone()).await.unwrap();
+    assert!(written
+        .iter()
+        .all(|handle| handle.contains(":budget-v1:a3:")));
+
+    let reconfigured = PgTierPCiJobBudgetReservation::new(
+        runtime.clone(),
+        "fr-par",
+        4,
+        CiAttemptBudgetPolicy::production(),
+        OperationalReservationWriteVersion::V2,
+    )
+    .unwrap();
+    let replayed = reconfigured.reserve_batch(batch).await.unwrap();
+    assert_eq!(
+        replayed, written,
+        "replay must recover the ORIGINAL 3-attempt policy from the durable handle, not \
+         production's 5-attempt policy this second provider is configured with"
+    );
+    assert_eq!(reservation_rows(&admin, "v2-policy-drift").await.len(), 2);
+
+    runtime.close().await;
+    admin.close().await;
+    bootstrap
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+    bootstrap.close().await;
+}
+
+/// CT-007 slice 5b.3-4a.1c: a genuinely fresh `v2` write whose ceiling arithmetic overflows must
+/// leave zero durable rows -- `build_v2_candidates` computes the complete batch before any INSERT,
+/// so a single unrepresentable job refuses the whole batch atomically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_v2_overflow_leaves_zero_rows() {
+    let schema = format!(
+        "ci_operational_reservation_v2_overflow_{}",
+        std::process::id()
+    );
+    let bootstrap = pinned_pool(&admin_url(), "public").await;
+    bootstrap
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+    bootstrap
+        .execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .unwrap();
+    let admin = pinned_pool(&admin_url(), &schema).await;
+    PgMigrator::apply(&admin, &reserve_settle_durable_migrations())
+        .await
+        .unwrap();
+    admin
+        .execute(format!("GRANT USAGE ON SCHEMA {schema} TO myelin_app").as_str())
+        .await
+        .unwrap();
+    admin
+        .execute("GRANT SELECT, INSERT, UPDATE ON cost_reservation TO myelin_app")
+        .await
+        .unwrap();
+    let runtime = pinned_pool(&app_url(), &schema).await;
+
+    // Checkout job (4 executions/attempt) under production's 5-attempt policy: 20x the raw
+    // ceiling. mem_bytes = u64::MAX / 15 makes that 20x overflow u64 -- same fixture the unit
+    // tests use to trigger this exact overflow.
+    let mut overflow_request = request("v2-overflow", 8, 40);
+    overflow_request.limits.mem_bytes = u64::MAX / 15;
+    overflow_request.limits.timeout_secs = 1;
+
+    let provider = PgTierPCiJobBudgetReservation::new(
+        runtime.clone(),
+        "fr-par",
+        4,
+        CiAttemptBudgetPolicy::production(),
+        OperationalReservationWriteVersion::V2,
+    )
+    .unwrap();
+    let error = provider
+        .reserve_batch(vec![overflow_request])
+        .await
+        .unwrap_err();
+    assert!(error.0.contains("overflow"), "message was: {}", error.0);
+    assert!(
+        reservation_rows(&admin, "v2-overflow").await.is_empty(),
+        "an overflowing fresh v2 batch must leave zero durable rows"
     );
 
     runtime.close().await;

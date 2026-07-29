@@ -120,6 +120,15 @@ pub struct PgTierPCiJobBudgetReservation {
     pool: PgPool,
     region: String,
     max_outstanding_jobs_per_tenant: u32,
+    /// Stored explicitly (never re-derived ad hoc) so every fresh `v2` write this provider ever
+    /// mints agrees on the same policy. Read-side replay of an EXISTING durable `v2` row never
+    /// consults this -- it reconstructs the policy from that row's own embedded descriptor instead,
+    /// since a durable row may have been minted under an older policy than whatever is configured
+    /// now (see `replay_v2_batch`).
+    budget_policy: CiAttemptBudgetPolicy,
+    /// CT-007 slice 5b.3-4a.1c: gates whether a genuinely fresh batch (no durable rows yet) mints
+    /// `v1` or `v2`. See [`OperationalReservationWriteVersion`].
+    write_version: OperationalReservationWriteVersion,
 }
 
 /// Completion-side policy paired with [`PgTierPCiJobBudgetReservation`].
@@ -155,6 +164,8 @@ impl PgTierPCiJobBudgetReservation {
         pool: PgPool,
         region: impl Into<String>,
         max_outstanding_jobs_per_tenant: u32,
+        budget_policy: CiAttemptBudgetPolicy,
+        write_version: OperationalReservationWriteVersion,
     ) -> Result<Self, CiLaunchAuthorityError> {
         let region = region.into();
         if !valid_machine_token(&region) {
@@ -167,6 +178,8 @@ impl PgTierPCiJobBudgetReservation {
             pool,
             region,
             max_outstanding_jobs_per_tenant,
+            budget_policy,
+            write_version,
         })
     }
 }
@@ -186,12 +199,20 @@ impl CiJobBudgetReservationProvider for PgTierPCiJobBudgetReservation {
             let tenant = prepared[0].request.tenant_id.clone();
             let region = self.region.clone();
             let ceiling = self.max_outstanding_jobs_per_tenant;
+            let budget_policy = self.budget_policy;
+            let write_version = self.write_version;
             let tx_tenant = tenant.clone();
             let tx_region = region.clone();
             let result = with_tenant_tx(&self.pool, &tenant, &region, move |conn| {
                 Box::pin(async move {
                     reserve_operational_batch_on_conn(
-                        conn, &tx_tenant, &tx_region, ceiling, &prepared,
+                        conn,
+                        &tx_tenant,
+                        &tx_region,
+                        ceiling,
+                        &budget_policy,
+                        write_version,
+                        &prepared,
                     )
                     .await
                 })
@@ -220,6 +241,8 @@ impl CiJobBudgetReservationProvider for PgTierPCiJobBudgetReservation {
                 &tenant,
                 &self.region,
                 self.max_outstanding_jobs_per_tenant,
+                &self.budget_policy,
+                self.write_version,
                 &prepared,
             )
             .await
@@ -234,9 +257,17 @@ impl CiJobBudgetReservationProvider for PgTierPCiJobBudgetReservation {
 /// candidate here under the provider's CURRENT policy on every batch, even though nothing writes
 /// `v2` this slice -- that meant a fresh `v1` write (or an exact `v1` replay) could fail solely
 /// because unrelated, unused `v2` ceiling arithmetic overflowed for the current policy. `v2`
-/// candidates are computed ONLY where actually needed: lazily, inside `replay_v2_batch`, using a
-/// policy reconstructed from an already-durable row's own embedded descriptor -- never eagerly, and
-/// never under "whatever the provider happens to be configured with right now".
+/// candidates are still never computed here; every `v2` computation this module ever does is one of
+/// exactly two callers (CT-007 slice 5b.3-4a.1c), each with its own policy:
+/// - a genuinely FRESH batch (no durable rows at all) that this provider is configured to WRITE
+///   `v2` for -- computed lazily in `reserve_operational_batch_on_conn`'s fresh branch, using the
+///   provider's CURRENTLY configured policy, only after replay has already confirmed there is
+///   nothing durable to recover instead;
+/// - an existing DURABLE `v2` row being replayed -- computed lazily in `replay_v2_batch`, using a
+///   policy RECONSTRUCTED from that row's own embedded descriptor, never the current one.
+///
+/// Neither case ever runs for a `v1`-shaped fresh write or an exact `v1` replay -- those two paths
+/// never touch `v2` arithmetic in any form.
 #[derive(Clone)]
 struct PreparedOperationalReservation {
     request: CiJobRuntimeAuthorityRequest,
@@ -381,6 +412,7 @@ fn build_v2_candidates(
                 "{TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX}{}:{budget_tag}:{attempts_tag}:{batch_digest_v2}:{}:{request_digest_v2}",
                 request.ci_run_id, request.job_id
             );
+            validate_handle("reserve", &handle)?;
             Ok(V2Candidate { handle, amount })
         })
         .collect()
@@ -455,6 +487,8 @@ async fn reserve_operational_batch_on_conn(
     tenant_id: &str,
     region: &str,
     ceiling: u32,
+    budget_policy: &CiAttemptBudgetPolicy,
+    write_version: OperationalReservationWriteVersion,
     prepared: &[PreparedOperationalReservation],
 ) -> Result<Result<Vec<String>, CiLaunchAuthorityError>, PgError> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -521,24 +555,44 @@ async fn reserve_operational_batch_on_conn(
         )));
     }
 
-    // Fresh writes stay `v1` this slice (CT-007 slice 5b.3-4a.1c activates the `v2` writer).
-    for item in prepared {
+    // Genuinely fresh (no durable rows exist for this run yet): mint whichever version this
+    // provider is currently configured to WRITE. `v2` candidates are computed here for the first
+    // time in this whole call -- CT-007 slice 5b.3-4a.1b's round-1 bug was eagerly computing them
+    // for every batch regardless of need; this is the one place they're actually needed. Building
+    // the complete candidate `Vec` before the insert loop starts means a `v2` overflow anywhere in
+    // the batch refuses before any row is written -- never a partial insert.
+    let fresh: Vec<(String, i64)> = match write_version {
+        OperationalReservationWriteVersion::V1 => prepared
+            .iter()
+            .map(|item| (item.v1_handle.clone(), item.v1_amount))
+            .collect(),
+        OperationalReservationWriteVersion::V2 => {
+            let requests: Vec<CiJobRuntimeAuthorityRequest> =
+                prepared.iter().map(|item| item.request.clone()).collect();
+            match build_v2_candidates(&requests, budget_policy) {
+                Ok(candidates) => candidates
+                    .into_iter()
+                    .map(|candidate| (candidate.handle, candidate.amount))
+                    .collect(),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+    };
+
+    for (handle, amount) in &fresh {
         sqlx::query(
             "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state) \
              VALUES ($1, $2, $3, $4, 'reserved')",
         )
         .bind(tenant_id)
         .bind(region)
-        .bind(&item.v1_handle)
-        .bind(item.v1_amount)
+        .bind(handle)
+        .bind(amount)
         .execute(&mut *conn)
         .await
         .map_err(pg_query)?;
     }
-    Ok(Ok(prepared
-        .iter()
-        .map(|item| item.v1_handle.clone())
-        .collect()))
+    Ok(Ok(fresh.into_iter().map(|(handle, _)| handle).collect()))
 }
 
 /// The pure replay/divergence decision over already-fetched durable rows (CT-007 slice 5b.3-4a.1b) --
@@ -1189,6 +1243,22 @@ impl CiAttemptBudgetPolicy {
     pub fn max_parent_attempts(&self) -> NonZeroU32 {
         self.max_parent_attempts
     }
+}
+
+/// CT-007 slice 5b.3-4a.1c: which reservation version a provider mints for a genuinely FRESH batch
+/// (one with no durable rows for its run yet). This is orthogonal to [`CiAttemptBudgetPolicy`] --
+/// that describes the `v2` AMOUNT topology; this describes whether fresh writes use it at all.
+///
+/// Sol's review: a committed 4a.1c binary is safe to write `v2` ONLY once every reader in the fleet
+/// already understands `v2` (i.e. every binary has 5b.3-4a.1b's compatibility reads). A preceding
+/// commit alone does not guarantee that during a rolling deployment -- an old binary mid-rollout
+/// still cannot discover or count `v2` rows. Production MUST stay on `V1` until fleet convergence is
+/// separately confirmed and this is deliberately flipped; existing durable rows always replay under
+/// whichever version they were actually written with regardless of this setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationalReservationWriteVersion {
+    V1,
+    V2,
 }
 
 /// Raw, unpriced resource-seconds — CPU-seconds and memory-byte-seconds kept SEPARATE (Sol's

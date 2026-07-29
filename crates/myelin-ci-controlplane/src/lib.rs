@@ -91,8 +91,9 @@ pub use ci_identity_adapter::{
 pub use ci_launch_authority::{
     CiAttemptBudgetPolicy, CiAttemptBudgetRevision, CiJobBudgetReservationProvider,
     CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority, ManifestBoundCiJobTokenAuthority,
-    PgTierPCiJobBudgetReservation, TierPOperationalCiJobPricer, LINUX_SMALL_V1_POLICY_REVISION,
-    LINUX_SMALL_V1_RUNNER_LABELS, TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
+    OperationalReservationWriteVersion, PgTierPCiJobBudgetReservation, TierPOperationalCiJobPricer,
+    LINUX_SMALL_V1_POLICY_REVISION, LINUX_SMALL_V1_RUNNER_LABELS,
+    TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
 };
 pub use ci_manifest_job_runner::{
     register_durable_ci_manifest_pipeline, CiJobTokenIssueError, CiJobTokenIssuer,
@@ -932,10 +933,17 @@ pub fn ci_run_starter_factory(
     rt: tokio::runtime::Handle,
     supersession_ledger: myelin_storage::DurableCostLedger,
 ) -> Result<PgCiRunStarterFactory, CiLaunchAuthorityError> {
+    // CT-007 slice 5b.3-4a.1c: fresh writes stay pinned to `v1` here even though the `v2` writer
+    // is fully implemented and tested -- Sol's review: this is only safe to flip to `v2` once every
+    // reader in the fleet has already deployed 5b.3-4a.1b's compatibility reads. A prior commit
+    // landing is not the same guarantee as fleet convergence during a rolling deploy. Flip this
+    // deliberately, in its own commit, once that's confirmed.
     let reservations = ci_launch_authority::PgTierPCiJobBudgetReservation::new(
         pool.clone(),
         region.0.clone(),
         ci_launch_authority::TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
+        ci_launch_authority::CiAttemptBudgetPolicy::production(),
+        ci_launch_authority::OperationalReservationWriteVersion::V1,
     )?;
     Ok(PgCiRunStarterFactory::new_with_authority_and_supersession(
         pool,
