@@ -2664,3 +2664,105 @@ table, write-ahead `begin`/`complete`/reaper-`seal` state machine) and 5b.3-4b (
 settlement consumers of that journal) remain. The `v1`→`v2` fleet-convergence flip in `lib.rs` is a
 separate, explicitly-tracked follow-up once deployment safety is confirmed — not yet scheduled as a
 ledger task. 5b.3-5 through 5b.3-7 and the rest of ledger 12's open items are unchanged.
+
+---
+
+## 2026-07-29 — CT-007 slice 5b.3-4a.2 schema landed (Sol, design + 2 review rounds): the durable
+`ci_job_parent_attempt` + `ci_job_prelaunch_usage` journal pair — schema and RLS/grants only, the
+Rust `begin`/`complete`/`seal` state machine is still open
+
+Sol's initial design check surfaced that "recognize both job shapes" needed a genuinely different
+shape than task #89's original single-table sketch: a **common `ci_job_parent_attempt` table**
+counts durably-begun claim generations as ROWS (never `MAX(lease_epoch)`, never phase rows) so a
+checkout job's two prelaunch phases count as exactly one attempt while a compute job (no phase at
+all) still counts correctly without inventing a fake phase for it — plus a **checkout-only child
+`ci_job_prelaunch_usage`** table for the two real phases. `max_parent_attempts`/`budget_revision` are
+persisted on the ATTEMPT row itself (never re-derived from current configuration later).
+
+**What landed:**
+- `ci_job_parent_attempt`: tenant/region/job/wf_run/ci_run/reserve_handle/lease_owner/lease_epoch/
+  claim_nonce/claim_started_at_epoch_secs/claim_expires_at_epoch_secs/budget_revision/
+  max_parent_attempts/begun_at. PK `(tenant,region,job,lease_epoch,claim_nonce)` plus two `UNIQUE`
+  constraints preventing a divergent epoch/nonce pairing from becoming a second attempt row. FK to
+  `ci_run` only (mirrors `ci_job_accounting`'s FK posture, avoiding lock contention on the hot
+  `job_queue` table). Immutable: `REVOKE UPDATE, DELETE` + reject-mutation trigger, the exact
+  `ci_job_accounting`/`ci_drive_manifest` convention.
+- `ci_job_prelaunch_usage`: adds `phase`/`status` to the parent-attempt key, FK-anchored to it.
+  `status` is `started` (ceiling only) → `measured` (exact usage, `complete_phase`) or
+  `sealed_ceiling` (the reaper's fallback when a worker never reports, `seal_phase`) — both terminal.
+  Deliberately NO database `exact <= ceiling` CHECK (an honest over-ceiling measurement must stay
+  writable). A `BEFORE UPDATE` trigger — not just `REVOKE`, since legitimate transitions need
+  `UPDATE` — refuses any UPDATE once a row leaves `started` (both terminal states are unconditionally
+  terminal) and refuses tampering with identity/ceiling/`started_at` on the one legal transition.
+  `DELETE` is revoked outright.
+- A non-blocking partial reaper index `(region, started_at) WHERE status = 'started'`, plus (added in
+  round 2 after Sol caught the gap) a full scheduler RLS/grant boundary mirroring `job_queue`'s: the
+  real `myelin_ci_region_scheduler` role gets read-only SELECT on the parent table and SELECT +
+  column-scoped `UPDATE (status, resolved_at)` on the child — column-scoped, never table-wide, same
+  as every other scheduler grant in this file.
+- Both tables added to `ci_controlplane_hot_tables()` (per-attempt/per-phase write churn comparable
+  to `ci_cost_event`'s per-metered-unit rate).
+
+**Sol's round-1 review found two real schema blockers**, not caught by my first draft:
+1. The four usage columns were originally `bigint`, but `ResourceUsage`/`ResourceCeiling` are `u64`
+   and — as CT-007 slice 5b.3-4a.1a's own overflow tests already demonstrate — a scaled ceiling can
+   legitimately exceed `i64::MAX` while still fitting in `u64`. Fixed with `numeric(20,0)` +
+   explicit `CHECK (... BETWEEN 0 AND 18446744073709551615)` bounds; `max_parent_attempts` moved from
+   `integer` (32-bit signed, can't hold half of `u32`'s range) to `bigint CHECK (... BETWEEN 1 AND
+   4294967295)`. No new Rust dependency needed yet (schema only, nothing binds these columns until
+   the state-machine slice; the plan is a `::text` cast round trip, not `bigdecimal`/`rust_decimal`).
+2. The `(region, started_at)` reaper index implied a cross-tenant regional scan, but the tables
+   carried only ordinary per-tenant RLS — the real scheduler role would have hit "permission denied"
+   the first time it tried to reap, the exact gap `GRANT_SCHEDULER_CI_JOB_REAP_RESET_DDL`'s own doc
+   comment already names as a real production incident elsewhere in this file. Fixed with the
+   scheduler RLS boundary described above. Round 1 also required three additional CHECK constraints
+   (`lease_epoch > 0`, `claim_expires_at_epoch_secs > claim_started_at_epoch_secs`,
+   `resolved_at >= started_at` when resolved) and real trigger-exercising integration tests instead
+   of DDL-text pinning alone. Round 2: cleared, no remaining blockers.
+
+**Test coverage:** two new unit tests pin the immutable/FK/CHECK shape of both DDL constants
+(mirroring the existing `job_accounting_is_complete_unique_and_structurally_insert_only` pattern);
+four existing hardcoded-count assertions updated (18→20 tables, 44→48 total migrations, five→seven
+hot tables). One new dedicated integration test
+(`tests/integration_ci_prelaunch_usage_journal.rs`) against live Postgres exercises the REAL state
+machine, not just DDL text: parent-attempt UPDATE/DELETE refusal; a genuine CHECK violation (a
+`started` row with non-null exact usage); the legal `started→measured` transition; the illegal
+`measured→started` revert refusing via the trigger's `RAISE EXCEPTION` (SQLSTATE `P0001` — caught
+and fixed a mismatch where I'd initially expected `23514`, the actual-CHECK-constraint code, for a
+trigger-raised refusal instead); a second phase reaching `started→sealed_ceiling`; a late completion
+after sealing refusing; identity/ceiling tampering on the one legal transition refusing; DELETE
+refusing outright; and the REAL `myelin_ci_scheduler_fr_par` production reaper role successfully
+sealing a started row through the exact column-scoped grant while being refused on any other
+column/table.
+
+Full sweep: `cargo test -p myelin-ci-controlplane --lib` → 529 passed (0 failed — the two new DDL-
+pinning tests, no regressions). The new dedicated integration test plus the two existing full-
+migration-application integration tests all pass against live Postgres. `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean. rustfmt applied cleanly to every touched file
+(confirmed no pre-existing skew via a `git stash` baseline check first) — caught and reverted, a
+SECOND time this session, the same `rustfmt` (write mode) directly on `lib.rs` collateral-damage
+mistake reformatting the unrelated, pre-existing-skewed `job_queue_region.rs`; reverted it again
+before finishing both times. This is now a standing rule for this crate: never run `rustfmt` write
+mode on `lib.rs` (or any crate-root file) directly — always target the specific non-root file(s)
+actually changed.
+
+**Deliberately NOT in this commit** (Sol's explicit scope line): the Rust `begin_parent_attempt`/
+`begin_phase`/`complete_phase`/`seal_phase` state machine itself. Sol's design for
+`begin_parent_attempt` requires a "narrow verified resolver," not the simpler plan I'd sketched
+(parse the v2 handle's embedded run/job id + check `cost_reservation` exists) — Sol's review: a
+durable-but-corrupted/manually-inserted `cost_reservation` row could carry a tampered digest/amount,
+so the parser's own contract is explicitly non-authoritative. The real resolver must, in one tenant
+transaction: require agreement among the claim, the manifest job's `reserve_handle`, and durable
+`ci_job_spec.spec.meter_to.reserve_id`; reconstruct the policy from the `v2` descriptor; recompute
+the COMPLETE expected `v2` handle and amount from durable authority and compare both byte-for-byte
+against `cost_reservation`; require the reservation to already be `inflight` if `hooks.reserve` has
+completed, or accept `reserved` only if this operation atomically transitions it to `inflight`; and
+refuse `v1` outright for the capped journal path. This closes the journal's OWN authority check;
+task #91 (binding `reserve_id` into the signed launch credential) remains a separate, still-necessary
+fix for the broader launch-hook boundary — the two are complementary, not duplicative.
+
+**Still open:** the Rust state machine described above (a substantial piece in its own right, likely
+warranting its own multi-round design/review cycle), 5b.3-4b (reaper/reconciliation/settlement
+consumers), and task #91 (credential binding). The `v1`→`v2` fleet-convergence flip in `lib.rs`
+remains a separate follow-up. 5b.3-5 through 5b.3-7 and the rest of ledger 12's open items are
+unchanged.

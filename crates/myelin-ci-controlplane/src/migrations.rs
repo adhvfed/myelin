@@ -103,6 +103,18 @@ pub const SECRET_BINDING_TABLE: &str = "secret_binding";
 /// against whichever applied first, silently leaving the other's INSERT to fail on missing columns.
 pub const CI_COST_EVENT_TABLE: &str = "ci_cost_event";
 pub const CI_JOB_ACCOUNTING_TABLE: &str = "ci_job_accounting";
+/// CT-007 slice 5b.3-4a.2 — one row per durably-begun claim generation for EITHER job shape (a
+/// checkout-bearing job's Hop A/B preparation, or a compute job's workload launch): the common
+/// attempt-cap-counting mechanism [`CiAttemptBudgetPolicy::max_parent_attempts`] enforces against,
+/// counted as ROWS (never `MAX(lease_epoch)`, never phase rows), so a checkout job's two prelaunch
+/// phases count as exactly one attempt while a compute job (which has no phase at all) still counts
+/// correctly without inventing a fake phase for it.
+pub const CI_JOB_PARENT_ATTEMPT_TABLE: &str = "ci_job_parent_attempt";
+/// CT-007 slice 5b.3-4a.2 — the checkout-ONLY child journal of [`CI_JOB_PARENT_ATTEMPT_TABLE`]:
+/// exactly the two prelaunch phases (`checkout_transport`, `checkout_materialization`) a
+/// checkout-bearing parent attempt runs before its workload. A compute attempt has no child rows at
+/// all here — it is fully accounted for by its `ci_job_parent_attempt` row alone.
+pub const CI_JOB_PRELAUNCH_USAGE_TABLE: &str = "ci_job_prelaunch_usage";
 /// CT-004d.1 — the durable `JobSpec` store table. One row per DISPATCHED stage job: the
 /// digest-pinned [`myelin_ci_sandbox::JobSpec`] (image/command/egress/limits/trust/workspace/run-token/
 /// meter/idem) the runner resolves + EXECUTES, keyed by the `(tenant_id, job_id)` the leased
@@ -220,6 +232,18 @@ pub const CI_SCHEDULER_CI_RUN_WORKFLOW_ID_GRANT_MIGRATION_ID: &str =
 /// job, exactly as `tests/integration_ci_region_scheduler_boundary.rs`'s dedicated-role test caught.
 pub const CI_SCHEDULER_CI_JOB_REAP_RESET_GRANT_MIGRATION_ID: &str =
     "ci_0018h_scheduler_ci_job_reap_reset_grant";
+/// CT-007 slice 5b.3-4a.2 — the new parent-attempt journal table/RLS migration.
+pub const CI_JOB_PARENT_ATTEMPT_MIGRATION_ID: &str = "ci_0019_ci_job_parent_attempt";
+/// CT-007 slice 5b.3-4a.2 — the new checkout-phase child journal table/RLS migration.
+pub const CI_JOB_PRELAUNCH_USAGE_MIGRATION_ID: &str = "ci_0020_ci_job_prelaunch_usage";
+/// Additive, non-blocking partial index over unresolved (`started`) phase rows, for the reaper
+/// (CT-007 slice 5b.3-4b) to find and seal abandoned prelaunch work without a full table scan.
+pub const CI_JOB_PRELAUNCH_USAGE_REAPER_INDEX_MIGRATION_ID: &str =
+    "ci_0020a_ci_job_prelaunch_usage_reaper";
+/// Additive, column-minimal scheduler grant for the cross-tenant, single-region reaper scan the
+/// preceding index implies.
+pub const CI_SCHEDULER_PRELAUNCH_USAGE_REAP_GRANT_MIGRATION_ID: &str =
+    "ci_0020b_scheduler_prelaunch_usage_reap_grant";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -678,6 +702,169 @@ ADD COLUMN IF NOT EXISTS skipped boolean NOT NULL DEFAULT false, \
 ADD CONSTRAINT ci_job_accounting_skipped_verdict \
 CHECK (NOT skipped OR (NOT passed AND NOT timed_out))";
 
+/// `ci_job_parent_attempt` (CT-007 slice 5b.3-4a.2) — one immutable row per durably-begun claim
+/// generation, for EITHER job shape. `max_parent_attempts`/`budget_revision` are the exact values
+/// this attempt was durably admitted under (never re-derived from current configuration on replay
+/// or reaper reconciliation); the two `UNIQUE` constraints beside the primary key prevent a
+/// divergent epoch/nonce pairing for the same job from slipping in as a distinct attempt row.
+pub const CREATE_CI_JOB_PARENT_ATTEMPT_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS ci_job_parent_attempt (
+  tenant_id                    text NOT NULL,
+  region                       text NOT NULL,
+  job_id                       uuid NOT NULL,
+  wf_run_id                    uuid NOT NULL,
+  ci_run_id                    uuid NOT NULL,
+  reserve_handle               text NOT NULL,
+  lease_owner                  text NOT NULL,
+  lease_epoch                  bigint NOT NULL CHECK (lease_epoch > 0),
+  claim_nonce                  uuid NOT NULL,
+  claim_started_at_epoch_secs  bigint NOT NULL,
+  claim_expires_at_epoch_secs  bigint NOT NULL
+    CHECK (claim_expires_at_epoch_secs > claim_started_at_epoch_secs),
+  budget_revision              smallint NOT NULL,
+  max_parent_attempts          bigint NOT NULL CHECK (max_parent_attempts BETWEEN 1 AND 4294967295),
+  begun_at                     timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, region, job_id, lease_epoch, claim_nonce),
+  UNIQUE (tenant_id, region, job_id, lease_epoch),
+  UNIQUE (tenant_id, region, job_id, claim_nonce),
+  FOREIGN KEY (tenant_id, ci_run_id) REFERENCES ci_run(tenant_id, run_id)
+);
+REVOKE UPDATE, DELETE ON ci_job_parent_attempt FROM myelin_app;
+CREATE OR REPLACE FUNCTION myelin_reject_ci_job_parent_attempt_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+BEGIN
+  RAISE EXCEPTION 'ci_job_parent_attempt is immutable';
+END
+$myelin$;
+CREATE TRIGGER ci_job_parent_attempt_reject_mutation
+BEFORE UPDATE OR DELETE ON ci_job_parent_attempt
+FOR EACH ROW EXECUTE FUNCTION myelin_reject_ci_job_parent_attempt_mutation()";
+
+/// `ci_job_prelaunch_usage` (CT-007 slice 5b.3-4a.2) — the checkout-only child journal of
+/// `ci_job_parent_attempt`. `started` rows carry a fixed ceiling and null exact usage; `measured`
+/// rows carry exact usage (`complete_phase`); `sealed_ceiling` rows are the reaper's conservative
+/// fallback when a worker never reports (`seal_phase`) and also carry null exact usage, so
+/// reconciliation always falls back to the stored ceiling for a sealed phase. Deliberately NOT a
+/// database `CHECK (exact <= ceiling)`: preserving an honest over-ceiling measurement is more
+/// important than making the row unwritable (Sol's review).
+pub const CREATE_CI_JOB_PRELAUNCH_USAGE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS ci_job_prelaunch_usage (
+  tenant_id                 text NOT NULL,
+  region                    text NOT NULL,
+  job_id                    uuid NOT NULL,
+  lease_epoch               bigint NOT NULL,
+  claim_nonce               uuid NOT NULL,
+  phase                     text NOT NULL CHECK (phase IN ('checkout_transport','checkout_materialization')),
+  status                    text NOT NULL CHECK (status IN ('started','measured','sealed_ceiling')),
+  ceiling_cpu_seconds       numeric(20,0) NOT NULL
+    CHECK (ceiling_cpu_seconds BETWEEN 0 AND 18446744073709551615),
+  ceiling_mem_byte_seconds  numeric(20,0) NOT NULL
+    CHECK (ceiling_mem_byte_seconds BETWEEN 0 AND 18446744073709551615),
+  exact_cpu_seconds         numeric(20,0)
+    CHECK (exact_cpu_seconds BETWEEN 0 AND 18446744073709551615),
+  exact_mem_byte_seconds    numeric(20,0)
+    CHECK (exact_mem_byte_seconds BETWEEN 0 AND 18446744073709551615),
+  started_at                timestamptz NOT NULL DEFAULT now(),
+  resolved_at               timestamptz,
+  PRIMARY KEY (tenant_id, region, job_id, lease_epoch, claim_nonce, phase),
+  CHECK (
+    (status = 'started' AND exact_cpu_seconds IS NULL AND exact_mem_byte_seconds IS NULL AND resolved_at IS NULL)
+    OR (status = 'measured' AND exact_cpu_seconds IS NOT NULL AND exact_mem_byte_seconds IS NOT NULL
+        AND resolved_at IS NOT NULL AND resolved_at >= started_at)
+    OR (status = 'sealed_ceiling' AND exact_cpu_seconds IS NULL AND exact_mem_byte_seconds IS NULL
+        AND resolved_at IS NOT NULL AND resolved_at >= started_at)
+  ),
+  FOREIGN KEY (tenant_id, region, job_id, lease_epoch, claim_nonce)
+    REFERENCES ci_job_parent_attempt (tenant_id, region, job_id, lease_epoch, claim_nonce)
+);
+REVOKE DELETE ON ci_job_prelaunch_usage FROM myelin_app;
+CREATE OR REPLACE FUNCTION myelin_guard_ci_job_prelaunch_usage_transition()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+BEGIN
+  IF OLD.status <> 'started' THEN
+    RAISE EXCEPTION 'ci_job_prelaunch_usage phase % is already resolved (%)', OLD.phase, OLD.status;
+  END IF;
+  IF NEW.status = 'started' THEN
+    RAISE EXCEPTION 'ci_job_prelaunch_usage phase % cannot revert to started', OLD.phase;
+  END IF;
+  IF NEW.tenant_id <> OLD.tenant_id OR NEW.region <> OLD.region OR NEW.job_id <> OLD.job_id
+     OR NEW.lease_epoch <> OLD.lease_epoch OR NEW.claim_nonce <> OLD.claim_nonce OR NEW.phase <> OLD.phase
+     OR NEW.ceiling_cpu_seconds <> OLD.ceiling_cpu_seconds
+     OR NEW.ceiling_mem_byte_seconds <> OLD.ceiling_mem_byte_seconds
+     OR NEW.started_at <> OLD.started_at THEN
+    RAISE EXCEPTION 'ci_job_prelaunch_usage identity and ceiling are immutable';
+  END IF;
+  RETURN NEW;
+END
+$myelin$;
+CREATE TRIGGER ci_job_prelaunch_usage_guard_transition
+BEFORE UPDATE ON ci_job_prelaunch_usage
+FOR EACH ROW EXECUTE FUNCTION myelin_guard_ci_job_prelaunch_usage_transition()";
+
+/// Non-blocking partial index for the reaper (CT-007 slice 5b.3-4b) to find unresolved `started`
+/// phase rows without a full table scan, mirroring the `jq_claimable`/`ci_run_active_workflow`
+/// partial-index convention.
+pub const CREATE_CI_JOB_PRELAUNCH_USAGE_REAPER_INDEX_DDL: &str =
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS ci_job_prelaunch_usage_reaper \
+ON ci_job_prelaunch_usage (region, started_at) WHERE status = 'started'";
+
+/// The reaper (CT-007 slice 5b.3-4b) scans for unresolved `started` phase rows CROSS-TENANT within
+/// one region -- the same server-mapped, empty-tenant scheduler boundary as `job_queue`'s reap query
+/// (Sol's review: the `(region, started_at)` partial index implies exactly this cross-tenant access
+/// pattern, which the ordinary per-tenant RLS this table otherwise carries does not admit; without
+/// this additive grant the real reaper would fail closed with "permission denied" the first time it
+/// tried to seal a row, exactly the gap `GRANT_SCHEDULER_CI_JOB_REAP_RESET_DDL` closed for `ci_job`).
+/// `ci_job_parent_attempt` is read-only to the scheduler (it never seals/mutates the parent row);
+/// `ci_job_prelaunch_usage` additionally grants column-scoped `UPDATE (status, resolved_at)` --
+/// never a table-wide UPDATE, and the transition-guard trigger still enforces every other invariant
+/// regardless of which role issues the UPDATE.
+pub const GRANT_SCHEDULER_CI_JOB_PRELAUNCH_USAGE_REAP_DDL: &str = "\
+CREATE POLICY myelin_ci_scheduler_parent_attempt_access ON ci_job_parent_attempt
+  AS PERMISSIVE FOR SELECT TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+CREATE POLICY myelin_ci_scheduler_parent_attempt_guard ON ci_job_parent_attempt
+  AS RESTRICTIVE FOR SELECT TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+CREATE POLICY myelin_ci_scheduler_prelaunch_usage_access ON ci_job_prelaunch_usage
+  AS PERMISSIVE FOR ALL TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  )
+  WITH CHECK (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+CREATE POLICY myelin_ci_scheduler_prelaunch_usage_guard ON ci_job_prelaunch_usage
+  AS RESTRICTIVE FOR ALL TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  )
+  WITH CHECK (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+GRANT SELECT ON ci_job_parent_attempt TO myelin_ci_region_scheduler;
+GRANT SELECT ON ci_job_prelaunch_usage TO myelin_ci_region_scheduler;
+GRANT UPDATE (status, resolved_at) ON ci_job_prelaunch_usage TO myelin_ci_region_scheduler";
+
 /// **The immutable forward-only ALTER adding the original completion columns to `job_queue`
 /// (CT-004d.2 claim-bound completion).** `lease_epoch` is the monotone claim generation the
 /// [`crate::scheduler::CLAIM_QUERY`] bumps on every claim, so a stale worker whose lease was reaped and
@@ -824,6 +1011,16 @@ fn create_statements() -> Vec<(&'static str, &'static str, String)> {
             "ci_0017_ci_job_accounting",
             CI_JOB_ACCOUNTING_TABLE,
             CREATE_CI_JOB_ACCOUNTING_DDL.to_string(),
+        ),
+        (
+            CI_JOB_PARENT_ATTEMPT_MIGRATION_ID,
+            CI_JOB_PARENT_ATTEMPT_TABLE,
+            CREATE_CI_JOB_PARENT_ATTEMPT_DDL.to_string(),
+        ),
+        (
+            CI_JOB_PRELAUNCH_USAGE_MIGRATION_ID,
+            CI_JOB_PRELAUNCH_USAGE_TABLE,
+            CREATE_CI_JOB_PRELAUNCH_USAGE_DDL.to_string(),
         ),
     ]
 }
@@ -1106,6 +1303,18 @@ pub fn ci_controlplane_migrations() -> Migrations {
                 CI_JOB_ACCOUNTING_TABLE,
             ));
         }
+        if table == CI_JOB_PRELAUNCH_USAGE_TABLE {
+            migrations.push(Migration::plain_on(
+                CI_JOB_PRELAUNCH_USAGE_REAPER_INDEX_MIGRATION_ID,
+                CREATE_CI_JOB_PRELAUNCH_USAGE_REAPER_INDEX_DDL,
+                CI_JOB_PRELAUNCH_USAGE_TABLE,
+            ));
+            migrations.push(Migration::plain_on(
+                CI_SCHEDULER_PRELAUNCH_USAGE_REAP_GRANT_MIGRATION_ID,
+                GRANT_SCHEDULER_CI_JOB_PRELAUNCH_USAGE_REAP_DDL,
+                CI_JOB_PRELAUNCH_USAGE_TABLE,
+            ));
+        }
     }
     migrations.push(Migration::plain_on(
         CI_REGION_SCHEDULER_RLS_MIGRATION_ID,
@@ -1248,6 +1457,8 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
         CI_COST_EVENT_TABLE,
         CHECK_ATTEMPT_TABLE,
         CI_RUN_CHECK_ATTEMPT_TABLE,
+        CI_JOB_PARENT_ATTEMPT_TABLE,
+        CI_JOB_PRELAUNCH_USAGE_TABLE,
     ])
 }
 
@@ -1255,12 +1466,12 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
 mod tests {
     use super::*;
 
-    /// **All eighteen CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
-    /// The complete arch 01 §3 control-plane schema (+ CT-004d.1's `ci_job_spec`) lands here; `ci_run`
-    /// precedes `ci_job` (the FK dependency). This is the prompt's "the complete forward-only
-    /// data-model migrations" gate.
+    /// **All twenty CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
+    /// The complete arch 01 §3 control-plane schema (+ CT-004d.1's `ci_job_spec` + CT-007 slice
+    /// 5b.3-4a.2's prelaunch-usage journal pair) lands here; `ci_run` precedes `ci_job` (the FK
+    /// dependency). This is the prompt's "the complete forward-only data-model migrations" gate.
     #[test]
-    fn all_eighteen_controlplane_tables_are_present_fk_ordered() {
+    fn all_twenty_controlplane_tables_are_present_fk_ordered() {
         let migrations = ci_controlplane_migrations();
         let tables: Vec<&str> = migrations
             .0
@@ -1289,8 +1500,10 @@ mod tests {
                 CI_COST_EVENT_TABLE,
                 CI_JOB_SPEC_TABLE,
                 CI_JOB_ACCOUNTING_TABLE,
+                CI_JOB_PARENT_ATTEMPT_TABLE,
+                CI_JOB_PRELAUNCH_USAGE_TABLE,
             ],
-            "all 18 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
+            "all 20 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
         );
         // ci_run precedes ci_job (the FK target before the FK source).
         let run_pos = tables.iter().position(|t| *t == CI_RUN_TABLE).unwrap();
@@ -1373,6 +1586,52 @@ mod tests {
         }
     }
 
+    /// CT-007 slice 5b.3-4a.2: the parent-attempt journal is immutable (insert-only, like
+    /// `ci_job_accounting`/`ci_drive_manifest`), FK-anchored to `ci_run`, and its two extra `UNIQUE`
+    /// constraints prevent a divergent epoch/nonce pairing for the same job from becoming a second
+    /// attempt row (Sol's review).
+    #[test]
+    fn parent_attempt_is_unique_fk_anchored_and_structurally_insert_only() {
+        let ddl = CREATE_CI_JOB_PARENT_ATTEMPT_DDL;
+        for required in [
+            "PRIMARY KEY (tenant_id, region, job_id, lease_epoch, claim_nonce)",
+            "UNIQUE (tenant_id, region, job_id, lease_epoch)",
+            "UNIQUE (tenant_id, region, job_id, claim_nonce)",
+            "max_parent_attempts          bigint NOT NULL CHECK (max_parent_attempts BETWEEN 1 AND 4294967295)",
+            "REFERENCES ci_run(tenant_id, run_id)",
+            "REVOKE UPDATE, DELETE ON ci_job_parent_attempt FROM myelin_app",
+            "BEFORE UPDATE OR DELETE ON ci_job_parent_attempt",
+            "RAISE EXCEPTION 'ci_job_parent_attempt is immutable'",
+        ] {
+            assert!(ddl.contains(required), "parent-attempt DDL pins `{required}`");
+        }
+    }
+
+    /// CT-007 slice 5b.3-4a.2: the checkout-phase journal is FK-anchored to the parent-attempt
+    /// table, restricted to the two checkout phases and three lifecycle states, has NO database
+    /// `exact <= ceiling` constraint (Sol's review: an honest over-ceiling measurement must remain
+    /// writable), forbids DELETE (append/transition-only), and guards every UPDATE through a
+    /// transition trigger rather than relying on application discipline alone.
+    #[test]
+    fn prelaunch_usage_is_phase_restricted_fk_anchored_and_delete_free() {
+        let ddl = CREATE_CI_JOB_PRELAUNCH_USAGE_DDL;
+        for required in [
+            "phase                     text NOT NULL CHECK (phase IN ('checkout_transport','checkout_materialization'))",
+            "status                    text NOT NULL CHECK (status IN ('started','measured','sealed_ceiling'))",
+            "PRIMARY KEY (tenant_id, region, job_id, lease_epoch, claim_nonce, phase)",
+            "REFERENCES ci_job_parent_attempt (tenant_id, region, job_id, lease_epoch, claim_nonce)",
+            "REVOKE DELETE ON ci_job_prelaunch_usage FROM myelin_app",
+            "BEFORE UPDATE ON ci_job_prelaunch_usage",
+        ] {
+            assert!(ddl.contains(required), "prelaunch-usage DDL pins `{required}`");
+        }
+        assert!(
+            !ddl.contains("exact_cpu_seconds <= ceiling_cpu_seconds")
+                && !ddl.contains("exact_mem_byte_seconds <= ceiling_mem_byte_seconds"),
+            "an honest over-ceiling measurement must never be rejected by a database constraint"
+        );
+    }
+
     /// **The migration set applies forward-only (no DROP, no down) — the contract-1.5 floor.** Every
     /// assembled DDL is forward-only-legal (`is_destructive` is false) and carries the platform RLS
     /// scoping. The runner / lint enforce this at boot / source-scan; this is the in-module proof.
@@ -1381,8 +1640,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            44,
-            "18 table/RLS + 3 ci_run ALTERs + 8 concurrent-index + 1 index-validation + 4 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 3 scheduler ci_run/workflow discovery grants + 1 scheduler ci_job reap-reset grant"
+            48,
+            "20 table/RLS + 3 ci_run ALTERs + 8 concurrent-index + 1 index-validation + 4 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 3 scheduler ci_run/workflow discovery grants + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant"
         );
         for m in &migrations.0 {
             assert!(
@@ -1436,6 +1695,8 @@ mod tests {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL);
             } else if m.id == CI_SCHEDULER_CI_JOB_REAP_RESET_GRANT_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CI_JOB_REAP_RESET_DDL);
+            } else if m.id == CI_SCHEDULER_PRELAUNCH_USAGE_REAP_GRANT_MIGRATION_ID {
+                assert_eq!(m.ddl, GRANT_SCHEDULER_CI_JOB_PRELAUNCH_USAGE_REAP_DDL);
             } else if m.id == CI_REGION_SCHEDULER_RLS_MIGRATION_ID {
                 assert_eq!(m.ddl, CREATE_CI_REGION_SCHEDULER_RLS_DDL);
             } else {
@@ -1468,8 +1729,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            44,
-            "the runner applied all 18 table/RLS, 3 ci_run ALTERs, 8 concurrent-index, 1 index-validation, 4 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, and 1 scheduler ci_job reap-reset grant"
+            48,
+            "the runner applied all 20 table/RLS, 3 ci_run ALTERs, 8 concurrent-index, 1 index-validation, 4 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, and 1 scheduler prelaunch-usage reap grant"
         );
         assert_eq!(
             runner.applied()[0],
@@ -1750,11 +2011,12 @@ mod tests {
         );
     }
 
-    /// **The five hot tables are declared (arch 01 §3 "Hot-table flags declared").** `job_queue` /
-    /// `log_segment` / `ci_cost_event` / the high-water and run-scoped check-attempt ledgers — the
-    /// write-QPS tables that refuse a blocking ALTER at boot.
+    /// **The seven hot tables are declared (arch 01 §3 "Hot-table flags declared").** `job_queue` /
+    /// `log_segment` / `ci_cost_event` / the high-water and run-scoped check-attempt ledgers, plus
+    /// (CT-007 slice 5b.3-4a.2) the parent-attempt and checkout-phase journal pair — the write-QPS
+    /// tables that refuse a blocking ALTER at boot.
     #[test]
-    fn the_five_hot_tables_are_declared() {
+    fn the_seven_hot_tables_are_declared() {
         let hot = ci_controlplane_hot_tables();
         for t in [
             JOB_QUEUE_TABLE,
@@ -1762,6 +2024,8 @@ mod tests {
             CI_COST_EVENT_TABLE,
             CHECK_ATTEMPT_TABLE,
             CI_RUN_CHECK_ATTEMPT_TABLE,
+            CI_JOB_PARENT_ATTEMPT_TABLE,
+            CI_JOB_PRELAUNCH_USAGE_TABLE,
         ] {
             assert!(hot.is_hot(t), "`{t}` is declared hot (arch 01 §3)");
         }
