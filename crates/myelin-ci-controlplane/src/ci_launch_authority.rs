@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -860,6 +861,289 @@ fn refused(detail: &str) -> CiLaunchAuthorityError {
     CiLaunchAuthorityError(detail.into())
 }
 
+// =================================================================================================
+// CT-007 slice 5b.3-4a.1a — the `v2` operational-reservation budget authority (design locked with
+// Sol, 2026-07-29): pure calculator + digest-encoder machinery, NOT wired into any live reservation
+// path yet (5b.3-4a.1b activates it at `PgTierPCiJobBudgetReservation` materialization). `v1` stays
+// completely untouched — every function/constant above this section is byte-frozen.
+//
+// The core fact this machinery prices: a checkout-bearing parent attempt sequentially runs Hop A's
+// two nested git-wire executions (advertise-refs, fetch) plus Hop B's checkout-materialization run,
+// BEFORE the workload's own execution — four sequential executions total, each independently
+// enforcing the SAME `spec.limits` ceiling (Sol's review: peak resources stay one container's
+// limits since the four are sequential, never concurrent; metered resource-TIME is additive across
+// them). The existing `v1` single-workload reservation has no concept of this and must not be
+// reinterpreted to cover it — `v2` adds a separate, ADDITIVE parent-attempt budget instead of
+// dividing the existing per-container ceiling four ways (which would silently weaken every
+// individual execution's own timeout/resource allowance).
+// =================================================================================================
+
+/// Named execution counts within one checkout-bearing parent attempt — never a bare `4` scattered
+/// through the ceiling math. Hop A's two nested git-wire executions (advertise-refs, fetch) plus Hop
+/// B's one checkout-materialization run, additive with the workload's own one execution.
+#[allow(dead_code)]
+const CHECKOUT_TRANSPORT_EXECUTIONS: u64 = 2;
+#[allow(dead_code)]
+const CHECKOUT_MATERIALIZATION_EXECUTIONS: u64 = 1;
+#[allow(dead_code)]
+const WORKLOAD_EXECUTIONS: u64 = 1;
+
+#[allow(dead_code)]
+const CI_OPERATIONAL_RESERVATION_V2_DOMAIN: &[u8] = b"myelin.ci.operational-reservation.v2\0";
+
+/// The revision of the attempt-budget CALCULATION topology/algorithm a `v2` reservation was priced
+/// under — distinct from [`CiAttemptBudgetPolicy::max_parent_attempts`] (a policy VALUE), this
+/// identifies HOW ceilings combine (how many executions per phase, how they're aggregated). Hashed
+/// separately into the `v2` digest so a future topology change (e.g. Hop B splitting into two
+/// executions) can never silently collide with today's `V1` revision's handles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum CiAttemptBudgetRevision {
+    V1,
+}
+
+impl CiAttemptBudgetRevision {
+    fn tag(self) -> u8 {
+        match self {
+            CiAttemptBudgetRevision::V1 => 1,
+        }
+    }
+}
+
+/// The durable policy governing how many times one job may be attempted before its `v2`
+/// reservation's upper bound is exhausted. Sol's round-2 review: a "parent attempt" is counted from
+/// a durably-begun claim generation — before Hop A for a checkout-bearing job, or before workload
+/// launch itself for a compute job (which has no Hop A/B preparation at all, yet still receives the
+/// SAME 5-attempt `v2` ceiling — this cap counts attempts at the job, not at checkout preparation
+/// specifically). CT-007 slice 5b.3-4a.2 must enforce this cap for BOTH shapes.
+///
+/// `max_parent_attempts` is a deliberate, REVISABLE policy value (CT-007 slice 5b.3-4, default `5`
+/// — chosen 2026-07-29 as a cost/reliability trade-off, not derived from any technical constraint;
+/// mirrors the same house convention as [`TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING`]). A
+/// provider must STORE this explicitly (never re-derive it ad hoc) so every request it prices agrees
+/// on the same policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CiAttemptBudgetPolicy {
+    revision: CiAttemptBudgetRevision,
+    max_parent_attempts: NonZeroU32,
+}
+
+impl CiAttemptBudgetPolicy {
+    /// The production default: revision `V1`, 5 attempts.
+    pub fn production() -> Self {
+        Self {
+            revision: CiAttemptBudgetRevision::V1,
+            max_parent_attempts: NonZeroU32::new(5).expect("5 is nonzero"),
+        }
+    }
+
+    /// A checked constructor for tests and future non-default compositions.
+    pub fn new(revision: CiAttemptBudgetRevision, max_parent_attempts: NonZeroU32) -> Self {
+        Self {
+            revision,
+            max_parent_attempts,
+        }
+    }
+
+    pub fn revision(&self) -> CiAttemptBudgetRevision {
+        self.revision
+    }
+
+    pub fn max_parent_attempts(&self) -> NonZeroU32 {
+        self.max_parent_attempts
+    }
+}
+
+/// Raw, unpriced resource-seconds — CPU-seconds and memory-byte-seconds kept SEPARATE (Sol's
+/// review: "aggregate raw dimensions first, price once"). Distinct from `v1`'s
+/// [`operational_reservation_amount`], which combines cpu-seconds + memory-GiB-seconds into one
+/// already-converted `i64` at the very first step — `v2`'s math instead stays in raw dimensions
+/// through every intermediate aggregation, converting to operational units exactly once, at the end
+/// ([`operational_reservation_amount_v2`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+struct ResourceCeiling {
+    cpu_seconds: u64,
+    mem_byte_seconds: u64,
+}
+
+impl ResourceCeiling {
+    fn checked_mul(self, factor: u64) -> Result<ResourceCeiling, CiLaunchAuthorityError> {
+        Ok(ResourceCeiling {
+            cpu_seconds: self
+                .cpu_seconds
+                .checked_mul(factor)
+                .ok_or_else(|| refused("operational v2 cpu-seconds ceiling overflow"))?,
+            mem_byte_seconds: self
+                .mem_byte_seconds
+                .checked_mul(factor)
+                .ok_or_else(|| refused("operational v2 mem-byte-seconds ceiling overflow"))?,
+        })
+    }
+}
+
+/// The raw resource-seconds ceiling for ONE execution at `limits` — checked arithmetic, kept in raw
+/// dimensions (never combined/converted here). Mirrors `v1`'s [`operational_reservation_amount`]
+/// CPU/memory formulas exactly (same inputs, same validation), but returns the two dimensions
+/// separately instead of one pre-converted `i64`.
+#[allow(dead_code)]
+fn raw_execution_ceiling(
+    limits: &CiManifestLimitsV1,
+) -> Result<ResourceCeiling, CiLaunchAuthorityError> {
+    if limits.cpu_millis == 0
+        || limits.mem_bytes == 0
+        || limits.timeout_secs == 0
+        || limits.pids_max == 0
+        || limits.disk_bytes == 0
+    {
+        return Err(refused(
+            "operational v2 reservation limits must all be positive",
+        ));
+    }
+    let timeout = u128::from(limits.timeout_secs);
+    let cpu_millis_seconds = u128::from(limits.cpu_millis)
+        .checked_mul(timeout)
+        .ok_or_else(|| refused("operational v2 CPU reservation overflow"))?;
+    let mem_byte_seconds = u128::from(limits.mem_bytes)
+        .checked_mul(timeout)
+        .ok_or_else(|| refused("operational v2 memory reservation overflow"))?;
+    let cpu_seconds = cpu_millis_seconds.div_ceil(1_000);
+    Ok(ResourceCeiling {
+        cpu_seconds: u64::try_from(cpu_seconds)
+            .map_err(|_| refused("operational v2 cpu-seconds ceiling exceeds durable range"))?,
+        mem_byte_seconds: u64::try_from(mem_byte_seconds).map_err(|_| {
+            refused("operational v2 mem-byte-seconds ceiling exceeds durable range")
+        })?,
+    })
+}
+
+/// One parent attempt's total raw ceiling: the workload alone for a compute job, or Hop A (2
+/// executions) + Hop B (1) + the workload (1) for a checkout-bearing job. Checkout presence is
+/// derived ONLY from `request.checkout` (Sol's review: never a caller-supplied bool, which could
+/// disagree with the authority request and under-reserve it).
+#[allow(dead_code)]
+fn parent_attempt_ceiling(
+    request: &CiJobRuntimeAuthorityRequest,
+) -> Result<ResourceCeiling, CiLaunchAuthorityError> {
+    let one_execution = raw_execution_ceiling(&request.limits)?;
+    let executions = if request.checkout.is_some() {
+        CHECKOUT_TRANSPORT_EXECUTIONS + CHECKOUT_MATERIALIZATION_EXECUTIONS + WORKLOAD_EXECUTIONS
+    } else {
+        WORKLOAD_EXECUTIONS
+    };
+    one_execution.checked_mul(executions)
+}
+
+/// The complete raw ceiling a job may durably accrue across every parent attempt its budget policy
+/// allows — [`parent_attempt_ceiling`] times `policy.max_parent_attempts`, checked.
+#[allow(dead_code)]
+fn job_lifetime_ceiling(
+    request: &CiJobRuntimeAuthorityRequest,
+    policy: &CiAttemptBudgetPolicy,
+) -> Result<ResourceCeiling, CiLaunchAuthorityError> {
+    let per_attempt = parent_attempt_ceiling(request)?;
+    per_attempt.checked_mul(u64::from(policy.max_parent_attempts.get()))
+}
+
+/// The final conversion from a raw [`ResourceCeiling`] to operational units — `cpu_seconds +
+/// ceil(mem_byte_seconds / GiB)`, checked. Mirrors [`TierPOperationalCiJobPricer`]'s own conversion
+/// formula exactly, so a job's `v2` reservation and its eventual settlement price always agree on
+/// units. Extracted as its own function (Sol's round-2 review) so both overflow boundaries — the
+/// `checked_add` and the `i64` range check — are directly testable without needing to construct
+/// realistic-looking `CiManifestLimitsV1`/policy inputs that happen to trigger each one.
+#[allow(dead_code)]
+fn operational_amount_from_ceiling(
+    ceiling: ResourceCeiling,
+) -> Result<i64, CiLaunchAuthorityError> {
+    let memory_gib_seconds = ceiling.mem_byte_seconds.div_ceil(GIB_BYTES);
+    let total = ceiling
+        .cpu_seconds
+        .checked_add(memory_gib_seconds)
+        .ok_or_else(|| refused("operational v2 reservation overflow"))?;
+    i64::try_from(total).map_err(|_| refused("operational v2 reservation exceeds durable range"))
+}
+
+/// `v2`'s final conversion to operational units — aggregate raw dimensions first
+/// ([`job_lifetime_ceiling`]), convert exactly once via [`operational_amount_from_ceiling`].
+#[allow(dead_code)]
+fn operational_reservation_amount_v2(
+    request: &CiJobRuntimeAuthorityRequest,
+    policy: &CiAttemptBudgetPolicy,
+) -> Result<i64, CiLaunchAuthorityError> {
+    let ceiling = job_lifetime_ceiling(request, policy)?;
+    operational_amount_from_ceiling(ceiling)
+}
+
+/// The `v2` operational-reservation digest — a wholly SEPARATE encoder from
+/// [`runtime_authority_digest`] (which stays byte-frozen; it is ALSO shared by the `v1` batch
+/// domain, which has no reason to know about checkout scope, budget policy, or ceilings at all).
+/// Mirrors [`token_authority_digest_v2`]'s checkout-hashing pattern exactly (same present/absent
+/// discriminator + canonical fields), and additionally binds the budget-policy revision,
+/// `max_parent_attempts`, and the resulting per-attempt/lifetime raw ceilings — so two jobs with
+/// identical limits and checkout-presence, but a different budget policy (or a future topology
+/// revision), can NEVER collide on the same `v2` handle, even if their reservation AMOUNT happens to
+/// coincide. Sol's round-2 review: derives `per_attempt`/`lifetime` INTERNALLY from `request`/
+/// `policy` rather than accepting them as caller-supplied parameters — no authority encoder may
+/// accept independently forgeable derived facts; a caller could otherwise pass ceilings that
+/// disagree with the request/policy they claim to describe.
+#[allow(dead_code)]
+fn operational_reservation_digest_v2(
+    request: &CiJobRuntimeAuthorityRequest,
+    policy: &CiAttemptBudgetPolicy,
+) -> Result<blake3::Hash, CiLaunchAuthorityError> {
+    let per_attempt = parent_attempt_ceiling(request)?;
+    let lifetime = job_lifetime_ceiling(request, policy)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CI_OPERATIONAL_RESERVATION_V2_DOMAIN);
+    for value in [
+        request.tenant_id.as_str(),
+        request.region.as_str(),
+        request.ci_run_id.as_str(),
+        request.wf_run_id.as_str(),
+        request.project_id.as_str(),
+        request.job_id.as_str(),
+        request.stage.as_str(),
+        request.concrete_name.as_str(),
+        request.trigger_kind.as_str(),
+        request.trust_tier.as_str(),
+        request.source_snapshot_digest.as_str(),
+        request.workflow_code_hash.as_str(),
+        request.policy_revision.as_str(),
+    ] {
+        hash_length_prefixed(&mut hasher, value.as_bytes());
+    }
+    hasher.update(&request.workflow_definition_version.to_be_bytes());
+    hasher.update(&request.limits.cpu_millis.to_be_bytes());
+    hasher.update(&request.limits.mem_bytes.to_be_bytes());
+    hasher.update(&request.limits.disk_bytes.to_be_bytes());
+    hasher.update(&request.limits.pids_max.to_be_bytes());
+    hasher.update(&request.limits.timeout_secs.to_be_bytes());
+    match &request.checkout {
+        None => {
+            hasher.update(&[0u8]);
+        }
+        Some(scope) => {
+            hasher.update(&[1u8]);
+            hash_length_prefixed(&mut hasher, scope.tenant().0.as_bytes());
+            hash_length_prefixed(&mut hasher, scope.repo_ref().0.as_bytes());
+            hash_length_prefixed(&mut hasher, scope.repo_id().as_bytes());
+            hash_length_prefixed(&mut hasher, scope.commit_hex().as_bytes());
+            let format_tag: u8 = match scope.commit_format() {
+                myelin_ci_sandbox::GitObjectFormat::Sha1 => 1,
+                myelin_ci_sandbox::GitObjectFormat::Sha256 => 2,
+            };
+            hasher.update(&[format_tag]);
+        }
+    }
+    hasher.update(&[policy.revision.tag()]);
+    hasher.update(&policy.max_parent_attempts.get().to_be_bytes());
+    hasher.update(&per_attempt.cpu_seconds.to_be_bytes());
+    hasher.update(&per_attempt.mem_byte_seconds.to_be_bytes());
+    hasher.update(&lifetime.cpu_seconds.to_be_bytes());
+    hasher.update(&lifetime.mem_byte_seconds.to_be_bytes());
+    Ok(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,6 +1195,262 @@ mod tests {
 
     fn policy(budget: Arc<dyn CiJobBudgetReservationProvider>) -> LinuxSmallV1LaunchAuthority {
         LinuxSmallV1LaunchAuthority::new(budget)
+    }
+
+    // =============================================================================================
+    // CT-007 slice 5b.3-4a.1a — the `v2` operational-reservation budget authority. Pure
+    // calculator/digest-encoder tests only; nothing here is wired into any live reservation path yet
+    // (5b.3-4a.1b).
+    // =============================================================================================
+    mod v2_budget_authority_5b3_4a1a {
+        use super::*;
+
+        fn v2_request(
+            checkout: Option<CheckoutAuthorizationScope>,
+        ) -> CiJobRuntimeAuthorityRequest {
+            CiJobRuntimeAuthorityRequest {
+                tenant_id: "acme".into(),
+                region: "fr-par".into(),
+                ci_run_id: "11111111-1111-1111-1111-111111111111".into(),
+                wf_run_id: "22222222-2222-2222-2222-222222222222".into(),
+                project_id: "33333333-3333-3333-3333-333333333333".into(),
+                job_id: "44444444-4444-4444-4444-444444444444".into(),
+                stage: "build".into(),
+                concrete_name: "build".into(),
+                trigger_kind: "push".into(),
+                trust_tier: "trusted".into(),
+                source_snapshot_digest: "digest-fixture".into(),
+                workflow_definition_version: 3,
+                workflow_code_hash: "code-hash-fixture".into(),
+                policy_revision: LINUX_SMALL_V1_POLICY_REVISION.into(),
+                limits: linux_small_limits(),
+                checkout,
+            }
+        }
+
+        fn checkout_scope_fixture() -> CheckoutAuthorizationScope {
+            myelin_ci_sandbox::derive_checkout_authorization_scope(
+                myelin_ci_sandbox::JobKind::Ci,
+                &myelin_ci_sandbox::WorkspaceSpec {
+                    repo_ref: Some("myelin://acme/git/repo/widgets".into()),
+                    commit: Some("a".repeat(40)),
+                },
+            )
+            .unwrap()
+            .unwrap()
+        }
+
+        #[test]
+        fn v1_amount_is_completely_unchanged_by_this_slice() {
+            assert_eq!(
+                operational_reservation_amount(&linux_small_limits()).unwrap(),
+                750
+            );
+        }
+
+        #[test]
+        fn golden_v1_digest_for_a_fixed_request_is_pinned() {
+            // Frozen hard-coded v1 handle-digest vector (Sol's round-4a.1a review): proves this
+            // slice's additions never touch `runtime_authority_digest`/`CI_OPERATIONAL_RESERVATION_V1_DOMAIN`
+            // byte-for-byte, computed once and pasted as a literal (never compared via the same
+            // function under test).
+            let request = v2_request(None);
+            let digest = runtime_authority_digest(CI_OPERATIONAL_RESERVATION_V1_DOMAIN, &request);
+            assert_eq!(
+                digest.to_hex().as_str(),
+                "e7342bddca7b3b20491a47906abc128515486354aaab516bd68837be536a9592"
+            );
+        }
+
+        #[test]
+        fn raw_execution_ceiling_matches_v1s_own_formula_in_raw_dimensions() {
+            let ceiling = raw_execution_ceiling(&linux_small_limits()).unwrap();
+            assert_eq!(ceiling.cpu_seconds, 600);
+            assert_eq!(ceiling.mem_byte_seconds, 161_061_273_600);
+        }
+
+        #[test]
+        fn compute_job_parent_attempt_ceiling_is_exactly_one_execution() {
+            let request = v2_request(None);
+            let ceiling = parent_attempt_ceiling(&request).unwrap();
+            let one = raw_execution_ceiling(&linux_small_limits()).unwrap();
+            assert_eq!(ceiling, one);
+        }
+
+        #[test]
+        fn checkout_job_parent_attempt_ceiling_is_exactly_four_executions() {
+            let request = v2_request(Some(checkout_scope_fixture()));
+            let ceiling = parent_attempt_ceiling(&request).unwrap();
+            let one = raw_execution_ceiling(&linux_small_limits()).unwrap();
+            assert_eq!(ceiling.cpu_seconds, one.cpu_seconds * 4);
+            assert_eq!(ceiling.mem_byte_seconds, one.mem_byte_seconds * 4);
+        }
+
+        #[test]
+        fn compute_job_lifetime_ceiling_and_amount_golden() {
+            let policy = CiAttemptBudgetPolicy::production();
+            let request = v2_request(None);
+            let lifetime = job_lifetime_ceiling(&request, &policy).unwrap();
+            assert_eq!(lifetime.cpu_seconds, 3_000);
+            assert_eq!(lifetime.mem_byte_seconds, 805_306_368_000);
+            assert_eq!(
+                operational_reservation_amount_v2(&request, &policy).unwrap(),
+                3_750
+            );
+        }
+
+        #[test]
+        fn checkout_job_lifetime_ceiling_and_amount_golden() {
+            let policy = CiAttemptBudgetPolicy::production();
+            let request = v2_request(Some(checkout_scope_fixture()));
+            let lifetime = job_lifetime_ceiling(&request, &policy).unwrap();
+            assert_eq!(lifetime.cpu_seconds, 12_000);
+            assert_eq!(lifetime.mem_byte_seconds, 3_221_225_472_000);
+            assert_eq!(
+                operational_reservation_amount_v2(&request, &policy).unwrap(),
+                15_000
+            );
+        }
+
+        #[test]
+        fn golden_v2_compute_digest_is_pinned() {
+            let policy = CiAttemptBudgetPolicy::production();
+            let request = v2_request(None);
+            let digest = operational_reservation_digest_v2(&request, &policy).unwrap();
+            assert_eq!(
+                digest.to_hex().as_str(),
+                "72d454ec72766e876206495631c7f01311e8e967461e0ce31b2a077d4c09e1ac"
+            );
+        }
+
+        #[test]
+        fn golden_v2_checkout_digest_is_pinned() {
+            let policy = CiAttemptBudgetPolicy::production();
+            let request = v2_request(Some(checkout_scope_fixture()));
+            let digest = operational_reservation_digest_v2(&request, &policy).unwrap();
+            assert_eq!(
+                digest.to_hex().as_str(),
+                "8f75d7cdca35c8646e98f865ae548283fde626ef11ebde6df1247fe8cf58fc3b"
+            );
+        }
+
+        #[test]
+        fn different_max_parent_attempts_yields_different_amount_and_handle() {
+            let request = v2_request(None);
+            let policy_5 = CiAttemptBudgetPolicy::production();
+            let policy_3 = CiAttemptBudgetPolicy::new(
+                CiAttemptBudgetRevision::V1,
+                NonZeroU32::new(3).unwrap(),
+            );
+            let amount_5 = operational_reservation_amount_v2(&request, &policy_5).unwrap();
+            let amount_3 = operational_reservation_amount_v2(&request, &policy_3).unwrap();
+            assert_ne!(amount_5, amount_3);
+
+            let digest_5 = operational_reservation_digest_v2(&request, &policy_5).unwrap();
+            let digest_3 = operational_reservation_digest_v2(&request, &policy_3).unwrap();
+            assert_ne!(digest_5, digest_3);
+        }
+
+        #[test]
+        fn different_checkout_scope_same_limits_same_amount_different_handle() {
+            let request_a = v2_request(Some(checkout_scope_fixture()));
+            let other_scope = myelin_ci_sandbox::derive_checkout_authorization_scope(
+                myelin_ci_sandbox::JobKind::Ci,
+                &myelin_ci_sandbox::WorkspaceSpec {
+                    repo_ref: Some("myelin://acme/git/repo/other".into()),
+                    commit: Some("b".repeat(40)),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            let request_b = v2_request(Some(other_scope));
+
+            let policy = CiAttemptBudgetPolicy::production();
+            let amount_a = operational_reservation_amount_v2(&request_a, &policy).unwrap();
+            let amount_b = operational_reservation_amount_v2(&request_b, &policy).unwrap();
+            assert_eq!(
+                amount_a, amount_b,
+                "same limits, same execution count -> same amount"
+            );
+
+            let digest_a = operational_reservation_digest_v2(&request_a, &policy).unwrap();
+            let digest_b = operational_reservation_digest_v2(&request_b, &policy).unwrap();
+            assert_ne!(
+                digest_a, digest_b,
+                "different checkout scope must still produce a different handle"
+            );
+        }
+
+        #[test]
+        fn zero_attempts_cannot_be_constructed() {
+            assert!(NonZeroU32::new(0).is_none());
+        }
+
+        #[test]
+        fn resource_ceiling_checked_mul_overflow_refuses_loudly() {
+            let ceiling = ResourceCeiling {
+                cpu_seconds: u64::MAX,
+                mem_byte_seconds: 1,
+            };
+            assert!(ceiling.checked_mul(2).is_err());
+
+            let ceiling = ResourceCeiling {
+                cpu_seconds: 1,
+                mem_byte_seconds: u64::MAX,
+            };
+            assert!(ceiling.checked_mul(2).is_err());
+        }
+
+        #[test]
+        fn raw_execution_ceiling_mem_byte_seconds_overflow_refuses_loudly() {
+            let mut limits = linux_small_limits();
+            limits.mem_bytes = u64::MAX;
+            limits.timeout_secs = 2;
+            let err = raw_execution_ceiling(&limits).unwrap_err();
+            assert!(
+                err.0.contains("overflow") || err.0.contains("exceeds"),
+                "message was: {}",
+                err.0
+            );
+        }
+
+        #[test]
+        fn job_lifetime_ceiling_overflow_refuses_loudly() {
+            // A large-but-individually-valid raw ceiling whose CHECKOUT parent-attempt (x4) times
+            // the production policy's max_parent_attempts (x5) overflows u64 mem-byte-seconds.
+            let mut limits = linux_small_limits();
+            limits.mem_bytes = u64::MAX / 15; // *4 (checkout) *5 (max_attempts) = *20 > u64::MAX
+            limits.timeout_secs = 1;
+            let request = v2_request(Some(checkout_scope_fixture()));
+            let mut request = request;
+            request.limits = limits;
+            let policy = CiAttemptBudgetPolicy::production();
+            let err = job_lifetime_ceiling(&request, &policy).unwrap_err();
+            assert!(err.0.contains("overflow"), "message was: {}", err.0);
+        }
+
+        #[test]
+        fn operational_amount_from_ceiling_add_overflow_refuses_loudly() {
+            // cpu_seconds is already u64::MAX; adding even one memory-GiB-second overflows u64.
+            let ceiling = ResourceCeiling {
+                cpu_seconds: u64::MAX,
+                mem_byte_seconds: GIB_BYTES,
+            };
+            let err = operational_amount_from_ceiling(ceiling).unwrap_err();
+            assert!(err.0.contains("overflow"), "message was: {}", err.0);
+        }
+
+        #[test]
+        fn operational_amount_from_ceiling_exceeding_i64_range_refuses_loudly() {
+            // A total that fits comfortably in u64 (no checked_add overflow) but exceeds i64::MAX --
+            // a DISTINCT failure mode from the checked_add overflow above.
+            let ceiling = ResourceCeiling {
+                cpu_seconds: i64::MAX as u64 + 100,
+                mem_byte_seconds: 0,
+            };
+            let err = operational_amount_from_ceiling(ceiling).unwrap_err();
+            assert!(err.0.contains("exceeds"), "message was: {}", err.0);
+        }
     }
 
     #[test]
