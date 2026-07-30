@@ -423,8 +423,10 @@ fn build_v2_candidates(
 /// minted under -- never trusted on its own; the caller must still recompute the expected candidate
 /// from these parsed fields and compare it byte-for-byte against the durable row.
 struct ParsedV2Handle {
+    ci_run_id: String,
     revision: CiAttemptBudgetRevision,
     max_parent_attempts: NonZeroU32,
+    job_id: String,
 }
 
 /// Parses `<run_id>:<budget_tag>:<attempts_tag>:<batch_digest>:<job_id>:<request_digest>` (the
@@ -434,11 +436,11 @@ struct ParsedV2Handle {
 fn parse_v2_handle(handle: &str) -> Option<ParsedV2Handle> {
     let suffix = handle.strip_prefix(TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX)?;
     let mut parts = suffix.split(':');
-    let _run_id = parts.next()?;
+    let ci_run_id = parts.next()?;
     let budget_tag = parts.next()?;
     let attempts_tag = parts.next()?;
     let _batch_digest = parts.next()?;
-    let _job_id = parts.next()?;
+    let job_id = parts.next()?;
     let _request_digest = parts.next()?;
     if parts.next().is_some() {
         return None;
@@ -446,9 +448,48 @@ fn parse_v2_handle(handle: &str) -> Option<ParsedV2Handle> {
     let revision = CiAttemptBudgetRevision::from_handle_tag(budget_tag)?;
     let max_parent_attempts = parse_attempts_handle_tag(attempts_tag)?;
     Some(ParsedV2Handle {
+        ci_run_id: ci_run_id.to_owned(),
         revision,
         max_parent_attempts,
+        job_id: job_id.to_owned(),
     })
+}
+
+/// Verify one durable v2 reservation against the complete immutable authority batch.
+///
+/// Parsing only recovers the policy descriptor; it grants no authority. This resolver reconstructs
+/// that policy, rebuilds every candidate (thereby binding the batch digest), then requires the
+/// current job's complete handle and durable amount to match byte-for-byte.
+pub(crate) fn verify_v2_operational_reservation(
+    requests: &[CiJobRuntimeAuthorityRequest],
+    expected_ci_run_id: &str,
+    expected_job_id: &str,
+    durable_handle: &str,
+    durable_amount: i64,
+) -> Result<CiAttemptBudgetPolicy, CiLaunchAuthorityError> {
+    let parsed = parse_v2_handle(durable_handle)
+        .ok_or_else(|| refused("operational reservation is not a valid v2 handle"))?;
+    if parsed.ci_run_id != expected_ci_run_id || parsed.job_id != expected_job_id {
+        return Err(refused(
+            "operational v2 reservation identity differs from the durable claim",
+        ));
+    }
+    let policy = CiAttemptBudgetPolicy::new(parsed.revision, parsed.max_parent_attempts);
+    let candidates = build_v2_candidates(requests, &policy)?;
+    let candidate = requests
+        .iter()
+        .zip(candidates.iter())
+        .find_map(|(request, candidate)| {
+            (request.ci_run_id == expected_ci_run_id && request.job_id == expected_job_id)
+                .then_some(candidate)
+        })
+        .ok_or_else(|| refused("claimed job is absent from the operational authority batch"))?;
+    if candidate.handle != durable_handle || candidate.amount != durable_amount {
+        return Err(refused(
+            "durable operational v2 reservation authority diverged",
+        ));
+    }
+    Ok(policy)
 }
 
 /// Reserve the maximum CPU-seconds plus memory-GiB-seconds the server-owned limits can consume.
@@ -1175,7 +1216,7 @@ pub enum CiAttemptBudgetRevision {
 }
 
 impl CiAttemptBudgetRevision {
-    fn tag(self) -> u8 {
+    pub(crate) fn tag(self) -> u8 {
         match self {
             CiAttemptBudgetRevision::V1 => 1,
         }
@@ -1319,6 +1360,18 @@ fn raw_execution_ceiling(
         mem_byte_seconds: u64::try_from(mem_byte_seconds).map_err(|_| {
             refused("operational v2 mem-byte-seconds ceiling exceeds durable range")
         })?,
+    })
+}
+
+/// Raw ceiling for one sandbox execution, exposed only to the prelaunch journal so it can derive
+/// phase ceilings from the same checked arithmetic used by the v2 reservation.
+pub(crate) fn raw_execution_usage_ceiling(
+    request: &CiJobRuntimeAuthorityRequest,
+) -> Result<ResourceUsage, CiLaunchAuthorityError> {
+    let ceiling = raw_execution_ceiling(&request.limits)?;
+    Ok(ResourceUsage {
+        cpu_seconds: ceiling.cpu_seconds,
+        mem_byte_seconds: ceiling.mem_byte_seconds,
     })
 }
 
@@ -2193,8 +2246,63 @@ mod tests {
             let candidates = build_v2_candidates(&requests, &policy).unwrap();
             let parsed =
                 parse_v2_handle(&candidates[0].handle).expect("must parse a real candidate");
+            assert_eq!(parsed.ci_run_id, requests[0].ci_run_id);
             assert_eq!(parsed.revision, policy.revision());
             assert_eq!(parsed.max_parent_attempts, policy.max_parent_attempts());
+            assert_eq!(parsed.job_id, requests[0].job_id);
+        }
+
+        #[test]
+        fn narrow_v2_resolver_recomputes_the_complete_batch_and_policy() {
+            let requests = fixture_batch();
+            let policy = CiAttemptBudgetPolicy::new(
+                CiAttemptBudgetRevision::V1,
+                NonZeroU32::new(3).unwrap(),
+            );
+            let candidates = build_v2_candidates(&requests, &policy).unwrap();
+            let recovered = verify_v2_operational_reservation(
+                &requests,
+                &requests[0].ci_run_id,
+                &requests[0].job_id,
+                &candidates[0].handle,
+                candidates[0].amount,
+            )
+            .unwrap();
+            assert_eq!(recovered, policy);
+        }
+
+        #[test]
+        fn narrow_v2_resolver_refuses_identity_digest_and_amount_divergence() {
+            let requests = fixture_batch();
+            let policy = CiAttemptBudgetPolicy::production();
+            let candidates = build_v2_candidates(&requests, &policy).unwrap();
+            assert!(verify_v2_operational_reservation(
+                &requests,
+                &requests[0].ci_run_id,
+                &requests[1].job_id,
+                &candidates[0].handle,
+                candidates[0].amount,
+            )
+            .is_err());
+            let mut tampered = candidates[0].handle.clone();
+            let last = tampered.pop().unwrap();
+            tampered.push(if last == '0' { '1' } else { '0' });
+            assert!(verify_v2_operational_reservation(
+                &requests,
+                &requests[0].ci_run_id,
+                &requests[0].job_id,
+                &tampered,
+                candidates[0].amount,
+            )
+            .is_err());
+            assert!(verify_v2_operational_reservation(
+                &requests,
+                &requests[0].ci_run_id,
+                &requests[0].job_id,
+                &candidates[0].handle,
+                candidates[0].amount + 1,
+            )
+            .is_err());
         }
 
         #[test]
