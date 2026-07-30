@@ -3066,3 +3066,79 @@ gated) durable-schema enrichment — no new production behavior beyond the v4 op
 against the existing workload CAS — deliberately not started this slice), 5b.3-6, 5b.3-7, task #91,
 the `v1`→`v2` reservation fleet-convergence flip, and the lease/topology prerequisite for 5b.3-6. The
 rest of ledger 12's open items are unchanged.
+
+---
+
+## 2026-07-30 — CT-007 slice 5b.3-5b: the preparation-terminal completion CAS lands, the highest-
+blast-radius piece on this track so far (Sol, design + implementation; Sonnet, independent review via
+a fresh reviewer agent + direct verification of every claim before commit)
+
+**What this is:** the actual `CiPipelineReporter::report_preparation_terminal` completion path for a
+job that got through checkout preparation but never launched its workload. This is the piece 5a
+deliberately deferred: a brand-new conditional `UPDATE job_queue` (`CONSUME_PREPARATION_CLAIM_QUERY`)
+that must race safely against the existing, already-production workload-completion CAS
+(`CONSUME_CLAIM_QUERY`) — the two most security/money-relevant queries in the scheduler now coexist.
+
+**Design, reviewed before any code:** the new CAS is structurally symmetric to the existing one —
+requires `state = 'leased'` (mirroring the workload CAS's `state = 'running'`) plus a full identity
+bind (tenant/region/job/run/idem/owner/epoch/nonce/stage/claim timestamps) and an `EXISTS` against
+the exact durable `ci_job_parent_attempt` generation. Since a `job_queue` row can only be in one of
+`leased`/`running` at a time, Postgres's own row-level `UPDATE` serialization makes the launch CAS
+(`leased→running`) and this CAS (`leased→terminal`) naturally mutually exclusive — no extra
+application lock needed. The design also added an anti-forgery check I hadn't asked for: the caller's
+claimed disposition (`Failed{phase}`/`TimedOut{phase}`/`AttemptsExhausted`) must agree with the
+durable journal's own actual state (the named phase must genuinely be terminal in
+`ci_job_prelaunch_usage`; the exhaustion count must genuinely equal `max_parent_attempts`) — a caller
+cannot fabricate a disposition the journal doesn't support. `report_preparation_terminal` requires
+`CiJobAccountingWriteVersion::V4` explicitly (production stays V3-default), so even a premature/
+accidental invocation refuses before any mutation. This slice remains genuinely dormant — zero
+production callers; 5b.3-6 is what will eventually call it.
+
+**Independent review — a fresh-context reviewer agent, not Sol, checked seven specific claims
+against the actual SQL/test bodies (not the self-report), and I separately re-verified the two most
+critical ones myself before trusting either report:**
+1. CAS shape: full identity bind confirmed; `CONSUME_CLAIM_QUERY` confirmed byte-for-byte untouched
+   (a test now also asserts the new query never contains `state = 'running'`/`state IN`, guarding
+   against future accidental widening).
+2. **The race test — verified myself directly, not just via the reviewer.** Read
+   `preparation_terminal_and_launch_cas_race_with_exactly_one_winner`: two genuine
+   `tokio::task::spawn_blocking` threads (the real `acquire_launch_permit().commit_and_release()`
+   path in one, the real `report_preparation_terminal` call in the other), synchronized by a 3-party
+   `std::sync::Barrier` so both transactions are actually in flight simultaneously, against separate
+   pooled connections. Asserts `assert_ne!(launch_won, preparation_won)` (exactly one wins), final
+   `job_queue.state` matches the winner, and `ci_job_accounting` row count is exactly
+   `i64::from(preparation_won)` — exactly one settlement, no deadlock.
+3. Disposition-to-journal anti-forgery: confirmed both directions tested — claiming a phase that's
+   still `started` refuses; claiming the wrong phase after the right one is measured refuses;
+   claiming `AttemptsExhausted` below the durable count refuses; the exact-cap case is accepted.
+4. No double-settlement/terminalization: an already-`running` job refuses the new CAS cleanly (no
+   partial writes, whole thing in one transaction) and can still complete normally afterward via the
+   existing workload path; exact replay returns `Duplicate` (no re-charge); a changed disposition or
+   generation on replay is refused because the v4 receipt hash is disposition-bound.
+5. Confirmed dormant: `report_preparation_terminal` has zero callers anywhere outside its own tests.
+6. Post-CAS rollback: a dedicated test installs a Postgres trigger that raises after the CAS executes
+   but before commit, and proves the whole transaction — including the queue-state change — rolls
+   back atomically (job stays `leased`, zero accounting/cost rows).
+7. No other issues: no unwraps/raw arithmetic/TODOs in the new production code; overflow still routes
+   through the existing checked-bigint-range path; the V4 gate refuses both a V3-configured reporter
+   and the test-only `TestBypass` accounting variant — no backdoor into the real path.
+
+One design note the reviewer flagged and I confirmed with Sol before committing: the CAS requires
+`claim_expires_at > statement_timestamp()`, so a preparation-failure report after the claim already
+expired is refused. Confirmed intentional — an expired claim's ownership transfers to the reaper/
+reconciliation path, and accepting a late report would create a race with that path's own sealing.
+
+**Full independent verification, re-run myself after the design review** (not the self-report):
+`myelin-ci-controlplane --lib` → 541 passed; the entire `--all-targets --features integration`
+matrix → all green (terminal-accounting suite alone now 16 tests, up from 7 before this slice);
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` clean; `cargo check
+--workspace --tests --all-features` clean.
+
+**5b.3-5 (both halves) is now complete.** A preparation-only outcome has an honest, forgery-resistant,
+race-safe, one-shot-settled terminal path — still dormant until 5b.3-6 gives it a real caller.
+
+**Still open:** 5b.3-6 (compose the full checkout+workload sequence into `launch_with`, including
+wiring a real caller to `report_preparation_terminal` — the first slice that makes any of 5b.3-4/5b.3-5
+load-bearing in production), 5b.3-7, task #91, the `v1`→`v2` reservation fleet-convergence flip, and
+the lease/topology prerequisite for 5b.3-6 noted in the 4b.1 entry. The rest of ledger 12's open items
+are unchanged.

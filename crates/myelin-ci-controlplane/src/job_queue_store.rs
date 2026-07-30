@@ -72,8 +72,8 @@ use crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS;
 use crate::scheduler::CANCEL_SUPERSEDED_QUERY;
 use crate::scheduler::{
     EnqueueOutcome, Lane, AUTHORIZE_JOB_LAUNCH_QUERY, COMPLETE_JOB_QUERY, CONSUME_CLAIM_QUERY,
-    HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY, READ_COMPLETION_DISPOSITION_QUERY,
-    VERIFY_JOB_LAUNCH_LIVE_QUERY,
+    CONSUME_PREPARATION_CLAIM_QUERY, HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY,
+    READ_COMPLETION_DISPOSITION_QUERY, VERIFY_JOB_LAUNCH_LIVE_QUERY,
 };
 
 // =================================================================================================
@@ -274,6 +274,24 @@ pub(crate) struct ClaimConsumeSpec<'a> {
     /// The other recognized receipt generation, accepted only by the already-terminal replay read.
     /// It is never written by the live-generation CAS.
     pub alternate_replay_receipt: Option<&'a str>,
+}
+
+/// Exact authority for the preparation-only `leased -> terminal` CAS.
+pub(crate) struct PreparationClaimConsumeSpec<'a> {
+    pub tenant_id: &'a str,
+    pub region: &'a str,
+    pub job_id: Uuid,
+    pub wf_run_id: Uuid,
+    pub ci_run_id: Uuid,
+    pub idem_token: &'a str,
+    pub lease_owner: &'a str,
+    pub lease_epoch: i64,
+    pub claim_nonce: Uuid,
+    pub stage: &'a str,
+    pub claim_started_at_epoch_secs: i64,
+    pub claim_expires_at_epoch_secs: i64,
+    pub reserve_handle: &'a str,
+    pub completion_receipt: &'a str,
 }
 
 // =================================================================================================
@@ -756,6 +774,74 @@ impl CiJobQueueStore {
         }
     }
 
+    /// Consume an exact still-leased parent attempt after checkout preparation terminated. Replay is
+    /// v4-only: there was no historical preparation writer whose legacy receipt is authoritative.
+    pub(crate) async fn consume_preparation_claim_on_conn(
+        conn: &mut sqlx::PgConnection,
+        spec: PreparationClaimConsumeSpec<'_>,
+    ) -> Result<ClaimConsumeOutcome, PgError> {
+        let consumed = sqlx::query(CONSUME_PREPARATION_CLAIM_QUERY)
+            .bind(spec.tenant_id)
+            .bind(spec.region)
+            .bind(spec.job_id)
+            .bind(spec.wf_run_id)
+            .bind(spec.idem_token)
+            .bind(spec.lease_owner)
+            .bind(spec.lease_epoch)
+            .bind(spec.claim_nonce)
+            .bind(spec.stage)
+            .bind(spec.claim_started_at_epoch_secs)
+            .bind(spec.claim_expires_at_epoch_secs)
+            .bind(spec.ci_run_id)
+            .bind(spec.reserve_handle)
+            .bind(spec.completion_receipt)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+        if consumed.is_some() {
+            return Ok(ClaimConsumeOutcome::Consumed);
+        }
+        let replay = sqlx::query_scalar::<_, i32>(
+            "SELECT 1
+             FROM job_queue q
+             WHERE q.tenant_id = $1 AND q.region = $2 AND q.job_id = $3::uuid
+               AND q.run_id = $4::uuid AND q.idem_token = $5 AND q.stage = $6
+               AND q.state = 'terminal' AND q.completion_receipt = $7
+               AND EXISTS (
+                 SELECT 1 FROM ci_job_parent_attempt p
+                 WHERE p.tenant_id = q.tenant_id AND p.region = q.region
+                   AND p.job_id = q.job_id AND p.wf_run_id = q.run_id
+                   AND p.ci_run_id = $8::uuid AND p.reserve_handle = $9
+                   AND p.lease_owner = $10 AND p.lease_epoch = $11
+                   AND p.claim_nonce = $12::uuid
+                   AND p.claim_started_at_epoch_secs = $13
+                   AND p.claim_expires_at_epoch_secs = $14
+               )",
+        )
+        .bind(spec.tenant_id)
+        .bind(spec.region)
+        .bind(spec.job_id)
+        .bind(spec.wf_run_id)
+        .bind(spec.idem_token)
+        .bind(spec.stage)
+        .bind(spec.completion_receipt)
+        .bind(spec.ci_run_id)
+        .bind(spec.reserve_handle)
+        .bind(spec.lease_owner)
+        .bind(spec.lease_epoch)
+        .bind(spec.claim_nonce)
+        .bind(spec.claim_started_at_epoch_secs)
+        .bind(spec.claim_expires_at_epoch_secs)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        Ok(if replay.is_some() {
+            ClaimConsumeOutcome::AlreadyConsumed
+        } else {
+            ClaimConsumeOutcome::Refused
+        })
+    }
+
     /// **Heartbeat — a live runner extends its lease ([`HEARTBEAT_QUERY`]).** Tenant-scoped. Only the
     /// lease OWNER (while `leased` or `running`) can extend, so a heart-beating runner is NOT reaped (only a DEAD
     /// runner's expired lease is swept). Returns `true` iff the lease was extended.
@@ -1066,7 +1152,8 @@ mod tests {
     use super::*;
     use crate::scheduler::{
         AUTHORIZE_JOB_LAUNCH_QUERY, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, COMPLETE_JOB_QUERY,
-        CONSUME_CLAIM_QUERY, HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
+        CONSUME_CLAIM_QUERY, CONSUME_PREPARATION_CLAIM_QUERY, HEARTBEAT_QUERY,
+        INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
     };
 
     /// **The store's SQL constants are well-formed against the real DDL (bind arity + column names).**
@@ -1119,6 +1206,28 @@ mod tests {
         assert!(CONSUME_CLAIM_QUERY.contains("stage = $7"));
         assert!(CONSUME_CLAIM_QUERY.contains("state = 'running'"));
         assert!(!CONSUME_CLAIM_QUERY.contains("state IN ('leased','running')"));
+        for predicate in [
+            "q.state = 'leased'",
+            "q.region = $2",
+            "q.run_id = $4::uuid",
+            "q.idem_token = $5",
+            "q.lease_owner = $6",
+            "q.lease_epoch = $7",
+            "q.claim_nonce = $8::uuid",
+            "q.stage = $9",
+            "q.claim_expires_at > statement_timestamp()",
+            "FROM ci_job_parent_attempt AS parent",
+            "parent.ci_run_id = $12::uuid",
+            "parent.reserve_handle = $13",
+            "surface.state IN ('queued', 'leased')",
+        ] {
+            assert!(
+                CONSUME_PREPARATION_CLAIM_QUERY.contains(predicate),
+                "missing preparation authority predicate `{predicate}`"
+            );
+        }
+        assert!(!CONSUME_PREPARATION_CLAIM_QUERY.contains("q.state = 'running'"));
+        assert!(!CONSUME_PREPARATION_CLAIM_QUERY.contains("q.state IN"));
         // Final launch is a one-shot exact-generation CAS, including original claim times.
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("$10"));
         assert!(!AUTHORIZE_JOB_LAUNCH_QUERY.contains("$11"));

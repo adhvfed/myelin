@@ -801,3 +801,61 @@ fn terminal_usage_aggregation_refuses_u64_overflow_and_bigint_overflow() {
         Err(CiUsageAggregationError::DurableRange),
     );
 }
+
+#[test]
+fn preparation_completion_receipts_are_disposition_bound_and_externally_pinned() {
+    let tenant = TenantId("receipt-tenant".into());
+    let input = PreparationCompletionReceiptInput {
+        tenant: &tenant,
+        region: "fr-par",
+        wf_run_id: "11111111-1111-4111-8111-111111111111",
+        ci_run_id: "22222222-2222-4222-8222-222222222222",
+        job_id: "33333333-3333-4333-8333-333333333333",
+        idem_token: "receipt-idem",
+        stage: "build",
+        reserve_handle: "ci-reserve:v2:fixed",
+        usage: ResourceUsage {
+            cpu_seconds: 17,
+            mem_byte_seconds: 23,
+        },
+        lease_owner: "runner-fixed",
+        lease_epoch: 7,
+        claim_nonce: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        claim_started_at_epoch_secs: 1_785_000_000,
+        claim_expires_at_epoch_secs: 1_785_000_300,
+    };
+    let transport = preparation_completion_receipts(
+        input,
+        PreparationTerminalDisposition::Failed {
+            phase: myelin_ci_sandbox::PreparationPhase::CheckoutTransport,
+        },
+    );
+    let materialization = preparation_completion_receipts(
+        input,
+        PreparationTerminalDisposition::Failed {
+            phase: myelin_ci_sandbox::PreparationPhase::CheckoutMaterialization,
+        },
+    );
+    let timed_out = preparation_completion_receipts(
+        input,
+        PreparationTerminalDisposition::TimedOut {
+            phase: myelin_ci_sandbox::PreparationPhase::CheckoutTransport,
+        },
+    );
+    let exhausted =
+        preparation_completion_receipts(input, PreparationTerminalDisposition::AttemptsExhausted);
+    assert_eq!(transport.legacy_v3, materialization.legacy_v3);
+    assert_eq!(transport.legacy_v3, timed_out.legacy_v3);
+    assert_eq!(transport.legacy_v3, exhausted.legacy_v3);
+    assert_ne!(transport.current_v4, materialization.current_v4);
+    assert_ne!(transport.current_v4, timed_out.current_v4);
+    assert_ne!(transport.current_v4, exhausted.current_v4);
+    assert_eq!(
+        transport.legacy_v3, "v3:3c960f83b2b4ce366ee2cd2c939f91b1c33b12ee581a519aa4f841de32ac85ad",
+        "the preparation v3 compatibility digest is externally pinned"
+    );
+    assert_eq!(
+        transport.current_v4, "v4:78b417e2c0371548954f7f0a9b79acebe4143f18a036cea3827394ebd2393295",
+        "the preparation disposition-bound receipt is externally pinned"
+    );
+}
