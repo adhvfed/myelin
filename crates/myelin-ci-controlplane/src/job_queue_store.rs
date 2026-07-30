@@ -594,6 +594,50 @@ impl CiJobQueueStore {
         &self,
         claim: &CiJobLaunchClaim,
     ) -> Result<Option<RetainedCiJobLaunch>, JobQueueStoreError> {
+        self.authorize_launch_retained_inner(claim, None).await
+    }
+
+    /// **CT-007 phase-credential generations: the immediate V2 launch CAS.** The V2 analogue of
+    /// [`Self::authorize_launch`] — same commit-and-release shape, but through
+    /// [`AUTHORIZE_JOB_LAUNCH_V2_QUERY`], so the current `workload` generation predicate is part of
+    /// the same transaction as the `leased -> running` transition.
+    pub async fn authorize_launch_v2(
+        &self,
+        claim: &CiJobLaunchClaim,
+        generation: &crate::ci_credential_generation::CiPhaseGenerationGate,
+    ) -> Result<bool, JobQueueStoreError> {
+        let Some(mut launch) = self.authorize_launch_v2_retained(claim, generation).await? else {
+            return Ok(false);
+        };
+        launch.validate().await?;
+        launch.release().await?;
+        Ok(true)
+    }
+
+    /// **CT-007 phase-credential generations: the V2 workload launch fence.** Identical ownership
+    /// choreography to [`Self::authorize_launch_retained`], but executes
+    /// [`AUTHORIZE_JOB_LAUNCH_V2_QUERY`] so the current `workload` generation predicate is folded
+    /// into the SAME transaction and row lock as the `leased -> running` CAS. The legacy query and
+    /// its call path are untouched.
+    pub(crate) async fn authorize_launch_v2_retained(
+        &self,
+        claim: &CiJobLaunchClaim,
+        generation: &crate::ci_credential_generation::CiPhaseGenerationGate,
+    ) -> Result<Option<RetainedCiJobLaunch>, JobQueueStoreError> {
+        if generation.purpose != crate::ci_credential_generation::CiCredentialPurpose::Workload {
+            return Err(JobQueueStoreError::Db(
+                "the V2 launch fence accepts only a workload credential generation".into(),
+            ));
+        }
+        self.authorize_launch_retained_inner(claim, Some(generation))
+            .await
+    }
+
+    async fn authorize_launch_retained_inner(
+        &self,
+        claim: &CiJobLaunchClaim,
+        generation: Option<&crate::ci_credential_generation::CiPhaseGenerationGate>,
+    ) -> Result<Option<RetainedCiJobLaunch>, JobQueueStoreError> {
         let job_id = parse_id("job_id", &claim.job_id)?;
         let wf_run_id = parse_id("run_id", &claim.wf_run_id)?;
         let claim_nonce = parse_id("claim_nonce", &claim.claim_nonce)?;
@@ -636,7 +680,13 @@ impl CiJobQueueStore {
         .execute(&mut *transaction)
         .await
         .map_err(|error| JobQueueStoreError::Db(format!("scope retained launch fence: {error}")))?;
-        let row = sqlx::query(AUTHORIZE_JOB_LAUNCH_QUERY)
+        // The V2 query is the legacy CAS plus the current-generation predicate; both bind the
+        // tenant as `$1` in the same position, so the tenant predicate is threaded identically.
+        let launch_query = match generation {
+            None => AUTHORIZE_JOB_LAUNCH_QUERY,
+            Some(_) => crate::scheduler::AUTHORIZE_JOB_LAUNCH_V2_QUERY,
+        };
+        let mut query = sqlx::query(launch_query)
             .bind(&claim.tenant_id)
             .bind(&claim.region)
             .bind(job_id)
@@ -646,7 +696,20 @@ impl CiJobQueueStore {
             .bind(claim_nonce)
             .bind(claim.claim_started_at_epoch_secs)
             .bind(claim.claim_expires_at_epoch_secs)
-            .bind(CI_RUNNER_EXECUTION_LEASE_TTL_SECS)
+            .bind(CI_RUNNER_EXECUTION_LEASE_TTL_SECS);
+        if let Some(generation) = generation {
+            let ci_run_id = parse_id("ci_run_id", &generation.ci_run_id)?;
+            query = query
+                .bind(generation.binding_version)
+                .bind(generation.generation_id.clone())
+                .bind(generation.jti.clone())
+                .bind(generation.issued_at_epoch_secs)
+                .bind(generation.expires_at_epoch_secs)
+                .bind(ci_run_id)
+                .bind(generation.token_authority_handle.clone())
+                .bind(generation.idem_token.clone());
+        }
+        let row = query
             .fetch_optional(&mut *transaction)
             .await
             .map_err(|error| JobQueueStoreError::Db(format!("authorize launch fence: {error}")))?;

@@ -284,6 +284,123 @@ WHERE surface.tenant_id = launched.tenant_id
   AND surface.state IN ('queued', 'leased')
 RETURNING surface.job_id";
 
+/// **CT-007 phase-credential generations: the V2 workload launch CAS.** Structurally the SAME
+/// `leased -> running` transition as [`AUTHORIZE_JOB_LAUNCH_QUERY`] — which stays BYTE-UNCHANGED, is
+/// what production still executes, and is pinned byte-for-byte by its own test — with the current
+/// `workload` credential-generation predicate folded into the same statement, and therefore the same
+/// transaction and the same row lock as the CAS itself. Folding rather than pre-checking is the
+/// point: a separate `SELECT` would leave a window in which a successor generation could be appended
+/// between the check and the CAS.
+///
+/// The added predicates: the EXECUTION lease is still live, the exact `workload` generation row
+/// exists with exactly the presented binding facts, no generation with a greater ordinal exists
+/// (structurally impossible for ordinal 4, asserted anyway so a future fifth purpose cannot silently
+/// make a stale workload credential current), the generation itself has not expired, the exact
+/// durable parent attempt exists, and NO prelaunch phase row for this claim is in a non-`measured`
+/// state (which is vacuously true for a compute job with no phase rows, and requires both phases
+/// measured for a checkout-bearing one).
+///
+/// **Why the lease predicate is V2-only and load-bearing (round-1 blocker 3).** Minting and every
+/// preparation gate already require `lease_expires > statement_timestamp()`; without the same
+/// requirement here, a workload credential minted moments before lease expiry could be presented
+/// AFTER expiry but before the reaper wins the row-lock race, transitioning a stale owner to
+/// `running` and installing a fresh lease — resurrecting ownership the reaper was about to reclaim.
+/// The LEGACY query cannot take this predicate (it is byte-frozen, and its V1 callers legitimately
+/// launch under the flat claim contract), which is exactly why the two queries are separate.
+///
+/// Bind: `$1..$10` exactly as the legacy query, then `$11 binding version`, `$12 generation id`,
+/// `$13 jti`, `$14 issued at`, `$15 expires at`, `$16 CI run`, `$17 authority handle`,
+/// `$18 idem token`.
+pub const AUTHORIZE_JOB_LAUNCH_V2_QUERY: &str = "\
+WITH launched AS (
+UPDATE job_queue
+SET state = 'running',
+    lease_expires = LEAST(
+      claim_expires_at,
+      statement_timestamp() + ($10 || ' seconds')::interval
+    )
+WHERE tenant_id = $1
+  AND region = $2
+  AND job_id = $3::uuid
+  AND run_id = $4::uuid
+  AND state = 'leased'
+  AND lease_owner = $5
+  AND lease_epoch = $6
+  AND claim_nonce = $7::uuid
+  AND EXTRACT(EPOCH FROM claim_started_at)::bigint = $8
+  AND EXTRACT(EPOCH FROM claim_expires_at)::bigint = $9
+  AND claim_expires_at > statement_timestamp()
+  AND lease_expires > statement_timestamp()
+  AND completion_receipt IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM ci_job_credential_generation AS generation
+    WHERE generation.tenant_id = job_queue.tenant_id
+      AND generation.region = job_queue.region
+      AND generation.job_id = job_queue.job_id
+      AND generation.lease_epoch = job_queue.lease_epoch
+      AND generation.claim_nonce = job_queue.claim_nonce
+      AND generation.purpose = 'workload'
+      AND generation.binding_version = $11
+      AND generation.generation_id = $12
+      AND generation.jti = $13
+      AND generation.issued_at_epoch_secs = $14
+      AND generation.expires_at_epoch_secs = $15
+      AND generation.wf_run_id = job_queue.run_id
+      AND generation.ci_run_id = $16::uuid
+      AND generation.token_authority_handle = $17
+      AND generation.idem_token = $18
+      AND generation.lease_owner = job_queue.lease_owner
+      AND generation.claim_started_at_epoch_secs = $8
+      AND generation.claim_expires_at_epoch_secs = $9
+      AND generation.expires_at_epoch_secs >
+          FLOOR(EXTRACT(EPOCH FROM statement_timestamp()))::bigint
+      AND NOT EXISTS (
+        SELECT 1
+        FROM ci_job_credential_generation AS successor
+        WHERE successor.tenant_id = generation.tenant_id
+          AND successor.region = generation.region
+          AND successor.job_id = generation.job_id
+          AND successor.lease_epoch = generation.lease_epoch
+          AND successor.claim_nonce = generation.claim_nonce
+          AND successor.phase_ordinal > generation.phase_ordinal
+      )
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM ci_job_parent_attempt AS parent
+    WHERE parent.tenant_id = job_queue.tenant_id
+      AND parent.region = job_queue.region
+      AND parent.job_id = job_queue.job_id
+      AND parent.wf_run_id = job_queue.run_id
+      AND parent.ci_run_id = $16::uuid
+      AND parent.lease_owner = job_queue.lease_owner
+      AND parent.lease_epoch = job_queue.lease_epoch
+      AND parent.claim_nonce = job_queue.claim_nonce
+      AND parent.claim_started_at_epoch_secs = $8
+      AND parent.claim_expires_at_epoch_secs = $9
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM ci_job_prelaunch_usage AS unresolved
+    WHERE unresolved.tenant_id = job_queue.tenant_id
+      AND unresolved.region = job_queue.region
+      AND unresolved.job_id = job_queue.job_id
+      AND unresolved.lease_epoch = job_queue.lease_epoch
+      AND unresolved.claim_nonce = job_queue.claim_nonce
+      AND unresolved.status <> 'measured'
+  )
+RETURNING tenant_id, region, job_id
+)
+UPDATE ci_job AS surface
+SET state = 'running'
+FROM launched
+WHERE surface.tenant_id = launched.tenant_id
+  AND surface.region = launched.region
+  AND surface.job_id = launched.job_id
+  AND surface.state IN ('queued', 'leased')
+RETURNING surface.job_id";
+
 /// **CT-007 slice 5b.3-2c: the read-only sibling of [`AUTHORIZE_JOB_LAUNCH_QUERY`].** Same exact
 /// generation predicate (every bound parameter, in the same order), including the SAME `ci_job`
 /// surface-state gate the real CAS's second `UPDATE` enforces (Sol's review: the `job_queue`-only
@@ -1561,5 +1678,91 @@ RETURNING surface.job_id";
         );
         // The owner-only heartbeat is deliberately NOT the renewal path and stays unchanged.
         assert!(HEARTBEAT_QUERY.contains("state IN ('leased', 'running')"));
+    }
+
+    /// **CT-007 phase-credential generations: the V2 launch CAS is the legacy CAS PLUS the current
+    /// workload-generation predicate, in the SAME statement.** A separate pre-`SELECT` would leave a
+    /// window in which a successor generation could be appended between check and CAS, so the
+    /// predicate must live inside the `UPDATE`'s own `WHERE`.
+    #[test]
+    fn the_v2_launch_cas_folds_the_current_workload_generation_into_the_same_statement() {
+        // Everything the legacy CAS admits, unchanged.
+        for predicate in [
+            "SET state = 'running'",
+            "WHERE tenant_id = $1",
+            "AND region = $2",
+            "AND job_id = $3::uuid",
+            "AND run_id = $4::uuid",
+            "AND state = 'leased'",
+            "AND lease_owner = $5",
+            "AND lease_epoch = $6",
+            "AND claim_nonce = $7::uuid",
+            "AND EXTRACT(EPOCH FROM claim_started_at)::bigint = $8",
+            "AND EXTRACT(EPOCH FROM claim_expires_at)::bigint = $9",
+            "AND claim_expires_at > statement_timestamp()",
+            "AND completion_receipt IS NULL",
+            "UPDATE ci_job AS surface",
+            "AND surface.state IN ('queued', 'leased')",
+        ] {
+            assert!(
+                AUTHORIZE_JOB_LAUNCH_V2_QUERY.contains(predicate),
+                "the V2 launch CAS must still bind `{predicate}`"
+            );
+        }
+        // Round-1 blocker 3: the V2 CAS may never resurrect an expired execution lease, and the
+        // byte-frozen legacy CAS may never acquire this predicate by accident.
+        assert!(
+            AUTHORIZE_JOB_LAUNCH_V2_QUERY.contains("AND lease_expires > statement_timestamp()"),
+            "the V2 launch CAS requires a LIVE execution lease, like every other V2 boundary"
+        );
+        assert!(
+            !AUTHORIZE_JOB_LAUNCH_QUERY.contains("lease_expires > statement_timestamp()"),
+            "the legacy launch CAS stays byte-frozen; the lease predicate is V2-only"
+        );
+        // Plus the generation predicate, inside the same UPDATE.
+        for predicate in [
+            "FROM ci_job_credential_generation AS generation",
+            "generation.purpose = 'workload'",
+            "generation.binding_version = $11",
+            "generation.generation_id = $12",
+            "generation.jti = $13",
+            "generation.issued_at_epoch_secs = $14",
+            "generation.expires_at_epoch_secs = $15",
+            "generation.ci_run_id = $16::uuid",
+            "generation.token_authority_handle = $17",
+            "generation.idem_token = $18",
+            "generation.claim_started_at_epoch_secs = $8",
+            "generation.claim_expires_at_epoch_secs = $9",
+            "successor.phase_ordinal > generation.phase_ordinal",
+            "FROM ci_job_parent_attempt AS parent",
+            "unresolved.status <> 'measured'",
+        ] {
+            assert!(
+                AUTHORIZE_JOB_LAUNCH_V2_QUERY.contains(predicate),
+                "the V2 launch CAS must bind `{predicate}`"
+            );
+        }
+        let generation_predicate_position = AUTHORIZE_JOB_LAUNCH_V2_QUERY
+            .find("FROM ci_job_credential_generation AS generation")
+            .expect("the generation predicate exists");
+        let cte_close = AUTHORIZE_JOB_LAUNCH_V2_QUERY
+            .find("RETURNING tenant_id, region, job_id")
+            .expect("the launching CTE closes");
+        assert!(
+            generation_predicate_position < cte_close,
+            "the generation predicate must live INSIDE the launching UPDATE, not after it"
+        );
+        // A V2 generation predicate must never leak into the legacy query.
+        assert!(
+            !AUTHORIZE_JOB_LAUNCH_QUERY.contains("ci_job_credential_generation"),
+            "the production launch CAS stays byte-unchanged: production is still V1-pinned"
+        );
+        assert!(
+            !VERIFY_JOB_LAUNCH_LIVE_QUERY.contains("ci_job_credential_generation")
+                && !RENEW_PREPARATION_LEASE_QUERY.contains("ci_job_credential_generation")
+                && !CONSUME_CLAIM_QUERY.contains("ci_job_credential_generation")
+                && !CONSUME_PREPARATION_CLAIM_QUERY.contains("ci_job_credential_generation"),
+            "no previously shipped query gains a credential-generation dependency in this slice"
+        );
     }
 }

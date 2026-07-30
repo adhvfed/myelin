@@ -115,6 +115,13 @@ pub const CI_JOB_PARENT_ATTEMPT_TABLE: &str = "ci_job_parent_attempt";
 /// checkout-bearing parent attempt runs before its workload. A compute attempt has no child rows at
 /// all here — it is fully accounted for by its `ci_job_parent_attempt` row alone.
 pub const CI_JOB_PRELAUNCH_USAGE_TABLE: &str = "ci_job_prelaunch_usage";
+/// CT-007 phase-credential generations — the append-only credential-generation log. AT MOST ONE
+/// immutable row per exact claim and purpose (`checkout_advertise`, `checkout_fetch`,
+/// `checkout_materialization`, `workload`), so a claim is structurally bounded to four credentials.
+/// There is deliberately NO status column: a generation is CURRENT iff no row with a greater
+/// `phase_ordinal` exists for that exact claim, which makes appending the successor the (atomic)
+/// revocation of its predecessor at every durable execution gate.
+pub const CI_JOB_CREDENTIAL_GENERATION_TABLE: &str = "ci_job_credential_generation";
 /// CT-004d.1 — the durable `JobSpec` store table. One row per DISPATCHED stage job: the
 /// digest-pinned [`myelin_ci_sandbox::JobSpec`] (image/command/egress/limits/trust/workspace/run-token/
 /// meter/idem) the runner resolves + EXECUTES, keyed by the `(tenant_id, job_id)` the leased
@@ -284,6 +291,11 @@ pub const CI_PIPELINE_VERSION_BACKLOG_PROBE_MIGRATION_ID: &str =
 /// the predecessor must never be read as "nothing to fence".
 pub const CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
     "ci_0020i_ci_pipeline_cutover_fence_row";
+/// CT-007 phase-credential generations — the new append-only credential-generation table/RLS
+/// migration. Purely additive: no existing migration text changes, and the scheduler role receives
+/// NO privilege on it at all (neither reaping nor renewal needs it), so the startup
+/// excess-privilege probe treats ANY privilege here as excess.
+pub const CI_JOB_CREDENTIAL_GENERATION_MIGRATION_ID: &str = "ci_0021_ci_job_credential_generation";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -893,6 +905,77 @@ CREATE TRIGGER ci_job_prelaunch_usage_guard_transition
 BEFORE UPDATE ON ci_job_prelaunch_usage
 FOR EACH ROW EXECUTE FUNCTION myelin_guard_ci_job_prelaunch_usage_transition()";
 
+/// `ci_job_credential_generation` (CT-007 phase-credential generations) — one IMMUTABLE row per
+/// exact claim and credential purpose.
+///
+/// **Why there is no status column.** The current generation is defined structurally: the row with
+/// the greatest `phase_ordinal` for that exact claim. Appending `checkout_fetch` therefore makes
+/// `checkout_advertise` non-current at every execution gate in the same commit that created the
+/// successor — an atomic supersession no separate revocation write could give us across two durable
+/// systems.
+///
+/// **Why there is no FK to `ci_job_parent_attempt`.** The production resolver mints the first
+/// (advertise) credential while resolving the freshly leased row, BEFORE `begin_parent_attempt` can
+/// run, so the first row must be persistable before the accounting parent exists. The execution gate
+/// still requires the exact parent and a `started` journal phase, so such a credential is unusable
+/// until admission completes; the FK to `ci_run` is retained.
+///
+/// **Bounded cardinality.** `purpose` is part of the primary key and constrained to four values, so
+/// one claim can never hold more than four credential generations, and a same-purpose "rotation" is
+/// structurally impossible rather than merely refused in Rust.
+pub const CREATE_CI_JOB_CREDENTIAL_GENERATION_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS ci_job_credential_generation (
+  tenant_id                    text NOT NULL,
+  region                       text NOT NULL,
+  job_id                       uuid NOT NULL,
+  wf_run_id                    uuid NOT NULL,
+  ci_run_id                    uuid NOT NULL,
+  token_authority_handle       text NOT NULL,
+  idem_token                   text NOT NULL,
+  lease_owner                  text NOT NULL,
+  lease_epoch                  bigint NOT NULL CHECK (lease_epoch > 0),
+  claim_nonce                  uuid NOT NULL,
+  claim_started_at_epoch_secs  bigint NOT NULL CHECK (claim_started_at_epoch_secs > 0),
+  claim_expires_at_epoch_secs  bigint NOT NULL
+    CHECK (claim_expires_at_epoch_secs > claim_started_at_epoch_secs),
+  binding_version              smallint NOT NULL CHECK (binding_version = 1),
+  purpose                      text NOT NULL CHECK (purpose IN ('checkout_advertise','checkout_fetch','checkout_materialization','workload')),
+  phase_ordinal                smallint NOT NULL CHECK (phase_ordinal BETWEEN 1 AND 4),
+  issued_at_epoch_secs         bigint NOT NULL CHECK (issued_at_epoch_secs > 0),
+  expires_at_epoch_secs        bigint NOT NULL,
+  generation_id                text NOT NULL,
+  jti                          text NOT NULL,
+  minted_at                    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, region, job_id, lease_epoch, claim_nonce, purpose),
+  UNIQUE (tenant_id, region, generation_id),
+  UNIQUE (tenant_id, region, jti),
+  CHECK (
+    CASE purpose
+      WHEN 'checkout_advertise' THEN phase_ordinal = 1
+      WHEN 'checkout_fetch' THEN phase_ordinal = 2
+      WHEN 'checkout_materialization' THEN phase_ordinal = 3
+      WHEN 'workload' THEN phase_ordinal = 4
+      ELSE false
+    END
+  ),
+  CHECK (expires_at_epoch_secs > issued_at_epoch_secs),
+  CHECK (expires_at_epoch_secs <= claim_expires_at_epoch_secs),
+  CHECK (issued_at_epoch_secs >= claim_started_at_epoch_secs),
+  FOREIGN KEY (tenant_id, ci_run_id) REFERENCES ci_run(tenant_id, run_id)
+);
+REVOKE UPDATE, DELETE ON ci_job_credential_generation FROM myelin_app;
+CREATE OR REPLACE FUNCTION myelin_reject_ci_job_credential_generation_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+BEGIN
+  RAISE EXCEPTION 'ci_job_credential_generation is immutable';
+END
+$myelin$;
+CREATE TRIGGER ci_job_credential_generation_reject_mutation
+BEFORE UPDATE OR DELETE ON ci_job_credential_generation
+FOR EACH ROW EXECUTE FUNCTION myelin_reject_ci_job_credential_generation_mutation()";
+
 /// Non-blocking partial index for the reaper (CT-007 slice 5b.3-4b) to find unresolved `started`
 /// phase rows without a full table scan, mirroring the `jq_claimable`/`ci_run_active_workflow`
 /// partial-index convention.
@@ -1494,6 +1577,11 @@ fn create_statements() -> Vec<(&'static str, &'static str, String)> {
             CI_JOB_PRELAUNCH_USAGE_TABLE,
             CREATE_CI_JOB_PRELAUNCH_USAGE_DDL.to_string(),
         ),
+        (
+            CI_JOB_CREDENTIAL_GENERATION_MIGRATION_ID,
+            CI_JOB_CREDENTIAL_GENERATION_TABLE,
+            CREATE_CI_JOB_CREDENTIAL_GENERATION_DDL.to_string(),
+        ),
     ]
 }
 
@@ -1977,6 +2065,7 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
         CI_RUN_CHECK_ATTEMPT_TABLE,
         CI_JOB_PARENT_ATTEMPT_TABLE,
         CI_JOB_PRELAUNCH_USAGE_TABLE,
+        CI_JOB_CREDENTIAL_GENERATION_TABLE,
     ])
 }
 
@@ -1984,10 +2073,11 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
 mod tests {
     use super::*;
 
-    /// **All twenty CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
+    /// **All twenty-one CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
     /// The complete arch 01 §3 control-plane schema (+ CT-004d.1's `ci_job_spec` + CT-007 slice
-    /// 5b.3-4a.2's prelaunch-usage journal pair) lands here; `ci_run` precedes `ci_job` (the FK
-    /// dependency). This is the prompt's "the complete forward-only data-model migrations" gate.
+    /// 5b.3-4a.2's prelaunch-usage journal pair + CT-007's phase-credential generation log) lands
+    /// here; `ci_run` precedes `ci_job` (the FK dependency). This is the prompt's "the complete
+    /// forward-only data-model migrations" gate.
     #[test]
     fn all_twenty_controlplane_tables_are_present_fk_ordered() {
         let migrations = ci_controlplane_migrations();
@@ -2020,8 +2110,9 @@ mod tests {
                 CI_JOB_ACCOUNTING_TABLE,
                 CI_JOB_PARENT_ATTEMPT_TABLE,
                 CI_JOB_PRELAUNCH_USAGE_TABLE,
+                CI_JOB_CREDENTIAL_GENERATION_TABLE,
             ],
-            "all 20 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
+            "all 21 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
         );
         // ci_run precedes ci_job (the FK target before the FK source).
         let run_pos = tables.iter().position(|t| *t == CI_RUN_TABLE).unwrap();
@@ -2172,6 +2263,65 @@ mod tests {
                 && !ddl.contains("exact_mem_byte_seconds <= ceiling_mem_byte_seconds"),
             "an honest over-ceiling measurement must never be rejected by a database constraint"
         );
+    }
+
+    /// CT-007 phase-credential generations: the credential log is append-only, purpose-unique,
+    /// purpose-to-ordinal checked, structurally bounded to four rows per claim, has NO status column
+    /// (current = highest ordinal), and carries NO foreign key to `ci_job_parent_attempt` (the
+    /// production resolver mints advertise BEFORE admission can create the parent).
+    #[test]
+    fn credential_generation_is_purpose_unique_append_only_and_status_free() {
+        let ddl = CREATE_CI_JOB_CREDENTIAL_GENERATION_DDL;
+        for required in [
+            "PRIMARY KEY (tenant_id, region, job_id, lease_epoch, claim_nonce, purpose)",
+            "UNIQUE (tenant_id, region, generation_id)",
+            "UNIQUE (tenant_id, region, jti)",
+            "purpose                      text NOT NULL CHECK (purpose IN ('checkout_advertise','checkout_fetch','checkout_materialization','workload'))",
+            "WHEN 'checkout_advertise' THEN phase_ordinal = 1",
+            "WHEN 'checkout_fetch' THEN phase_ordinal = 2",
+            "WHEN 'checkout_materialization' THEN phase_ordinal = 3",
+            "WHEN 'workload' THEN phase_ordinal = 4",
+            "CHECK (expires_at_epoch_secs > issued_at_epoch_secs)",
+            "CHECK (expires_at_epoch_secs <= claim_expires_at_epoch_secs)",
+            "CHECK (issued_at_epoch_secs >= claim_started_at_epoch_secs)",
+            "binding_version              smallint NOT NULL CHECK (binding_version = 1)",
+            "REFERENCES ci_run(tenant_id, run_id)",
+            "REVOKE UPDATE, DELETE ON ci_job_credential_generation FROM myelin_app",
+            "BEFORE UPDATE OR DELETE ON ci_job_credential_generation",
+            "RAISE EXCEPTION 'ci_job_credential_generation is immutable'",
+        ] {
+            assert!(
+                ddl.contains(required),
+                "credential-generation DDL pins `{required}`"
+            );
+        }
+        assert!(
+            !ddl.contains("status"),
+            "there is deliberately NO status column: current = the highest phase_ordinal"
+        );
+        assert!(
+            !ddl.contains("REFERENCES ci_job_parent_attempt"),
+            "advertise is minted in the resolver, BEFORE begin_parent_attempt can create the parent"
+        );
+        assert!(
+            !ddl.contains("bearer") && !ddl.contains("token_material"),
+            "the credential log stores the expected JTI and generation id, never bearer material"
+        );
+    }
+
+    /// The credential-generation table must never receive a scheduler grant: neither reaping nor
+    /// renewal reads it, and the startup probe treats ANY privilege on it as excess.
+    #[test]
+    fn credential_generation_carries_no_scheduler_grant_migration() {
+        for migration in &ci_controlplane_migrations().0 {
+            if migration.ddl.contains("myelin_ci_region_scheduler") {
+                assert!(
+                    !migration.ddl.contains("ci_job_credential_generation"),
+                    "migration {} grants the scheduler role access to the credential log",
+                    migration.id
+                );
+            }
+        }
     }
 
     #[test]
@@ -2397,8 +2547,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            57,
-            "20 table/RLS + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate) + 1 ci_job_spec-stage ALTER + 3 ci_job_accounting ALTERs + 1 scheduler-boundary + 3 scheduler claim grants + 4 scheduler ci_run/workflow discovery grants (incl. wf_version) + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand"
+            58,
+            "21 table/RLS (incl. the CT-007 credential-generation log) + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate) + 1 ci_job_spec-stage ALTER + 3 ci_job_accounting ALTERs + 1 scheduler-boundary + 3 scheduler claim grants + 4 scheduler ci_run/workflow discovery grants (incl. wf_version) + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand"
         );
         for m in &migrations.0 {
             assert!(
@@ -2521,8 +2671,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            57,
-            "the runner applied all 20 table/RLS, 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate), 1 ci_job_spec-stage ALTER, 3 ci_job_accounting ALTERs, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, and 1 prelaunch deadline expand"
+            58,
+            "the runner applied all 21 table/RLS (incl. the CT-007 credential-generation log), 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate), 1 ci_job_spec-stage ALTER, 3 ci_job_accounting ALTERs, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, and 1 prelaunch deadline expand"
         );
         assert_eq!(
             runner.applied()[0],
@@ -2818,6 +2968,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             CI_RUN_CHECK_ATTEMPT_TABLE,
             CI_JOB_PARENT_ATTEMPT_TABLE,
             CI_JOB_PRELAUNCH_USAGE_TABLE,
+            CI_JOB_CREDENTIAL_GENERATION_TABLE,
         ] {
             assert!(hot.is_hot(t), "`{t}` is declared hot (arch 01 §3)");
         }

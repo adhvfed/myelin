@@ -450,6 +450,50 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         "the scheduler never gets write access to the immutable parent-attempt journal",
     );
 
+    // **CT-007 phase-credential generations: the scheduler role holds NO privilege at all on the
+    // credential log.** Neither reaping nor renewal reads it, and it is the durable authority every
+    // phase execution gate consults — so unlike the two journal tables above, even SELECT is denied.
+    for statement in [
+        "SELECT count(*) FROM ci_job_credential_generation",
+        "SELECT generation_id FROM ci_job_credential_generation LIMIT 1",
+    ] {
+        assert_permission_denied(
+            sqlx::query(statement).execute(&scheduler).await,
+            "the scheduler role may not READ the credential log",
+        );
+    }
+    assert_permission_denied(
+        sqlx::query(
+            "INSERT INTO ci_job_credential_generation (\
+             tenant_id, region, job_id, wf_run_id, ci_run_id, token_authority_handle, idem_token, \
+             lease_owner, lease_epoch, claim_nonce, claim_started_at_epoch_secs, \
+             claim_expires_at_epoch_secs, binding_version, purpose, phase_ordinal, \
+             issued_at_epoch_secs, expires_at_epoch_secs, generation_id, jti) \
+             VALUES ($1, 'fr-par', $2::uuid, $3::uuid, $4::uuid, 'h', 'i', 'o', 1, $5::uuid, \
+             1, 2, 1, 'workload', 4, 1, 2, 'g', 'j')",
+        )
+        .bind(tenant)
+        .bind(job_a)
+        .bind(wf_run_id)
+        .bind(run_id)
+        .bind("90000000-0000-0000-0000-000000000001")
+        .execute(&scheduler)
+        .await,
+        "the scheduler role may not forge a credential generation",
+    );
+    assert_permission_denied(
+        sqlx::query("UPDATE ci_job_credential_generation SET jti = 'x'")
+            .execute(&scheduler)
+            .await,
+        "the scheduler role may not rewrite a credential generation",
+    );
+    assert_permission_denied(
+        sqlx::query("DELETE FROM ci_job_credential_generation")
+            .execute(&scheduler)
+            .await,
+        "the scheduler role may not delete a credential generation",
+    );
+
     // 5b.3-5a compatibility proof: after the additive disposition/v4 migration, an immutable
     // historical v3-only accounting row still inserts and replays byte-for-byte unchanged.
     let accounting = CiJobAccountingStore::with_pg(app.clone(), Region("fr-par".into()));
