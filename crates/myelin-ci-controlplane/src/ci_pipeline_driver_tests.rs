@@ -690,3 +690,40 @@ fn retryable_attempt_cause_storage_token_round_trips_and_rejects_unknown_tokens(
         "an unrecognized token must map to None, never silently coerce to an existing cause"
     );
 }
+
+#[test]
+fn terminal_usage_aggregation_refuses_u64_overflow_and_bigint_overflow() {
+    assert_eq!(
+        checked_add_accounting_usage(
+            ResourceUsage {
+                cpu_seconds: u64::MAX,
+                mem_byte_seconds: 0,
+            },
+            ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 0,
+            },
+        ),
+        Err(CiUsageAggregationError::Overflow),
+    );
+    assert_eq!(
+        checked_add_accounting_usage(
+            ResourceUsage {
+                cpu_seconds: i64::MAX as u64,
+                mem_byte_seconds: 0,
+            },
+            ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 0,
+            },
+        ),
+        Err(CiUsageAggregationError::DurableRange),
+    );
+    assert_eq!(
+        checked_accounting_usage(ResourceUsage {
+            cpu_seconds: 0,
+            mem_byte_seconds: i64::MAX as u64 + 1,
+        }),
+        Err(CiUsageAggregationError::DurableRange),
+    );
+}

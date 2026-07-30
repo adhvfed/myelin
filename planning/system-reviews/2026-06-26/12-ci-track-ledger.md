@@ -2915,3 +2915,78 @@ queued/leased cancellation, `reconcile_abandoned_job`, and existing-accounting r
 and prove one-shot settlement end to end; 4b is inert until both land), task #91 (credential
 binding), the `v1`→`v2` fleet-convergence flip, and the lease/topology prerequisite for 5b.3-6 noted
 above. 5b.3-5 and 5b.3-7 and the rest of ledger 12's open items are unchanged.
+
+---
+
+## 2026-07-30 — CT-007 slice 5b.3-4b.2: wired the settlement resolver into all five real terminal
+owners; 4b is no longer inert (Sol, implementation; Sonnet, independent review + two unrelated fixes)
+
+Sol wired `resolve_prelaunch_usage_on_conn` into every real settlement path per its own 4b.1 design:
+normal completion (`CiPipelineReporter`), cancellation-terminal retry (`report_retryable_attempt`),
+queued/leased cancellation (`PgCiRunSupersession`), abandoned/expired launched-work reconciliation,
+and existing-accounting replay verification. Confirmed a key finding before accepting it: checkout
+preparation is not yet composed into `launch_with` (that's 5b.3-6, still open), so `TerminalReport`
+today genuinely carries workload-only usage already — no call site needed the workload-only
+reporting-contract change flagged as an open issue in the 4b.1 entry, because none of the five
+currently reports checkout-hop usage. The contract is now documented in code comments at both real
+call sites (`ci_pipeline_driver.rs`) so it stays correct once 5b.3-6 lands.
+
+**Settlement math per owner** (matches 4b.1's design exactly): normal completion = prelaunch (all
+parent attempts) + prior retries + current workload, `Required + Refuse`. Cancellation-terminal retry
+= prelaunch + all recorded workload attempts, `Required + Refuse`. Queued/leased cancellation =
+prelaunch + prior retries, `OptionalBeforeLaunch + SealToCeiling` (a job cancelled before ever being
+claimed may have zero parent attempts and, for a job that was never enqueued at all, no `job_queue`
+row either — `resolve_prelaunch_usage_on_conn` was extended to tolerate a missing queue row only
+under `OptionalBeforeLaunch`, while still refusing if parent-attempt rows exist without a backing
+queue row, an internal-consistency check). Abandoned/expired launched work = prelaunch + prior
+retries + the existing immutable workload ceiling (never re-measured usage), `Required +
+SealToCeiling`. Existing-accounting replay = re-resolves the journal, verifies the previously-written
+receipt's usage against the recomputed floor (`>=` for normal-completion replay, exact match for
+superseded/cancelled replay), and settles nothing new — read/verify-only. A new
+`CiUsageAggregationError` (`Overflow`/`DurableRange`) is checked at every aggregation point before
+usage reaches pricing or the `bigint`-backed accounting tables, refusing typed rather than
+clamping/wrapping, proven by a direct unit test at both boundaries.
+
+**My independent review:** read the full diff (`ci_pipeline_driver.rs`, `ci_run_supersession.rs`,
+`ci_pipeline_driver_tests.rs`, the extended `integration_ci_terminal_accounting_atomic.rs`, the small
+`ci_prelaunch_usage_journal.rs` queue-existence relaxation). Traced the workload-only claim by
+grep — confirmed no production call site composes checkout preparation into `launch_with` yet.
+Confirmed the settlement math per owner against the design. Confirmed the overflow/bigint-range
+guard is real via its dedicated test.
+
+**While running the full crate test suite (not just the curated subset from 4a.2/4b.1) to verify,
+found and fixed two bugs — committed separately as `4dba5754` before this slice's commit:**
+1. `production_pg_bootstrap_source.rs`'s static source-inspection test failed on an unscoped
+   `str::find` matching an earlier doc comment instead of the real `ownership.release()` call site
+   in `launch_gate.rs` — confirmed pre-existing (reproduced against last HEAD with zero uncommitted
+   changes applied) and unrelated to any file in this session's diffs.
+2. The SAME test file's pinned call-site string for `authority_from_durable_claim` was stale: this
+   session's own earlier 4a.2 commit (`c61b4b55`) added a fourth argument (`&launch_template`) to
+   that real call, but I had not run this test file as part of that commit's verification, so the
+   regression passed uncaught through both the 4a.2 and 4b.1 commits. Root-caused and fixed; this is
+   a gap in my own verification process, not Sol's — the full crate test suite (all targets, not a
+   curated subset) is now what I run before every commit going forward on this track.
+3. (unrelated third bug, same investigation) `integration_pg_ci_pipeline_starter.rs`'s two tests each
+   run independent `PgMigrator` sequences against the same live Postgres; run concurrently (Rust's
+   default), they hit a genuine advisory-lock deadlock. Fixed with the same `MIGRATION_SCENARIO_LOCK`
+   serialization guard already used in `integration_ci_terminal_accounting_atomic.rs`. Also confirmed
+   pre-existing and unrelated to this session's changes.
+
+**Full gate, re-run after both fixes:** `cargo test -p myelin-ci-controlplane --lib` clean; the
+*entire* `--all-targets --features integration` matrix (every integration/unit test file in the
+crate, not a named subset) — all green, including the 7 terminal-accounting-atomic tests (one new
+test per owner, each proving prelaunch usage — a mix of a measured phase and a sealed-ceiling phase —
+lands in the final settlement exactly once) and the 2 pipeline-starter tests re-run three times to
+confirm the deadlock fix is stable, not merely quieter; `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean; `cargo check --workspace --tests --all-features` clean.
+
+**4b is complete.** The journal (4a.2), the topology-aware sealer (4b.1), and the settlement wiring
+(4b.2) together mean prelaunch checkout-preparation usage — once 5b.3-6 actually composes checkout
+into `launch_with` — will be durably admitted, reaped on a correct deadline, and settled exactly once
+through every real terminal path, with no silent double-count and no silent overflow.
+
+**Still open:** task #91 (credential binding), the `v1`→`v2` fleet-convergence flip in `lib.rs`, the
+lease/topology prerequisite for 5b.3-6 (noted in the 4b.1 entry), and 5b.3-5/5b.3-6/5b.3-7 themselves
+(5b.3-6 is what will actually compose checkout preparation into `launch_with` and make this journal
+load-bearing in production — until then 4b is correct but dormant). The rest of ledger 12's open
+items are unchanged.

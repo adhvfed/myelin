@@ -26,10 +26,14 @@ use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
 
 use crate::ci_pipeline_driver::{
-    close_cancelled_run_if_accounted, decode_retry_attempt_usage, priced_cost_rows,
-    validate_reservation_pricing_policy, DurableCiJobAccounting,
-    TIER_P_OPERATIONAL_PRICING_REVISION, TIER_P_OPERATIONAL_RESERVATION_PREFIX,
-    TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX,
+    checked_accounting_usage, checked_add_accounting_usage, close_cancelled_run_if_accounted,
+    decode_retry_attempt_usage, priced_cost_rows, validate_reservation_pricing_policy,
+    CiUsageAggregationError, DurableCiJobAccounting, TIER_P_OPERATIONAL_PRICING_REVISION,
+    TIER_P_OPERATIONAL_RESERVATION_PREFIX, TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX,
+};
+use crate::ci_prelaunch_usage_journal::{
+    resolve_prelaunch_usage_on_conn, CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity,
+    CiPrelaunchUnresolvedPolicy, CiPrelaunchUsageJournalError,
 };
 use crate::{
     CiCostEventStore, CiDriveManifestStore, CiJobAccountingPricer, CiJobAccountingRecord,
@@ -78,6 +82,8 @@ pub enum CiRunSupersessionError {
     Workflow,
     Accounting,
     Pricing,
+    Prelaunch(CiPrelaunchUsageJournalError),
+    Usage(CiUsageAggregationError),
     Settlement,
     CorruptState(&'static str),
 }
@@ -96,6 +102,18 @@ impl std::fmt::Display for CiRunSupersessionError {
             Self::Workflow => f.write_str("CI run supersession workflow termination was refused"),
             Self::Accounting => f.write_str("CI run supersession accounting was refused"),
             Self::Pricing => f.write_str("CI run supersession pricing policy was refused"),
+            Self::Prelaunch(error) => {
+                write!(
+                    f,
+                    "CI run supersession prelaunch usage was refused: {error}"
+                )
+            }
+            Self::Usage(error) => {
+                write!(
+                    f,
+                    "CI run supersession usage aggregation was refused: {error}"
+                )
+            }
             Self::Settlement => f.write_str("CI run supersession settlement was refused"),
             Self::CorruptState(detail) => {
                 write!(
@@ -623,32 +641,29 @@ impl PgCiRunSupersession {
                 "accounting receipt diverges from manifest",
             ));
         }
-        let usage = match queue {
+        enum ReplayKind {
+            Reported,
+            Superseded,
+        }
+        let replay_kind = match queue {
             Some(queue)
                 if queue.state == "terminal"
                     && !existing.skipped
                     && queue.completion_receipt.as_deref()
                         == Some(existing.completion_receipt.as_str()) =>
             {
-                existing.usage
+                ReplayKind::Reported
             }
-            None if existing.skipped
-                && !existing.passed
-                && !existing.timed_out
-                && existing.usage.cpu_seconds == 0
-                && existing.usage.mem_byte_seconds == 0
-                && existing.completion_receipt
-                    == superseded_receipt(
-                        &self.scope,
-                        &peer.run_id,
-                        &peer.wf_run_id,
-                        &job.job_id,
-                        &job.reserve_handle,
-                        existing.usage,
-                        existing.skipped,
-                    ) =>
+            Some(queue)
+                if queue.state == "terminal"
+                    && queue.completion_receipt.is_none()
+                    && !existing.passed
+                    && !existing.timed_out =>
             {
-                existing.usage
+                ReplayKind::Superseded
+            }
+            None if existing.skipped && !existing.passed && !existing.timed_out => {
+                ReplayKind::Superseded
             }
             _ => {
                 return Err(CiRunSupersessionError::CorruptState(
@@ -656,6 +671,61 @@ impl PgCiRunSupersession {
                 ))
             }
         };
+        let base_usage = queue
+            .and_then(|queue| queue.retry_usage)
+            .unwrap_or(ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            });
+        let accounted_floor = self
+            .resolve_job_usage_on_conn(
+                conn,
+                CiPrelaunchSettlementIdentity {
+                    tenant_id: self.tenant.as_str(),
+                    region: self.region.as_str(),
+                    job_id: &job.job_id,
+                    wf_run_id: &peer.wf_run_id,
+                    ci_run_id: &peer.run_id,
+                    reserve_handle: &job.reserve_handle,
+                },
+                base_usage,
+                if existing.skipped {
+                    CiPrelaunchParentExpectation::OptionalBeforeLaunch
+                } else {
+                    CiPrelaunchParentExpectation::Required
+                },
+                CiPrelaunchUnresolvedPolicy::Refuse,
+            )
+            .await?;
+        let usage =
+            checked_accounting_usage(existing.usage).map_err(CiRunSupersessionError::Usage)?;
+        let contains_floor = usage.cpu_seconds >= accounted_floor.cpu_seconds
+            && usage.mem_byte_seconds >= accounted_floor.mem_byte_seconds;
+        let exact_superseded = matches!(replay_kind, ReplayKind::Superseded)
+            && usage == accounted_floor
+            && existing.completion_receipt
+                == superseded_receipt(
+                    &self.scope,
+                    &peer.run_id,
+                    &peer.wf_run_id,
+                    &job.job_id,
+                    &job.reserve_handle,
+                    usage,
+                    existing.skipped,
+                );
+        match replay_kind {
+            ReplayKind::Reported if !contains_floor => {
+                return Err(CiRunSupersessionError::CorruptState(
+                    "accounting usage omits durable prelaunch usage",
+                ));
+            }
+            ReplayKind::Superseded if !exact_superseded => {
+                return Err(CiRunSupersessionError::CorruptState(
+                    "accounting receipt disagrees with queue lifecycle",
+                ));
+            }
+            _ => {}
+        }
         let priced = TierPOperationalCiJobPricer
             .price(usage)
             .map_err(|_| CiRunSupersessionError::Pricing)?;
@@ -705,7 +775,7 @@ impl PgCiRunSupersession {
         conn: &mut sqlx::PgConnection,
         manifest: &crate::CiDriveManifestV1,
         job: &crate::GrantedCiJobV1,
-        usage: ResourceUsage,
+        base_usage: ResourceUsage,
         skipped: bool,
     ) -> Result<(), CiRunSupersessionError> {
         if !job
@@ -717,6 +787,26 @@ impl PgCiRunSupersession {
         {
             return Err(CiRunSupersessionError::Settlement);
         }
+        let usage = self
+            .resolve_job_usage_on_conn(
+                conn,
+                CiPrelaunchSettlementIdentity {
+                    tenant_id: self.tenant.as_str(),
+                    region: self.region.as_str(),
+                    job_id: &job.job_id,
+                    wf_run_id: &manifest.wf_run_id,
+                    ci_run_id: &manifest.ci_run_id,
+                    reserve_handle: &job.reserve_handle,
+                },
+                base_usage,
+                if skipped {
+                    CiPrelaunchParentExpectation::OptionalBeforeLaunch
+                } else {
+                    CiPrelaunchParentExpectation::Required
+                },
+                CiPrelaunchUnresolvedPolicy::SealToCeiling,
+            )
+            .await?;
         let priced = TierPOperationalCiJobPricer
             .price(usage)
             .map_err(|_| CiRunSupersessionError::Pricing)?;
@@ -787,6 +877,22 @@ impl PgCiRunSupersession {
             .await
             .map_err(|_| CiRunSupersessionError::Accounting)?;
         Ok(())
+    }
+
+    async fn resolve_job_usage_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        identity: CiPrelaunchSettlementIdentity<'_>,
+        base_usage: ResourceUsage,
+        parent_expectation: CiPrelaunchParentExpectation,
+        unresolved_policy: CiPrelaunchUnresolvedPolicy,
+    ) -> Result<ResourceUsage, CiRunSupersessionError> {
+        let prelaunch =
+            resolve_prelaunch_usage_on_conn(conn, identity, parent_expectation, unresolved_policy)
+                .await
+                .map_err(CiRunSupersessionError::Prelaunch)?;
+        checked_add_accounting_usage(base_usage, prelaunch.usage)
+            .map_err(CiRunSupersessionError::Usage)
     }
 
     /// Reconcile one cancelled launched job whose execution lease expired before its runner could
@@ -904,16 +1010,14 @@ impl PgCiRunSupersession {
                 .checked_mul(timeout)
                 .ok_or(CiRunSupersessionError::Pricing)?,
         };
-        let usage = ResourceUsage {
-            cpu_seconds: attempt_usage
-                .cpu_seconds
-                .checked_add(prior_usage.map_or(0, |usage| usage.cpu_seconds))
-                .ok_or(CiRunSupersessionError::Pricing)?,
-            mem_byte_seconds: attempt_usage
-                .mem_byte_seconds
-                .checked_add(prior_usage.map_or(0, |usage| usage.mem_byte_seconds))
-                .ok_or(CiRunSupersessionError::Pricing)?,
-        };
+        let usage = checked_add_accounting_usage(
+            attempt_usage,
+            prior_usage.unwrap_or(ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            }),
+        )
+        .map_err(CiRunSupersessionError::Usage)?;
         let updated = sqlx::query(
             "UPDATE job_queue
              SET state = 'terminal', lease_owner = NULL, lease_expires = NULL, claim_nonce = NULL

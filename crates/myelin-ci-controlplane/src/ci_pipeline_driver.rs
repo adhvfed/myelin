@@ -90,6 +90,10 @@ use crate::ci_drive_manifest::CiDriveManifestStore;
 use crate::ci_pipeline::PipelineStage;
 #[cfg(any(test, feature = "test-support"))]
 use crate::ci_pipeline::{run_ci_pipeline_body, PipelineRun, RunVerdict};
+use crate::ci_prelaunch_usage_journal::{
+    resolve_prelaunch_usage_on_conn, CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity,
+    CiPrelaunchUnresolvedPolicy, CiPrelaunchUsageJournalError,
+};
 #[cfg(any(test, feature = "test-support"))]
 use crate::ci_run_store::CiRunRecord;
 use crate::cost_store::{CiCostEventStore, CiCostStoreError};
@@ -573,17 +577,60 @@ fn aggregate_usage(
     current: ResourceUsage,
 ) -> Result<ResourceUsage, CompletionTxError> {
     let Some(attempts) = attempts else {
-        return Ok(current);
+        return checked_accounting_usage(current).map_err(CompletionTxError::Usage);
     };
-    Ok(ResourceUsage {
-        cpu_seconds: current
+    checked_add_accounting_usage(
+        current,
+        ResourceUsage {
+            cpu_seconds: attempts.cpu_seconds,
+            mem_byte_seconds: attempts.mem_byte_seconds,
+        },
+    )
+    .map_err(CompletionTxError::Usage)
+}
+
+/// A typed refusal before raw usage reaches bigint-backed accounting or pricing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiUsageAggregationError {
+    Overflow,
+    DurableRange,
+}
+
+impl core::fmt::Display for CiUsageAggregationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Overflow => f.write_str("CI usage aggregation overflowed"),
+            Self::DurableRange => {
+                f.write_str("CI usage aggregation exceeds the durable bigint range")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CiUsageAggregationError {}
+
+pub(crate) fn checked_accounting_usage(
+    usage: ResourceUsage,
+) -> Result<ResourceUsage, CiUsageAggregationError> {
+    if i64::try_from(usage.cpu_seconds).is_err() || i64::try_from(usage.mem_byte_seconds).is_err() {
+        return Err(CiUsageAggregationError::DurableRange);
+    }
+    Ok(usage)
+}
+
+pub(crate) fn checked_add_accounting_usage(
+    left: ResourceUsage,
+    right: ResourceUsage,
+) -> Result<ResourceUsage, CiUsageAggregationError> {
+    checked_accounting_usage(ResourceUsage {
+        cpu_seconds: left
             .cpu_seconds
-            .checked_add(attempts.cpu_seconds)
-            .ok_or(CompletionTxError::Refused)?,
-        mem_byte_seconds: current
+            .checked_add(right.cpu_seconds)
+            .ok_or(CiUsageAggregationError::Overflow)?,
+        mem_byte_seconds: left
             .mem_byte_seconds
-            .checked_add(attempts.mem_byte_seconds)
-            .ok_or(CompletionTxError::Refused)?,
+            .checked_add(right.mem_byte_seconds)
+            .ok_or(CiUsageAggregationError::Overflow)?,
     })
 }
 
@@ -741,6 +788,7 @@ enum ReporterAccounting {
 struct TerminalAccountingInput<'a> {
     tenant: &'a TenantId,
     wf_run: &'a RunId,
+    ci_run_id: &'a str,
     job_id: &'a str,
     reserve_handle: &'a str,
     report: &'a TerminalReport,
@@ -761,6 +809,8 @@ pub(crate) enum CompletionTxError {
     Signal(ExecutorError),
     RetryStore,
     RetryCorrupt,
+    Prelaunch(CiPrelaunchUsageJournalError),
+    Usage(CiUsageAggregationError),
     Refused,
 }
 
@@ -926,22 +976,6 @@ async fn co_commit_terminal_accounting(
     accounting: &DurableCiJobAccounting,
     input: TerminalAccountingInput<'_>,
 ) -> Result<(), CompletionTxError> {
-    let (manifest, _) = accounting
-        .manifest_store
-        .load_by_wf_run_on_conn(conn, &input.wf_run.0)
-        .await
-        .map_err(|_| CompletionTxError::Manifest)?
-        .ok_or(CompletionTxError::Refused)?;
-    let granted_job = manifest
-        .jobs
-        .iter()
-        .find(|job| job.job_id == input.job_id)
-        .ok_or(CompletionTxError::Refused)?;
-    if granted_job.reserve_handle != input.reserve_handle {
-        return Err(CompletionTxError::Refused);
-    }
-    let ci_run_id = manifest.ci_run_id.clone();
-
     if input.replay {
         let existing = accounting
             .receipt_store
@@ -952,7 +986,7 @@ async fn co_commit_terminal_accounting(
         let exact = existing.tenant == *input.tenant
             && existing.job_id == input.job_id
             && existing.wf_run_id == input.wf_run.0
-            && existing.ci_run_id == manifest.ci_run_id
+            && existing.ci_run_id == input.ci_run_id
             && existing.reserve_handle == input.reserve_handle
             && existing.passed == input.report.passed
             && existing.timed_out == input.report.timed_out
@@ -970,7 +1004,7 @@ async fn co_commit_terminal_accounting(
             .map_err(CompletionTxError::Pricing)?;
         let rows = priced_cost_rows(
             input.tenant,
-            &ci_run_id,
+            input.ci_run_id,
             input.job_id,
             input.report.usage,
             &priced,
@@ -1008,7 +1042,7 @@ async fn co_commit_terminal_accounting(
                     tenant: input.tenant.clone(),
                     job_id: input.job_id.to_owned(),
                     wf_run_id: input.wf_run.0.clone(),
-                    ci_run_id: ci_run_id.clone(),
+                    ci_run_id: input.ci_run_id.to_owned(),
                     reserve_handle: input.reserve_handle.to_owned(),
                     passed: input.report.passed,
                     timed_out: input.report.timed_out,
@@ -1027,12 +1061,61 @@ async fn co_commit_terminal_accounting(
         conn,
         input.tenant,
         accounting.scope.region(),
-        &ci_run_id,
+        input.ci_run_id,
         input.job_id,
         input.report,
     )
     .await?;
     Ok(())
+}
+
+struct TerminalUsageResolutionInput<'a> {
+    tenant: &'a TenantId,
+    wf_run_id: &'a str,
+    job_id: &'a str,
+    reserve_handle: &'a str,
+    base_usage: ResourceUsage,
+    parent_expectation: CiPrelaunchParentExpectation,
+    unresolved_policy: CiPrelaunchUnresolvedPolicy,
+}
+
+async fn resolve_terminal_usage_on_conn(
+    conn: &mut sqlx::PgConnection,
+    accounting: &DurableCiJobAccounting,
+    input: TerminalUsageResolutionInput<'_>,
+) -> Result<(String, ResourceUsage), CompletionTxError> {
+    let (manifest, _) = accounting
+        .manifest_store
+        .load_by_wf_run_on_conn(conn, input.wf_run_id)
+        .await
+        .map_err(|_| CompletionTxError::Manifest)?
+        .ok_or(CompletionTxError::Refused)?;
+    let granted_job = manifest
+        .jobs
+        .iter()
+        .find(|job| job.job_id == input.job_id)
+        .ok_or(CompletionTxError::Refused)?;
+    if manifest.tenant_id != input.tenant.0 || granted_job.reserve_handle != input.reserve_handle {
+        return Err(CompletionTxError::Refused);
+    }
+    let prelaunch = resolve_prelaunch_usage_on_conn(
+        conn,
+        CiPrelaunchSettlementIdentity {
+            tenant_id: input.tenant.as_str(),
+            region: accounting.scope.region().as_str(),
+            job_id: input.job_id,
+            wf_run_id: input.wf_run_id,
+            ci_run_id: &manifest.ci_run_id,
+            reserve_handle: input.reserve_handle,
+        },
+        input.parent_expectation,
+        input.unresolved_policy,
+    )
+    .await
+    .map_err(CompletionTxError::Prelaunch)?;
+    let usage = checked_add_accounting_usage(input.base_usage, prelaunch.usage)
+        .map_err(CompletionTxError::Usage)?;
+    Ok((manifest.ci_run_id, usage))
 }
 
 async fn settle_ci_job_surface_on_conn(
@@ -1391,8 +1474,34 @@ impl TerminalReporter for CiPipelineReporter {
                         )
                         .await?;
                         let mut accounted_report = report_owned.clone();
+                        // The sandbox report is workload-only. Checkout preparation is authoritative
+                        // in `ci_job_prelaunch_usage` and is added exactly once below; folding it
+                        // into `TerminalReport` as well would double-account it.
                         accounted_report.usage =
                             aggregate_usage(attempts.as_ref(), report_owned.usage)?;
+                        let (ci_run_id, usage) = match &accounting {
+                            ReporterAccounting::Durable(accounting) => {
+                                resolve_terminal_usage_on_conn(
+                                    conn,
+                                    accounting,
+                                    TerminalUsageResolutionInput {
+                                        tenant: &TenantId(tenant_owned.clone()),
+                                        wf_run_id: &run_owned.0,
+                                        job_id: &job_owned,
+                                        reserve_handle: &reserve_handle,
+                                        base_usage: accounted_report.usage,
+                                        parent_expectation: CiPrelaunchParentExpectation::Required,
+                                        unresolved_policy: CiPrelaunchUnresolvedPolicy::Refuse,
+                                    },
+                                )
+                                .await?
+                            }
+                            #[cfg(any(test, feature = "test-support"))]
+                            ReporterAccounting::TestBypass => {
+                                (String::new(), accounted_report.usage)
+                            }
+                        };
+                        accounted_report.usage = usage;
                         let receipt = completion_receipt(CompletionReceiptInput {
                             tenant: &TenantId(tenant_owned.clone()),
                             region: &region_owned,
@@ -1432,6 +1541,7 @@ impl TerminalReporter for CiPipelineReporter {
                                     TerminalAccountingInput {
                                         tenant: &TenantId(tenant_owned.clone()),
                                         wf_run: &run_owned,
+                                        ci_run_id: &ci_run_id,
                                         job_id: &job_owned,
                                         reserve_handle: &reserve_handle,
                                         report: &accounted_report,
@@ -1504,6 +1614,16 @@ impl TerminalReporter for CiPipelineReporter {
                 return Err(ExecutorError::Storage(
                     "durable retry-attempt state is corrupt".into(),
                 ))
+            }
+            Err(CompletionTxError::Prelaunch(error)) => {
+                return Err(ExecutorError::Storage(format!(
+                    "terminal CI prelaunch usage resolution refused: {error}"
+                )))
+            }
+            Err(CompletionTxError::Usage(error)) => {
+                return Err(ExecutorError::Storage(format!(
+                    "terminal CI usage aggregation refused: {error}"
+                )))
             }
             Err(CompletionTxError::Scope(error)) => {
                 return Err(ExecutorError::Storage(format!(
@@ -1631,6 +1751,8 @@ impl TerminalReporter for CiPipelineReporter {
                             let report = TerminalReport {
                                 passed: false,
                                 timed_out: false,
+                                // `retry_attempts` contains workload attempts only. Prelaunch usage
+                                // is resolved from its journal immediately below.
                                 usage: ResourceUsage {
                                     cpu_seconds: attempts.cpu_seconds,
                                     mem_byte_seconds: attempts.mem_byte_seconds,
@@ -1639,6 +1761,22 @@ impl TerminalReporter for CiPipelineReporter {
                             };
                             match &accounting {
                                 ReporterAccounting::Durable(accounting) => {
+                                    let (ci_run_id, usage) = resolve_terminal_usage_on_conn(
+                                        conn,
+                                        accounting,
+                                        TerminalUsageResolutionInput {
+                                            tenant: &TenantId(tenant_owned.clone()),
+                                            wf_run_id: &claim_owned.run.0,
+                                            job_id: &claim_owned.job_id,
+                                            reserve_handle: &reserve_handle,
+                                            base_usage: report.usage,
+                                            parent_expectation:
+                                                CiPrelaunchParentExpectation::Required,
+                                            unresolved_policy: CiPrelaunchUnresolvedPolicy::Refuse,
+                                        },
+                                    )
+                                    .await?;
+                                    let report = TerminalReport { usage, ..report };
                                     let receipt = crate::ci_run_supersession::superseded_receipt(
                                         &accounting.scope,
                                         cancelled_ci_run
@@ -1656,6 +1794,7 @@ impl TerminalReporter for CiPipelineReporter {
                                         TerminalAccountingInput {
                                             tenant: &TenantId(tenant_owned.clone()),
                                             wf_run: &claim_owned.run,
+                                            ci_run_id: &ci_run_id,
                                             job_id: &claim_owned.job_id,
                                             reserve_handle: &reserve_handle,
                                             report: &report,
@@ -1701,6 +1840,12 @@ impl TerminalReporter for CiPipelineReporter {
             Err(CompletionTxError::RetryCorrupt) => Err(ExecutorError::Storage(
                 "durable retry-attempt state is corrupt".into(),
             )),
+            Err(CompletionTxError::Prelaunch(error)) => Err(ExecutorError::Storage(format!(
+                "terminal retry prelaunch usage resolution refused: {error}"
+            ))),
+            Err(CompletionTxError::Usage(error)) => Err(ExecutorError::Storage(format!(
+                "terminal retry usage aggregation refused: {error}"
+            ))),
             Err(_) => Err(ExecutorError::Storage(
                 "retryable-attempt transaction reached an invalid accounting path".into(),
             )),
