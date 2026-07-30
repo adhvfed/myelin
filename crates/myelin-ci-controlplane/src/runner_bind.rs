@@ -131,18 +131,25 @@ use crate::{
     LogPipelineSink,
 };
 
-/// **The runner's lease TTL, wired ABOVE the max job timeout (CT-004d.1 — the CT-004c.2 verifier's
-/// MEDIUM fix).** [`RunnerAgent::run_one`](myelin_ci_sandbox::RunnerAgent) BLOCKS for the whole in-line
-/// job and heartbeats only BEFORE + AFTER the blocking launch (never mid-launch, absent a structural
-/// change to the sandbox launch). So if the lease TTL were below the job's wall-clock, the lease would
-/// lapse mid-run → the reaper re-queues it → a second runner double-executes. Setting the TTL strictly
-/// above [`MAX_JOB_TIMEOUT_SECS`] (which the spec store enforces as the per-job ceiling) makes that
-/// impossible: a leased job provably finishes before its lease can lapse. The tighter fix — a
-/// heartbeat thread DURING the blocking launch, which would let this shrink back toward the reaper
-/// cadence — is the named CT-004d follow-on (it needs a structural hook in the sandbox launch, out of
-/// scope for CT-004d.1, which must not touch `run_one`'s security body). The `+ 600` is the margin
-/// over the ceiling (reaper-cadence + clock-skew headroom).
-pub const CI_RUNNER_LEASE_TTL_SECS: i64 = MAX_JOB_TIMEOUT_SECS as i64 + 600;
+/// **The runner's EXECUTION lease TTL, wired ABOVE the max job timeout (CT-004d.1 — the CT-004c.2
+/// verifier's MEDIUM fix).** [`RunnerAgent::run_one`](myelin_ci_sandbox::RunnerAgent) BLOCKS for the
+/// whole in-line job and heartbeats only BEFORE + AFTER the blocking launch (never mid-launch, absent
+/// a structural change to the sandbox launch). So if the lease TTL were below the job's wall-clock,
+/// the lease would lapse mid-run → the reaper re-queues it → a second runner double-executes. Setting
+/// the TTL strictly above [`MAX_JOB_TIMEOUT_SECS`] (which the spec store enforces as the per-job
+/// ceiling) makes that impossible: a leased job provably finishes before its lease can lapse. The
+/// tighter fix — a heartbeat thread DURING the blocking launch, which would let this shrink back
+/// toward the reaper cadence — is the named CT-004d follow-on (it needs a structural hook in the
+/// sandbox launch, out of scope for CT-004d.1, which must not touch `run_one`'s security body). The
+/// `+ 600` is the margin over the ceiling (reaper-cadence + clock-skew headroom).
+///
+/// **This bounds ONE execution, not a whole claim generation** (CT-007 lease/topology
+/// reconciliation): a checkout-bearing parent attempt legally contains four sequential executions,
+/// and its hard per-generation ceiling is the immutable
+/// [`claim_window_secs`](crate::ci_claim_window::claim_window_secs) instead. The two were the same
+/// constant before that slice, which is why this one was renamed outright rather than aliased — a
+/// time-authority constant whose meaning narrowed must not keep its old, now-ambiguous name.
+pub const CI_RUNNER_EXECUTION_LEASE_TTL_SECS: i64 = MAX_JOB_TIMEOUT_SECS as i64 + 600;
 
 /// **Resolve a leased `job_queue` row to its digest-pinned [`JobSpec`] (the CT-004d spec-store seam).**
 /// The durable queue holds scheduling metadata, not the spec; this maps a claimed [`LeasedJob`] to the
@@ -732,6 +739,22 @@ fn durable_spec_resolver_with_issuer(
         if launch.spec.trust_tier != leased.trust_tier {
             return Err("claimed trust tier differs from the durable launch template".into());
         }
+        // CT-007 lease/topology reconciliation: THE mechanical per-job null-window check. A
+        // checkout-bearing job claimed on a legacy row has no durable four-execution ceiling, so its
+        // claim would expire mid-preparation; refuse here, before the mint, so no resolved `JobSpec`
+        // for such a row ever reaches `RunnerAgent`/`launch_with`. The row stays leased and the
+        // reaper recovers it. The token issuer repeats this refusal under its own row lock, and the
+        // regional activation guard counts such rows — enforcement is per-job, not procedural.
+        if leased.claim_window_secs.is_none()
+            && crate::ci_claim_window::is_checkout_bearing(launch.spec.kind, &launch.spec.workspace)
+                .map_err(|e| e.to_string())?
+        {
+            return Err(
+                "checkout-bearing job was claimed on a legacy row with no durable claim window; \
+                 refusing before mint (its claim would expire mid-preparation)"
+                    .into(),
+            );
+        }
         let request = CiJobTokenRequest {
             tenant_id: leased.tenant_id.clone(),
             region: region.clone(),
@@ -760,6 +783,49 @@ fn durable_spec_resolver_with_issuer(
             .spec
             .resolve_with_authorization(run_token, Some(authorization)))
     })
+}
+
+/// **The durable backing for the sandbox's preparation-lease checkpoint seam (CT-007 lease/topology
+/// reconciliation).** Binds ONE exact claim generation and renews its execution lease through
+/// [`CiJobQueueStore::renew_preparation_lease`], bridging the sync sandbox call onto the runner
+/// thread's runtime with the same off-runtime `block_on` convention [`DurableLeaseAdapter`] uses.
+///
+/// **Deliberately dormant.** The transport takes `Option<&dyn PreparationLeaseCheckpoint>` and every
+/// caller passes `None` today; 5b.3-6's composition is what constructs this and adds the later Hop
+/// A→B and B→workload checkpoints. It exists here so the composition slice wires an already-proven
+/// seam instead of inventing durable ownership semantics inline.
+pub struct DurablePreparationLeaseCheckpoint {
+    store: CiJobQueueStore,
+    claim: crate::job_queue_store::CiJobLaunchClaim,
+    rt: tokio::runtime::Handle,
+}
+
+impl DurablePreparationLeaseCheckpoint {
+    /// Bind the checkpoint to one exact durable claim generation.
+    pub fn new(
+        store: CiJobQueueStore,
+        claim: crate::job_queue_store::CiJobLaunchClaim,
+        rt: tokio::runtime::Handle,
+    ) -> DurablePreparationLeaseCheckpoint {
+        DurablePreparationLeaseCheckpoint { store, claim, rt }
+    }
+}
+
+impl myelin_ci_sandbox::PreparationLeaseCheckpoint for DurablePreparationLeaseCheckpoint {
+    /// A DB error is treated as lost ownership, not as success: continuing to the next execution on
+    /// an unconfirmed renewal is exactly the double-run the lease exists to prevent.
+    fn renew(&self) -> Result<(), myelin_ci_sandbox::PreparationLeaseLost> {
+        match bridge(&self.rt, self.store.renew_preparation_lease(&self.claim)) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(myelin_ci_sandbox::PreparationLeaseLost(format!(
+                "no live leased generation matched job {} epoch {} nonce {}",
+                self.claim.job_id, self.claim.lease_epoch, self.claim.claim_nonce
+            ))),
+            Err(error) => Err(myelin_ci_sandbox::PreparationLeaseLost(format!(
+                "renewal query failed (treated as lost ownership, fail-closed): {error}"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]

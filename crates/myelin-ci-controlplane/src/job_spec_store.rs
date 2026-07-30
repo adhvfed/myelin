@@ -52,7 +52,7 @@
 //! reaper re-queues it → a second runner double-executes. CT-004d.1 makes that impossible on TWO ends:
 //! (1) [`MAX_JOB_TIMEOUT_SECS`] is the ceiling this store enforces at persist ([`CiJobSpecStoreError::TimeoutTooLong`]
 //! fail-closed) — a spec whose `timeout_secs` exceeds it never becomes a claimable job; and (2) the
-//! runner is wired with `lease_ttl_secs = ` [`CI_RUNNER_LEASE_TTL_SECS`](crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS)
+//! runner is wired with `lease_ttl_secs = ` [`CI_RUNNER_EXECUTION_LEASE_TTL_SECS`](crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS)
 //! `> MAX_JOB_TIMEOUT_SECS`, so a leased job provably cannot outlive its lease. (The mid-launch
 //! heartbeat is the tighter fix — named as the follow-on that would let the lease TTL shrink again.)
 
@@ -67,7 +67,7 @@ use crate::scheduler::{EnqueueOutcome, INSERT_JOB_QUEUE_QUERY};
 use crate::DurableEnqueue;
 
 /// **The wall-clock ceiling a dispatched [`JobSpecTemplate`]'s timeout may not exceed.**
-/// The runner's lease TTL is wired ABOVE this (see [`crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS`]),
+/// The runner's lease TTL is wired ABOVE this (see [`crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS`]),
 /// so a leased job can never outlive its lease mid-run (the CT-004c.2 double-run guard, closed at the
 /// dispatch). 6 h (GitHub-Actions parity) — comfortably above every real CI job (the workspace's
 /// longest configured job is 2 h) so this rejects nothing legitimate; a spec above it is refused
@@ -110,6 +110,7 @@ const SELECT_EXACT_DISPATCH_QUERY: &str = "\
 SELECT q.region, q.job_id::text AS queue_job_id, q.run_id::text AS queue_run_id,
        q.lane, q.labels, q.trust_tier, q.concurrency_group, q.fair_key,
        q.idem_token AS queue_idem_token, q.stage AS queue_stage,
+       q.claim_window_secs AS queue_claim_window_secs,
        s.region AS spec_region, s.run_id::text AS spec_run_id,
        s.idem_token AS spec_idem_token, s.spec, s.stage AS spec_stage
 FROM job_queue q
@@ -127,6 +128,19 @@ WHERE q.tenant_id = $1 AND q.idem_token = $2";
 pub const NON_TERMINAL_NULL_STAGE_JOBS_QUERY: &str = "\
 SELECT count(*) FROM job_queue q \
 WHERE q.region = $1 AND q.state <> 'terminal' AND q.stage IS NULL";
+
+/// **The claim-window activation guard's probe (CT-007 lease/topology reconciliation).** Counts, in
+/// a region, non-terminal `job_queue` rows whose `claim_window_secs` is still NULL — a dispatch
+/// written by a binary older than the claim-window expand. Such a row is claimed under the flat
+/// execution-lease fallback, which is correct for the workload-only topology it was dispatched under
+/// but cannot hold a four-execution checkout composition. Every new Rust writer populates the
+/// column, so a converged fleet returns 0; the checkout-composition activation path refuses while it
+/// does not, and the resolver/issuer refuse per-job regardless, so this is a coarse operational
+/// guard layered on top of enforcement, never the enforcement itself. Cross-tenant within a region
+/// (the runner lane claims cross-tenant), so it runs on the region-scheduler path. Bind: `$1 region`.
+pub const NON_TERMINAL_NULL_CLAIM_WINDOW_JOBS_QUERY: &str = "\
+SELECT count(*) FROM job_queue q \
+WHERE q.region = $1 AND q.state <> 'terminal' AND q.claim_window_secs IS NULL";
 
 /// Durable, non-launchable job input. The scheduler may persist this for an arbitrary queue wait:
 /// it contains the immutable sandbox template plus the stable Identity authority handle, but no JTI
@@ -200,6 +214,19 @@ pub enum CiJobSpecStoreError {
         /// The job id whose durable stage is absent.
         job_id: String,
     },
+    /// The enqueue's declared `claim_window_secs` does not equal what the dispatched spec's own
+    /// topology derives — refused before any row is written, the same posture as
+    /// [`Self::TrustTierMismatch`]. The durable scalar is CACHED authority, never a second authority
+    /// source: a caller may not widen (or narrow) the immutable claim ceiling the runner will get.
+    ClaimWindowMismatch {
+        /// The window the enqueue declared (the would-be `job_queue.claim_window_secs`).
+        enqueue: i64,
+        /// The window the dispatched spec derives (the truth the queue row must carry).
+        spec: i64,
+    },
+    /// The dispatched spec's claim window is underivable at all (a malformed checkout workspace or
+    /// an over-ceiling timeout). Refused fail-closed rather than defaulted.
+    ClaimWindowUnderivable(String),
 }
 
 impl core::fmt::Display for CiJobSpecStoreError {
@@ -239,6 +266,16 @@ impl core::fmt::Display for CiJobSpecStoreError {
                 f,
                 "durable ci_job_spec for job `{job_id}` has a NULL stage (a pre-rewire historical row) \
                  — the reporter fails closed rather than attribute a verdict to an unknown stage"
+            ),
+            CiJobSpecStoreError::ClaimWindowMismatch { enqueue, spec } => write!(
+                f,
+                "durable dispatch refused: the job_queue row's claim_window_secs {enqueue} does not \
+                 match the {spec}s window the dispatched spec's own topology derives — the immutable \
+                 claim ceiling MUST come from the spec that executes (no widening/defaulting)"
+            ),
+            CiJobSpecStoreError::ClaimWindowUnderivable(detail) => write!(
+                f,
+                "durable dispatch refused: {detail}"
             ),
         }
     }
@@ -350,7 +387,7 @@ impl CiJobSpecStore {
         require_active_flow: bool,
     ) -> Result<DispatchOutcome, CiJobSpecStoreError> {
         // ── the two fail-closed dispatch invariants (SECURITY trust-tier + the lease-TTL floor). ──
-        validate_dispatch(enq.trust_tier, launch)?;
+        validate_dispatch(enq.trust_tier, Some(enq.claim_window_secs), launch)?;
 
         let job_uuid = parse_id_local("job_id", &enq.job_id)?;
         let run_uuid = parse_id_local("run_id", &enq.run_id)?;
@@ -367,6 +404,7 @@ impl CiJobSpecStore {
         let fair_key = enq.fair_key.clone();
         let idem = enq.idem_token.clone();
         let workflow_run_id = enq.run_id.clone();
+        let claim_window_secs = enq.claim_window_secs;
         if enq.stage != stage {
             return Err(CiJobSpecStoreError::Db(
                 "durable dispatch stage differs between queue authority and spec identity".into(),
@@ -406,6 +444,7 @@ impl CiJobSpecStore {
                         .bind(&fair_key) // $9 fair_key
                         .bind(&idem) // $10 idem_token
                         .bind(&stage) // $11 stage (regional guard + completion authority)
+                        .bind(claim_window_secs) // $12 immutable dispatch-derived claim window
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|e| PgError::Query(e.to_string()))?;
@@ -445,6 +484,7 @@ impl CiJobSpecStore {
                         &fair_key,
                         &idem,
                         &stage,
+                        claim_window_secs,
                         &spec_json,
                     )?;
                     Ok((jq_row.is_some(), spec_row.is_some()))
@@ -608,9 +648,11 @@ fn verify_exact_dispatch(
     fair_key: &str,
     idem_token: &str,
     stage: &str,
+    claim_window_secs: i64,
     spec: &serde_json::Value,
 ) -> Result<(), PgError> {
-    let exact = row.get::<String, _>("region") == region
+    let exact = row.get::<Option<i64>, _>("queue_claim_window_secs") == Some(claim_window_secs)
+        && row.get::<String, _>("region") == region
         && row.get::<String, _>("queue_job_id") == job_id.to_string()
         && row.get::<String, _>("queue_run_id") == run_id.to_string()
         && row.get::<String, _>("lane") == lane
@@ -657,6 +699,7 @@ pub struct ClaimedDispatchIdentity {
 /// job can never outlive the runner's lease. A violation is a typed fail-closed error, NEVER coerced.
 fn validate_dispatch(
     enq_trust: TrustTier,
+    enq_claim_window_secs: Option<i64>,
     launch: &DurableCiJobLaunchTemplate,
 ) -> Result<(), CiJobSpecStoreError> {
     if launch.token_authority_handle.trim().is_empty() || launch.token_authority_handle.len() > 512
@@ -677,6 +720,23 @@ fn validate_dispatch(
             ceiling: MAX_JOB_TIMEOUT_SECS,
         });
     }
+    // (3) the immutable claim ceiling — recomputed from `launch.spec`, exactly the pattern the
+    // trust-tier invariant above uses. Deliberately WRITE-PATH ONLY: `None` (the resolve-side
+    // decode, which has no caller-supplied window to compare) skips the derivation entirely, so an
+    // already-persisted row whose window is underivable stays READABLE. The reporter's settlement
+    // path decodes the same template, and refusing to read a dispatched job's identity would strand
+    // it; the resolver's own `derive_checkout_authorization_scope` call already fails such a spec
+    // closed before launch.
+    if let Some(declared) = enq_claim_window_secs {
+        let derived = crate::ci_claim_window::claim_window_secs_for_template(&launch.spec)
+            .map_err(|error| CiJobSpecStoreError::ClaimWindowUnderivable(error.to_string()))?;
+        if declared != derived {
+            return Err(CiJobSpecStoreError::ClaimWindowMismatch {
+                enqueue: declared,
+                spec: derived,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -694,7 +754,7 @@ fn decode_launch_template(
             detail: e.to_string(),
         }
     })?;
-    validate_dispatch(launch.spec.trust_tier, &launch)?;
+    validate_dispatch(launch.spec.trust_tier, None, &launch)?;
     Ok(launch)
 }
 

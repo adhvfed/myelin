@@ -1,9 +1,12 @@
 //! Live proof of the dedicated, least-privilege CI region scheduler boundary.
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use myelin_ci_controlplane::CI_RUNNER_EXECUTION_LEASE_TTL_SECS;
 use myelin_ci_controlplane::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, ci_job_queue_store,
     CiSchedulerDbConfig, CiSchedulerDbError, CiSchedulerDbProvider, DurableEnqueue, EnqueueOutcome,
@@ -44,6 +47,7 @@ fn job(tenant: &str, region: &str, label: &str, ordinal: u16) -> DurableEnqueue 
         fair_key: tenant.to_owned(),
         idem_token: format!("scheduler-boundary-{ordinal}"),
         stage: "build".into(),
+        claim_window_secs: CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
     }
 }
 
@@ -160,6 +164,14 @@ async fn insert_active_job_owner(admin: &PgPool, tenant: &str, region: &str, ord
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe() {
+    // This test boots the REAL `CiSchedulerDbProvider`, whose excess-privilege probe scans every
+    // non-system schema — so it must not run while another suite's per-test schema (carrying CI
+    // scheduler grants) exists. Same advisory lock, same sweep.
+    let lock_admin_url = configured_url("DATABASE_MIGRATION_URL", ADMIN_DEFAULT);
+    common::with_privilege_fixture_lock(
+        &lock_admin_url,
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
     let app_url = configured_url("DATABASE_URL", APP_DEFAULT);
     let admin_url = configured_url("DATABASE_MIGRATION_URL", ADMIN_DEFAULT);
     let scheduler_url = configured_url("MYELIN_CI_SCHEDULER_DATABASE_URL", SCHEDULER_DEFAULT);
@@ -393,6 +405,39 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         baseline_null_stage
     );
 
+    // CT-007 lease/topology reconciliation: the checkout-composition activation guard, read through
+    // the SAME scheduler capability. It counts pre-expand rows without gating the ordinary runner
+    // lane — a legacy row's workload still runs correctly under the flat fallback.
+    let baseline_null_window = region_store
+        .count_non_terminal_null_claim_window_jobs(FR_PAR)
+        .await
+        .expect("region-authorized claim-window activation guard");
+    sqlx::query("UPDATE job_queue SET claim_window_secs = NULL WHERE tenant_id = $1")
+        .bind(&tenant_b)
+        .execute(&admin)
+        .await
+        .expect("simulate one historical pre-expand row");
+    assert_eq!(
+        region_store
+            .count_non_terminal_null_claim_window_jobs(FR_PAR)
+            .await
+            .expect("guard observes the pre-expand fixture"),
+        baseline_null_window + 1
+    );
+    sqlx::query("UPDATE job_queue SET claim_window_secs = $2 WHERE tenant_id = $1")
+        .bind(&tenant_b)
+        .bind(CI_RUNNER_EXECUTION_LEASE_TTL_SECS)
+        .execute(&admin)
+        .await
+        .expect("repair the pre-expand fixture before claim");
+    assert_eq!(
+        region_store
+            .count_non_terminal_null_claim_window_jobs(FR_PAR)
+            .await
+            .expect("guard after claim-window repair"),
+        baseline_null_window
+    );
+
     let first = region_store
         .claim(FR_PAR, &labels, &[TrustTier::Trusted], "worker-one", 30)
         .await
@@ -579,6 +624,106 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
             .await,
         "scheduler DELETE must be denied",
     );
+    // CT-007 lease/topology reconciliation: the immutable claim window is dispatch authority the
+    // scheduler only READS when sizing `claim_expires_at`. An explicit negative alongside the
+    // dynamic excess-column probe in `ci_scheduler_db.rs`.
+    assert_permission_denied(
+        sqlx::query("UPDATE job_queue SET claim_window_secs = 1 WHERE true")
+            .execute(&raw_scheduler)
+            .await,
+        "scheduler claim_window_secs mutation must be denied",
+    );
+    let scheduler_reads_claim_window: bool = sqlx::query_scalar(
+        "SELECT pg_catalog.has_column_privilege(
+           session_user, 'public.job_queue', 'claim_window_secs', 'SELECT')",
+    )
+    .fetch_one(&raw_scheduler)
+    .await
+    .expect("inspect scheduler claim-window read privilege");
+    assert!(
+        scheduler_reads_claim_window,
+        "the claim must be able to READ the durable window it sizes claim_expires_at from"
+    );
+
+    // CT-007 round-2 blocker 4: a POSITIVE, real-role proof — not merely "the query is permitted".
+    // Seed a VISIBLE superseded-version run, observe it through the exact production scheduler
+    // provider's discovery, remediate it through the REAL `DurableExecutor::cancel`, and prove the
+    // diagnostic then reports nothing. `fetch_optional().is_ok()` would have proven none of this.
+    let stranded_run = format!("stranded-{suffix}");
+    sqlx::query(
+        "INSERT INTO workflow_run (
+           tenant_id, region, run_id, wf_type, wf_version, input, state, correlation_id,
+           depth, partition
+         ) VALUES ($1, $2, $3, 'ci.pipeline', $4, '[]'::jsonb, 'running', $3, 0, 0)",
+    )
+    .bind(&tenant_a)
+    .bind(FR_PAR)
+    .bind(&stranded_run)
+    .bind(myelin_ci_controlplane::CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+    .execute(&admin)
+    .await
+    .expect("seed a visible superseded-version run");
+
+    let visible = run_discovery
+        .superseded_definition_runs(
+            FR_PAR,
+            myelin_ci_controlplane::CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
+            16,
+        )
+        .await
+        .expect("the guard's read is granted to the dedicated scheduler role");
+    assert!(
+        visible
+            .iter()
+            .any(|run| run.wf_run_id == stranded_run && run.tenant.0 == tenant_a),
+        "FORCE RLS must EXPOSE the seeded row to the real scheduler provider — a permitted query \
+         that returns nothing proves nothing; got {visible:?}"
+    );
+
+    // REAL remediation: the production cancellation path the refusal message names, not an UPDATE.
+    let executor = myelin_flow::PgFlowExecutor::new(
+        app.clone(),
+        tokio::runtime::Handle::current(),
+        std::sync::Arc::new(myelin_events::MonotonicMinter::new()),
+        myelin_tenancy::TenantId(tenant_a.clone()),
+        myelin_tenancy::Region(FR_PAR.to_owned()),
+    );
+    myelin_flow::DurableExecutor::cancel(
+        &executor,
+        &myelin_flow::RunId(stranded_run.clone()),
+        "ci.pipeline definition cutover remediation",
+    )
+    .expect("DurableExecutor::cancel is the documented remediation");
+    let cancelled_state: String =
+        sqlx::query_scalar("SELECT state FROM workflow_run WHERE run_id = $1")
+            .bind(&stranded_run)
+            .fetch_one(&admin)
+            .await
+            .expect("read the remediated run");
+    assert_eq!(
+        cancelled_state, "terminated",
+        "the real cancel path writes a terminal state"
+    );
+    assert!(
+        run_discovery
+            .superseded_definition_runs(
+                FR_PAR,
+                myelin_ci_controlplane::CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
+                16,
+            )
+            .await
+            .expect("post-remediation discovery")
+            .iter()
+            .all(|run| run.wf_run_id != stranded_run),
+        "performing the documented remediation must actually clear the diagnostic"
+    );
+
+    assert_permission_denied(
+        sqlx::query("SELECT input FROM workflow_run LIMIT 1")
+            .execute(&raw_scheduler)
+            .await,
+        "scheduler workflow payload read must stay denied",
+    );
     assert_permission_denied(
         sqlx::query("SELECT * FROM ci_run LIMIT 1")
             .execute(&raw_scheduler)
@@ -684,4 +829,7 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }
+    },
+    )
+    .await;
 }

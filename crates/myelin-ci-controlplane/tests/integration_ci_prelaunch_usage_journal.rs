@@ -5,6 +5,8 @@
 //! scheduler role can SELECT/seal what the reaper (CT-007 slice 5b.3-4b) needs and nothing more.
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::time::Duration;
 
 use myelin_ci_controlplane::{
@@ -110,6 +112,19 @@ fn assert_trigger_refusal(result: Result<PgQueryResult, sqlx::Error>, operation:
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
+    // Unlike the other schema fixtures, this suite DELIBERATELY exercises the real
+    // `myelin_ci_region_scheduler` role against its isolated schema — it asserts exactly which
+    // journal columns that role may read and seal. Revoking those grants after migration (what the
+    // other fixtures do) would delete the thing under test, so this one takes the other branch:
+    // hold CI_PRIVILEGE_FIXTURE_LOCK across the WHOLE body, so the grants exist but no concurrent
+    // scheduler-boundary or production-boot probe can observe them.
+    //
+    // The sweep prefix and the inner `with_schema_cleanup` are what make that hold panic-safe. With
+    // only the happy-path DROP at the end, a panic anywhere in the body released the lock while a
+    // fully scheduler-granted schema was still standing — the exact state the lock exists to hide —
+    // and it stayed there for every later run. Cleanup now happens INSIDE the lock, and the prefix
+    // sweep collects whatever an earlier crashed run left behind.
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_prelaunch_usage_journal_"], || async {
     let schema = format!("ci_prelaunch_usage_journal_{}", std::process::id());
     let bootstrap = pinned_pool(&admin_url(), "public").await;
     bootstrap
@@ -120,6 +135,9 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         .execute(format!("CREATE SCHEMA {schema} AUTHORIZATION myelin_admin").as_str())
         .await
         .unwrap();
+    let cleanup_bootstrap = bootstrap.clone();
+    let schema_for_cleanup = schema.clone();
+    common::with_schema_cleanup(&cleanup_bootstrap, &schema_for_cleanup, move || async move {
     let admin = pinned_pool(&admin_url(), &schema).await;
     admin
         .execute(
@@ -522,9 +540,12 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
     scheduler.close().await;
     app.close().await;
     admin.close().await;
-    bootstrap
-        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .unwrap();
-    bootstrap.close().await;
+    // The schema drop belongs to `with_schema_cleanup` above, which runs it on the panicking path
+    // too — and, critically, still inside CI_PRIVILEGE_FIXTURE_LOCK. `bootstrap` is deliberately NOT
+    // closed here: `cleanup_bootstrap` is a `.clone()` of the SAME underlying pool, and
+    // `PgPool::close()` shuts it down for every clone, which would break that drop silently.
+    })
+    .await;
+    })
+    .await;
 }

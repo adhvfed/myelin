@@ -45,8 +45,8 @@ use myelin_ci_controlplane::{
     CiJobTokenIssuer, CiJobTokenRequest, DurableCiJobLaunchTemplate, DurableEnqueue,
     DurableLeaseAdapter, EnqueueOutcome, Lane, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
-    CI_RUNNER_LEASE_TTL_SECS, CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    CI_RUNNER_EXECUTION_LEASE_TTL_SECS, CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL,
     CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, MAX_JOB_TIMEOUT_SECS,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
@@ -123,6 +123,10 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL)
         .await
         .expect("add retryable-attempt usage accrual");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
+        .await
+        .expect("add the durable claim window");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin.execute(idx.as_str()).await.expect("index");
@@ -211,6 +215,7 @@ fn enq(
         fair_key: tenant.into(),
         idem_token: idem.into(),
         stage: "build".into(),
+        claim_window_secs: CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
     }
 }
 
@@ -524,7 +529,7 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
         vec!["linux".into()],
         vec![TrustTier::Trusted], // trusted-only
         Region(region.into()),
-        CI_RUNNER_LEASE_TTL_SECS, // the CT-004d.1 lease-TTL floor (> max job timeout)
+        CI_RUNNER_EXECUTION_LEASE_TTL_SECS, // the CT-004d.1 lease-TTL floor (> max job timeout)
         adapter,
         &backend,
         &firehose,
@@ -820,7 +825,7 @@ async fn trusted_runner_never_executes_a_dispatched_untrusted_fork() {
         &[TrustTier::Trusted], // trusted-only
         &Region(region.into()),
         1000,
-        CI_RUNNER_LEASE_TTL_SECS,
+        CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
     );
     assert!(
         claimed.is_none(),
@@ -901,7 +906,7 @@ async fn a_leased_row_without_a_spec_resolves_fail_closed() {
         &[TrustTier::Trusted],
         &Region(region.into()),
         1000,
-        CI_RUNNER_LEASE_TTL_SECS,
+        CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
     );
     assert!(
         claimed.is_none(),
@@ -928,8 +933,8 @@ async fn a_leased_row_without_a_spec_resolves_fail_closed() {
 #[test]
 fn the_wired_lease_ttl_exceeds_the_max_job_timeout() {
     assert!(
-        CI_RUNNER_LEASE_TTL_SECS > MAX_JOB_TIMEOUT_SECS as i64,
-        "the wired runner lease TTL ({CI_RUNNER_LEASE_TTL_SECS}) must exceed the max job timeout \
+        CI_RUNNER_EXECUTION_LEASE_TTL_SECS > MAX_JOB_TIMEOUT_SECS as i64,
+        "the wired runner lease TTL ({CI_RUNNER_EXECUTION_LEASE_TTL_SECS}) must exceed the max job timeout \
          ({MAX_JOB_TIMEOUT_SECS}) so a job never lapses its lease mid-run (no reaper double-run)"
     );
 }

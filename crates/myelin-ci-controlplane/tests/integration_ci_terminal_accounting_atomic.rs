@@ -18,7 +18,7 @@ use myelin_ci_controlplane::{
     CiRunFinalizationJob, CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert, CiRunStoreError,
     CiRunTerminalState, DurableCiJobAccounting, DurableCiRunFinalizer, DurableEnqueue,
     DurableLeaseAdapter, GrantedCiJobV1, JobQueueReaper, Lane, ManifestBoundCiJobTokenAuthority,
-    PgCiRunSupersession, PricedCiJobUsage, CI_MANIFEST_PIPELINE_VERSION, CI_RUNNER_LEASE_TTL_SECS,
+    PgCiRunSupersession, PricedCiJobUsage, CI_MANIFEST_PIPELINE_VERSION, CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
     LINUX_SMALL_V1_RUNNER_LABELS, TIER_P_OPERATIONAL_PRICING_REVISION,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
@@ -450,33 +450,21 @@ async fn run_reporter_scenario(
     PgMigrator::apply(&pool, &reserve_settle_durable_migrations())
         .await
         .unwrap();
-    PgMigrator::apply_validated(
-        &pool,
-        &ci_controlplane_migrations(),
-        &ci_controlplane_hot_tables(),
-    )
-    .await
-    .unwrap();
     // This drill uses the admin-backed test scheduler adapter, not the dedicated production role.
-    // Remove the migration's schema-local grants immediately so a later assertion failure cannot
-    // leave an abandoned test schema that trips the global scheduler least-privilege probe.
-    sqlx::raw_sql(&format!(
-        "REVOKE SELECT ON {schema}.job_queue FROM myelin_ci_region_scheduler;
-         REVOKE UPDATE (
-           state, lease_owner, lease_expires, lease_epoch, claim_nonce,
-           claim_started_at, claim_expires_at
-         ) ON {schema}.job_queue FROM myelin_ci_region_scheduler;
-         REVOKE SELECT ON {schema}.fair_deficit FROM myelin_ci_region_scheduler;
-         REVOKE SELECT (
-           tenant_id, region, state, created_at, run_id, wf_run_id
-         ) ON {schema}.ci_run FROM myelin_ci_region_scheduler;
-         REVOKE SELECT (
-           tenant_id, region, run_id, wf_type, state, partition, created_at
-         ) ON {schema}.workflow_run FROM myelin_ci_region_scheduler;"
-    ))
-    .execute(&pool)
-    .await
-    .expect("remove scheduler grants from the disposable accounting schema");
+    // The shared helper holds CI_PRIVILEGE_FIXTURE_LOCK across the apply and then strips EVERY
+    // scheduler grant from this schema — replacing a hand-listed REVOKE that had silently fallen
+    // behind the migration set (it never covered ci_job_parent_attempt, ci_job_prelaunch_usage,
+    // ci_job, or workflow_run.wf_version).
+    common::with_fixture_migration_lock(&admin_url(), &pool, &schema, || async {
+        PgMigrator::apply_validated(
+            &pool,
+            &ci_controlplane_migrations(),
+            &ci_controlplane_hot_tables(),
+        )
+        .await
+        .unwrap();
+    })
+    .await;
 
     let tenant = TenantId::from_token("accounting-tenant");
     let region = Region::new("fr-par");
@@ -722,7 +710,7 @@ async fn run_reporter_scenario(
             &runner_labels,
             &[TrustTier::Trusted],
             owner,
-            CI_RUNNER_LEASE_TTL_SECS as u64,
+            CI_RUNNER_EXECUTION_LEASE_TTL_SECS as u64,
         )
         .await
         .unwrap()
@@ -1533,7 +1521,7 @@ async fn run_reporter_scenario(
                     &runner_labels,
                     &[TrustTier::Trusted],
                     "obsolete-before-report",
-                    CI_RUNNER_LEASE_TTL_SECS as u64,
+                    CI_RUNNER_EXECUTION_LEASE_TTL_SECS as u64,
                 )
                 .await
                 .unwrap()
@@ -1608,6 +1596,7 @@ async fn run_reporter_scenario(
                     fair_key: poison_tenant.into(),
                     idem_token: "poison-cancelled-recovery".into(),
                     stage: "build".into(),
+                    claim_window_secs: CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
                 })
                 .await
                 .unwrap();
@@ -1754,7 +1743,7 @@ async fn run_reporter_scenario(
                     &runner_labels,
                     &[TrustTier::Trusted],
                     "obsolete-probe",
-                    CI_RUNNER_LEASE_TTL_SECS as u64,
+                    CI_RUNNER_EXECUTION_LEASE_TTL_SECS as u64,
                 )
                 .await
                 .unwrap()
@@ -1865,7 +1854,7 @@ async fn run_reporter_scenario(
                 &runner_labels,
                 &[TrustTier::Trusted],
                 "obsolete-retry-probe",
-                CI_RUNNER_LEASE_TTL_SECS as u64,
+                CI_RUNNER_EXECUTION_LEASE_TTL_SECS as u64,
             )
             .await
             .unwrap()
@@ -1890,7 +1879,7 @@ async fn run_reporter_scenario(
             &runner_labels,
             &[TrustTier::Trusted],
             owner,
-            CI_RUNNER_LEASE_TTL_SECS as u64,
+            CI_RUNNER_EXECUTION_LEASE_TTL_SECS as u64,
         )
         .await
         .unwrap()
@@ -2182,7 +2171,7 @@ async fn run_reporter_scenario(
             .collect(),
         vec![TrustTier::Trusted],
         region.clone(),
-        CI_RUNNER_LEASE_TTL_SECS,
+        CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
         leases,
         &backend,
         &firehose,
@@ -2619,13 +2608,16 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
         PgMigrator::apply(&pool, &reserve_settle_durable_migrations())
             .await
             .unwrap();
-        PgMigrator::apply_validated(
-            &pool,
-            &ci_controlplane_migrations(),
-            &ci_controlplane_hot_tables(),
-        )
-        .await
-        .unwrap();
+        common::with_fixture_migration_lock(&admin_url(), &pool, &schema, || async {
+            PgMigrator::apply_validated(
+                &pool,
+                &ci_controlplane_migrations(),
+                &ci_controlplane_hot_tables(),
+            )
+            .await
+            .unwrap();
+        })
+        .await;
 
         let tenant = TenantId::from_token("accounting-v2-tenant");
         let region = Region::new("fr-par");

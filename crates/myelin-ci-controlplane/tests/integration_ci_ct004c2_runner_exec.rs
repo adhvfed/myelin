@@ -34,13 +34,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use common::with_schema_cleanup;
+use myelin_ci_controlplane::CI_RUNNER_EXECUTION_LEASE_TTL_SECS;
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_region_queue_store_test_support, DurableEnqueue, DurableLeaseAdapter,
     DurableLogPersist, EnqueueOutcome, JobSpecResolver, Lane, LeasedJob, LogPipelineSink,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
-    CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
-    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
+    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL,
+    CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL,
+    CREATE_LOG_SEGMENT_DDL,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
@@ -122,6 +124,10 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL)
         .await
         .expect("add retryable-attempt usage accrual");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
+        .await
+        .expect("add the durable claim window");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin.execute(idx.as_str()).await.expect("index");
@@ -269,6 +275,7 @@ fn enq(
         fair_key: tenant.into(),
         idem_token: idem.into(),
         stage: "build".into(),
+        claim_window_secs: CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
     }
 }
 

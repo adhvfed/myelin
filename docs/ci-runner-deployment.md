@@ -125,6 +125,52 @@ already landed in its final `supervisor/` location and the boundary is fully set
 uses `exec` (not a plain subshell) to replace itself with the real binary so systemd's
 MainPID/signal tracking is unaffected.
 
+## PostgreSQL definition-fence provisioning
+
+**Required before deploying a binary that carries `ci_0020h`, on every existing database.** A fresh
+Docker volume provisions itself (the `pg-init` scripts run in filename order); an existing database
+does not, so this is a deliberate two-stage rollout.
+
+The `ci.pipeline` definition cutover drains the superseded workflow definition and activates the new
+one in a single transaction, gated on a database-wide backlog probe. That probe must see past
+`workflow_run`'s FORCE row-level security — otherwise it returns `false` rather than raising, and the
+cutover drains a definition that live runs still depend on. The authority lives in one dedicated
+`BYPASSRLS` role, provisioned by an operator rather than by a migration: migration behaviour must not
+vary with whatever privileges the migration credential happens to hold.
+
+**Order (do not deploy before step 1 on each database):**
+
+1. Run the provisioning script with a cluster-admin/superuser credential, passing the ACTUAL role
+   behind `DATABASE_MIGRATION_URL`:
+
+   ```sh
+   psql "$DATABASE_PROVISIONING_URL" \
+     --set=ON_ERROR_STOP=1 \
+     --set=migration_role=myelin_admin \
+     --file scripts/pg-init/01-ci-definition-fence.sql
+   ```
+
+2. Verify the postconditions the script prints: the role is
+   `NOLOGIN NOSUPERUSER BYPASSRLS NOINHERIT`, `myelin_ci_security` is owned by it, and the migration
+   role holds exactly one membership edge with `admin=false, inherit=false, set=true`.
+3. Deploy the new binary.
+4. Boot applies `ci_0020h` (verifies the provisioning, grants the fence role `SELECT` on exactly
+   `wf_type, wf_version, state`, and creates the probe already owned by the fence role) and then
+   `ci_0020i` (seeds the cutover's predecessor row).
+5. Only then does the definition cutover run, as the last gate before the runner lane starts.
+
+**If step 1 is skipped**, `ci_0020h` fails before it is recorded and before anything is drained. The
+error names this script and the exact `migration_role=` argument. Already-deployed binaries are
+untouched and keep serving; the failure is safe, loud and actionable. Re-run step 1 and reboot.
+
+The script is idempotent and safe to re-run. It refuses — rather than mass-revoking — if a role of
+the same name already exists owning or holding anything outside this dedicated scope, since that
+would mean the name was previously used for another purpose.
+
+`scripts/drill-ci-definition-fence-fresh-postgres.sh` proves the fresh-volume half of this against a
+throwaway `postgres:16` container, including a non-superuser migration role; the persistent dev stack
+cannot cover init-ordering by construction.
+
 ## Installing the service
 
 ```sh

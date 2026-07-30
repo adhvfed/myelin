@@ -67,13 +67,14 @@ use sqlx::postgres::PgPool;
 use sqlx::types::Uuid;
 use sqlx::{Acquire, Postgres, Row};
 
-use crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS;
+use crate::ci_claim_window::MAX_CI_JOB_CLAIM_WINDOW_SECS;
+use crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS;
 #[cfg(any(test, feature = "test-support"))]
 use crate::scheduler::CANCEL_SUPERSEDED_QUERY;
 use crate::scheduler::{
     EnqueueOutcome, Lane, AUTHORIZE_JOB_LAUNCH_QUERY, COMPLETE_JOB_QUERY, CONSUME_CLAIM_QUERY,
     CONSUME_PREPARATION_CLAIM_QUERY, HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY,
-    READ_COMPLETION_DISPOSITION_QUERY, VERIFY_JOB_LAUNCH_LIVE_QUERY,
+    READ_COMPLETION_DISPOSITION_QUERY, RENEW_PREPARATION_LEASE_QUERY, VERIFY_JOB_LAUNCH_LIVE_QUERY,
 };
 
 // =================================================================================================
@@ -168,6 +169,11 @@ pub struct DurableEnqueue {
     /// Durable pipeline stage attribution. Every new dispatch supplies it; NULL is reserved for
     /// historical pre-expand rows and blocks runner-lane activation.
     pub stage: String,
+    /// The immutable claim window (seconds) the claim sizes `claim_expires_at` from — derived from
+    /// this dispatch's own launch template by
+    /// [`claim_window_secs`](crate::ci_claim_window::claim_window_secs). NOT an `Option`: a NULL
+    /// window is legacy-only, so a Rust writer that could produce one must not exist.
+    pub claim_window_secs: i64,
 }
 
 /// A leased `job_queue` row (the `CLAIM_QUERY` `RETURNING` shape) — the claimed job's identity + the
@@ -204,6 +210,11 @@ pub struct LeasedJob {
     /// Initial claim expiry in Unix epoch seconds. A token authority may issue only within this
     /// bounded claim generation; heartbeat may extend execution but never rewrites mint identity.
     pub claim_expires_at_epoch_secs: i64,
+    /// The durable claim window this generation's expiry was sized from, or `None` for a legacy row
+    /// dispatched before the column existed (which the claim sized from the flat execution-lease TTL
+    /// instead). A checkout-bearing job may never run under `None`: the resolver refuses it before
+    /// mint, and the token issuer refuses it again inside the locked mint transaction.
+    pub claim_window_secs: Option<i64>,
 }
 
 /// Exact durable scheduler generation presented to the final pre-spawn launch fence.
@@ -232,14 +243,17 @@ pub(crate) struct LockedJobClaim {
     pub claim_nonce: Option<String>,
     pub claim_started_at_epoch_secs: Option<i64>,
     pub claim_expires_at_epoch_secs: Option<i64>,
+    pub claim_window_secs: Option<i64>,
     pub claim_is_live: bool,
 }
 
 /// Lock one exact scheduler row and recover its persisted initial claim generation. Job-queue lock
 /// precedes the CI-run lock everywhere token minting needs both, matching reporter/reaper ownership.
+/// `claim_window_secs` is returned so the issuer can prove the locked generation's expiry really was
+/// sized from the durable window, and that the window really is what the dispatched spec derives.
 pub const LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY: &str = "\
 SELECT state, idem_token, stage, trust_tier, lease_owner, lease_epoch,
-       claim_nonce::text AS claim_nonce,
+       claim_nonce::text AS claim_nonce, claim_window_secs,
        EXTRACT(EPOCH FROM claim_started_at)::bigint AS claim_started_at_epoch_secs,
        EXTRACT(EPOCH FROM claim_expires_at)::bigint AS claim_expires_at_epoch_secs,
        COALESCE(claim_expires_at > statement_timestamp(), false) AS claim_is_live
@@ -433,6 +447,7 @@ impl CiJobQueueStore {
             claim_nonce: row.get("claim_nonce"),
             claim_started_at_epoch_secs: row.get("claim_started_at_epoch_secs"),
             claim_expires_at_epoch_secs: row.get("claim_expires_at_epoch_secs"),
+            claim_window_secs: row.get("claim_window_secs"),
             claim_is_live: row.get("claim_is_live"),
         }))
     }
@@ -457,6 +472,12 @@ impl CiJobQueueStore {
         let fair_key = job.fair_key.clone();
         let idem = job.idem_token.clone();
         let stage = job.stage.clone();
+        let claim_window_secs = job.claim_window_secs;
+        if !(1..=MAX_CI_JOB_CLAIM_WINDOW_SECS as i64).contains(&claim_window_secs) {
+            return Err(JobQueueStoreError::InvalidInput(format!(
+                "claim window {claim_window_secs}s is outside the durable 1..={MAX_CI_JOB_CLAIM_WINDOW_SECS}s bound"
+            )));
+        }
         let inserted = with_tenant_tx(&self.pool, &job.tenant_id, &job.region, move |conn| {
             Box::pin(async move {
                 let row = sqlx::query(INSERT_JOB_QUEUE_QUERY)
@@ -471,6 +492,7 @@ impl CiJobQueueStore {
                     .bind(&fair_key) // $9 fair_key
                     .bind(&idem) // $10 idem_token
                     .bind(&stage) // $11 durable pipeline stage
+                    .bind(claim_window_secs) // $12 immutable dispatch-derived claim window
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(|e| PgError::Query(e.to_string()))?;
@@ -624,7 +646,7 @@ impl CiJobQueueStore {
             .bind(claim_nonce)
             .bind(claim.claim_started_at_epoch_secs)
             .bind(claim.claim_expires_at_epoch_secs)
-            .bind(CI_RUNNER_LEASE_TTL_SECS)
+            .bind(CI_RUNNER_EXECUTION_LEASE_TTL_SECS)
             .fetch_optional(&mut *transaction)
             .await
             .map_err(|error| JobQueueStoreError::Db(format!("authorize launch fence: {error}")))?;
@@ -688,6 +710,52 @@ impl CiJobQueueStore {
             connection: Some(connection),
             lock_key,
         }))
+    }
+
+    /// **The exact-generation preparation-lease renewal ([`RENEW_PREPARATION_LEASE_QUERY`]).** Push
+    /// `lease_expires` forward by one execution slot, capped at the immutable claim expiry, for a
+    /// generation that is still `leased`, still owns the exact durable parent attempt, and whose
+    /// public surface has not yet crossed to `running`.
+    ///
+    /// Returns `false` when NOTHING matched — the generation was reaped, cancelled, terminalized, or
+    /// its workload launch already won. That is ownership loss, not a benign no-op: the caller MUST
+    /// abort before spawning anything else under this claim.
+    pub async fn renew_preparation_lease(
+        &self,
+        claim: &CiJobLaunchClaim,
+    ) -> Result<bool, JobQueueStoreError> {
+        let job_id = parse_id("job_id", &claim.job_id)?;
+        let wf_run_id = parse_id("run_id", &claim.wf_run_id)?;
+        let claim_nonce = parse_id("claim_nonce", &claim.claim_nonce)?;
+        let tenant_id = claim.tenant_id.clone();
+        let region = claim.region.clone();
+        let lease_owner = claim.lease_owner.clone();
+        let lease_epoch = claim.lease_epoch;
+        let claim_started_at_epoch_secs = claim.claim_started_at_epoch_secs;
+        let claim_expires_at_epoch_secs = claim.claim_expires_at_epoch_secs;
+        let execution_lease = CI_RUNNER_EXECUTION_LEASE_TTL_SECS.to_string();
+        let renewed = with_tenant_tx(&self.pool, &claim.tenant_id, &claim.region, move |conn| {
+            Box::pin(async move {
+                let row = sqlx::query(RENEW_PREPARATION_LEASE_QUERY)
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .bind(job_id)
+                    .bind(wf_run_id)
+                    .bind(&lease_owner)
+                    .bind(lease_epoch)
+                    .bind(claim_nonce)
+                    .bind(claim_started_at_epoch_secs)
+                    .bind(claim_expires_at_epoch_secs)
+                    .bind(&execution_lease)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| PgError::Query(e.to_string()))?;
+                Ok(row.is_some())
+            })
+        })
+        .await
+        .map_err(JobQueueStoreError::from_pg)?;
+        Ok(renewed)
     }
 
     /// **CT-007 slice 5b.3-2c: read-only sibling of [`Self::authorize_launch_retained`].** Checks
@@ -1153,7 +1221,7 @@ mod tests {
     use crate::scheduler::{
         AUTHORIZE_JOB_LAUNCH_QUERY, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, COMPLETE_JOB_QUERY,
         CONSUME_CLAIM_QUERY, CONSUME_PREPARATION_CLAIM_QUERY, HEARTBEAT_QUERY,
-        INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
+        INSERT_JOB_QUEUE_QUERY, REAP_QUERY, RENEW_PREPARATION_LEASE_QUERY,
     };
 
     /// **The store's SQL constants are well-formed against the real DDL (bind arity + column names).**
@@ -1162,8 +1230,9 @@ mod tests {
     /// column, a changed bind order) is loud here, before the live integration test.
     #[test]
     fn the_bound_sql_matches_the_store_binds() {
-        // INSERT: eleven binds ($1..$11), including queue-authority stage.
-        assert!(INSERT_JOB_QUEUE_QUERY.contains("$11") && !INSERT_JOB_QUEUE_QUERY.contains("$12"));
+        // INSERT: twelve binds ($1..$12), including queue-authority stage + the claim window.
+        assert!(INSERT_JOB_QUEUE_QUERY.contains("$12") && !INSERT_JOB_QUEUE_QUERY.contains("$13"));
+        assert!(INSERT_JOB_QUEUE_QUERY.contains("claim_window_secs"));
         assert!(INSERT_JOB_QUEUE_QUERY.contains("ON CONFLICT (tenant_id, idem_token) DO NOTHING"));
         assert!(INSERT_JOB_QUEUE_QUERY.contains("RETURNING job_id"));
         // CLAIM: five binds ($1..$5), RETURNING every column leased_from_row reads.
@@ -1178,6 +1247,7 @@ mod tests {
             "j.trust_tier",
             "j.lease_epoch",
             "j.claim_nonce",
+            "j.claim_window_secs",
             "claim_started_at_epoch_secs",
             "claim_expires_at_epoch_secs",
         ] {
@@ -1190,8 +1260,7 @@ mod tests {
         assert!(CLAIM_QUERY.contains("lease_epoch = j.lease_epoch + 1"));
         assert!(CLAIM_QUERY.contains("claim_nonce = gen_random_uuid()"));
         assert!(CLAIM_QUERY.contains("claim_started_at = statement_timestamp()"));
-        assert!(CLAIM_QUERY
-            .contains("claim_expires_at = statement_timestamp() + ($5 || ' seconds')::interval"));
+        assert!(CLAIM_QUERY.contains("COALESCE(j.claim_window_secs::text, $5)"));
         assert!(CLAIM_QUERY.contains("w.state IN ('running', 'waiting')"));
         assert!(CLAIM_QUERY.contains("c.state = 'running'"));
         assert!(CLAIM_QUERY.contains("c.wf_run_id = q.run_id"));
@@ -1235,10 +1304,17 @@ mod tests {
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("SET state = 'running'"));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("UPDATE ci_job AS surface"));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("surface.state IN ('queued', 'leased')"));
-        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("lease_expires = statement_timestamp()"));
+        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("lease_expires = LEAST("));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("state = 'leased'"));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("claim_nonce = $7::uuid"));
         assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("claim_expires_at > statement_timestamp()"));
+        // RENEW: ten binds ($1..$10), leased-only, capped at the immutable claim expiry.
+        assert!(
+            RENEW_PREPARATION_LEASE_QUERY.contains("$10")
+                && !RENEW_PREPARATION_LEASE_QUERY.contains("$11")
+        );
+        assert!(RENEW_PREPARATION_LEASE_QUERY.contains("SET lease_expires = LEAST("));
+        assert!(RENEW_PREPARATION_LEASE_QUERY.contains("q.state = 'leased'"));
         // REAP: one bind ($1 region), an in-place UPDATE (no INSERT → 0 duplicate enqueues).
         assert!(REAP_QUERY.contains("$1") && !REAP_QUERY.contains("$2"));
         assert!(REAP_QUERY

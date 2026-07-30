@@ -87,12 +87,14 @@ impl CiJobTokenRequest {
                 .map_err(|_| {
                     CiJobTokenIssueError("claim lifetime is outside the supported range".into())
                 })?;
-        if claim_lifetime
-            > u64::try_from(crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS)
-                .expect("the runner lease bound is positive")
-        {
+        // CT-007 lease/topology reconciliation: the accepted ceiling is the CLAIM window's maximum
+        // (four executions at the job-timeout ceiling), not the one-execution lease TTL — a
+        // legitimately long checkout-bearing claim must not be refused here. The credential's own
+        // lifetime stays capped at `MAX_CI_JOB_TOKEN_TTL_SECS`; this bounds only the claim generation
+        // a credential may be bound to.
+        if claim_lifetime > crate::ci_claim_window::MAX_CI_JOB_CLAIM_WINDOW_SECS {
             return Err(CiJobTokenIssueError(
-                "claim lifetime exceeds the production runner lease bound".into(),
+                "claim lifetime exceeds the production claim-window bound".into(),
             ));
         }
         Ok(())
@@ -278,6 +280,10 @@ fn manifest_dispatch_parts(
         IdemToken(flow.idem_token.clone()),
     )
     .map_err(|error| ActivityError(error.to_string()))?;
+    // The immutable claim ceiling comes from the SAME template this dispatch persists, so
+    // `co_persist_dispatch`'s recomputation can only ever agree (it refuses fail-closed otherwise).
+    let claim_window_secs = crate::ci_claim_window::claim_window_secs_for_template(&spec)
+        .map_err(|error| ActivityError(error.to_string()))?;
     let enqueue = DurableEnqueue {
         tenant_id: manifest.tenant_id.clone(),
         region: manifest.region.clone(),
@@ -290,6 +296,7 @@ fn manifest_dispatch_parts(
         fair_key: job.scheduling.fair_key.clone(),
         idem_token: flow.idem_token.clone(),
         stage: job.name.clone(),
+        claim_window_secs,
     };
     Ok((
         enqueue,
@@ -389,12 +396,36 @@ mod tests {
         };
         request.validate().unwrap();
 
+        // A legitimately long checkout-bearing claim is ACCEPTED up to the claim-window maximum, and
+        // refused one second past it. The one-execution lease TTL is no longer the bound here.
+        let mut longest_legal = request.clone();
+        longest_legal.claim_expires_at_epoch_secs = longest_legal.claim_started_at_epoch_secs
+            + crate::ci_claim_window::MAX_CI_JOB_CLAIM_WINDOW_SECS as i64;
+        longest_legal.validate().unwrap();
+        let mut checkout_length = request.clone();
+        checkout_length.claim_expires_at_epoch_secs = checkout_length.claim_started_at_epoch_secs
+            + crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS
+            + 1;
+        checkout_length.validate().unwrap();
+
         let mut overlong = request.clone();
-        overlong.claim_expires_at_epoch_secs =
-            overlong.claim_started_at_epoch_secs + crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS + 1;
+        overlong.claim_expires_at_epoch_secs = overlong.claim_started_at_epoch_secs
+            + crate::ci_claim_window::MAX_CI_JOB_CLAIM_WINDOW_SECS as i64
+            + 1;
         assert!(overlong.validate().is_err());
         let mut malformed = request;
         malformed.claim_nonce = "not-a-uuid".into();
         assert!(malformed.validate().is_err());
+    }
+
+    /// **The credential ceiling is unchanged by the longer claim window.** A 300-second token
+    /// remains the credential bound regardless of how long the generation it is bound to lives.
+    #[test]
+    fn the_token_ttl_ceiling_is_independent_of_the_claim_window() {
+        assert_eq!(MAX_CI_JOB_TOKEN_TTL_SECS, 300);
+        assert!(
+            (MAX_CI_JOB_TOKEN_TTL_SECS as i64)
+                < crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS
+        );
     }
 }

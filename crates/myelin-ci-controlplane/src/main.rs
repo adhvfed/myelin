@@ -569,10 +569,6 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(error) = runner_runtime.activate_definition() {
-            eprintln!("ci-controlplane: ci.pipeline definition activation refused: {error}");
-            std::process::exit(1);
-        }
         let starter_poller = myelin_ci_controlplane::PgCiRunStarterPoller::new(
             scheduler_provider.region_run_discovery(),
             starter_factory,
@@ -647,7 +643,7 @@ async fn main() {
                 .collect(),
             vec![myelin_ci_sandbox::TrustTier::Trusted],
             provider.config().region.clone(),
-            myelin_ci_controlplane::CI_RUNNER_LEASE_TTL_SECS,
+            myelin_ci_controlplane::CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
             region_queue_store.clone(),
             myelin_ci_controlplane::ci_job_queue_store(provider.db_pool().clone()),
             tokio::runtime::Handle::current(),
@@ -659,6 +655,23 @@ async fn main() {
             gvisor_workspace_config
                 .expect("gvisor_workspace_config is Some whenever runner_host_requested is true"),
         );
+        // THE DEFINITION CUTOVER FENCE (CT-007 lease/topology reconciliation) — the LAST boot gate,
+        // deliberately after every fallible composition above. It is a single transaction that locks
+        // the superseded `wf_definition` row `FOR UPDATE` (the same row a fresh old-binary admission
+        // holds `FOR SHARE` until it commits), runs the database-wide backlog probe under that
+        // fence, and only then drains the old version and activates this one — atomically. A
+        // preflight SELECT could not close that race; see `cutover_definition`'s own doc.
+        //
+        // Placed here so a refusal cannot leave a half-composed process holding a committed
+        // registry transition, and so nothing has spawned that would admit work under the new
+        // version before the fence commits.
+        if let Err(error) = runner_runtime
+            .cutover_definition(&scheduler_provider.region_run_discovery())
+            .await
+        {
+            eprintln!("ci-controlplane: startup refused: {error}");
+            std::process::exit(1);
+        }
         match myelin_ci_controlplane::CiRunnerHost::new(starter_poller, workflow_poller, runner)
             .start_with_shutdown(
                 myelin_ci_controlplane::CiRunnerHostConfig::production(),

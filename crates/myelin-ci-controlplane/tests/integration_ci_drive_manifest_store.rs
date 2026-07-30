@@ -20,10 +20,10 @@ use myelin_ci_controlplane::{
     ManifestBoundCiJobTokenAuthority, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
     ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
     ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
-    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, CI_PIPELINE_WF_TYPE, CREATE_CI_DRIVE_MANIFEST_DDL,
-    CREATE_CI_JOB_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL,
-    CREATE_JOB_QUEUE_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    CI_PIPELINE_WF_TYPE, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_SPEC_DDL,
+    CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
@@ -448,6 +448,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
          {ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL};
          {ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL};
          {ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL};
+         {ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL};
          SELECT myelin_make_tenant_scoped('job_queue');
          {CREATE_CI_JOB_SPEC_DDL};
          {ALTER_CI_JOB_SPEC_ADD_STAGE_DDL};
@@ -544,11 +545,11 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         "INSERT INTO job_queue (
            tenant_id, region, job_id, run_id, lane, labels, trust_tier, fair_key, idem_token,
            lease_owner, lease_expires, state, lease_epoch, claim_nonce, stage,
-           claim_started_at, claim_expires_at
+           claim_started_at, claim_expires_at, claim_window_secs
          ) VALUES (
            $1, $2, $3::uuid, $4::uuid, 'batch', ARRAY['linux'], 'trusted', $5, $6,
            $7, statement_timestamp() + interval '300 seconds', 'leased', $8, $9::uuid, 'build',
-           statement_timestamp(), statement_timestamp() + interval '300 seconds'
+           statement_timestamp(), statement_timestamp() + interval '4800 seconds', 4800
          )
          RETURNING EXTRACT(EPOCH FROM claim_started_at)::bigint,
                    EXTRACT(EPOCH FROM claim_expires_at)::bigint",
@@ -578,11 +579,11 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
            tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group,
            fair_key, idem_token,
            lease_owner, lease_expires, state, lease_epoch, claim_nonce, stage,
-           claim_started_at, claim_expires_at
+           claim_started_at, claim_expires_at, claim_window_secs
          ) VALUES (
            $1, $2, $3::uuid, $4::uuid, 'batch', ARRAY['linux'], 'trusted', 'pr:web:42', $5, $6,
            $7, statement_timestamp() + interval '300 seconds', 'leased', $8, $9::uuid, 'lint',
-           statement_timestamp(), statement_timestamp() + interval '300 seconds'
+           statement_timestamp(), statement_timestamp() + interval '4800 seconds', 4800
          )
          RETURNING EXTRACT(EPOCH FROM claim_started_at)::bigint,
                    EXTRACT(EPOCH FROM claim_expires_at)::bigint",
@@ -612,11 +613,11 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
            tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group,
            fair_key, idem_token,
            lease_owner, lease_expires, state, lease_epoch, claim_nonce, stage,
-           claim_started_at, claim_expires_at
+           claim_started_at, claim_expires_at, claim_window_secs
          ) VALUES (
            $1, $2, $3::uuid, $4::uuid, 'batch', ARRAY['linux'], 'trusted', 'pr:web:42', $5, $6,
            $7, statement_timestamp() + interval '300 seconds', 'leased', $8, $9::uuid, 'test',
-           statement_timestamp(), statement_timestamp() + interval '300 seconds'
+           statement_timestamp(), statement_timestamp() + interval '4800 seconds', 4800
          )
          RETURNING EXTRACT(EPOCH FROM claim_started_at)::bigint,
                    EXTRACT(EPOCH FROM claim_expires_at)::bigint",
@@ -1201,7 +1202,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         "UPDATE job_queue
          SET state = 'leased', lease_owner = $4, lease_epoch = $5, claim_nonce = $6::uuid,
              claim_started_at = statement_timestamp(),
-             claim_expires_at = statement_timestamp() + interval '300 seconds',
+             claim_expires_at = statement_timestamp() + interval '4800 seconds',
              lease_expires = statement_timestamp() + interval '300 seconds'
          WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
          RETURNING EXTRACT(EPOCH FROM claim_started_at)::bigint,

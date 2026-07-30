@@ -1,6 +1,8 @@
 //! Live PostgreSQL proof for immutable-manifest resolution and DAG replay.
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -339,13 +341,16 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
     )
     .await
     .unwrap();
-    PgMigrator::apply_validated(
-        &pool,
-        &ci_controlplane_migrations(),
-        &ci_controlplane_hot_tables(),
-    )
-    .await
-    .unwrap();
+    common::with_fixture_migration_lock(&admin_url(), &pool, &schema, || async {
+        PgMigrator::apply_validated(
+            &pool,
+            &ci_controlplane_migrations(),
+            &ci_controlplane_hot_tables(),
+        )
+        .await
+        .unwrap();
+    })
+    .await;
 
     let register = PgFlowExecutor::new(
         pool.clone(),
@@ -369,7 +374,7 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
          trigger_kind, trust_tier, state, correlation_id) \
          VALUES ($1,$2,$3::uuid,'43000000-0000-8000-8000-000000000001'::uuid, \
          '44000000-0000-8000-8000-000000000001'::uuid,$4::uuid, \
-         'myelin://manifest_dag/git/repo/core','deadbeef','trigger-manifest-dag',1, \
+         'myelin://manifest_dag/git/repo/core','deadbeef00deadbeef00deadbeef00deadbeef00','trigger-manifest-dag',1, \
          'session:test',$5,'push','trusted','queued','corr-manifest-dag')",
     )
     .bind(TENANT)
@@ -387,7 +392,7 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         &pool,
         CI_RUN_ID,
         "myelin://manifest_dag/git/repo/core",
-        "deadbeef",
+        "deadbeef00deadbeef00deadbeef00deadbeef00",
     )
     .await;
     let starter = PgCiPipelineStarter::new_with_authority(
@@ -530,7 +535,7 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
             spec.workspace.repo_ref.as_deref(),
             Some("myelin://manifest_dag/git/repo/core")
         );
-        assert_eq!(spec.workspace.commit.as_deref(), Some("deadbeef"));
+        assert_eq!(spec.workspace.commit.as_deref(), Some("deadbeef00deadbeef00deadbeef00deadbeef00"));
         assert!(spec.env.is_empty());
         assert!(spec.secret_refs.is_empty());
         assert!(spec.egress.allow.is_empty());

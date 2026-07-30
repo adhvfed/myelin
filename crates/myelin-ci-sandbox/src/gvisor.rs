@@ -6868,6 +6868,7 @@ pub(crate) fn fetch_checkout_pack_within_parent_attempt(
     run_token: RunTokenCredential,
     proof: CheckoutAuthorizationProof,
     cancellation: &AtomicBool,
+    lease_checkpoint: Option<&dyn crate::PreparationLeaseCheckpoint>,
 ) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
     fetch_checkout_pack_within_parent_attempt_given(
         root,
@@ -6879,6 +6880,7 @@ pub(crate) fn fetch_checkout_pack_within_parent_attempt(
         run_token,
         proof,
         cancellation,
+        lease_checkpoint,
         &|job, cfg, stdin, rootfs, cancellation, permit| {
             run_git_wire_container_raw(job, cfg, stdin, rootfs, cancellation, permit)
         },
@@ -6902,6 +6904,7 @@ fn fetch_checkout_pack_within_parent_attempt_given(
     run_token: RunTokenCredential,
     proof: CheckoutAuthorizationProof,
     cancellation: &AtomicBool,
+    lease_checkpoint: Option<&dyn crate::PreparationLeaseCheckpoint>,
     execute: GitWireHopExecutor,
 ) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
     // Verify the proof's scope AND the exact token generation it was checked against, against THIS
@@ -7059,6 +7062,19 @@ fn fetch_checkout_pack_within_parent_attempt_given(
             usage_after_advertise,
         )
     })?;
+
+    // CT-007 lease/topology reconciliation: Hop A contains TWO independently full-timeout
+    // executions, so the advertise→fetch boundary is a mandatory renewal checkpoint — without it the
+    // interval between renewals could legally hold two executions and lapse the lease mid-Hop-A. The
+    // renewal runs AFTER the advertisement is fully retired and BEFORE the fetch spawns; a lost
+    // generation aborts here carrying the advertisement's already-measured usage, never spawns under
+    // a lease another worker now owns. `None` keeps every pre-composition caller unchanged; 5b.3-6
+    // supplies the durable checkpoint and adds the later Hop A→B and B→workload calls.
+    if let Some(checkpoint) = lease_checkpoint {
+        checkpoint.renew().map_err(|lost| {
+            checkout_transport_retryable(lost.to_string(), usage_after_advertise)
+        })?;
+    }
 
     let (fetch_result, usage_after_fetch) = run_one_git_wire_hop_within_parent_attempt(
         &fetch_spec,
@@ -14666,6 +14682,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -14702,6 +14719,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -14736,6 +14754,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -14767,6 +14786,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -14818,6 +14838,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .expect("scripted happy path must succeed");
@@ -14835,6 +14856,139 @@ mod tests {
                     },
                     "success must checked-add advertisement + fetch usage"
                 );
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            // ---- the advertise→fetch preparation-lease checkpoint ----
+
+            /// A checkpoint that always refuses, recording that it was consulted exactly once.
+            struct LostLeaseCheckpoint {
+                calls: std::sync::Mutex<u32>,
+            }
+
+            impl crate::PreparationLeaseCheckpoint for LostLeaseCheckpoint {
+                fn renew(&self) -> Result<(), crate::PreparationLeaseLost> {
+                    *self.calls.lock().unwrap() += 1;
+                    Err(crate::PreparationLeaseLost(
+                        "exact generation no longer owns this claim".into(),
+                    ))
+                }
+            }
+
+            #[test]
+            fn a_lost_preparation_lease_refuses_between_advertise_and_fetch_and_retains_usage() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd9);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 3,
+                    mem_byte_seconds: 7,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                // Exactly ONE scripted hop: the fetch must never spawn once the lease is lost.
+                let (executor, remaining) = scripted_executor(vec![Box::new(move || {
+                    Ok((fake_hop_container_run(advertise_bytes, advertise_usage), false))
+                })]);
+                let cancellation = AtomicBool::new(false);
+                let checkpoint = LostLeaseCheckpoint {
+                    calls: std::sync::Mutex::new(0),
+                };
+
+                let err = fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    Some(&checkpoint),
+                    &*executor,
+                )
+                .unwrap_err();
+
+                assert_eq!(*checkpoint.calls.lock().unwrap(), 1);
+                assert_eq!(
+                    *remaining.lock().unwrap(),
+                    0,
+                    "only the advertisement hop may run; the fetch hop must never spawn"
+                );
+                match err {
+                    CheckoutTransportError::Failed {
+                        usage, disposition, ..
+                    } => {
+                        assert_eq!(usage, advertise_usage, "advertisement usage survives");
+                        assert_eq!(
+                            disposition,
+                            PreparationAttemptDisposition::RetryableInfrastructure {
+                                phase: PreparationPhase::CheckoutTransport,
+                            },
+                            "a lost claim generation is a clean retry, not a checkout verdict"
+                        );
+                    }
+                    other => panic!("expected a retryable lost-lease refusal, got {other:?}"),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn a_live_preparation_lease_checkpoint_lets_hop_a_complete() {
+                struct LiveCheckpoint {
+                    calls: std::sync::Mutex<u32>,
+                }
+                impl crate::PreparationLeaseCheckpoint for LiveCheckpoint {
+                    fn renew(&self) -> Result<(), crate::PreparationLeaseLost> {
+                        *self.calls.lock().unwrap() += 1;
+                        Ok(())
+                    }
+                }
+
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xda);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let proof =
+                    minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+                let usage = ResourceUsage {
+                    cpu_seconds: 2,
+                    mem_byte_seconds: 4,
+                };
+                let advertise_bytes = advertisement_bytes(&oid);
+                let fetch_bytes = fetch_response_bytes(b"pack-payload");
+                let (executor, remaining) = scripted_executor(vec![
+                    Box::new(move || Ok((fake_hop_container_run(advertise_bytes, usage), false))),
+                    Box::new(move || Ok((fake_hop_container_run(fetch_bytes, usage), false))),
+                ]);
+                let cancellation = AtomicBool::new(false);
+                let checkpoint = LiveCheckpoint {
+                    calls: std::sync::Mutex::new(0),
+                };
+
+                fetch_checkout_pack_within_parent_attempt_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    proof,
+                    &cancellation,
+                    Some(&checkpoint),
+                    &*executor,
+                )
+                .expect("a live checkpoint must not change the happy path");
+                assert_eq!(*checkpoint.calls.lock().unwrap(), 1);
+                assert_eq!(*remaining.lock().unwrap(), 0);
                 let _ = std::fs::remove_dir_all(&root);
             }
 
@@ -14875,6 +15029,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -14926,6 +15081,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -14990,6 +15146,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -15057,6 +15214,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -15129,6 +15287,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -15179,6 +15338,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -15232,6 +15392,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -15326,6 +15487,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .expect("scripted happy path must succeed");
@@ -15376,6 +15538,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -15435,6 +15598,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -15524,6 +15688,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -15590,6 +15755,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -15655,6 +15821,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -15752,6 +15919,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -15825,6 +15993,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();
@@ -15923,6 +16092,7 @@ mod tests {
                     run_token,
                     proof,
                     &cancellation,
+                    None,
                     &*executor,
                 )
                 .unwrap_err();

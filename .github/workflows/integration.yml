@@ -66,3 +66,19 @@ jobs:
             thresholds.toml
           if-no-files-found: warn
           retention-days: 35
+
+  fresh-definition-fence:
+    # The FRESH-VOLUME half of the CI definition-fence provisioning, which no persistent-stack gate
+    # can cover: on the dev stack `pg-init` ran long ago and the migration role is a superuser, so
+    # both init ORDERING and the NON-SUPERUSER migration posture are structurally invisible there.
+    # This job builds a disposable postgres:16, lets Docker run the real pg-init scripts on a brand
+    # new volume, creates a genuinely constrained `myelin_fresh_migrator`, and runs the ignored
+    # `integration_ci_definition_fence_fresh` target through it. LOUD: no continue-on-error.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-20
+        with:
+          toolchain: stable
+      - name: The fresh-volume definition-fence drill (disposable postgres:16, non-superuser migrator)
+        run: scripts/drill-ci-definition-fence-fresh-postgres.sh

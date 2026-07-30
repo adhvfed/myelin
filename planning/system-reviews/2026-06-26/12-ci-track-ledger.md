@@ -3142,3 +3142,99 @@ wiring a real caller to `report_preparation_terminal` — the first slice that m
 load-bearing in production), 5b.3-7, task #91, the `v1`→`v2` reservation fleet-convergence flip, and
 the lease/topology prerequisite for 5b.3-6 noted in the 4b.1 entry. The rest of ledger 12's open items
 are unchanged.
+
+---
+
+## 2026-07-30 — CT-007 lease/topology reconciliation landed: the 5b.3-6 prerequisite, plus the
+definition-cutover fence it turned out to require (Fable orchestrating; Opus, implementation; Sol,
+design + 7 adversarial review rounds to "no merge blockers")
+
+**What this slice is.** The 4b.1 entry's named prerequisite: a checkout-bearing parent attempt can
+legitimately need ~24h40m (Hop A x2 + Hop B + workload, each configurable to the 6h ceiling) while
+the flat lease read expired at ~6h10m. Design (Sol, 2 rounds): an IMMUTABLE topology-derived claim
+window plus a short renewable per-execution lease — never a renewable `claim_expires_at`, which
+would have broken the parent-attempt exact-epoch anti-forgery chain.
+
+**Core (new `ci_claim_window.rs` + scheduler/dispatch/issuer):** nullable `job_queue.
+claim_window_secs` (additive `ci_0020e`/`ci_0020f`, CHECK 1..88800 with a catalog-checked
+duplicate-constraint guard and Rust drift pins vs `MAX_CI_JOB_CLAIM_WINDOW_SECS = 4*(6h+600s)`);
+dispatch derives+persists the window from the durable launch template (`validate_dispatch`
+recomputes and refuses mismatch; checkout-bearing = 4*(timeout+600), non-checkout stays the flat
+22,200s — proven unchanged at 1s/2h/6h so the live fleet sees zero behavior change);
+`CLAIM_QUERY` sets `claim_expires_at` from `COALESCE(claim_window_secs, $5)` (NULL = legacy-only;
+checkout on a NULL-window row refuses at the resolver AND inside the locked mint);
+`CI_RUNNER_LEASE_TTL_SECS` renamed `CI_RUNNER_EXECUTION_LEASE_TTL_SECS` outright, no alias;
+exact-generation `RENEW_PREPARATION_LEASE_QUERY` (full identity bind + parent-attempt EXISTS +
+pre-workload surface states only, `LEAST(claim_expires_at, ...)` cap — the launch CAS lease gets
+the same cap, predicates byte-frozen by a new exact-suffix pin); the advertise→fetch renewal
+checkpoint lives INSIDE `fetch_checkout_pack_within_parent_attempt` (Hop A hides two executions);
+reap now seals the exact reaped generation's `started` journal rows to `sealed_ceiling` in the
+SAME transaction as requeue (legacy no-nonce rows excluded, `GREATEST` clock guard,
+injected-failure rollback proven live); the raw credential-minter seam enforces the
+topology-specific ceiling so a non-checkout authority cannot mint an 88,800s claim.
+
+**What review forced into existence (the reason this took 7 rounds):** the
+`CI_MANIFEST_PIPELINE_VERSION` 2→3 bump (dispatch output changed) exposed that a v3-only binary
+would strand non-terminal `ci.pipeline@2` rows, and the preflight-SELECT guard I first accepted
+had a rolling-deploy race — an old starter mid-transaction could commit a fresh v2 run after the
+guard's snapshot. Final shape: a **definition-cutover fence** — one transaction takes
+`wf_definition@2 FOR UPDATE` (the same row the old starter's admission locks `FOR SHARE`
+in-transaction, so the happens-before proof is exhaustive), runs a database-wide backlog probe,
+then drains v2 and activates v3 atomically; 10s `lock_timeout` → typed fail-closed; missing v2
+row fails closed (fresh DBs get an inadmissible `retired` sentinel via `ci_0020i`); the probe is
+`myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs`, SECURITY DEFINER with
+`row_security=off`, owned by the new `myelin_ci_definition_fence` role (the stack's only
+BYPASSRLS holder: NOLOGIN, three readable columns, one function, one schema) — born fence-owned
+under `SET LOCAL ROLE` in `ci_0020h`'s implicit simple-query transaction (exact adopt-or-create
+over nine catalog fields; no ALTER OWNER, no CREATE OR REPLACE; crash-window reapply proven with
+unchanged OID). Provisioning is `scripts/pg-init/01-ci-definition-fence.sql`: ON_ERROR_STOP +
+one explicit transaction, strict validate-before-mutate (foreign schema/overloads/membership
+edges in both directions refused WITH the evidence preserved). **DEPLOY ORDERING (new, real):**
+existing volumes must run `01-ci-definition-fence.sql` as the provisioning admin BEFORE the new
+binary migrates — documented in `docs/ci-runner-deployment.md` ("PostgreSQL definition-fence
+provisioning") and `docs/dev-stack.md`. A genuine fresh-volume drill
+(`scripts/drill-ci-definition-fence-fresh-postgres.sh` + ignored target
+`integration_ci_definition_fence_fresh`, wired as the `fresh-definition-fence` job in
+integration.yml + inventory row) proves init ordering, non-superuser migration, the crash window,
+and the full cutover on a disposable postgres:16 — it caught three drill-scaffolding bugs and
+hosts the destructive negative control the shared stack must never run.
+
+**Review chain (the discipline worked):** Sol's verdict each round: r1 = 2 blockers (v2
+stranding; migration wrapper masking a divergent constraint) + raw-seam ceiling + predicate-pin
+honesty; r2 = 4 blockers (the admission race; definition hash not covering `ci_claim_window.rs`;
+seq-scan boot guard; simulated-not-real role/remediation tests); r3 = 3 blockers (missing-v2
+bypass; SECURITY DEFINER owner lacking BYPASSRLS = silent fail-OPEN under the documented
+production migrator posture; unqualified call = substitution surface) + RLS-blind diagnostic +
+unbounded fence wait; r4-6 = provisioning atomicity, validate-before-mutate, exact-regprocedure
+identity, negative-control restoration safety, fixture-lock completeness, panic-safety; r7 =
+**no merge blockers**. Builder deviations adjudicated: implicit-tx-in-migration CORRECT (explicit
+BEGIN strands the pooled session in 25P02), boot-refusal-guard correctly softened to
+activation-time, dispatch-time refusal of underivable windows kept write-path-only.
+
+**Gates (run independently by the orchestrator, not just the builder):** controlplane --lib 563,
+sandbox --lib 465, the ENTIRE `--all-targets --features integration` matrix green (EXIT=0),
+workspace clippy -D warnings clean, cargo check clean; fresh-volume drill PASS twice; lints
+inventory gate green. KNOWN STANDING RED (pre-existing, confirmed byte-identical to b86dc154,
+tracked separately): lint-gate `ci_gate` fails on `job_accounting_store.rs:649` [residency-pin]
+and `ci_pipeline_driver.rs:1360` [tenant-predicate] — NOT introduced or fixed here.
+
+**Also landed this session (separate commit `d23f9d28`):** frontend security-advisory burndown —
+security.yml's pnpm job red ~1 week on 6 real advisories; 3 fixed for real (postcss, node-tar,
+style-dictionary 4→5 with token output proven byte-stable), brace-expansion GHSA-mh99-v99m-4gvg
+documented-ignored (only patch line breaks eslint-plugin-jsx-a11y's minimatch@3 usage; all paths
+are dev/build tooling; removal condition documented). The npm legacy-audit-endpoint retirement
+concern was investigated: endpoints are back up, pnpm 10.x works today, fix-when-it-recurs =
+pnpm 11 (v11.0.0-rc.1 carries the bulk-endpoint fix).
+
+**Still open (updated):** 5b.3-6 now has TWO named prerequisites — this slice closed #1;
+**#2 = phase-credential generations** (found in this slice's design round: the signed credential
+expires at min(claim_started+300s, claim_expires_at) and refuses re-mint, so >5min preparation
+reaches workload authorization with a dead credential; full design locked with Sol 2026-07-30 —
+append-only `ci_job_credential_generation` table, purpose-unique rows, highest-ordinal-current,
+digest-form signed run_id, purpose-attenuated capability vectors — next build). **The `v1`→`v2`
+reservation flip must precede 5b.3-6** (begin_parent_attempt refuses v1 as LegacyReservation;
+flip = lib.rs:960 literal + the v1 LIKE assertions in integration_pg_ci_pipeline_starter.rs).
+Then 5b.3-6 composition, 5b.3-7 live drill, task #91 (fact sheet gathered: the seam is
+authority_from_durable_claim never cross-checking meter_to.reserve_id; template = the 5b.3-2b/2c
+checkout_scope precedent). Pre-existing lint-gate red tracked as its own item. The rest of ledger
+12's open items are unchanged.

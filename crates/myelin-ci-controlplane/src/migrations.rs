@@ -260,6 +260,30 @@ pub const CI_JOB_PRELAUNCH_USAGE_SEAL_DEADLINE_MIGRATION_ID: &str =
 /// Additive, non-blocking partial index for the topology-aware deadline scan.
 pub const CI_JOB_PRELAUNCH_USAGE_SEAL_DEADLINE_INDEX_MIGRATION_ID: &str =
     "ci_0020d_ci_job_prelaunch_usage_seal_deadline_reaper";
+/// CT-007 lease/topology reconciliation, expand phase: the nullable, dispatch-derived claim window.
+/// Appended after every previously applied id (never inserted among the `ci_0004*` queue
+/// migrations, which are checksum-immutable). NULL is legacy-only: every Rust writer populates it,
+/// the claim falls back to the flat execution-lease TTL for a legacy row, and checkout composition
+/// refuses such a row outright.
+pub const CI_JOB_QUEUE_CLAIM_WINDOW_MIGRATION_ID: &str = "ci_0020e_job_queue_claim_window";
+/// The online second half: validate the bounded CHECK the expand added `NOT VALID`, so the full-table
+/// verification scan runs without holding the write lock the expand would otherwise have taken.
+pub const CI_JOB_QUEUE_CLAIM_WINDOW_VALIDATE_MIGRATION_ID: &str =
+    "ci_0020f_job_queue_claim_window_validate";
+/// Additive, column-minimal grant letting the superseded-definition boot guard read `wf_version`.
+/// The already-applied `ci_0018c` workflow-discovery grant stays byte-frozen; this adds the ONE
+/// further column that guard needs, so the least-privilege posture is preserved.
+pub const CI_SCHEDULER_WORKFLOW_VERSION_GRANT_MIGRATION_ID: &str =
+    "ci_0020g_scheduler_workflow_version_grant";
+/// The database-wide, boolean-only backlog probe the definition cutover fence calls while holding
+/// the `wf_definition` row lock. `wf_definition` is database-GLOBAL, so a merely regional check must
+/// never authorize a global status transition.
+pub const CI_PIPELINE_VERSION_BACKLOG_PROBE_MIGRATION_ID: &str =
+    "ci_0020h_ci_pipeline_version_backlog_probe";
+/// Seeds the cutover fence's predecessor row so a fresh database has something to lock. Absence of
+/// the predecessor must never be read as "nothing to fence".
+pub const CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
+    "ci_0020i_ci_pipeline_cutover_fence_row";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -998,6 +1022,348 @@ pub const ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL: &str = "ALTER TABLE job_queue \
 ADD COLUMN IF NOT EXISTS claim_started_at timestamptz, \
 ADD COLUMN IF NOT EXISTS claim_expires_at timestamptz";
 
+/// **CT-007 lease/topology reconciliation, expand phase.** The immutable, dispatch-derived claim
+/// window (seconds) the claim sizes `claim_expires_at` from. Nullable so an already-populated hot
+/// queue takes no rewrite and an older dispatch binary's rows stay readable: the claim COALESCEs a
+/// NULL to the flat `$5` execution-lease TTL (byte-identical to pre-slice behaviour), while every
+/// new Rust writer supplies a derived value and the checkout composition path refuses a NULL row.
+///
+/// The CHECK is added `NOT VALID` here and validated by `ci_0020f`, the online idiom for a
+/// declared-hot table. Its upper bound is the literal form of
+/// [`MAX_CI_JOB_CLAIM_WINDOW_SECS`](crate::ci_claim_window::MAX_CI_JOB_CLAIM_WINDOW_SECS); a unit
+/// test pins the two equal so a future ceiling change fails loudly instead of silently diverging.
+///
+/// The constraint add is wrapped in a `DO` block because several live-Postgres test fixtures
+/// re-execute this exact DDL text against an already-migrated shared `job_queue`, where a bare
+/// `ADD CONSTRAINT` would raise `duplicate_object`. The exception branch does NOT simply swallow
+/// that: a same-named constraint carrying a DIFFERENT definition (a hand-patched or divergently
+/// deployed bound) would otherwise be silently adopted and then `VALIDATE`d by `ci_0020f`, leaving
+/// the durable ceiling disagreeing with Rust while every test still passed. So the branch compares
+/// `pg_get_constraintdef` against the exact expected text and re-raises on any divergence — the
+/// idempotence is "this precise constraint already exists", never "some constraint by that name".
+pub const ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL: &str = "\
+ALTER TABLE job_queue ADD COLUMN IF NOT EXISTS claim_window_secs bigint;
+DO $myelin$
+DECLARE
+  expected_definition constant text :=
+    'CHECK (((claim_window_secs >= 1) AND (claim_window_secs <= 88800))) NOT VALID';
+  existing_definition text;
+BEGIN
+  ALTER TABLE job_queue
+    ADD CONSTRAINT job_queue_claim_window_range
+    CHECK (claim_window_secs BETWEEN 1 AND 88800) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN
+  SELECT pg_catalog.pg_get_constraintdef(constraint_catalog.oid)
+    INTO existing_definition
+    FROM pg_catalog.pg_constraint AS constraint_catalog
+   WHERE constraint_catalog.conrelid = 'job_queue'::regclass
+     AND constraint_catalog.conname = 'job_queue_claim_window_range';
+  IF existing_definition IS DISTINCT FROM expected_definition
+     AND existing_definition IS DISTINCT FROM replace(expected_definition, ' NOT VALID', '') THEN
+    RAISE EXCEPTION
+      'job_queue_claim_window_range already exists with a DIVERGENT definition: % (expected: %)',
+      existing_definition, expected_definition;
+  END IF;
+END
+$myelin$";
+
+/// The online second half of the claim-window expand: verify the existing rows against the bounded
+/// CHECK without the write-blocking lock a validated-on-add constraint would have taken.
+pub const VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL: &str = "\
+ALTER TABLE job_queue VALIDATE CONSTRAINT job_queue_claim_window_range";
+
+/// **The superseded-definition boot guard's one extra column.** `ci_0018c` already granted the
+/// region scheduler `SELECT (tenant_id, region, run_id, wf_type, state, partition, created_at)` on
+/// `workflow_run` and remains byte-frozen; the guard additionally needs `wf_version` to tell a
+/// stranded `ci.pipeline@N` row from a live `ci.pipeline@N+1` one. Still column-scoped — never a
+/// table-wide `SELECT` — and the startup excess-privilege probe's allowed-column set is widened by
+/// exactly this one name.
+pub const GRANT_SCHEDULER_WORKFLOW_VERSION_DDL: &str =
+    "GRANT SELECT (wf_version) ON workflow_run TO myelin_ci_region_scheduler";
+
+/// **The definition cutover fence's database-wide backlog probe (CT-007 lease/topology
+/// reconciliation).** `wf_definition` has no tenant or region column — flipping `ci.pipeline@N` to
+/// `draining` is a DATABASE-GLOBAL act. A regional `workflow_run` scan therefore must not be the
+/// authority for it: one database may serve several independently deployed regions, and a region
+/// whose control plane has not yet been upgraded would be silently fenced out with its runs
+/// stranded. This function is that global authority.
+///
+/// It is `SECURITY DEFINER` because the caller (the runtime app role) is `NOBYPASSRLS` and
+/// `workflow_run` is FORCE-RLS `(tenant_id, region)`, so no cross-region count is possible under the
+/// caller's own privileges.
+///
+/// **Ownership is load-bearing, not incidental (CT-007 round-3 blocker 2).** A `SECURITY DEFINER`
+/// function runs as its OWNER, so its RLS authority is the owner's. The intended production
+/// migration role is a non-superuser schema owner WITHOUT `BYPASSRLS` (see `PgBootstrap`) — owning
+/// this function as that role would leave the `EXISTS` silently filtered, returning false despite a
+/// real backlog, which is a fail-OPEN cutover. So the migration ADOPTS the dedicated
+/// `myelin_ci_definition_fence` role (`scripts/pg-init/01-ci-definition-fence.sql`) for the length
+/// of one transaction and creates the function under it: the function is born fence-owned, and no
+/// ownership transfer is ever performed. A pre-existing function is adopted only when every catalog
+/// field matches exactly; any divergence raises rather than being silently replaced.
+///
+/// `SET row_security = off` is the belt-and-braces half: if this function is ever owned by a role
+/// without bypass authority, PostgreSQL raises a LOUD error on any RLS-affected read instead of
+/// quietly returning a false negative. Fail-closed beats fail-open even when provisioning drifts.
+///
+/// The rest of the hardening:
+/// - `SET search_path = pg_catalog` plus fully-qualified object names, so no schema-injection can
+///   redirect it;
+/// - a fixed query with NO dynamic SQL and one bound parameter;
+/// - a BOOLEAN result — it returns "does a backlog exist", never a row, a tenant, or a payload, so
+///   it cannot become a cross-region data-exfiltration path;
+/// - `REVOKE ALL ... FROM PUBLIC`, then `GRANT EXECUTE` to exactly the one runtime role that already
+///   registers `wf_definition`;
+/// - a positive privilege probe at boot, so a missing grant is loud rather than a silent refusal.
+///
+/// The predicate matches the `ci_workflow_active_region` partial index's own, for the same
+/// index-eligibility reason the regional diagnostic does — the clean path must not seq-scan history.
+///
+/// The production caller names this function SCHEMA-QUALIFIED
+/// (`myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs`), because an unqualified
+/// name resolves through `search_path` and a shadowing function that returns `false` instead of
+/// raising would be a fail-open cutover. The fully-qualified references inside the body are the
+/// separate, complementary guarantee a `SECURITY DEFINER` function must pin so what it READS cannot
+/// be redirected. Schema-isolated live tests substitute the call through a dedicated test seam
+/// rather than the production resolution being weakened.
+pub const CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL: &str = "\
+-- ATOMICITY: this whole script is ONE transaction, but deliberately the IMPLICIT one PostgreSQL
+-- opens around a multi-statement simple query — NOT an explicit `BEGIN`/`COMMIT`. Both are equally
+-- atomic (a failure rolls the complete script back), but an explicit `BEGIN` leaves the SESSION in
+-- an aborted transaction block when a statement raises, and `PgMigrator` returns that connection to
+-- the pool: the next user of it fails with `25P02 current transaction is aborted`, including the
+-- migrator's own `pg_advisory_unlock`. The implicit form ends the transaction on error, so a
+-- refusal here is loud and local instead of poisoning the pool.
+
+-- (1) PROVISIONING PREFLIGHT. The migration VERIFIES; it never creates or alters a cluster role,
+-- even if `current_user` happens to hold CREATEROLE. BYPASSRLS provisioning is an operator-
+-- controlled action, and migration behaviour must not vary with accidental excess privilege.
+DO $myelin$
+DECLARE
+  remediation constant text :=
+    'run scripts/pg-init/01-ci-definition-fence.sql as the database provisioning administrator, '
+    'passing migration_role=<DATABASE_MIGRATION_URL role>, then retry boot';
+  role_ok boolean;
+  schema_owner text;
+  edge record;
+  extra text;
+BEGIN
+  SELECT rolcanlogin = false AND rolsuper = false AND rolbypassrls = true
+         AND rolcreatedb = false AND rolcreaterole = false AND rolreplication = false
+         AND rolinherit = false
+    INTO role_ok
+    FROM pg_catalog.pg_roles
+   WHERE rolname = 'myelin_ci_definition_fence';
+  IF role_ok IS NULL THEN
+    RAISE EXCEPTION 'the myelin_ci_definition_fence role is absent: %', remediation;
+  END IF;
+  IF NOT role_ok THEN
+    RAISE EXCEPTION
+      'the myelin_ci_definition_fence role does not carry the exact provisioned attributes '
+      '(NOLOGIN NOSUPERUSER BYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT): %',
+      remediation;
+  END IF;
+
+  SELECT pg_catalog.pg_get_userbyid(n.nspowner) INTO schema_owner
+    FROM pg_catalog.pg_namespace n WHERE n.nspname = 'myelin_ci_security';
+  IF schema_owner IS NULL THEN
+    RAISE EXCEPTION 'the myelin_ci_security schema is absent: %', remediation;
+  END IF;
+  IF schema_owner <> 'myelin_ci_definition_fence' THEN
+    RAISE EXCEPTION
+      'the myelin_ci_security schema is owned by % rather than myelin_ci_definition_fence: %',
+      schema_owner, remediation;
+  END IF;
+
+  SELECT a.admin_option, a.inherit_option, a.set_option INTO edge
+    FROM pg_catalog.pg_auth_members a
+   WHERE a.roleid = 'myelin_ci_definition_fence'::regrole::oid
+     AND a.member = current_user::regrole::oid;
+  IF edge IS NULL THEN
+    RAISE EXCEPTION
+      'the migration role % has no direct membership in myelin_ci_definition_fence, so it cannot '
+      'create the probe function as its final owner: %', current_user, remediation;
+  END IF;
+  IF NOT edge.set_option OR edge.inherit_option OR edge.admin_option THEN
+    RAISE EXCEPTION
+      'the migration role % membership in myelin_ci_definition_fence must be '
+      '(set_option=true, inherit_option=false, admin_option=false), found (%, %, %): %',
+      current_user, edge.set_option, edge.inherit_option, edge.admin_option, remediation;
+  END IF;
+
+  -- BOTH DIRECTIONS. Verifying only the current migrator's own edge would accept privilege drift
+  -- since provisioning: another role holding SET TRUE could adopt the same BYPASSRLS authority, and
+  -- the fence role being a member of anything else would silently widen its own reach.
+  SELECT string_agg(m.rolname, ', ' ORDER BY m.rolname) INTO extra
+    FROM pg_catalog.pg_auth_members a
+    JOIN pg_catalog.pg_roles m ON m.oid = a.member
+   WHERE a.roleid = 'myelin_ci_definition_fence'::regrole::oid
+     AND a.member <> current_user::regrole::oid;
+  IF extra IS NOT NULL THEN
+    RAISE EXCEPTION
+      'role(s) % may also adopt myelin_ci_definition_fence; exactly one migration role may hold '
+      'that authority: %', extra, remediation;
+  END IF;
+  SELECT string_agg(g.rolname, ', ' ORDER BY g.rolname) INTO extra
+    FROM pg_catalog.pg_auth_members a
+    JOIN pg_catalog.pg_roles g ON g.oid = a.roleid
+   WHERE a.member = 'myelin_ci_definition_fence'::regrole::oid;
+  IF extra IS NOT NULL THEN
+    RAISE EXCEPTION
+      'myelin_ci_definition_fence is a member of %, which widens its reach beyond the one '
+      'question it exists to answer: %', extra, remediation;
+  END IF;
+END
+$myelin$;
+
+-- (2) TABLE ACCESS, established only now that `workflow_run` exists. Table-level REVOKE does not
+-- remove separately granted COLUMN ACLs, so every live column is revoked explicitly before the
+-- three-column grant is (re)issued. This is what makes an adopted role's stale column grants go.
+REVOKE ALL PRIVILEGES ON TABLE public.workflow_run FROM myelin_ci_definition_fence;
+DO $myelin$
+DECLARE
+  column_name text;
+BEGIN
+  FOR column_name IN
+    SELECT a.attname
+      FROM pg_catalog.pg_attribute a
+     WHERE a.attrelid = 'public.workflow_run'::regclass
+       AND a.attnum > 0
+       AND NOT a.attisdropped
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL (%I) ON TABLE public.workflow_run FROM myelin_ci_definition_fence', column_name);
+  END LOOP;
+END
+$myelin$;
+GRANT USAGE ON SCHEMA public TO myelin_ci_definition_fence;
+GRANT SELECT (wf_type, wf_version, state) ON public.workflow_run TO myelin_ci_definition_fence;
+
+-- (3) BECOME THE FINAL OWNER. The function is BORN fence-owned, so no ownership transfer is ever
+-- needed — and the silent-adoption hazard of replacing a function that keeps a foreign owner
+-- cannot arise. Works in both postures: a dogfood superuser may set the role regardless, and a
+-- production non-superuser migrator uses its explicit `SET TRUE` membership.
+SET LOCAL ROLE myelin_ci_definition_fence;
+
+-- (4) EXACT ADOPT-OR-CREATE. Never CREATE OR REPLACE: an existing function is accepted only when
+-- every catalog field agrees exactly, and ANY divergence raises rather than overwriting something
+-- another operator or an older build put there.
+DO $myelin$
+DECLARE
+  probe constant text :=
+    'myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs(integer)';
+  expected_body constant text :=
+    'SELECT EXISTS (SELECT 1 FROM public.workflow_run '
+    'WHERE wf_type = ''ci.pipeline'' AND wf_version = $1 '
+    'AND state IN (''running'', ''waiting''))';
+  existing oid := pg_catalog.to_regprocedure(probe);
+  found record;
+BEGIN
+  IF existing IS NULL THEN
+    EXECUTE format(
+      'CREATE FUNCTION %s RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER '
+      'SET search_path = pg_catalog SET row_security = off AS $body$%s$body$',
+      probe, expected_body);
+  ELSE
+    SELECT p.proowner, p.prolang, p.prokind, p.prorettype, p.proargtypes::text,
+           p.provolatile, p.prosecdef, p.proconfig, btrim(p.prosrc) AS body
+      INTO found
+      FROM pg_catalog.pg_proc p
+     WHERE p.oid = existing;
+    IF found.proowner <> 'myelin_ci_definition_fence'::regrole::oid
+       OR found.prolang <> (SELECT oid FROM pg_catalog.pg_language WHERE lanname = 'sql')
+       OR found.prokind <> 'f'
+       OR found.prorettype <> 'boolean'::regtype::oid
+       OR found.proargtypes <> 'int4'::regtype::oid::text
+       OR found.provolatile <> 's'
+       OR found.prosecdef <> true
+       OR found.proconfig IS DISTINCT FROM
+          ARRAY['search_path=pg_catalog', 'row_security=off']
+       OR found.body <> expected_body THEN
+      RAISE EXCEPTION
+        'a function already exists at % but diverges from the expected definition-fence probe '
+        '(owner/language/kind/return/args/volatility/security/config/body). Refusing to overwrite '
+        'it. Inspect it, then remove or reconcile it deliberately.', probe;
+    END IF;
+  END IF;
+END
+$myelin$;
+
+-- (5) FUNCTION AND SCHEMA ACLs, normalized. Every non-owner grant is stripped first so an adopted
+-- object cannot retain an execute grant from another purpose.
+DO $myelin$
+DECLARE
+  probe constant text :=
+    'myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs(integer)';
+  grantee text;
+BEGIN
+  FOR grantee IN
+    SELECT pg_catalog.pg_get_userbyid(acl.grantee)
+      FROM pg_catalog.pg_proc p
+      CROSS JOIN LATERAL pg_catalog.aclexplode(p.proacl) AS acl
+     WHERE p.oid = pg_catalog.to_regprocedure(probe)
+       AND acl.grantee <> 'myelin_ci_definition_fence'::regrole::oid
+       AND acl.grantee <> 0
+  LOOP
+    EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I', probe, grantee);
+  END LOOP;
+END
+$myelin$;
+REVOKE ALL ON FUNCTION myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs(integer)
+  FROM PUBLIC;
+-- Every non-owner grant on the security schema itself is stripped too. Granting `myelin_app` USAGE
+-- without removing anyone else's USAGE/CREATE would let privilege drift since provisioning survive
+-- a migration that claims to verify exact provisioning.
+DO $myelin$
+DECLARE
+  grantee text;
+BEGIN
+  FOR grantee IN
+    SELECT pg_catalog.pg_get_userbyid(acl.grantee)
+      FROM pg_catalog.pg_namespace n
+      CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) AS acl
+     WHERE n.nspname = 'myelin_ci_security'
+       AND acl.grantee <> 'myelin_ci_definition_fence'::regrole::oid
+       AND acl.grantee <> 0
+       AND acl.grantee <> 'myelin_app'::regrole::oid
+  LOOP
+    EXECUTE format('REVOKE ALL ON SCHEMA myelin_ci_security FROM %I', grantee);
+  END LOOP;
+END
+$myelin$;
+REVOKE ALL ON SCHEMA myelin_ci_security FROM PUBLIC;
+REVOKE CREATE ON SCHEMA myelin_ci_security FROM myelin_app;
+GRANT USAGE ON SCHEMA myelin_ci_security TO myelin_app;
+GRANT EXECUTE ON FUNCTION
+  myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs(integer) TO myelin_app;
+
+RESET ROLE;";
+
+/// **The cutover fence's predecessor row (CT-007 round-3 blocker 1).** The cutover fails closed when
+/// `ci.pipeline@2` is absent, because absence is NOT the same as "nothing to fence": with no row
+/// there is nothing to lock `FOR UPDATE`, so a concurrently-booting old binary could
+/// `register_definition(v2)` with no conflicting lock and reopen late v2 admission, and an orphaned
+/// non-terminal v2 run would never be probed.
+///
+/// This seeds that predecessor row so a genuinely fresh installation has a fence to take, rather
+/// than requiring an operator step a fresh install would silently skip. It is chosen over an
+/// operator/test-support bootstrap for exactly that reason — a safety precondition that must hold on
+/// EVERY database should be established by the same forward-only mechanism that builds the schema.
+///
+/// Correct on both database ages, which is what makes it safe as an additive migration:
+/// - **existing database:** `ci.pipeline@2` already exists in whatever status the fleet left it;
+///   `ON CONFLICT DO NOTHING` makes this a strict no-op. Zero behaviour change.
+/// - **fresh database:** the row lands as `retired` with a self-describing sentinel hash. `retired`
+///   is the honest status — v2 never ran here and must never be admitted — and it makes an old v2
+///   binary booting against this database fail LOUDLY (`register_definition` refuses a non-`active`
+///   row, and `validate_definition_pin` refuses a non-`active` status for a fresh start) instead of
+///   quietly activating itself. The sentinel hash can never equal a real source-derived pin, so it
+///   also fails the hash check first.
+pub const SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL: &str = "\
+INSERT INTO wf_definition (wf_type, version, code_hash, status)
+VALUES ('ci.pipeline', 2, 'sentinel:ci-pipeline-v2-never-deployed-on-this-database', 'retired')
+ON CONFLICT (wf_type, version) DO NOTHING";
+
 /// Accumulate exact, immutable failed-attempt receipts on the durable queue row until a later
 /// terminal generation settles their aggregate usage. A constant empty-object default is an
 /// expand-only metadata change on supported PostgreSQL and keeps existing hot rows readable.
@@ -1508,6 +1874,32 @@ pub fn ci_controlplane_migrations() -> Migrations {
         GRANT_SCHEDULER_CI_JOB_REAP_RESET_DDL,
         CI_JOB_TABLE,
     ));
+    // CT-007 lease/topology reconciliation. No scheduler grant accompanies these: the claim only
+    // READS `claim_window_secs` (covered by the existing table-level SELECT), and the least-privilege
+    // probe asserts explicitly that the scheduler role can never UPDATE it.
+    migrations.push(Migration::plain_on(
+        CI_JOB_QUEUE_CLAIM_WINDOW_MIGRATION_ID,
+        ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL,
+        JOB_QUEUE_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_JOB_QUEUE_CLAIM_WINDOW_VALIDATE_MIGRATION_ID,
+        VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL,
+        JOB_QUEUE_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_SCHEDULER_WORKFLOW_VERSION_GRANT_MIGRATION_ID,
+        GRANT_SCHEDULER_WORKFLOW_VERSION_DDL,
+        "workflow_run",
+    ));
+    migrations.push(Migration::plain(
+        CI_PIPELINE_VERSION_BACKLOG_PROBE_MIGRATION_ID,
+        CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL,
+    ));
+    migrations.push(Migration::plain(
+        CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID,
+        SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL,
+    ));
     Migrations::of(migrations)
 }
 
@@ -1808,6 +2200,195 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         );
     }
 
+    /// **The claim-window expand is online, additive, and its CHECK bound cannot drift from Rust.**
+    /// The literal upper bound in the durable constraint is asserted equal to
+    /// [`MAX_CI_JOB_CLAIM_WINDOW_SECS`] — a future `MAX_JOB_TIMEOUT_SECS`/headroom change fails here
+    /// until a new additive constraint migration is designed, rather than silently admitting windows
+    /// the constraint rejects (or rejecting windows Rust considers legal).
+    /// **The cutover probe's authority is structural, not incidental (round-3 blocker 2).** Its RLS
+    /// power is its OWNER's, so ownership is forced explicitly (a `CREATE OR REPLACE` over a
+    /// pre-existing function would otherwise keep that function's old owner), and `row_security=off`
+    /// turns a wrongly-owned deployment into a LOUD failure instead of a silent false negative.
+    #[test]
+    fn the_backlog_probe_is_born_fence_owned_and_never_overwrites_a_divergent_function() {
+        let ddl = CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL;
+        for required in [
+            // Born fence-owned: the role is adopted, the function created, the role reset.
+            "SET LOCAL ROLE myelin_ci_definition_fence;",
+            "RESET ROLE;",
+            // The dedicated security schema, never `public`.
+            "myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs",
+            "SECURITY DEFINER",
+            "SET search_path = pg_catalog",
+            "SET row_security = off",
+            // Verify-and-refuse provisioning, with the exact operator remediation.
+            "run scripts/pg-init/01-ci-definition-fence.sql as the database provisioning administrator",
+            "passing migration_role=<DATABASE_MIGRATION_URL role>, then retry boot",
+            // Exact adopt-or-create, never a blind replace.
+            "to_regprocedure",
+            "diverges from the expected definition-fence probe",
+            // Column-scoped table access, established only once `workflow_run` exists.
+            "REVOKE ALL PRIVILEGES ON TABLE public.workflow_run FROM myelin_ci_definition_fence",
+            "GRANT SELECT (wf_type, wf_version, state) ON public.workflow_run",
+            "FROM public.workflow_run",
+            "state IN (''running'', ''waiting'')",
+        ] {
+            assert!(ddl.contains(required), "the backlog probe pins `{required}`");
+        }
+        assert!(
+            !ddl.contains("BEGIN;") && !ddl.contains("COMMIT;"),
+            "atomicity comes from the implicit multi-statement transaction; an explicit BEGIN would \
+             leave the pooled migration connection in an aborted transaction block on refusal"
+        );
+        assert!(
+            !ddl.contains("ALTER FUNCTION"),
+            "the function is BORN fence-owned; ALTER FUNCTION ... OWNER TO would reintroduce the \
+             silent-adoption hazard this shape exists to remove"
+        );
+        assert!(
+            !ddl.contains("CREATE OR REPLACE FUNCTION"),
+            "a blind replace would overwrite a divergent function instead of raising"
+        );
+        for forbidden in ["CREATE ROLE", "ALTER ROLE", "GRANT myelin_ci_definition_fence TO"] {
+            assert!(
+                !ddl.contains(forbidden),
+                "a migration must never provision cluster authority (`{forbidden}`) — it verifies \
+                 and names the operator script"
+            );
+        }
+        assert!(
+            ddl.contains("TO myelin_app") && !ddl.contains("TO myelin_ci_region_scheduler"),
+            "only the runtime role that registers wf_definition may execute the fence's probe"
+        );
+    }
+
+    /// The provisioning script is the ONLY place cluster authority is granted, and the migration's
+    /// refusal names it exactly — so an operator reading the failure knows what to run.
+    #[test]
+    fn the_definition_fence_provisioning_script_is_the_named_operator_remediation() {
+        let script = include_str!("../../../scripts/pg-init/01-ci-definition-fence.sql");
+        for required in [
+            "CREATE ROLE myelin_ci_definition_fence",
+            "NOLOGIN NOSUPERUSER BYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT",
+            "CREATE SCHEMA IF NOT EXISTS myelin_ci_security AUTHORIZATION myelin_ci_definition_fence",
+            "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE",
+            "REVOKE ALL ON SCHEMA myelin_ci_security FROM PUBLIC",
+        ] {
+            assert!(script.contains(required), "the fence provisioning pins `{required}`");
+        }
+        assert!(
+            !script.contains("GRANT SELECT") && !script.contains("ON TABLE public.workflow_run TO"),
+            "table access belongs to ci_0020h, which runs only once workflow_run exists"
+        );
+        assert!(
+            CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL
+                .contains("scripts/pg-init/01-ci-definition-fence.sql"),
+            "the migration's refusal must name this exact script"
+        );
+        // The fence block must be GONE from the general RLS conventions file.
+        let conventions = include_str!("../../../scripts/pg-init/00-rls-conventions.sql");
+        assert!(
+            !conventions.contains("myelin_ci_definition_fence"),
+            "the fence provisioning moved to its own operator-runnable file"
+        );
+    }
+
+    /// The predecessor seed must be additive and self-describing: a no-op on an existing database,
+    /// and unmistakably NOT a real definition on a fresh one.
+    #[test]
+    fn the_cutover_fence_row_seed_is_additive_and_never_admissible() {
+        let ddl = SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL;
+        assert!(ddl.contains("ON CONFLICT (wf_type, version) DO NOTHING"));
+        assert!(
+            ddl.contains("'retired'"),
+            "a freshly seeded predecessor must never be admissible for a start"
+        );
+        assert!(
+            ddl.contains("sentinel:"),
+            "the seeded hash must be unmistakable for a real source-derived pin"
+        );
+        assert!(!ddl.contains("DO UPDATE"), "the seed never rewrites an existing row");
+    }
+
+    #[test]
+    fn claim_window_expand_is_online_and_its_check_bound_matches_the_rust_maximum() {
+        let ddl = ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL;
+        assert!(ddl.contains("ADD COLUMN IF NOT EXISTS claim_window_secs bigint"));
+        assert!(ddl.contains("ADD CONSTRAINT job_queue_claim_window_range"));
+        assert!(ddl.contains("NOT VALID"));
+        assert!(
+            ddl.contains(&format!(
+                "CHECK (claim_window_secs BETWEEN 1 AND {})",
+                crate::ci_claim_window::MAX_CI_JOB_CLAIM_WINDOW_SECS
+            )),
+            "the durable CHECK bound must be the literal form of MAX_CI_JOB_CLAIM_WINDOW_SECS"
+        );
+        assert!(
+            !ddl.contains("claim_window_secs bigint NOT NULL"),
+            "the hot-table expand stays nullable until a later bounded backfill/contract"
+        );
+        assert!(
+            !myelin_substrate::is_blocking_alter(ddl)
+                && !myelin_substrate::is_blocking_alter(VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL),
+            "neither half of the claim-window expand may take a blocking lock on the hot queue"
+        );
+        assert_eq!(
+            VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL,
+            "ALTER TABLE job_queue VALIDATE CONSTRAINT job_queue_claim_window_range"
+        );
+        // The idempotent re-apply branch must VERIFY the existing constraint, never adopt it: the
+        // normalized `pg_get_constraintdef` text it compares against carries the SAME bound as the
+        // `BETWEEN` form above, so the two literals cannot drift apart silently.
+        assert!(ddl.contains("pg_get_constraintdef"));
+        assert!(ddl.contains("DIVERGENT definition"));
+        assert!(
+            ddl.contains(&format!(
+                "(claim_window_secs >= 1) AND (claim_window_secs <= {})",
+                crate::ci_claim_window::MAX_CI_JOB_CLAIM_WINDOW_SECS
+            )),
+            "the expected-definition literal must carry the same bound as the CHECK it guards"
+        );
+        assert!(
+            !ddl.contains("EXCEPTION WHEN duplicate_object THEN\n  NULL"),
+            "a same-named constraint must never be adopted without comparing its definition"
+        );
+    }
+
+    /// **The claim-window migrations are appended after every previously shipped id.** Inserting a
+    /// new id among the applied `ci_0004*`/`ci_0016*` queue migrations would reorder a checksum-
+    /// guarded, already-applied sequence.
+    #[test]
+    fn claim_window_migrations_are_appended_after_every_shipped_id() {
+        let ids: Vec<&str> = ci_controlplane_migrations()
+            .0
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        let expand = ids
+            .iter()
+            .position(|id| *id == CI_JOB_QUEUE_CLAIM_WINDOW_MIGRATION_ID)
+            .expect("the claim-window expand is in the set");
+        let validate = ids
+            .iter()
+            .position(|id| *id == CI_JOB_QUEUE_CLAIM_WINDOW_VALIDATE_MIGRATION_ID)
+            .expect("the claim-window validation is in the set");
+        assert_eq!(expand, ids.len() - 5);
+        assert_eq!(validate, ids.len() - 4);
+        assert_eq!(
+            ids.last().copied(),
+            Some(CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID),
+            "the cutover fence's predecessor-row seed is appended last of all"
+        );
+        assert!(
+            expand
+                > ids
+                    .iter()
+                    .position(|id| *id == CI_JOB_PRELAUNCH_USAGE_SEAL_DEADLINE_INDEX_MIGRATION_ID)
+                    .unwrap(),
+            "the expand follows the last previously shipped migration"
+        );
+    }
+
     /// **The migration set applies forward-only (no DROP, no down) — the contract-1.5 floor.** Every
     /// assembled DDL is forward-only-legal (`is_destructive` is false) and carries the platform RLS
     /// scoping. The runner / lint enforce this at boot / source-scan; this is the in-module proof.
@@ -1816,8 +2397,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            52,
-            "20 table/RLS + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 4 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 3 ci_job_accounting ALTERs + 1 scheduler-boundary + 3 scheduler claim grants + 3 scheduler ci_run/workflow discovery grants + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand"
+            57,
+            "20 table/RLS + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate) + 1 ci_job_spec-stage ALTER + 3 ci_job_accounting ALTERs + 1 scheduler-boundary + 3 scheduler claim grants + 4 scheduler ci_run/workflow discovery grants (incl. wf_version) + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand"
         );
         for m in &migrations.0 {
             assert!(
@@ -1826,11 +2407,27 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 m.id,
                 m.ddl
             );
-            assert!(
-                !m.ddl.to_ascii_uppercase().contains("DROP"),
-                "no DROP in migration {}",
-                m.id
-            );
+            // Stricter than `is_destructive` (which names only TABLE/COLUMN) but keyword-anchored:
+            // a bare "DROP" substring also matches the catalogue column `attisdropped`, which
+            // `ci_0020h` legitimately reads when enumerating live columns to revoke.
+            let upper = m.ddl.to_ascii_uppercase();
+            for destructive in [
+                "DROP TABLE",
+                "DROP COLUMN",
+                "DROP SCHEMA",
+                "DROP FUNCTION",
+                "DROP ROLE",
+                "DROP INDEX",
+                "DROP CONSTRAINT",
+                "DROP DATABASE",
+                "DROP OWNED",
+            ] {
+                assert!(
+                    !upper.contains(destructive),
+                    "no `{destructive}` in migration {}",
+                    m.id
+                );
+            }
             if m.ddl.contains("CREATE TABLE") {
                 assert!(
                     m.ddl.contains("myelin_make_tenant_scoped"),
@@ -1864,6 +2461,16 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL);
             } else if m.id == CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL);
+            } else if m.id == CI_JOB_QUEUE_CLAIM_WINDOW_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL);
+            } else if m.id == CI_JOB_QUEUE_CLAIM_WINDOW_VALIDATE_MIGRATION_ID {
+                assert_eq!(m.ddl, VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL);
+            } else if m.id == CI_SCHEDULER_WORKFLOW_VERSION_GRANT_MIGRATION_ID {
+                assert_eq!(m.ddl, GRANT_SCHEDULER_WORKFLOW_VERSION_DDL);
+            } else if m.id == CI_PIPELINE_VERSION_BACKLOG_PROBE_MIGRATION_ID {
+                assert_eq!(m.ddl, CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL);
+            } else if m.id == CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID {
+                assert_eq!(m.ddl, SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL);
             } else if m.id == CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_LEASE_EPOCH_DDL);
             } else if m.id == CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID {
@@ -1914,8 +2521,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            52,
-            "the runner applied all 20 table/RLS, 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 4 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 3 ci_job_accounting ALTERs, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, and 1 prelaunch deadline expand"
+            57,
+            "the runner applied all 20 table/RLS, 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate), 1 ci_job_spec-stage ALTER, 3 ci_job_accounting ALTERs, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, and 1 prelaunch deadline expand"
         );
         assert_eq!(
             runner.applied()[0],
@@ -1979,10 +2586,10 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             workflow_id_grant.ddl,
             GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL
         );
-        let ci_job_reap_reset_grant = migrations
-            .0
-            .last()
-            .expect("the ci_job reap-reset grant is appended under a fresh id, now last");
+        let ci_job_reap_reset_grant = migrations.0.iter().rev().nth(5).expect(
+            "the ci_job reap-reset grant precedes only the claim-window pair and the wf_version \
+             grant",
+        );
         assert_eq!(
             ci_job_reap_reset_grant.id,
             CI_SCHEDULER_CI_JOB_REAP_RESET_GRANT_MIGRATION_ID

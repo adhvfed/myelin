@@ -28,10 +28,11 @@
 
 use myelin_ci_controlplane::{
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
-    BUMP_CHECK_ATTEMPT_SQL, CLAIM_QUERY, CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL,
-    CREATE_CI_JOB_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL, CREATE_LOG_ANCHOR_DDL,
-    INSERT_COST_EVENT_QUERY, REAP_QUERY, SELECT_COST_EVENTS_FOR_RUN_QUERY, UPSERT_LOG_ANCHOR_QUERY,
+    ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
+    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, BUMP_CHECK_ATTEMPT_SQL, CLAIM_QUERY,
+    CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL, CREATE_CI_JOB_DDL, CREATE_CI_RUN_DDL,
+    CREATE_JOB_QUEUE_DDL, CREATE_LOG_ANCHOR_DDL, INSERT_COST_EVENT_QUERY, REAP_QUERY,
+    SELECT_COST_EVENTS_FOR_RUN_QUERY, UPSERT_LOG_ANCHOR_QUERY,
 };
 use sqlx::types::Uuid;
 use sqlx::{PgPool, Row};
@@ -131,6 +132,11 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
         .execute(&p1)
         .await
         .expect("apply job_queue claim-time columns");
+    let alter = ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL.replace("job_queue", &tbl);
+    sqlx::raw_sql(&alter)
+        .execute(&p1)
+        .await
+        .expect("apply the job_queue claim-window expand");
     let alter = ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL.replace("job_queue", &tbl);
     sqlx::query(&alter)
         .execute(&p1)

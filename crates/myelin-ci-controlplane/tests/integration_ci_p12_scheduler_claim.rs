@@ -25,9 +25,9 @@
 
 use myelin_ci_controlplane::{
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
-    CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
-    REAP_QUERY,
+    ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
+    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY,
+    CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, REAP_QUERY,
 };
 
 fn app_url() -> String {
@@ -203,6 +203,11 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         .execute(&admin)
         .await
         .expect("apply the job_queue retryable-attempt ALTER");
+    let alter = ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL.replace("job_queue", &tbl);
+    sqlx::raw_sql(&alter)
+        .execute(&admin)
+        .await
+        .expect("apply the job_queue claim-window expand");
     // The indexes (rewritten to the suffixed table; CONCURRENTLY needs its own tx outside a pool tx —
     // a fresh empty table makes a plain index create lock-free, so drop CONCURRENTLY for the test DDL).
     for (name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {

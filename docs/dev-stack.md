@@ -50,8 +50,8 @@ does not fight a host-native Postgres/Redis.
 
 ## Postgres RLS-ready init
 
-`scripts/pg-init/00-rls-conventions.sql` runs once on first cluster init and establishes the
-`(tenant, region)` Row-Level-Security conventions:
+`scripts/pg-init/*.sql` run once, in filename order, on first cluster init.
+`00-rls-conventions.sql` establishes the `(tenant, region)` Row-Level-Security conventions:
 
 - **`myelin_admin`** — the migration/owner role (`POSTGRES_USER`).
 - **`myelin_app`** — the runtime application role. It is `NOSUPERUSER NOBYPASSRLS`: a superuser or
@@ -62,6 +62,16 @@ does not fight a host-native Postgres/Redis.
   admin-owned table and receives only queue `SELECT`, updates to the three lease columns, and
   fairness reads. It cannot assume the capability role or use a client-selected region to widen its
   server-owned region boundary.
+- **`myelin_ci_definition_fence`** (from `scripts/pg-init/01-ci-definition-fence.sql`) — the ONLY
+  role in the stack that carries `BYPASSRLS`, and the one exception to the rule above. The
+  `ci.pipeline` definition cutover must ask a database-wide question ("is any non-terminal run still
+  pinned to the superseded version?") while `workflow_run` is FORCE-RLS and no tenant scope is set;
+  without bypass authority that question answers `false` instead of raising, which would drain the
+  old definition while live runs still depend on it. The role is `NOLOGIN` (never connectable),
+  `NOINHERIT`, owns only the `myelin_ci_security` schema and the single boolean probe function in
+  it, and — after `ci_0020h` — holds `SELECT` on exactly three non-payload `workflow_run` columns.
+  `myelin_admin` may adopt it (`SET TRUE`) but does not inherit it. See
+  [ci-runner-deployment.md](ci-runner-deployment.md)'s definition-fence provisioning section.
 - **Session GUCs** `myelin.tenant_id` / `myelin.region` — the app sets these per transaction
   (`SELECT set_config('myelin.tenant_id', $1, true)`); RLS policies reference
   `current_setting('myelin.tenant_id', true)`.

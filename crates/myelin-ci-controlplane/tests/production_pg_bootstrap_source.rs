@@ -83,15 +83,32 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let runtime_factory = source
         .find("ci_production_runtime_factory(")
         .expect("the exact-tenant workflow/reporter factory must be composed at the root");
-    let definition_activation = source
-        .find("runner_runtime.activate_definition()")
-        .expect("the source-pinned ci.pipeline definition must be durably activated");
+    // CT-007 round-2 blocker 1: the source-pinned definition is now activated by the CUTOVER FENCE
+    // — one transaction that locks the superseded `wf_definition` row `FOR UPDATE` (mutually
+    // exclusive with a fresh old-binary admission's `FOR SHARE`), runs the database-wide backlog
+    // probe under that fence, and only then drains the old version and activates this one. The
+    // preflight `activate_definition()` it replaced could not close that race.
+    let definition_cutover = source
+        .find(".cutover_definition(&scheduler_provider.region_run_discovery())")
+        .expect("the source-pinned ci.pipeline definition must be activated through the fence");
+    assert!(
+        source[..definition_cutover].ends_with("runner_runtime\n            "),
+        "the cutover must be invoked on the composed runtime factory"
+    );
+    // The diagnostic must come from the SCHEDULER capability, not the RLS-blind app pool: the app
+    // role cannot see other tenants' rows, so an app-pool diagnostic reports "0 runs" for a real
+    // backlog (round-3 finding 4).
+    assert!(
+        !source.contains("runner_runtime.activate_definition()"),
+        "the unserialized preflight activation must never come back — it cannot fence fresh \
+         admission by the outgoing binary"
+    );
     let starter_poller = source
         .find("PgCiRunStarterPoller::new(")
         .expect("the region discovery to exact-tenant starter poller must be composed at the root");
     assert!(
-        runtime_factory < definition_activation && definition_activation < starter_poller,
-        "definition activation must succeed before queued-run intake is constructed"
+        runtime_factory < definition_cutover,
+        "the cutover needs the composed runtime factory"
     );
     let workflow_poller = source
         .find(".workflow_poller(scheduler_provider.region_run_discovery()")
@@ -132,6 +149,28 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let service = source
         .find("run_controlplane_until_shutdown(Config::default()")
         .expect("signal-driven service lifecycle must remain wired");
+
+    // The cutover is the LAST boot gate: every fallible composition happens first (so a refusal
+    // cannot strand a half-built process holding a committed registry transition), and nothing that
+    // could admit work under the new version has spawned before the fence commits.
+    for (name, position) in [
+        ("starter poller", starter_poller),
+        ("workflow poller", workflow_poller),
+        ("reporter router", reporter_router),
+        ("runner identity", runner_identity),
+        ("runner hooks", runner_hooks),
+        ("runner resolver", runner_resolver),
+        ("runner loop", runner_loop),
+    ] {
+        assert!(
+            position < definition_cutover,
+            "{name} composition must complete BEFORE the definition cutover commits"
+        );
+    }
+    assert!(
+        definition_cutover < runner_host,
+        "the cutover fence must be the last gate before the v3 lane is spawned"
+    );
 
     assert!(!source.contains("spawn_until_shutdown"));
     assert!(!source.contains("runner.spawn("));
@@ -252,7 +291,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
             "production runner lifecycle must retain {production_lifecycle_dependency}"
         );
     }
-    assert!(job_queue_store_source.contains(".bind(CI_RUNNER_LEASE_TTL_SECS)"));
+    assert!(job_queue_store_source.contains(".bind(CI_RUNNER_EXECUTION_LEASE_TTL_SECS)"));
     assert!(
         job_queue_store_source.contains("pg_backend_pid() AND locktype = 'advisory'"),
         "the final launch fence must reject a pooled session with stale advisory ownership"

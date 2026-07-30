@@ -128,6 +128,22 @@ impl CiRegionQueueStore {
     ) -> Result<i64, JobQueueStoreError> {
         count_non_terminal_null_stage_jobs_region_scoped(&self.pool, region).await
     }
+
+    /// **The CHECKOUT-COMPOSITION activation guard (CT-007 lease/topology reconciliation).** Counts
+    /// non-terminal rows dispatched before the claim-window expand. Such a row is claimed under the
+    /// flat execution-lease fallback — CORRECT for the workload-only topology it was dispatched
+    /// under, which is why this deliberately does NOT gate the ordinary runner lane the way the
+    /// null-stage backlog does: a legacy row still runs its workload fine, so refusing to start a
+    /// runner over it would be a self-inflicted outage. It can never hold a four-execution checkout
+    /// topology, and per-job enforcement already refuses exactly that (the resolver before mint, the
+    /// issuer inside the locked mint). 5b.3-6 calls this before enabling checkout composition, so
+    /// the coarse fleet-convergence check exists alongside the per-job one rather than instead of it.
+    pub async fn count_non_terminal_null_claim_window_jobs(
+        &self,
+        region: &str,
+    ) -> Result<i64, JobQueueStoreError> {
+        count_non_terminal_null_claim_window_jobs_region_scoped(&self.pool, region).await
+    }
 }
 
 async fn seal_expired_prelaunch_usage_region_scoped(
@@ -288,6 +304,38 @@ WHERE state = 'running'
     SELECT * FROM UNNEST($1::text[], $2::uuid[])
   )";
 
+/// **CT-007 lease/topology reconciliation: seal the reaped generation's unresolved prelaunch phases
+/// in the SAME transaction as the requeue.** A heartbeat-lapsed generation whose claim window is
+/// still open must not become freshly claimable while its `started` journal rows remain unresolved:
+/// the replacement claim would admit a new parent attempt whose settlement could not honestly
+/// account for the old generation's accrued preparation usage until the independent `seal_after`
+/// deadline eventually elapsed.
+///
+/// The predicate names the EXACT generation [`REAP_QUERY`] just requeued (tenant, region, job,
+/// `lease_epoch`, `claim_nonce`) and only `started` rows — a neighbouring generation's phases, and
+/// any phase a worker already `measured`, are untouched. `GREATEST(statement_timestamp(),
+/// started_at)` closes the one edge the table CHECK would otherwise reject: a backward host-clock
+/// step cannot produce `resolved_at < started_at`.
+///
+/// This is the only transition it performs (`started -> sealed_ceiling`), which the transition
+/// trigger admits unconditionally: it refuses only a non-`started` OLD status, a `started` NEW
+/// status, or a mutation of identity/ceiling/`started_at`/`seal_after`. So no reachable journal
+/// state makes this refuse while the queue row is reapable — a failure here is infrastructural, and
+/// rolling the whole sweep back is the honest response.
+const SEAL_REAPED_PRELAUNCH_USAGE_QUERY: &str = "\
+UPDATE ci_job_prelaunch_usage u
+SET status = 'sealed_ceiling',
+    resolved_at = GREATEST(statement_timestamp(), u.started_at)
+FROM UNNEST($1::text[], $2::uuid[], $3::bigint[], $4::uuid[])
+  AS reaped(tenant_id, job_id, lease_epoch, claim_nonce)
+WHERE u.tenant_id = reaped.tenant_id
+  AND u.region = $5
+  AND u.job_id = reaped.job_id
+  AND u.lease_epoch = reaped.lease_epoch
+  AND u.claim_nonce = reaped.claim_nonce
+  AND u.status = 'started'
+RETURNING u.job_id";
+
 /// **The dead-runner reaper raw execution (arch 02 §2.1; [`REAP_QUERY`]) — region-scoped, cross-tenant.**
 /// Runs [`REAP_QUERY`] under [`with_region_tx`], re-queuing every expired lease with an active
 /// Flow/CI owner in place (no INSERT → 0 duplicate enqueues). Cancelled owners are excluded and
@@ -295,11 +343,21 @@ WHERE state = 'running'
 /// surface row(s) back to `'queued'` for exactly the jobs just re-queued (see
 /// [`RESET_REAPED_CI_JOB_SURFACE_QUERY`]), so a freshly re-claimed generation can win the launch fence
 /// again. Returns the count re-queued.
+///
+/// **All three effects commit atomically (CT-007 lease/topology reconciliation).** Between the
+/// requeue and the surface reset, the exact reaped generation's unresolved prelaunch phases are
+/// sealed to their stored ceiling ([`SEAL_REAPED_PRELAUNCH_USAGE_QUERY`]); the surface is reset only
+/// after that sealing succeeds. A seal failure rolls the WHOLE sweep back, so there is never a
+/// committed "freshly claimable but old phase unresolved" state — a persistently failing seal
+/// deliberately pins the row and reports loudly rather than making preparation usage it cannot
+/// settle honestly disappear. The independent `seal_after` deadline sealer remains necessary and
+/// untouched: it covers abandonment paths with no active-owner lease reap at all.
 pub(crate) async fn reap_region_scoped(
     pool: &PgPool,
     region: &str,
 ) -> Result<u64, JobQueueStoreError> {
     let region_owned = region.to_string();
+    let seal_region = region.to_string();
     let rows = with_region_tx(pool, region, move |conn| {
         Box::pin(async move {
             let reaped = sqlx::query(REAP_QUERY)
@@ -308,9 +366,44 @@ pub(crate) async fn reap_region_scoped(
                 .await
                 .map_err(|e| PgError::Query(e.to_string()))?;
             if !reaped.is_empty() {
-                let tenant_ids: Vec<String> =
-                    reaped.iter().map(|r| r.get::<String, _>("tenant_id")).collect();
-                let job_ids: Vec<Uuid> = reaped.iter().map(|r| r.get::<Uuid, _>("job_id")).collect();
+                // The exact generation each row carried BEFORE the requeue cleared its nonce. A
+                // legacy row with no nonce names no journal generation, so it is excluded here
+                // rather than widening the seal predicate.
+                let mut seal_tenants: Vec<String> = Vec::with_capacity(reaped.len());
+                let mut seal_jobs: Vec<Uuid> = Vec::with_capacity(reaped.len());
+                let mut seal_epochs: Vec<i64> = Vec::with_capacity(reaped.len());
+                let mut seal_nonces: Vec<Uuid> = Vec::with_capacity(reaped.len());
+                for row in &reaped {
+                    let Some(nonce) = row.get::<Option<String>, _>("reaped_claim_nonce") else {
+                        continue;
+                    };
+                    let Ok(nonce) = Uuid::parse_str(&nonce) else {
+                        return Err(PgError::Query(
+                            "reaped generation carries a non-uuid claim nonce".into(),
+                        ));
+                    };
+                    seal_tenants.push(row.get::<String, _>("tenant_id"));
+                    seal_jobs.push(row.get::<Uuid, _>("job_id"));
+                    seal_epochs.push(row.get::<i64, _>("reaped_lease_epoch"));
+                    seal_nonces.push(nonce);
+                }
+                if !seal_tenants.is_empty() {
+                    sqlx::query(SEAL_REAPED_PRELAUNCH_USAGE_QUERY)
+                        .bind(&seal_tenants)
+                        .bind(&seal_jobs)
+                        .bind(&seal_epochs)
+                        .bind(&seal_nonces)
+                        .bind(&seal_region)
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(|e| PgError::Query(e.to_string()))?;
+                }
+                let tenant_ids: Vec<String> = reaped
+                    .iter()
+                    .map(|r| r.get::<String, _>("tenant_id"))
+                    .collect();
+                let job_ids: Vec<Uuid> =
+                    reaped.iter().map(|r| r.get::<Uuid, _>("job_id")).collect();
                 sqlx::query(RESET_REAPED_CI_JOB_SURFACE_QUERY)
                     .bind(&tenant_ids)
                     .bind(&job_ids)
@@ -345,6 +438,31 @@ pub(crate) async fn count_non_terminal_null_stage_jobs_region_scoped(
                 .fetch_one(&mut *conn)
                 .await
                 .map_err(|e| PgError::Query(e.to_string()))
+        })
+    })
+    .await
+}
+
+/// **The claim-window activation guard (CT-007 lease/topology reconciliation), region-scoped +
+/// cross-tenant.** Counts, across every tenant in `region`, non-terminal `job_queue` rows whose
+/// `claim_window_secs` is still NULL — see
+/// [`NON_TERMINAL_NULL_CLAIM_WINDOW_JOBS_QUERY`](crate::job_spec_store::NON_TERMINAL_NULL_CLAIM_WINDOW_JOBS_QUERY).
+/// Lives in this NAMED `tenant-predicate`-excluded module for the same reason its null-stage sibling
+/// does: it is a cross-tenant service read under [`with_region_tx`], never a per-tenant store op.
+pub(crate) async fn count_non_terminal_null_claim_window_jobs_region_scoped(
+    pool: &PgPool,
+    region: &str,
+) -> Result<i64, JobQueueStoreError> {
+    let region_owned = region.to_string();
+    with_region_tx(pool, region, move |conn| {
+        Box::pin(async move {
+            sqlx::query_scalar::<_, i64>(
+                crate::job_spec_store::NON_TERMINAL_NULL_CLAIM_WINDOW_JOBS_QUERY,
+            )
+            .bind(&region_owned) // $1 region (RESIDENCY, not a tenant predicate — cross-tenant read)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))
         })
     })
     .await
@@ -404,6 +522,7 @@ fn leased_from_row(
     let claim_nonce: String = r.get("claim_nonce");
     let claim_started_at_epoch_secs: i64 = r.get("claim_started_at_epoch_secs");
     let claim_expires_at_epoch_secs: i64 = r.get("claim_expires_at_epoch_secs");
+    let claim_window_secs: Option<i64> = r.get("claim_window_secs");
     let lane = Lane::from_token(&lane_token).ok_or_else(|| {
         JobQueueStoreError::CorruptRow(format!("unknown lane token `{lane_token}`"))
     })?;
@@ -421,5 +540,6 @@ fn leased_from_row(
         claim_nonce,
         claim_started_at_epoch_secs,
         claim_expires_at_epoch_secs,
+        claim_window_secs,
     })
 }
