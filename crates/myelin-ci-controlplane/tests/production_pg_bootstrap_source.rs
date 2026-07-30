@@ -263,9 +263,10 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let open_gate = launch_gate_source
         .find("gate.write_all(b\"launch\\n\")")
         .expect("the durable gate must have one explicit release byte");
-    let release_ownership = launch_gate_source
-        .find("ownership.release()")
-        .expect("launch ownership must be released after the gate handoff");
+    let release_ownership = open_gate
+        + launch_gate_source[open_gate..]
+            .find("ownership.release()")
+            .expect("launch ownership must be released after the gate handoff");
     assert!(
         validate_ownership < open_gate && open_gate < release_ownership,
         "launch ownership must remain held across the exact child-gate write"
@@ -372,7 +373,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         .find(".load_by_identity_on_conn(")
         .expect("claim-time issuer must reload the immutable manifest");
     let verify = claim_issuer_source
-        .find("authority_from_durable_claim(&request, &run, &manifest)")
+        .find("authority_from_durable_claim(&request, &run, &manifest, &launch_template)")
         .expect("claim-time issuer must reconstruct and verify durable authority");
     let mint = claim_issuer_source
         .find(".mint_verified(request.clone(), authority)")
