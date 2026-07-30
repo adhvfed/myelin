@@ -144,7 +144,7 @@ fn a_corrupt_spec_jsonb_is_a_fail_closed_resolve_error() {
 fn a_trust_tier_mismatch_is_refused_before_any_write() {
     let fork_spec = full_spec(TrustTier::UntrustedFork, 60);
     // The classic widening attempt: gate the row as `trusted` while the spec is `untrusted_fork`.
-    let e = validate_dispatch(TrustTier::Trusted, &fork_spec)
+    let e = validate_dispatch(TrustTier::Trusted, None, &fork_spec)
         .expect_err("a widened gate tier is refused");
     match e {
         CiJobSpecStoreError::TrustTierMismatch { enqueue, spec } => {
@@ -154,14 +154,14 @@ fn a_trust_tier_mismatch_is_refused_before_any_write() {
         other => panic!("expected TrustTierMismatch, got {other:?}"),
     }
     // The matching case (the honest dispatch) passes.
-    assert!(validate_dispatch(TrustTier::UntrustedFork, &fork_spec).is_ok());
+    assert!(validate_dispatch(TrustTier::UntrustedFork, None, &fork_spec).is_ok());
     // Every tier agreeing with itself is admitted.
     for t in [
         TrustTier::Trusted,
         TrustTier::UntrustedFork,
         TrustTier::SelfHosted,
     ] {
-        assert!(validate_dispatch(t, &full_spec(t, 60)).is_ok());
+        assert!(validate_dispatch(t, None, &full_spec(t, 60)).is_ok());
     }
 }
 
@@ -172,12 +172,13 @@ fn a_trust_tier_mismatch_is_refused_before_any_write() {
 fn a_timeout_over_the_ceiling_is_refused() {
     let at = full_spec(TrustTier::Trusted, MAX_JOB_TIMEOUT_SECS);
     assert!(
-        validate_dispatch(TrustTier::Trusted, &at).is_ok(),
+        validate_dispatch(TrustTier::Trusted, None, &at).is_ok(),
         "at the ceiling is admitted"
     );
 
     let over = full_spec(TrustTier::Trusted, MAX_JOB_TIMEOUT_SECS + 1);
-    let e = validate_dispatch(TrustTier::Trusted, &over).expect_err("over the ceiling is refused");
+    let e = validate_dispatch(TrustTier::Trusted, None, &over)
+        .expect_err("over the ceiling is refused");
     match e {
         CiJobSpecStoreError::TimeoutTooLong { requested, ceiling } => {
             assert_eq!(requested, MAX_JOB_TIMEOUT_SECS + 1);
@@ -189,14 +190,14 @@ fn a_timeout_over_the_ceiling_is_refused() {
 
 /// **The runner's wired lease TTL is strictly ABOVE the max job timeout — the invariant that makes a
 /// lease-outliving double-run impossible.** This is the numeric proof of the CT-004c.2 verifier fix:
-/// `CI_RUNNER_LEASE_TTL_SECS > MAX_JOB_TIMEOUT_SECS`, so a job capped at the ceiling still finishes
+/// `CI_RUNNER_EXECUTION_LEASE_TTL_SECS > MAX_JOB_TIMEOUT_SECS`, so a job capped at the ceiling still finishes
 /// (and heartbeats) before its lease could lapse.
 #[test]
 fn the_wired_lease_ttl_exceeds_the_max_job_timeout() {
     assert!(
-        crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS > MAX_JOB_TIMEOUT_SECS as i64,
+        crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS > MAX_JOB_TIMEOUT_SECS as i64,
         "the runner lease TTL ({}) must exceed the max job timeout ({}) so a job never outlives its lease",
-        crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS,
+        crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
         MAX_JOB_TIMEOUT_SECS
     );
 }

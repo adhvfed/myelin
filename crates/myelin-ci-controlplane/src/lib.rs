@@ -56,6 +56,9 @@ pub mod artifact_cache;
 pub mod check_emitter;
 /// Claim-time durable authority verification in front of the raw Identity credential minter.
 pub mod ci_claim_token_issuer;
+/// The immutable, topology-derived scheduler claim window — the per-generation hard ceiling the
+/// heartbeat-extendable execution lease is renewed inside.
+pub mod ci_claim_window;
 /// Canonical, insert-only replay authority for a durable CI workflow. The manifest binds the exact
 /// DAG, per-context check attempts, workflow code identity, and server-granted launch templates;
 /// secret values and minted token JTIs are structurally absent.
@@ -119,9 +122,12 @@ pub use ci_runner_composition::{
 #[doc(hidden)]
 pub use ci_runtime_composition::ci_production_runtime_factory_test_support;
 pub use ci_runtime_composition::{
-    ci_manifest_pipeline_definition, ci_production_runtime_factory, CiProductionRuntimeFactory,
-    CiProductionWorkflowPoller, CiRuntimeCompositionError, CiWorkflowFanoutBatch,
-    CI_FLOW_OUTBOX_SCHEMA_VERSION, CI_FLOW_WORKER_LEASE_TTL_SECS, CI_MANIFEST_PIPELINE_VERSION,
+    ci_manifest_pipeline_definition, ci_production_runtime_factory,
+    CiProductionRuntimeFactory,
+    CiProductionWorkflowPoller, CiRuntimeCompositionError, CiSupersededDefinitionBacklog,
+    CiSupersededDefinitionGuardError, CiWorkflowFanoutBatch, CI_FLOW_OUTBOX_SCHEMA_VERSION,
+    CI_FLOW_WORKER_LEASE_TTL_SECS, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
+    CI_MANIFEST_PIPELINE_VERSION, CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS,
     MAX_CI_WORKFLOW_DRIVES_PER_SCOPE, MAX_CI_WORKFLOW_SCOPES_PER_PASS,
 };
 pub use ci_prelaunch_usage_journal::{
@@ -580,7 +586,9 @@ pub use job_spec_store::{
 // The co-emitted events stay absorb-mode through the outbox (the honest #7 H1 split).
 pub use ci_run_region::{
     CiActiveRunCursor, CiActiveRunPage, CiActiveRunRoute, CiRegionRunDiscovery,
-    DISCOVER_ACTIVE_CI_RUNS_QUERY, DISCOVER_QUEUED_CI_RUN_TENANT_QUERY, MAX_ACTIVE_CI_RUN_PAGE,
+    SupersededCiPipelineRun, DISCOVER_ACTIVE_CI_RUNS_QUERY, DISCOVER_QUEUED_CI_RUN_TENANT_QUERY,
+    DISCOVER_SUPERSEDED_CI_PIPELINE_RUNS_QUERY, MAX_ACTIVE_CI_RUN_PAGE,
+    MAX_SUPERSEDED_CI_PIPELINE_RUN_PROBE, MAX_SUPERSEDED_CI_PIPELINE_RUN_REPORT,
 };
 pub use ci_run_starter_poller::{
     CiRunStarterBatch, CiRunStarterPollerError, PgCiRunStarterPoller, MAX_CI_RUN_START_BATCH,
@@ -604,12 +612,22 @@ pub use ci_scheduler_db::{
 
 // CT-004c.2: the runner exec binding — the durable-store lease adapter + the bounded runner loop the
 // service `main` spawns (WIRES `RunnerAgent` to `CiJobQueueStore` + a real gVisor backend). CT-004d.1
-// adds the REAL spec resolver (`durable_spec_resolver`) + the lease-TTL floor (`CI_RUNNER_LEASE_TTL_SECS`).
+// adds the REAL spec resolver (`durable_spec_resolver`) + the lease-TTL floor (`CI_RUNNER_EXECUTION_LEASE_TTL_SECS`).
 #[cfg(any(test, feature = "test-support"))]
 pub use runner_bind::durable_spec_resolver_test_support;
 pub use runner_bind::{
     durable_spec_resolver, spec_store_unavailable_resolver, CiRunnerLoop, CiRunnerLoopExit,
-    DurableLeaseAdapter, JobSpecResolver, CI_RUNNER_LEASE_TTL_SECS,
+    DurableLeaseAdapter, DurablePreparationLeaseCheckpoint, JobSpecResolver,
+    CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
+};
+
+// CT-007 lease/topology reconciliation: the immutable claim-window authority. `claim_window_secs`
+// is the ONE derivation every dispatch writer, the dispatch replay check, and the token issuer's
+// cross-check all call, so a queue row's ceiling can never disagree with the spec that executes.
+pub use ci_claim_window::{
+    claim_window_secs, claim_window_secs_for_template, is_checkout_bearing, CiClaimWindowError,
+    CI_CHECKOUT_PARENT_ATTEMPT_EXECUTIONS, CI_EXECUTION_LEASE_HEADROOM_SECS,
+    MAX_CI_JOB_CLAIM_WINDOW_SECS,
 };
 
 // CT-004d.2 CULMINATION (chunks 2/3/5): the CI pipeline driver — `DurableJobRunner` (chunk 5) dispatches
@@ -654,23 +672,25 @@ pub use fairness::{
 pub use migrations::CI_RUN_SURFACE_INDEX_READINESS;
 pub use migrations::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, ci_durable_hot_tables,
-    ci_durable_migrations, make_tenant_scoped_ddl,
-    ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL,
+    ci_durable_migrations, make_tenant_scoped_ddl, ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL,
     ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL,
-    ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL,
-    ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
-    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+    ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
+    ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
+    ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL,
     ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, ARTIFACT_TABLE,
     CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DRIVE_MANIFEST_TABLE,
+    CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID, CI_PIPELINE_VERSION_BACKLOG_PROBE_MIGRATION_ID,
+    CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL, SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL,
     CI_DURABLE_WRITER_IDS, CI_JOB_ACCOUNTING_DISPOSITION_V4_MIGRATION_ID,
-    CI_JOB_ACCOUNTING_DISPOSITION_V4_VERDICT_MIGRATION_ID,
-    CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID, CI_JOB_ACCOUNTING_TABLE,
-    CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_JOB_QUEUE_CLAIM_TIME_MIGRATION_ID,
-    CI_JOB_QUEUE_COMPLETION_MIGRATION_ID, CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID,
-    CI_JOB_RUN_LEDGER_INDEX, CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID,
-    CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID, CI_JOB_SPEC_STAGE_MIGRATION_ID, CI_JOB_SPEC_TABLE,
-    CI_JOB_TABLE, CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
+    CI_JOB_ACCOUNTING_DISPOSITION_V4_VERDICT_MIGRATION_ID, CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID,
+    CI_JOB_ACCOUNTING_TABLE, CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID,
+    CI_JOB_QUEUE_CLAIM_TIME_MIGRATION_ID, CI_JOB_QUEUE_CLAIM_WINDOW_MIGRATION_ID,
+    CI_JOB_QUEUE_CLAIM_WINDOW_VALIDATE_MIGRATION_ID, CI_JOB_QUEUE_COMPLETION_MIGRATION_ID,
+    CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID, CI_JOB_RUN_LEDGER_INDEX,
+    CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID, CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID,
+    CI_JOB_SPEC_STAGE_MIGRATION_ID, CI_JOB_SPEC_TABLE, CI_JOB_TABLE,
+    CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
     CI_RUN_CHECK_ATTEMPT_TABLE, CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
     CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID, CI_RUN_QUEUED_REGION_INDEX,
     CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID, CI_RUN_SURFACE_REPO_CREATED_INDEX,
@@ -690,6 +710,7 @@ pub use migrations::{
     GRANT_SCHEDULER_CLAIM_TIME_DDL, GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE,
     JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE,
     RUNNER_TABLE, SECRET_BINDING_TABLE, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+    VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL,
 };
 
 pub use permanent_gates::{
@@ -1091,8 +1112,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            52,
-            "all 20 tables, three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 4 job_queue ALTERs, the ci_job_spec-stage and three accounting ALTERs, scheduler RLS boundary, 3 claim-column grants, 3 ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, and the prelaunch deadline expand are present"
+            57,
+            "all 20 tables, three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 6 job_queue ALTERs (4 claim/completion + the claim-window expand and its validation), the ci_job_spec-stage and three accounting ALTERs, scheduler RLS boundary, 3 claim-column grants, 4 ci_run/workflow discovery grants (incl. the wf_version grant the cutover fence needs), 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, the prelaunch deadline expand, and the cutover fence's database-wide backlog probe plus its predecessor-row seed are present"
         );
         assert!(
             spec.consumers.is_empty(),

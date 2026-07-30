@@ -142,9 +142,10 @@ pub use gvisor::{
 
 pub use runner::{
     CompletionClaim, CountingFirehose, EngineTerminalReporter, FirehoseSink, JobLeaseStore,
-    LeaseStore, PreparationAttemptDisposition, PreparationPhase, PreparationTerminalDisposition,
-    QueuedJob, RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome, RunOutcome,
-    RunnerAgent, RunnerError, TerminalReport, TerminalReporter,
+    LeaseStore, PreparationAttemptDisposition, PreparationLeaseCheckpoint, PreparationLeaseLost,
+    PreparationPhase, PreparationTerminalDisposition, QueuedJob, RetryableAttemptCause,
+    RetryableAttemptFailure, RetryableAttemptOutcome, RunOutcome, RunnerAgent, RunnerError,
+    TerminalReport, TerminalReporter,
 };
 
 use serde::{Deserialize, Serialize};

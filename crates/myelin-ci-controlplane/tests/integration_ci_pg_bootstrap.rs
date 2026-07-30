@@ -2,6 +2,8 @@
 //! with only the constrained runtime role.
 #![cfg(feature = "integration")]
 
+mod common;
+
 use myelin_config::MyelinConfig;
 use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap};
 use sqlx::postgres::PgPoolOptions;
@@ -74,13 +76,22 @@ async fn exercise(
         )
         .await
         .map_err(|e| format!("migrate Controlplane Flow prerequisite: {e}"))?;
-    bootstrap
-        .migrate(
-            &myelin_ci_controlplane::ci_controlplane_migrations(),
-            &myelin_ci_controlplane::ci_controlplane_hot_tables(),
-        )
-        .await
-        .map_err(|e| format!("migrate complete Controlplane schema: {e}"))?;
+    // The CI set installs `myelin_ci_region_scheduler` grants in THIS schema, and the production
+    // scheduler provider's excess-privilege probe scans every non-system schema. Hold the fixture
+    // lock across the apply, then strip those grants, so a concurrent scheduler-boundary or
+    // production-boot test can never observe them.
+    let mut migrate_result = Ok(());
+    common::with_fixture_migration_lock(&base.database_migration_url, admin, schema, || async {
+        migrate_result = bootstrap
+            .migrate(
+                &myelin_ci_controlplane::ci_controlplane_migrations(),
+                &myelin_ci_controlplane::ci_controlplane_hot_tables(),
+            )
+            .await
+            .map_err(|e| format!("migrate complete Controlplane schema: {e}"));
+    })
+    .await;
+    migrate_result?;
     bootstrap
         .verify_index_ready_exact(myelin_ci_controlplane::CI_RUN_SURFACE_INDEX_READINESS)
         .await

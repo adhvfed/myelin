@@ -153,6 +153,15 @@ note = "cargo build --workspace --locked, cargo test --workspace --locked, cargo
 
 [[job]]
 workflow = "integration.yml"
+job = "fresh-definition-fence"
+status = "github-only"
+migration_step = 2
+migration_state = "not-started"
+myelin_job = ""
+note = "The CT-007 fresh-volume CI definition-fence drill (scripts/drill-ci-definition-fence-fresh-postgres.sh): launches a disposable postgres:16 with scripts/pg-init mounted, proves the init scripts complete in filename order before any migrated table exists, provisions a NOSUPERUSER/NOBYPASSRLS/NOCREATEROLE `myelin_fresh_migrator`, and runs the ignored `integration_ci_definition_fence_fresh` target through it. Covers the two failure classes the persistent dev stack cannot: pg-init ORDERING on a brand-new volume, and whether a non-superuser migration role can adopt the BYPASSRLS fence role via its explicit SET TRUE membership to create the probe as its final owner (a superuser would succeed even with that membership missing). Workload parity needs a runner asset that can start a sibling Postgres container plus a host `psql`, i.e. the same rootless-Docker-capable job pod integration.yml's other job needs — it is not additional runner capability beyond that."
+
+[[job]]
+workflow = "integration.yml"
 job = "integration"
 status = "github-only"
 migration_step = 2

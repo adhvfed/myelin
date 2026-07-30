@@ -25,6 +25,7 @@ use crate::ci_manifest_job_runner::{
 use crate::ci_run_store::{CiRunRecord, CiRunStore};
 use crate::job_queue_store::{CiJobQueueStore, LockedJobClaim};
 use crate::job_spec_store::{CiJobSpecStore, DurableCiJobLaunchTemplate};
+use crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS;
 
 /// The narrow Identity-facing mint seam. Implementations receive only server-reconstructed durable
 /// authority plus the exact live claim. They must be exact-retry stable while the deterministic
@@ -144,6 +145,11 @@ impl CiJobTokenIssuer for LockedManifestCiJobTokenIssuer {
                             "scheduler claim authority differs from the immutable manifest",
                         ));
                     }
+                    // CT-007 lease/topology reconciliation, defense in depth: the durable spec
+                    // resolver already refused a checkout-bearing legacy row before this mint was
+                    // requested, but the credential boundary re-derives the window from the durable
+                    // spec under the SAME row lock rather than trusting that earlier check.
+                    verify_claim_window(&request, &locked_claim, &launch_template)?;
                     let credential = credential_minter
                         .mint_verified(request.clone(), authority)
                         .await?;
@@ -172,6 +178,61 @@ pub(crate) fn verify_locked_claim(
         return Err(refused(
             "presented scheduler claim is stale, expired, or divergent",
         ));
+    }
+    Ok(())
+}
+
+/// **CT-007 lease/topology reconciliation: the claim window's anti-forgery cross-check.** The
+/// immutable `claim_expires_at - claim_started_at` difference is what every downstream authority
+/// binds; this proves that difference really was sized from the durable window, and that the durable
+/// window really is what the dispatched spec's own topology derives. The two directions matter
+/// separately: the first catches a queue row whose timestamps were written under a different window
+/// than the one it now carries; the second catches a queue row whose window disagrees with the spec
+/// that will actually execute.
+///
+/// `claim_window_secs = NULL` is the legacy generation, claimed under the flat execution-lease
+/// fallback:
+/// - non-checkout → accepted only if the difference is exactly
+///   [`CI_RUNNER_EXECUTION_LEASE_TTL_SECS`], i.e. the row really was claimed under that fallback;
+/// - checkout-bearing → REFUSED outright. A four-execution topology under a one-execution ceiling
+///   would have its claim expire mid-preparation, and no credential may be minted for it.
+pub(crate) fn verify_claim_window(
+    request: &CiJobTokenRequest,
+    locked: &LockedJobClaim,
+    launch_template: &DurableCiJobLaunchTemplate,
+) -> Result<(), CiJobTokenIssueError> {
+    let observed = request
+        .claim_expires_at_epoch_secs
+        .checked_sub(request.claim_started_at_epoch_secs)
+        .ok_or_else(|| refused("claim lifetime is outside the supported range"))?;
+    let derived = crate::ci_claim_window::claim_window_secs_for_template(&launch_template.spec)
+        .map_err(|_| refused("durable launch template has no derivable claim window"))?;
+    match locked.claim_window_secs {
+        Some(window) => {
+            if observed != window || window != derived {
+                return Err(refused(
+                    "durable claim window disagrees with the claim generation or the dispatched spec",
+                ));
+            }
+        }
+        None => {
+            let checkout_bearing = crate::ci_claim_window::is_checkout_bearing(
+                launch_template.spec.kind,
+                &launch_template.spec.workspace,
+            )
+            .map_err(|_| refused("durable launch template has no derivable checkout intent"))?;
+            if checkout_bearing {
+                return Err(refused(
+                    "checkout-bearing job carries no durable claim window (a legacy pre-expand \
+                     dispatch); its claim would expire mid-preparation",
+                ));
+            }
+            if observed != CI_RUNNER_EXECUTION_LEASE_TTL_SECS {
+                return Err(refused(
+                    "legacy null-window claim was not sized from the flat execution-lease TTL",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -607,6 +668,9 @@ mod tests {
             claim_nonce: Some(claim.claim_nonce.clone()),
             claim_started_at_epoch_secs: Some(claim.claim_started_at_epoch_secs),
             claim_expires_at_epoch_secs: Some(claim.claim_expires_at_epoch_secs),
+            claim_window_secs: Some(
+                claim.claim_expires_at_epoch_secs - claim.claim_started_at_epoch_secs,
+            ),
             claim_is_live: true,
         }
     }
@@ -746,6 +810,84 @@ mod tests {
             mutate(&mut divergent);
             assert!(verify_locked_claim(&claim, &divergent).is_err());
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // CT-007 lease/topology reconciliation: the claim-window cross-check at the mint boundary.
+    // ---------------------------------------------------------------------------------------
+
+    /// A claim/locked pair whose generation really was sized from `window`.
+    fn claim_of_window(window: i64) -> (CiJobTokenRequest, LockedJobClaim) {
+        let (_, mut claim) = manifest_and_claim();
+        claim.claim_expires_at_epoch_secs = claim.claim_started_at_epoch_secs + window;
+        let mut locked = locked_claim(&claim);
+        locked.claim_window_secs = Some(window);
+        (claim, locked)
+    }
+
+    /// The checkout-bearing template every fixture here dispatches: timeout 600s, four execution
+    /// slots → 4,800s.
+    const FIXTURE_CHECKOUT_WINDOW_SECS: i64 = 4 * (600 + 600);
+
+    fn compute_launch_template(claim: &CiJobTokenRequest) -> DurableCiJobLaunchTemplate {
+        let mut template = default_launch_template(claim);
+        template.spec.workspace = myelin_ci_sandbox::WorkspaceSpec::default();
+        template
+    }
+
+    #[test]
+    fn a_populated_window_must_match_both_the_generation_and_the_dispatched_spec() {
+        let (claim, locked) = claim_of_window(FIXTURE_CHECKOUT_WINDOW_SECS);
+        let template = default_launch_template(&claim);
+        verify_claim_window(&claim, &locked, &template).unwrap();
+
+        // The generation's timestamps say something different from the stored window.
+        let (_, mut divergent_generation) = claim_of_window(FIXTURE_CHECKOUT_WINDOW_SECS);
+        divergent_generation.claim_window_secs = Some(FIXTURE_CHECKOUT_WINDOW_SECS - 1);
+        assert!(verify_claim_window(&claim, &divergent_generation, &template).is_err());
+
+        // The stored window says something different from what the dispatched spec derives.
+        let (short_claim, short_locked) = claim_of_window(30);
+        assert!(verify_claim_window(
+            &short_claim,
+            &short_locked,
+            &default_launch_template(&short_claim)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_legacy_null_window_is_accepted_only_for_a_flat_window_non_checkout_generation() {
+        let (claim, mut locked) = claim_of_window(CI_RUNNER_EXECUTION_LEASE_TTL_SECS);
+        locked.claim_window_secs = None;
+        verify_claim_window(&claim, &locked, &compute_launch_template(&claim)).unwrap();
+
+        // A null-window row whose generation was NOT sized from the flat TTL is not the legacy
+        // shape this fallback exists for.
+        let (short_claim, mut short_locked) = claim_of_window(30);
+        short_locked.claim_window_secs = None;
+        assert!(verify_claim_window(
+            &short_claim,
+            &short_locked,
+            &compute_launch_template(&short_claim)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_legacy_null_window_is_refused_outright_for_a_checkout_bearing_spec() {
+        let (claim, mut locked) = claim_of_window(CI_RUNNER_EXECUTION_LEASE_TTL_SECS);
+        locked.claim_window_secs = None;
+        let checkout = default_launch_template(&claim);
+        assert!(crate::ci_claim_window::is_checkout_bearing(
+            checkout.spec.kind,
+            &checkout.spec.workspace
+        )
+        .unwrap());
+        assert!(
+            verify_claim_window(&claim, &locked, &checkout).is_err(),
+            "a four-execution topology may never mint under a one-execution claim ceiling"
+        );
     }
 
     #[test]

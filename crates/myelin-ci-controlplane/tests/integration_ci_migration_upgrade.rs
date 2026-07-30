@@ -115,6 +115,12 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
     .await
     .expect("the isolated Flow prerequisite applies");
 
+    // Steps 1–4 are ONE locked region. `old_sequence()` filters only nine migration ids and still
+    // contains the `myelin_ci_region_scheduler` grant migrations, so its grants are live from step 1
+    // onward; locking only the step-2 apply left them exposed to every concurrently-booting
+    // scheduler probe throughout the step-1 assertions. The helper revokes once, after step 4, and
+    // only then releases the lock.
+    common::with_fixture_migration_lock(&admin_url(), &pool, &schema, || async {
     // ── 1. Apply the already-shipped WIP sequence (including immutable a-suffix migrations). ──
     PgMigrator::apply_validated(&pool, &old_sequence(), &ci_controlplane_hot_tables())
         .await
@@ -194,6 +200,8 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
     )
     .await
     .expect("a second apply of the full set is an idempotent no-op");
+    })
+    .await;
 
     pool.close().await;
     // NOTE: do NOT close `bare` here — `cleanup_bare` (passed to `with_schema_cleanup` above) is a

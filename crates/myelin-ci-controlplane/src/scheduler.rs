@@ -76,7 +76,17 @@ pub use myelin_ci_sandbox::TrustTier;
 /// runner long-polls and claims the highest-priority, fairest, label-eligible, in-region, trust-
 /// allowed, non-serialized job via `FOR UPDATE SKIP LOCKED` (so concurrent runners never block each
 /// other; each takes a different row). Bind params: `$1 cell_region`, `$2 runner_labels text[]`,
-/// `$3 runner_allowed_tiers text[]`, `$4 lease_owner`, `$5 lease_ttl_seconds`.
+/// `$3 runner_allowed_tiers text[]`, `$4 lease_owner`, `$5 execution_lease_ttl_seconds`.
+///
+/// **The two deadlines are sized from different authorities (CT-007 lease/topology
+/// reconciliation).** `lease_expires` is the heartbeat-extendable EXECUTION lease and still comes
+/// from `$5` — one execution's wall clock plus headroom. `claim_expires_at` is the IMMUTABLE
+/// per-generation ceiling and comes from the row's own dispatch-derived `claim_window_secs`, which is
+/// four execution slots for a checkout-bearing job and exactly `$5` for every other job. A legacy
+/// row written before that column existed COALESCEs back to `$5`, so its claim window is
+/// byte-identical to pre-slice behaviour; the returned window lets the resolver refuse such a row
+/// for checkout composition rather than silently running a four-execution topology under a
+/// one-execution ceiling.
 ///
 /// The `lane_priority` CASE is the strict lane ORDER (interactive > batch > deploy, arch 02 §2.3);
 /// `fair_deficit.deficit DESC` is the DRR fairness term (the ADVANCE is CI-P13); `enqueued_at ASC`
@@ -139,11 +149,12 @@ SET state = 'leased',
     lease_epoch = j.lease_epoch + 1,
     claim_nonce = gen_random_uuid(),
     claim_started_at = statement_timestamp(),
-    claim_expires_at = statement_timestamp() + ($5 || ' seconds')::interval
+    claim_expires_at = statement_timestamp()
+      + (COALESCE(j.claim_window_secs::text, $5) || ' seconds')::interval
 FROM eligible e
 WHERE j.tenant_id = e.tenant_id AND j.job_id = e.job_id
 RETURNING j.tenant_id, j.job_id, j.run_id, j.lane, j.concurrency_group, j.fair_key, j.trust_tier,
-          j.lease_epoch, j.claim_nonce::text AS claim_nonce,
+          j.lease_epoch, j.claim_nonce::text AS claim_nonce, j.claim_window_secs,
           EXTRACT(EPOCH FROM j.claim_started_at)::bigint AS claim_started_at_epoch_secs,
           EXTRACT(EPOCH FROM j.claim_expires_at)::bigint AS claim_expires_at_epoch_secs";
 
@@ -167,6 +178,14 @@ RETURNING job_id";
 /// Cancelled/terminated owners are excluded so generic lease recovery cannot resurrect superseded
 /// work; the production driver reconciles an expired launched row through terminal accounting
 /// instead. Active re-queue is idempotent, and `jq_idem` rejects duplicate enqueue. Bind: `$1 region`.
+///
+/// **The OLD generation identity is returned alongside the row (CT-007 lease/topology
+/// reconciliation).** The `UPDATE` clears `claim_nonce`, so `RETURNING` on the queue row alone
+/// cannot name the generation that was just reaped. The `expired` CTE carries the pre-requeue
+/// `lease_epoch`/`claim_nonce` through, so [`crate::job_queue_region::reap_region_scoped`] can seal
+/// exactly that generation's unresolved prelaunch phases in the SAME transaction — never a
+/// neighbouring generation's, and never a committed "freshly claimable but old phase unresolved"
+/// state.
 pub const REAP_QUERY: &str = "\
 WITH candidates AS MATERIALIZED (
   SELECT tenant_id, region, job_id, state, lease_epoch, claim_nonce
@@ -191,7 +210,7 @@ WITH candidates AS MATERIALIZED (
   FOR UPDATE SKIP LOCKED
 ),
 expired AS (
-  SELECT tenant_id, job_id
+  SELECT tenant_id, job_id, lease_epoch, claim_nonce
   FROM candidates
   WHERE state = 'leased'
      OR (
@@ -214,7 +233,8 @@ UPDATE job_queue j
 SET state = 'queued', lease_owner = NULL, lease_expires = NULL, claim_nonce = NULL
 FROM expired e
 WHERE j.tenant_id = e.tenant_id AND j.job_id = e.job_id
-RETURNING j.tenant_id, j.job_id";
+RETURNING j.tenant_id, j.job_id, e.lease_epoch AS reaped_lease_epoch,
+          e.claim_nonce::text AS reaped_claim_nonce";
 
 /// **Final exact-generation launch fence.** Atomically move one still-live scheduler generation
 /// from `leased` to `running` immediately before sandbox spawn. Cancellation and this CAS serialize
@@ -227,11 +247,20 @@ RETURNING j.tenant_id, j.job_id";
 /// lease seconds`. The public `ci_job` row crosses to `running` in the SAME statement: if that
 /// surface row is absent, cancelled, or otherwise inconsistent, the CTE returns no row and the
 /// caller rolls the complete launch transaction back rather than executing an invisible job.
+///
+/// **The installed lease is capped at the immutable claim expiry (CT-007 lease/topology
+/// reconciliation).** Every downstream authority already refuses past `claim_expires_at`, so an
+/// execution lease reaching beyond it would only delay the reaper's recovery of a generation nothing
+/// can legitimately act on any more. `LEAST` makes the hard ceiling structural. The PREDICATES are
+/// unchanged, byte for byte.
 pub const AUTHORIZE_JOB_LAUNCH_QUERY: &str = "\
 WITH launched AS (
 UPDATE job_queue
 SET state = 'running',
-    lease_expires = statement_timestamp() + ($10 || ' seconds')::interval
+    lease_expires = LEAST(
+      claim_expires_at,
+      statement_timestamp() + ($10 || ' seconds')::interval
+    )
 WHERE tenant_id = $1
   AND region = $2
   AND job_id = $3::uuid
@@ -288,6 +317,65 @@ WHERE tenant_id = $1
       AND surface.state IN ('queued', 'leased')
   )";
 
+/// **The exact-generation preparation-lease renewal (CT-007 lease/topology reconciliation).** A
+/// checkout-bearing parent attempt contains four sequential executions under ONE immutable claim
+/// window; this is what a preparation phase boundary calls so no interval between renewals holds
+/// more than one legally bounded execution.
+///
+/// Deliberately NOT a widening of [`HEARTBEAT_QUERY`]: that query is owner-only and accepts
+/// `running`, which is precisely what a preparation renewal must refuse — a generation whose
+/// workload launch already won is no longer in preparation, and extending it here would let a stale
+/// preparation worker prolong a lease the workload owns. This binds the SAME full identity the
+/// checkout/live-claim boundary does (tenant, region, job, workflow run, owner, epoch, nonce, both
+/// claim timestamps), requires the exact durable parent attempt to exist, requires the pre-workload
+/// `ci_job` surface states, and requires the claim itself to still be live.
+///
+/// The renewal is capped at `claim_expires_at`: the immutable window is the hard ceiling and renewal
+/// can never push past it. ZERO ROWS MEANS OWNERSHIP WAS LOST — the caller aborts before another
+/// spawn rather than treating a no-op as success. Bind: `$1 tenant`, `$2 region`, `$3 job`,
+/// `$4 workflow run`, `$5 owner`, `$6 epoch`, `$7 nonce`, `$8 claim start`, `$9 claim expiry`,
+/// `$10 execution lease seconds`.
+pub const RENEW_PREPARATION_LEASE_QUERY: &str = "\
+UPDATE job_queue AS q
+SET lease_expires = LEAST(
+      q.claim_expires_at,
+      statement_timestamp() + ($10 || ' seconds')::interval
+    )
+WHERE q.tenant_id = $1
+  AND q.region = $2
+  AND q.job_id = $3::uuid
+  AND q.run_id = $4::uuid
+  AND q.state = 'leased'
+  AND q.lease_owner = $5
+  AND q.lease_epoch = $6
+  AND q.claim_nonce = $7::uuid
+  AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $8
+  AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $9
+  AND q.claim_expires_at > statement_timestamp()
+  AND q.completion_receipt IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM ci_job_parent_attempt AS parent
+    WHERE parent.tenant_id = q.tenant_id
+      AND parent.region = q.region
+      AND parent.job_id = q.job_id
+      AND parent.wf_run_id = q.run_id
+      AND parent.lease_owner = $5
+      AND parent.lease_epoch = q.lease_epoch
+      AND parent.claim_nonce = q.claim_nonce
+      AND parent.claim_started_at_epoch_secs = $8
+      AND parent.claim_expires_at_epoch_secs = $9
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM ci_job AS surface
+    WHERE surface.tenant_id = q.tenant_id
+      AND surface.region = q.region
+      AND surface.job_id = q.job_id
+      AND surface.state IN ('queued', 'leased')
+  )
+RETURNING q.job_id";
+
 /// **The idempotent enqueue (arch 02 §2.1 / §3.2) — insert ONE schedulable `job_queue` row.** The
 /// durable equivalent of [`SchedulerState::enqueue`]: a job the run's `SCHEDULE_AND_RUN_JOB`
 /// activity dispatches becomes a `queued` row. Idempotent on the `jq_idem` unique
@@ -296,12 +384,14 @@ WHERE tenant_id = $1
 /// enqueues — the CI-D1 effectively-once floor). `enqueued_at` defaults to `now()` (the claim's
 /// oldest-first tie-break). Bind: `$1 tenant_id`, `$2 region`, `$3 job_id` (uuid), `$4 run_id`
 /// (uuid), `$5 lane`, `$6 labels text[]`, `$7 trust_tier`, `$8 concurrency_group` (nullable),
-/// `$9 fair_key`, `$10 idem_token`, `$11 stage`. `RETURNING job_id` is present iff the row was inserted (absent on
-/// the idempotent conflict) — so the store reads INSERTED vs DUPLICATE from the returned-row count.
+/// `$9 fair_key`, `$10 idem_token`, `$11 stage`, `$12 claim_window_secs` (the dispatch-derived
+/// immutable window; a new writer never supplies NULL — NULL is legacy-only). `RETURNING job_id` is
+/// present iff the row was inserted (absent on the idempotent conflict) — so the store reads
+/// INSERTED vs DUPLICATE from the returned-row count.
 pub const INSERT_JOB_QUEUE_QUERY: &str = "\
 INSERT INTO job_queue
-  (tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group, fair_key, idem_token, stage, state)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued')
+  (tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group, fair_key, idem_token, stage, claim_window_secs, state)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'queued')
 ON CONFLICT (tenant_id, idem_token) DO NOTHING
 RETURNING job_id";
 
@@ -1351,5 +1441,125 @@ mod tests {
         // The lane tokens match the model's CHECK-constraint strings.
         assert_eq!(lane_token(Lane::Interactive), "interactive");
         assert_eq!(state_token(JobState::Leased), "leased");
+    }
+
+    /// **The two deadlines are sized from different authorities, and the claim returns the durable
+    /// window.** The execution lease still comes from `$5`; the immutable claim ceiling comes from
+    /// the row's own `claim_window_secs`, falling back to `$5` only for a legacy NULL row.
+    #[test]
+    fn the_claim_sizes_the_execution_lease_and_the_claim_ceiling_separately() {
+        assert!(
+            CLAIM_QUERY
+                .contains("lease_expires = statement_timestamp() + ($5 || ' seconds')::interval"),
+            "the execution lease is still one execution slot from $5"
+        );
+        assert!(
+            CLAIM_QUERY.contains("COALESCE(j.claim_window_secs::text, $5)"),
+            "the immutable claim ceiling comes from the durable window, legacy-NULL back to $5"
+        );
+        assert!(
+            CLAIM_QUERY.contains("j.claim_window_secs,"),
+            "the claim returns the durable window so the resolver can refuse a legacy checkout row"
+        );
+    }
+
+    /// **The reaper returns the OLD generation identity it just requeued.** Without this the
+    /// same-transaction journal seal could not name the exact generation (the UPDATE clears the
+    /// nonce), and would have to guess.
+    #[test]
+    fn the_reaper_returns_the_exact_generation_it_requeued() {
+        assert!(REAP_QUERY
+            .contains("SELECT tenant_id, job_id, lease_epoch, claim_nonce\n  FROM candidates"));
+        assert!(REAP_QUERY.contains("e.lease_epoch AS reaped_lease_epoch"));
+        assert!(REAP_QUERY.contains("e.claim_nonce::text AS reaped_claim_nonce"));
+    }
+
+    /// **Both lease installations are capped by the immutable claim ceiling; the launch CAS's
+    /// predicates are untouched.**
+    #[test]
+    fn every_installed_lease_is_capped_at_the_immutable_claim_expiry() {
+        for (name, query) in [
+            ("launch", AUTHORIZE_JOB_LAUNCH_QUERY),
+            ("preparation renewal", RENEW_PREPARATION_LEASE_QUERY),
+        ] {
+            assert!(
+                query.contains("LEAST(") && query.contains("claim_expires_at"),
+                "the {name} lease must be capped at the immutable claim expiry"
+            );
+        }
+        // The predicate block is FROZEN byte-for-byte, not spot-checked: a substring list would
+        // still pass if the tenant/region/job/run or surface predicates were deleted outright. This
+        // slice may only change how the launch CAS SIZES the lease, never what it admits — so any
+        // edit between `WHERE` and the `RETURNING` that closes the CTE fails here.
+        const FROZEN_LAUNCH_PREDICATES: &str = "\
+WHERE tenant_id = $1
+  AND region = $2
+  AND job_id = $3::uuid
+  AND run_id = $4::uuid
+  AND state = 'leased'
+  AND lease_owner = $5
+  AND lease_epoch = $6
+  AND claim_nonce = $7::uuid
+  AND EXTRACT(EPOCH FROM claim_started_at)::bigint = $8
+  AND EXTRACT(EPOCH FROM claim_expires_at)::bigint = $9
+  AND claim_expires_at > statement_timestamp()
+  AND completion_receipt IS NULL
+RETURNING tenant_id, region, job_id
+)
+UPDATE ci_job AS surface
+SET state = 'running'
+FROM launched
+WHERE surface.tenant_id = launched.tenant_id
+  AND surface.region = launched.region
+  AND surface.job_id = launched.job_id
+  AND surface.state IN ('queued', 'leased')
+RETURNING surface.job_id";
+        let predicates_start = AUTHORIZE_JOB_LAUNCH_QUERY
+            .find("WHERE tenant_id = $1")
+            .expect("the launch CAS opens its predicate block with the tenant bind");
+        assert_eq!(
+            &AUTHORIZE_JOB_LAUNCH_QUERY[predicates_start..],
+            FROZEN_LAUNCH_PREDICATES,
+            "the launch CAS admits EXACTLY what it admitted before this slice: only the lease \
+             assignment above the WHERE may change"
+        );
+    }
+
+    /// **The preparation renewal binds the complete generation and never accepts a launched job.**
+    /// A renewal that accepted `running` would let a stale preparation worker extend a lease the
+    /// workload already owns.
+    #[test]
+    fn the_preparation_renewal_binds_the_full_generation_and_refuses_a_launched_job() {
+        for predicate in [
+            "q.tenant_id = $1",
+            "q.region = $2",
+            "q.job_id = $3::uuid",
+            "q.run_id = $4::uuid",
+            "q.state = 'leased'",
+            "q.lease_owner = $5",
+            "q.lease_epoch = $6",
+            "q.claim_nonce = $7::uuid",
+            "EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $8",
+            "EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $9",
+            "q.claim_expires_at > statement_timestamp()",
+            "q.completion_receipt IS NULL",
+            "FROM ci_job_parent_attempt AS parent",
+            "parent.claim_started_at_epoch_secs = $8",
+            "parent.claim_expires_at_epoch_secs = $9",
+            "surface.state IN ('queued', 'leased')",
+        ] {
+            assert!(
+                RENEW_PREPARATION_LEASE_QUERY.contains(predicate),
+                "the preparation renewal must bind `{predicate}`"
+            );
+        }
+        assert!(!RENEW_PREPARATION_LEASE_QUERY.contains("q.state = 'running'"));
+        assert!(!RENEW_PREPARATION_LEASE_QUERY.contains("q.state IN"));
+        assert!(
+            !RENEW_PREPARATION_LEASE_QUERY.contains("SET state"),
+            "a renewal is a lease extension only, never a lifecycle transition"
+        );
+        // The owner-only heartbeat is deliberately NOT the renewal path and stays unchanged.
+        assert!(HEARTBEAT_QUERY.contains("state IN ('leased', 'running')"));
     }
 }

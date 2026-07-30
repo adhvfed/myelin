@@ -442,6 +442,27 @@ fn validate_claim_authority(
             "durable CI authority does not match the scheduler claim",
         ));
     }
+    // CT-007 lease/topology reconciliation: `CiJobTokenRequest::validate` can only bound the claim
+    // lifetime by the GLOBAL maximum (88,800s), because it has no topology context. This is the
+    // boundary that does have it — the server-reconstructed authority says whether the job is
+    // checkout-bearing — so the topology-specific ceiling is enforced HERE, at the raw Identity
+    // seam. Without it, a caller reaching `mint_verified` directly (the exported minter, not the
+    // locked issuer whose `verify_claim_window` protects the composed path) could bind a credential
+    // to a non-checkout claim four times longer than that job's topology can justify.
+    let claim_lifetime =
+        u64::try_from(claim.claim_expires_at_epoch_secs - claim.claim_started_at_epoch_secs)
+            .map_err(|_| refused("claim lifetime is outside the supported range"))?;
+    let topology_ceiling = if authority.checkout.is_some() {
+        crate::ci_claim_window::MAX_CI_JOB_CLAIM_WINDOW_SECS
+    } else {
+        u64::try_from(crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS)
+            .expect("the execution-lease bound is positive")
+    };
+    if claim_lifetime > topology_ceiling {
+        return Err(refused(
+            "claim lifetime exceeds what this job's durable topology can justify",
+        ));
+    }
     Ok(())
 }
 
@@ -1162,7 +1183,7 @@ mod tests {
         let adapter = IdentityCiJobCredentialMinter::new(minter.clone()).with_clock(|| NOW);
         let mut long_claim = claim();
         long_claim.claim_expires_at_epoch_secs =
-            START + crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS;
+            START + crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS;
 
         let credential = adapter
             .mint_verified(long_claim.clone(), authority())
@@ -1187,6 +1208,66 @@ mod tests {
         assert!(
             late.mint_verified(long_claim, authority()).await.is_err(),
             "the same long claim cannot remint after its deterministic token generation expires"
+        );
+    }
+
+    /// **The topology ceiling is enforced at the RAW seam, not only at the locked issuer.**
+    /// `CiJobTokenRequest::validate` cannot bound a claim by topology (it has no authority), and the
+    /// locked issuer's `verify_claim_window` only guards the composed path — so `mint_verified`,
+    /// which is exported and reachable directly, must refuse a non-checkout authority carrying a
+    /// checkout-length claim.
+    #[tokio::test]
+    async fn the_raw_minter_seam_enforces_the_topology_specific_claim_ceiling() {
+        let store = RevocationStore::new();
+        let cell = Arc::new(CellTokenAuthority::from_seed(&[5_u8; 32], &[6_u8; 32]).unwrap());
+        let signer = Arc::new(PasetoCapabilitySigner::new(cell).with_clock(|| NOW));
+        let minter = RunTokenMinter::with_signer_and_tuples(store, None, signer);
+        let adapter = IdentityCiJobCredentialMinter::new(minter).with_clock(|| NOW);
+
+        // A NON-checkout job may claim exactly one execution slot — and not one second more.
+        let mut at_execution_bound = claim();
+        at_execution_bound.claim_expires_at_epoch_secs =
+            START + crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS;
+        adapter
+            .mint_verified(at_execution_bound.clone(), authority())
+            .await
+            .expect("a non-checkout claim at the execution-lease bound mints");
+
+        let mut over_execution_bound = claim();
+        over_execution_bound.claim_expires_at_epoch_secs =
+            START + crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS + 1;
+        let refused = adapter
+            .mint_verified(over_execution_bound.clone(), authority())
+            .await
+            .expect_err("a non-checkout job may not bind a checkout-length claim");
+        assert!(
+            refused.0.contains("durable topology"),
+            "unexpected refusal: {refused:?}"
+        );
+
+        // The SAME over-bound claim mints once the authority is genuinely checkout-bearing — proving
+        // the ceiling tracks topology, not merely a lowered global constant.
+        adapter
+            .mint_verified(over_execution_bound, checkout_authority())
+            .await
+            .expect("a checkout-bearing authority justifies a multi-execution claim");
+
+        // A checkout-bearing job is still bounded, at the four-execution maximum.
+        let mut at_claim_window_bound = claim();
+        at_claim_window_bound.claim_expires_at_epoch_secs =
+            START + crate::ci_claim_window::MAX_CI_JOB_CLAIM_WINDOW_SECS as i64;
+        adapter
+            .mint_verified(at_claim_window_bound.clone(), checkout_authority())
+            .await
+            .expect("a checkout claim at the topology maximum mints");
+        let mut over_claim_window_bound = at_claim_window_bound;
+        over_claim_window_bound.claim_expires_at_epoch_secs += 1;
+        assert!(
+            adapter
+                .mint_verified(over_claim_window_bound, checkout_authority())
+                .await
+                .is_err(),
+            "no authority justifies a claim past the four-execution maximum"
         );
     }
 }

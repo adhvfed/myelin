@@ -411,6 +411,42 @@ impl LeaseStore for JobLeaseStore {
 }
 
 // =================================================================================================
+// The preparation-lease checkpoint PORT (CT-007 lease/topology reconciliation) — the seam a
+// checkout-preparation phase boundary renews the execution lease through. Declared HERE, in the
+// lower crate, so `myelin-ci-controlplane` implements it over `CiJobQueueStore` without this crate
+// ever depending on the control plane.
+// =================================================================================================
+
+/// Ownership of the exact claim generation was lost, so nothing further may be spawned under it.
+/// Carries only a structural reason; a caller never parses it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparationLeaseLost(pub String);
+
+impl std::fmt::Display for PreparationLeaseLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "preparation lease renewal refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for PreparationLeaseLost {}
+
+/// **A phase-boundary renewal of the execution lease held by one exact claim generation.** The
+/// immutable claim window bounds a checkout-bearing parent attempt as a whole; the heartbeat-
+/// extendable execution lease bounds ONE execution inside it. A preparation phase boundary is where
+/// the two are reconciled: the renewal pushes `lease_expires` forward by one execution slot, capped
+/// at the immutable claim expiry, so no interval between renewals ever contains more than one
+/// legally bounded execution.
+///
+/// An implementation MUST bind the complete durable generation (owner, epoch, nonce, claim
+/// timestamps, parent attempt) and MUST return [`PreparationLeaseLost`] — never `Ok` — when the
+/// generation no longer matches: the caller aborts before the next spawn rather than executing under
+/// a lease another worker now owns.
+pub trait PreparationLeaseCheckpoint: Send + Sync {
+    /// Renew the execution lease for this exact generation, or refuse because it is no longer ours.
+    fn renew(&self) -> Result<(), PreparationLeaseLost>;
+}
+
+// =================================================================================================
 // The firehose STUB seam — the full log pipeline is CI-P20 (named floor).
 // =================================================================================================
 

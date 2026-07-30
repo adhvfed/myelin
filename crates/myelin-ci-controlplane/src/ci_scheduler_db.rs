@@ -249,6 +249,11 @@ struct SchedulerProbe {
     job_update_nonce: bool,
     job_update_claim_started_at: bool,
     job_update_claim_expires_at: bool,
+    /// CT-007 lease/topology reconciliation: an EXPLICIT negative. The claim window is immutable
+    /// dispatch authority written by the app role; the scheduler only reads it when sizing
+    /// `claim_expires_at`. The dynamic excess-column check below would also catch a stray grant, but
+    /// a named probe makes the intent unmissable to the next person adding a column grant.
+    job_update_claim_window: bool,
     fair_select: bool,
     run_select_tenant: bool,
     run_select_region: bool,
@@ -261,6 +266,10 @@ struct SchedulerProbe {
     workflow_select_run_id: bool,
     workflow_select_type: bool,
     workflow_select_state: bool,
+    /// CT-007 lease/topology reconciliation: the superseded-definition boot guard's one extra
+    /// column (`ci_0020g`). Column-scoped, read-only, and added to the excess-column allowlist by
+    /// exactly this one name.
+    workflow_select_version: bool,
     workflow_select_partition: bool,
     workflow_select_created_at: bool,
     parent_attempt_select: bool,
@@ -368,6 +377,7 @@ fn validate_probe_before_mapping(
         && scheduler.workflow_select_run_id
         && scheduler.workflow_select_type
         && scheduler.workflow_select_state
+        && scheduler.workflow_select_version
         && scheduler.workflow_select_partition
         && scheduler.workflow_select_created_at
         && scheduler.parent_attempt_select
@@ -377,6 +387,11 @@ fn validate_probe_before_mapping(
         && scheduler.mapping_function_execute)
     {
         return Err(CiSchedulerDbError::InsufficientPrivileges);
+    }
+    // CT-007 lease/topology reconciliation: the claim window is READ-ONLY to the scheduler. The
+    // dynamic excess-column check already covers it; this names it so the guarantee is explicit.
+    if scheduler.job_update_claim_window {
+        return Err(CiSchedulerDbError::ExcessPrivileges);
     }
     if scheduler.excess_privilege {
         return Err(CiSchedulerDbError::ExcessPrivileges);
@@ -472,6 +487,7 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'claim_nonce', 'UPDATE') AS job_update_nonce,
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'claim_started_at', 'UPDATE') AS job_update_claim_started_at,
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'claim_expires_at', 'UPDATE') AS job_update_claim_expires_at,
+                pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'claim_window_secs', 'UPDATE') AS job_update_claim_window,
                 pg_catalog.has_table_privilege(session_user, 'public.fair_deficit', 'SELECT') AS fair_select,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'tenant_id', 'SELECT') AS run_select_tenant,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'region', 'SELECT') AS run_select_region,
@@ -484,6 +500,7 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                 pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'run_id', 'SELECT') AS workflow_select_run_id,
                 pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'wf_type', 'SELECT') AS workflow_select_type,
                 pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'state', 'SELECT') AS workflow_select_state,
+                pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'wf_version', 'SELECT') AS workflow_select_version,
                 pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'partition', 'SELECT') AS workflow_select_partition,
                 pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'created_at', 'SELECT') AS workflow_select_created_at,
                 pg_catalog.has_table_privilege(session_user, 'public.ci_job_parent_attempt', 'SELECT') AS parent_attempt_select,
@@ -616,7 +633,8 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                        AND workflow_column.attnum > 0
                        AND NOT workflow_column.attisdropped
                        AND workflow_column.attname NOT IN (
-                         'tenant_id', 'region', 'run_id', 'wf_type', 'state', 'partition', 'created_at'
+                         'tenant_id', 'region', 'run_id', 'wf_type', 'wf_version', 'state',
+                         'partition', 'created_at'
                        )
                        AND pg_catalog.has_column_privilege(
                          session_user, workflow_column.attrelid, workflow_column.attnum, 'SELECT'
@@ -708,6 +726,7 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
         job_update_nonce: row.get("job_update_nonce"),
         job_update_claim_started_at: row.get("job_update_claim_started_at"),
         job_update_claim_expires_at: row.get("job_update_claim_expires_at"),
+        job_update_claim_window: row.get("job_update_claim_window"),
         fair_select: row.get("fair_select"),
         run_select_tenant: row.get("run_select_tenant"),
         run_select_region: row.get("run_select_region"),
@@ -720,6 +739,7 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
         workflow_select_run_id: row.get("workflow_select_run_id"),
         workflow_select_type: row.get("workflow_select_type"),
         workflow_select_state: row.get("workflow_select_state"),
+        workflow_select_version: row.get("workflow_select_version"),
         workflow_select_partition: row.get("workflow_select_partition"),
         workflow_select_created_at: row.get("workflow_select_created_at"),
         parent_attempt_select: row.get("parent_attempt_select"),

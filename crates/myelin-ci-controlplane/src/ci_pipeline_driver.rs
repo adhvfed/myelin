@@ -261,6 +261,15 @@ fn build_dispatch_parts(
         spec.limits.timeout_secs = MAX_JOB_TIMEOUT_SECS;
     }
 
+    // The immutable claim ceiling, derived from the SAME (already timeout-clamped) spec this
+    // dispatch persists — `co_persist_dispatch` recomputes it and refuses any divergence.
+    let claim_window_secs = crate::ci_claim_window::claim_window_secs(
+        spec.kind,
+        &spec.workspace,
+        spec.limits.timeout_secs,
+    )
+    .map_err(|error| ActivityError(error.to_string()))?;
+
     // The DURABLE enqueue — trust_tier + region FROM the run's terms (forwarded UNCHANGED);
     // idem_token = the engine's dispatch token (the jq_idem key + the job.done echo key).
     let enq = DurableEnqueue {
@@ -275,6 +284,7 @@ fn build_dispatch_parts(
         fair_key: terms.fair_key.clone(),
         idem_token: flow_spec.idem_token.clone(),
         stage: flow_spec.target.clone(),
+        claim_window_secs,
     };
     Ok((enq, spec))
 }

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
 use common::with_schema_cleanup;
+use myelin_ci_controlplane::claim_window_secs_for_template;
 use myelin_ci_controlplane::{
     resolve_prelaunch_usage_on_conn, CiAttemptBudgetPolicy, CiAttemptBudgetRevision,
     CiDriveManifestStore, CiDriveManifestV1, CiJobBudgetReservationProvider,
@@ -318,6 +319,7 @@ async fn seed_fixture(
                 fair_key: format!("project-{seed}"),
                 idem_token: idem_token.clone(),
                 stage: "build".into(),
+                claim_window_secs: claim_window_secs_for_template(&launch.spec).unwrap(),
             },
             &launch,
             "build",
@@ -406,13 +408,16 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
         )
         .await
         .unwrap();
-        PgMigrator::apply_validated(
-            &admin,
-            &myelin_ci_controlplane::ci_controlplane_migrations(),
-            &myelin_ci_controlplane::ci_controlplane_hot_tables(),
-        )
-        .await
-        .unwrap();
+        common::with_fixture_migration_lock(&admin_url(), &admin, &schema, || async {
+            PgMigrator::apply_validated(
+                &admin,
+                &myelin_ci_controlplane::ci_controlplane_migrations(),
+                &myelin_ci_controlplane::ci_controlplane_hot_tables(),
+            )
+            .await
+            .unwrap();
+        })
+        .await;
         let app = pinned_pool(&app_url(), &schema).await;
         let journal = CiPrelaunchUsageJournal::new(app.clone(), REGION).unwrap();
 

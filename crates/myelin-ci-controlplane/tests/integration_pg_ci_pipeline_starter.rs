@@ -9,6 +9,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use common::with_schema_cleanup;
+use myelin_ci_controlplane::claim_window_secs_for_template;
 use myelin_ci_controlplane::{
     ci_artifact_ref, ci_job_id_v2, ci_production_runtime_factory_test_support,
     ci_region_run_discovery_test_support, ci_run_ref, ci_run_starter_factory, CiDriveManifestStore,
@@ -23,12 +24,12 @@ use myelin_ci_controlplane::{
     ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
     ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
     ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
-    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, BUMP_CHECK_ATTEMPT_SQL, CI_JOB_RUN_LEDGER_INDEX,
-    CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL,
-    CREATE_CI_JOB_ACCOUNTING_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
-    CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_CHECK_ATTEMPT_DDL, CREATE_CI_RUN_DDL,
-    CREATE_JOB_QUEUE_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    BUMP_CHECK_ATTEMPT_SQL, CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
+    CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_ACCOUNTING_DDL,
+    CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL,
+    CREATE_CI_RUN_CHECK_ATTEMPT_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
 };
 use myelin_ci_sandbox::{
     CompletionClaim, EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpecTemplate,
@@ -550,6 +551,7 @@ fn manifest_dispatch_for_test(
             fair_key: job.scheduling.fair_key.clone(),
             idem_token,
             stage: job.name.clone(),
+            claim_window_secs: claim_window_secs_for_template(&template.spec).unwrap(),
         },
         template,
     )
@@ -1158,6 +1160,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
         ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
         ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+        ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL,
     ] {
         admin
             .execute(ddl)
@@ -3699,6 +3702,7 @@ async fn a_v2_reservation_prevents_stale_queued_cancellation() {
             ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
             ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
             ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+            ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL,
         ] {
             admin
                 .execute(ddl)
