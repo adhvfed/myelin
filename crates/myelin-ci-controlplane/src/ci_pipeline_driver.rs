@@ -98,7 +98,9 @@ use crate::ci_prelaunch_usage_journal::{
 use crate::ci_run_store::CiRunRecord;
 use crate::cost_store::{CiCostEventStore, CiCostStoreError};
 use crate::job_accounting_store::{
-    CiJobAccountingError, CiJobAccountingRecord, CiJobAccountingStore,
+    disposition_receipt_v4, versioned_accounting_receipt, CiJobAccountingError,
+    CiJobAccountingRecord, CiJobAccountingStore, CiJobAccountingWriteVersion,
+    CiJobTerminalDisposition,
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::job_queue_store::{trust_from_token, JobQueueStoreError};
@@ -407,6 +409,7 @@ fn verify_claimed_identity(
 /// refs, owner, epoch, and the fresh claim nonce. Exact at-least-once redelivery recomputes the same
 /// receipt; any authority, verdict, accounting, or payload divergence is refused. The row CAS still
 /// proves live ownership; the keyed receipt is its tamper-evident idempotency evidence.
+#[derive(Clone, Copy)]
 struct CompletionReceiptInput<'a> {
     tenant: &'a TenantId,
     region: &'a str,
@@ -453,6 +456,36 @@ fn completion_receipt(input: CompletionReceiptInput<'_>) -> String {
         hasher.update(result_ref.0.as_bytes());
     }
     format!("v3:{}", hasher.finalize().to_hex())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompletionReceipts {
+    current_v4: String,
+    legacy_v3: String,
+}
+
+/// Mint the new disposition-bound receipt while retaining the exact historical v3 encoder above.
+/// The v3 twin is needed both for old-row replay and for the byte-frozen accounting column during a
+/// rolling deployment.
+fn completion_receipts_v4(
+    input: CompletionReceiptInput<'_>,
+    disposition: CiJobTerminalDisposition,
+) -> CompletionReceipts {
+    let legacy_v3 = completion_receipt(input);
+    CompletionReceipts {
+        current_v4: disposition_receipt_v4(&legacy_v3, disposition),
+        legacy_v3,
+    }
+}
+
+fn workload_disposition(report: &TerminalReport) -> CiJobTerminalDisposition {
+    if report.timed_out {
+        CiJobTerminalDisposition::WorkloadTimedOut
+    } else if report.passed {
+        CiJobTerminalDisposition::WorkloadPassed
+    } else {
+        CiJobTerminalDisposition::WorkloadFailed
+    }
 }
 
 const RETRY_ATTEMPT_RECORD_VERSION: u8 = 1;
@@ -792,7 +825,8 @@ struct TerminalAccountingInput<'a> {
     job_id: &'a str,
     reserve_handle: &'a str,
     report: &'a TerminalReport,
-    receipt: &'a str,
+    receipts: &'a CompletionReceipts,
+    disposition: CiJobTerminalDisposition,
     replay: bool,
 }
 
@@ -976,25 +1010,32 @@ async fn co_commit_terminal_accounting(
     accounting: &DurableCiJobAccounting,
     input: TerminalAccountingInput<'_>,
 ) -> Result<(), CompletionTxError> {
-    if input.replay {
+    let surface_disposition = if input.replay {
         let existing = accounting
             .receipt_store
             .load_in_tx(conn, &accounting.scope, input.job_id)
             .await
             .map_err(CompletionTxError::Accounting)?
             .ok_or(CompletionTxError::Refused)?;
-        let exact = existing.tenant == *input.tenant
+        let common_exact = existing.tenant == *input.tenant
             && existing.job_id == input.job_id
             && existing.wf_run_id == input.wf_run.0
             && existing.ci_run_id == input.ci_run_id
             && existing.reserve_handle == input.reserve_handle
             && existing.passed == input.report.passed
             && existing.timed_out == input.report.timed_out
-            && existing.usage == input.report.usage
-            && existing.completion_receipt == input.receipt;
-        if !exact {
+            && existing.usage == input.report.usage;
+        let receipt_exact = match existing.disposition {
+            None => existing.completion_receipt == input.receipts.legacy_v3,
+            Some(disposition) => {
+                disposition == input.disposition
+                    && existing.completion_receipt == input.receipts.current_v4
+            }
+        };
+        if !common_exact || !receipt_exact {
             return Err(CompletionTxError::Refused);
         }
+        existing.disposition
     } else {
         let priced = accounting
             .pricer
@@ -1033,6 +1074,11 @@ async fn co_commit_terminal_accounting(
             .settle_in_tx(conn, &accounting.scope, &rows)
             .await
             .map_err(CompletionTxError::Projection)?;
+        let receipt = versioned_accounting_receipt(
+            accounting.receipt_store.write_version(),
+            input.receipts.legacy_v3.clone(),
+            input.disposition,
+        );
         accounting
             .receipt_store
             .record_in_tx(
@@ -1051,12 +1097,16 @@ async fn co_commit_terminal_accounting(
                     pricing_revision: priced.pricing_revision,
                     billed: settled.billed_total,
                     refunded: settled.refunded,
-                    completion_receipt: input.receipt.to_owned(),
+                    disposition: receipt.disposition,
+                    completion_receipt: receipt.completion_receipt,
+                    legacy_completion_receipt_v3: receipt.legacy_completion_receipt_v3,
                 },
             )
             .await
             .map_err(CompletionTxError::Accounting)?;
-    }
+        (accounting.receipt_store.write_version() == CiJobAccountingWriteVersion::V4)
+            .then_some(input.disposition)
+    };
     settle_ci_job_surface_on_conn(
         conn,
         input.tenant,
@@ -1064,6 +1114,7 @@ async fn co_commit_terminal_accounting(
         input.ci_run_id,
         input.job_id,
         input.report,
+        surface_disposition,
     )
     .await?;
     Ok(())
@@ -1125,16 +1176,14 @@ async fn settle_ci_job_surface_on_conn(
     ci_run_id: &str,
     job_id: &str,
     report: &TerminalReport,
+    disposition: Option<CiJobTerminalDisposition>,
 ) -> Result<(), CompletionTxError> {
     let state = if report.passed && !report.timed_out {
         "succeeded"
     } else {
         "failed"
     };
-    let summary = serde_json::json!({
-        "passed": report.passed,
-        "timed_out": report.timed_out,
-    });
+    let summary = terminal_result_summary(report, disposition);
     let updated = sqlx::query_scalar::<_, Uuid>(
         "UPDATE ci_job
          SET state=$5, result_summary=$6
@@ -1159,6 +1208,43 @@ async fn settle_ci_job_surface_on_conn(
     } else {
         Err(CompletionTxError::Refused)
     }
+}
+
+fn terminal_result_summary(
+    report: &TerminalReport,
+    disposition: Option<CiJobTerminalDisposition>,
+) -> serde_json::Value {
+    match disposition {
+        Some(disposition) => serde_json::json!({
+            "passed": report.passed,
+            "timed_out": report.timed_out,
+            "disposition": disposition.as_storage_token(),
+            "workload_started": disposition.workload_started(),
+        }),
+        None => serde_json::json!({
+            "passed": report.passed,
+            "timed_out": report.timed_out,
+        }),
+    }
+}
+
+/// Canonical surface summary for 5b's future preparation-only terminal CAS. It is intentionally
+/// pure and cannot accept caller-supplied pass/usage/text fields.
+#[allow(dead_code)]
+pub(crate) fn preparation_terminal_result_summary(
+    disposition: myelin_ci_sandbox::PreparationTerminalDisposition,
+) -> serde_json::Value {
+    let timed_out = matches!(
+        disposition,
+        myelin_ci_sandbox::PreparationTerminalDisposition::TimedOut { .. }
+    );
+    let disposition = CiJobTerminalDisposition::Preparation(disposition);
+    serde_json::json!({
+        "passed": false,
+        "timed_out": timed_out,
+        "disposition": disposition.as_storage_token(),
+        "workload_started": false,
+    })
 }
 
 pub(crate) async fn close_cancelled_run_if_accounted(
@@ -1502,21 +1588,42 @@ impl TerminalReporter for CiPipelineReporter {
                             }
                         };
                         accounted_report.usage = usage;
-                        let receipt = completion_receipt(CompletionReceiptInput {
-                            tenant: &TenantId(tenant_owned.clone()),
-                            region: &region_owned,
-                            run: &run_owned,
-                            job_id: &job_owned,
-                            idem_token: &idem_owned,
-                            stage: &stage,
-                            passed: accounted_report.passed,
-                            timed_out: accounted_report.timed_out,
-                            usage: accounted_report.usage,
-                            result_refs: &accounted_report.result_refs,
-                            lease_owner: &owner_owned,
-                            lease_epoch,
-                            claim_nonce: &nonce_owned,
-                        });
+                        let disposition = workload_disposition(&accounted_report);
+                        let receipts = completion_receipts_v4(
+                            CompletionReceiptInput {
+                                tenant: &TenantId(tenant_owned.clone()),
+                                region: &region_owned,
+                                run: &run_owned,
+                                job_id: &job_owned,
+                                idem_token: &idem_owned,
+                                stage: &stage,
+                                passed: accounted_report.passed,
+                                timed_out: accounted_report.timed_out,
+                                usage: accounted_report.usage,
+                                result_refs: &accounted_report.result_refs,
+                                lease_owner: &owner_owned,
+                                lease_epoch,
+                                claim_nonce: &nonce_owned,
+                            },
+                            disposition,
+                        );
+                        let write_version = match &accounting {
+                            ReporterAccounting::Durable(accounting) => {
+                                accounting.receipt_store.write_version()
+                            }
+                            #[cfg(any(test, feature = "test-support"))]
+                            ReporterAccounting::TestBypass => CiJobAccountingWriteVersion::V3,
+                        };
+                        let (completion_receipt, alternate_replay_receipt) = match write_version {
+                            CiJobAccountingWriteVersion::V3 => (
+                                receipts.legacy_v3.as_str(),
+                                Some(receipts.current_v4.as_str()),
+                            ),
+                            CiJobAccountingWriteVersion::V4 => (
+                                receipts.current_v4.as_str(),
+                                Some(receipts.legacy_v3.as_str()),
+                            ),
+                        };
                         let claim = CiJobQueueStore::consume_claim_on_conn(
                             conn,
                             ClaimConsumeSpec {
@@ -1526,7 +1633,8 @@ impl TerminalReporter for CiPipelineReporter {
                                 lease_epoch,
                                 claim_nonce: nonce_uuid,
                                 stage: &stage,
-                                completion_receipt: &receipt,
+                                completion_receipt,
+                                alternate_replay_receipt,
                             },
                         )
                         .await?;
@@ -1545,7 +1653,8 @@ impl TerminalReporter for CiPipelineReporter {
                                         job_id: &job_owned,
                                         reserve_handle: &reserve_handle,
                                         report: &accounted_report,
-                                        receipt: &receipt,
+                                        receipts: &receipts,
+                                        disposition,
                                         replay: claim == ClaimConsumeOutcome::AlreadyConsumed,
                                     },
                                 )
@@ -1777,7 +1886,7 @@ impl TerminalReporter for CiPipelineReporter {
                                     )
                                     .await?;
                                     let report = TerminalReport { usage, ..report };
-                                    let receipt = crate::ci_run_supersession::superseded_receipt(
+                                    let legacy_v3 = crate::ci_run_supersession::superseded_receipt(
                                         &accounting.scope,
                                         cancelled_ci_run
                                             .as_deref()
@@ -1788,6 +1897,12 @@ impl TerminalReporter for CiPipelineReporter {
                                         report.usage,
                                         false,
                                     );
+                                    let disposition =
+                                        CiJobTerminalDisposition::CancelledAfterWorkloadLaunch;
+                                    let receipts = CompletionReceipts {
+                                        current_v4: disposition_receipt_v4(&legacy_v3, disposition),
+                                        legacy_v3,
+                                    };
                                     co_commit_terminal_accounting(
                                         conn,
                                         accounting,
@@ -1798,7 +1913,8 @@ impl TerminalReporter for CiPipelineReporter {
                                             job_id: &claim_owned.job_id,
                                             reserve_handle: &reserve_handle,
                                             report: &report,
-                                            receipt: &receipt,
+                                            receipts: &receipts,
+                                            disposition,
                                             replay: outcome == RetryableAttemptOutcome::ExactReplay,
                                         },
                                     )

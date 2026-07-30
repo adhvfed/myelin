@@ -36,7 +36,10 @@
 use crate::hardening::HardeningProfile;
 use crate::launch_gate::{DirectChildRetirement, SandboxCommand, SpawnPhase};
 use crate::redaction::RedactionPlan;
-use crate::runner::RetryableAttemptCause;
+use crate::runner::{
+    PreparationAttemptDisposition, PreparationPhase, PreparationTerminalDisposition,
+    RetryableAttemptCause,
+};
 use crate::user_namespace::{
     CheckoutPreparationSession, PreparationQuiescenceProof, RunscInvocationMode,
     UserNamespaceAllocator, UserNamespaceAllocatorError, UserNamespaceBindError,
@@ -6255,13 +6258,14 @@ pub(crate) enum CheckoutTransportError {
     /// Refused before anything spawned for the WHOLE transport (a proof/scope/token-generation
     /// mismatch, or a malformed request) — there is no usage to account.
     Refused { message: String },
-    /// A real execution ran and failed (a non-passing exit, a malformed wire response, an
-    /// unreachable want, or output that exceeded the wire cap) — `usage` carries everything
-    /// measured up through the point of failure and must still be folded into the parent attempt's
-    /// aggregate settlement, never treated as free.
+    /// A safely retired execution or post-hop operation failed. `disposition` structurally
+    /// distinguishes a terminal checkout rejection/timeout from retryable infrastructure or an
+    /// invariant requiring reconciliation; no caller parses `message`. `usage` carries everything
+    /// measured up through the point of failure and must still be folded into the parent attempt.
     Failed {
         message: String,
         usage: ResourceUsage,
+        disposition: PreparationAttemptDisposition,
     },
     /// A real execution ran, but this function could not independently prove the nested container
     /// was fully retired (child killed AND bundle removed, OR `finalize_runtime`'s own OS-level
@@ -6285,6 +6289,80 @@ pub(crate) enum CheckoutTransportError {
         usage: ResourceUsage,
         teardown_unproven: bool,
     },
+}
+
+impl CheckoutTransportError {
+    /// The machine-readable outcome for Hop A. This deliberately never examines `message`;
+    /// diagnostics are not an authorization, retry, or terminal-accounting protocol.
+    #[allow(dead_code)]
+    pub(crate) fn attempt_disposition(&self) -> PreparationAttemptDisposition {
+        match self {
+            Self::Refused { .. } => PreparationAttemptDisposition::RefusedBeforeExecution {
+                phase: PreparationPhase::CheckoutTransport,
+            },
+            Self::Failed { disposition, .. } => *disposition,
+            Self::TeardownUnproven { .. } => {
+                PreparationAttemptDisposition::ReconciliationRequired {
+                    phase: PreparationPhase::CheckoutTransport,
+                    teardown_unproven: true,
+                    usage_unrepresentable: false,
+                    quarantine_required: false,
+                }
+            }
+            Self::UsageUnrepresentable {
+                teardown_unproven,
+                ..
+            } => PreparationAttemptDisposition::ReconciliationRequired {
+                phase: PreparationPhase::CheckoutTransport,
+                teardown_unproven: *teardown_unproven,
+                usage_unrepresentable: true,
+                quarantine_required: false,
+            },
+        }
+    }
+}
+
+fn checkout_transport_terminal_failed(
+    message: String,
+    usage: ResourceUsage,
+) -> CheckoutTransportError {
+    CheckoutTransportError::Failed {
+        message,
+        usage,
+        disposition: PreparationAttemptDisposition::Terminal(
+            PreparationTerminalDisposition::Failed {
+                phase: PreparationPhase::CheckoutTransport,
+            },
+        ),
+    }
+}
+
+fn checkout_transport_timed_out(
+    message: String,
+    usage: ResourceUsage,
+) -> CheckoutTransportError {
+    CheckoutTransportError::Failed {
+        message,
+        usage,
+        disposition: PreparationAttemptDisposition::Terminal(
+            PreparationTerminalDisposition::TimedOut {
+                phase: PreparationPhase::CheckoutTransport,
+            },
+        ),
+    }
+}
+
+fn checkout_transport_retryable(
+    message: String,
+    usage: ResourceUsage,
+) -> CheckoutTransportError {
+    CheckoutTransportError::Failed {
+        message,
+        usage,
+        disposition: PreparationAttemptDisposition::RetryableInfrastructure {
+            phase: PreparationPhase::CheckoutTransport,
+        },
+    }
 }
 
 impl std::fmt::Display for CheckoutTransportError {
@@ -6369,10 +6447,7 @@ fn map_hop_run_failure(
     match run_failure {
         RunFailure::Uncommitted { .. } => {
             if prior_hop_completed {
-                CheckoutTransportError::Failed {
-                    message,
-                    usage: usage_before,
-                }
+                checkout_transport_retryable(message, usage_before)
             } else {
                 CheckoutTransportError::Refused { message }
             }
@@ -6383,18 +6458,20 @@ fn map_hop_run_failure(
                  fail, so this should be unreachable): {message}"
             ),
             usage: usage_before,
+            disposition: PreparationAttemptDisposition::ReconciliationRequired {
+                phase: PreparationPhase::CheckoutTransport,
+                teardown_unproven: false,
+                usage_unrepresentable: false,
+                quarantine_required: false,
+            },
         },
-        RunFailure::CommittedButNotExecuted { .. } => CheckoutTransportError::Failed {
-            message,
-            usage: usage_before,
-        },
+        RunFailure::CommittedButNotExecuted { .. } => {
+            checkout_transport_retryable(message, usage_before)
+        }
         RunFailure::Executed {
             usage: hop_usage, ..
         } => match checked_add_usage(usage_before, hop_usage) {
-            Ok(total) => CheckoutTransportError::Failed {
-                message,
-                usage: total,
-            },
+            Ok(total) => checkout_transport_retryable(message, total),
             Err(overflow) => CheckoutTransportError::UsageUnrepresentable {
                 message: format!(
                     "{message} (usage aggregation overflowed combining a hop that DID execute: \
@@ -6566,7 +6643,7 @@ fn force_teardown_unproven_if_cleanup_unproven(
             message: format!("{message} AND {note}"),
             usage: usage_before,
         },
-        CheckoutTransportError::Failed { message, usage } => {
+        CheckoutTransportError::Failed { message, usage, .. } => {
             CheckoutTransportError::TeardownUnproven {
                 message: format!("{message} AND {note}"),
                 usage,
@@ -6652,10 +6729,15 @@ fn handle_git_wire_hop_finalization(
     if !reasons.is_empty() {
         let combined_reason = reasons.join("; ");
         return Err(match retire_parent_attempt_hop(child, &bundle_dir) {
-            Ok(()) => CheckoutTransportError::Failed {
-                message: combined_reason,
-                usage: new_total,
-            },
+            Ok(()) => {
+                if run_error.is_some() {
+                    checkout_transport_retryable(combined_reason, new_total)
+                } else if result.timed_out {
+                    checkout_transport_timed_out(combined_reason, new_total)
+                } else {
+                    checkout_transport_terminal_failed(combined_reason, new_total)
+                }
+            }
             Err(teardown_error) => CheckoutTransportError::TeardownUnproven {
                 message: format!(
                     "{combined_reason} AND retiring its sandbox container also failed \
@@ -6697,10 +6779,7 @@ fn run_one_git_wire_hop_within_parent_attempt(
 ) -> Result<(SandboxResult, ResourceUsage), CheckoutTransportError> {
     let refuse_or_fail = |message: String| {
         if prior_hop_completed {
-            CheckoutTransportError::Failed {
-                message,
-                usage: usage_before,
-            }
+            checkout_transport_retryable(message, usage_before)
         } else {
             CheckoutTransportError::Refused { message }
         }
@@ -6918,18 +6997,19 @@ fn fetch_checkout_pack_within_parent_attempt_given(
     )?;
 
     let advertise_parsed = parse_upload_pack_advertisement(&advertise_result.stdout, expected)
-        .map_err(|e| CheckoutTransportError::Failed {
-            message: format!("parse advertisement: {e}"),
-            usage: usage_after_advertise,
+        .map_err(|e| {
+            checkout_transport_terminal_failed(
+                format!("parse advertisement: {e}"),
+                usage_after_advertise,
+            )
         })?;
     if !advertise_parsed.directly_advertised && !advertise_parsed.allows_reachable_want {
-        return Err(CheckoutTransportError::Failed {
-            message: "expected commit is not an advertised ref tip AND the server did not offer \
-                      allow-reachable-sha1-in-want -- refusing rather than sending an unreachable \
-                      want"
+        return Err(checkout_transport_terminal_failed(
+            "expected commit is not an advertised ref tip AND the server did not offer \
+             allow-reachable-sha1-in-want -- refusing rather than sending an unreachable want"
                 .to_string(),
-            usage: usage_after_advertise,
-        });
+            usage_after_advertise,
+        ));
     }
 
     let mut capabilities = "no-progress ofs-delta".to_string();
@@ -6959,9 +7039,11 @@ fn fetch_checkout_pack_within_parent_attempt_given(
         synthetic_parent_attempt_meter_target(),
         synthetic_parent_attempt_idem_token("checkout-fetch"),
     )
-    .map_err(|e| CheckoutTransportError::Failed {
-        message: format!("build fetch spec: {e}"),
-        usage: usage_after_advertise,
+    .map_err(|e| {
+        checkout_transport_retryable(
+            format!("build fetch spec: {e}"),
+            usage_after_advertise,
+        )
     })?;
     let mut fetch_command = Vec::with_capacity(fetch_spec.git_argv.len() + 2);
     fetch_command.push("git".to_string());
@@ -6971,11 +7053,12 @@ fn fetch_checkout_pack_within_parent_attempt_given(
     // Stage the pack artifact BEFORE launching the fetch (same reasoning as `fetch_checkout_pack`):
     // a staging failure here must still carry the advertisement's already-measured usage, never
     // silently drop it.
-    let mut pack_file =
-        tempfile_for_checkout_pack().map_err(|e| CheckoutTransportError::Failed {
-            message: format!("stage pack artifact: {e}"),
-            usage: usage_after_advertise,
-        })?;
+    let mut pack_file = tempfile_for_checkout_pack().map_err(|e| {
+        checkout_transport_retryable(
+            format!("stage pack artifact: {e}"),
+            usage_after_advertise,
+        )
+    })?;
 
     let (fetch_result, usage_after_fetch) = run_one_git_wire_hop_within_parent_attempt(
         &fetch_spec,
@@ -6992,28 +7075,36 @@ fn fetch_checkout_pack_within_parent_attempt_given(
         &mut pack_file,
         limits.disk_bytes,
     )
-    .map_err(|e| CheckoutTransportError::Failed {
-        message: format!("parse fetch response: {e}"),
-        usage: usage_after_fetch,
+    .map_err(|e| {
+        checkout_transport_terminal_failed(
+            format!("parse fetch response: {e}"),
+            usage_after_fetch,
+        )
     })?;
 
     pack_file
         .flush()
-        .map_err(|e| CheckoutTransportError::Failed {
-            message: format!("flush pack artifact: {e}"),
-            usage: usage_after_fetch,
+        .map_err(|e| {
+            checkout_transport_retryable(
+                format!("flush pack artifact: {e}"),
+                usage_after_fetch,
+            )
         })?;
     let mut pack_file = pack_file
         .into_inner()
-        .map_err(|e| CheckoutTransportError::Failed {
-            message: format!("finish pack artifact: {e}"),
-            usage: usage_after_fetch,
+        .map_err(|e| {
+            checkout_transport_retryable(
+                format!("finish pack artifact: {e}"),
+                usage_after_fetch,
+            )
         })?;
     pack_file
         .seek(std::io::SeekFrom::Start(0))
-        .map_err(|e| CheckoutTransportError::Failed {
-            message: format!("rewind pack artifact: {e}"),
-            usage: usage_after_fetch,
+        .map_err(|e| {
+            checkout_transport_retryable(
+                format!("rewind pack artifact: {e}"),
+                usage_after_fetch,
+            )
         })?;
 
     Ok(ParentAttemptCheckoutTransportOutcome {
@@ -7161,14 +7252,128 @@ pub(crate) enum CheckoutPreparationError {
         usage: ResourceUsage,
     },
     /// Teardown was independently proven (`confirm_prepared` succeeded — the session is durably
-    /// `Prepared`) but the checkout itself was wrong: a non-zero exit, a malformed/mismatched
-    /// confirmation line, or the host's own independent `.git/HEAD` re-check disagreed. The
-    /// workspace is provably garbage but the LEASE is fine — the caller should delete the workspace
-    /// and call `session.release_prepared(lease)`, never quarantine the identity.
+    /// `Prepared`) but the attempt cannot continue. `disposition` distinguishes a terminal checkout
+    /// failure/timeout, retryable infrastructure, or an invariant requiring reconciliation without
+    /// parsing `message`. For terminal/retryable outcomes the workspace is provably garbage but the
+    /// lease is fine, so the caller may delete the workspace and release the prepared session.
+    /// `ReconciliationRequired` remains fail-closed: it must not be silently released or settled.
     RejectedAfterQuiescence {
         message: String,
         usage: ResourceUsage,
+        disposition: PreparationAttemptDisposition,
     },
+}
+
+impl CheckoutPreparationError {
+    /// The machine-readable outcome for Hop B. Diagnostic strings remain diagnostics only.
+    #[allow(dead_code)]
+    pub(crate) fn attempt_disposition(&self) -> PreparationAttemptDisposition {
+        match self {
+            Self::Refused(_) => PreparationAttemptDisposition::RefusedBeforeExecution {
+                phase: PreparationPhase::CheckoutMaterialization,
+            },
+            Self::Unreleasable { .. } => {
+                PreparationAttemptDisposition::ReconciliationRequired {
+                    phase: PreparationPhase::CheckoutMaterialization,
+                    teardown_unproven: false,
+                    usage_unrepresentable: false,
+                    quarantine_required: true,
+                }
+            }
+            Self::TeardownUnproven { .. } => {
+                PreparationAttemptDisposition::ReconciliationRequired {
+                    phase: PreparationPhase::CheckoutMaterialization,
+                    teardown_unproven: true,
+                    usage_unrepresentable: false,
+                    quarantine_required: true,
+                }
+            }
+            Self::RejectedAfterQuiescence { disposition, .. } => *disposition,
+        }
+    }
+}
+
+fn checkout_materialization_terminal_failed(
+    message: String,
+    usage: ResourceUsage,
+) -> CheckoutPreparationError {
+    CheckoutPreparationError::RejectedAfterQuiescence {
+        message,
+        usage,
+        disposition: PreparationAttemptDisposition::Terminal(
+            PreparationTerminalDisposition::Failed {
+                phase: PreparationPhase::CheckoutMaterialization,
+            },
+        ),
+    }
+}
+
+fn checkout_materialization_timed_out(
+    message: String,
+    usage: ResourceUsage,
+) -> CheckoutPreparationError {
+    CheckoutPreparationError::RejectedAfterQuiescence {
+        message,
+        usage,
+        disposition: PreparationAttemptDisposition::Terminal(
+            PreparationTerminalDisposition::TimedOut {
+                phase: PreparationPhase::CheckoutMaterialization,
+            },
+        ),
+    }
+}
+
+fn checkout_materialization_retryable(
+    message: String,
+    usage: ResourceUsage,
+) -> CheckoutPreparationError {
+    CheckoutPreparationError::RejectedAfterQuiescence {
+        message,
+        usage,
+        disposition: PreparationAttemptDisposition::RetryableInfrastructure {
+            phase: PreparationPhase::CheckoutMaterialization,
+        },
+    }
+}
+
+/// Classify a Hop B run failure only after runtime teardown was independently proven and the
+/// preparation session reached `Prepared`. The immediate launch permit makes
+/// `CommitOutcomeUnknown` unreachable in today's production path, but matching every variant here
+/// keeps a future invariant violation fail-closed exactly like Hop A's [`map_hop_run_failure`].
+fn map_checkout_materialization_run_failure(
+    failure: RunFailure,
+) -> CheckoutPreparationError {
+    match failure {
+        failure @ RunFailure::CommitOutcomeUnknown { .. } => {
+            CheckoutPreparationError::RejectedAfterQuiescence {
+                message: format!(
+                    "internal invariant violated (an immediate launch permit's commit closure \
+                     cannot fail, so this should be unreachable): the run itself failed: {failure}"
+                ),
+                usage: ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0,
+                },
+                disposition: PreparationAttemptDisposition::ReconciliationRequired {
+                    phase: PreparationPhase::CheckoutMaterialization,
+                    teardown_unproven: false,
+                    usage_unrepresentable: false,
+                    quarantine_required: false,
+                },
+            }
+        }
+        failure @ (RunFailure::Uncommitted { .. }
+        | RunFailure::CommittedButNotExecuted { .. }) => checkout_materialization_retryable(
+            format!("the run itself failed: {failure}"),
+            ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            },
+        ),
+        failure @ RunFailure::Executed { usage, .. } => {
+            checkout_materialization_retryable(format!("the run itself failed: {failure}"), usage)
+        }
+    }
 }
 
 impl std::fmt::Display for CheckoutPreparationError {
@@ -7757,75 +7962,60 @@ fn evaluate_checkout_finalization(
     // now do we look at whether the checkout itself was actually right.
     let outcome = match primary {
         Ok(outcome) => outcome,
-        Err(failure) => {
-            let usage = match &failure {
-                RunFailure::Executed { usage, .. } => *usage,
-                _ => ResourceUsage {
-                    cpu_seconds: 0,
-                    mem_byte_seconds: 0,
-                },
-            };
-            return Err(CheckoutPreparationError::RejectedAfterQuiescence {
-                message: format!("the run itself failed: {failure}"),
-                usage,
-            });
-        }
+        Err(failure) => return Err(map_checkout_materialization_run_failure(failure)),
     };
     let usage = usage_from_runsc_outcome(mem_bytes, &outcome);
     if outcome.timed_out {
-        return Err(CheckoutPreparationError::RejectedAfterQuiescence {
-            message: "the checkout container timed out".to_string(),
+        return Err(checkout_materialization_timed_out(
+            "the checkout container timed out".to_string(),
             usage,
-        });
+        ));
     }
     // Sol's review: a truncated confirmation line or a stream/output error must ALSO be treated as
     // a semantic failure (never silently trusted as if the (possibly incomplete) captured stdout
     // were the guest's real, complete output) — checked here, AFTER `confirm_prepared` already ran.
     if outcome.stdout_truncated {
-        return Err(CheckoutPreparationError::RejectedAfterQuiescence {
-            message: "the checkout confirmation output was truncated (exceeded its capture bound)"
+        return Err(checkout_materialization_terminal_failed(
+            "the checkout confirmation output was truncated (exceeded its capture bound)"
                 .to_string(),
             usage,
-        });
+        ));
     }
     if let Some(stream_error) = &outcome.stream_error {
-        return Err(CheckoutPreparationError::RejectedAfterQuiescence {
-            message: format!("a stream/output error occurred during the checkout run: {stream_error}"),
+        return Err(checkout_materialization_retryable(
+            format!("a stream/output error occurred during the checkout run: {stream_error}"),
             usage,
-        });
+        ));
     }
     if outcome.exit != Some(0) {
-        return Err(CheckoutPreparationError::RejectedAfterQuiescence {
-            message: format!(
+        return Err(checkout_materialization_terminal_failed(
+            format!(
                 "the checkout script exited {:?} (stderr: {})",
                 outcome.exit,
                 String::from_utf8_lossy(&outcome.stderr)
             ),
             usage,
-        });
+        ));
     }
     let tree_oid = match parse_checkout_confirmation_line(&outcome.stdout, expected_commit) {
         Ok(tree) => tree,
         Err(reason) => {
-            return Err(CheckoutPreparationError::RejectedAfterQuiescence {
-                message: reason,
-                usage,
-            })
+            return Err(checkout_materialization_terminal_failed(reason, usage))
         }
     };
     if let Err(reason) = verify_workspace_head_no_follow(workspace_host_path, expected_commit) {
-        return Err(CheckoutPreparationError::RejectedAfterQuiescence {
-            message: format!("host-side HEAD re-verification disagreed: {reason}"),
+        return Err(checkout_materialization_terminal_failed(
+            format!("host-side HEAD re-verification disagreed: {reason}"),
             usage,
-        });
+        ));
     }
     let cargo_lock_sha256_hex = match hash_workspace_cargo_lock_no_follow(workspace_host_path) {
         Ok(hex) => hex,
         Err(reason) => {
-            return Err(CheckoutPreparationError::RejectedAfterQuiescence {
-                message: format!("could not hash the materialized Cargo.lock: {reason}"),
+            return Err(checkout_materialization_terminal_failed(
+                format!("could not hash the materialized Cargo.lock: {reason}"),
                 usage,
-            })
+            ))
         }
     };
 
@@ -14175,6 +14365,91 @@ mod tests {
             const REGION: &str = "fr-par";
             const REPO: &str = "widgets";
 
+            #[test]
+            fn preparation_error_classification_is_structural_never_message_based() {
+                let usage = ResourceUsage {
+                    cpu_seconds: 1,
+                    mem_byte_seconds: 2,
+                };
+                let transport_failed =
+                    checkout_transport_terminal_failed("looks retryable".into(), usage);
+                assert_eq!(
+                    transport_failed.attempt_disposition(),
+                    PreparationAttemptDisposition::Terminal(
+                        PreparationTerminalDisposition::Failed {
+                            phase: PreparationPhase::CheckoutTransport,
+                        }
+                    )
+                );
+                let transport_retryable =
+                    checkout_transport_retryable("looks terminal".into(), usage);
+                assert_eq!(
+                    transport_retryable.attempt_disposition(),
+                    PreparationAttemptDisposition::RetryableInfrastructure {
+                        phase: PreparationPhase::CheckoutTransport,
+                    }
+                );
+                let materialization_timeout =
+                    checkout_materialization_timed_out("arbitrary diagnostic".into(), usage);
+                assert_eq!(
+                    materialization_timeout.attempt_disposition(),
+                    PreparationAttemptDisposition::Terminal(
+                        PreparationTerminalDisposition::TimedOut {
+                            phase: PreparationPhase::CheckoutMaterialization,
+                        }
+                    )
+                );
+                let poisoned = CheckoutPreparationError::Unreleasable {
+                    message: "ordinary words".into(),
+                    usage: Some(usage),
+                };
+                assert_eq!(
+                    poisoned.attempt_disposition(),
+                    PreparationAttemptDisposition::ReconciliationRequired {
+                        phase: PreparationPhase::CheckoutMaterialization,
+                        teardown_unproven: false,
+                        usage_unrepresentable: false,
+                        quarantine_required: true,
+                    }
+                );
+            }
+
+            #[test]
+            fn hop_b_commit_outcome_unknown_is_never_downgraded_to_an_ordinary_retry() {
+                let error = map_checkout_materialization_run_failure(
+                    RunFailure::commit_outcome_unknown(
+                        "injected impossible immediate-permit commit ambiguity",
+                    ),
+                );
+                assert_eq!(
+                    error.attempt_disposition(),
+                    PreparationAttemptDisposition::ReconciliationRequired {
+                        phase: PreparationPhase::CheckoutMaterialization,
+                        teardown_unproven: false,
+                        usage_unrepresentable: false,
+                        quarantine_required: false,
+                    }
+                );
+                match error {
+                    CheckoutPreparationError::RejectedAfterQuiescence {
+                        message,
+                        usage,
+                        ..
+                    } => {
+                        assert_eq!(
+                            usage,
+                            ResourceUsage {
+                                cpu_seconds: 0,
+                                mem_byte_seconds: 0,
+                            }
+                        );
+                        assert!(message.contains("internal invariant violated"));
+                        assert!(message.contains("commit ambiguity"));
+                    }
+                    other => panic!("expected a fail-closed post-quiescence error, got {other:?}"),
+                }
+            }
+
             /// A real (not symlinked) bare-repo directory under a fresh root, matching exactly what
             /// `resolve_bare_repo_path`/`assert_repo_under_root` require — both hops resolve the SAME
             /// path, so this is staged once per test.
@@ -15106,7 +15381,7 @@ mod tests {
                 .unwrap_err();
                 assert_eq!(*remaining.lock().unwrap(), 0);
                 match err {
-                    CheckoutTransportError::Failed { message, usage } => {
+                    CheckoutTransportError::Failed { message, usage, .. } => {
                         assert!(message.contains("did not pass"), "message was: {message}");
                         assert_eq!(usage, advertise_usage);
                     }
@@ -15165,7 +15440,7 @@ mod tests {
                 .unwrap_err();
                 assert_eq!(*remaining.lock().unwrap(), 0);
                 match err {
-                    CheckoutTransportError::Failed { message, usage } => {
+                    CheckoutTransportError::Failed { message, usage, .. } => {
                         assert!(message.contains("did not pass"), "message was: {message}");
                         assert_eq!(
                             usage,

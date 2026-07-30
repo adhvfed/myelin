@@ -417,7 +417,8 @@ pub use metering::reserve_settle_parity_drill;
 pub use cost_store::{cost_id_for, verify_ci_cost_event_shape, CiCostEventStore, CiCostStoreError};
 pub use job_accounting_store::{
     CiJobAccountingError, CiJobAccountingRecord, CiJobAccountingStore, CiJobAccountingWrite,
-    INSERT_CI_JOB_ACCOUNTING_QUERY, SELECT_CI_JOB_ACCOUNTING_QUERY,
+    CiJobAccountingWriteVersion, CiJobTerminalDisposition, INSERT_CI_JOB_ACCOUNTING_QUERY,
+    SELECT_CI_JOB_ACCOUNTING_QUERY,
 };
 
 pub use holder::{
@@ -653,13 +654,18 @@ pub use fairness::{
 pub use migrations::CI_RUN_SURFACE_INDEX_READINESS;
 pub use migrations::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, ci_durable_hot_tables,
-    ci_durable_migrations, make_tenant_scoped_ddl, ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL,
+    ci_durable_migrations, make_tenant_scoped_ddl,
+    ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL,
+    ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL,
+    ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL,
     ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
     ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
     ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, ARTIFACT_TABLE,
     CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DRIVE_MANIFEST_TABLE,
-    CI_DURABLE_WRITER_IDS, CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID, CI_JOB_ACCOUNTING_TABLE,
+    CI_DURABLE_WRITER_IDS, CI_JOB_ACCOUNTING_DISPOSITION_V4_MIGRATION_ID,
+    CI_JOB_ACCOUNTING_DISPOSITION_V4_VERDICT_MIGRATION_ID,
+    CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID, CI_JOB_ACCOUNTING_TABLE,
     CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_JOB_QUEUE_CLAIM_TIME_MIGRATION_ID,
     CI_JOB_QUEUE_COMPLETION_MIGRATION_ID, CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID,
     CI_JOB_RUN_LEDGER_INDEX, CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID,
@@ -1085,8 +1091,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            50,
-            "all 20 tables, three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 4 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, 3 ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, and the prelaunch deadline expand are present"
+            52,
+            "all 20 tables, three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 4 job_queue ALTERs, the ci_job_spec-stage and three accounting ALTERs, scheduler RLS boundary, 3 claim-column grants, 3 ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, and the prelaunch deadline expand are present"
         );
         assert!(
             spec.consumers.is_empty(),

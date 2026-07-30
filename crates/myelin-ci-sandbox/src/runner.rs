@@ -543,6 +543,63 @@ pub struct TerminalReport {
     pub result_refs: Vec<ArtifactRef>,
 }
 
+/// The checkout-preparation phase that produced a terminal or nonterminal attempt disposition.
+///
+/// This vocabulary is shared by the sandbox's Hop A/Hop B classifiers and the control plane's
+/// durable accounting receipt. It deliberately names only the two journaled pre-workload phases;
+/// an ordinary workload result continues to use [`TerminalReport`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationPhase {
+    CheckoutTransport,
+    CheckoutMaterialization,
+}
+
+impl PreparationPhase {
+    /// Stable storage/result-summary token. Kept here so sandbox classification and durable
+    /// accounting cannot encode the same phase through separate hand-written strings.
+    pub fn as_storage_token(self) -> &'static str {
+        match self {
+            Self::CheckoutTransport => "checkout_transport",
+            Self::CheckoutMaterialization => "checkout_materialization",
+        }
+    }
+}
+
+/// Closed terminal vocabulary for a job whose workload never launched.
+///
+/// There is intentionally no usage, caller-supplied `passed`, arbitrary message, or result payload
+/// here. Prelaunch usage is authoritative in `ci_job_prelaunch_usage`; every variant resumes the
+/// DAG as failed; diagnostics remain in the bounded durable log stream. The exact-owner/CAS method
+/// that consumes this report lands in CT-007 slice 5b.3-5b.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationTerminalDisposition {
+    Failed { phase: PreparationPhase },
+    TimedOut { phase: PreparationPhase },
+    AttemptsExhausted,
+}
+
+/// Structural classification of one checkout-preparation attempt.
+///
+/// Low-level Hop A/Hop B errors expose this instead of asking 5b.3-6 to parse human-readable error
+/// strings. Only [`Self::Terminal`] may become a preparation-only `job.done`; the other variants
+/// remain nonterminal and preserve the cleanup/reconciliation owner proved by the sandbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationAttemptDisposition {
+    Terminal(PreparationTerminalDisposition),
+    RefusedBeforeExecution {
+        phase: PreparationPhase,
+    },
+    RetryableInfrastructure {
+        phase: PreparationPhase,
+    },
+    ReconciliationRequired {
+        phase: PreparationPhase,
+        teardown_unproven: bool,
+        usage_unrepresentable: bool,
+        quarantine_required: bool,
+    },
+}
+
 /// Claimed authority for one terminal delivery. Keeping these fields together prevents callers from
 /// omitting or reordering an owner/epoch/nonce component at the reporting boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]

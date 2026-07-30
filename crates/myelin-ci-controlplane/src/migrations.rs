@@ -175,6 +175,14 @@ pub const CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID: &str = "ci_0001d_ci_run_pr_hea
 pub const CI_JOB_SPEC_STAGE_MIGRATION_ID: &str = "ci_0015a_ci_job_spec_stage";
 /// Forward-only disposition column for manifest jobs terminalized without execution.
 pub const CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID: &str = "ci_0017a_ci_job_accounting_skipped";
+/// Additive v4 terminal-disposition and receipt columns. The original required v3 receipt remains
+/// byte-frozen for rolling compatibility; a v4 row stores both generations.
+pub const CI_JOB_ACCOUNTING_DISPOSITION_V4_MIGRATION_ID: &str =
+    "ci_0017b_ci_job_accounting_disposition_v4";
+/// Forward-only consistency constraint for v4 terminal dispositions. Kept separate because the
+/// original v4 column/receipt migration has already been applied and is checksum-immutable.
+pub const CI_JOB_ACCOUNTING_DISPOSITION_V4_VERDICT_MIGRATION_ID: &str =
+    "ci_0017c_ci_job_accounting_disposition_v4_verdict";
 /// Forward-only migration id for [`ALTER_JOB_QUEUE_ADD_COMPLETION_DDL`]. A sub-migration of the
 /// already-applied `ci_0004_job_queue` table, applied immediately after it (the `ci_0002a` convention)
 /// so the `ci_0004` create stays byte-frozen. Its ADD COLUMNs are non-blocking (a constant-default
@@ -709,6 +717,54 @@ pub const ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL: &str = "ALTER TABLE ci_job_ac
 ADD COLUMN IF NOT EXISTS skipped boolean NOT NULL DEFAULT false, \
 ADD CONSTRAINT ci_job_accounting_skipped_verdict \
 CHECK (NOT skipped OR (NOT passed AND NOT timed_out))";
+
+/// Add v4 meaning without rewriting or weakening the shipped v3 receipt column. Historical writers
+/// continue inserting only `completion_receipt`; explicitly activated v4 writers retain their
+/// deterministic v3 twin there and put the authoritative v4 receipt beside its closed disposition.
+pub const ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL: &str = "\
+ALTER TABLE ci_job_accounting
+  ADD COLUMN IF NOT EXISTS terminal_disposition text,
+  ADD COLUMN IF NOT EXISTS completion_receipt_v4 text,
+  ADD CONSTRAINT ci_job_accounting_terminal_disposition_v4
+    CHECK (
+      (terminal_disposition IS NULL AND completion_receipt_v4 IS NULL)
+      OR (
+        terminal_disposition IN (
+          'workload_passed',
+          'workload_failed',
+          'workload_timed_out',
+          'checkout_transport_failed',
+          'checkout_transport_timed_out',
+          'checkout_materialization_failed',
+          'checkout_materialization_timed_out',
+          'preparation_attempts_exhausted',
+          'skipped_before_start',
+          'cancelled_during_preparation',
+          'cancelled_after_workload_launch'
+        )
+        AND completion_receipt_v4 ~ '^v4:[0-9a-f]{64}$'
+      )
+    ),
+  ADD CONSTRAINT ci_job_accounting_completion_receipt_v4_unique
+    UNIQUE (tenant_id, completion_receipt_v4)";
+
+/// Bind each closed v4 disposition to the legacy verdict columns it is allowed to accompany. This
+/// is a separate forward migration so the already-applied v4 column/receipt DDL remains byte-frozen.
+pub const ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL: &str = "\
+ALTER TABLE ci_job_accounting
+  ADD CONSTRAINT ci_job_accounting_terminal_disposition_v4_verdict
+    CHECK (
+      terminal_disposition IS NULL
+      OR CASE terminal_disposition
+        WHEN 'workload_passed' THEN passed AND NOT timed_out AND NOT skipped
+        WHEN 'workload_timed_out' THEN NOT passed AND timed_out AND NOT skipped
+        WHEN 'checkout_transport_timed_out' THEN NOT passed AND timed_out AND NOT skipped
+        WHEN 'checkout_materialization_timed_out' THEN NOT passed AND timed_out AND NOT skipped
+        WHEN 'skipped_before_start' THEN NOT passed AND NOT timed_out AND skipped
+        WHEN 'cancelled_during_preparation' THEN NOT passed AND NOT timed_out AND skipped
+        ELSE NOT passed AND NOT timed_out AND NOT skipped
+      END
+    )";
 
 /// `ci_job_parent_attempt` (CT-007 slice 5b.3-4a.2) — one immutable row per durably-begun claim
 /// generation, for EITHER job shape. `max_parent_attempts`/`budget_revision` are the exact values
@@ -1352,6 +1408,16 @@ pub fn ci_controlplane_migrations() -> Migrations {
                 ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL,
                 CI_JOB_ACCOUNTING_TABLE,
             ));
+            migrations.push(Migration::plain_on(
+                CI_JOB_ACCOUNTING_DISPOSITION_V4_MIGRATION_ID,
+                ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL,
+                CI_JOB_ACCOUNTING_TABLE,
+            ));
+            migrations.push(Migration::plain_on(
+                CI_JOB_ACCOUNTING_DISPOSITION_V4_VERDICT_MIGRATION_ID,
+                ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL,
+                CI_JOB_ACCOUNTING_TABLE,
+            ));
         }
         if table == CI_JOB_PRELAUNCH_USAGE_TABLE {
             migrations.push(Migration::plain_on(
@@ -1644,6 +1710,30 @@ mod tests {
                 "skipped-accounting ALTER pins `{required}`"
             );
         }
+        for required in [
+            "terminal_disposition text",
+            "completion_receipt_v4 text",
+            "completion_receipt_v4 ~ '^v4:[0-9a-f]{64}$'",
+            "terminal_disposition IS NULL AND completion_receipt_v4 IS NULL",
+            "cancelled_during_preparation",
+            "UNIQUE (tenant_id, completion_receipt_v4)",
+        ] {
+            assert!(
+                ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL.contains(required),
+                "v4 accounting ALTER pins `{required}`"
+            );
+        }
+        for required in [
+            "ci_job_accounting_terminal_disposition_v4_verdict",
+            "terminal_disposition IS NULL",
+            "WHEN 'workload_passed' THEN passed AND NOT timed_out AND NOT skipped",
+            "WHEN 'cancelled_during_preparation' THEN NOT passed AND NOT timed_out AND skipped",
+        ] {
+            assert!(
+                ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL.contains(required),
+                "v4 accounting verdict ALTER pins `{required}`"
+            );
+        }
     }
 
     /// CT-007 slice 5b.3-4a.2: the parent-attempt journal is immutable (insert-only, like
@@ -1726,8 +1816,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            50,
-            "20 table/RLS + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 4 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 3 scheduler ci_run/workflow discovery grants + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand"
+            52,
+            "20 table/RLS + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 4 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 3 ci_job_accounting ALTERs + 1 scheduler-boundary + 3 scheduler claim grants + 3 scheduler ci_run/workflow discovery grants + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand"
         );
         for m in &migrations.0 {
             assert!(
@@ -1759,6 +1849,13 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL);
             } else if m.id == CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL);
+            } else if m.id == CI_JOB_ACCOUNTING_DISPOSITION_V4_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL);
+            } else if m.id == CI_JOB_ACCOUNTING_DISPOSITION_V4_VERDICT_MIGRATION_ID {
+                assert_eq!(
+                    m.ddl,
+                    ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL
+                );
             } else if m.id == CI_JOB_QUEUE_COMPLETION_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL);
             } else if m.id == CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID {
@@ -1817,8 +1914,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            50,
-            "the runner applied all 20 table/RLS, 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 4 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, and 1 prelaunch deadline expand"
+            52,
+            "the runner applied all 20 table/RLS, 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 4 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 3 ci_job_accounting ALTERs, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, and 1 prelaunch deadline expand"
         );
         assert_eq!(
             runner.applied()[0],

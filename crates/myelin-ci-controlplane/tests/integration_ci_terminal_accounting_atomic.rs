@@ -1530,7 +1530,8 @@ async fn run_reporter_scenario(
     );
     let accounting = sqlx::query(
         "SELECT cpu_seconds, mem_byte_seconds, pricing_revision, billed_minor_units,
-                refunded_minor_units, completion_receipt
+                refunded_minor_units, completion_receipt, terminal_disposition,
+                completion_receipt_v4
          FROM ci_job_accounting WHERE job_id = $1::uuid",
     )
     .bind(job)
@@ -1564,6 +1565,15 @@ async fn run_reporter_scenario(
     assert!(accounting
         .get::<String, _>("completion_receipt")
         .starts_with("v3:"));
+    assert_eq!(
+        accounting.get::<Option<String>, _>("terminal_disposition"),
+        None,
+        "production reporter and supersession owners remain pinned to v3 until fleet convergence"
+    );
+    assert_eq!(
+        accounting.get::<Option<String>, _>("completion_receipt_v4"),
+        None
+    );
     let storage_events: i64 =
         sqlx::query_scalar("SELECT count(*) FROM cost_event WHERE run_id = $1")
             .bind(&reserve_handle)

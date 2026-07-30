@@ -5,7 +5,7 @@
 //! completion may observe the existing row, but it is accepted only when every authoritative field
 //! is identical; a conflicting replay fails closed.
 
-use myelin_ci_sandbox::ResourceUsage;
+use myelin_ci_sandbox::{PreparationPhase, PreparationTerminalDisposition, ResourceUsage};
 use myelin_flow::MinorUnits;
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
@@ -18,8 +18,8 @@ pub const INSERT_CI_JOB_ACCOUNTING_QUERY: &str = "\
 INSERT INTO ci_job_accounting
   (tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle, passed, timed_out, skipped,
    cpu_seconds, mem_byte_seconds, pricing_revision, billed_minor_units, refunded_minor_units,
-   completion_receipt)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+   completion_receipt, terminal_disposition, completion_receipt_v4)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 ON CONFLICT (tenant_id, job_id) DO NOTHING
 RETURNING job_id";
 
@@ -27,7 +27,7 @@ RETURNING job_id";
 pub const SELECT_CI_JOB_ACCOUNTING_QUERY: &str = "\
 SELECT region, wf_run_id, ci_run_id, reserve_handle, passed, timed_out, skipped, cpu_seconds,
        mem_byte_seconds, pricing_revision, billed_minor_units, refunded_minor_units,
-       completion_receipt
+       completion_receipt, terminal_disposition, completion_receipt_v4
 FROM ci_job_accounting
 WHERE tenant_id = $1 AND job_id = $2";
 
@@ -48,7 +48,143 @@ pub struct CiJobAccountingRecord {
     pub pricing_revision: String,
     pub billed: MinorUnits,
     pub refunded: MinorUnits,
+    /// Closed, machine-readable terminal meaning for v4 receipts. `None` identifies a v3-compatible
+    /// row, including fresh writes while production remains activation-gated to v3.
+    pub disposition: Option<CiJobTerminalDisposition>,
+    /// The authoritative receipt for this row's selected write generation.
     pub completion_receipt: String,
+    /// V4 rows retain the exact v3 receipt in the byte-frozen legacy column so activation never
+    /// requires weakening or replacing its shipped v3 CHECK/UNIQUE constraints.
+    pub legacy_completion_receipt_v3: Option<String>,
+}
+
+/// Closed terminal-accounting vocabulary. Preparation dispositions deliberately carry no usage,
+/// pass bit, or arbitrary text; those remain separate, independently validated accounting facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiJobTerminalDisposition {
+    WorkloadPassed,
+    WorkloadFailed,
+    WorkloadTimedOut,
+    Preparation(PreparationTerminalDisposition),
+    SkippedBeforeStart,
+    CancelledDuringPreparation,
+    CancelledAfterWorkloadLaunch,
+}
+
+impl CiJobTerminalDisposition {
+    pub fn as_storage_token(self) -> &'static str {
+        match self {
+            Self::WorkloadPassed => "workload_passed",
+            Self::WorkloadFailed => "workload_failed",
+            Self::WorkloadTimedOut => "workload_timed_out",
+            Self::Preparation(PreparationTerminalDisposition::Failed {
+                phase: PreparationPhase::CheckoutTransport,
+            }) => "checkout_transport_failed",
+            Self::Preparation(PreparationTerminalDisposition::TimedOut {
+                phase: PreparationPhase::CheckoutTransport,
+            }) => "checkout_transport_timed_out",
+            Self::Preparation(PreparationTerminalDisposition::Failed {
+                phase: PreparationPhase::CheckoutMaterialization,
+            }) => "checkout_materialization_failed",
+            Self::Preparation(PreparationTerminalDisposition::TimedOut {
+                phase: PreparationPhase::CheckoutMaterialization,
+            }) => "checkout_materialization_timed_out",
+            Self::Preparation(PreparationTerminalDisposition::AttemptsExhausted) => {
+                "preparation_attempts_exhausted"
+            }
+            Self::SkippedBeforeStart => "skipped_before_start",
+            Self::CancelledDuringPreparation => "cancelled_during_preparation",
+            Self::CancelledAfterWorkloadLaunch => "cancelled_after_workload_launch",
+        }
+    }
+
+    fn from_storage_token(value: &str) -> Option<Self> {
+        Some(match value {
+            "workload_passed" => Self::WorkloadPassed,
+            "workload_failed" => Self::WorkloadFailed,
+            "workload_timed_out" => Self::WorkloadTimedOut,
+            "checkout_transport_failed" => {
+                Self::Preparation(PreparationTerminalDisposition::Failed {
+                    phase: PreparationPhase::CheckoutTransport,
+                })
+            }
+            "checkout_transport_timed_out" => {
+                Self::Preparation(PreparationTerminalDisposition::TimedOut {
+                    phase: PreparationPhase::CheckoutTransport,
+                })
+            }
+            "checkout_materialization_failed" => {
+                Self::Preparation(PreparationTerminalDisposition::Failed {
+                    phase: PreparationPhase::CheckoutMaterialization,
+                })
+            }
+            "checkout_materialization_timed_out" => {
+                Self::Preparation(PreparationTerminalDisposition::TimedOut {
+                    phase: PreparationPhase::CheckoutMaterialization,
+                })
+            }
+            "preparation_attempts_exhausted" => {
+                Self::Preparation(PreparationTerminalDisposition::AttemptsExhausted)
+            }
+            "skipped_before_start" => Self::SkippedBeforeStart,
+            "cancelled_during_preparation" => Self::CancelledDuringPreparation,
+            "cancelled_after_workload_launch" => Self::CancelledAfterWorkloadLaunch,
+            _ => return None,
+        })
+    }
+
+    pub fn workload_started(self) -> bool {
+        matches!(
+            self,
+            Self::WorkloadPassed
+                | Self::WorkloadFailed
+                | Self::WorkloadTimedOut
+                | Self::CancelledAfterWorkloadLaunch
+        )
+    }
+}
+
+/// Bind a closed disposition to an existing deterministic v3 accounting receipt. Owners with
+/// distinct historical v3 domains (normal completion, supersession, skipped-before-start) can
+/// preserve those encoders byte-for-byte while converging on one v4 compatibility shape.
+pub(crate) fn disposition_receipt_v4(
+    legacy_v3: &str,
+    disposition: CiJobTerminalDisposition,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"myelin.ci.accounting-disposition-receipt.v4\0");
+    for field in [legacy_v3, disposition.as_storage_token()] {
+        hasher.update(&(field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    format!("v4:{}", hasher.finalize().to_hex())
+}
+
+pub(crate) struct VersionedCiJobAccountingReceipt {
+    pub disposition: Option<CiJobTerminalDisposition>,
+    pub completion_receipt: String,
+    pub legacy_completion_receipt_v3: Option<String>,
+}
+
+/// Select only the fresh-write representation. Replay readers remain dual-version regardless of
+/// this choice.
+pub(crate) fn versioned_accounting_receipt(
+    write_version: CiJobAccountingWriteVersion,
+    legacy_completion_receipt_v3: String,
+    disposition: CiJobTerminalDisposition,
+) -> VersionedCiJobAccountingReceipt {
+    match write_version {
+        CiJobAccountingWriteVersion::V3 => VersionedCiJobAccountingReceipt {
+            disposition: None,
+            completion_receipt: legacy_completion_receipt_v3,
+            legacy_completion_receipt_v3: None,
+        },
+        CiJobAccountingWriteVersion::V4 => VersionedCiJobAccountingReceipt {
+            disposition: Some(disposition),
+            completion_receipt: disposition_receipt_v4(&legacy_completion_receipt_v3, disposition),
+            legacy_completion_receipt_v3: Some(legacy_completion_receipt_v3),
+        },
+    }
 }
 
 impl core::fmt::Debug for CiJobAccountingRecord {
@@ -66,7 +202,9 @@ impl core::fmt::Debug for CiJobAccountingRecord {
             .field("pricing_revision", &"<redacted>")
             .field("billed", &"<redacted>")
             .field("refunded", &"<redacted>")
+            .field("disposition", &self.disposition)
             .field("completion_receipt", &"<redacted>")
+            .field("legacy_completion_receipt_v3", &"<redacted>")
             .finish()
     }
 }
@@ -75,6 +213,15 @@ impl core::fmt::Debug for CiJobAccountingRecord {
 pub enum CiJobAccountingWrite {
     Inserted,
     ExactReplay,
+}
+
+/// Fresh-write format for immutable CI job accounting. Reads always understand both generations;
+/// production remains pinned to v3 until the fleet can safely replay v4 queue receipts and result
+/// summaries during a rolling deployment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiJobAccountingWriteVersion {
+    V3,
+    V4,
 }
 
 /// A safe-to-log refusal from the immutable accounting store.
@@ -122,6 +269,7 @@ impl From<myelin_storage::PgError> for CiJobAccountingError {
 pub struct CiJobAccountingStore {
     pool: PgPool,
     region: Region,
+    write_version: CiJobAccountingWriteVersion,
 }
 
 impl core::fmt::Debug for CiJobAccountingStore {
@@ -129,17 +277,37 @@ impl core::fmt::Debug for CiJobAccountingStore {
         f.debug_struct("CiJobAccountingStore")
             .field("pool", &"<redacted>")
             .field("region", &"<redacted>")
+            .field("write_version", &self.write_version)
             .finish()
     }
 }
 
 impl CiJobAccountingStore {
+    /// Production-safe constructor. Fresh writes remain v3 until every possible replay owner
+    /// understands v4; additive v4 columns are still readable.
     pub fn with_pg(pool: PgPool, region: Region) -> Self {
-        Self { pool, region }
+        Self::with_pg_and_write_version(pool, region, CiJobAccountingWriteVersion::V3)
+    }
+
+    /// Explicit activation seam for tests and a future fleet-convergence switch.
+    pub fn with_pg_and_write_version(
+        pool: PgPool,
+        region: Region,
+        write_version: CiJobAccountingWriteVersion,
+    ) -> Self {
+        Self {
+            pool,
+            region,
+            write_version,
+        }
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub(crate) fn write_version(&self) -> CiJobAccountingWriteVersion {
+        self.write_version
     }
 
     /// Record or exactly verify a receipt on the caller's tenant-scoped transaction.
@@ -152,6 +320,11 @@ impl CiJobAccountingStore {
         scope: &TenantScope,
         record: &CiJobAccountingRecord,
     ) -> Result<CiJobAccountingWrite, CiJobAccountingError> {
+        if self.write_version == CiJobAccountingWriteVersion::V3 && record.disposition.is_some() {
+            return Err(CiJobAccountingError::InvalidField(
+                "v4 write while the accounting writer is pinned to v3",
+            ));
+        }
         if scope.tenant() != &record.tenant
             || scope.tenant().as_str().is_empty()
             || scope.region() != &self.region
@@ -169,6 +342,16 @@ impl CiJobAccountingStore {
         let billed = fit_bigint("billed amount", record.billed.0)?;
         let refunded = fit_bigint("refunded amount", record.refunded.0)?;
         let tenant_id = record.tenant.as_str();
+        let legacy_receipt = record
+            .legacy_completion_receipt_v3
+            .as_deref()
+            .unwrap_or(record.completion_receipt.as_str());
+        let disposition = record
+            .disposition
+            .map(CiJobTerminalDisposition::as_storage_token);
+        let receipt_v4 = record
+            .disposition
+            .map(|_| record.completion_receipt.as_str());
 
         let inserted = sqlx::query(INSERT_CI_JOB_ACCOUNTING_QUERY)
             .bind(tenant_id)
@@ -185,7 +368,9 @@ impl CiJobAccountingStore {
             .bind(&record.pricing_revision)
             .bind(billed)
             .bind(refunded)
-            .bind(&record.completion_receipt)
+            .bind(legacy_receipt)
+            .bind(disposition)
+            .bind(receipt_v4)
             .fetch_optional(&mut *conn)
             .await
             .map_err(|_| CiJobAccountingError::Db("receipt insert"))?;
@@ -212,7 +397,15 @@ impl CiJobAccountingStore {
             && existing.get::<String, _>("pricing_revision") == record.pricing_revision
             && existing.get::<i64, _>("billed_minor_units") == billed
             && existing.get::<i64, _>("refunded_minor_units") == refunded
-            && existing.get::<String, _>("completion_receipt") == record.completion_receipt;
+            && existing.get::<String, _>("completion_receipt") == legacy_receipt
+            && existing
+                .get::<Option<String>, _>("terminal_disposition")
+                .as_deref()
+                == disposition
+            && existing
+                .get::<Option<String>, _>("completion_receipt_v4")
+                .as_deref()
+                == receipt_v4;
         if exact {
             Ok(CiJobAccountingWrite::ExactReplay)
         } else {
@@ -251,6 +444,18 @@ impl CiJobAccountingStore {
         let nonnegative = |column: &'static str| -> Result<u64, CiJobAccountingError> {
             u64::try_from(row.get::<i64, _>(column)).map_err(|_| CiJobAccountingError::CorruptRow)
         };
+        let disposition = row
+            .get::<Option<String>, _>("terminal_disposition")
+            .map(|value| {
+                CiJobTerminalDisposition::from_storage_token(&value)
+                    .ok_or(CiJobAccountingError::CorruptRow)
+            })
+            .transpose()?;
+        let completion_receipt_v3: String = row.get("completion_receipt");
+        let completion_receipt_v4: Option<String> = row.get("completion_receipt_v4");
+        if disposition.is_some() != completion_receipt_v4.is_some() {
+            return Err(CiJobAccountingError::CorruptRow);
+        }
         Ok(Some(CiJobAccountingRecord {
             tenant: scope.tenant().clone(),
             job_id: job_id.to_owned(),
@@ -267,7 +472,10 @@ impl CiJobAccountingStore {
             pricing_revision: row.get("pricing_revision"),
             billed: MinorUnits(nonnegative("billed_minor_units")?),
             refunded: MinorUnits(nonnegative("refunded_minor_units")?),
-            completion_receipt: row.get("completion_receipt"),
+            disposition,
+            completion_receipt: completion_receipt_v4
+                .unwrap_or_else(|| completion_receipt_v3.clone()),
+            legacy_completion_receipt_v3: disposition.map(|_| completion_receipt_v3),
         }))
     }
 
@@ -303,10 +511,50 @@ fn validate_record(record: &CiJobAccountingRecord) -> Result<(), CiJobAccounting
             return Err(CiJobAccountingError::InvalidField(name));
         }
     }
-    if !is_completion_receipt_v3(&record.completion_receipt) {
-        return Err(CiJobAccountingError::InvalidField("completion receipt"));
+    match (
+        record.disposition,
+        record.legacy_completion_receipt_v3.as_deref(),
+    ) {
+        (None, None) if is_completion_receipt_v3(&record.completion_receipt) => {}
+        (Some(disposition), Some(legacy))
+            if is_completion_receipt_v4(&record.completion_receipt)
+                && is_completion_receipt_v3(legacy)
+                && disposition_matches_verdict(
+                    disposition,
+                    record.passed,
+                    record.timed_out,
+                    record.skipped,
+                ) => {}
+        _ => return Err(CiJobAccountingError::InvalidField("completion receipt")),
     }
     Ok(())
+}
+
+fn disposition_matches_verdict(
+    disposition: CiJobTerminalDisposition,
+    passed: bool,
+    timed_out: bool,
+    skipped: bool,
+) -> bool {
+    match disposition {
+        CiJobTerminalDisposition::WorkloadPassed => passed && !timed_out && !skipped,
+        CiJobTerminalDisposition::WorkloadTimedOut => !passed && timed_out && !skipped,
+        CiJobTerminalDisposition::Preparation(PreparationTerminalDisposition::TimedOut {
+            ..
+        }) => !passed && timed_out && !skipped,
+        CiJobTerminalDisposition::SkippedBeforeStart
+        | CiJobTerminalDisposition::CancelledDuringPreparation => !passed && !timed_out && skipped,
+        CiJobTerminalDisposition::WorkloadFailed
+        | CiJobTerminalDisposition::Preparation(PreparationTerminalDisposition::Failed {
+            ..
+        })
+        | CiJobTerminalDisposition::Preparation(
+            PreparationTerminalDisposition::AttemptsExhausted,
+        )
+        | CiJobTerminalDisposition::CancelledAfterWorkloadLaunch => {
+            !passed && !timed_out && !skipped
+        }
+    }
 }
 
 fn parse_uuid(field: &'static str, value: &str) -> Result<Uuid, CiJobAccountingError> {
@@ -320,6 +568,14 @@ fn fit_bigint(field: &'static str, value: u64) -> Result<i64, CiJobAccountingErr
 fn is_completion_receipt_v3(value: &str) -> bool {
     value.len() == 67
         && value.starts_with("v3:")
+        && value.as_bytes()[3..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn is_completion_receipt_v4(value: &str) -> bool {
+    value.len() == 67
+        && value.starts_with("v4:")
         && value.as_bytes()[3..]
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
@@ -346,7 +602,9 @@ mod tests {
             pricing_revision: "pricing:v1".into(),
             billed: MinorUnits(19),
             refunded: MinorUnits(4),
+            disposition: None,
             completion_receipt: format!("v3:{}", "a".repeat(64)),
+            legacy_completion_receipt_v3: None,
         }
     }
 
@@ -368,6 +626,95 @@ mod tests {
                 Err(CiJobAccountingError::InvalidField("completion receipt"))
             );
         }
+    }
+
+    #[test]
+    fn v4_receipt_requires_a_closed_disposition_and_legacy_v3_twin() {
+        let mut candidate = record();
+        candidate.passed = false;
+        candidate.disposition = Some(CiJobTerminalDisposition::WorkloadFailed);
+        candidate.completion_receipt = format!("v4:{}", "b".repeat(64));
+        candidate.legacy_completion_receipt_v3 = Some(format!("v3:{}", "a".repeat(64)));
+        assert_eq!(validate_record(&candidate), Ok(()));
+
+        candidate.legacy_completion_receipt_v3 = None;
+        assert_eq!(
+            validate_record(&candidate),
+            Err(CiJobAccountingError::InvalidField("completion receipt"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_write_version_is_explicit_and_production_defaults_to_v3() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .unwrap();
+        let production = CiJobAccountingStore::with_pg(pool, Region("fr-par".into()));
+        assert_eq!(production.write_version(), CiJobAccountingWriteVersion::V3);
+
+        let legacy = format!("v3:{}", "a".repeat(64));
+        let v3 = versioned_accounting_receipt(
+            CiJobAccountingWriteVersion::V3,
+            legacy.clone(),
+            CiJobTerminalDisposition::WorkloadFailed,
+        );
+        assert_eq!(v3.disposition, None);
+        assert_eq!(v3.completion_receipt, legacy);
+        assert_eq!(v3.legacy_completion_receipt_v3, None);
+
+        let v4 = versioned_accounting_receipt(
+            CiJobAccountingWriteVersion::V4,
+            legacy.clone(),
+            CiJobTerminalDisposition::WorkloadFailed,
+        );
+        assert_eq!(
+            v4.disposition,
+            Some(CiJobTerminalDisposition::WorkloadFailed)
+        );
+        assert!(v4.completion_receipt.starts_with("v4:"));
+        assert_eq!(
+            v4.legacy_completion_receipt_v3.as_deref(),
+            Some(legacy.as_str())
+        );
+    }
+
+    #[test]
+    fn disposition_tokens_round_trip_and_bind_verdict_shape() {
+        let all = [
+            CiJobTerminalDisposition::WorkloadPassed,
+            CiJobTerminalDisposition::WorkloadFailed,
+            CiJobTerminalDisposition::WorkloadTimedOut,
+            CiJobTerminalDisposition::Preparation(PreparationTerminalDisposition::Failed {
+                phase: PreparationPhase::CheckoutTransport,
+            }),
+            CiJobTerminalDisposition::Preparation(PreparationTerminalDisposition::TimedOut {
+                phase: PreparationPhase::CheckoutMaterialization,
+            }),
+            CiJobTerminalDisposition::Preparation(
+                PreparationTerminalDisposition::AttemptsExhausted,
+            ),
+            CiJobTerminalDisposition::SkippedBeforeStart,
+            CiJobTerminalDisposition::CancelledDuringPreparation,
+            CiJobTerminalDisposition::CancelledAfterWorkloadLaunch,
+        ];
+        for disposition in all {
+            assert_eq!(
+                CiJobTerminalDisposition::from_storage_token(disposition.as_storage_token()),
+                Some(disposition)
+            );
+        }
+        assert!(disposition_matches_verdict(
+            CiJobTerminalDisposition::WorkloadPassed,
+            true,
+            false,
+            false
+        ));
+        assert!(!disposition_matches_verdict(
+            CiJobTerminalDisposition::WorkloadPassed,
+            false,
+            false,
+            false
+        ));
     }
 
     #[test]
@@ -406,6 +753,8 @@ mod tests {
             "billed_minor_units",
             "refunded_minor_units",
             "completion_receipt",
+            "terminal_disposition",
+            "completion_receipt_v4",
         ] {
             assert!(
                 SELECT_CI_JOB_ACCOUNTING_QUERY.contains(field),
