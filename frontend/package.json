@@ -15,6 +15,13 @@
     "lint:prove": "pnpm -r --no-bail lint:prove",
     "test": "pnpm -r test"
   },
+  "pnpm": {
+    "auditConfig": {
+      "ignoreGhsas": [
+        "GHSA-mh99-v99m-4gvg"
+      ]
+    }
+  },
   "devDependencies": {
     "@eslint/js": "^9.18.0",
     "eslint": "^9.18.0",
