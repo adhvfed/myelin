@@ -627,7 +627,7 @@ pub async fn resolve_prelaunch_usage_on_conn(
     .fetch_optional(&mut *connection)
     .await
     .map_err(map_sql_error)?;
-    if queue.is_none() {
+    if queue.is_none() && parent_expectation == CiPrelaunchParentExpectation::Required {
         return Err(CiPrelaunchUsageJournalError::SettlementIdentityMismatch);
     }
 
@@ -661,6 +661,9 @@ pub async fn resolve_prelaunch_usage_on_conn(
     .fetch_all(&mut *connection)
     .await
     .map_err(map_sql_error)?;
+    if queue.is_none() && !parents.is_empty() {
+        return Err(CiPrelaunchUsageJournalError::SettlementIdentityMismatch);
+    }
     if is_v1 {
         return if parents.is_empty() {
             Ok(CiPrelaunchUsageAccrual::default())

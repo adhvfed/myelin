@@ -292,10 +292,101 @@ async fn drive_clock(pool: &PgPool) -> (i64, String) {
     .unwrap()
 }
 
+const JOURNALED_PRELAUNCH_USAGE: ResourceUsage = ResourceUsage {
+    cpu_seconds: 8,
+    mem_byte_seconds: 5 * 1_073_741_824,
+};
+
+fn expected_operational_settlement(usage: ResourceUsage) -> (i64, i64) {
+    let priced = usage
+        .cpu_seconds
+        .checked_add(usage.mem_byte_seconds.div_ceil(1_073_741_824))
+        .unwrap();
+    let billed = i64::try_from(priced.min(100)).unwrap();
+    (billed, 100 - billed)
+}
+
+async fn seed_prelaunch_usage_mix(pool: &PgPool, seed: JournalSeed<'_>) {
+    sqlx::query(
+        "INSERT INTO ci_job_parent_attempt (
+           tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle, lease_owner,
+           lease_epoch, claim_nonce, claim_started_at_epoch_secs, claim_expires_at_epoch_secs,
+           budget_revision, max_parent_attempts
+         )
+         SELECT tenant_id, region, job_id, run_id, $5::uuid, $6, lease_owner, lease_epoch,
+                claim_nonce, EXTRACT(EPOCH FROM claim_started_at)::bigint,
+                EXTRACT(EPOCH FROM claim_expires_at)::bigint, 1, 5
+         FROM job_queue
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid AND run_id = $4::uuid",
+    )
+    .bind(seed.tenant)
+    .bind(seed.region)
+    .bind(seed.job_id)
+    .bind(seed.wf_run_id)
+    .bind(seed.ci_run_id)
+    .bind(seed.reserve_handle)
+    .execute(pool)
+    .await
+    .expect("seed the exact durable parent attempt");
+    if !seed.include_phases {
+        return;
+    }
+    sqlx::query(
+        "INSERT INTO ci_job_prelaunch_usage (
+           tenant_id, region, job_id, lease_epoch, claim_nonce, phase, status,
+           ceiling_cpu_seconds, ceiling_mem_byte_seconds, exact_cpu_seconds,
+           exact_mem_byte_seconds, started_at, resolved_at, seal_after
+         )
+         SELECT tenant_id, region, job_id, lease_epoch, claim_nonce,
+                'checkout_transport', 'measured', 120, 120000000000, 3, $4::numeric,
+                statement_timestamp(), statement_timestamp(), statement_timestamp() + interval '1 hour'
+         FROM job_queue
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+    )
+    .bind(seed.tenant)
+    .bind(seed.region)
+    .bind(seed.job_id)
+    .bind((2 * 1_073_741_824_u64).to_string())
+    .execute(pool)
+    .await
+    .expect("seed measured checkout transport usage");
+    sqlx::query(
+        "INSERT INTO ci_job_prelaunch_usage (
+           tenant_id, region, job_id, lease_epoch, claim_nonce, phase, status,
+           ceiling_cpu_seconds, ceiling_mem_byte_seconds, exact_cpu_seconds,
+           exact_mem_byte_seconds, started_at, resolved_at, seal_after
+         )
+         SELECT tenant_id, region, job_id, lease_epoch, claim_nonce,
+                'checkout_materialization', 'sealed_ceiling', 5, $4::numeric, NULL, NULL,
+                statement_timestamp(), statement_timestamp(), statement_timestamp() + interval '1 hour'
+         FROM job_queue
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+    )
+    .bind(seed.tenant)
+    .bind(seed.region)
+    .bind(seed.job_id)
+    .bind((3 * 1_073_741_824_u64).to_string())
+    .execute(pool)
+    .await
+    .expect("seed sealed checkout materialization usage");
+}
+
+struct JournalSeed<'a> {
+    tenant: &'a str,
+    region: &'a str,
+    job_id: &'a str,
+    wf_run_id: &'a str,
+    ci_run_id: &'a str,
+    reserve_handle: &'a str,
+    include_phases: bool,
+}
+
 async fn run_reporter_scenario(
     supersession_wins_first: bool,
     runner_abandoned: bool,
     retry_then_supersession: bool,
+    journal_prelaunch_usage: bool,
+    verify_existing_via_supersession: bool,
 ) {
     let suffix = if runner_abandoned {
         "cancel_abandoned"
@@ -386,6 +477,19 @@ async fn run_reporter_scenario(
     let job = "33333333-3333-8333-8333-333333333333";
     let skipped_job = "77777777-7777-8777-8777-777777777777";
     let owner = "runner-live";
+    let reserve_handle = if journal_prelaunch_usage {
+        format!("ci-reserve:v2:{ci_run}:budget-v1:a5:batch:{job}:usage")
+    } else {
+        OPERATIONAL_RESERVE_HANDLE.to_owned()
+    };
+    let journal_usage = if journal_prelaunch_usage {
+        JOURNALED_PRELAUNCH_USAGE
+    } else {
+        ResourceUsage {
+            cpu_seconds: 0,
+            mem_byte_seconds: 0,
+        }
+    };
 
     let ci_runs = ci_run_store_factory(pool.clone());
     ci_runs
@@ -430,7 +534,8 @@ async fn run_reporter_scenario(
         skipped_job,
         production_definition.code_hash(),
     );
-    if supersession_wins_first || retry_then_supersession {
+    drive_manifest.jobs[0].reserve_handle = reserve_handle.clone();
+    if supersession_wins_first || retry_then_supersession || verify_existing_via_supersession {
         drive_manifest.jobs.truncate(1);
         drive_manifest.check_attempts.remove("package");
     }
@@ -462,11 +567,11 @@ async fn run_reporter_scenario(
     )
     .bind(&tenant.0)
     .bind(&region.0)
-    .bind(OPERATIONAL_RESERVE_HANDLE)
+    .bind(&reserve_handle)
     .execute(&pool)
     .await
     .unwrap();
-    if !supersession_wins_first && !retry_then_supersession {
+    if !supersession_wins_first && !retry_then_supersession && !verify_existing_via_supersession {
         sqlx::query(
             "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
              VALUES ($1, $2, 'reserve:skipped-live', 40, 'reserved')",
@@ -602,6 +707,21 @@ async fn run_reporter_scenario(
         .unwrap()
         .expect("the first production generation claims the queued manifest job");
     assert_eq!(first_lease.lease_epoch, 1);
+    if journal_prelaunch_usage {
+        seed_prelaunch_usage_mix(
+            &pool,
+            JournalSeed {
+                tenant: &tenant.0,
+                region: &region.0,
+                job_id: job,
+                wf_run_id: wf_run,
+                ci_run_id: ci_run,
+                reserve_handle: &reserve_handle,
+                include_phases: true,
+            },
+        )
+        .await;
+    }
     let first_spec =
         resolver(&first_lease).expect("the first production generation mints its Identity token");
     let first_hooks = ci_runner_hooks(
@@ -611,7 +731,7 @@ async fn run_reporter_scenario(
     );
     assert_eq!(
         first_hooks.reserve(&first_spec).unwrap().0,
-        OPERATIONAL_RESERVE_HANDLE
+        reserve_handle
     );
 
     let reporter = |valid| {
@@ -848,17 +968,29 @@ async fn run_reporter_scenario(
                 poison_state, "running",
                 "the corrupt first candidate rolls back without blocking the later tenant"
             );
-            let accounting: (bool, i64, i64) = sqlx::query_as(
-                "SELECT skipped, cpu_seconds, mem_byte_seconds
+            let accounting: (bool, i64, i64, i64, i64) = sqlx::query_as(
+                "SELECT skipped, cpu_seconds, mem_byte_seconds,
+                        billed_minor_units, refunded_minor_units
                  FROM ci_job_accounting WHERE job_id = $1::uuid",
             )
             .bind(job)
             .fetch_one(&pool)
             .await
             .unwrap();
+            let usage = ResourceUsage {
+                cpu_seconds: 60 + journal_usage.cpu_seconds,
+                mem_byte_seconds: 60 * 1_073_741_824 + journal_usage.mem_byte_seconds,
+            };
+            let (billed, refunded) = expected_operational_settlement(usage);
             assert_eq!(
                 accounting,
-                (false, 60, 60 * 1_073_741_824),
+                (
+                    false,
+                    i64::try_from(usage.cpu_seconds).unwrap(),
+                    i64::try_from(usage.mem_byte_seconds).unwrap(),
+                    billed,
+                    refunded,
+                ),
                 "unknown crash usage is conservatively closed at immutable manifest ceilings"
             );
             let run_closed: bool = sqlx::query_scalar(
@@ -889,20 +1021,28 @@ async fn run_reporter_scenario(
             (1, 2, 0, "terminal".into()),
             "the late measured attempt emits no job.done and cannot become claimable again"
         );
-        let accounting: (bool, i64, i64) = sqlx::query_as(
-            "SELECT skipped, cpu_seconds, mem_byte_seconds
+        let accounting: (bool, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT skipped, cpu_seconds, mem_byte_seconds,
+                    billed_minor_units, refunded_minor_units
              FROM ci_job_accounting WHERE job_id = $1::uuid",
         )
         .bind(job)
         .fetch_one(&pool)
         .await
         .unwrap();
+        let usage = ResourceUsage {
+            cpu_seconds: retryable.usage.cpu_seconds + journal_usage.cpu_seconds,
+            mem_byte_seconds: retryable.usage.mem_byte_seconds + journal_usage.mem_byte_seconds,
+        };
+        let (billed, refunded) = expected_operational_settlement(usage);
         assert_eq!(
             accounting,
             (
                 false,
-                i64::try_from(retryable.usage.cpu_seconds).unwrap(),
-                i64::try_from(retryable.usage.mem_byte_seconds).unwrap()
+                i64::try_from(usage.cpu_seconds).unwrap(),
+                i64::try_from(usage.mem_byte_seconds).unwrap(),
+                billed,
+                refunded,
             )
         );
         let run_closed: bool = sqlx::query_scalar(
@@ -1001,20 +1141,28 @@ async fn run_reporter_scenario(
             (1, 2, 0, "terminal".into()),
             "real supersession settles accrued usage without job.done"
         );
-        let accounting: (bool, i64, i64) = sqlx::query_as(
-            "SELECT skipped, cpu_seconds, mem_byte_seconds
+        let accounting: (bool, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT skipped, cpu_seconds, mem_byte_seconds,
+                    billed_minor_units, refunded_minor_units
              FROM ci_job_accounting WHERE job_id = $1::uuid",
         )
         .bind(job)
         .fetch_one(&pool)
         .await
         .unwrap();
+        let usage = ResourceUsage {
+            cpu_seconds: retryable.usage.cpu_seconds + journal_usage.cpu_seconds,
+            mem_byte_seconds: retryable.usage.mem_byte_seconds + journal_usage.mem_byte_seconds,
+        };
+        let (billed, refunded) = expected_operational_settlement(usage);
         assert_eq!(
             accounting,
             (
                 false,
-                i64::try_from(retryable.usage.cpu_seconds).unwrap(),
-                i64::try_from(retryable.usage.mem_byte_seconds).unwrap()
+                i64::try_from(usage.cpu_seconds).unwrap(),
+                i64::try_from(usage.mem_byte_seconds).unwrap(),
+                billed,
+                refunded,
             )
         );
         assert!(region_store
@@ -1054,6 +1202,21 @@ async fn run_reporter_scenario(
         .unwrap()
         .expect("the retryable failure is immediately claimable as a fresh generation");
     assert_eq!(second_lease.lease_epoch, 2);
+    if journal_prelaunch_usage {
+        seed_prelaunch_usage_mix(
+            &pool,
+            JournalSeed {
+                tenant: &tenant.0,
+                region: &region.0,
+                job_id: job,
+                wf_run_id: wf_run,
+                ci_run_id: ci_run,
+                reserve_handle: &reserve_handle,
+                include_phases: false,
+            },
+        )
+        .await;
+    }
     let second_spec = resolver(&second_lease).expect("the retry generation mints fresh authority");
     let second_hooks = ci_runner_hooks(
         provider.clone(),
@@ -1062,7 +1225,7 @@ async fn run_reporter_scenario(
     );
     assert_eq!(
         second_hooks.reserve(&second_spec).unwrap().0,
-        OPERATIONAL_RESERVE_HANDLE,
+        reserve_handle,
         "the in-flight operational reservation spans retry generations"
     );
     second_hooks
@@ -1080,6 +1243,105 @@ async fn run_reporter_scenario(
         claim_nonce: second_lease.claim_nonce.clone(),
     };
 
+    if journal_prelaunch_usage {
+        assert_eq!(
+            production_reporter.report_done(&claim, &report).unwrap(),
+            SignalOutcome::Buffered,
+            "normal completion settles journaled prelaunch, prior retry, and current workload once",
+        );
+        let expected = ResourceUsage {
+            cpu_seconds: JOURNALED_PRELAUNCH_USAGE.cpu_seconds
+                + retryable.usage.cpu_seconds
+                + report.usage.cpu_seconds,
+            mem_byte_seconds: JOURNALED_PRELAUNCH_USAGE.mem_byte_seconds
+                + retryable.usage.mem_byte_seconds
+                + report.usage.mem_byte_seconds,
+        };
+        let accounted: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT cpu_seconds, mem_byte_seconds, billed_minor_units, refunded_minor_units
+             FROM ci_job_accounting WHERE job_id = $1::uuid",
+        )
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (billed, refunded) = expected_operational_settlement(expected);
+        assert_eq!(
+            accounted,
+            (
+                i64::try_from(expected.cpu_seconds).unwrap(),
+                i64::try_from(expected.mem_byte_seconds).unwrap(),
+                billed,
+                refunded,
+            ),
+            "the measured and sealed phases are included exactly once",
+        );
+        assert_eq!(
+            production_reporter.report_done(&claim, &report).unwrap(),
+            SignalOutcome::Duplicate,
+            "existing accounting replay re-resolves the journal without adding it twice",
+        );
+        let replayed: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT cpu_seconds, mem_byte_seconds, billed_minor_units, refunded_minor_units,
+                    (SELECT count(*) FROM cost_event WHERE run_id = $2)
+             FROM ci_job_accounting WHERE job_id = $1::uuid",
+        )
+        .bind(job)
+        .bind(&reserve_handle)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            replayed,
+            (
+                i64::try_from(expected.cpu_seconds).unwrap(),
+                i64::try_from(expected.mem_byte_seconds).unwrap(),
+                billed,
+                refunded,
+                2,
+            ),
+            "replay preserves one immutable receipt and one pair of cost rows",
+        );
+        if verify_existing_via_supersession {
+            let supersession = PgCiRunSupersession::new(
+                pool.clone(),
+                ledger.clone(),
+                tenant.clone(),
+                region.clone(),
+                tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+            supersession
+                .cancel_running_for_test(ci_run, wf_run)
+                .await
+                .expect(
+                    "supersession re-verifies existing accounting against the durable prelaunch \
+                     journal",
+                );
+            let after_supersession: (i64, i64, i64, i64, i64) = sqlx::query_as(
+                "SELECT cpu_seconds, mem_byte_seconds, billed_minor_units,
+                        refunded_minor_units,
+                        (SELECT count(*) FROM cost_event WHERE run_id = $2)
+                 FROM ci_job_accounting WHERE job_id = $1::uuid",
+            )
+            .bind(job)
+            .bind(&reserve_handle)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                after_supersession, replayed,
+                "existing-accounting verification neither omits nor double-adds prelaunch usage",
+            );
+        }
+        drop(pool);
+        bootstrap
+            .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+            .await
+            .unwrap();
+        return;
+    }
+
     let finalization = CiRunFinalization {
         tenant_id: tenant.0.clone(),
         region: region.0.clone(),
@@ -1090,7 +1352,7 @@ async fn run_reporter_scenario(
         jobs: vec![
             CiRunFinalizationJob {
                 job_id: job.into(),
-                reserve_handle: OPERATIONAL_RESERVE_HANDLE.into(),
+                reserve_handle: reserve_handle.clone(),
                 flow_timed_out: false,
                 dispatched: true,
             },
@@ -1159,7 +1421,7 @@ async fn run_reporter_scenario(
                 (SELECT count(*) FROM cost_event WHERE run_id = $1)
            FROM cost_reservation WHERE run_id = $1",
     )
-    .bind(OPERATIONAL_RESERVE_HANDLE)
+    .bind(&reserve_handle)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1304,7 +1566,7 @@ async fn run_reporter_scenario(
         .starts_with("v3:"));
     let storage_events: i64 =
         sqlx::query_scalar("SELECT count(*) FROM cost_event WHERE run_id = $1")
-            .bind(OPERATIONAL_RESERVE_HANDLE)
+            .bind(&reserve_handle)
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -1450,10 +1712,40 @@ async fn run_reporter_scenario(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retry_and_supersession_are_safe_in_both_commit_orders() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    run_reporter_scenario(false, false, false).await;
-    run_reporter_scenario(false, false, true).await;
-    run_reporter_scenario(true, false, false).await;
-    run_reporter_scenario(true, true, false).await;
+    run_reporter_scenario(false, false, false, false, false).await;
+    run_reporter_scenario(false, false, true, false, false).await;
+    run_reporter_scenario(true, false, false, false, false).await;
+    run_reporter_scenario(true, true, false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn normal_completion_and_existing_accounting_replay_include_prelaunch_usage_once() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(false, false, false, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_terminal_retry_includes_prelaunch_usage_once() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(true, false, false, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_supersession_includes_prelaunch_usage_once() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(false, false, true, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_launched_reconciliation_includes_prelaunch_usage_once() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(true, true, false, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn existing_accounting_replay_verifies_prelaunch_usage_without_resettling() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(false, false, false, true, true).await;
 }
 
 /// CT-007 slice 5b.3-4a.1b: `settle_cancelled_job` must recognize a `ci-reserve:v2:...` handle
