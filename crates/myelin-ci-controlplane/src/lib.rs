@@ -125,8 +125,10 @@ pub use ci_runtime_composition::{
     MAX_CI_WORKFLOW_DRIVES_PER_SCOPE, MAX_CI_WORKFLOW_SCOPES_PER_PASS,
 };
 pub use ci_prelaunch_usage_journal::{
-    CiJobParentAttempt, CiPrelaunchJournalOutcome, CiPrelaunchUsageJournal,
-    CiPrelaunchUsageJournalError, CiPrelaunchUsagePhase,
+    resolve_prelaunch_usage_on_conn, CiJobParentAttempt, CiPrelaunchJournalOutcome,
+    CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity, CiPrelaunchUnresolvedPolicy,
+    CiPrelaunchUsageAccrual, CiPrelaunchUsageJournal, CiPrelaunchUsageJournalError,
+    CiPrelaunchUsagePhase,
 };
 /// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
 /// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`
@@ -1083,8 +1085,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            48,
-            "all 20 tables, three ci_run forward ALTERs, 8 concurrent indexes, the ledger validator, 4 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, 3 ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, and 1 scheduler prelaunch-usage reap grant are present"
+            50,
+            "all 20 tables, three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 4 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, 3 claim-column grants, 3 ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, and the prelaunch deadline expand are present"
         );
         assert!(
             spec.consumers.is_empty(),

@@ -67,6 +67,7 @@ pub(crate) struct AbandonedCancelledCursor {
 }
 
 pub(crate) const MAX_ABANDONED_CANCELLED_RECOVERY_BATCH: i64 = 64;
+pub(crate) const MAX_PRELAUNCH_USAGE_SEAL_BATCH: i64 = 64;
 
 impl CiRegionQueueStore {
     /// Bind the dedicated, startup-probed region-scheduler pool.
@@ -99,6 +100,16 @@ impl CiRegionQueueStore {
         reap_region_scoped(&self.pool, region).await
     }
 
+    /// Seal one bounded, skip-locked page of prelaunch phases whose immutable topology-aware
+    /// deadline has elapsed. NULL legacy deadlines are deliberately invisible: the reaper never
+    /// guesses abandonment from the flat scheduler lease.
+    pub async fn seal_expired_prelaunch_usage(
+        &self,
+        region: &str,
+    ) -> Result<u64, JobQueueStoreError> {
+        seal_expired_prelaunch_usage_region_scoped(&self.pool, region).await
+    }
+
     /// Discover at most one bounded keyset page of identities for exact-tenant cancelled-launch
     /// reconciliation. The caller rotates the cursor across sweeps so a persistent poison row
     /// cannot monopolize the region.
@@ -117,6 +128,45 @@ impl CiRegionQueueStore {
     ) -> Result<i64, JobQueueStoreError> {
         count_non_terminal_null_stage_jobs_region_scoped(&self.pool, region).await
     }
+}
+
+async fn seal_expired_prelaunch_usage_region_scoped(
+    pool: &PgPool,
+    region: &str,
+) -> Result<u64, JobQueueStoreError> {
+    let region_owned = region.to_owned();
+    let sealed = with_region_tx(pool, region, move |conn| {
+        Box::pin(async move {
+            sqlx::query(
+                "WITH candidates AS MATERIALIZED (
+                   SELECT tenant_id, region, job_id, lease_epoch, claim_nonce, phase
+                   FROM ci_job_prelaunch_usage
+                   WHERE region = $1 AND status = 'started'
+                     AND seal_after IS NOT NULL
+                     AND seal_after <= statement_timestamp()
+                   ORDER BY seal_after, tenant_id, job_id, lease_epoch, claim_nonce, phase
+                   FOR UPDATE SKIP LOCKED
+                   LIMIT $2
+                 )
+                 UPDATE ci_job_prelaunch_usage u
+                 SET status = 'sealed_ceiling', resolved_at = statement_timestamp()
+                 FROM candidates c
+                 WHERE u.tenant_id = c.tenant_id AND u.region = c.region
+                   AND u.job_id = c.job_id AND u.lease_epoch = c.lease_epoch
+                   AND u.claim_nonce = c.claim_nonce AND u.phase = c.phase
+                   AND u.status = 'started'
+                 RETURNING u.job_id",
+            )
+            .bind(&region_owned)
+            .bind(MAX_PRELAUNCH_USAGE_SEAL_BATCH)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))
+        })
+    })
+    .await?;
+    u64::try_from(sealed.len())
+        .map_err(|_| JobQueueStoreError::CorruptRow("prelaunch seal count overflowed".into()))
 }
 
 async fn abandoned_cancelled_region_scoped(

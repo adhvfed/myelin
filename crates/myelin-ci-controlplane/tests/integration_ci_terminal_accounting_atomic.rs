@@ -46,6 +46,7 @@ use sqlx::{Executor, PgPool, Row};
 
 const OPERATIONAL_RESERVE_HANDLE: &str =
     "ci-reserve:v1:22222222-2222-8222-8222-222222222222:batch:33333333-3333-8333-8333-333333333333:item";
+static MIGRATION_SCENARIO_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The real, already-founder-pipeline-pinned `linux-small-v1` image. CT-007 gate 2/4 made
 /// `spec.image` the real launch authority: only the "build" job (`/bin/false`) in this file's
@@ -1448,6 +1449,7 @@ async fn run_reporter_scenario(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retry_and_supersession_are_safe_in_both_commit_orders() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
     run_reporter_scenario(false, false, false).await;
     run_reporter_scenario(false, false, true).await;
     run_reporter_scenario(true, false, false).await;
@@ -1463,6 +1465,7 @@ async fn retry_and_supersession_are_safe_in_both_commit_orders() {
 /// machinery that scenario needs for its OWN assertions but this one does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
     let schema = format!("ci_accounting_{}_v2_settle", std::process::id());
     let bootstrap = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)

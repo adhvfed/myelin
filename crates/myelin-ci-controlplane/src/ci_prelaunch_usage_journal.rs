@@ -26,6 +26,8 @@ use crate::ci_run_store::CiRunStore;
 use crate::job_queue_store::CiJobQueueStore;
 use crate::job_spec_store::CiJobSpecStore;
 
+const PRELAUNCH_PHASE_DEADLINE_HEADROOM_SECS: u64 = 600;
+
 /// One checkout-preparation phase represented by `ci_job_prelaunch_usage`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiPrelaunchUsagePhase {
@@ -74,6 +76,10 @@ pub enum CiPrelaunchUsageJournalError {
     PhaseUnavailable,
     PhaseDivergence,
     IllegalPhaseTransition,
+    MissingParentAttempt,
+    SettlementIdentityMismatch,
+    UnresolvedPhase,
+    DeadlineUnavailable,
     UsageOverflow,
     Database,
 }
@@ -106,6 +112,16 @@ impl std::fmt::Display for CiPrelaunchUsageJournalError {
             Self::PhaseUnavailable => "the requested prelaunch phase has not begun",
             Self::PhaseDivergence => "the prelaunch phase replay differs from durable facts",
             Self::IllegalPhaseTransition => "the prelaunch phase transition is not legal",
+            Self::MissingParentAttempt => {
+                "the v2 reservation has no durable parent-attempt journal"
+            }
+            Self::SettlementIdentityMismatch => {
+                "the prelaunch journal differs from the settlement identity"
+            }
+            Self::UnresolvedPhase => "a prelaunch phase remains unresolved",
+            Self::DeadlineUnavailable => {
+                "the prelaunch phase has no verified topology-aware sealing deadline"
+            }
             Self::UsageOverflow => "the prelaunch phase usage ceiling overflowed",
             Self::Database => "the durable prelaunch-usage transaction failed",
         };
@@ -159,6 +175,54 @@ impl CiJobParentAttempt {
 pub struct CiPrelaunchUsageJournal {
     pool: PgPool,
     region: String,
+}
+
+/// Whether a v2 settlement boundary requires proof that at least one parent attempt began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiPrelaunchParentExpectation {
+    Required,
+    OptionalBeforeLaunch,
+}
+
+/// How a terminal owner handles a phase that is still `started` while it holds the queue lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiPrelaunchUnresolvedPolicy {
+    Refuse,
+    SealToCeiling,
+}
+
+/// Exact prelaunch usage recovered from the durable journal for one job settlement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CiPrelaunchUsageAccrual {
+    pub usage: ResourceUsage,
+    pub parent_attempts: u64,
+    pub measured_phases: u64,
+    pub sealed_phases: u64,
+}
+
+impl Default for CiPrelaunchUsageAccrual {
+    fn default() -> Self {
+        Self {
+            usage: ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            },
+            parent_attempts: 0,
+            measured_phases: 0,
+            sealed_phases: 0,
+        }
+    }
+}
+
+/// Durable identity the terminal owner must match before consuming journaled prelaunch usage.
+#[derive(Clone, Copy, Debug)]
+pub struct CiPrelaunchSettlementIdentity<'a> {
+    pub tenant_id: &'a str,
+    pub region: &'a str,
+    pub job_id: &'a str,
+    pub wf_run_id: &'a str,
+    pub ci_run_id: &'a str,
+    pub reserve_handle: &'a str,
 }
 
 impl CiPrelaunchUsageJournal {
@@ -322,14 +386,13 @@ impl CiPrelaunchUsageJournal {
                         }
                     }
 
-                    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                        .bind(format!(
-                            "myelin.ci.parent-attempt.v1:{}:{}:{}",
-                            claim.tenant_id, claim.region, claim.job_id
-                        ))
-                        .execute(&mut *connection)
-                        .await
-                        .map_err(map_sql_error)?;
+                    lock_parent_attempt_job_on_conn(
+                        connection,
+                        &claim.tenant_id,
+                        &claim.region,
+                        &claim.job_id,
+                    )
+                    .await?;
 
                     let outcome = insert_or_replay_parent_attempt(
                         connection,
@@ -366,6 +429,7 @@ impl CiPrelaunchUsageJournal {
             return Err(CiPrelaunchUsageJournalError::PhaseUnavailable);
         }
         let ceiling = phase_ceiling(&attempt.authority, phase)?;
+        let seal_window_secs = phase_seal_window_secs(&attempt.authority, phase)?;
         let attempt = attempt.clone();
         let region = self.region.clone();
         with_tenant_tx_error(
@@ -374,13 +438,21 @@ impl CiPrelaunchUsageJournal {
             &region,
             move |connection| {
                 Box::pin(async move {
-                    require_parent_attempt(connection, &attempt).await?;
+                    require_live_parent_attempt_on_conn(connection, &attempt).await?;
+                    lock_parent_attempt_job_on_conn(
+                        connection,
+                        &attempt.tenant_id,
+                        &attempt.region,
+                        &attempt.job_id,
+                    )
+                    .await?;
                     let inserted = sqlx::query(
                         "INSERT INTO ci_job_prelaunch_usage (
                        tenant_id, region, job_id, lease_epoch, claim_nonce, phase, status,
-                       ceiling_cpu_seconds, ceiling_mem_byte_seconds
+                       ceiling_cpu_seconds, ceiling_mem_byte_seconds, started_at, seal_after
                      ) VALUES ($1, $2, $3::uuid, $4, $5::uuid, $6, 'started',
-                               $7::text::numeric, $8::text::numeric)
+                               $7::text::numeric, $8::text::numeric, statement_timestamp(),
+                               statement_timestamp() + ($9::text || ' seconds')::interval)
                      ON CONFLICT DO NOTHING",
                     )
                     .bind(&attempt.tenant_id)
@@ -391,6 +463,7 @@ impl CiPrelaunchUsageJournal {
                     .bind(phase.token())
                     .bind(ceiling.cpu_seconds.to_string())
                     .bind(ceiling.mem_byte_seconds.to_string())
+                    .bind(seal_window_secs.to_string())
                     .execute(&mut *connection)
                     .await
                     .map_err(map_sql_error)?;
@@ -400,7 +473,7 @@ impl CiPrelaunchUsageJournal {
                     let row = load_phase(connection, &attempt, phase)
                         .await?
                         .ok_or(CiPrelaunchUsageJournalError::PhaseDivergence)?;
-                    if row.ceiling == ceiling {
+                    if row.ceiling == ceiling && row.seal_window_secs == Some(seal_window_secs) {
                         Ok(CiPrelaunchJournalOutcome::Replayed)
                     } else {
                         Err(CiPrelaunchUsageJournalError::PhaseDivergence)
@@ -448,7 +521,14 @@ impl CiPrelaunchUsageJournal {
             &region,
             move |connection| {
                 Box::pin(async move {
-                    require_parent_attempt(connection, &attempt).await?;
+                    require_live_parent_attempt_on_conn(connection, &attempt).await?;
+                    lock_parent_attempt_job_on_conn(
+                        connection,
+                        &attempt.tenant_id,
+                        &attempt.region,
+                        &attempt.job_id,
+                    )
+                    .await?;
                     let (status, cpu, mem) = match resolution {
                         PhaseResolution::Measured(usage) => (
                             "measured",
@@ -523,10 +603,199 @@ enum PhaseResolution {
     Sealed,
 }
 
+/// Resolve every durable prelaunch phase for one eventual settlement while holding the canonical
+/// queue → advisory → journal lock order. This is the single accounting reader shared by normal
+/// terminal settlement and abandoned-job reconciliation in 4b.2; 4b.1 lands and tests the reader
+/// before either caller changes billing behavior.
+pub async fn resolve_prelaunch_usage_on_conn(
+    connection: &mut sqlx::PgConnection,
+    identity: CiPrelaunchSettlementIdentity<'_>,
+    parent_expectation: CiPrelaunchParentExpectation,
+    unresolved_policy: CiPrelaunchUnresolvedPolicy,
+) -> Result<CiPrelaunchUsageAccrual, CiPrelaunchUsageJournalError> {
+    let queue = sqlx::query_scalar::<_, String>(
+        "SELECT job_id::text
+         FROM job_queue
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+           AND run_id = $4::uuid
+         FOR UPDATE",
+    )
+    .bind(identity.tenant_id)
+    .bind(identity.region)
+    .bind(identity.job_id)
+    .bind(identity.wf_run_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(map_sql_error)?;
+    if queue.is_none() {
+        return Err(CiPrelaunchUsageJournalError::SettlementIdentityMismatch);
+    }
+
+    lock_parent_attempt_job_on_conn(
+        connection,
+        identity.tenant_id,
+        identity.region,
+        identity.job_id,
+    )
+    .await?;
+
+    let is_v1 = identity
+        .reserve_handle
+        .starts_with(TIER_P_OPERATIONAL_RESERVATION_PREFIX);
+    let is_v2 = identity
+        .reserve_handle
+        .starts_with(TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX);
+    if !is_v1 && !is_v2 {
+        return Err(CiPrelaunchUsageJournalError::SettlementIdentityMismatch);
+    }
+
+    let parents = sqlx::query(
+        "SELECT wf_run_id::text AS wf_run_id, ci_run_id::text AS ci_run_id, reserve_handle
+         FROM ci_job_parent_attempt
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+         ORDER BY begun_at, lease_epoch, claim_nonce",
+    )
+    .bind(identity.tenant_id)
+    .bind(identity.region)
+    .bind(identity.job_id)
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(map_sql_error)?;
+    if is_v1 {
+        return if parents.is_empty() {
+            Ok(CiPrelaunchUsageAccrual::default())
+        } else {
+            Err(CiPrelaunchUsageJournalError::SettlementIdentityMismatch)
+        };
+    }
+    if parents.is_empty() {
+        return match parent_expectation {
+            CiPrelaunchParentExpectation::Required => {
+                Err(CiPrelaunchUsageJournalError::MissingParentAttempt)
+            }
+            CiPrelaunchParentExpectation::OptionalBeforeLaunch => {
+                Ok(CiPrelaunchUsageAccrual::default())
+            }
+        };
+    }
+    for parent in &parents {
+        if parent
+            .try_get::<String, _>("wf_run_id")
+            .map_err(|_| CiPrelaunchUsageJournalError::Database)?
+            != identity.wf_run_id
+            || parent
+                .try_get::<String, _>("ci_run_id")
+                .map_err(|_| CiPrelaunchUsageJournalError::Database)?
+                != identity.ci_run_id
+            || parent
+                .try_get::<String, _>("reserve_handle")
+                .map_err(|_| CiPrelaunchUsageJournalError::Database)?
+                != identity.reserve_handle
+        {
+            return Err(CiPrelaunchUsageJournalError::SettlementIdentityMismatch);
+        }
+    }
+
+    if unresolved_policy == CiPrelaunchUnresolvedPolicy::SealToCeiling {
+        sqlx::query(
+            "UPDATE ci_job_prelaunch_usage u
+             SET status = 'sealed_ceiling', resolved_at = statement_timestamp()
+             FROM ci_job_parent_attempt p
+             WHERE u.tenant_id = p.tenant_id AND u.region = p.region AND u.job_id = p.job_id
+               AND u.lease_epoch = p.lease_epoch AND u.claim_nonce = p.claim_nonce
+               AND u.tenant_id = $1 AND u.region = $2 AND u.job_id = $3::uuid
+               AND p.wf_run_id = $4::uuid AND p.ci_run_id = $5::uuid
+               AND p.reserve_handle = $6 AND u.status = 'started'",
+        )
+        .bind(identity.tenant_id)
+        .bind(identity.region)
+        .bind(identity.job_id)
+        .bind(identity.wf_run_id)
+        .bind(identity.ci_run_id)
+        .bind(identity.reserve_handle)
+        .execute(&mut *connection)
+        .await
+        .map_err(map_sql_error)?;
+    }
+
+    let phases = sqlx::query(
+        "SELECT u.status,
+                u.ceiling_cpu_seconds::text AS ceiling_cpu_seconds,
+                u.ceiling_mem_byte_seconds::text AS ceiling_mem_byte_seconds,
+                u.exact_cpu_seconds::text AS exact_cpu_seconds,
+                u.exact_mem_byte_seconds::text AS exact_mem_byte_seconds,
+                u.seal_after IS NOT NULL AS has_seal_deadline
+         FROM ci_job_prelaunch_usage u
+         JOIN ci_job_parent_attempt p
+           ON p.tenant_id = u.tenant_id AND p.region = u.region AND p.job_id = u.job_id
+          AND p.lease_epoch = u.lease_epoch AND p.claim_nonce = u.claim_nonce
+         WHERE u.tenant_id = $1 AND u.region = $2 AND u.job_id = $3::uuid
+           AND p.wf_run_id = $4::uuid AND p.ci_run_id = $5::uuid
+           AND p.reserve_handle = $6
+         ORDER BY p.begun_at, u.phase",
+    )
+    .bind(identity.tenant_id)
+    .bind(identity.region)
+    .bind(identity.job_id)
+    .bind(identity.wf_run_id)
+    .bind(identity.ci_run_id)
+    .bind(identity.reserve_handle)
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(map_sql_error)?;
+
+    let mut accrual = CiPrelaunchUsageAccrual {
+        parent_attempts: u64::try_from(parents.len())
+            .map_err(|_| CiPrelaunchUsageJournalError::UsageOverflow)?,
+        ..CiPrelaunchUsageAccrual::default()
+    };
+    for phase in phases {
+        let status = phase
+            .try_get::<String, _>("status")
+            .map_err(|_| CiPrelaunchUsageJournalError::Database)?;
+        let ceiling =
+            usage_from_columns(&phase, "ceiling_cpu_seconds", "ceiling_mem_byte_seconds")?
+                .ok_or(CiPrelaunchUsageJournalError::Database)?;
+        let exact = usage_from_columns(&phase, "exact_cpu_seconds", "exact_mem_byte_seconds")?;
+        let contribution = match status.as_str() {
+            "started" => {
+                let has_deadline = phase
+                    .try_get::<bool, _>("has_seal_deadline")
+                    .map_err(|_| CiPrelaunchUsageJournalError::Database)?;
+                if !has_deadline {
+                    return Err(CiPrelaunchUsageJournalError::DeadlineUnavailable);
+                }
+                return Err(CiPrelaunchUsageJournalError::UnresolvedPhase);
+            }
+            "measured" => {
+                accrual.measured_phases = accrual
+                    .measured_phases
+                    .checked_add(1)
+                    .ok_or(CiPrelaunchUsageJournalError::UsageOverflow)?;
+                exact.ok_or(CiPrelaunchUsageJournalError::Database)?
+            }
+            "sealed_ceiling" => {
+                if exact.is_some() {
+                    return Err(CiPrelaunchUsageJournalError::Database);
+                }
+                accrual.sealed_phases = accrual
+                    .sealed_phases
+                    .checked_add(1)
+                    .ok_or(CiPrelaunchUsageJournalError::UsageOverflow)?;
+                ceiling
+            }
+            _ => return Err(CiPrelaunchUsageJournalError::Database),
+        };
+        accrual.usage = checked_add_usage(accrual.usage, contribution)?;
+    }
+    Ok(accrual)
+}
+
 struct DurablePhase {
     status: String,
     ceiling: ResourceUsage,
     exact: Option<ResourceUsage>,
+    seal_window_secs: Option<u64>,
 }
 
 async fn insert_or_replay_parent_attempt(
@@ -650,29 +919,61 @@ fn parent_row_matches(
             == i64::from(policy.max_parent_attempts().get()))
 }
 
-async fn require_parent_attempt(
+async fn lock_parent_attempt_job_on_conn(
+    connection: &mut sqlx::PgConnection,
+    tenant_id: &str,
+    region: &str,
+    job_id: &str,
+) -> Result<(), CiPrelaunchUsageJournalError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "myelin.ci.parent-attempt.v1:{tenant_id}:{region}:{job_id}"
+        ))
+        .execute(&mut *connection)
+        .await
+        .map_err(map_sql_error)?;
+    Ok(())
+}
+
+/// Lock and re-verify the exact queue generation before any worker-side phase mutation. The queue
+/// row is deliberately locked before the per-job advisory lock at every entry point, establishing
+/// the canonical queue → advisory → journal order shared with settlement reconciliation.
+async fn require_live_parent_attempt_on_conn(
     connection: &mut sqlx::PgConnection,
     attempt: &CiJobParentAttempt,
 ) -> Result<(), CiPrelaunchUsageJournalError> {
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-           SELECT 1 FROM ci_job_parent_attempt
-           WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
-             AND lease_epoch = $4 AND claim_nonce = $5::uuid
-         )",
+    let live = sqlx::query_scalar::<_, String>(
+        "SELECT q.job_id::text
+         FROM ci_job_parent_attempt p
+         JOIN job_queue q
+           ON q.tenant_id = p.tenant_id AND q.region = p.region AND q.job_id = p.job_id
+          AND q.run_id = p.wf_run_id
+         WHERE p.tenant_id = $1 AND p.region = $2 AND p.job_id = $3::uuid
+           AND p.lease_epoch = $4 AND p.claim_nonce = $5::uuid
+           AND q.state IN ('leased', 'running')
+           AND q.lease_owner = p.lease_owner
+           AND q.lease_epoch = p.lease_epoch
+           AND q.claim_nonce = p.claim_nonce
+           AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint =
+               p.claim_started_at_epoch_secs
+           AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint =
+               p.claim_expires_at_epoch_secs
+           AND q.claim_expires_at > statement_timestamp()
+           AND q.completion_receipt IS NULL
+         FOR UPDATE OF q",
     )
     .bind(&attempt.tenant_id)
     .bind(&attempt.region)
     .bind(&attempt.job_id)
     .bind(attempt.lease_epoch)
     .bind(&attempt.claim_nonce)
-    .fetch_one(&mut *connection)
+    .fetch_optional(&mut *connection)
     .await
     .map_err(map_sql_error)?;
-    if exists {
+    if live.is_some() {
         Ok(())
     } else {
-        Err(CiPrelaunchUsageJournalError::ParentAttemptDivergence)
+        Err(CiPrelaunchUsageJournalError::ClaimUnavailable)
     }
 }
 
@@ -686,7 +987,8 @@ async fn load_phase(
                 ceiling_cpu_seconds::text AS ceiling_cpu_seconds,
                 ceiling_mem_byte_seconds::text AS ceiling_mem_byte_seconds,
                 exact_cpu_seconds::text AS exact_cpu_seconds,
-                exact_mem_byte_seconds::text AS exact_mem_byte_seconds
+                exact_mem_byte_seconds::text AS exact_mem_byte_seconds,
+                EXTRACT(EPOCH FROM (seal_after - started_at))::bigint::text AS seal_window_secs
          FROM ci_job_prelaunch_usage
          WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
            AND lease_epoch = $4 AND claim_nonce = $5::uuid AND phase = $6",
@@ -720,10 +1022,20 @@ async fn load_phase(
             (None, None) => None,
             _ => return Err(CiPrelaunchUsageJournalError::Database),
         };
+        let seal_window_secs = row
+            .try_get::<Option<String>, _>("seal_window_secs")
+            .map_err(|_| CiPrelaunchUsageJournalError::Database)?
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| CiPrelaunchUsageJournalError::Database)
+            })
+            .transpose()?;
         Ok(DurablePhase {
             status,
             ceiling,
             exact,
+            seal_window_secs,
         })
     })
     .transpose()
@@ -743,6 +1055,40 @@ fn parse_usage_column(
         .transpose()
 }
 
+fn usage_from_columns(
+    row: &sqlx::postgres::PgRow,
+    cpu_column: &str,
+    mem_column: &str,
+) -> Result<Option<ResourceUsage>, CiPrelaunchUsageJournalError> {
+    match (
+        parse_usage_column(row, cpu_column)?,
+        parse_usage_column(row, mem_column)?,
+    ) {
+        (Some(cpu_seconds), Some(mem_byte_seconds)) => Ok(Some(ResourceUsage {
+            cpu_seconds,
+            mem_byte_seconds,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(CiPrelaunchUsageJournalError::Database),
+    }
+}
+
+fn checked_add_usage(
+    left: ResourceUsage,
+    right: ResourceUsage,
+) -> Result<ResourceUsage, CiPrelaunchUsageJournalError> {
+    Ok(ResourceUsage {
+        cpu_seconds: left
+            .cpu_seconds
+            .checked_add(right.cpu_seconds)
+            .ok_or(CiPrelaunchUsageJournalError::UsageOverflow)?,
+        mem_byte_seconds: left
+            .mem_byte_seconds
+            .checked_add(right.mem_byte_seconds)
+            .ok_or(CiPrelaunchUsageJournalError::UsageOverflow)?,
+    })
+}
+
 fn phase_ceiling(
     authority: &CiJobRuntimeAuthorityRequest,
     phase: CiPrelaunchUsagePhase,
@@ -760,6 +1106,16 @@ fn phase_ceiling(
             .checked_mul(factor)
             .ok_or(CiPrelaunchUsageJournalError::UsageOverflow)?,
     })
+}
+
+fn phase_seal_window_secs(
+    authority: &CiJobRuntimeAuthorityRequest,
+    phase: CiPrelaunchUsagePhase,
+) -> Result<u64, CiPrelaunchUsageJournalError> {
+    u64::from(authority.limits.timeout_secs)
+        .checked_mul(phase.execution_count())
+        .and_then(|seconds| seconds.checked_add(PRELAUNCH_PHASE_DEADLINE_HEADROOM_SECS))
+        .ok_or(CiPrelaunchUsageJournalError::UsageOverflow)
 }
 
 fn map_sql_error(error: sqlx::Error) -> CiPrelaunchUsageJournalError {
@@ -847,6 +1203,23 @@ mod tests {
         assert_eq!(
             CiPrelaunchUsagePhase::CheckoutMaterialization.token(),
             "checkout_materialization"
+        );
+    }
+
+    #[test]
+    fn phase_seal_windows_cover_the_full_topology_plus_headroom() {
+        let mut authority = authority(true);
+        authority.limits.timeout_secs = 21_600;
+        assert_eq!(
+            phase_seal_window_secs(&authority, CiPrelaunchUsagePhase::CheckoutTransport).unwrap(),
+            43_800,
+            "two full six-hour transport executions plus ten minutes"
+        );
+        assert_eq!(
+            phase_seal_window_secs(&authority, CiPrelaunchUsagePhase::CheckoutMaterialization)
+                .unwrap(),
+            22_200,
+            "one full six-hour materialization execution plus ten minutes"
         );
     }
 }

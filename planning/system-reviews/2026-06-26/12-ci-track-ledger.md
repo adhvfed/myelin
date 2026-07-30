@@ -2835,3 +2835,83 @@ concurrency — worth a dedicated concurrency drill before this path carries pro
 **Still open:** 5b.3-4b (reaper/reconciliation/settlement consumers of this journal — the natural
 next slice), task #91 (credential binding), and the `v1`→`v2` fleet-convergence flip in `lib.rs`.
 5b.3-5 through 5b.3-7 and the rest of ledger 12's open items are unchanged.
+
+---
+
+## 2026-07-30 — CT-007 slice 5b.3-4b.1: topology-aware regional sealer + shared settlement resolver
+(Sol, design + implementation; Sonnet, design pushback + independent review)
+
+Before any code, Sol proposed a design (regional sealer extending `JobQueueReaper`, a shared
+`resolve_prelaunch_usage_on_conn` reader, one-shot final settlement, journal-authoritative/workload-
+only reporting contract) and flagged its own gap: the sealer's obvious deadline signal,
+`claim_expires_at_epoch_secs`, is driven by the flat `CI_RUNNER_LEASE_TTL_SECS` (`MAX_JOB_TIMEOUT_SECS
++ 600s` = ~6h10m), but one checkout-bearing parent attempt can contain four sequential full-limit
+executions (Hop A x2, Hop B x1, workload x1), each legally configurable up to `MAX_JOB_TIMEOUT_SECS`
+(6h) — so a legitimately-configured long job could need ~24h while its lease reads as expired at
+~6h10m. I independently checked the actual constants (`runner_bind.rs:145`,
+`job_spec_store.rs:75`) before accepting this as real, then required it be resolved as PART of 4b.1,
+not deferred to 5b.3-6 as Sol's design had proposed — the sealer's own correctness depends on it.
+
+**Sol's fix:** decouple the sealing deadline from the flat lease entirely. Each phase now gets a
+durable, topology-derived `seal_after` timestamp written once at `begin_phase` time:
+`timeout_secs * phase.execution_count() + 600s` headroom (transport = 2x, materialization = 1x) —
+sized from the job's own durable limits, immutable thereafter (the existing transition trigger now
+also guards `seal_after` identity). The regional sealer scans `WHERE status = 'started' AND
+seal_after IS NOT NULL AND seal_after <= statement_timestamp()` via a bounded (64-row),
+`FOR UPDATE SKIP LOCKED` materialized-CTE page — never the flat lease. NULL legacy deadlines
+(pre-migration rows) are deliberately invisible to the sealer, never guessed abandoned. New
+migrations `ci_0020c`/`ci_0020d` are purely additive (nullable expand, `NOT VALID` + `VALIDATE
+CONSTRAINT` online pattern, `CREATE INDEX CONCURRENTLY`) — migration count 48→50, confirmed no
+existing migration DDL text was modified.
+
+**What else landed:**
+- The sealer is wired into the existing `JobQueueReaper::reap_once` cadence (15s), not a second
+  background loop; prelaunch sealing, lease requeue, and cancelled-reconciliation are now attempted
+  independently within one sweep so a failure in one surface can't suppress the others.
+- `resolve_prelaunch_usage_on_conn`: the shared settlement reader. Locks the `job_queue` row first
+  (canonical queue→advisory→journal lock order), validates every durable parent-attempt row against
+  the caller's full settlement identity (tenant/region/job/wf_run/ci_run/reserve_handle) before
+  trusting any of them, sums measured-exact or sealed-ceiling usage per phase with checked arithmetic,
+  and refuses (`UnresolvedPhase`)/optionally force-seals (`SealToCeiling`, for authoritative
+  cancellation owners) any phase still `started`. v1 reservations return zero journal usage
+  unconditionally (preserves existing behavior); v2 requires >=1 parent attempt unless the caller
+  explicitly allows zero (unlaunched/skipped jobs).
+- Closed the race Sol's own design flagged: `begin_phase`/`complete_phase`/`seal_phase` now re-lock
+  and re-verify the *exact live* `job_queue` generation (state, lease identity, timestamps,
+  `completion_receipt IS NULL`) before any journal mutation — a stale `CiJobParentAttempt` handle
+  held past terminal accounting can no longer write to the journal.
+- Scheduler privilege probe extended to the two new tables, preserving the existing least-privilege
+  convention exactly: read-only SELECT plus column-scoped UPDATE on `status`/`resolved_at` only,
+  with `excess_privilege` now catching any other grant (INSERT/UPDATE-on-other-columns/DELETE/
+  TRUNCATE/REFERENCES/TRIGGER) on either table.
+
+**My independent review:** read every file in the diff (`ci_prelaunch_usage_journal.rs`,
+`migrations.rs`, `job_queue_region.rs`, `job_queue_store.rs`, `ci_scheduler_db.rs`) before accepting
+the self-report. Confirmed the migration diff is additive-only (no existing DDL constant edited —
+Sol's own note about the checksum guard catching an attempted edit mid-session was already reverted
+in the final diff). Confirmed `phase_seal_window_secs` matches Sol's stated numbers via its own unit
+test (43,800s / 22,200s at the 6h ceiling). Confirmed the concurrency drill is real, not asserted:
+the new `integration_ci_prelaunch_usage_state_machine.rs` test exercises two simultaneous
+`begin_parent_attempt` calls (exactly one applies, one replays, one durable row) and a genuine
+stale-generation drill (a requeued `job_queue` row correctly refuses a subsequent `begin_phase` via
+the new live-generation check) — this closes the concurrency gap I flagged as non-blocking in the
+prior 4a.2 entry. Re-ran the full gate myself rather than trust the report: `cargo test -p
+myelin-ci-controlplane --lib` → 535 passed; the state-machine, journal-schema, terminal-accounting,
+and operational-reservation live-Postgres suites → 9 passed, no regressions (including the
+mentioned test-only mutex fix for the terminal-accounting file's migration-setup race); `cargo
+clippy --workspace --all-targets --all-features -- -D warnings` clean; `cargo check --workspace
+--tests --all-features` clean.
+
+**Explicitly NOT settled here (correctly deferred):** the flat claim-expiry/lease-renewal topology
+mismatch is no longer a sealer-correctness problem, but it's still a real prerequisite before
+5b.3-6 can run genuinely long real-world preparation end-to-end — a job whose lease still expires at
+~6h10m will get requeued by the ordinary lease reaper long before a legitimate 24h worst-case
+checkout could finish, independent of the journal. That reconciliation (lease sizing or renewal) is
+tracked as a named prerequisite for 5b.3-6, not resolved by this slice.
+
+**Still open:** 5b.3-4b.2 (wire `resolve_prelaunch_usage_on_conn` into every terminal owner —
+`CiPipelineReporter` normal completion, `report_retryable_attempt` cancellation, `PgCiRunSupersession`
+queued/leased cancellation, `reconcile_abandoned_job`, and existing-accounting replay verification —
+and prove one-shot settlement end to end; 4b is inert until both land), task #91 (credential
+binding), the `v1`→`v2` fleet-convergence flip, and the lease/topology prerequisite for 5b.3-6 noted
+above. 5b.3-5 and 5b.3-7 and the rest of ledger 12's open items are unchanged.
