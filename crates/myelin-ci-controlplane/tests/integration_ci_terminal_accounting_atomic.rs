@@ -12,22 +12,23 @@ use myelin_ci_controlplane::{
     ci_region_queue_store_test_support, ci_region_run_discovery_test_support, ci_run_ref,
     ci_run_store_factory, ci_runner_hooks, ci_runner_identity_authorities, durable_spec_resolver,
     CiDriveManifestStore, CiDriveManifestV1, CiJobAccountingPricer, CiJobAccountingStore,
-    CiJobPricingError, CiJobRuntimeAuthorityRequest, CiManifestLaneV1, CiManifestLimitsV1,
-    CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiPipelineReporter,
-    CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert,
-    CiRunStoreError, CiRunTerminalState, DurableCiJobAccounting, DurableCiRunFinalizer,
-    DurableEnqueue, DurableLeaseAdapter, GrantedCiJobV1, JobQueueReaper, Lane,
-    ManifestBoundCiJobTokenAuthority, PgCiRunSupersession, PricedCiJobUsage,
-    CI_MANIFEST_PIPELINE_VERSION, CI_RUNNER_LEASE_TTL_SECS, LINUX_SMALL_V1_RUNNER_LABELS,
-    TIER_P_OPERATIONAL_PRICING_REVISION,
+    CiJobAccountingWriteVersion, CiJobPricingError, CiJobRuntimeAuthorityRequest,
+    CiJobTokenRequest, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
+    CiManifestTrustTierV1, CiManifestWorkspaceV1, CiPipelineReporter, CiRunFinalization,
+    CiRunFinalizationJob, CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert, CiRunStoreError,
+    CiRunTerminalState, DurableCiJobAccounting, DurableCiRunFinalizer, DurableEnqueue,
+    DurableLeaseAdapter, GrantedCiJobV1, JobQueueReaper, Lane, ManifestBoundCiJobTokenAuthority,
+    PgCiRunSupersession, PricedCiJobUsage, CI_MANIFEST_PIPELINE_VERSION, CI_RUNNER_LEASE_TTL_SECS,
+    LINUX_SMALL_V1_RUNNER_LABELS, TIER_P_OPERATIONAL_PRICING_REVISION,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     derive_checkout_authorization_scope, resolved_gvisor_rootfs, CompletionClaim,
-    CompletionSettlementOwner, CountingFirehose, ImageRef, JobKind, ResourceUsage,
-    RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome, RunnerAgent,
-    TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
+    CompletionSettlementOwner, CountingFirehose, ImageRef, JobKind, PreparationPhase,
+    PreparationTerminalDisposition, ResourceUsage, RetryableAttemptCause, RetryableAttemptFailure,
+    RetryableAttemptOutcome, RunnerAgent, TerminalReport, TerminalReporter, TrustTier,
+    WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::{IdMinter, MonotonicMinter};
@@ -317,7 +318,8 @@ async fn seed_prelaunch_usage_mix(pool: &PgPool, seed: JournalSeed<'_>) {
                 claim_nonce, EXTRACT(EPOCH FROM claim_started_at)::bigint,
                 EXTRACT(EPOCH FROM claim_expires_at)::bigint, 1, 5
          FROM job_queue
-         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid AND run_id = $4::uuid",
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid AND run_id = $4::uuid
+         ON CONFLICT DO NOTHING",
     )
     .bind(seed.tenant)
     .bind(seed.region)
@@ -387,8 +389,11 @@ async fn run_reporter_scenario(
     retry_then_supersession: bool,
     journal_prelaunch_usage: bool,
     verify_existing_via_supersession: bool,
+    preparation_scenario: Option<&'static str>,
 ) {
-    let suffix = if runner_abandoned {
+    let suffix = if let Some(preparation_scenario) = preparation_scenario {
+        preparation_scenario
+    } else if runner_abandoned {
         "cancel_abandoned"
     } else if supersession_wins_first {
         "cancel_reported"
@@ -421,7 +426,10 @@ async fn run_reporter_scenario(
     // gets cleaned up, which previously leaked the schema.
     let cleanup_bootstrap = bootstrap.clone();
     let schema_for_cleanup = schema.clone();
-    with_schema_cleanup(&cleanup_bootstrap, &schema_for_cleanup, move || async move {
+    with_schema_cleanup(
+        &cleanup_bootstrap,
+        &schema_for_cleanup,
+        move || async move {
     let pool = isolated_pool(&schema).await;
     PgMigrator::apply(&pool, &foundation_migrations())
         .await
@@ -477,7 +485,9 @@ async fn run_reporter_scenario(
     let job = "33333333-3333-8333-8333-333333333333";
     let skipped_job = "77777777-7777-8777-8777-777777777777";
     let owner = "runner-live";
-    let reserve_handle = if journal_prelaunch_usage {
+            let journal_prelaunch_usage = journal_prelaunch_usage || preparation_scenario.is_some();
+            let reserve_handle =
+                if journal_prelaunch_usage && preparation_scenario != Some("preparation_v1") {
         format!("ci-reserve:v2:{ci_run}:budget-v1:a5:batch:{job}:usage")
     } else {
         OPERATIONAL_RESERVE_HANDLE.to_owned()
@@ -516,7 +526,9 @@ async fn run_reporter_scenario(
         })
         .await
         .unwrap();
-    sqlx::query("UPDATE ci_run SET state = 'running' WHERE tenant_id = $1 AND run_id = $2::uuid")
+            sqlx::query(
+                "UPDATE ci_run SET state = 'running' WHERE tenant_id = $1 AND run_id = $2::uuid",
+            )
         .bind(&tenant.0)
         .bind(ci_run)
         .execute(&pool)
@@ -535,7 +547,10 @@ async fn run_reporter_scenario(
         production_definition.code_hash(),
     );
     drive_manifest.jobs[0].reserve_handle = reserve_handle.clone();
-    if supersession_wins_first || retry_then_supersession || verify_existing_via_supersession {
+            if supersession_wins_first
+                || retry_then_supersession
+                || verify_existing_via_supersession
+            {
         drive_manifest.jobs.truncate(1);
         drive_manifest.check_attempts.remove("package");
     }
@@ -571,7 +586,10 @@ async fn run_reporter_scenario(
     .execute(&pool)
     .await
     .unwrap();
-    if !supersession_wins_first && !retry_then_supersession && !verify_existing_via_supersession {
+            if !supersession_wins_first
+                && !retry_then_supersession
+                && !verify_existing_via_supersession
+            {
         sqlx::query(
             "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
              VALUES ($1, $2, 'reserve:skipped-live', 40, 'reserved')",
@@ -649,7 +667,10 @@ async fn run_reporter_scenario(
                 StartSpec {
                     wf_type: CI_PIPELINE_WF_TYPE.into(),
                     input: vec![
-                        ci_artifact_ref(&tenant.0, &format!("drive-manifest-{manifest_digest}")),
+                                ci_artifact_ref(
+                                    &tenant.0,
+                                    &format!("drive-manifest-{manifest_digest}"),
+                                ),
                         ci_run_ref(&tenant.0, ci_run),
                     ],
                     budget: None,
@@ -707,7 +728,7 @@ async fn run_reporter_scenario(
         .unwrap()
         .expect("the first production generation claims the queued manifest job");
     assert_eq!(first_lease.lease_epoch, 1);
-    if journal_prelaunch_usage {
+            if journal_prelaunch_usage && preparation_scenario.is_none() {
         seed_prelaunch_usage_mix(
             &pool,
             JournalSeed {
@@ -722,17 +743,14 @@ async fn run_reporter_scenario(
         )
         .await;
     }
-    let first_spec =
-        resolver(&first_lease).expect("the first production generation mints its Identity token");
+            let first_spec = resolver(&first_lease)
+                .expect("the first production generation mints its Identity token");
     let first_hooks = ci_runner_hooks(
         provider.clone(),
         identity.launch_authorizer(),
         tokio::runtime::Handle::current(),
     );
-    assert_eq!(
-        first_hooks.reserve(&first_spec).unwrap().0,
-        reserve_handle
-    );
+            assert_eq!(first_hooks.reserve(&first_spec).unwrap().0, reserve_handle);
 
     let reporter = |valid| {
         CiPipelineReporter::new_accounted(
@@ -744,12 +762,38 @@ async fn run_reporter_scenario(
                 scope.clone(),
                 manifest_store.clone(),
                 ledger.clone(),
-                myelin_ci_controlplane::CiCostEventStore::with_pg(pool.clone(), region.clone()),
+                        myelin_ci_controlplane::CiCostEventStore::with_pg(
+                            pool.clone(),
+                            region.clone(),
+                        ),
                 CiJobAccountingStore::with_pg(pool.clone(), region.clone()),
                 Arc::new(TestPricer { valid }),
             ),
         )
     };
+            let preparation_reporter = || {
+                CiPipelineReporter::new_accounted(
+                    pg_executor.clone(),
+                    ci_job_spec_store(pool.clone()),
+                    ci_job_queue_store(pool.clone()),
+                    tokio::runtime::Handle::current(),
+                    DurableCiJobAccounting::new(
+                        scope.clone(),
+                        manifest_store.clone(),
+                        ledger.clone(),
+                        myelin_ci_controlplane::CiCostEventStore::with_pg(
+                            pool.clone(),
+                            region.clone(),
+                        ),
+                        CiJobAccountingStore::with_pg_and_write_version(
+                            pool.clone(),
+                            region.clone(),
+                            CiJobAccountingWriteVersion::V4,
+                        ),
+                        Arc::new(TestPricer { valid: true }),
+                    ),
+                )
+            };
     let claim = CompletionClaim {
         tenant: tenant.clone(),
         run: RunId(wf_run.into()),
@@ -768,6 +812,655 @@ async fn run_reporter_scenario(
         },
         result_refs: Vec::new(),
     };
+            if let Some(preparation_scenario) = preparation_scenario {
+                let preparation_claim = CiJobTokenRequest {
+                    tenant_id: tenant.0.clone(),
+                    region: region.0.clone(),
+                    wf_run_id: wf_run.into(),
+                    ci_run_id: ci_run.into(),
+                    job_id: job.into(),
+                    token_authority_handle: drive_manifest.jobs[0].token_authority_handle.clone(),
+                    idem_token: idem.clone(),
+                    lease_owner: owner.into(),
+                    lease_epoch: first_lease.lease_epoch,
+                    claim_nonce: first_lease.claim_nonce.clone(),
+                    claim_started_at_epoch_secs: first_lease.claim_started_at_epoch_secs,
+                    claim_expires_at_epoch_secs: first_lease.claim_expires_at_epoch_secs,
+                };
+                assert!(
+                    reporter(true)
+                        .report_preparation_terminal(
+                            &preparation_claim,
+                            PreparationTerminalDisposition::Failed {
+                                phase: PreparationPhase::CheckoutTransport,
+                            },
+                        )
+                        .is_err(),
+                    "the production-v3 accounting gate refuses preparation writes"
+                );
+                assert!(
+                    preparation_reporter()
+                        .report_preparation_terminal(
+                            &preparation_claim,
+                            PreparationTerminalDisposition::Failed {
+                                phase: PreparationPhase::CheckoutTransport,
+                            },
+                        )
+                        .is_err(),
+                    "no parent attempt can authorize preparation completion"
+                );
+                seed_prelaunch_usage_mix(
+                    &pool,
+                    JournalSeed {
+                        tenant: &tenant.0,
+                        region: &region.0,
+                        job_id: job,
+                        wf_run_id: wf_run,
+                        ci_run_id: ci_run,
+                        reserve_handle: &reserve_handle,
+                        include_phases: false,
+                    },
+                )
+                .await;
+                let refusal_disposition = PreparationTerminalDisposition::Failed {
+                    phase: PreparationPhase::CheckoutTransport,
+                };
+                assert!(preparation_reporter()
+                    .report_preparation_terminal(
+                        &preparation_claim,
+                        PreparationTerminalDisposition::Failed {
+                            phase: PreparationPhase::CheckoutTransport,
+                        },
+                    )
+                    .is_err());
+                sqlx::query(
+                    "INSERT INTO ci_job_prelaunch_usage (
+               tenant_id, region, job_id, lease_epoch, claim_nonce, phase, status,
+               ceiling_cpu_seconds, ceiling_mem_byte_seconds, started_at, seal_after
+             )
+             SELECT tenant_id, region, job_id, lease_epoch, claim_nonce,
+                    'checkout_transport', 'started', 120, 120000000000,
+                    statement_timestamp(), statement_timestamp() + interval '1 hour'
+             FROM job_queue WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+                )
+                .bind(&tenant.0)
+                .bind(&region.0)
+                .bind(job)
+                .execute(&pool)
+                .await
+                .unwrap();
+                assert!(preparation_reporter()
+                    .report_preparation_terminal(
+                        &preparation_claim,
+                        PreparationTerminalDisposition::Failed {
+                            phase: PreparationPhase::CheckoutTransport,
+                        },
+                    )
+                    .is_err());
+                sqlx::query(
+                    "UPDATE ci_job_prelaunch_usage
+             SET status = 'measured', exact_cpu_seconds = 3,
+                 exact_mem_byte_seconds = $4::numeric, resolved_at = statement_timestamp()
+             WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+               AND phase = 'checkout_transport'",
+                )
+                .bind(&tenant.0)
+                .bind(&region.0)
+                .bind(job)
+                .bind(if preparation_scenario == "preparation_overflow" {
+                    (i64::MAX as u64 + 1).to_string()
+                } else {
+                    (2 * 1_073_741_824_u64).to_string()
+                })
+                .execute(&pool)
+                .await
+                .unwrap();
+                assert!(preparation_reporter()
+                    .report_preparation_terminal(
+                        &preparation_claim,
+                        PreparationTerminalDisposition::Failed {
+                            phase: PreparationPhase::CheckoutMaterialization,
+                        },
+                    )
+                    .is_err());
+                assert!(preparation_reporter()
+                    .report_preparation_terminal(
+                        &preparation_claim,
+                        PreparationTerminalDisposition::AttemptsExhausted,
+                    )
+                    .is_err());
+                sqlx::query(
+                    "INSERT INTO ci_job_prelaunch_usage (
+               tenant_id, region, job_id, lease_epoch, claim_nonce, phase, status,
+               ceiling_cpu_seconds, ceiling_mem_byte_seconds, started_at, resolved_at, seal_after
+             )
+             SELECT tenant_id, region, job_id, lease_epoch, claim_nonce,
+                    'checkout_materialization', 'sealed_ceiling', 5, $4::numeric,
+                    statement_timestamp(), statement_timestamp(),
+                    statement_timestamp() + interval '1 hour'
+             FROM job_queue WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+                )
+                .bind(&tenant.0)
+                .bind(&region.0)
+                .bind(job)
+                .bind((3 * 1_073_741_824_u64).to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+
+                if preparation_scenario == "preparation_v1" {
+                    assert!(
+                        preparation_reporter()
+                            .report_preparation_terminal(&preparation_claim, refusal_disposition)
+                            .is_err(),
+                        "legacy v1 reservations cannot enter capped preparation completion"
+                    );
+                    assert_eq!(counts(&pool, job, wf_run).await, (0, 0, 0, "leased".into()));
+                    drop(pool);
+                    bootstrap
+                        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                        .await
+                        .unwrap();
+                    return;
+                }
+
+                if preparation_scenario == "preparation_overflow" {
+                    let error = preparation_reporter()
+                        .report_preparation_terminal(&preparation_claim, refusal_disposition)
+                        .expect_err("usage outside the accounting bigint range must refuse");
+                    assert!(error.to_string().contains("usage"));
+                    assert_eq!(counts(&pool, job, wf_run).await, (0, 0, 0, "leased".into()));
+                    drop(pool);
+                    bootstrap
+                        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                        .await
+                        .unwrap();
+                    return;
+                }
+
+                let mut divergent_claims = Vec::new();
+                let mut divergent = preparation_claim.clone();
+                divergent.tenant_id = "different-tenant".into();
+                divergent_claims.push(divergent);
+                let mut divergent = preparation_claim.clone();
+                divergent.region = "different-region".into();
+                divergent_claims.push(divergent);
+                let mut divergent = preparation_claim.clone();
+                divergent.wf_run_id = "aaaaaaaa-1111-4111-8111-111111111111".into();
+                divergent_claims.push(divergent);
+                let mut divergent = preparation_claim.clone();
+                divergent.ci_run_id = "aaaaaaaa-2222-4222-8222-222222222222".into();
+                divergent_claims.push(divergent);
+                let mut divergent = preparation_claim.clone();
+                divergent.idem_token.push_str("-different");
+                divergent_claims.push(divergent);
+                let mut divergent = preparation_claim.clone();
+                divergent.token_authority_handle.push_str("-different");
+                divergent_claims.push(divergent);
+                let mut divergent = preparation_claim.clone();
+                divergent.lease_owner.push_str("-different");
+                divergent_claims.push(divergent);
+                let mut divergent = preparation_claim.clone();
+                divergent.lease_epoch += 1;
+                divergent_claims.push(divergent);
+                let mut divergent = preparation_claim.clone();
+                divergent.claim_nonce = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into();
+                divergent_claims.push(divergent);
+                let mut divergent = preparation_claim.clone();
+                divergent.claim_started_at_epoch_secs += 1;
+                divergent_claims.push(divergent);
+                let mut divergent = preparation_claim.clone();
+                divergent.claim_expires_at_epoch_secs += 1;
+                divergent_claims.push(divergent);
+                for divergent in divergent_claims {
+                    assert!(
+                        preparation_reporter()
+                            .report_preparation_terminal(&divergent, refusal_disposition)
+                            .is_err(),
+                        "every exact-generation identity divergence is refused"
+                    );
+                }
+                let original_spec: serde_json::Value =
+                    sqlx::query_scalar("SELECT spec FROM ci_job_spec WHERE job_id = $1::uuid")
+                        .bind(job)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                sqlx::query(
+                    "UPDATE ci_job_spec
+             SET spec = jsonb_set(spec, '{spec,meter_to,reserve_id}', '\"different-reserve\"')
+             WHERE job_id = $1::uuid",
+                )
+                .bind(job)
+                .execute(&pool)
+                .await
+                .unwrap();
+                assert!(
+                    preparation_reporter()
+                        .report_preparation_terminal(&preparation_claim, refusal_disposition)
+                        .is_err(),
+                    "a dispatched meter target diverging from the manifest/parent is refused"
+                );
+                sqlx::query("UPDATE ci_job_spec SET spec = $2 WHERE job_id = $1::uuid")
+                    .bind(job)
+                    .bind(original_spec.clone())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "UPDATE ci_job_spec
+             SET spec = jsonb_set(
+                 jsonb_set(spec, '{spec,workspace,repo_ref}', 'null'),
+                 '{spec,workspace,commit}', 'null'
+             )
+             WHERE job_id = $1::uuid",
+                )
+                .bind(job)
+                .execute(&pool)
+                .await
+                .unwrap();
+                assert!(
+                    preparation_reporter()
+                        .report_preparation_terminal(&preparation_claim, refusal_disposition)
+                        .is_err(),
+                    "a compute-only durable job cannot claim a preparation disposition"
+                );
+                sqlx::query("UPDATE ci_job_spec SET spec = $2 WHERE job_id = $1::uuid")
+                    .bind(job)
+                    .bind(original_spec)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+
+                if preparation_scenario == "preparation_launch_first" {
+                    first_hooks
+                        .acquire_launch_permit(&first_spec)
+                        .unwrap()
+                        .commit_and_release()
+                        .unwrap();
+                    assert!(preparation_reporter()
+                        .report_preparation_terminal(&preparation_claim, refusal_disposition)
+                        .is_err());
+                    assert_eq!(
+                        reporter(true).report_done(&claim, &report).unwrap(),
+                        SignalOutcome::Buffered,
+                        "after launch wins, only the ordinary running completion can terminalize"
+                    );
+                    drop(pool);
+                    bootstrap
+                        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                        .await
+                        .unwrap();
+                    return;
+                }
+
+                if preparation_scenario == "preparation_exhausted" {
+                    for epoch in 2_i64..=5 {
+                        let nonce = format!("bbbbbbbb-bbbb-4bbb-8bbb-{epoch:012}");
+                        sqlx::query(
+                            "INSERT INTO ci_job_parent_attempt (
+                       tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle,
+                       lease_owner, lease_epoch, claim_nonce, claim_started_at_epoch_secs,
+                       claim_expires_at_epoch_secs, budget_revision, max_parent_attempts
+                     ) VALUES (
+                       $1, $2, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8, $9::uuid,
+                       $10, $11, 1, 5
+                     )",
+                        )
+                        .bind(&tenant.0)
+                        .bind(&region.0)
+                        .bind(job)
+                        .bind(wf_run)
+                        .bind(ci_run)
+                        .bind(&reserve_handle)
+                        .bind(format!("prior-runner-{epoch}"))
+                        .bind(epoch)
+                        .bind(nonce)
+                        .bind(preparation_claim.claim_started_at_epoch_secs - epoch)
+                        .bind(preparation_claim.claim_expires_at_epoch_secs - epoch)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    }
+                    sqlx::query(
+                        "UPDATE job_queue q
+                 SET lease_owner = p.lease_owner, lease_epoch = p.lease_epoch,
+                     claim_nonce = p.claim_nonce,
+                     claim_started_at = to_timestamp(p.claim_started_at_epoch_secs),
+                     claim_expires_at = to_timestamp(p.claim_expires_at_epoch_secs),
+                     lease_expires = to_timestamp(p.claim_expires_at_epoch_secs)
+                 FROM ci_job_parent_attempt p
+                 WHERE q.tenant_id = p.tenant_id AND q.region = p.region
+                   AND q.job_id = p.job_id AND p.lease_epoch = 5
+                   AND q.job_id = $1::uuid",
+                    )
+                    .bind(job)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    let exhausted_claim = sqlx::query(
+                        "SELECT lease_owner, lease_epoch, claim_nonce::text AS claim_nonce,
+                        EXTRACT(EPOCH FROM claim_started_at)::bigint AS claim_started,
+                        EXTRACT(EPOCH FROM claim_expires_at)::bigint AS claim_expires
+                 FROM job_queue WHERE job_id = $1::uuid",
+                    )
+                    .bind(job)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    let mut exhausted_claim_request = preparation_claim.clone();
+                    exhausted_claim_request.lease_owner = exhausted_claim.get("lease_owner");
+                    exhausted_claim_request.lease_epoch = exhausted_claim.get("lease_epoch");
+                    exhausted_claim_request.claim_nonce = exhausted_claim.get("claim_nonce");
+                    exhausted_claim_request.claim_started_at_epoch_secs =
+                        exhausted_claim.get("claim_started");
+                    exhausted_claim_request.claim_expires_at_epoch_secs =
+                        exhausted_claim.get("claim_expires");
+                    assert_eq!(
+                        preparation_reporter()
+                            .report_preparation_terminal(
+                                &exhausted_claim_request,
+                                PreparationTerminalDisposition::AttemptsExhausted,
+                            )
+                            .unwrap(),
+                        SignalOutcome::Buffered
+                    );
+                    let disposition: String = sqlx::query_scalar(
+                "SELECT terminal_disposition FROM ci_job_accounting WHERE job_id = $1::uuid",
+            )
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+                    assert_eq!(disposition, "preparation_attempts_exhausted");
+                    drop(pool);
+                    bootstrap
+                        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                        .await
+                        .unwrap();
+                    return;
+                }
+
+                if preparation_scenario == "preparation_duplicate" {
+                    let barrier = Arc::new(std::sync::Barrier::new(3));
+                    let mut tasks = Vec::new();
+                    for _ in 0..2 {
+                        let barrier = barrier.clone();
+                        let reporter = preparation_reporter();
+                        let claim = preparation_claim.clone();
+                        tasks.push(tokio::task::spawn_blocking(move || {
+                            barrier.wait();
+                            reporter.report_preparation_terminal(&claim, refusal_disposition)
+                        }));
+                    }
+                    barrier.wait();
+                    let left = tasks.remove(0).await.unwrap().unwrap();
+                    let right = tasks.remove(0).await.unwrap().unwrap();
+                    assert!(
+                        matches!(
+                            (left, right),
+                            (SignalOutcome::Buffered, SignalOutcome::Duplicate)
+                                | (SignalOutcome::Duplicate, SignalOutcome::Buffered)
+                        ),
+                        "concurrent identical deliveries produce one signal and one exact replay"
+                    );
+                    assert_eq!(
+                        counts(&pool, job, wf_run).await,
+                        (1, 2, 1, "terminal".into())
+                    );
+                    drop(pool);
+                    bootstrap
+                        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                        .await
+                        .unwrap();
+                    return;
+                }
+
+                if preparation_scenario == "preparation_cancel_race" {
+                    sqlx::query(
+                        "UPDATE workflow_run
+                 SET state = 'terminated', cancel_reason = 'preparation-race'
+                 WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+                    )
+                    .bind(&tenant.0)
+                    .bind(&region.0)
+                    .bind(wf_run)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    sqlx::query(
+                        "UPDATE ci_run
+                 SET state = 'cancelled', finished_at = statement_timestamp()
+                 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid",
+                    )
+                    .bind(&tenant.0)
+                    .bind(&region.0)
+                    .bind(ci_run)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    let supersession = PgCiRunSupersession::new(
+                        pool.clone(),
+                        ledger.clone(),
+                        tenant.clone(),
+                        region.clone(),
+                        tokio::runtime::Handle::current(),
+                    )
+                    .unwrap();
+                    let barrier = Arc::new(std::sync::Barrier::new(3));
+                    let cancellation_barrier = barrier.clone();
+                    let cancellation = tokio::spawn(async move {
+                        cancellation_barrier.wait();
+                        supersession.cancel_running_for_test(ci_run, wf_run).await
+                    });
+                    let completion_barrier = barrier.clone();
+                    let completion_reporter = preparation_reporter();
+                    let completion_claim = preparation_claim.clone();
+                    let completion = tokio::task::spawn_blocking(move || {
+                        completion_barrier.wait();
+                        completion_reporter
+                            .report_preparation_terminal(&completion_claim, refusal_disposition)
+                    });
+                    barrier.wait();
+                    let cancellation_won = cancellation.await.unwrap().is_ok();
+                    let preparation_won = completion.await.unwrap().is_ok();
+                    assert_ne!(
+                        cancellation_won, preparation_won,
+                        "cancellation and preparation completion admit one terminal owner"
+                    );
+                    let shape = counts(&pool, job, wf_run).await;
+                    assert_eq!((shape.0, shape.1, shape.3.as_str()), (1, 2, "terminal"));
+                    drop(pool);
+                    bootstrap
+                        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                        .await
+                        .unwrap();
+                    return;
+                }
+
+                if preparation_scenario == "preparation_rollback" {
+                    sqlx::raw_sql(
+                        "CREATE FUNCTION fail_preparation_accounting_receipt() RETURNS trigger
+                   LANGUAGE plpgsql AS $$
+                   BEGIN
+                     RAISE EXCEPTION 'injected preparation receipt failure';
+                   END $$;
+                 CREATE TRIGGER fail_preparation_accounting_receipt
+                   BEFORE INSERT ON ci_job_accounting
+                   FOR EACH ROW EXECUTE FUNCTION fail_preparation_accounting_receipt();",
+                    )
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    assert!(preparation_reporter()
+                        .report_preparation_terminal(
+                            &preparation_claim,
+                            PreparationTerminalDisposition::Failed {
+                                phase: PreparationPhase::CheckoutTransport,
+                            },
+                        )
+                        .is_err());
+                    assert_eq!(
+                        counts(&pool, job, wf_run).await,
+                        (0, 0, 0, "leased".into()),
+                        "a post-CAS receipt failure rolls every preparation effect back"
+                    );
+                    let reservation: (String, i64) = sqlx::query_as(
+                        "SELECT state, (SELECT count(*) FROM cost_event WHERE run_id = $1)
+                 FROM cost_reservation WHERE run_id = $1",
+                    )
+                    .bind(&reserve_handle)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(reservation, ("inflight".into(), 0));
+                    drop(pool);
+                    bootstrap
+                        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                        .await
+                        .unwrap();
+                    return;
+                }
+
+                if preparation_scenario == "preparation_race" {
+                    let barrier = Arc::new(std::sync::Barrier::new(3));
+                    let launch_barrier = barrier.clone();
+                    let report_barrier = barrier.clone();
+                    let launch = tokio::task::spawn_blocking(move || {
+                        launch_barrier.wait();
+                        first_hooks
+                            .acquire_launch_permit(&first_spec)
+                            .and_then(|permit| {
+                                permit.commit_and_release().map_err(|error| {
+                                    myelin_ci_sandbox::HookError(format!("{error:?}"))
+                                })
+                            })
+                    });
+                    let racing_reporter = preparation_reporter();
+                    let racing_claim = preparation_claim.clone();
+                    let completion = tokio::task::spawn_blocking(move || {
+                        report_barrier.wait();
+                        racing_reporter.report_preparation_terminal(
+                            &racing_claim,
+                            PreparationTerminalDisposition::Failed {
+                                phase: PreparationPhase::CheckoutTransport,
+                            },
+                        )
+                    });
+                    barrier.wait();
+                    let launch_won = launch.await.unwrap().is_ok();
+                    let preparation_won = completion.await.unwrap().is_ok();
+                    assert_ne!(
+                        launch_won, preparation_won,
+                        "real concurrent PostgreSQL updates admit exactly one owner"
+                    );
+                    let state: String =
+                        sqlx::query_scalar("SELECT state FROM job_queue WHERE job_id = $1::uuid")
+                            .bind(job)
+                            .fetch_one(&pool)
+                            .await
+                            .unwrap();
+                    assert_eq!(state, if launch_won { "running" } else { "terminal" });
+                    let accounting_count: i64 =
+                        sqlx::query_scalar("SELECT count(*) FROM ci_job_accounting")
+                            .fetch_one(&pool)
+                            .await
+                            .unwrap();
+                    assert_eq!(accounting_count, i64::from(preparation_won));
+                    drop(pool);
+                    bootstrap
+                        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                        .await
+                        .unwrap();
+                    return;
+                }
+
+                let exact = preparation_reporter()
+                    .report_preparation_terminal(
+                        &preparation_claim,
+                        PreparationTerminalDisposition::Failed {
+                            phase: PreparationPhase::CheckoutTransport,
+                        },
+                    )
+                    .expect("the exact leased preparation generation terminalizes");
+                assert_eq!(exact, SignalOutcome::Buffered);
+                assert_eq!(
+                    preparation_reporter()
+                        .report_preparation_terminal(
+                            &preparation_claim,
+                            PreparationTerminalDisposition::Failed {
+                                phase: PreparationPhase::CheckoutTransport,
+                            },
+                        )
+                        .unwrap(),
+                    SignalOutcome::Duplicate
+                );
+        assert!(preparation_reporter()
+            .report_preparation_terminal(
+                &preparation_claim,
+                PreparationTerminalDisposition::TimedOut {
+                    phase: PreparationPhase::CheckoutTransport,
+                },
+            )
+            .is_err());
+        assert!(preparation_reporter()
+            .report_preparation_terminal(
+                &preparation_claim,
+                PreparationTerminalDisposition::Failed {
+                    phase: PreparationPhase::CheckoutMaterialization,
+                },
+            )
+            .is_err());
+                assert!(first_hooks.acquire_launch_permit(&first_spec).is_err());
+                assert!(reporter(true).report_done(&claim, &report).is_err());
+                assert_eq!(
+                    counts(&pool, job, wf_run).await,
+                    (1, 2, 1, "terminal".into())
+                );
+                let accounting: (i64, i64, bool, bool, String, i64) = sqlx::query_as(
+                    "SELECT cpu_seconds, mem_byte_seconds, passed, timed_out, terminal_disposition,
+                    (SELECT count(*) FROM cost_event WHERE run_id = $2)
+             FROM ci_job_accounting WHERE job_id = $1::uuid",
+                )
+                .bind(job)
+                .bind(&reserve_handle)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(
+                    accounting,
+                    (
+                        i64::try_from(JOURNALED_PRELAUNCH_USAGE.cpu_seconds).unwrap(),
+                        i64::try_from(JOURNALED_PRELAUNCH_USAGE.mem_byte_seconds).unwrap(),
+                        false,
+                        false,
+                        "checkout_transport_failed".into(),
+                        2,
+                    ),
+                    "prelaunch usage is priced exactly once with zero workload usage"
+                );
+                let summary: serde_json::Value =
+                    sqlx::query_scalar("SELECT result_summary FROM ci_job WHERE job_id = $1::uuid")
+                        .bind(job)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    summary,
+                    serde_json::json!({
+                        "passed": false,
+                        "timed_out": false,
+                        "disposition": "checkout_transport_failed",
+                        "workload_started": false,
+                    })
+                );
+                drop(pool);
+                bootstrap
+                    .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                    .await
+                    .unwrap();
+                return;
+            }
     assert!(
         reporter(true).report_done(&claim, &report).is_err(),
         "a merely leased generation cannot report work that never crossed the launch CAS"
@@ -941,10 +1634,9 @@ async fn run_reporter_scenario(
                 std::time::Duration::from_secs(1),
             )
             .with_cancelled_accounting(pool.clone(), ledger.clone());
-            let recovery_error = reaper
-                .reap_once()
-                .await
-                .expect_err("the poison candidate is surfaced after the healthy candidate runs");
+                    let recovery_error = reaper.reap_once().await.expect_err(
+                        "the poison candidate is surfaced after the healthy candidate runs",
+                    );
             let rendered = recovery_error.to_string();
             assert!(
                 rendered.contains("1 cancelled recovery candidate(s) failed")
@@ -1032,7 +1724,8 @@ async fn run_reporter_scenario(
         .unwrap();
         let usage = ResourceUsage {
             cpu_seconds: retryable.usage.cpu_seconds + journal_usage.cpu_seconds,
-            mem_byte_seconds: retryable.usage.mem_byte_seconds + journal_usage.mem_byte_seconds,
+                    mem_byte_seconds: retryable.usage.mem_byte_seconds
+                        + journal_usage.mem_byte_seconds,
         };
         let (billed, refunded) = expected_operational_settlement(usage);
         assert_eq!(
@@ -1152,7 +1845,8 @@ async fn run_reporter_scenario(
         .unwrap();
         let usage = ResourceUsage {
             cpu_seconds: retryable.usage.cpu_seconds + journal_usage.cpu_seconds,
-            mem_byte_seconds: retryable.usage.mem_byte_seconds + journal_usage.mem_byte_seconds,
+                    mem_byte_seconds: retryable.usage.mem_byte_seconds
+                        + journal_usage.mem_byte_seconds,
         };
         let (billed, refunded) = expected_operational_settlement(usage);
         assert_eq!(
@@ -1217,7 +1911,8 @@ async fn run_reporter_scenario(
         )
         .await;
     }
-    let second_spec = resolver(&second_lease).expect("the retry generation mints fresh authority");
+            let second_spec =
+                resolver(&second_lease).expect("the retry generation mints fresh authority");
     let second_hooks = ci_runner_hooks(
         provider.clone(),
         identity.launch_authorizer(),
@@ -1542,18 +2237,22 @@ async fn run_reporter_scenario(
     let accounted_memory = accounting.get::<i64, _>("mem_byte_seconds");
     assert_eq!(
         accounted_cpu,
-        i64::try_from(recovered.report.usage.cpu_seconds + retryable.usage.cpu_seconds).unwrap()
+                i64::try_from(recovered.report.usage.cpu_seconds + retryable.usage.cpu_seconds)
+                    .unwrap()
     );
     assert_eq!(
         accounted_memory,
-        i64::try_from(recovered.report.usage.mem_byte_seconds + retryable.usage.mem_byte_seconds)
+                i64::try_from(
+                    recovered.report.usage.mem_byte_seconds + retryable.usage.mem_byte_seconds
+                )
             .unwrap()
     );
     assert_eq!(
         accounting.get::<String, _>("pricing_revision"),
         TIER_P_OPERATIONAL_PRICING_REVISION
     );
-    let expected_billed = accounted_cpu + (accounted_memory + 1_073_741_823) / 1_073_741_824;
+            let expected_billed =
+                accounted_cpu + (accounted_memory + 1_073_741_823) / 1_073_741_824;
     assert_eq!(
         accounting.get::<i64, _>("billed_minor_units"),
         expected_billed
@@ -1676,7 +2375,8 @@ async fn run_reporter_scenario(
     assert_eq!(replay.write, CiRunFinalizationWrite::ExactReplay);
     let mut divergent_finalization = finalization.clone();
     divergent_finalization.completed_at = "2026-07-21T13:00:01Z".into();
-    let acknowledgement_loss_replay = durable_finalizer.finalize(&divergent_finalization).unwrap();
+            let acknowledgement_loss_replay =
+                durable_finalizer.finalize(&divergent_finalization).unwrap();
     assert_eq!(
         acknowledgement_loss_replay.write,
         CiRunFinalizationWrite::ExactReplay
@@ -1715,47 +2415,158 @@ async fn run_reporter_scenario(
         .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
         .await
         .unwrap();
-    })
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retry_and_supersession_are_safe_in_both_commit_orders() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    run_reporter_scenario(false, false, false, false, false).await;
-    run_reporter_scenario(false, false, true, false, false).await;
-    run_reporter_scenario(true, false, false, false, false).await;
-    run_reporter_scenario(true, true, false, false, false).await;
+    run_reporter_scenario(false, false, false, false, false, None).await;
+    run_reporter_scenario(false, false, true, false, false, None).await;
+    run_reporter_scenario(true, false, false, false, false, None).await;
+    run_reporter_scenario(true, true, false, false, false, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn normal_completion_and_existing_accounting_replay_include_prelaunch_usage_once() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    run_reporter_scenario(false, false, false, true, false).await;
+    run_reporter_scenario(false, false, false, true, false, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancellation_terminal_retry_includes_prelaunch_usage_once() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    run_reporter_scenario(true, false, false, true, false).await;
+    run_reporter_scenario(true, false, false, true, false, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn queued_supersession_includes_prelaunch_usage_once() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    run_reporter_scenario(false, false, true, true, false).await;
+    run_reporter_scenario(false, false, true, true, false, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn abandoned_launched_reconciliation_includes_prelaunch_usage_once() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    run_reporter_scenario(true, true, false, true, false).await;
+    run_reporter_scenario(true, true, false, true, false, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn existing_accounting_replay_verifies_prelaunch_usage_without_resettling() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    run_reporter_scenario(false, false, false, true, true).await;
+    run_reporter_scenario(false, false, false, true, true, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preparation_terminal_is_exact_replay_safe_and_one_shot_accounted() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(
+        false,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_terminal"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preparation_terminal_and_launch_cas_race_with_exactly_one_winner() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(false, false, false, true, false, Some("preparation_race")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preparation_post_cas_failure_rolls_back_every_durable_effect() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(
+        false,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_rollback"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workload_launch_winning_first_excludes_preparation_completion() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(
+        false,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_launch_first"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_identical_preparation_reports_settle_once() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(
+        false,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_duplicate"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attempts_exhausted_requires_and_accepts_the_exact_durable_cap() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(
+        false,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_exhausted"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preparation_usage_outside_accounting_range_refuses_and_rolls_back() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(
+        false,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_overflow"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preparation_completion_refuses_legacy_v1_reservations() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(false, false, false, false, false, Some("preparation_v1")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_and_preparation_completion_race_with_one_settlement_owner() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(
+        true,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_cancel_race"),
+    )
+    .await;
 }
 
 /// CT-007 slice 5b.3-4a.1b: `settle_cancelled_job` must recognize a `ci-reserve:v2:...` handle
@@ -1784,7 +2595,10 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
         .unwrap();
     let cleanup_bootstrap = bootstrap.clone();
     let schema_for_cleanup = schema.clone();
-    with_schema_cleanup(&cleanup_bootstrap, &schema_for_cleanup, move || async move {
+    with_schema_cleanup(
+        &cleanup_bootstrap,
+        &schema_for_cleanup,
+        move || async move {
         let pool = isolated_pool(&schema).await;
         PgMigrator::apply(&pool, &foundation_migrations())
             .await
@@ -1846,7 +2660,9 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
             })
             .await
             .unwrap();
-        sqlx::query("UPDATE ci_run SET state = 'running' WHERE tenant_id = $1 AND run_id = $2::uuid")
+            sqlx::query(
+                "UPDATE ci_run SET state = 'running' WHERE tenant_id = $1 AND run_id = $2::uuid",
+            )
             .bind(&tenant.0)
             .bind(ci_run)
             .execute(&pool)
@@ -1949,6 +2765,7 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
             .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
             .await
             .unwrap();
-    })
+        },
+    )
     .await;
 }

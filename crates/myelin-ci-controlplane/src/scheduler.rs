@@ -359,6 +359,55 @@ WHERE tenant_id = $1
   AND completion_receipt IS NULL
 RETURNING job_id";
 
+/// **Preparation-only completion CAS (CT-007 slice 5b.3-5b).** This is deliberately separate from
+/// [`CONSUME_CLAIM_QUERY`]: a checkout failure may terminalize only the exact still-`leased`
+/// generation whose immutable parent-attempt row exists. The ordinary workload completion remains
+/// `running`-only. The launch CAS and this CAS both require the same `leased` row, so PostgreSQL's
+/// row-level UPDATE serialization makes them mutually exclusive. Bind: `$1 tenant`, `$2 region`,
+/// `$3 job`, `$4 workflow run`, `$5 idem token`, `$6 owner`, `$7 epoch`, `$8 nonce`, `$9 stage`,
+/// `$10 claim start`, `$11 claim expiry`, `$12 CI run`, `$13 reserve handle`, `$14 v4 receipt`.
+pub const CONSUME_PREPARATION_CLAIM_QUERY: &str = "\
+UPDATE job_queue AS q
+SET state = 'terminal', completion_receipt = $14, lease_owner = NULL, lease_expires = NULL
+WHERE q.tenant_id = $1
+  AND q.region = $2
+  AND q.job_id = $3::uuid
+  AND q.run_id = $4::uuid
+  AND q.idem_token = $5
+  AND q.lease_owner = $6
+  AND q.lease_epoch = $7
+  AND q.claim_nonce = $8::uuid
+  AND q.stage = $9
+  AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $10
+  AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $11
+  AND q.claim_expires_at > statement_timestamp()
+  AND q.state = 'leased'
+  AND q.completion_receipt IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM ci_job_parent_attempt AS parent
+    WHERE parent.tenant_id = q.tenant_id
+      AND parent.region = q.region
+      AND parent.job_id = q.job_id
+      AND parent.wf_run_id = q.run_id
+      AND parent.ci_run_id = $12::uuid
+      AND parent.reserve_handle = $13
+      AND parent.lease_owner = $6
+      AND parent.lease_epoch = q.lease_epoch
+      AND parent.claim_nonce = q.claim_nonce
+      AND parent.claim_started_at_epoch_secs = $10
+      AND parent.claim_expires_at_epoch_secs = $11
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM ci_job AS surface
+    WHERE surface.tenant_id = q.tenant_id
+      AND surface.region = q.region
+      AND surface.job_id = q.job_id
+      AND surface.state IN ('queued', 'leased')
+  )
+RETURNING q.job_id";
+
 /// **Read a job's terminal disposition for the completion CAS's 0-row branch.** When
 /// [`CONSUME_CLAIM_QUERY`] consumes nothing, this distinguishes an IDEMPOTENT redelivery (the row is
 /// already `terminal` with the SAME `completion_receipt`) from a fail-closed REFUSAL (missing row,

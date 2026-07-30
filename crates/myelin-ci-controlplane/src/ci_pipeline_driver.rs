@@ -52,9 +52,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use myelin_ci_sandbox::{
-    CompletionClaim, CompletionSettlementOwner, IdemToken, JobSpec as SandboxJobSpec,
-    ResourceUsage, RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome,
-    TerminalReport, TerminalReporter,
+    derive_checkout_authorization_scope, CompletionClaim, CompletionSettlementOwner, IdemToken,
+    JobKind, JobSpec as SandboxJobSpec, PreparationTerminalDisposition, ResourceUsage,
+    RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome, TerminalReport,
+    TerminalReporter,
 };
 #[cfg(any(test, feature = "test-support"))]
 use myelin_ci_sandbox::{
@@ -87,6 +88,7 @@ use myelin_flow::{
 };
 
 use crate::ci_drive_manifest::CiDriveManifestStore;
+use crate::ci_manifest_job_runner::CiJobTokenRequest;
 use crate::ci_pipeline::PipelineStage;
 #[cfg(any(test, feature = "test-support"))]
 use crate::ci_pipeline::{run_ci_pipeline_body, PipelineRun, RunVerdict};
@@ -106,6 +108,7 @@ use crate::job_accounting_store::{
 use crate::job_queue_store::{trust_from_token, JobQueueStoreError};
 use crate::job_queue_store::{
     CiJobQueueStore, ClaimConsumeOutcome, ClaimConsumeSpec, DurableEnqueue,
+    PreparationClaimConsumeSpec,
 };
 use crate::job_spec_store::{
     CiJobSpecStore, CiJobSpecStoreError, ClaimedDispatchIdentity, DurableCiJobLaunchTemplate,
@@ -472,6 +475,64 @@ fn completion_receipts_v4(
     disposition: CiJobTerminalDisposition,
 ) -> CompletionReceipts {
     let legacy_v3 = completion_receipt(input);
+    CompletionReceipts {
+        current_v4: disposition_receipt_v4(&legacy_v3, disposition),
+        legacy_v3,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreparationCompletionReceiptInput<'a> {
+    tenant: &'a TenantId,
+    region: &'a str,
+    wf_run_id: &'a str,
+    ci_run_id: &'a str,
+    job_id: &'a str,
+    idem_token: &'a str,
+    stage: &'a str,
+    reserve_handle: &'a str,
+    usage: ResourceUsage,
+    lease_owner: &'a str,
+    lease_epoch: i64,
+    claim_nonce: &'a str,
+    claim_started_at_epoch_secs: i64,
+    claim_expires_at_epoch_secs: i64,
+}
+
+/// Preparation completion has its own byte domain and cannot accept caller verdict/payload fields.
+/// The v3 twin exists only for the byte-frozen accounting compatibility column; the queue CAS
+/// always writes and replays the disposition-bound v4 receipt.
+fn preparation_completion_receipts(
+    input: PreparationCompletionReceiptInput<'_>,
+    disposition: PreparationTerminalDisposition,
+) -> CompletionReceipts {
+    let key = blake3::derive_key(
+        "myelin.ci.preparation-completion-receipt.v3",
+        input.claim_nonce.as_bytes(),
+    );
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    for frame in [
+        input.tenant.as_str().as_bytes(),
+        input.region.as_bytes(),
+        input.wf_run_id.as_bytes(),
+        input.ci_run_id.as_bytes(),
+        input.job_id.as_bytes(),
+        input.idem_token.as_bytes(),
+        input.stage.as_bytes(),
+        input.reserve_handle.as_bytes(),
+        &input.usage.cpu_seconds.to_be_bytes(),
+        &input.usage.mem_byte_seconds.to_be_bytes(),
+        input.lease_owner.as_bytes(),
+        &input.lease_epoch.to_be_bytes(),
+        input.claim_nonce.as_bytes(),
+        &input.claim_started_at_epoch_secs.to_be_bytes(),
+        &input.claim_expires_at_epoch_secs.to_be_bytes(),
+    ] {
+        hasher.update(&(frame.len() as u64).to_be_bytes());
+        hasher.update(frame);
+    }
+    let legacy_v3 = format!("v3:{}", hasher.finalize().to_hex());
+    let disposition = CiJobTerminalDisposition::Preparation(disposition);
     CompletionReceipts {
         current_v4: disposition_receipt_v4(&legacy_v3, disposition),
         legacy_v3,
@@ -1169,6 +1230,95 @@ async fn resolve_terminal_usage_on_conn(
     Ok((manifest.ci_run_id, usage))
 }
 
+async fn verify_preparation_disposition_on_conn(
+    conn: &mut sqlx::PgConnection,
+    claim: &CiJobTokenRequest,
+    reserve_handle: &str,
+    disposition: PreparationTerminalDisposition,
+) -> Result<(), CompletionTxError> {
+    let current = sqlx::query(
+        "SELECT budget_revision, max_parent_attempts
+         FROM ci_job_parent_attempt
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+           AND wf_run_id = $4::uuid AND ci_run_id = $5::uuid
+           AND reserve_handle = $6 AND lease_owner = $7
+           AND lease_epoch = $8 AND claim_nonce = $9::uuid
+           AND claim_started_at_epoch_secs = $10
+           AND claim_expires_at_epoch_secs = $11",
+    )
+    .bind(&claim.tenant_id)
+    .bind(&claim.region)
+    .bind(&claim.job_id)
+    .bind(&claim.wf_run_id)
+    .bind(&claim.ci_run_id)
+    .bind(reserve_handle)
+    .bind(&claim.lease_owner)
+    .bind(claim.lease_epoch)
+    .bind(&claim.claim_nonce)
+    .bind(claim.claim_started_at_epoch_secs)
+    .bind(claim.claim_expires_at_epoch_secs)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|_| CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database))?
+    .ok_or(CompletionTxError::Refused)?;
+
+    match disposition {
+        PreparationTerminalDisposition::Failed { phase }
+        | PreparationTerminalDisposition::TimedOut { phase } => {
+            let terminal = sqlx::query_scalar::<_, i32>(
+                "SELECT 1
+                 FROM ci_job_prelaunch_usage
+                 WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+                   AND lease_epoch = $4 AND claim_nonce = $5::uuid AND phase = $6
+                   AND status IN ('measured', 'sealed_ceiling')",
+            )
+            .bind(&claim.tenant_id)
+            .bind(&claim.region)
+            .bind(&claim.job_id)
+            .bind(claim.lease_epoch)
+            .bind(&claim.claim_nonce)
+            .bind(phase.as_storage_token())
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|_| CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database))?;
+            if terminal.is_none() {
+                return Err(CompletionTxError::Refused);
+            }
+        }
+        PreparationTerminalDisposition::AttemptsExhausted => {
+            let revision: i16 = current
+                .try_get("budget_revision")
+                .map_err(|_| CompletionTxError::Refused)?;
+            let maximum: i64 = current
+                .try_get("max_parent_attempts")
+                .map_err(|_| CompletionTxError::Refused)?;
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*)
+                 FROM ci_job_parent_attempt
+                 WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+                   AND wf_run_id = $4::uuid AND ci_run_id = $5::uuid
+                   AND reserve_handle = $6 AND budget_revision = $7
+                   AND max_parent_attempts = $8",
+            )
+            .bind(&claim.tenant_id)
+            .bind(&claim.region)
+            .bind(&claim.job_id)
+            .bind(&claim.wf_run_id)
+            .bind(&claim.ci_run_id)
+            .bind(reserve_handle)
+            .bind(revision)
+            .bind(maximum)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|_| CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database))?;
+            if count != maximum {
+                return Err(CompletionTxError::Refused);
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn settle_ci_job_surface_on_conn(
     conn: &mut sqlx::PgConnection,
     tenant: &TenantId,
@@ -1178,31 +1328,37 @@ async fn settle_ci_job_surface_on_conn(
     report: &TerminalReport,
     disposition: Option<CiJobTerminalDisposition>,
 ) -> Result<(), CompletionTxError> {
-    let state = if report.passed && !report.timed_out {
+    let preparation = matches!(disposition, Some(CiJobTerminalDisposition::Preparation(_)));
+    let state = if !preparation && report.passed && !report.timed_out {
         "succeeded"
     } else {
         "failed"
     };
     let summary = terminal_result_summary(report, disposition);
-    let updated = sqlx::query_scalar::<_, Uuid>(
+    let state_predicate = if preparation {
+        "state IN ('queued','leased') OR (state=$5 AND result_summary=$6)"
+    } else {
+        "state IN ('queued','leased','running') OR (state=$5 AND result_summary=$6)"
+    };
+    let query = format!(
         "UPDATE ci_job
          SET state=$5, result_summary=$6
          WHERE tenant_id=$1 AND region=$2 AND run_id=$3::uuid AND job_id=$4::uuid
-           AND (
-             state IN ('queued','leased','running')
-             OR (state=$5 AND result_summary=$6)
-           )
-         RETURNING job_id",
-    )
-    .bind(tenant.as_str())
-    .bind(region.as_str())
-    .bind(ci_run_id)
-    .bind(job_id)
-    .bind(state)
-    .bind(summary)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|_| CompletionTxError::Accounting(CiJobAccountingError::Db("job surface update")))?;
+           AND ({state_predicate})
+         RETURNING job_id"
+    );
+    let updated = sqlx::query_scalar::<_, Uuid>(&query)
+        .bind(tenant.as_str())
+        .bind(region.as_str())
+        .bind(ci_run_id)
+        .bind(job_id)
+        .bind(state)
+        .bind(summary)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|_| {
+            CompletionTxError::Accounting(CiJobAccountingError::Db("job surface update"))
+        })?;
     if updated.is_some() {
         Ok(())
     } else {
@@ -1409,6 +1565,273 @@ impl CiPipelineReporter {
             accounting: ReporterAccounting::Durable(Arc::new(accounting)),
             #[cfg(any(test, feature = "test-support"))]
             test_executor: None,
+        }
+    }
+
+    /// Terminalize an exact still-leased checkout preparation generation. This endpoint deliberately
+    /// accepts the claim-bound token request rather than [`CompletionClaim`]: the immutable claim
+    /// timestamps, CI-run identity, and token-authority handle are all required to re-verify the
+    /// parent attempt. No production caller is wired until the full checkout sequence lands.
+    pub fn report_preparation_terminal(
+        &self,
+        claim: &CiJobTokenRequest,
+        disposition: PreparationTerminalDisposition,
+    ) -> Result<SignalOutcome, ExecutorError> {
+        claim.validate().map_err(|error| {
+            ExecutorError::InvalidInput(format!(
+                "ci.pipeline preparation completion refused: {}",
+                error.0
+            ))
+        })?;
+        if claim.tenant_id != self.tenant.0 || claim.region != self.region {
+            return Err(ExecutorError::InvalidInput(
+                "ci.pipeline preparation completion refused: reporter scope mismatch".into(),
+            ));
+        }
+        let accounting = match &self.accounting {
+            ReporterAccounting::Durable(accounting)
+                if accounting.receipt_store.write_version() == CiJobAccountingWriteVersion::V4 =>
+            {
+                accounting.clone()
+            }
+            ReporterAccounting::Durable(_) => {
+                return Err(ExecutorError::InvalidInput(
+                    "ci.pipeline preparation completion refused: v4 accounting writer is not \
+                     activated"
+                        .into(),
+                ))
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            ReporterAccounting::TestBypass => {
+                return Err(ExecutorError::InvalidInput(
+                    "ci.pipeline preparation completion requires durable v4 accounting".into(),
+                ))
+            }
+        };
+
+        let job_uuid = Uuid::parse_str(&claim.job_id)
+            .map_err(|_| ExecutorError::InvalidInput("invalid job UUID".into()))?;
+        let wf_run_uuid = Uuid::parse_str(&claim.wf_run_id)
+            .map_err(|_| ExecutorError::InvalidInput("invalid workflow run UUID".into()))?;
+        let ci_run_uuid = Uuid::parse_str(&claim.ci_run_id)
+            .map_err(|_| ExecutorError::InvalidInput("invalid CI run UUID".into()))?;
+        let nonce_uuid = Uuid::parse_str(&claim.claim_nonce)
+            .map_err(|_| ExecutorError::InvalidInput("invalid claim nonce UUID".into()))?;
+        let claim = claim.clone();
+        let refusal_job = claim.job_id.clone();
+        let refusal_owner = claim.lease_owner.clone();
+        let refusal_epoch = claim.lease_epoch;
+        let tenant = self.tenant.clone();
+        let region = self.region.clone();
+        let transaction_tenant = tenant.0.clone();
+        let transaction_region = region.clone();
+        let spec_store = self.spec_store.clone();
+        let pg_executor = self.pg_executor.clone();
+
+        let durable = bridge(
+            &self.rt,
+            with_tenant_tx_error(
+                self.queue_store.pool(),
+                &transaction_tenant,
+                &transaction_region,
+                move |conn| {
+                    Box::pin(async move {
+                        let identity = spec_store
+                            .get_dispatch_identity_on_conn(
+                                conn,
+                                tenant.as_str(),
+                                job_uuid,
+                                &claim.job_id,
+                            )
+                            .await
+                            .map_err(CompletionTxError::Spec)?;
+                        let reserve_handle = identity
+                            .as_ref()
+                            .map(|identity| identity.reserve_handle.clone())
+                            .ok_or(CompletionTxError::Refused)?;
+                        let stage = verify_claimed_identity(
+                            &tenant,
+                            &tenant,
+                            &claim.wf_run_id,
+                            &claim.job_id,
+                            &claim.idem_token,
+                            identity,
+                        )
+                        .map_err(|_| CompletionTxError::Refused)?;
+                        let launch = spec_store
+                            .get_launch_template_on_conn(conn, tenant.as_str(), &claim.job_id)
+                            .await
+                            .map_err(CompletionTxError::Spec)?;
+                        if launch.ci_run_id != claim.ci_run_id
+                            || launch.token_authority_handle != claim.token_authority_handle
+                            || launch.spec.idem_token.0 != claim.idem_token
+                            || launch.spec.meter_to.reserve_id != reserve_handle
+                            || derive_checkout_authorization_scope(
+                                JobKind::Ci,
+                                &launch.spec.workspace,
+                            )
+                            .map_err(|_| CompletionTxError::Refused)?
+                            .is_none()
+                        {
+                            return Err(CompletionTxError::Refused);
+                        }
+
+                        // Preserve the existing Flow -> queue -> advisory -> journal lock order.
+                        let signal = TypedSignalSpec {
+                            run: RunId(claim.wf_run_id.clone()),
+                            signal_name: JOB_DONE_SIGNAL.to_string(),
+                            idem_key: claim.idem_token.clone(),
+                            payload: SignalPayload::CiJobDone {
+                                stage: stage.clone(),
+                                passed: false,
+                                result_refs: Vec::new(),
+                            },
+                            payload_key_ref: None,
+                        };
+                        let signal_outcome = pg_executor
+                            .signal_typed_on_conn(conn, signal)
+                            .await
+                            .map_err(CompletionTxError::Signal)?;
+                        let attempts =
+                            retry_attempts_for_terminal_on_conn(conn, &tenant, &region, job_uuid)
+                                .await?;
+                        let base_usage = aggregate_usage(
+                            attempts.as_ref(),
+                            ResourceUsage {
+                                cpu_seconds: 0,
+                                mem_byte_seconds: 0,
+                            },
+                        )?;
+                        let (ci_run_id, usage) = resolve_terminal_usage_on_conn(
+                            conn,
+                            &accounting,
+                            TerminalUsageResolutionInput {
+                                tenant: &tenant,
+                                wf_run_id: &claim.wf_run_id,
+                                job_id: &claim.job_id,
+                                reserve_handle: &reserve_handle,
+                                base_usage,
+                                parent_expectation: CiPrelaunchParentExpectation::Required,
+                                unresolved_policy: CiPrelaunchUnresolvedPolicy::Refuse,
+                            },
+                        )
+                        .await?;
+                        if ci_run_id != claim.ci_run_id {
+                            return Err(CompletionTxError::Refused);
+                        }
+                        verify_preparation_disposition_on_conn(
+                            conn,
+                            &claim,
+                            &reserve_handle,
+                            disposition,
+                        )
+                        .await?;
+                        let receipts = preparation_completion_receipts(
+                            PreparationCompletionReceiptInput {
+                                tenant: &tenant,
+                                region: &region,
+                                wf_run_id: &claim.wf_run_id,
+                                ci_run_id: &claim.ci_run_id,
+                                job_id: &claim.job_id,
+                                idem_token: &claim.idem_token,
+                                stage: &stage,
+                                reserve_handle: &reserve_handle,
+                                usage,
+                                lease_owner: &claim.lease_owner,
+                                lease_epoch: claim.lease_epoch,
+                                claim_nonce: &claim.claim_nonce,
+                                claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
+                                claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
+                            },
+                            disposition,
+                        );
+                        let claim_outcome = CiJobQueueStore::consume_preparation_claim_on_conn(
+                            conn,
+                            PreparationClaimConsumeSpec {
+                                tenant_id: tenant.as_str(),
+                                region: &region,
+                                job_id: job_uuid,
+                                wf_run_id: wf_run_uuid,
+                                ci_run_id: ci_run_uuid,
+                                idem_token: &claim.idem_token,
+                                lease_owner: &claim.lease_owner,
+                                lease_epoch: claim.lease_epoch,
+                                claim_nonce: nonce_uuid,
+                                stage: &stage,
+                                claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
+                                claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
+                                reserve_handle: &reserve_handle,
+                                completion_receipt: &receipts.current_v4,
+                            },
+                        )
+                        .await?;
+                        if claim_outcome == ClaimConsumeOutcome::Refused {
+                            return Err(CompletionTxError::Refused);
+                        }
+                        let report = TerminalReport {
+                            passed: false,
+                            timed_out: matches!(
+                                disposition,
+                                PreparationTerminalDisposition::TimedOut { .. }
+                            ),
+                            usage,
+                            result_refs: Vec::new(),
+                        };
+                        co_commit_terminal_accounting(
+                            conn,
+                            &accounting,
+                            TerminalAccountingInput {
+                                tenant: &tenant,
+                                wf_run: &RunId(claim.wf_run_id.clone()),
+                                ci_run_id: &claim.ci_run_id,
+                                job_id: &claim.job_id,
+                                reserve_handle: &reserve_handle,
+                                report: &report,
+                                receipts: &receipts,
+                                disposition: CiJobTerminalDisposition::Preparation(disposition),
+                                replay: claim_outcome == ClaimConsumeOutcome::AlreadyConsumed,
+                            },
+                        )
+                        .await?;
+                        close_cancelled_run_if_accounted(conn, &accounting, &claim.wf_run_id)
+                            .await?;
+                        Ok(signal_outcome)
+                    })
+                },
+            ),
+        );
+        match durable {
+            Ok(outcome) => Ok(outcome),
+            Err(CompletionTxError::Refused) => Err(ExecutorError::InvalidInput(format!(
+                "ci.pipeline preparation completion refused (stale or divergent generation): job \
+                 `{}` owner `{}` epoch `{}`",
+                refusal_job, refusal_owner, refusal_epoch
+            ))),
+            Err(CompletionTxError::Spec(error)) => Err(ExecutorError::Storage(format!(
+                "durable preparation dispatch read refused: {error}"
+            ))),
+            Err(CompletionTxError::Signal(error)) => Err(error),
+            Err(CompletionTxError::Prelaunch(error)) => Err(ExecutorError::Storage(format!(
+                "preparation usage resolution refused: {error}"
+            ))),
+            Err(CompletionTxError::Usage(error)) => Err(ExecutorError::Storage(format!(
+                "preparation usage aggregation refused: {error}"
+            ))),
+            Err(CompletionTxError::Pricing(error)) => Err(ExecutorError::Storage(format!(
+                "preparation accounting pricing refused: {error}"
+            ))),
+            Err(CompletionTxError::Money(error)) => Err(ExecutorError::Storage(format!(
+                "preparation money settlement refused: {error}"
+            ))),
+            Err(CompletionTxError::Projection(error)) => Err(ExecutorError::Storage(format!(
+                "preparation cost projection refused: {error}"
+            ))),
+            Err(CompletionTxError::Accounting(error)) => Err(ExecutorError::Storage(format!(
+                "preparation accounting receipt refused: {error}"
+            ))),
+            Err(error) => Err(ExecutorError::Storage(format!(
+                "preparation completion transaction failed: {error:?}"
+            ))),
         }
     }
 
