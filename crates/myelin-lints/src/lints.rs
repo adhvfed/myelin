@@ -238,6 +238,109 @@ fn raw_statement_text(raw_lines: &[&str], line: usize) -> String {
     out
 }
 
+/// The statement that DEFINES the SQL a query-builder call executes, when the SQL text was hoisted
+/// into a local (`let sql = format!("… WHERE tenant_id=$1 …"); sqlx::query(&sql)`).
+///
+/// Returns the defining `let` statement's code text so the caller can look for the tenant predicate
+/// there as well as on the query statement — the query-site fingerprint is textual and statement-
+/// local, so without this a composed query (one whose predicate is assembled with `format!`) loses
+/// its tenant binder purely by where the string literal sits. Only the NEAREST PRECEDING definition
+/// of that exact identifier is consulted (so a later shadowing binding is the one that counts), and
+/// only a bare identifier argument (`&sql`, `sql`, `sql.as_str()`) resolves — anything else (an
+/// inline literal, an expression) is left to the statement-local check.
+fn hoisted_sql_statement<'a>(
+    statements: &'a [(usize, String)],
+    index: usize,
+    code: &str,
+    query_sites: &[&str],
+) -> Option<&'a str> {
+    let site_end = query_sites
+        .iter()
+        .filter_map(|site| {
+            // A site token that already includes its `(` (`.from(`, `query!(`) must not consume it —
+            // the argument scan starts at the call's OWN open paren.
+            let width = site.len() - usize::from(site.ends_with('('));
+            code.find(site).map(|at| at + width)
+        })
+        .min()?;
+    let ident = sql_argument_identifier(query_argument(code, site_end)?)?;
+    statements[..index]
+        .iter()
+        .rev()
+        .find(|(_, statement)| binds_identifier(statement, ident))
+        .map(|(_, statement)| statement.as_str())
+}
+
+/// The FIRST argument text of the call whose `(` follows `after` in `code` (the query-builder call's
+/// SQL argument). Stops at the matching `)` or the first top-level `,`.
+fn query_argument(code: &str, after: usize) -> Option<&str> {
+    let rest = code.get(after..)?;
+    let open = rest.find('(')?;
+    let bytes = rest.as_bytes();
+    let mut depth = 0usize;
+    for (offset, byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(rest[open + 1..offset].trim());
+                }
+            }
+            b',' if depth == 1 => return Some(rest[open + 1..offset].trim()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The bare local identifier an argument names, if it is one: `&sql`, `sql`, `&*sql`,
+/// `sql.as_str()` → `sql`. A literal / a compound expression yields `None`.
+fn sql_argument_identifier(argument: &str) -> Option<&str> {
+    let mut rest = argument.trim();
+    while let Some(stripped) = rest.strip_prefix('&').or_else(|| rest.strip_prefix('*')) {
+        rest = stripped.trim_start();
+    }
+    rest = rest.strip_prefix("mut ").unwrap_or(rest).trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let ident = &rest[..end];
+    if ident.is_empty() || ident.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    // Only a plain identifier or a borrow-ish accessor on it (`sql.as_str()`, `sql.as_ref()`).
+    let tail = rest[end..].trim();
+    (tail.is_empty() || tail.starts_with('.')).then_some(ident)
+}
+
+/// Whether `statement` contains a `let` binding of exactly `ident` (`let sql = …`, `let mut sql = …`).
+fn binds_identifier(statement: &str, ident: &str) -> bool {
+    let bytes = statement.as_bytes();
+    let mut cursor = 0usize;
+    while let Some(at) = statement[cursor..].find("let ") {
+        let start = cursor + at;
+        cursor = start + 4;
+        // `let` must be a whole word (not the tail of `booklet `).
+        let preceded_by_ident = start
+            .checked_sub(1)
+            .and_then(|i| bytes.get(i))
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        if preceded_by_ident {
+            continue;
+        }
+        let after = statement[cursor..].trim_start();
+        let after = after.strip_prefix("mut ").map_or(after, str::trim_start);
+        let Some(tail) = after.strip_prefix(ident) else {
+            continue;
+        };
+        if !tail.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            return true;
+        }
+    }
+    false
+}
+
 fn scan_tenant_predicate(src: &str) -> Vec<Violation> {
     // The query-builder fingerprints that MUST be tenant-bound.
     const QUERY_SITES: &[&str] = &[
@@ -271,12 +374,23 @@ fn scan_tenant_predicate(src: &str) -> Vec<Violation> {
     let mut out = Vec::new();
     // Scan at STATEMENT granularity so a tenant binder on a later line of the same fluent
     // query-builder chain (`sqlx::query(..)\n  .with_tenant(t)\n  .fetch_all(p);`) is seen.
-    for (line, code) in code_statements(src) {
+    let statements = code_statements(src);
+    for (index, (line, code)) in statements.iter().enumerate() {
+        let (line, code) = (*line, code.as_str());
         let is_query = QUERY_SITES.iter().any(|s| code.contains(s));
         if !is_query {
             continue;
         }
-        let is_tenant_bound = TENANT_BINDERS.iter().any(|b| code.contains(b));
+        // The tenant predicate may live on the query statement itself, OR — when the SQL text is
+        // HOISTED into a local because the statement is composed (`let sql = format!("… WHERE
+        // tenant_id=$1 …"); sqlx::query(&sql)`) — on the statement that DEFINES the SQL the query
+        // executes. Resolving that one binding makes the check HOIST-INVARIANT: the same query
+        // gets the same verdict whether its SQL is written inline or built one statement above.
+        // It is not a weakening — a hoisted SQL string with NO tenant predicate still has no
+        // tenant binder in either statement and still fires (see the unit tests).
+        let is_tenant_bound = TENANT_BINDERS.iter().any(|b| code.contains(b))
+            || hoisted_sql_statement(&statements, index, code, QUERY_SITES)
+                .is_some_and(|sql| TENANT_BINDERS.iter().any(|b| sql.contains(b)));
         let idx = line.saturating_sub(1);
         let marker_here = raw_lines
             .get(idx)
@@ -1832,6 +1946,70 @@ mod tests {
         "#;
         assert!(tenant_predicate().run(green).is_empty());
         assert!(!tenant_predicate().run(red).is_empty());
+    }
+
+    #[test]
+    fn tenant_predicate_is_hoist_invariant_over_composed_sql() {
+        // A COMPOSED query (the predicate assembled with `format!`, then executed from a local) is
+        // tenant-bound exactly when its SQL binds the tenant — the same verdict the inline form
+        // gets. The green case is the shape CT-007 introduced in `settle_ci_job_surface_on_conn`.
+        let green = r#"
+            let query = format!(
+                "UPDATE ci_job
+                 SET state=$5
+                 WHERE tenant_id=$1 AND region=$2
+                   AND ({state_predicate})
+                 RETURNING job_id"
+            );
+            let updated = sqlx::query_scalar::<_, Uuid>(&query)
+                .bind(tenant.as_str())
+                .fetch_optional(&mut *conn);
+        "#;
+        assert!(
+            tenant_predicate().run(green).is_empty(),
+            "a hoisted SQL string that BINDS the tenant must be admitted"
+        );
+
+        // ANTI-WEAKENING: hoisting the SQL must NOT launder a tenant-less query.
+        let red = r#"
+            let query = format!(
+                "UPDATE ci_job
+                 SET state=$1
+                 WHERE run_id=$2::uuid
+                 RETURNING job_id"
+            );
+            let updated = sqlx::query_scalar::<_, Uuid>(&query)
+                .bind(state)
+                .fetch_optional(&mut *conn);
+        "#;
+        assert!(
+            !tenant_predicate().run(red).is_empty(),
+            "a hoisted SQL string with NO tenant predicate must still be rejected"
+        );
+
+        // The resolution follows the argument identifier only — an unrelated tenant-bound local
+        // does not launder a query that executes a DIFFERENT, tenant-less SQL string.
+        let red_other_local = r#"
+            let tenant_sql = "SELECT id FROM ci_job WHERE tenant_id=$1";
+            let query = "SELECT id FROM ci_job";
+            let rows = sqlx::query(&query).fetch_all(&pool);
+        "#;
+        assert!(
+            !tenant_predicate().run(red_other_local).is_empty(),
+            "only the SQL the query actually executes may admit it"
+        );
+
+        // The NEAREST PRECEDING binding wins: a tenant-bound earlier definition must not admit a
+        // query that runs the later, tenant-less rebinding of the same name.
+        let red_shadowed = r#"
+            let query = "SELECT id FROM ci_job WHERE tenant_id=$1";
+            let query = "SELECT id FROM ci_job";
+            let rows = sqlx::query(&query).fetch_all(&pool);
+        "#;
+        assert!(
+            !tenant_predicate().run(red_shadowed).is_empty(),
+            "a shadowed tenant-bound binding must not admit the later tenant-less one"
+        );
     }
 
     #[test]

@@ -646,6 +646,8 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_write_version_is_explicit_and_production_defaults_to_v3() {
+        // @residency-cell-pinned: lazy unit-test pool that never connects; the store built from it
+        // on the next line pins its region explicitly (`with_pg(pool, Region("fr-par"))`).
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
             .unwrap();

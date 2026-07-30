@@ -45,7 +45,7 @@ fn edge_shutdown_reaches_active_git_wire_containers() {
     }
     for required in [
         "let cancelled = cancellation.load(Ordering::Acquire)",
-        "if cancelled || start.elapsed() >= timeout",
+        "if cancelled || executed_at.elapsed() >= timeout",
         "timed_out = !cancelled",
     ] {
         assert!(
