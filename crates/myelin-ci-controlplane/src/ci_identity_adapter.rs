@@ -12,8 +12,9 @@ use std::sync::Arc;
 use chrono::{DateTime, SecondsFormat, Utc};
 use myelin_ci_sandbox::{
     derive_checkout_authorization_scope, AttributeHook, CheckoutAuthorizationScope,
-    CiJobAuthorizationContext, HookError, JobKind, JobSpec, LaunchFenceHook, LaunchOwnership,
-    LaunchPermit, RunTokenAuthorizationContext, RunTokenCredential, ValidatedLaunchOwnership,
+    CiJobAuthorizationContext, CiJobCredentialBinding, HookError, JobKind, JobSpec,
+    LaunchFenceHook, LaunchOwnership, LaunchPermit, RunTokenAuthorizationContext,
+    RunTokenCredential, ValidatedLaunchOwnership,
 };
 use myelin_events::Timestamp;
 use myelin_identity::{
@@ -26,11 +27,28 @@ use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 
 use crate::ci_claim_token_issuer::CiJobCredentialMinter;
+use crate::ci_credential_generation::CiPhaseGenerationGate;
+use crate::ci_credential_generation::{
+    phase_generation_id, CiCredentialPurpose, CiPhaseCredentialBinding,
+    CiPhaseCredentialMintRequest, CiPhaseCredentialMinter, CiPhaseGenerationInputs,
+    CI_PHASE_CREDENTIAL_BINDING_V1,
+};
 use crate::ci_launch_authority::CiJobRuntimeAuthorityRequest;
 use crate::ci_manifest_job_runner::{
     CiJobTokenIssueError, CiJobTokenRequest, MAX_CI_JOB_TOKEN_TTL_SECS,
 };
 use crate::{CiJobLaunchClaim, CiJobQueueStore};
+
+/// **CT-007 phase-credential generations: which credential SHAPE a boundary requires.** Passed in by
+/// the caller, never inferred from the presented context, so the two shapes can never satisfy each
+/// other's boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiCredentialExpectation {
+    /// The V1 production shape: signed `run_id == job_id`, one credential per claim.
+    LegacyClaimBound,
+    /// The V2 shape: signed `run_id` == the recomputed generation id for exactly this purpose.
+    Phase(CiCredentialPurpose),
+}
 
 /// The platform CI service principal cryptographically bound into every hosted-job token.
 pub const CI_JOB_PRINCIPAL_ID: &str = "svc:ci";
@@ -58,6 +76,49 @@ fn required_ci_capabilities(checkout: Option<&CheckoutAuthorizationScope>) -> Ve
     capabilities
 }
 
+/// **CT-007 phase-credential generations: the purpose-attenuated capability vectors.** The ONE place
+/// a V2 phase credential's authority is derived, shared by minting, context construction, and
+/// verification exactly like [`required_ci_capabilities`] is for V1.
+///
+/// The attenuation is the point: a preparation credential must not carry `artifact.write`, so an
+/// escaped Hop A/B container holding a live preparation bearer cannot write artifacts; and the
+/// workload credential must not carry `repo:<ref>#pull`, so a workload bearer cannot re-enter the
+/// git wire. Only advertise/fetch (the two git-wire executions) get the repo grant.
+pub fn phase_ci_capabilities(
+    purpose: CiCredentialPurpose,
+    checkout: Option<&CheckoutAuthorizationScope>,
+) -> Vec<String> {
+    match purpose {
+        CiCredentialPurpose::CheckoutAdvertise | CiCredentialPurpose::CheckoutFetch => {
+            let mut capabilities = vec!["job.launch".to_string()];
+            if let Some(scope) = checkout {
+                capabilities.push(format!("repo:{}#pull", scope.repo_ref().0));
+            }
+            capabilities
+        }
+        CiCredentialPurpose::CheckoutMaterialization => vec!["job.launch".to_string()],
+        CiCredentialPurpose::Workload => {
+            vec!["job.launch".to_string(), "artifact.write".to_string()]
+        }
+    }
+}
+
+/// The deterministic JTI Identity will return for one exact generation. Identity derives it from
+/// `(principal, run_id, mint_instant)`, and a V2 mint supplies the generation id as the run id and
+/// the persisted issuance anchor as the mint instant — so the control plane can compute the expected
+/// value BEFORE calling Identity and store it as durable evidence.
+pub fn expected_phase_jti(
+    generation_id: &str,
+    issued_at_epoch_secs: i64,
+) -> Result<String, CiJobTokenIssueError> {
+    let minted_at = timestamp_from_epoch(issued_at_epoch_secs)?;
+    Ok(myelin_identity_service::run_token_jti(
+        &PrincipalId(CI_JOB_PRINCIPAL_ID.into()),
+        &RunId(generation_id.to_owned()),
+        &minted_at,
+    ))
+}
+
 /// Build the non-secret expected facts carried from a locked scheduler claim to final launch.
 /// `checkout` must be the SAME checkout scope (or lack thereof) the claim was actually minted
 /// against (CT-007 slice 5b.3-2c) -- see callers for how each derives it.
@@ -78,6 +139,40 @@ pub fn ci_job_authorization_context(
         claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
         required_capabilities: required_ci_capabilities(checkout),
         checkout_scope: checkout.cloned(),
+        credential_binding: None,
+    })
+}
+
+/// CT-007 phase-credential generations: the V2 analogue of [`ci_job_authorization_context`]. Carries
+/// the exact durable generation so the launch boundary can recompute the signed generation id.
+pub fn ci_job_phase_authorization_context(
+    claim: &CiJobTokenRequest,
+    checkout: Option<&CheckoutAuthorizationScope>,
+    binding: &CiPhaseCredentialBinding,
+) -> RunTokenAuthorizationContext {
+    RunTokenAuthorizationContext::CiJob(CiJobAuthorizationContext {
+        tenant_id: claim.tenant_id.clone(),
+        region: claim.region.clone(),
+        principal_id: CI_JOB_PRINCIPAL_ID.into(),
+        wf_run_id: claim.wf_run_id.clone(),
+        job_id: claim.job_id.clone(),
+        lease_owner: claim.lease_owner.clone(),
+        lease_epoch: claim.lease_epoch,
+        claim_nonce: claim.claim_nonce.clone(),
+        claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
+        claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
+        required_capabilities: phase_ci_capabilities(binding.purpose, checkout),
+        checkout_scope: checkout.cloned(),
+        credential_binding: Some(CiJobCredentialBinding {
+            binding_version: binding.binding_version,
+            purpose: binding.purpose.token().to_string(),
+            generation_id: binding.generation_id.clone(),
+            issued_at_epoch_secs: binding.issued_at_epoch_secs,
+            expires_at_epoch_secs: binding.expires_at_epoch_secs,
+            ci_run_id: claim.ci_run_id.clone(),
+            token_authority_handle: claim.token_authority_handle.clone(),
+            idem_token: claim.idem_token.clone(),
+        }),
     })
 }
 
@@ -129,6 +224,134 @@ impl CiJobCredentialMinter for IdentityCiJobCredentialMinter {
                 .map_err(|_| refused("Identity mint worker terminated"))?
         })
     }
+}
+
+impl CiPhaseCredentialMinter for IdentityCiJobCredentialMinter {
+    /// **CT-007 phase-credential generations: the raw V2 Identity seam.** Signs exactly the supplied
+    /// generation id as `CredentialPurpose::CiJob.run_id`, anchors the token at exactly the
+    /// PERSISTED issuance instant (never a process clock, so an exact retry is byte-stable), and
+    /// attenuates authority to exactly this purpose's vector.
+    ///
+    /// The liveness check is against the persisted expiry, not a recomputed one: a generation whose
+    /// window has closed refuses here as well as in the store, so even a direct caller of this seam
+    /// cannot resurrect a dead phase.
+    fn mint_phase<'a>(
+        &'a self,
+        request: CiPhaseCredentialMintRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<RunTokenCredential, CiJobTokenIssueError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            request.claim.validate()?;
+            validate_phase_mint_request(&request)?;
+            let now = (self.now_epoch_secs)();
+            request
+                .expires_at_epoch_secs
+                .checked_sub(now)
+                .filter(|remaining| *remaining > 0)
+                .ok_or_else(|| {
+                    refused("phase credential generation expired before Identity mint")
+                })?;
+            let minter = self.minter.clone();
+            let task = tokio::task::spawn_blocking(move || sign_phase_credential(minter, request));
+            task.await
+                .map_err(|_| refused("Identity mint worker terminated"))?
+        })
+    }
+}
+
+/// Structural preconditions the raw phase seam enforces itself, so a direct caller (not only the
+/// locked store) cannot bind a credential to an unbounded or claim-overlong window.
+fn validate_phase_mint_request(
+    request: &CiPhaseCredentialMintRequest,
+) -> Result<(), CiJobTokenIssueError> {
+    let claim = &request.claim;
+    if request.issued_at_epoch_secs <= 0
+        || request.issued_at_epoch_secs < claim.claim_started_at_epoch_secs
+        || request.expires_at_epoch_secs <= request.issued_at_epoch_secs
+        || request.expires_at_epoch_secs > claim.claim_expires_at_epoch_secs
+    {
+        return Err(refused("phase credential window is outside its claim"));
+    }
+    let lifetime = u64::try_from(request.expires_at_epoch_secs - request.issued_at_epoch_secs)
+        .map_err(|_| refused("phase credential lifetime is outside the supported range"))?;
+    if lifetime > MAX_CI_JOB_TOKEN_TTL_SECS {
+        return Err(refused(
+            "phase credential lifetime exceeds the CI token ceiling",
+        ));
+    }
+    if request.purpose.is_preparation() && request.checkout.is_none() {
+        return Err(refused(
+            "a preparation credential requires durable checkout authority",
+        ));
+    }
+    // The signed generation id must be the digest of exactly these inputs — a caller cannot supply
+    // an arbitrary `run_id` and have Identity sign it.
+    let expected = phase_generation_id(CiPhaseGenerationInputs {
+        tenant_id: &claim.tenant_id,
+        region: &claim.region,
+        wf_run_id: &claim.wf_run_id,
+        ci_run_id: &claim.ci_run_id,
+        job_id: &claim.job_id,
+        token_authority_handle: &claim.token_authority_handle,
+        idem_token: &claim.idem_token,
+        lease_owner: &claim.lease_owner,
+        lease_epoch: claim.lease_epoch,
+        claim_nonce: &claim.claim_nonce,
+        claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
+        claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
+        purpose: request.purpose,
+        issued_at_epoch_secs: request.issued_at_epoch_secs,
+        expires_at_epoch_secs: request.expires_at_epoch_secs,
+        binding_version: CI_PHASE_CREDENTIAL_BINDING_V1,
+    });
+    if expected != request.generation_id {
+        return Err(refused(
+            "phase credential generation id is not the digest of its own binding",
+        ));
+    }
+    Ok(())
+}
+
+/// The blocking Identity signing step. Named distinctly from
+/// [`CiJobCredentialGenerationStore::mint_phase_credential`](crate::CiJobCredentialGenerationStore)
+/// — that one is the DURABLE mint (insert-or-replay + Identity + exact validation, all inside the
+/// locked transaction); this is only the signature.
+fn sign_phase_credential(
+    minter: RunTokenMinter,
+    request: CiPhaseCredentialMintRequest,
+) -> Result<RunTokenCredential, CiJobTokenIssueError> {
+    let lifetime_secs = u64::try_from(request.expires_at_epoch_secs - request.issued_at_epoch_secs)
+        .map_err(|_| refused("phase credential lifetime is outside the supported range"))?;
+    let minted_at = timestamp_from_epoch(request.issued_at_epoch_secs)?;
+    let principal = ci_principal(&request.claim.tenant_id, &request.claim.region);
+    let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
+    let required_capabilities = phase_ci_capabilities(request.purpose, request.checkout.as_ref());
+    let authority = Authority::of(required_capabilities.clone());
+    let input = DelegationInput {
+        agent_policy: authority.clone(),
+        delegation: authority.clone(),
+        tenant_policy: authority.clone(),
+        trigger_actor_held: authority,
+    };
+    let caveats = DelegationCaveats(required_capabilities);
+    let token = minter
+        .mint_run_token(
+            &scope,
+            &principal.principal_id,
+            &RunId(request.generation_id),
+            &principal,
+            &principal,
+            &input,
+            &caveats,
+            MachineKind::Ci,
+            &FailStaticBound {
+                static_max_secs: lifetime_secs,
+            },
+            &minted_at,
+        )
+        .map_err(|_| refused("Identity refused the phase-bound CI credential"))?;
+    RunTokenCredential::new(token.token.clone(), token.jti.clone(), lifetime_secs)
+        .map_err(|_| refused("Identity returned an invalid CI credential carrier"))
 }
 
 fn mint_claim_credential(
@@ -198,6 +421,38 @@ fn claim_from_context(context: &CiJobAuthorizationContext) -> CiJobLaunchClaim {
     }
 }
 
+/// CT-007 phase-credential generations: build the durable gate input from server-resolved facts.
+fn phase_gate_from_context(
+    context: &CiJobAuthorizationContext,
+    binding: &CiJobCredentialBinding,
+    purpose: CiCredentialPurpose,
+) -> CiPhaseGenerationGate {
+    CiPhaseGenerationGate {
+        tenant_id: context.tenant_id.clone(),
+        region: context.region.clone(),
+        wf_run_id: context.wf_run_id.clone(),
+        ci_run_id: binding.ci_run_id.clone(),
+        job_id: context.job_id.clone(),
+        token_authority_handle: binding.token_authority_handle.clone(),
+        idem_token: binding.idem_token.clone(),
+        lease_owner: context.lease_owner.clone(),
+        lease_epoch: context.lease_epoch,
+        claim_nonce: context.claim_nonce.clone(),
+        claim_started_at_epoch_secs: context.claim_started_at_epoch_secs,
+        claim_expires_at_epoch_secs: context.claim_expires_at_epoch_secs,
+        purpose,
+        binding_version: binding.binding_version,
+        generation_id: binding.generation_id.clone(),
+        jti: crate::ci_identity_adapter::expected_phase_jti(
+            &binding.generation_id,
+            binding.issued_at_epoch_secs,
+        )
+        .unwrap_or_default(),
+        issued_at_epoch_secs: binding.issued_at_epoch_secs,
+        expires_at_epoch_secs: binding.expires_at_epoch_secs,
+    }
+}
+
 trait CiJobLaunchClaimGate: Send + Sync {
     fn permit(&self, context: &CiJobAuthorizationContext) -> Result<LaunchPermit, String>;
 
@@ -206,6 +461,20 @@ trait CiJobLaunchClaimGate: Send + Sync {
     /// The pre-Hop-A checkout-authorization hook uses this — it must never itself transition the
     /// real workload's state.
     fn verify_live(&self, context: &CiJobAuthorizationContext) -> Result<(), String>;
+
+    /// CT-007 phase-credential generations: a LAZY, retained preparation permit. The durable
+    /// predicate re-runs when the permit is committed — at the spawn boundary — never at mint time.
+    /// It performs no state transition: there is no CAS for a preparation phase to win, so the
+    /// returned ownership is immediate once the durable generation is proven still current.
+    fn phase_permit(&self, gate: CiPhaseGenerationGate) -> Result<LaunchPermit, String>;
+
+    /// CT-007 phase-credential generations: the V2 workload permit — the SAME `leased -> running`
+    /// CAS, with the current `workload` generation predicate folded into its transaction.
+    fn workload_v2_permit(
+        &self,
+        context: &CiJobAuthorizationContext,
+        gate: CiPhaseGenerationGate,
+    ) -> Result<LaunchPermit, String>;
 }
 
 #[derive(Clone)]
@@ -256,6 +525,73 @@ impl CiJobLaunchClaimGate for PgCiJobLaunchClaimGate {
             );
         }
         Ok(())
+    }
+
+    fn phase_permit(&self, gate: CiPhaseGenerationGate) -> Result<LaunchPermit, String> {
+        let pool = self.store.pool().clone();
+        let rt = self.rt.clone();
+        Ok(LaunchPermit::retained(move || {
+            // Round-1 blocker 1: RETAINED durable ownership, not a read-only probe. The returned
+            // handle holds an open transaction carrying a `FOR SHARE` lock on the exact `job_queue`
+            // row, so a requeue / successor mint / launch CAS cannot invalidate this generation
+            // between the check and the gated child release — it either waits or wins first (in
+            // which case acquisition returns `None` and nothing spawns).
+            let owned = bridge(
+                &rt,
+                crate::ci_credential_generation::acquire_phase_generation_ownership(&pool, &gate),
+            )
+            .map_err(|error| HookError(error.to_string()))?
+            .ok_or_else(|| {
+                HookError(
+                    "the durable phase credential generation is not current, has expired, or its \
+                     claim/journal predicate no longer holds"
+                        .into(),
+                )
+            })?;
+            let release_rt = rt.clone();
+            Ok(LaunchOwnership::retained(move || {
+                let mut owned = owned;
+                bridge(&release_rt, owned.validate())
+                    .map_err(|error| HookError(error.to_string()))?;
+                let release_rt = release_rt.clone();
+                Ok(ValidatedLaunchOwnership::retained(move || {
+                    bridge(&release_rt, owned.release())
+                        .map_err(|error| HookError(error.to_string()))
+                }))
+            }))
+        }))
+    }
+
+    fn workload_v2_permit(
+        &self,
+        context: &CiJobAuthorizationContext,
+        gate: CiPhaseGenerationGate,
+    ) -> Result<LaunchPermit, String> {
+        let claim = claim_from_context(context);
+        let store = self.store.clone();
+        let rt = self.rt.clone();
+        Ok(LaunchPermit::retained(move || {
+            let launch = bridge(&rt, store.authorize_launch_v2_retained(&claim, &gate))
+                .map_err(|error| HookError(error.to_string()))?
+                .ok_or_else(|| {
+                    HookError(
+                        "durable scheduler claim was canceled, reaped, expired, already launched, \
+                         or its workload credential generation is not current"
+                            .into(),
+                    )
+                })?;
+            let release_rt = rt.clone();
+            Ok(LaunchOwnership::retained(move || {
+                let mut launch = launch;
+                bridge(&release_rt, launch.validate())
+                    .map_err(|error| HookError(error.to_string()))?;
+                let release_rt = release_rt.clone();
+                Ok(ValidatedLaunchOwnership::retained(move || {
+                    bridge(&release_rt, launch.release())
+                        .map_err(|error| HookError(error.to_string()))
+                }))
+            }))
+        }))
     }
 }
 
@@ -332,6 +668,7 @@ impl IdentityCiJobLaunchAuthorizer {
     fn verify_ci_job_signed<'a>(
         &self,
         spec: &'a JobSpec,
+        expected_purpose: CiCredentialExpectation,
     ) -> Result<&'a CiJobAuthorizationContext, HookError> {
         if spec.kind != JobKind::Ci {
             return Err(HookError(
@@ -349,7 +686,34 @@ impl IdentityCiJobLaunchAuthorizer {
             .map_err(|error| {
                 HookError(format!("CI launch workspace intent is invalid: {error}"))
             })?;
-        let required = required_ci_capabilities(rederived_checkout.as_ref());
+        // CT-007 phase-credential generations: the expected credential SHAPE is decided by the
+        // caller's boundary, never inferred from whatever the in-hand context happens to carry — so
+        // a V2 phase context can never satisfy a legacy boundary, and a legacy context can never
+        // satisfy a phase boundary.
+        let (required, expected_run_id) =
+            match (expected_purpose, context.credential_binding.as_ref()) {
+                (CiCredentialExpectation::LegacyClaimBound, None) => (
+                    required_ci_capabilities(rederived_checkout.as_ref()),
+                    context.job_id.clone(),
+                ),
+                (CiCredentialExpectation::Phase(purpose), Some(binding)) => {
+                    let recomputed = self.verify_phase_binding(context, binding, purpose)?;
+                    (
+                        phase_ci_capabilities(purpose, rederived_checkout.as_ref()),
+                        recomputed,
+                    )
+                }
+                (CiCredentialExpectation::LegacyClaimBound, Some(_)) => return Err(HookError(
+                    "a phase-bound CI credential was presented at a legacy claim-bound boundary"
+                        .into(),
+                )),
+                (CiCredentialExpectation::Phase(_), None) => {
+                    return Err(HookError(
+                        "a legacy claim-bound CI credential was presented at a phase boundary"
+                            .into(),
+                    ))
+                }
+            };
         if context.principal_id != CI_JOB_PRINCIPAL_ID
             || context.required_capabilities != required
             || context.checkout_scope != rederived_checkout
@@ -379,7 +743,7 @@ impl IdentityCiJobLaunchAuthorizer {
             .authorize_ci_job(
                 &scope,
                 &principal.principal_id,
-                &context.job_id,
+                &expected_run_id,
                 &token,
                 &required,
             )
@@ -389,16 +753,201 @@ impl IdentityCiJobLaunchAuthorizer {
                 "signed CI credential outlives its durable scheduler claim".into(),
             ));
         }
+        // For V2 the expiry check is EXACT, not merely an upper bound: the cryptographically
+        // verified expiry must equal the persisted generation expiry, and the carrier's reported TTL
+        // must equal `expiry - anchor`.
+        if let CiCredentialExpectation::Phase(_) = expected_purpose {
+            let binding = context
+                .credential_binding
+                .as_ref()
+                .ok_or_else(|| HookError("phase binding disappeared mid-verification".into()))?;
+            let expected_ttl = binding
+                .expires_at_epoch_secs
+                .checked_sub(binding.issued_at_epoch_secs)
+                .and_then(|ttl| u64::try_from(ttl).ok())
+                .ok_or_else(|| HookError("phase credential window is invalid".into()))?;
+            if verified.exp_unix != binding.expires_at_epoch_secs
+                || spec.run_token.ttl_secs() != expected_ttl
+            {
+                return Err(HookError(
+                    "signed CI credential expiry differs from its durable generation".into(),
+                ));
+            }
+            // The carrier JTI must be the DETERMINISTIC one Identity produces for exactly this
+            // generation and anchor. Identity's own boundary already proves carrier == signed; this
+            // additionally proves both equal the value the control plane persisted as evidence.
+            let expected_jti = expected_phase_jti(&expected_run_id, binding.issued_at_epoch_secs)
+                .map_err(|error| {
+                HookError(format!(
+                    "CI phase credential JTI is underivable: {}",
+                    error.0
+                ))
+            })?;
+            if spec.run_token.jti != expected_jti {
+                return Err(HookError(
+                    "CI phase credential JTI is not the deterministic one for its generation"
+                        .into(),
+                ));
+            }
+        }
         Ok(context)
+    }
+
+    /// Recompute the generation id from server-resolved facts and require the carrier's JTI to be
+    /// the deterministic one Identity must have produced for it. Returns the RECOMPUTED generation
+    /// id, which is what the signed `run_id` is then required to equal — the context's own
+    /// `generation_id` field is never trusted as the comparison value.
+    fn verify_phase_binding(
+        &self,
+        context: &CiJobAuthorizationContext,
+        binding: &CiJobCredentialBinding,
+        expected_purpose: CiCredentialPurpose,
+    ) -> Result<String, HookError> {
+        if binding.binding_version != CI_PHASE_CREDENTIAL_BINDING_V1 {
+            return Err(HookError(
+                "CI phase credential carries an unsupported binding version".into(),
+            ));
+        }
+        if binding.purpose != expected_purpose.token() {
+            return Err(HookError(format!(
+                "CI phase credential was minted for purpose {:?}, but this boundary requires {:?}",
+                binding.purpose,
+                expected_purpose.token()
+            )));
+        }
+        if binding.issued_at_epoch_secs <= 0
+            || binding.issued_at_epoch_secs < context.claim_started_at_epoch_secs
+            || binding.expires_at_epoch_secs <= binding.issued_at_epoch_secs
+            || binding.expires_at_epoch_secs > context.claim_expires_at_epoch_secs
+            || binding.ci_run_id.trim().is_empty()
+            || binding.token_authority_handle.trim().is_empty()
+            || binding.idem_token.trim().is_empty()
+        {
+            return Err(HookError(
+                "CI phase credential binding is outside its durable claim".into(),
+            ));
+        }
+        let recomputed = phase_generation_id(CiPhaseGenerationInputs {
+            tenant_id: &context.tenant_id,
+            region: &context.region,
+            wf_run_id: &context.wf_run_id,
+            ci_run_id: &binding.ci_run_id,
+            job_id: &context.job_id,
+            token_authority_handle: &binding.token_authority_handle,
+            idem_token: &binding.idem_token,
+            lease_owner: &context.lease_owner,
+            lease_epoch: context.lease_epoch,
+            claim_nonce: &context.claim_nonce,
+            claim_started_at_epoch_secs: context.claim_started_at_epoch_secs,
+            claim_expires_at_epoch_secs: context.claim_expires_at_epoch_secs,
+            purpose: expected_purpose,
+            issued_at_epoch_secs: binding.issued_at_epoch_secs,
+            expires_at_epoch_secs: binding.expires_at_epoch_secs,
+            binding_version: binding.binding_version,
+        });
+        if recomputed != binding.generation_id {
+            return Err(HookError(
+                "CI phase credential generation id is not the digest of its own binding".into(),
+            ));
+        }
+        Ok(recomputed)
     }
 
     /// Reauthorize signed facts and return a lazy durable permit. The exact CAS runs only after the
     /// sandbox launch guard is spawned and armed.
     pub fn authorize_retained(&self, spec: &JobSpec) -> Result<LaunchPermit, HookError> {
-        let context = self.verify_ci_job_signed(spec)?;
+        let context = self.verify_ci_job_signed(spec, CiCredentialExpectation::LegacyClaimBound)?;
         self.claim_gate
             .permit(context)
             .map_err(|error| HookError(format!("durable scheduler launch fence failed: {error}")))
+    }
+
+    /// **CT-007 phase-credential generations: the V2 workload launch boundary.** Verifies the signed
+    /// credential as a `workload` phase credential (so any preparation credential is refused here by
+    /// purpose, generation id, AND capability vector) and returns the retained permit whose CAS
+    /// folds the current-generation predicate into the launch transaction itself.
+    pub fn authorize_workload_v2_retained(
+        &self,
+        spec: &JobSpec,
+    ) -> Result<LaunchPermit, HookError> {
+        let (context, gate) = self.phase_boundary(spec, CiCredentialPurpose::Workload)?;
+        self.claim_gate
+            .workload_v2_permit(context, gate)
+            .map_err(|error| {
+                HookError(format!("durable V2 scheduler launch fence failed: {error}"))
+            })
+    }
+
+    /// Hop A step 1 (`git upload-pack --advertise-refs`).
+    pub fn authorize_checkout_advertise_retained(
+        &self,
+        spec: &JobSpec,
+        scope: &CheckoutAuthorizationScope,
+    ) -> Result<LaunchPermit, HookError> {
+        self.authorize_preparation_retained(spec, scope, CiCredentialPurpose::CheckoutAdvertise)
+    }
+
+    /// Hop A step 2 (`git upload-pack`, the pack fetch).
+    pub fn authorize_checkout_fetch_retained(
+        &self,
+        spec: &JobSpec,
+        scope: &CheckoutAuthorizationScope,
+    ) -> Result<LaunchPermit, HookError> {
+        self.authorize_preparation_retained(spec, scope, CiCredentialPurpose::CheckoutFetch)
+    }
+
+    /// Hop B (the checkout-preparation runtime).
+    pub fn authorize_checkout_materialization_retained(
+        &self,
+        spec: &JobSpec,
+        scope: &CheckoutAuthorizationScope,
+    ) -> Result<LaunchPermit, HookError> {
+        self.authorize_preparation_retained(
+            spec,
+            scope,
+            CiCredentialPurpose::CheckoutMaterialization,
+        )
+    }
+
+    /// The shared preparation-boundary core. Every preparation gate ALSO re-checks that the caller's
+    /// own checkout scope agrees with the server-resolved context (the same anti-substitution check
+    /// `authorize_checkout` performs), because a caller holding a valid bearer for one repo/commit
+    /// must not be able to drive a spawn against another.
+    fn authorize_preparation_retained(
+        &self,
+        spec: &JobSpec,
+        scope: &CheckoutAuthorizationScope,
+        purpose: CiCredentialPurpose,
+    ) -> Result<LaunchPermit, HookError> {
+        let (context, gate) = self.phase_boundary(spec, purpose)?;
+        if context.checkout_scope.as_ref() != Some(scope) {
+            return Err(HookError(
+                "checkout scope handed to the phase authorization boundary differs from the \
+                 server-resolved authorization context"
+                    .into(),
+            ));
+        }
+        self.claim_gate
+            .phase_permit(gate)
+            .map_err(|error| HookError(format!("durable phase credential gate failed: {error}")))
+    }
+
+    fn phase_boundary<'a>(
+        &self,
+        spec: &'a JobSpec,
+        purpose: CiCredentialPurpose,
+    ) -> Result<(&'a CiJobAuthorizationContext, CiPhaseGenerationGate), HookError> {
+        let context = self.verify_ci_job_signed(spec, CiCredentialExpectation::Phase(purpose))?;
+        let binding = context.credential_binding.as_ref().ok_or_else(|| {
+            HookError("verified phase context carries no credential binding".into())
+        })?;
+        let gate = phase_gate_from_context(context, binding, purpose);
+        if gate.jti != spec.run_token.jti {
+            return Err(HookError(
+                "the durable phase gate's expected JTI differs from the presented carrier".into(),
+            ));
+        }
+        Ok((context, gate))
     }
 
     /// CT-007 slice 5b.3-2c: the real `CheckoutAuthorizationHook` implementation — a READ-ONLY,
@@ -414,7 +963,7 @@ impl IdentityCiJobLaunchAuthorizer {
         spec: &JobSpec,
         scope: &CheckoutAuthorizationScope,
     ) -> Result<(), HookError> {
-        let context = self.verify_ci_job_signed(spec)?;
+        let context = self.verify_ci_job_signed(spec, CiCredentialExpectation::LegacyClaimBound)?;
         if context.checkout_scope.as_ref() != Some(scope) {
             return Err(HookError(
                 "checkout scope handed to the authorization hook differs from the server-resolved \
@@ -522,6 +1071,18 @@ mod tests {
         fn verify_live(&self, _context: &CiJobAuthorizationContext) -> Result<(), String> {
             Ok(())
         }
+
+        fn phase_permit(&self, _gate: CiPhaseGenerationGate) -> Result<LaunchPermit, String> {
+            Ok(LaunchPermit::immediate())
+        }
+
+        fn workload_v2_permit(
+            &self,
+            _context: &CiJobAuthorizationContext,
+            _gate: CiPhaseGenerationGate,
+        ) -> Result<LaunchPermit, String> {
+            Ok(LaunchPermit::immediate())
+        }
     }
 
     struct RefuseClaimGate;
@@ -535,6 +1096,22 @@ mod tests {
 
         fn verify_live(&self, _context: &CiJobAuthorizationContext) -> Result<(), String> {
             Err("durable scheduler claim was refused".into())
+        }
+
+        fn phase_permit(&self, _gate: CiPhaseGenerationGate) -> Result<LaunchPermit, String> {
+            Ok(LaunchPermit::retained(|| {
+                Err(HookError("durable phase generation was refused".into()))
+            }))
+        }
+
+        fn workload_v2_permit(
+            &self,
+            _context: &CiJobAuthorizationContext,
+            _gate: CiPhaseGenerationGate,
+        ) -> Result<LaunchPermit, String> {
+            Ok(LaunchPermit::retained(|| {
+                Err(HookError("durable scheduler claim was refused".into()))
+            }))
         }
     }
 
@@ -683,6 +1260,10 @@ mod tests {
     struct SpyClaimGateCalls {
         verify_live_calls: usize,
         permit_calls: usize,
+        /// Every phase gate this boundary handed down, in order — the V2 tests assert exactly which
+        /// purpose/generation reached the durable layer.
+        phase_gates: Vec<CiPhaseGenerationGate>,
+        workload_v2_gates: Vec<CiPhaseGenerationGate>,
     }
 
     struct SpyClaimGate(std::sync::Mutex<SpyClaimGateCalls>);
@@ -696,6 +1277,20 @@ mod tests {
         fn verify_live(&self, _context: &CiJobAuthorizationContext) -> Result<(), String> {
             self.0.lock().unwrap().verify_live_calls += 1;
             Ok(())
+        }
+
+        fn phase_permit(&self, gate: CiPhaseGenerationGate) -> Result<LaunchPermit, String> {
+            self.0.lock().unwrap().phase_gates.push(gate);
+            Ok(LaunchPermit::immediate())
+        }
+
+        fn workload_v2_permit(
+            &self,
+            _context: &CiJobAuthorizationContext,
+            gate: CiPhaseGenerationGate,
+        ) -> Result<LaunchPermit, String> {
+            self.0.lock().unwrap().workload_v2_gates.push(gate);
+            Ok(LaunchPermit::immediate())
         }
     }
 
@@ -1268,6 +1863,499 @@ mod tests {
                 .await
                 .is_err(),
             "no authority justifies a claim past the four-execution maximum"
+        );
+    }
+
+    // =============================================================================================
+    // CT-007 phase-credential generations.
+    // =============================================================================================
+
+    const ALL_PURPOSES: [CiCredentialPurpose; 4] = [
+        CiCredentialPurpose::CheckoutAdvertise,
+        CiCredentialPurpose::CheckoutFetch,
+        CiCredentialPurpose::CheckoutMaterialization,
+        CiCredentialPurpose::Workload,
+    ];
+
+    /// **Purpose attenuation is the containment property.** A preparation credential must not carry
+    /// `artifact.write` (an escaped Hop A/B container cannot write artifacts) and the workload
+    /// credential must not carry the repo grant (a workload bearer cannot re-enter the git wire).
+    #[test]
+    fn phase_capability_vectors_are_attenuated_per_purpose() {
+        let scope = checkout_scope();
+        assert_eq!(
+            phase_ci_capabilities(CiCredentialPurpose::CheckoutAdvertise, Some(&scope)),
+            vec![
+                "job.launch".to_string(),
+                "repo:myelin://acme/git/repo/widgets#pull".to_string()
+            ]
+        );
+        assert_eq!(
+            phase_ci_capabilities(CiCredentialPurpose::CheckoutFetch, Some(&scope)),
+            phase_ci_capabilities(CiCredentialPurpose::CheckoutAdvertise, Some(&scope))
+        );
+        assert_eq!(
+            phase_ci_capabilities(CiCredentialPurpose::CheckoutMaterialization, Some(&scope)),
+            vec!["job.launch".to_string()]
+        );
+        assert_eq!(
+            phase_ci_capabilities(CiCredentialPurpose::Workload, Some(&scope)),
+            vec!["job.launch".to_string(), "artifact.write".to_string()]
+        );
+        for purpose in ALL_PURPOSES {
+            let caps = phase_ci_capabilities(purpose, Some(&scope));
+            assert_eq!(
+                caps.contains(&"artifact.write".to_string()),
+                purpose == CiCredentialPurpose::Workload,
+                "only the workload credential may write artifacts ({purpose:?})"
+            );
+            assert_eq!(
+                caps.iter().any(|c| c.starts_with("repo:")),
+                matches!(
+                    purpose,
+                    CiCredentialPurpose::CheckoutAdvertise | CiCredentialPurpose::CheckoutFetch
+                ),
+                "only the two git-wire executions may pull the repo ({purpose:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_expected_phase_jti_is_deterministic_and_generation_bound() {
+        let a = expected_phase_jti("ci-credential:v1:aaaa", 1_785_000_100).unwrap();
+        assert_eq!(
+            a,
+            expected_phase_jti("ci-credential:v1:aaaa", 1_785_000_100).unwrap()
+        );
+        assert!(a.starts_with("runtok:svc:ci:ci-credential:v1:aaaa:"));
+        assert_ne!(
+            a,
+            expected_phase_jti("ci-credential:v1:bbbb", 1_785_000_100).unwrap()
+        );
+        assert_ne!(
+            a,
+            expected_phase_jti("ci-credential:v1:aaaa", 1_785_000_101).unwrap()
+        );
+    }
+
+    fn phase_binding_for(
+        claim: &CiJobTokenRequest,
+        purpose: CiCredentialPurpose,
+        issued: i64,
+        expires: i64,
+    ) -> CiPhaseCredentialBinding {
+        let generation_id = phase_generation_id(CiPhaseGenerationInputs {
+            tenant_id: &claim.tenant_id,
+            region: &claim.region,
+            wf_run_id: &claim.wf_run_id,
+            ci_run_id: &claim.ci_run_id,
+            job_id: &claim.job_id,
+            token_authority_handle: &claim.token_authority_handle,
+            idem_token: &claim.idem_token,
+            lease_owner: &claim.lease_owner,
+            lease_epoch: claim.lease_epoch,
+            claim_nonce: &claim.claim_nonce,
+            claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
+            claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
+            purpose,
+            issued_at_epoch_secs: issued,
+            expires_at_epoch_secs: expires,
+            binding_version: CI_PHASE_CREDENTIAL_BINDING_V1,
+        });
+        CiPhaseCredentialBinding {
+            binding_version: CI_PHASE_CREDENTIAL_BINDING_V1,
+            purpose,
+            jti: expected_phase_jti(&generation_id, issued).unwrap(),
+            generation_id,
+            issued_at_epoch_secs: issued,
+            expires_at_epoch_secs: expires,
+        }
+    }
+
+    /// Mint a REAL signed V2 credential for `purpose`, plus the matching ephemeral context, using
+    /// the same anchor/expiry a durable generation row would have carried.
+    async fn phase_credential(
+        adapter: &IdentityCiJobCredentialMinter,
+        claim: &CiJobTokenRequest,
+        purpose: CiCredentialPurpose,
+    ) -> (RunTokenCredential, CiPhaseCredentialBinding) {
+        let binding = phase_binding_for(claim, purpose, NOW, EXPIRY);
+        let credential = adapter
+            .mint_phase(CiPhaseCredentialMintRequest {
+                claim: claim.clone(),
+                checkout: Some(checkout_scope()),
+                purpose,
+                generation_id: binding.generation_id.clone(),
+                issued_at_epoch_secs: binding.issued_at_epoch_secs,
+                expires_at_epoch_secs: binding.expires_at_epoch_secs,
+            })
+            .await
+            .expect("the phase credential mints");
+        assert_eq!(credential.jti, binding.jti, "the JTI is deterministic");
+        (credential, binding)
+    }
+
+    fn phase_job(
+        credential: RunTokenCredential,
+        claim: &CiJobTokenRequest,
+        binding: &CiPhaseCredentialBinding,
+    ) -> JobSpec {
+        let scope = checkout_scope();
+        let mut spec = JobSpec::new(
+            JobKind::Ci,
+            ImageRef::pinned(format!("registry.invalid/ci@sha256:{}", "a".repeat(64))).unwrap(),
+            vec!["true".into()],
+            Vec::new(),
+            Vec::new(),
+            EgressPolicy::deny_all(),
+            ResourceLimits {
+                cpu_millis: 1_000,
+                mem_bytes: 256 * 1024 * 1024,
+                disk_bytes: 1024 * 1024 * 1024,
+                tmpfs_bytes: 1024 * 1024 * 1024,
+                pids_max: 128,
+                timeout_secs: 30,
+            },
+            checkout_workspace(),
+            TrustTier::Trusted,
+            credential,
+            MeterTarget {
+                reserve_id: "reserve-1".into(),
+            },
+            IdemToken("idem-job".into()),
+        )
+        .unwrap();
+        spec.run_token_authorization = Some(ci_job_phase_authorization_context(
+            claim,
+            Some(&scope),
+            binding,
+        ));
+        spec
+    }
+
+    /// The boundary entry point for each purpose, so the substitution matrix can be driven
+    /// uniformly.
+    fn authorize_at(
+        boundary: &IdentityCiJobLaunchAuthorizer,
+        spec: &JobSpec,
+        purpose: CiCredentialPurpose,
+    ) -> Result<LaunchPermit, HookError> {
+        let scope = checkout_scope();
+        match purpose {
+            CiCredentialPurpose::CheckoutAdvertise => {
+                boundary.authorize_checkout_advertise_retained(spec, &scope)
+            }
+            CiCredentialPurpose::CheckoutFetch => {
+                boundary.authorize_checkout_fetch_retained(spec, &scope)
+            }
+            CiCredentialPurpose::CheckoutMaterialization => {
+                boundary.authorize_checkout_materialization_retained(spec, &scope)
+            }
+            CiCredentialPurpose::Workload => boundary.authorize_workload_v2_retained(spec),
+        }
+    }
+
+    async fn phase_rig() -> (
+        IdentityCiJobCredentialMinter,
+        CiJobTokenRequest,
+        Arc<CellTokenAuthority>,
+        RevocationStore,
+    ) {
+        let s7 = RevocationStore::new();
+        let cell = Arc::new(CellTokenAuthority::from_seed(&[11_u8; 32], &[12_u8; 32]).unwrap());
+        let signer = Arc::new(PasetoCapabilitySigner::new(cell.clone()).with_clock(|| NOW));
+        let minter = RunTokenMinter::with_signer_and_tuples(s7.clone(), None, signer);
+        let adapter = IdentityCiJobCredentialMinter::new(minter).with_clock(|| NOW);
+        (adapter, claim(), cell, s7)
+    }
+
+    /// **THE SUBSTITUTION MATRIX.** Every purpose's credential is accepted at exactly its own
+    /// boundary and refused at all three others — including "any preparation credential presented at
+    /// workload authorization" and "the workload credential presented at a preparation boundary".
+    #[tokio::test]
+    async fn every_phase_credential_is_accepted_only_at_its_own_boundary() {
+        let (adapter, claim, cell, s7) = phase_rig().await;
+        let boundary = checkout_boundary(&cell, s7, Arc::new(AllowClaimGate));
+        for minted_purpose in ALL_PURPOSES {
+            let (credential, binding) = phase_credential(&adapter, &claim, minted_purpose).await;
+            let spec = phase_job(credential, &claim, &binding);
+            for boundary_purpose in ALL_PURPOSES {
+                let outcome = authorize_at(&boundary, &spec, boundary_purpose);
+                assert_eq!(
+                    outcome.is_ok(),
+                    minted_purpose == boundary_purpose,
+                    "a {minted_purpose:?} credential at the {boundary_purpose:?} boundary"
+                );
+            }
+        }
+    }
+
+    /// **Dual-read rollout, both directions.** A legacy V1 context cannot satisfy any phase
+    /// boundary, and a V2 phase context cannot satisfy the legacy workload boundary — so a mixed
+    /// fleet can never accidentally cross-accept.
+    #[tokio::test]
+    async fn v1_and_v2_credentials_never_satisfy_each_other_s_boundary() {
+        let (adapter, claim, cell, s7) = phase_rig().await;
+        let boundary = checkout_boundary(&cell, s7.clone(), Arc::new(AllowClaimGate));
+
+        // V2 -> legacy boundary.
+        let (credential, binding) =
+            phase_credential(&adapter, &claim, CiCredentialPurpose::Workload).await;
+        let v2_spec = phase_job(credential, &claim, &binding);
+        let error = boundary
+            .authorize_retained(&v2_spec)
+            .err()
+            .expect("a phase-bound credential may not satisfy the legacy boundary");
+        assert!(
+            error
+                .0
+                .contains("phase-bound CI credential was presented at a legacy"),
+            "message was: {}",
+            error.0
+        );
+
+        // V1 -> phase boundary. Mint through the legacy claim-bound seam.
+        let legacy = adapter
+            .mint_verified(claim.clone(), checkout_authority())
+            .await
+            .expect("the legacy claim-bound credential mints");
+        let scope = checkout_scope();
+        let v1_spec = checkout_job(legacy, &claim, checkout_workspace(), Some(&scope));
+        for purpose in ALL_PURPOSES {
+            let error = authorize_at(&boundary, &v1_spec, purpose)
+                .err()
+                .expect("a legacy credential may not satisfy a phase boundary");
+            assert!(
+                error
+                    .0
+                    .contains("legacy claim-bound CI credential was presented at a phase"),
+                "message was: {}",
+                error.0
+            );
+        }
+        // ...and the legacy credential still works at the legacy boundary, unchanged.
+        boundary
+            .authorize_retained(&v1_spec)
+            .expect("the shipped V1 path is untouched by this slice");
+    }
+
+    /// Every field of the binding is load-bearing: mutating any of them breaks the recomputed
+    /// generation id (or the exactness checks) and the credential is refused.
+    #[tokio::test]
+    async fn a_mutated_phase_binding_is_refused() {
+        let (adapter, claim, cell, s7) = phase_rig().await;
+        let boundary = checkout_boundary(&cell, s7, Arc::new(AllowClaimGate));
+        let (credential, binding) =
+            phase_credential(&adapter, &claim, CiCredentialPurpose::CheckoutAdvertise).await;
+
+        type Mutation = (&'static str, fn(&mut CiJobCredentialBinding));
+        let mutations: [Mutation; 8] = [
+            ("generation id", |b| {
+                b.generation_id = format!("ci-credential:v1:{}", "0".repeat(64))
+            }),
+            ("purpose", |b| b.purpose = "checkout_fetch".into()),
+            ("binding version", |b| b.binding_version = 2),
+            ("issuance anchor", |b| b.issued_at_epoch_secs += 1),
+            ("expiry", |b| b.expires_at_epoch_secs -= 1),
+            ("CI run", |b| {
+                b.ci_run_id = "99999999-9999-4999-8999-999999999999".into()
+            }),
+            ("authority handle", |b| {
+                b.token_authority_handle = "ci-token-authority:v2:tampered".into()
+            }),
+            ("idem token", |b| b.idem_token = "idem-other".into()),
+        ];
+        for (label, mutate) in mutations {
+            let mut spec = phase_job(credential.clone(), &claim, &binding);
+            let context = mut_context(&mut spec);
+            mutate(
+                context
+                    .credential_binding
+                    .as_mut()
+                    .expect("a V2 context carries its binding"),
+            );
+            assert!(
+                boundary
+                    .authorize_checkout_advertise_retained(&spec, &checkout_scope())
+                    .is_err(),
+                "a mutated {label} must be refused"
+            );
+        }
+    }
+
+    /// The durable phase gate receives the RECOMPUTED generation and the deterministic JTI, and the
+    /// preparation boundaries never touch the workload's `leased -> running` CAS.
+    #[tokio::test]
+    async fn a_preparation_boundary_hands_the_exact_generation_down_and_never_runs_the_launch_cas()
+    {
+        let (adapter, claim, cell, s7) = phase_rig().await;
+        let calls = Arc::new(SpyClaimGate(std::sync::Mutex::new(Default::default())));
+        let boundary = checkout_boundary(&cell, s7, calls.clone());
+        let (credential, binding) = phase_credential(
+            &adapter,
+            &claim,
+            CiCredentialPurpose::CheckoutMaterialization,
+        )
+        .await;
+        let spec = phase_job(credential, &claim, &binding);
+        boundary
+            .authorize_checkout_materialization_retained(&spec, &checkout_scope())
+            .expect("the materialization boundary authorizes");
+        let recorded = calls.0.lock().unwrap();
+        assert_eq!(recorded.permit_calls, 0, "no legacy launch CAS may run");
+        assert_eq!(recorded.workload_v2_gates.len(), 0);
+        assert_eq!(recorded.phase_gates.len(), 1);
+        let gate = &recorded.phase_gates[0];
+        assert_eq!(gate.purpose, CiCredentialPurpose::CheckoutMaterialization);
+        assert_eq!(gate.generation_id, binding.generation_id);
+        assert_eq!(gate.jti, binding.jti);
+        assert_eq!(gate.ci_run_id, claim.ci_run_id);
+        assert_eq!(gate.token_authority_handle, claim.token_authority_handle);
+        assert_eq!(gate.idem_token, claim.idem_token);
+        assert_eq!(gate.issued_at_epoch_secs, binding.issued_at_epoch_secs);
+        assert_eq!(gate.expires_at_epoch_secs, binding.expires_at_epoch_secs);
+    }
+
+    /// A caller holding a valid phase credential for one repo/commit cannot drive a preparation
+    /// spawn against another.
+    #[tokio::test]
+    async fn a_preparation_boundary_refuses_a_substituted_checkout_scope() {
+        let (adapter, claim, cell, s7) = phase_rig().await;
+        let boundary = checkout_boundary(&cell, s7, Arc::new(AllowClaimGate));
+        let (credential, binding) =
+            phase_credential(&adapter, &claim, CiCredentialPurpose::CheckoutFetch).await;
+        let spec = phase_job(credential, &claim, &binding);
+        let other = derive_checkout_authorization_scope(
+            JobKind::Ci,
+            &WorkspaceSpec {
+                repo_ref: Some("myelin://acme/git/repo/other".into()),
+                commit: Some("a".repeat(40)),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(boundary
+            .authorize_checkout_fetch_retained(&spec, &other)
+            .is_err());
+    }
+
+    /// **The raw V2 Identity seam is not a bypass.** A caller reaching `mint_phase` directly cannot
+    /// have an arbitrary `run_id` signed, cannot bind a window outside its claim, cannot exceed the
+    /// 300-second ceiling, and cannot mint a preparation credential without checkout authority.
+    #[tokio::test]
+    async fn the_raw_phase_seam_refuses_a_forged_binding() {
+        let (adapter, claim, _cell, _s7) = phase_rig().await;
+        let good = phase_binding_for(&claim, CiCredentialPurpose::Workload, NOW, EXPIRY);
+        let request = |generation_id: String,
+                       issued: i64,
+                       expires: i64,
+                       purpose: CiCredentialPurpose,
+                       checkout: Option<CheckoutAuthorizationScope>| {
+            CiPhaseCredentialMintRequest {
+                claim: claim.clone(),
+                checkout,
+                purpose,
+                generation_id,
+                issued_at_epoch_secs: issued,
+                expires_at_epoch_secs: expires,
+            }
+        };
+        adapter
+            .mint_phase(request(
+                good.generation_id.clone(),
+                NOW,
+                EXPIRY,
+                CiCredentialPurpose::Workload,
+                None,
+            ))
+            .await
+            .expect("the honest binding mints");
+
+        // A run_id that is not the digest of its own binding.
+        assert!(adapter
+            .mint_phase(request(
+                "ci-credential:v1:forged".into(),
+                NOW,
+                EXPIRY,
+                CiCredentialPurpose::Workload,
+                None,
+            ))
+            .await
+            .is_err());
+        // A window that outlives the claim.
+        assert!(adapter
+            .mint_phase(request(
+                good.generation_id.clone(),
+                NOW,
+                EXPIRY + 1,
+                CiCredentialPurpose::Workload,
+                None,
+            ))
+            .await
+            .is_err());
+        // A preparation purpose without checkout authority.
+        let preparation =
+            phase_binding_for(&claim, CiCredentialPurpose::CheckoutAdvertise, NOW, EXPIRY);
+        assert!(adapter
+            .mint_phase(request(
+                preparation.generation_id,
+                NOW,
+                EXPIRY,
+                CiCredentialPurpose::CheckoutAdvertise,
+                None,
+            ))
+            .await
+            .is_err());
+        // An anchor before the claim started.
+        let early = phase_binding_for(&claim, CiCredentialPurpose::Workload, START - 1, EXPIRY);
+        assert!(adapter
+            .mint_phase(request(
+                early.generation_id,
+                START - 1,
+                EXPIRY,
+                CiCredentialPurpose::Workload,
+                None,
+            ))
+            .await
+            .is_err());
+    }
+
+    /// A generation whose five-minute window has already closed refuses at the raw seam too — the
+    /// claim never remints a phase.
+    #[tokio::test]
+    async fn an_expired_phase_generation_refuses_rather_than_rotating() {
+        let (adapter, claim, _cell, _s7) = phase_rig().await;
+        let binding = phase_binding_for(&claim, CiCredentialPurpose::Workload, NOW, EXPIRY);
+        let late = IdentityCiJobCredentialMinter::new(adapter.minter.clone()).with_clock(|| EXPIRY);
+        assert!(late
+            .mint_phase(CiPhaseCredentialMintRequest {
+                claim: claim.clone(),
+                checkout: None,
+                purpose: CiCredentialPurpose::Workload,
+                generation_id: binding.generation_id,
+                issued_at_epoch_secs: binding.issued_at_epoch_secs,
+                expires_at_epoch_secs: binding.expires_at_epoch_secs,
+            })
+            .await
+            .is_err());
+    }
+
+    /// **Dormancy.** The V1 context construction path — the one the production resolver uses —
+    /// never carries a credential binding, so nothing in production can reach a phase boundary.
+    #[test]
+    fn the_production_context_constructor_never_carries_a_phase_binding() {
+        let claim = claim();
+        let scope = checkout_scope();
+        let RunTokenAuthorizationContext::CiJob(context) =
+            ci_job_authorization_context(&claim, Some(&scope));
+        assert!(
+            context.credential_binding.is_none(),
+            "the V1 production resolver context is claim-bound, never phase-bound"
+        );
+        assert_eq!(
+            context.required_capabilities,
+            required_ci_capabilities(Some(&scope)),
+            "the V1 capability vector is byte-unchanged by this slice"
         );
     }
 }

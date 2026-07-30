@@ -59,6 +59,9 @@ pub mod ci_claim_token_issuer;
 /// The immutable, topology-derived scheduler claim window — the per-generation hard ceiling the
 /// heartbeat-extendable execution lease is renewed inside.
 pub mod ci_claim_window;
+/// CT-007 phase-credential generations: the append-only per-purpose credential log, its
+/// digest-form signed generation binding, and the retained per-boundary execution gates.
+pub mod ci_credential_generation;
 /// Canonical, insert-only replay authority for a durable CI workflow. The manifest binds the exact
 /// DAG, per-context check attempts, workflow code identity, and server-granted launch templates;
 /// secret values and minted token JTIs are structurally absent.
@@ -89,9 +92,19 @@ pub use ci_drive_manifest::{
     GrantedCiJobV1, CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN, CI_DRIVE_MANIFEST_SCHEMA_V1,
     MAX_CI_DRIVE_MANIFEST_BYTES,
 };
+pub use ci_credential_generation::{
+    acquire_phase_generation_ownership, lock_phase_generation_query, phase_generation_id,
+    verify_phase_generation_live, CiCredentialGenerationError,
+    CiCredentialGenerationOutcome, CiCredentialPurpose, CiJobCredentialGenerationStore,
+    CiJobCredentialWriteVersion, CiPhaseCredentialBinding, CiPhaseCredentialMintRequest,
+    CiPhaseCredentialMinter, CiPhaseGenerationGate, CiPhaseGenerationInputs, MintedPhaseCredential,
+    RetainedCiPhaseGeneration, CI_PHASE_CREDENTIAL_BINDING_V1, CI_PHASE_CREDENTIAL_GENERATION_PREFIX,
+    CI_PHASE_CREDENTIAL_V1_DOMAIN, VERIFY_PHASE_GENERATION_QUERY,
+};
 pub use ci_identity_adapter::{
-    ci_job_authorization_context, IdentityCiJobCredentialMinter, IdentityCiJobLaunchAuthorizer,
-    CI_JOB_PRINCIPAL_ID, CI_JOB_REQUIRED_CAPABILITIES,
+    ci_job_authorization_context, ci_job_phase_authorization_context, expected_phase_jti,
+    phase_ci_capabilities, CiCredentialExpectation, IdentityCiJobCredentialMinter,
+    IdentityCiJobLaunchAuthorizer, CI_JOB_PRINCIPAL_ID, CI_JOB_REQUIRED_CAPABILITIES,
 };
 pub use ci_launch_authority::{
     CiAttemptBudgetPolicy, CiAttemptBudgetRevision, CiJobBudgetReservationProvider,
@@ -548,7 +561,8 @@ pub use surfacing_tools::{
 
 pub use scheduler::{
     lane_token, state_token, ClaimRequest, Claimed, EnqueueOutcome, JobState, Lane, QueuedJob,
-    SchedulerState, AUTHORIZE_JOB_LAUNCH_QUERY, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY,
+    SchedulerState, AUTHORIZE_JOB_LAUNCH_QUERY, AUTHORIZE_JOB_LAUNCH_V2_QUERY,
+    CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY,
     COMPLETE_JOB_QUERY, HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
 };
 
@@ -1112,8 +1126,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            57,
-            "all 20 tables, three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 6 job_queue ALTERs (4 claim/completion + the claim-window expand and its validation), the ci_job_spec-stage and three accounting ALTERs, scheduler RLS boundary, 3 claim-column grants, 4 ci_run/workflow discovery grants (incl. the wf_version grant the cutover fence needs), 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, the prelaunch deadline expand, and the cutover fence's database-wide backlog probe plus its predecessor-row seed are present"
+            58,
+            "all 21 tables (incl. the CT-007 credential-generation log), three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 6 job_queue ALTERs (4 claim/completion + the claim-window expand and its validation), the ci_job_spec-stage and three accounting ALTERs, scheduler RLS boundary, 3 claim-column grants, 4 ci_run/workflow discovery grants (incl. the wf_version grant the cutover fence needs), 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, the prelaunch deadline expand, and the cutover fence's database-wide backlog probe plus its predecessor-row seed are present"
         );
         assert!(
             spec.consumers.is_empty(),

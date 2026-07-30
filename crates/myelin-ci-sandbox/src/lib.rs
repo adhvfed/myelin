@@ -489,6 +489,37 @@ pub struct CiJobAuthorizationContext {
     /// from the in-hand `JobSpec.workspace` and require it to equal this field exactly (Sol's
     /// review).
     pub checkout_scope: Option<CheckoutAuthorizationScope>,
+    /// **CT-007 phase-credential generations.** The exact durable credential generation this
+    /// ephemeral context was resolved under, or `None` for the legacy V1 claim-bound shape whose
+    /// signed `run_id` is the bare `job_id`. Present iff the resolver ran under
+    /// `CiJobCredentialWriteVersion::V2PhaseBound`, so a rolling fleet keeps verifying legacy
+    /// contexts through the unchanged job-id path while V2 contexts verify through the generation.
+    pub credential_binding: Option<CiJobCredentialBinding>,
+}
+
+/// **CT-007 phase-credential generations: the ephemeral binding a V2 launch boundary re-verifies.**
+///
+/// Carries the durable generation's own facts PLUS the three immutable claim-identity fields the
+/// generation digest binds that [`CiJobAuthorizationContext`] does not already hold (`ci_run_id`,
+/// `token_authority_handle`, `idem_token`). Without those the boundary could only COMPARE the signed
+/// `run_id` against a value it was handed; with them it RECOMPUTES the generation id from
+/// server-resolved facts and requires the signed value to equal it — the same
+/// "never trust, always recompute" posture `token_authority_handle` verification already has.
+///
+/// Like [`RunTokenAuthorizationContext`] this deliberately implements neither `Serialize` nor
+/// `Deserialize`: a claimed authorization result must never be persistable or customer-suppliable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiJobCredentialBinding {
+    pub binding_version: i16,
+    /// The durable purpose vocabulary token (`checkout_advertise`, `checkout_fetch`,
+    /// `checkout_materialization`, `workload`).
+    pub purpose: String,
+    pub generation_id: String,
+    pub issued_at_epoch_secs: i64,
+    pub expires_at_epoch_secs: i64,
+    pub ci_run_id: String,
+    pub token_authority_handle: String,
+    pub idem_token: String,
 }
 
 impl RunTokenCredential {
@@ -1234,6 +1265,11 @@ pub struct RunnerHooks {
     /// [`Self::with_checkout_authorization`] — [`Self::authorize_checkout`] refuses outright on
     /// `None` rather than silently treating a missing hook as authorization granted.
     checkout_authorization: Option<CheckoutAuthorizationHook>,
+    /// CT-007 phase-credential generations: the V2 per-phase authorization hook. `None` for every
+    /// caller that has not opted into phase-bound credentials (which is all of production today);
+    /// `RunnerHooks::authorize_checkout_phase` refuses outright on `None`, and never falls back to
+    /// the legacy claim-bound hook.
+    checkout_phase_authorization: Option<CheckoutPhaseAuthorizationHook>,
 }
 
 /// Single durable owner of successful completion settlement.
@@ -1338,6 +1374,17 @@ impl CheckoutAuthorizationScope {
 pub type CheckoutAuthorizationHook =
     Box<dyn Fn(&JobSpec, &CheckoutAuthorizationScope) -> Result<(), HookError> + Send + Sync>;
 
+/// **CT-007 phase-credential generations: the V2 per-phase authorization hook.** Unlike
+/// [`CheckoutAuthorizationHook`] (read-only, returns `()`), this one RETURNS the retained durable
+/// [`LaunchPermit`] that the raw spawn gate must consume — so a preparation container can only ever
+/// be launched through a permit the control plane's own durable phase gate produced, never through
+/// an internally-minted [`LaunchPermit::immediate`].
+pub type CheckoutPhaseAuthorizationHook = Box<
+    dyn Fn(&JobSpec, &CheckoutAuthorizationScope, CheckoutPhase) -> Result<LaunchPermit, HookError>
+        + Send
+        + Sync,
+>;
+
 /// An unforgeable, one-shot proof that [`RunnerHooks::authorize_checkout`] genuinely succeeded for
 /// an EXACT [`CheckoutAuthorizationScope`] AND an exact token generation (CT-007 slice 5b.3-2a,
 /// Sol's review). Defined in the private `checkout_authorization` module — NOT here at the crate
@@ -1348,6 +1395,13 @@ pub type CheckoutAuthorizationHook =
 /// actually calls the hook — can ever construct one.
 #[allow(unused_imports)]
 pub(crate) use checkout_authorization::CheckoutAuthorizationProof;
+/// CT-007 round-1 blocker 2: the fused, non-constructible phase authorization. Same module-privacy
+/// reasoning as `CheckoutAuthorizationProof` — only `checkout_authorization` can build one.
+#[allow(unused_imports)]
+pub(crate) use checkout_authorization::PhaseAuthorization;
+/// CT-007 phase-credential generations: the preparation-boundary vocabulary. PUBLIC (unlike the
+/// proof itself) because the control plane supplies the hook that receives it.
+pub use checkout_authorization::CheckoutPhase;
 
 enum AttributionHook {
     Immediate(AttributeHook),
@@ -1473,6 +1527,7 @@ impl RunnerHooks {
             attribute: AttributionHook::Immediate(attribute),
             isolation_floor,
             checkout_authorization: None,
+            checkout_phase_authorization: None,
         }
     }
 
@@ -1492,6 +1547,7 @@ impl RunnerHooks {
             attribute: AttributionHook::Fenced(attribute),
             isolation_floor,
             checkout_authorization: None,
+            checkout_phase_authorization: None,
         }
     }
 
@@ -1502,6 +1558,18 @@ impl RunnerHooks {
     #[allow(dead_code)]
     pub fn with_checkout_authorization(mut self, hook: CheckoutAuthorizationHook) -> Self {
         self.checkout_authorization = Some(hook);
+        self
+    }
+
+    /// CT-007 phase-credential generations: attach the V2 per-phase authorization hook. Additive in
+    /// exactly the same way — every existing caller stays byte-unchanged and keeps `None`, so the
+    /// whole phase-bound API is unreachable until a caller explicitly opts in.
+    #[allow(dead_code)]
+    pub fn with_checkout_phase_authorization(
+        mut self,
+        hook: CheckoutPhaseAuthorizationHook,
+    ) -> Self {
+        self.checkout_phase_authorization = Some(hook);
         self
     }
 
@@ -2191,6 +2259,7 @@ mod tests {
             claim_expires_at_epoch_secs: 1_785_000_030,
             required_capabilities: vec!["job.launch".into()],
             checkout_scope: None,
+            credential_binding: None,
         });
         spec.run_token_authorization = Some(expected.clone());
         backend.launch(&spec, &hooks).unwrap();

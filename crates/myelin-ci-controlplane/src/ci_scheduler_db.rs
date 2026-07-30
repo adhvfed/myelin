@@ -276,6 +276,12 @@ struct SchedulerProbe {
     prelaunch_usage_select: bool,
     prelaunch_usage_update_status: bool,
     prelaunch_usage_update_resolved_at: bool,
+    /// **CT-007 phase-credential generations: an EXPLICIT negative.** The scheduler role must hold
+    /// NO privilege at all on `ci_job_credential_generation` — neither reaping nor renewal reads it,
+    /// and the credential log is the durable authority a phase gate consults. The dynamic
+    /// unrelated-table check below would also catch a stray grant, but a named probe makes the
+    /// intent unmissable to the next person adding a grant migration.
+    credential_generation_privilege: bool,
     mapping_function_execute: bool,
     excess_privilege: bool,
 }
@@ -393,6 +399,10 @@ fn validate_probe_before_mapping(
     if scheduler.job_update_claim_window {
         return Err(CiSchedulerDbError::ExcessPrivileges);
     }
+    // CT-007 phase-credential generations: the credential log is invisible to the scheduler role.
+    if scheduler.credential_generation_privilege {
+        return Err(CiSchedulerDbError::ExcessPrivileges);
+    }
     if scheduler.excess_privilege {
         return Err(CiSchedulerDbError::ExcessPrivileges);
     }
@@ -507,6 +517,48 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                 pg_catalog.has_table_privilege(session_user, 'public.ci_job_prelaunch_usage', 'SELECT') AS prelaunch_usage_select,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_job_prelaunch_usage', 'status', 'UPDATE') AS prelaunch_usage_update_status,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_job_prelaunch_usage', 'resolved_at', 'UPDATE') AS prelaunch_usage_update_resolved_at,
+                (
+                  pg_catalog.has_table_privilege(
+                    session_user, 'public.ci_job_credential_generation', 'SELECT')
+                  OR pg_catalog.has_table_privilege(
+                    session_user, 'public.ci_job_credential_generation', 'INSERT')
+                  OR pg_catalog.has_table_privilege(
+                    session_user, 'public.ci_job_credential_generation', 'UPDATE')
+                  OR pg_catalog.has_table_privilege(
+                    session_user, 'public.ci_job_credential_generation', 'DELETE')
+                  OR pg_catalog.has_table_privilege(
+                    session_user, 'public.ci_job_credential_generation', 'TRUNCATE')
+                  OR pg_catalog.has_table_privilege(
+                    session_user, 'public.ci_job_credential_generation', 'REFERENCES')
+                  OR pg_catalog.has_table_privilege(
+                    session_user, 'public.ci_job_credential_generation', 'TRIGGER')
+                  OR EXISTS (
+                    SELECT 1
+                      FROM pg_catalog.pg_attribute AS credential_column
+                     WHERE credential_column.attrelid =
+                           'public.ci_job_credential_generation'::regclass
+                       AND credential_column.attnum > 0
+                       AND NOT credential_column.attisdropped
+                       AND (
+                         pg_catalog.has_column_privilege(
+                           session_user, credential_column.attrelid,
+                           credential_column.attnum, 'SELECT'
+                         )
+                         OR pg_catalog.has_column_privilege(
+                           session_user, credential_column.attrelid,
+                           credential_column.attnum, 'INSERT'
+                         )
+                         OR pg_catalog.has_column_privilege(
+                           session_user, credential_column.attrelid,
+                           credential_column.attnum, 'UPDATE'
+                         )
+                         OR pg_catalog.has_column_privilege(
+                           session_user, credential_column.attrelid,
+                           credential_column.attnum, 'REFERENCES'
+                         )
+                       )
+                  )
+                ) AS credential_generation_privilege,
                 pg_catalog.has_function_privilege(
                   session_user, 'public.myelin_ci_scheduler_region()'::regprocedure, 'EXECUTE'
                 ) AS mapping_function_execute,
@@ -746,6 +798,7 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
         prelaunch_usage_select: row.get("prelaunch_usage_select"),
         prelaunch_usage_update_status: row.get("prelaunch_usage_update_status"),
         prelaunch_usage_update_resolved_at: row.get("prelaunch_usage_update_resolved_at"),
+        credential_generation_privilege: row.get("credential_generation_privilege"),
         mapping_function_execute: row.get("mapping_function_execute"),
         excess_privilege: row.get("excess_privilege"),
     })

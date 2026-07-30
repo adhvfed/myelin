@@ -3238,3 +3238,80 @@ Then 5b.3-6 composition, 5b.3-7 live drill, task #91 (fact sheet gathered: the s
 authority_from_durable_claim never cross-checking meter_to.reserve_id; template = the 5b.3-2b/2c
 checkout_scope precedent). Pre-existing lint-gate red tracked as its own item. The rest of ledger
 12's open items are unchanged.
+
+---
+
+## 2026-07-30 — CT-007 phase-credential generations landed: 5b.3-6 prerequisite #2 (Fable
+orchestrating; Opus, implementation; Sol, design + 3 adversarial review rounds to "no merge blockers")
+
+**Why.** Found in the lease-slice design round: the signed launch credential expires at
+`min(claim_started_at + 300s, claim_expires_at)` and the same claim deterministically refuses
+re-mint, so a checkout-bearing job whose preparation runs >5min reaches Hop B / workload
+authorization with a dead credential — independent of the lease sizing the previous slice fixed.
+5b.3-6 needs a fresh short-lived credential per phase boundary, each independently authorized
+against the exact live generation.
+
+**What landed (all dormant — production pinned V1ClaimBound, zero production mint callers, proven by
+a per-file/per-marker dormancy pin across BOTH crates + composition-root V1 assertions).** New
+append-only `ci_job_credential_generation` table (`ci_0021`, in `create_statements()` so it gets
+standard tenant RLS/FORCE): one row per exact claim + purpose (advertise/fetch/materialization/
+workload), purpose→ordinal CHECK, unique generation_id/jti per tenant+region, NO status column
+(current = highest ordinal), NO parent-attempt FK (advertise mints in the resolver before
+admission), immutability trigger + UPDATE/DELETE revoked, scheduler zero-privilege (excess-probe
+extended). The signed credential's `run_id` becomes `ci-credential:v1:<blake3 digest>` under domain
+`myelin.ci.phase-credential.v1\0`, length-prefixed, binding the full claim identity + purpose +
+ordinal + issuance anchor + exact expiry, EXCLUDING lease_expires/claim_window_secs/renewal/
+reserve_id; `CiJobCredentialWriteVersion::{V1ClaimBound default, V2PhaseBound}` with dual-read
+(legacy run_id=job_id keeps verifying). Digest-form run_id traced through every consumer
+(authorize_ci_job, capability_crypto, edge authz, JTI derivation) — all opaque-string, no
+structural conflict. Purpose-attenuated capability vectors (advertise/fetch = job.launch +
+repo:<ref>#pull; materialization = job.launch; workload = job.launch + artifact.write).
+Mint = exact lock order (queue FOR UPDATE → ci_run → manifest/spec authority → advisory → journal
++ generation rows), insert-or-replay inside the tx, Identity invoked with locks held, exact
+validation (JTI equality, TTL == expiry-anchor, signed expiry == persisted), 300s ceiling + claim
+cap; exact retry reuses everything and returns the same bearer; expired generation refuses, never
+rotates. Sandbox seam dormant: an inseparable non-Clone `PhaseAuthorization` (private permit
+reachable only by a consuming method that first runs verify_provenance — phase + privately-retained
+JTI vs the presented credential); separate legacy vs `_v2` entry points with no LegacyImmediate arm
+in the V2 API at the type level; the fetch-credential one-shot provider fires after advertise
+retires AND after the lease-slice's PreparationLeaseCheckpoint, before the fetch spawns.
+`AUTHORIZE_JOB_LAUNCH_V2_QUERY` folds the workload-generation + lease-liveness predicate into the
+launch CAS; the legacy `AUTHORIZE_JOB_LAUNCH_QUERY` stays byte-frozen (FROZEN_LAUNCH_PREDICATES pin
+holds).
+
+**Review chain (3 rounds, each caught real depth):** r1 = 3 blockers — preparation verification not
+retained through the child-release boundary (the SELECT's tx closed before the mechanically-blocked
+child released, so reaper/successor could invalidate the generation mid-flight); detachable
+proof/permit (a still-valid proof for requeued claim A + a live permit for claim B spawns A's
+container); the V2 CAS could resurrect an expired lease — plus a non-concurrent "race" drill and a
+dormancy test that scanned only one crate and excluded the defining modules (masking ~95% of
+gvisor.rs via a broken #[cfg(test)] split, a real pre-existing pin defect). r2 = 2 blockers — the
+retained transaction used raw BEGIN (not SQLx RAII), so an aborted acquisition future leaked an
+open transaction + tenant GUCs + row locks into the pool; and `FOR SHARE OF q` didn't freeze the
+authorization predicate's dependency on mutable journal `status` (the topology sealer updates it
+locking only the journal row, so the fetch child could start after its authorization silently
+became invalid). r3 = 1 minor (inseparability pin missed pub(super)/destructuring leak forms).
+Fixes: retained RAII `Transaction<'static>` (cancellation-safe at every await); acquisition also
+takes `FOR SHARE` on every status-bearing journal row in canonical queue→journal order + a third
+statement re-verifying under both locks; the sealer's SKIP LOCKED confirmed starvation-free; lock
+graph confirmed acyclic. Two builder deviations accepted: binding carries
+ci_run_id/token_authority_handle/idem_token beyond the design's five fields (required for
+server-side generation-id RECOMPUTATION — strictly stronger); enum-parameter authorities replacing
+the single proof arg (keeps 23 legacy call sites byte-unchanged).
+
+**Gates (orchestrator ran independently):** controlplane --lib 583, sandbox --lib 476, the entire
+`--all-targets --features integration` matrix green (credential suite 14), clippy -D warnings clean,
+check clean, myelin-lints fully green. Pre-existing failures untouched and tracked separately:
+firecracker `escape_prod_path_test` (guest emits nothing on this host — env, proven at clean HEAD).
+
+**5b.3-6 acceptance criterion carried forward (Sol, non-blocking):** Hop B's V2 boundary checks
+phase/JTI/generation/commit but NOT same-commit WORKSPACE provenance (CheckoutPreparationSpec
+carries nothing claim-specific beyond commit); 5b.3-6 must bind the exact parent-attempt runtime
+bundle / ManagedWorkspace / UserNamespaceLease / CheckoutPreparationSession.
+
+**Still open (updated):** BOTH 5b.3-6 prerequisites now closed (lease/topology `17d16043`; this
+slice). **v1→v2 reservation flip must land before 5b.3-6** (begin_parent_attempt refuses v1). Then
+5b.3-6 composition (flips BOTH CiJobCredentialWriteVersion→V2PhaseBound and the reservation
+writer→v2, wires the dormant renewal checkpoints + phase mint paths + PhaseAuthorization V2 entry
+points, binds workspace provenance per the criterion above), 5b.3-7 live drill, task #91. Then the
+gate-2 vertical slice. The rest of ledger 12's open items are unchanged.

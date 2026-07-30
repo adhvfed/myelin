@@ -52,7 +52,8 @@ use crate::workspace_manager::{
 use crate::workspace_storage::WorkspaceStorageError;
 use crate::{
     drain_capped, CheckoutAuthorizationProof, CompletionSettlementOwner, EgressPolicy, HookError,
-    IdemToken, ImageRef, JobKind, JobSpec, LaunchPermit, MeterTarget, ReserveHandle,
+    IdemToken, ImageRef, JobKind, JobSpec, LaunchPermit, MeterTarget, PhaseAuthorization,
+    ReserveHandle,
     ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend,
     SandboxCancellation, SandboxHandle, SandboxLaunch, SandboxLaunchError, SandboxOutputSink,
     SandboxOutputStream, SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
@@ -6769,12 +6770,14 @@ fn handle_git_wire_hop_finalization(
 /// [`BundleCleanupProof`] is checked against the FINAL disposition, regardless of which branch below
 /// produced it — an unproven pre-finalization bundle cleanup forces `TeardownUnproven`, never a free
 /// `Refused`.
+#[allow(clippy::too_many_arguments)]
 fn run_one_git_wire_hop_within_parent_attempt(
     hop_spec: &GitWireSpec,
     command: Vec<String>,
     cancellation: &AtomicBool,
     usage_before: ResourceUsage,
     prior_hop_completed: bool,
+    permit: LaunchPermit,
     execute: GitWireHopExecutor,
 ) -> Result<(SandboxResult, ResourceUsage), CheckoutTransportError> {
     let refuse_or_fail = |message: String| {
@@ -6795,7 +6798,7 @@ fn run_one_git_wire_hop_within_parent_attempt(
         hop_spec.stdin.clone(),
         &rootfs,
         cancellation,
-        LaunchPermit::immediate(),
+        permit,
     );
 
     // Sol's round-4 review: match the COMPLETE `(result, cleanup_proof)` pair, not just the error
@@ -6856,6 +6859,31 @@ fn synthetic_parent_attempt_idem_token(label: &str) -> IdemToken {
 /// workload CAS. See [`CheckoutTransportError`] for how a mid-transport failure still carries the
 /// real usage already measured; the caller (5b.3-4/5/6) decides how that pre-workload usage survives
 /// and settles.
+/// **CT-007 round-1 blocker 2: how Hop A is authorized, MODULE-PRIVATE.**
+///
+/// This enum is an implementation detail of the shared transport body — it is deliberately NOT
+/// `pub(crate)`, so no other module can select an arm. The two PUBLIC entry points
+/// ([`fetch_checkout_pack_within_parent_attempt`] for V1 and
+/// [`fetch_checkout_pack_within_parent_attempt_v2`] for V2) each construct exactly one arm, so the
+/// V2 entry point offers no legacy option at the TYPE level rather than by source-pin convention.
+enum TransportAuthority<'a> {
+    LegacyClaimBound {
+        proof: CheckoutAuthorizationProof,
+    },
+    PhaseBound {
+        advertise: PhaseAuthorization,
+        /// Invoked EXACTLY once, only after the advertisement succeeded and its container was
+        /// retired, and before the fetch spawns. A refusal here aborts Hop A carrying the
+        /// advertisement's already-measured usage — the fetch never spawns. The credential and the
+        /// authorization come back together, and the authorization's own privately-retained JTI is
+        /// what the credential is checked against when the permit is extracted.
+        fetch: &'a mut dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>,
+    },
+}
+
+/// **The LEGACY (V1 claim-bound) Hop A entry point.** Signature and behaviour are exactly as
+/// shipped: one claim-bound credential covers both git-wire executions, each spawned under an
+/// internally-minted immediate permit. There is no durable phase gate for a V1 preparation.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) fn fetch_checkout_pack_within_parent_attempt(
@@ -6887,6 +6915,128 @@ pub(crate) fn fetch_checkout_pack_within_parent_attempt(
     )
 }
 
+/// **The V2 (phase-bound) Hop A entry point.** Takes ONE opaque [`PhaseAuthorization`] for the
+/// advertise leg — proof and retained durable permit fused from a single hook invocation — plus a
+/// one-shot provider for the fetch leg's own credential + authorization, invoked only after the
+/// advertisement has fully retired and the lease checkpoint has renewed.
+///
+/// There is deliberately NO legacy arm reachable from here: a `CheckoutAuthorizationProof` cannot be
+/// passed to this function at all, and a `PhaseAuthorization` cannot be constructed outside
+/// `checkout_authorization`.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) fn fetch_checkout_pack_within_parent_attempt_v2(
+    root: &Path,
+    tenant: &str,
+    region: &str,
+    repo: &str,
+    expected: &ExpectedGitCommitId,
+    limits: ResourceLimits,
+    advertise_credential: RunTokenCredential,
+    advertise: PhaseAuthorization,
+    fetch: &mut dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>,
+    cancellation: &AtomicBool,
+    lease_checkpoint: Option<&dyn crate::PreparationLeaseCheckpoint>,
+) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
+    fetch_checkout_pack_within_parent_attempt_v2_given(
+        root,
+        tenant,
+        region,
+        repo,
+        expected,
+        limits,
+        advertise_credential,
+        advertise,
+        fetch,
+        cancellation,
+        lease_checkpoint,
+        &|job, cfg, stdin, rootfs, cancellation, permit| {
+            run_git_wire_container_raw(job, cfg, stdin, rootfs, cancellation, permit)
+        },
+    )
+}
+
+/// Deterministic `_given` seam for the V2 entry point (this codebase's established convention).
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+fn fetch_checkout_pack_within_parent_attempt_v2_given(
+    root: &Path,
+    tenant: &str,
+    region: &str,
+    repo: &str,
+    expected: &ExpectedGitCommitId,
+    limits: ResourceLimits,
+    advertise_credential: RunTokenCredential,
+    advertise: PhaseAuthorization,
+    fetch: &mut dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>,
+    cancellation: &AtomicBool,
+    lease_checkpoint: Option<&dyn crate::PreparationLeaseCheckpoint>,
+    execute: GitWireHopExecutor,
+) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
+    fetch_checkout_pack_within_parent_attempt_inner(
+        root,
+        tenant,
+        region,
+        repo,
+        expected,
+        limits,
+        advertise_credential,
+        TransportAuthority::PhaseBound { advertise, fetch },
+        cancellation,
+        lease_checkpoint,
+        execute,
+    )
+}
+
+/// The exact anti-substitution comparison every checkout proof must pass against the request it is
+/// about to authorize: the token generation it was checked against, and the tenant/repo/commit it
+/// names. Extracted (CT-007 phase-credential generations) so the V2 FETCH leg — whose proof and
+/// credential are minted mid-transport, after the advertisement — receives byte-identical scrutiny
+/// to the advertise leg rather than a weaker ad-hoc check.
+#[allow(dead_code)]
+fn verify_transport_proof_against_request(
+    proof: &CheckoutAuthorizationProof,
+    run_token: &RunTokenCredential,
+    tenant: &str,
+    repo: &str,
+    expected: &ExpectedGitCommitId,
+) -> Result<(), String> {
+    if proof.run_token_jti() != run_token.jti {
+        return Err(format!(
+            "checkout authorization proof was minted against run-token jti {:?}, but this \
+             transport is running under jti {:?} -- refusing before any spawn",
+            proof.run_token_jti(),
+            run_token.jti
+        ));
+    }
+    let scope = proof.scope();
+    if scope.tenant().0 != tenant {
+        return Err(format!(
+            "checkout authorization proof was minted for tenant {:?}, but this transport is \
+             requesting tenant {tenant:?}",
+            scope.tenant().0
+        ));
+    }
+    if scope.repo_id() != repo {
+        return Err(format!(
+            "checkout authorization proof was minted for repo {:?}, but this transport is \
+             requesting repo {repo:?}",
+            scope.repo_id()
+        ));
+    }
+    if scope.commit_hex() != expected.as_str() || scope.commit_format() != expected.format() {
+        return Err(format!(
+            "checkout authorization proof was minted for commit {:?} ({:?}), but this transport \
+             is requesting {:?} ({:?})",
+            scope.commit_hex(),
+            scope.commit_format(),
+            expected.as_str(),
+            expected.format()
+        ));
+    }
+    Ok(())
+}
+
 /// Deterministic `_given` seam for [`fetch_checkout_pack_within_parent_attempt`] (this codebase's
 /// established convention, e.g. `finalize_runtime_given`): `execute` stands in for
 /// `run_git_wire_container_raw` so tests can drive the aggregation/error-mapping logic without
@@ -6907,50 +7057,67 @@ fn fetch_checkout_pack_within_parent_attempt_given(
     lease_checkpoint: Option<&dyn crate::PreparationLeaseCheckpoint>,
     execute: GitWireHopExecutor,
 ) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
-    // Verify the proof's scope AND the exact token generation it was checked against, against THIS
-    // parent attempt's own request, BEFORE spawning anything (Sol's design, point A): a proof minted
-    // for a different repo/commit/token-generation must never authorize a substituted transport.
-    let scope = proof.scope();
-    if proof.run_token_jti() != run_token.jti {
-        return Err(CheckoutTransportError::Refused {
-            message: format!(
-                "checkout authorization proof was minted against run-token jti {:?}, but this \
-                 transport is running under jti {:?} -- refusing before any spawn",
-                proof.run_token_jti(),
-                run_token.jti
-            ),
-        });
-    }
-    if scope.tenant().0 != tenant {
-        return Err(CheckoutTransportError::Refused {
-            message: format!(
-                "checkout authorization proof was minted for tenant {:?}, but this transport is \
-                 requesting tenant {tenant:?}",
-                scope.tenant().0
-            ),
-        });
-    }
-    if scope.repo_id() != repo {
-        return Err(CheckoutTransportError::Refused {
-            message: format!(
-                "checkout authorization proof was minted for repo {:?}, but this transport is \
-                 requesting repo {repo:?}",
-                scope.repo_id()
-            ),
-        });
-    }
-    if scope.commit_hex() != expected.as_str() || scope.commit_format() != expected.format() {
-        return Err(CheckoutTransportError::Refused {
-            message: format!(
-                "checkout authorization proof was minted for commit {:?} ({:?}), but this \
-                 transport is requesting {:?} ({:?})",
-                scope.commit_hex(),
-                scope.commit_format(),
-                expected.as_str(),
-                expected.format()
-            ),
-        });
-    }
+    fetch_checkout_pack_within_parent_attempt_inner(
+        root,
+        tenant,
+        region,
+        repo,
+        expected,
+        limits,
+        run_token,
+        TransportAuthority::LegacyClaimBound { proof },
+        cancellation,
+        lease_checkpoint,
+        execute,
+    )
+}
+
+/// The one shared transport body both entry points drive. `authority` is module-private, so the arm
+/// is decided by WHICH entry point was called, never by the caller.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+fn fetch_checkout_pack_within_parent_attempt_inner(
+    root: &Path,
+    tenant: &str,
+    region: &str,
+    repo: &str,
+    expected: &ExpectedGitCommitId,
+    limits: ResourceLimits,
+    run_token: RunTokenCredential,
+    authority: TransportAuthority<'_>,
+    cancellation: &AtomicBool,
+    lease_checkpoint: Option<&dyn crate::PreparationLeaseCheckpoint>,
+    execute: GitWireHopExecutor,
+) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
+    // Resolve the advertise leg's launch permit plus (V2 only) the one-shot fetch source. In the V2
+    // arm the permit can ONLY be obtained by consuming the whole `PhaseAuthorization` through a
+    // check of its phase, its privately-retained run-token JTI, and its scope against THIS request —
+    // so a permit minted for another claim/generation can never be paired with this credential
+    // (round-1 blocker 2). In the V1 arm the proof is verified and an immediate permit is minted, as
+    // shipped.
+    let (advertise_generation, advertise_permit, mut fetch_source) = match authority {
+        TransportAuthority::LegacyClaimBound { proof } => {
+            // Verify the proof's scope AND the exact token generation it was checked against,
+            // against THIS parent attempt's own request, BEFORE spawning anything (Sol's design,
+            // point A).
+            verify_transport_proof_against_request(&proof, &run_token, tenant, repo, expected)
+                .map_err(|message| CheckoutTransportError::Refused { message })?;
+            (None, LaunchPermit::immediate(), None)
+        }
+        TransportAuthority::PhaseBound { advertise, fetch } => {
+            let generation = advertise.generation_id().to_owned();
+            let permit = advertise
+                .into_transport_permit(
+                    crate::CheckoutPhase::Advertise,
+                    &run_token,
+                    tenant,
+                    repo,
+                    expected,
+                )
+                .map_err(|error| CheckoutTransportError::Refused { message: error.0 })?;
+            (Some(generation), permit, Some(fetch))
+        }
+    };
 
     let zero = ResourceUsage {
         cpu_seconds: 0,
@@ -6996,6 +7163,7 @@ fn fetch_checkout_pack_within_parent_attempt_given(
         cancellation,
         zero,
         false, // this is the FIRST hop of the whole transport -- nothing has run yet.
+        advertise_permit,
         execute,
     )?;
 
@@ -7026,33 +7194,6 @@ fn fetch_checkout_pack_within_parent_attempt_given(
     request.extend_from_slice(&pkt_line_encode("done\n"));
 
     // ---- Hop A step 2: fetch ----
-    let mut fetch_argv = allow_reachable;
-    fetch_argv.extend(["upload-pack".to_string(), "--stateless-rpc".to_string()]);
-    let fetch_spec = GitWireSpec::for_repo(
-        root,
-        tenant,
-        region,
-        repo,
-        fetch_argv,
-        request,
-        Vec::new(),
-        None,
-        limits,
-        run_token,
-        synthetic_parent_attempt_meter_target(),
-        synthetic_parent_attempt_idem_token("checkout-fetch"),
-    )
-    .map_err(|e| {
-        checkout_transport_retryable(
-            format!("build fetch spec: {e}"),
-            usage_after_advertise,
-        )
-    })?;
-    let mut fetch_command = Vec::with_capacity(fetch_spec.git_argv.len() + 2);
-    fetch_command.push("git".to_string());
-    fetch_command.extend(fetch_spec.git_argv.iter().cloned());
-    fetch_command.push(WIRE_REPO_MOUNT.to_string());
-
     // Stage the pack artifact BEFORE launching the fetch (same reasoning as `fetch_checkout_pack`):
     // a staging failure here must still carry the advertisement's already-measured usage, never
     // silently drop it.
@@ -7076,12 +7217,79 @@ fn fetch_checkout_pack_within_parent_attempt_given(
         })?;
     }
 
+    // CT-007 phase-credential generations: mint the FETCH credential here — after the advertisement
+    // is fully retired, after the lease renewal proved this worker still owns the generation, and
+    // before anything for the fetch is built or spawned. The renewal is deliberately NOT treated as
+    // authorization: the provider re-locks and re-verifies the exact live generation itself. A
+    // refusal aborts carrying the advertisement's measured usage, and the fetch never spawns.
+    let (fetch_run_token, fetch_permit) = match fetch_source.as_mut() {
+        None => (run_token, LaunchPermit::immediate()),
+        Some(provider) => {
+            let (credential, authorization) = provider().map_err(|error| {
+                checkout_transport_retryable(
+                    format!("mint fetch-phase credential: {}", error.0),
+                    usage_after_advertise,
+                )
+            })?;
+            // The fetch generation must be a DISTINCT durable generation from the advertise one: a
+            // provider that handed back the advertise generation again would mean the successor was
+            // never appended, so the advertise credential is still current and this leg would run
+            // under a generation that has not been superseded as the phase sequence requires.
+            if advertise_generation.as_deref() == Some(authorization.generation_id()) {
+                return Err(checkout_transport_retryable(
+                    "the fetch-phase authorization names the SAME durable generation as the \
+                     advertisement -- the successor generation was never appended"
+                        .to_string(),
+                    usage_after_advertise,
+                ));
+            }
+            // Consuming the authorization is the ONLY way to reach its permit, and doing so checks
+            // the phase, the authorization's own retained JTI against THIS credential, and the full
+            // scope against this request. A credential from one invocation cannot be paired with a
+            // permit from another.
+            let permit = authorization
+                .into_transport_permit(crate::CheckoutPhase::Fetch, &credential, tenant, repo, expected)
+                .map_err(|error| {
+                    checkout_transport_retryable(error.0, usage_after_advertise)
+                })?;
+            (credential, permit)
+        }
+    };
+
+    let mut fetch_argv = allow_reachable;
+    fetch_argv.extend(["upload-pack".to_string(), "--stateless-rpc".to_string()]);
+    let fetch_spec = GitWireSpec::for_repo(
+        root,
+        tenant,
+        region,
+        repo,
+        fetch_argv,
+        request,
+        Vec::new(),
+        None,
+        limits,
+        fetch_run_token,
+        synthetic_parent_attempt_meter_target(),
+        synthetic_parent_attempt_idem_token("checkout-fetch"),
+    )
+    .map_err(|e| {
+        checkout_transport_retryable(
+            format!("build fetch spec: {e}"),
+            usage_after_advertise,
+        )
+    })?;
+    let mut fetch_command = Vec::with_capacity(fetch_spec.git_argv.len() + 2);
+    fetch_command.push("git".to_string());
+    fetch_command.extend(fetch_spec.git_argv.iter().cloned());
+    fetch_command.push(WIRE_REPO_MOUNT.to_string());
+
     let (fetch_result, usage_after_fetch) = run_one_git_wire_hop_within_parent_attempt(
         &fetch_spec,
         fetch_command,
         cancellation,
         usage_after_advertise,
         true, // the advertisement hop above already completed.
+        fetch_permit,
         execute,
     )?;
 
@@ -7746,12 +7954,68 @@ fn usage_from_runsc_outcome(mem_bytes: u64, o: &RunscOutcome) -> ResourceUsage {
 /// [`CheckoutPreparationError::RejectedAfterQuiescence`] with the session left `Prepared` — the
 /// slice 5b.3 caller must then delete the workspace and call `session.release_prepared`, never
 /// quarantine the identity.
+/// **The LEGACY (V1) Hop B entry point.** Signature and behaviour exactly as shipped: the
+/// preparation container runs under an internally-minted immediate permit, because a V1 preparation
+/// has no durable phase gate to consult.
 #[allow(dead_code)]
 pub(crate) fn run_checkout_preparation(
     lease: &mut UserNamespaceLease,
     session: &mut CheckoutPreparationSession,
     workspace: &ManagedWorkspace,
     spec: CheckoutPreparationSpec,
+) -> Result<PreparedCheckoutEvidence, CheckoutPreparationError> {
+    run_checkout_preparation_inner(lease, session, workspace, spec, LaunchPermit::immediate())
+}
+
+/// **The V2 (phase-bound) Hop B entry point.** Consumes the opaque [`PhaseAuthorization`] — which
+/// can only have come from one `authorize_checkout_phase` invocation — into the retained durable
+/// permit the preparation container spawns under. Consumption checks the `Materialization` phase,
+/// the authorization's privately-retained run-token JTI against `run_token`, and the exact commit
+/// this preparation is about to check out.
+///
+/// There is deliberately NO legacy/immediate option here: this entry point cannot construct or
+/// accept one, so "a V2 caller cannot select the legacy arm" is enforced by the type system rather
+/// than by a source pin (round-1 blocker 2).
+#[allow(dead_code)]
+pub(crate) fn run_checkout_preparation_v2(
+    lease: &mut UserNamespaceLease,
+    session: &mut CheckoutPreparationSession,
+    workspace: &ManagedWorkspace,
+    spec: CheckoutPreparationSpec,
+    run_token: RunTokenCredential,
+    authorization: PhaseAuthorization,
+) -> Result<PreparedCheckoutEvidence, CheckoutPreparationError> {
+    // Resolve the permit BEFORE any staging, cgroup, or durable bind — a refusal leaves the caller's
+    // lease, session, and workspace completely untouched.
+    let permit = resolve_checkout_preparation_permit(
+        authorization,
+        &run_token,
+        &spec.expected_commit,
+    )?;
+    run_checkout_preparation_inner(lease, session, workspace, spec, permit)
+}
+
+/// Hop B's ENTIRE pre-spawn V2 authorization decision, extracted so it is unit-testable without a
+/// real lease/session/workspace/`runsc` (the same convention [`evaluate_checkout_finalization`]
+/// follows).
+#[allow(dead_code)]
+fn resolve_checkout_preparation_permit(
+    authorization: PhaseAuthorization,
+    run_token: &RunTokenCredential,
+    expected_commit: &ExpectedGitCommitId,
+) -> Result<LaunchPermit, CheckoutPreparationError> {
+    authorization
+        .into_preparation_permit(run_token, expected_commit)
+        .map_err(|error| CheckoutPreparationError::Refused(error.0))
+}
+
+#[allow(dead_code)]
+fn run_checkout_preparation_inner(
+    lease: &mut UserNamespaceLease,
+    session: &mut CheckoutPreparationSession,
+    workspace: &ManagedWorkspace,
+    spec: CheckoutPreparationSpec,
+    launch_permit: LaunchPermit,
 ) -> Result<PreparedCheckoutEvidence, CheckoutPreparationError> {
     let bin = runsc_bin();
     let rootfs = resolved_gvisor_git_rootfs();
@@ -7881,7 +8145,7 @@ pub(crate) fn run_checkout_preparation(
             cancellation: &NEVER_CANCELLED,
             output: None,
         },
-        Some(LaunchPermit::immediate()),
+        Some(launch_permit),
         mode,
         &cgroup,
     );
@@ -8064,6 +8328,330 @@ mod tests {
 
     use super::*;
     use crate::RunTokenCredential;
+
+    // =============================================================================================
+    // CT-007 phase-credential generations: SOURCE PINS.
+    //
+    // These read this module's own source text. A behavioural test can only prove that the paths it
+    // exercises are gated; a source pin proves that NO path exists — which is exactly the property
+    // "no raw preparation spawn is reachable with an immediate permit in the V2 API" asserts.
+    // =============================================================================================
+
+    const GVISOR_SOURCE: &str = include_str!("gvisor.rs");
+
+    /// This module's PRODUCTION source only. A whole-file `contains` check would otherwise match
+    /// the assertion strings in these very tests — a source pin that reads its own file must
+    /// exclude the test region or it silently asserts against itself.
+    fn production_source() -> &'static str {
+        // Split on the TOP-LEVEL test module specifically: this file also carries inline
+        // `#[cfg(test)]` helpers far above it, so splitting on the bare attribute would truncate
+        // almost the whole production body and make every pin vacuously true.
+        let marker = "\n#[cfg(test)]\nmod tests {";
+        let end = GVISOR_SOURCE
+            .find(marker)
+            .expect("this module has a top-level test module");
+        &GVISOR_SOURCE[..end]
+    }
+
+    /// The body of a named `fn`/`pub(crate) fn`, from its signature to the next top-level `}` at
+    /// column 0 — enough to scope a source pin to one function without pulling in its neighbours.
+    fn source_of(function_signature: &str) -> &'static str {
+        let start = GVISOR_SOURCE
+            .find(function_signature)
+            .unwrap_or_else(|| panic!("`{function_signature}` exists in this module"));
+        let rest = &GVISOR_SOURCE[start..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("`{function_signature}` has a top-level close"));
+        &rest[..end]
+    }
+
+    /// **In the V2 API, neither preparation spawn can construct its own permit — and the V2 entry
+    /// points offer no legacy option at the TYPE level.** These pins are the structural complement
+    /// to the behavioural tests: a behavioural test proves the paths it exercises are gated, a
+    /// source pin proves no ungated path EXISTS.
+    #[test]
+    fn no_v2_preparation_spawn_can_mint_its_own_immediate_permit() {
+        let hop = source_of("fn run_one_git_wire_hop_within_parent_attempt(");
+        assert!(
+            !hop.contains("LaunchPermit::immediate()"),
+            "the git-wire hop runner must consume the permit it is handed, never mint one"
+        );
+        assert!(
+            hop.contains("permit: LaunchPermit"),
+            "the git-wire hop runner takes its permit as an argument"
+        );
+
+        // Hop B: the shared body takes its permit; only the LEGACY entry point mints an immediate
+        // one; the V2 entry point resolves it by CONSUMING a PhaseAuthorization.
+        let inner = source_of("fn run_checkout_preparation_inner(");
+        assert!(
+            inner.contains("launch_permit: LaunchPermit") && inner.contains("Some(launch_permit)"),
+            "Hop B's body consumes the permit it is handed, never mints one"
+        );
+        assert!(
+            !inner.contains("LaunchPermit::immediate()"),
+            "Hop B's body must never mint a permit inline"
+        );
+        let legacy_preparation = source_of("pub(crate) fn run_checkout_preparation(");
+        assert_eq!(
+            legacy_preparation.matches("LaunchPermit::immediate()").count(),
+            1,
+            "the LEGACY Hop B entry point is the one place an immediate preparation permit exists"
+        );
+        let v2_preparation = source_of("pub(crate) fn run_checkout_preparation_v2(");
+        assert!(
+            !v2_preparation.contains("LaunchPermit::immediate()")
+                && !v2_preparation.contains("CheckoutAuthorizationProof"),
+            "the V2 Hop B entry point can neither mint an immediate permit nor accept a legacy proof"
+        );
+        assert!(
+            v2_preparation.contains("authorization: PhaseAuthorization"),
+            "the V2 Hop B entry point takes the fused, non-constructible authorization"
+        );
+        let resolve = source_of("fn resolve_checkout_preparation_permit(");
+        assert!(
+            !resolve.contains("LaunchPermit::immediate()")
+                && resolve.contains("into_preparation_permit(run_token, expected_commit)"),
+            "the V2 permit is reachable ONLY by consuming the authorization through its own checks"
+        );
+
+        // Hop A: the module-private authority enum means the V2 entry point cannot select a legacy
+        // arm, and the legacy immediate permits live only on the legacy arm of the shared body.
+        let production = production_source();
+        assert!(
+            production.contains("\nenum TransportAuthority<'a> {")
+                && !production.contains("pub(crate) enum TransportAuthority")
+                && !production.contains("pub enum TransportAuthority"),
+            "the transport authority enum is MODULE-PRIVATE: no other module can select an arm"
+        );
+        let v2_transport = source_of("pub(crate) fn fetch_checkout_pack_within_parent_attempt_v2(");
+        assert!(
+            !v2_transport.contains("CheckoutAuthorizationProof")
+                && !v2_transport.contains("LaunchPermit"),
+            "the V2 Hop A entry point accepts neither a legacy proof nor a bare permit"
+        );
+        assert!(
+            v2_transport.contains("advertise: PhaseAuthorization")
+                && v2_transport.contains("Result<(RunTokenCredential, PhaseAuthorization), HookError>"),
+            "the V2 Hop A entry point takes the fused authorization for both legs"
+        );
+        let inner_transport = source_of("fn fetch_checkout_pack_within_parent_attempt_inner(");
+        assert_eq!(
+            inner_transport.matches("LaunchPermit::immediate()").count(),
+            2,
+            "exactly two immediate permits, both on the legacy arm (advertise + fetch)"
+        );
+        assert!(
+            inner_transport.contains("TransportAuthority::LegacyClaimBound { proof } => {")
+                && inner_transport.contains("(None, LaunchPermit::immediate(), None)"),
+            "the advertise immediate permit belongs to the legacy arm"
+        );
+        assert!(
+            inner_transport.contains("None => (run_token, LaunchPermit::immediate()),"),
+            "the fetch immediate permit belongs to the legacy (no fetch provider) arm"
+        );
+        assert!(
+            inner_transport.contains(
+                "let permit = advertise\n                .into_transport_permit(\n                    crate::CheckoutPhase::Advertise,"
+            ),
+            "the V2 advertise leg reaches its permit only by CONSUMING its authorization"
+        );
+        assert!(
+            inner_transport.contains("into_transport_permit(crate::CheckoutPhase::Fetch, &credential, tenant, repo, expected)"),
+            "the V2 fetch leg reaches its permit only by consuming its authorization, checked \
+             against the credential the SAME provider returned"
+        );
+    }
+
+    /// **The fused authorization cannot be taken apart.** `PhaseAuthorization` has no public
+    /// constructor, is not `Clone`, and its permit field is only ever moved out by a consuming
+    /// `into_*_permit` that runs the provenance checks first.
+    #[test]
+    fn the_phase_authorization_is_structurally_inseparable() {
+        const AUTHORIZATION_SOURCE: &str = include_str!("checkout_authorization.rs");
+        assert!(
+            AUTHORIZATION_SOURCE.contains("pub(crate) struct PhaseAuthorization {")
+                && AUTHORIZATION_SOURCE.contains("    permit: LaunchPermit,"),
+            "the permit is a PRIVATE field of the fused authorization"
+        );
+        let declaration = AUTHORIZATION_SOURCE
+            .split("pub(crate) struct PhaseAuthorization {")
+            .next()
+            .expect("the declaration exists");
+        // Whatever attribute block immediately precedes the struct must not derive Clone/Copy.
+        let attributes = declaration
+            .rsplit("\n\n")
+            .next()
+            .expect("there is an attribute block");
+        assert!(
+            !attributes.contains("derive(") || !attributes.contains("Clone"),
+            "the authorization is deliberately NOT Clone: it cannot be duplicated across legs"
+        );
+        assert!(
+            !AUTHORIZATION_SOURCE.contains("impl Clone for PhaseAuthorization"),
+            "the authorization must not hand-implement Clone either"
+        );
+        // Round-2 minor 3: pin EVERY access of `self.permit`, not just the two `Ok(self.permit)`
+        // returns. A future `pub(crate) fn leak(self) -> LaunchPermit { self.permit }` would add a
+        // third `self.permit` and fail here even though it changes neither the `Ok(self.permit)`
+        // count, the construction count, nor the Clone checks.
+        assert_eq!(
+            AUTHORIZATION_SOURCE.matches("self.permit").count(),
+            2,
+            "the permit field is TOUCHED in exactly two places: the two consuming into_*_permit \
+             methods. A new permit-exposing method would raise this count."
+        );
+        assert_eq!(
+            AUTHORIZATION_SOURCE.matches("Ok(self.permit)").count(),
+            2,
+            "the permit escapes only through the two consuming into_*_permit methods"
+        );
+        // Pin the COMPLETE method surface of `impl PhaseAuthorization` — an exact set. Any new
+        // method (permit-exposing or otherwise) fails until it is reviewed and added here.
+        //
+        // Round-3 minor: the parser must recognize a method under ANY visibility/modifier form, or a
+        // leak could hide behind a spelling the parser skips. The exact shapes defended against:
+        //   pub(super) async fn leak(self) -> LaunchPermit { let Self { permit, .. } = self; permit }
+        //   pub(in crate::foo) const unsafe fn leak(self) -> LaunchPermit { self.permit }
+        // The (a) method-surface enumeration below strips every `pub`/`pub(..)` visibility and every
+        // `async`/`const`/`unsafe`/`extern` modifier before reading the `fn` name, so ANY new method
+        // (regardless of spelling) enters the parsed set and breaks the exact-set assertion; the (b)
+        // destructuring guard forbids `Self {` / `PhaseAuthorization {` binding patterns inside the
+        // impl, closing the "move the field out by pattern" route the `self.permit` counter misses.
+        let impl_block = {
+            let start = AUTHORIZATION_SOURCE
+                .find("\nimpl PhaseAuthorization {")
+                .expect("the impl block exists");
+            let rest = &AUTHORIZATION_SOURCE[start + 1..];
+            let end = rest.find("\n}\n").expect("the impl block closes");
+            &rest[..end]
+        };
+        // Return the `fn` name of a method declaration under any visibility/modifier chain.
+        fn method_name(line: &str) -> Option<&str> {
+            let mut rest = line.trim_start();
+            // One visibility token: `pub`, `pub(crate)`, `pub(super)`, `pub(in path)`.
+            if let Some(after_pub) = rest.strip_prefix("pub") {
+                if let Some(inner) = after_pub.strip_prefix('(') {
+                    let close = inner.find(')')?;
+                    rest = inner[close + 1..].trim_start();
+                } else if after_pub.starts_with(char::is_whitespace) {
+                    rest = after_pub.trim_start();
+                }
+                // else: `pub` was a prefix of some other identifier — leave `rest` as-is; it will
+                // fail the `fn ` check below and be ignored.
+            }
+            // Any combination of `async`/`const`/`unsafe`/`extern "ABI"` modifiers, in any order.
+            loop {
+                let mut advanced = false;
+                for keyword in ["async", "const", "unsafe", "extern"] {
+                    if let Some(after) = rest.strip_prefix(keyword) {
+                        if after.starts_with(char::is_whitespace) || after.starts_with('"') {
+                            rest = after.trim_start();
+                            if keyword == "extern" {
+                                if let Some(abi) = rest.strip_prefix('"') {
+                                    if let Some(end) = abi.find('"') {
+                                        rest = abi[end + 1..].trim_start();
+                                    }
+                                }
+                            }
+                            advanced = true;
+                        }
+                    }
+                }
+                if !advanced {
+                    break;
+                }
+            }
+            let after_fn = rest.strip_prefix("fn ")?;
+            let name = after_fn.split(['(', '<', ' ']).next()?.trim();
+            (!name.is_empty()).then_some(name)
+        }
+        let mut methods: Vec<&str> = impl_block.lines().filter_map(method_name).collect();
+        methods.sort_unstable();
+        assert_eq!(
+            methods,
+            vec![
+                "generation_id",
+                "into_preparation_permit",
+                "into_transport_permit",
+                "phase",
+                "run_token_jti",
+                "verify_provenance",
+            ],
+            "the PhaseAuthorization method surface changed — any new method (under ANY visibility or \
+             modifier) that could move or expose `self.permit` (or destructure self) must be \
+             reviewed and pinned here"
+        );
+        // (b) Destructuring is the other route to a private field. Forbid BOTH binding spellings
+        // (`let Self { permit, .. } = self` and `let PhaseAuthorization { .. } = self`) ANYWHERE
+        // inside the inherent impl block.
+        assert_eq!(
+            impl_block.matches("Self {").count(),
+            0,
+            "no `Self {{ .. }}` destructuring pattern inside impl PhaseAuthorization may bind the \
+             private permit"
+        );
+        assert_eq!(
+            impl_block.matches("PhaseAuthorization {").count(),
+            1,
+            "the only `PhaseAuthorization {{` inside the impl block is its own header — never a \
+             destructuring pattern that could pull the permit out"
+        );
+        // Belt-and-braces global count too (struct decl, Debug header, inherent-impl header, and the
+        // ONE construction site in `RunnerHooks::authorize_checkout_phase`).
+        assert_eq!(
+            AUTHORIZATION_SOURCE.matches("PhaseAuthorization {").count(),
+            4,
+            "exactly: the struct decl, the Debug impl header, the inherent impl header, and the one \
+             construction site — no destructuring pattern reaches the private permit"
+        );
+        assert_eq!(
+            AUTHORIZATION_SOURCE
+                .matches("self.verify_provenance(")
+                .count(),
+            2,
+            "every consumption runs the phase/JTI/generation provenance check first"
+        );
+        assert!(
+            AUTHORIZATION_SOURCE.contains("PhaseAuthorization {\n            scope,"),
+            "the ONE construction site fuses the scope, retained JTI, phase, generation, and permit"
+        );
+        assert_eq!(
+            AUTHORIZATION_SOURCE.matches("permit,\n        })").count(),
+            1,
+            "there is exactly ONE construction site for the fused authorization"
+        );
+    }
+
+    /// **The one-shot fetch provider is invoked after the advertisement retires and the lease
+    /// checkpoint renews, and before ANYTHING for the fetch is built or spawned.** Ordering is the
+    /// whole security property here: minting the fetch credential earlier would let it be issued
+    /// against a generation this worker may no longer own.
+    #[test]
+    fn the_fetch_phase_authorization_is_obtained_between_the_checkpoint_and_the_fetch_spawn() {
+        let transport = source_of("fn fetch_checkout_pack_within_parent_attempt_inner(");
+        let advertise_hop = transport
+            .find("false, // this is the FIRST hop")
+            .expect("the advertise hop runs");
+        let checkpoint = transport
+            .find("if let Some(checkpoint) = lease_checkpoint {")
+            .expect("the lease checkpoint runs");
+        let provider = transport
+            .find("let (fetch_run_token, fetch_permit) = match fetch_source.as_mut()")
+            .expect("the fetch authorization is obtained");
+        let fetch_spec = transport
+            .find("let fetch_spec = GitWireSpec::for_repo(")
+            .expect("the fetch spec is built");
+        let fetch_hop = transport
+            .find("true, // the advertisement hop above already completed.")
+            .expect("the fetch hop runs");
+        assert!(
+            advertise_hop < checkpoint && checkpoint < provider && provider < fetch_spec
+                && fetch_spec < fetch_hop,
+            "ordering must be advertise -> renew -> mint fetch credential -> build -> spawn"
+        );
+    }
 
     #[derive(Default)]
     struct RecordingOutput {
@@ -14526,6 +15114,63 @@ mod tests {
                 hooks.authorize_checkout(&job, scope).unwrap()
             }
 
+            /// CT-007 phase-credential generations: mint a REAL fused [`PhaseAuthorization`]
+            /// through the real hook. `permit_outcome` stands in for the control plane's durable
+            /// phase gate: `Ok(())` = the generation is still current at the spawn boundary,
+            /// `Err(..)` = it is not (requeued, superseded, expired).
+            ///
+            /// Note there is NO way for a test to build one of these by hand either — the only
+            /// route is a genuine hook invocation, exactly like production.
+            fn minted_phase_authorization(
+                scope: CheckoutAuthorizationScope,
+                jti: &str,
+                phase: crate::CheckoutPhase,
+                generation_id: &str,
+                permit_outcome: Result<(), &'static str>,
+            ) -> PhaseAuthorization {
+                let hooks = ok_hooks().with_checkout_phase_authorization(Box::new(
+                    move |_spec, _scope, _phase| {
+                        Ok(match permit_outcome {
+                            Ok(()) => LaunchPermit::immediate(),
+                            Err(reason) => {
+                                LaunchPermit::retained(move || Err(HookError(reason.to_string())))
+                            }
+                        })
+                    },
+                ));
+                let job = JobSpec::new(
+                    JobKind::Ci,
+                    fixture_image(),
+                    vec!["true".to_string()],
+                    vec![],
+                    vec![],
+                    EgressPolicy::deny_all(),
+                    checkout_limits(),
+                    WorkspaceSpec::default(),
+                    TrustTier::Trusted,
+                    RunTokenCredential::new("bearer", jti, 300).unwrap(),
+                    MeterTarget {
+                        reserve_id: "r".to_string(),
+                    },
+                    IdemToken("idem-mint".to_string()),
+                )
+                .unwrap();
+                hooks
+                    .authorize_checkout_phase(&job, scope, phase, generation_id)
+                    .unwrap()
+            }
+
+            /// A distinct durable generation id per purpose, so the advertise→fetch supersession
+            /// check has real values to compare.
+            fn generation_id_for(phase: crate::CheckoutPhase) -> String {
+                let seed = match phase {
+                    crate::CheckoutPhase::Advertise => 'a',
+                    crate::CheckoutPhase::Fetch => 'f',
+                    crate::CheckoutPhase::Materialization => 'm',
+                };
+                format!("ci-credential:v1:{}", seed.to_string().repeat(64))
+            }
+
             fn fake_hop_container_run(stdout: Vec<u8>, usage: ResourceUsage) -> ContainerRun {
                 ContainerRun {
                     child: Box::new(FakeRunsc),
@@ -16116,6 +16761,621 @@ mod tests {
                 }
                 let _ = std::fs::remove_dir_all(&root);
             }
+
+
+
+            // =================================================================================
+            // CT-007 phase-credential generations: the V2 transport / preparation authority.
+            //
+            // Round-1 blocker 2: the concrete bypass these tests exist to close is "still-valid
+            // proof for requeued claim A + live permit for claim B". With the fused, consuming
+            // `PhaseAuthorization` that pairing is not expressible — the tests below prove the
+            // adjacent mix-and-match attempts that ARE expressible all refuse before any spawn.
+            // =================================================================================
+
+            /// An executor that COMMITS every permit it is handed and records the outcome plus the
+            /// run-token JTI of the spec it was called with — so a test can prove each leg spawned
+            /// under its OWN credential and its OWN durable phase permit.
+            #[allow(clippy::type_complexity)]
+            fn permit_recording_executor(
+                steps: Vec<ScriptedStep>,
+            ) -> (BoxedHopExecutor, Arc<Mutex<Vec<(String, bool)>>>) {
+                let seen: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+                let seen_for_closure = Arc::clone(&seen);
+                let queue = Mutex::new(std::collections::VecDeque::from(steps));
+                let f = move |job: &JobSpec,
+                              _cfg: &OciConfig,
+                              _stdin: Vec<u8>,
+                              _rootfs: &Path,
+                              _cancellation: &AtomicBool,
+                              permit: LaunchPermit| {
+                    let committed = permit.commit_and_release().is_ok();
+                    seen_for_closure
+                        .lock()
+                        .unwrap()
+                        .push((job.run_token.jti.clone(), committed));
+                    let mut queue = queue.lock().unwrap();
+                    let step = queue
+                        .pop_front()
+                        .expect("executor invoked more times than scripted");
+                    let finalization_result = match step() {
+                        Ok((run, truncated)) => Ok(RuntimeFinalization::Finalized(FinalizedRun {
+                            primary: Ok((run, truncated)),
+                            evidence: fake_quiescence_evidence(),
+                        })),
+                        Err(run_failure) => Err(run_failure),
+                    };
+                    (finalization_result, Ok(()))
+                };
+                (Box::new(f), seen)
+            }
+
+            fn advertise_authorization(oid: &str, jti: &str) -> PhaseAuthorization {
+                minted_phase_authorization(
+                    parent_attempt_scope(oid, GitObjectFormat::Sha1),
+                    jti,
+                    crate::CheckoutPhase::Advertise,
+                    &generation_id_for(crate::CheckoutPhase::Advertise),
+                    Ok(()),
+                )
+            }
+
+            /// **Cross-phase substitution, FETCH-for-ADVERTISE.** A well-formed authorization for
+            /// the wrong boundary refuses before anything spawns.
+            #[test]
+            fn a_fetch_phase_authorization_substituted_for_advertise_refuses_before_any_spawn() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd2);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let authorization = minted_phase_authorization(
+                    parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                    "jti-1",
+                    crate::CheckoutPhase::Fetch,
+                    &generation_id_for(crate::CheckoutPhase::Fetch),
+                    Ok(()),
+                );
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+                let (executor, _remaining) = panics_if_called_executor();
+                let cancellation = AtomicBool::new(false);
+                let mut never = || panic!("the fetch provider must never be reached");
+                let err = fetch_checkout_pack_within_parent_attempt_v2_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    authorization,
+                    &mut never,
+                    &cancellation,
+                    None,
+                    &*executor,
+                )
+                .unwrap_err();
+                match err {
+                    CheckoutTransportError::Refused { message } => assert!(
+                        message.contains("minted for the Fetch boundary"),
+                        "message was: {message}"
+                    ),
+                    other => panic!("expected Refused, got {other:?}"),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            /// **CROSS-INVOCATION: an authorization minted against a DIFFERENT claim's credential.**
+            /// This is the closest expressible form of the blocker-2 bypass — the caller holds a
+            /// live authorization (permit included) from claim B and tries to drive claim A's
+            /// transport with it. The authorization's privately retained JTI refuses it.
+            #[test]
+            fn an_authorization_from_another_claim_cannot_drive_this_transport() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd9);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                // Claim B's authorization: fully valid, permit live.
+                let claim_b = advertise_authorization(&oid, "jti-claim-b");
+                // ...presented alongside claim A's credential.
+                let claim_a_credential =
+                    RunTokenCredential::new("bearer", "jti-claim-a", 300).unwrap();
+                let (executor, _remaining) = panics_if_called_executor();
+                let cancellation = AtomicBool::new(false);
+                let mut never = || panic!("the fetch provider must never be reached");
+                let err = fetch_checkout_pack_within_parent_attempt_v2_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    claim_a_credential,
+                    claim_b,
+                    &mut never,
+                    &cancellation,
+                    None,
+                    &*executor,
+                )
+                .unwrap_err();
+                match err {
+                    CheckoutTransportError::Refused { message } => assert!(
+                        message.contains("minted against run-token jti")
+                            && message.contains("jti-claim-b"),
+                        "message was: {message}"
+                    ),
+                    other => panic!("expected Refused, got {other:?}"),
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            /// **CROSS-SCOPE: a valid authorization for another repo/commit.**
+            #[test]
+            fn an_authorization_for_another_target_cannot_drive_this_transport() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xda);
+                let other_oid = sha1_oid(0xdb);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                for (label, scope) in [
+                    (
+                        "commit",
+                        parent_attempt_scope(&other_oid, GitObjectFormat::Sha1),
+                    ),
+                    (
+                        "repo",
+                        CheckoutAuthorizationScope::new(
+                            myelin_tenancy::TenantId(TENANT.to_string()),
+                            myelin_events::ArtifactRef(format!(
+                                "myelin://{TENANT}/git/repo/other-repo"
+                            )),
+                            "other-repo".to_string(),
+                            oid.clone(),
+                            GitObjectFormat::Sha1,
+                        ),
+                    ),
+                    (
+                        "tenant",
+                        CheckoutAuthorizationScope::new(
+                            myelin_tenancy::TenantId("someone-else".to_string()),
+                            myelin_events::ArtifactRef(
+                                "myelin://someone-else/git/repo/widgets".to_string(),
+                            ),
+                            REPO.to_string(),
+                            oid.clone(),
+                            GitObjectFormat::Sha1,
+                        ),
+                    ),
+                ] {
+                    let authorization = minted_phase_authorization(
+                        scope,
+                        "jti-1",
+                        crate::CheckoutPhase::Advertise,
+                        &generation_id_for(crate::CheckoutPhase::Advertise),
+                        Ok(()),
+                    );
+                    let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+                    let (executor, _remaining) = panics_if_called_executor();
+                    let cancellation = AtomicBool::new(false);
+                    let mut never = || panic!("the fetch provider must never be reached");
+                    let err = fetch_checkout_pack_within_parent_attempt_v2_given(
+                        &root,
+                        TENANT,
+                        REGION,
+                        REPO,
+                        &expected,
+                        checkout_limits(),
+                        run_token,
+                        authorization,
+                        &mut never,
+                        &cancellation,
+                        None,
+                        &*executor,
+                    )
+                    .unwrap_err();
+                    assert!(
+                        matches!(err, CheckoutTransportError::Refused { .. }),
+                        "a substituted {label} must refuse before any spawn, got {err:?}"
+                    );
+                }
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            /// **Advertisement succeeds but the fetch mint refuses: the fetch never spawns, and the
+            /// advertisement's already-measured usage survives into the error.**
+            #[test]
+            fn a_refused_fetch_mint_never_spawns_the_fetch_and_keeps_the_advertisement_usage() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd3);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let authorization = advertise_authorization(&oid, "jti-advertise");
+                let run_token = RunTokenCredential::new("bearer", "jti-advertise", 300).unwrap();
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 7,
+                    mem_byte_seconds: 700,
+                };
+                let (executor, seen) = permit_recording_executor(vec![Box::new({
+                    let oid = oid.clone();
+                    move || {
+                        Ok((
+                            fake_hop_container_run(advertisement_bytes(&oid), advertise_usage),
+                            false,
+                        ))
+                    }
+                })]);
+                let cancellation = AtomicBool::new(false);
+                let mut refuse =
+                    || Err(HookError("the workload generation already superseded it".into()));
+                let err = fetch_checkout_pack_within_parent_attempt_v2_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    authorization,
+                    &mut refuse,
+                    &cancellation,
+                    None,
+                    &*executor,
+                )
+                .unwrap_err();
+                match err {
+                    CheckoutTransportError::Failed { usage, message, .. } => {
+                        assert_eq!(
+                            usage, advertise_usage,
+                            "the advertisement's measured usage must survive a refused fetch mint"
+                        );
+                        assert!(
+                            message.contains("mint fetch-phase credential"),
+                            "message was: {message}"
+                        );
+                    }
+                    other => {
+                        panic!("expected Failed carrying the advertisement usage, got {other:?}")
+                    }
+                }
+                let recorded = seen.lock().unwrap();
+                assert_eq!(
+                    recorded.len(),
+                    1,
+                    "exactly ONE container ran: the advertisement. The fetch never spawned."
+                );
+                assert_eq!(recorded[0], ("jti-advertise".to_string(), true));
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            /// The fetch provider returning a WRONG-PHASE authorization, a MISMATCHED credential, or
+            /// the SAME generation as the advertisement all refuse — and the fetch never spawns.
+            #[test]
+            fn a_divergent_fetch_authorization_refuses_before_the_fetch_spawns() {
+                type Provider = Box<
+                    dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>,
+                >;
+                /// (label, expected refusal fragment, provider builder).
+                type DivergentFetchCase = (&'static str, &'static str, fn(&str) -> Provider);
+                let cases: Vec<DivergentFetchCase> = vec![
+                    (
+                        "wrong phase",
+                        "minted for the Advertise boundary",
+                        |oid: &str| {
+                            let oid = oid.to_string();
+                            Box::new(move || {
+                                Ok((
+                                    RunTokenCredential::new("bearer", "jti-fetch", 300).unwrap(),
+                                    minted_phase_authorization(
+                                        parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                                        "jti-fetch",
+                                        crate::CheckoutPhase::Advertise,
+                                        "ci-credential:v1:distinct-advertise",
+                                        Ok(()),
+                                    ),
+                                ))
+                            })
+                        },
+                    ),
+                    (
+                        "credential from another invocation",
+                        "minted against run-token jti",
+                        |oid: &str| {
+                            let oid = oid.to_string();
+                            Box::new(move || {
+                                Ok((
+                                    // A credential that does NOT belong to the authorization
+                                    // returned alongside it.
+                                    RunTokenCredential::new("bearer", "jti-other-claim", 300)
+                                        .unwrap(),
+                                    minted_phase_authorization(
+                                        parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                                        "jti-fetch",
+                                        crate::CheckoutPhase::Fetch,
+                                        &generation_id_for(crate::CheckoutPhase::Fetch),
+                                        Ok(()),
+                                    ),
+                                ))
+                            })
+                        },
+                    ),
+                    (
+                        "same generation as the advertisement",
+                        "SAME durable generation",
+                        |oid: &str| {
+                            let oid = oid.to_string();
+                            Box::new(move || {
+                                Ok((
+                                    RunTokenCredential::new("bearer", "jti-fetch", 300).unwrap(),
+                                    minted_phase_authorization(
+                                        parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                                        "jti-fetch",
+                                        crate::CheckoutPhase::Fetch,
+                                        &generation_id_for(crate::CheckoutPhase::Advertise),
+                                        Ok(()),
+                                    ),
+                                ))
+                            })
+                        },
+                    ),
+                ];
+                for (label, expected_message, build) in cases {
+                    let root = staged_repo_root();
+                    let oid = sha1_oid(0xd4);
+                    let expected =
+                        ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                    let authorization = advertise_authorization(&oid, "jti-advertise");
+                    let run_token =
+                        RunTokenCredential::new("bearer", "jti-advertise", 300).unwrap();
+                    let advertise_usage = ResourceUsage {
+                        cpu_seconds: 3,
+                        mem_byte_seconds: 300,
+                    };
+                    let (executor, seen) = permit_recording_executor(vec![Box::new({
+                        let oid = oid.clone();
+                        move || {
+                            Ok((
+                                fake_hop_container_run(advertisement_bytes(&oid), advertise_usage),
+                                false,
+                            ))
+                        }
+                    })]);
+                    let cancellation = AtomicBool::new(false);
+                    let mut provider = build(&oid);
+                    let err = fetch_checkout_pack_within_parent_attempt_v2_given(
+                        &root,
+                        TENANT,
+                        REGION,
+                        REPO,
+                        &expected,
+                        checkout_limits(),
+                        run_token,
+                        authorization,
+                        &mut *provider,
+                        &cancellation,
+                        None,
+                        &*executor,
+                    )
+                    .unwrap_err();
+                    match err {
+                        CheckoutTransportError::Failed { usage, message, .. } => {
+                            assert_eq!(usage, advertise_usage, "{label}: usage survives");
+                            assert!(
+                                message.contains(expected_message),
+                                "{label}: message was: {message}"
+                            );
+                        }
+                        other => panic!("{label}: expected Failed, got {other:?}"),
+                    }
+                    assert_eq!(
+                        seen.lock().unwrap().len(),
+                        1,
+                        "{label}: the fetch must never spawn"
+                    );
+                    let _ = std::fs::remove_dir_all(&root);
+                }
+            }
+
+            /// **The V2 happy path: each leg spawns under its OWN credential and its OWN durable
+            /// phase permit.** This is what makes a >5-minute Hop A survivable at all.
+            #[test]
+            fn the_v2_transport_spawns_each_leg_under_its_own_credential_and_phase_permit() {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd5);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let authorization = advertise_authorization(&oid, "jti-advertise");
+                let run_token = RunTokenCredential::new("bearer", "jti-advertise", 300).unwrap();
+                let (executor, seen) = permit_recording_executor(vec![
+                    Box::new({
+                        let oid = oid.clone();
+                        move || {
+                            Ok((
+                                fake_hop_container_run(
+                                    advertisement_bytes(&oid),
+                                    ResourceUsage {
+                                        cpu_seconds: 1,
+                                        mem_byte_seconds: 100,
+                                    },
+                                ),
+                                false,
+                            ))
+                        }
+                    }),
+                    Box::new(move || {
+                        Ok((
+                            fake_hop_container_run(
+                                fetch_response_bytes(b"pack-bytes"),
+                                ResourceUsage {
+                                    cpu_seconds: 2,
+                                    mem_byte_seconds: 200,
+                                },
+                            ),
+                            false,
+                        ))
+                    }),
+                ]);
+                let cancellation = AtomicBool::new(false);
+                let fetch_oid = oid.clone();
+                let mut provide = move || {
+                    Ok((
+                        RunTokenCredential::new("bearer", "jti-fetch", 300).unwrap(),
+                        minted_phase_authorization(
+                            parent_attempt_scope(&fetch_oid, GitObjectFormat::Sha1),
+                            "jti-fetch",
+                            crate::CheckoutPhase::Fetch,
+                            &generation_id_for(crate::CheckoutPhase::Fetch),
+                            Ok(()),
+                        ),
+                    ))
+                };
+                let outcome = fetch_checkout_pack_within_parent_attempt_v2_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    authorization,
+                    &mut provide,
+                    &cancellation,
+                    None,
+                    &*executor,
+                )
+                .expect("the V2 phase-bound transport completes");
+                assert_eq!(
+                    outcome.usage,
+                    ResourceUsage {
+                        cpu_seconds: 3,
+                        mem_byte_seconds: 300,
+                    }
+                );
+                let recorded = seen.lock().unwrap();
+                assert_eq!(
+                    *recorded,
+                    vec![
+                        ("jti-advertise".to_string(), true),
+                        ("jti-fetch".to_string(), true),
+                    ],
+                    "each leg runs under its OWN phase credential and commits its OWN phase permit"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            }
+
+            /// **A phase permit whose durable generation is no longer current refuses AT THE SPAWN
+            /// GATE**, not at mint time — the whole reason the permit is retained and lazy.
+            #[test]
+            fn a_superseded_phase_permit_refuses_when_the_spawn_gate_commits_it() {
+                let oid = sha1_oid(0xd6);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let authorization = minted_phase_authorization(
+                    parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                    "jti-1",
+                    crate::CheckoutPhase::Advertise,
+                    &generation_id_for(crate::CheckoutPhase::Advertise),
+                    Err("a successor generation was appended"),
+                );
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+                let permit = authorization
+                    .into_transport_permit(
+                        crate::CheckoutPhase::Advertise,
+                        &run_token,
+                        TENANT,
+                        REPO,
+                        &expected,
+                    )
+                    .expect("the authorization itself is well-formed");
+                let error = permit
+                    .commit_and_release()
+                    .expect_err("a superseded generation must refuse at the gate");
+                assert!(
+                    error.0.contains("successor generation"),
+                    "message was: {}",
+                    error.0
+                );
+            }
+
+            // ---- Hop B: the materialization authority ----
+
+            #[test]
+            fn hop_b_consumes_only_a_materialization_authorization_for_the_exact_claim() {
+                let oid = sha1_oid(0xd7);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let run_token =
+                    RunTokenCredential::new("bearer", "jti-materialization", 300).unwrap();
+
+                // The exact materialization authorization is accepted, and its permit commits.
+                resolve_checkout_preparation_permit(
+                    minted_phase_authorization(
+                        parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                        "jti-materialization",
+                        crate::CheckoutPhase::Materialization,
+                        &generation_id_for(crate::CheckoutPhase::Materialization),
+                        Ok(()),
+                    ),
+                    &run_token,
+                    &expected,
+                )
+                .expect("the exact materialization authorization authorizes Hop B")
+                .commit_and_release()
+                .expect("its durable permit commits");
+
+                // Every adjacent substitution refuses.
+                let cases: [(&str, crate::CheckoutPhase, &str, &str, &str); 4] = [
+                    (
+                        "fetch phase",
+                        crate::CheckoutPhase::Fetch,
+                        "jti-materialization",
+                        &oid,
+                        "minted for the Fetch boundary",
+                    ),
+                    (
+                        "advertise phase",
+                        crate::CheckoutPhase::Advertise,
+                        "jti-materialization",
+                        &oid,
+                        "minted for the Advertise boundary",
+                    ),
+                    (
+                        "another claim's credential",
+                        crate::CheckoutPhase::Materialization,
+                        "jti-other-claim",
+                        &oid,
+                        "minted against run-token jti",
+                    ),
+                    (
+                        "another commit",
+                        crate::CheckoutPhase::Materialization,
+                        "jti-materialization",
+                        "ffffffffffffffffffffffffffffffffffffffff",
+                        "materialization authorization was minted for commit",
+                    ),
+                ];
+                for (label, phase, jti, commit, expected_message) in cases {
+                    let error = resolve_checkout_preparation_permit(
+                        minted_phase_authorization(
+                            parent_attempt_scope(commit, GitObjectFormat::Sha1),
+                            jti,
+                            phase,
+                            &generation_id_for(phase),
+                            Ok(()),
+                        ),
+                        &run_token,
+                        &expected,
+                    )
+                    .err()
+                    .unwrap_or_else(|| panic!("{label} must not drive Hop B"));
+                    match error {
+                        CheckoutPreparationError::Refused(message) => assert!(
+                            message.contains(expected_message),
+                            "{label}: message was: {message}"
+                        ),
+                        other => panic!("{label}: expected Refused, got {other:?}"),
+                    }
+                }
+            }
+
         }
     }
 }
