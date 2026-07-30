@@ -58,7 +58,10 @@ use sqlx::types::Uuid;
 use sqlx::Row;
 
 use crate::ci_drive_manifest::CiDriveManifestStore;
-use crate::job_accounting_store::{CiJobAccountingRecord, CiJobAccountingStore};
+use crate::job_accounting_store::{
+    versioned_accounting_receipt, CiJobAccountingRecord, CiJobAccountingStore,
+    CiJobAccountingWriteVersion, CiJobTerminalDisposition,
+};
 
 const PR_RUN_SUPERSESSION_LOCK_DOMAIN: &str = "myelin.ci.pr-run-supersession.v1";
 
@@ -621,8 +624,27 @@ impl CiRunFinalizer for DurableCiRunFinalizer {
                         .await
                         .map_err(|_| CiRunStoreError::SkippedJobAccounting)?;
                     if let Some(existing) = existing {
-                        let expected_receipt =
-                            skipped_completion_receipt(&scope, &finalization, job);
+                        let expected_v3 = skipped_accounting_record(
+                            &scope,
+                            &finalization,
+                            job,
+                            refunded,
+                            CiJobAccountingWriteVersion::V3,
+                        );
+                        let expected_v4 = skipped_accounting_record(
+                            &scope,
+                            &finalization,
+                            job,
+                            refunded,
+                            CiJobAccountingWriteVersion::V4,
+                        );
+                        let receipt_matches = match existing.disposition {
+                            None => existing.completion_receipt == expected_v3.completion_receipt,
+                            Some(_) => {
+                                existing.disposition == expected_v4.disposition
+                                    && existing.completion_receipt == expected_v4.completion_receipt
+                            }
+                        };
                         if !existing.skipped
                             || existing.wf_run_id != finalization.wf_run_id
                             || existing.ci_run_id != finalization.run_id
@@ -634,7 +656,7 @@ impl CiRunFinalizer for DurableCiRunFinalizer {
                             || existing.pricing_revision != "ci-skipped:v1"
                             || existing.billed != MinorUnits::ZERO
                             || existing.refunded != refunded
-                            || existing.completion_receipt != expected_receipt
+                            || !receipt_matches
                         {
                             return Err(CiRunStoreError::SkippedJobAccounting);
                         }
@@ -644,7 +666,13 @@ impl CiRunFinalizer for DurableCiRunFinalizer {
                         .record_in_tx(
                             conn,
                             &scope,
-                            &skipped_accounting_record(&scope, &finalization, job, refunded),
+                            &skipped_accounting_record(
+                                &scope,
+                                &finalization,
+                                job,
+                                refunded,
+                                accounting.write_version(),
+                            ),
                         )
                         .await
                         .map_err(|_| CiRunStoreError::SkippedJobAccounting)?;
@@ -1005,7 +1033,12 @@ fn skipped_accounting_record(
     finalization: &CiRunFinalization,
     job: &CiRunFinalizationJob,
     refunded: MinorUnits,
+    write_version: CiJobAccountingWriteVersion,
 ) -> CiJobAccountingRecord {
+    let disposition = CiJobTerminalDisposition::SkippedBeforeStart;
+    let legacy_completion_receipt_v3 = skipped_completion_receipt(scope, finalization, job);
+    let receipt =
+        versioned_accounting_receipt(write_version, legacy_completion_receipt_v3, disposition);
     CiJobAccountingRecord {
         tenant: scope.tenant().clone(),
         job_id: job.job_id.clone(),
@@ -1022,7 +1055,9 @@ fn skipped_accounting_record(
         pricing_revision: "ci-skipped:v1".into(),
         billed: MinorUnits::ZERO,
         refunded,
-        completion_receipt: skipped_completion_receipt(scope, finalization, job),
+        disposition: receipt.disposition,
+        completion_receipt: receipt.completion_receipt,
+        legacy_completion_receipt_v3: receipt.legacy_completion_receipt_v3,
     }
 }
 

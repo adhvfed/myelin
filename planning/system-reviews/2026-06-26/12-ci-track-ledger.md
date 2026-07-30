@@ -2990,3 +2990,79 @@ lease/topology prerequisite for 5b.3-6 (noted in the 4b.1 entry), and 5b.3-5/5b.
 (5b.3-6 is what will actually compose checkout preparation into `launch_with` and make this journal
 load-bearing in production — until then 4b is correct but dormant). The rest of ledger 12's open
 items are unchanged.
+
+---
+
+## 2026-07-30 — CT-007 slice 5b.3-5a: preparation-terminal disposition vocabulary + durable
+accounting compatibility, deliberately NOT wired to any live completion path yet (Sol, design +
+implementation; Sonnet, independent review via a fresh-context reviewer + two required fixes)
+
+**The gap:** a job that gets through checkout preparation but never reaches workload launch (prep
+itself failed, or the job was cancelled/superseded mid-prep) has no honest way to report a terminal
+result today, because the existing workload-completion CAS (`CONSUME_CLAIM_QUERY`, `scheduler.rs`)
+hard-requires `state = 'running'` in its `WHERE` clause — a preparation-only job stays `leased`.
+Verified this myself directly against the query text before accepting the premise. Loosening that
+CAS to also accept `leased` would erase the guarantee it exists for (a merely-leased worker can't
+fabricate workload results) — so 5b.3-5 needs a genuinely separate completion path, not a relaxed
+existing one. This slice (5a) builds only the vocabulary and durable-schema half; the actual new
+completion CAS (5b) is deliberately deferred to its own review, same pacing as 4a.2/4b.1/4b.2.
+
+**What landed:** a closed `PreparationTerminalDisposition` (`Failed{phase}`/`TimedOut{phase}`/
+`AttemptsExhausted`) and `PreparationAttemptDisposition` (`Terminal`/`RefusedBeforeExecution`/
+`RetryableInfrastructure`/`ReconciliationRequired{teardown_unproven,usage_unrepresentable,
+quarantine_required}`) — deliberately carrying no `ResourceUsage`, no caller-settable `passed`, and
+no arbitrary free text, so a preparation outcome can never be structurally confused with a workload
+result. Every Hop A/Hop B checkout-preparation error path is now structurally classified into this
+vocabulary (replacing the old `CheckoutTransportError::Failed`/`CheckoutPreparationError::
+RejectedAfterQuiescence` conflation). `ci_job_accounting` gained an additive nullable-column v4
+receipt encoding (closed disposition + a v4 completion-receipt shape) alongside the existing v3
+columns, with historical v3 rows replaying byte-for-byte unchanged.
+
+**Independent review (a fresh-context reviewer agent, not Sol, then verified myself) found two real
+issues before I'd commit anything:**
+
+1. **A genuine Hop A/Hop B inconsistency.** Hop A's `map_hop_run_failure` already special-cased
+   `RunFailure::CommitOutcomeUnknown` to `ReconciliationRequired`, with a comment noting it's
+   "unreachable in practice" via the immediate-launch-permit invariant but must never be silently
+   downgraded if it somehow occurred. Hop B's equivalent function did NOT match by variant — every
+   `RunFailure`, including `CommitOutcomeUnknown`, folded uniformly into ordinary
+   `RetryableInfrastructure`. I confirmed this myself by reading `gvisor.rs` directly before raising
+   it. Not currently exploitable (both paths reach it only through the same "unreachable" invariant),
+   but 5b.3-5b is about to build real reconciliation routing on this classification, and a future bug
+   violating that invariant would fail OPEN in Hop B while failing CLOSED in Hop A — a real latent
+   risk, not cosmetic. **Fixed:** `map_checkout_materialization_run_failure` now matches every
+   variant explicitly, routing `CommitOutcomeUnknown` to `ReconciliationRequired` exactly like Hop A,
+   proven by a dedicated regression test
+   (`hop_b_commit_outcome_unknown_is_never_downgraded_to_an_ordinary_retry`).
+2. **A judgment call I raised rather than assumed, and Sol reasoned through more precisely than my
+   own hypothesis.** Three already-live production completion paths (ordinary completion,
+   cancellation-terminal retry, supersession/skip-before-start) started unconditionally writing the
+   new v4 disposition data with no feature flag. My own first-pass read was that this looked lower-
+   risk than the v1→v2 reservation-writer precedent (pure additive metadata, no dollar amount
+   changes) — but I asked Sol for its own reasoning rather than accept that lean. Sol identified the
+   real risk precisely: it's not about money, it's about **fleet-convergence replay-safety** — an
+   older reporter binary replaying a row a newer binary wrote as v4 would recompute the OLD v3
+   receipt/summary shape, fail exact-equality against the durable v4 row, and spuriously refuse an
+   otherwise-legitimate idempotent redelivery during a rolling deployment. That is the identical risk
+   class the v1→v2 reservation writer was gated for, just via a different mechanism. **Fixed:** a new
+   `CiJobAccountingWriteVersion` (`V3`/`V4`) on `CiJobAccountingStore`, defaulting to `V3` via
+   `with_pg`; `with_pg_and_write_version(..., V4)` is the explicit opt-in, and the store refuses an
+   accidental V4 write while configured for V3. I confirmed every production composition-root call
+   site (`ci_runtime_composition.rs`, `ci_run_supersession.rs`, `lib.rs`) uses the plain `with_pg`
+   default — V4 is genuinely gated off in production, not just claimed to be.
+
+**Full independent verification, re-run after both fixes** (not the self-report): `myelin-ci-sandbox
+--lib` → 463 passed; `myelin-ci-controlplane --lib` → 540 passed; the *entire* control-plane
+integration matrix (`--all-targets --features integration`, every test binary in the crate) → all
+green; `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean; `cargo check
+--workspace --tests --all-features` clean.
+
+**Confirmed nothing new is live-callable yet:** the new classification functions and result-summary
+encoder are reachable only from their own unit tests; `CONSUME_CLAIM_QUERY` is untouched and a test
+still pins that it never accepts `leased`. 5a is genuinely dormant scaffolding plus (now properly
+gated) durable-schema enrichment — no new production behavior beyond the v4 opt-in seam itself.
+
+**Still open:** 5b.3-5b (the actual `report_preparation_terminal` completion CAS, racing safely
+against the existing workload CAS — deliberately not started this slice), 5b.3-6, 5b.3-7, task #91,
+the `v1`→`v2` reservation fleet-convergence flip, and the lease/topology prerequisite for 5b.3-6. The
+rest of ledger 12's open items are unchanged.

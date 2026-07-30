@@ -18,6 +18,8 @@ use myelin_ci_controlplane::{
     CiRunSupersessionError, CiWorkflowDefinitionPin, DurableCiJobLaunchTemplate, DurableEnqueue,
     GrantedCiJobV1, Lane, PgCiPipelineStarter, PgCiRunStarterFactory, PgCiRunStarterPoller,
     PgCiStarterError, PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
+    ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL,
+    ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL,
     ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
     ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
     ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
@@ -1182,6 +1184,14 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .execute(ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL)
         .await
         .expect("ci_job_accounting skipped migration");
+    admin
+        .execute(ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL)
+        .await
+        .expect("ci_job_accounting v4 disposition migration");
+    admin
+        .execute(ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL)
+        .await
+        .expect("ci_job_accounting v4 disposition verdict migration");
     admin
         .execute(CREATE_CHECK_ATTEMPT_DDL)
         .await
@@ -3715,6 +3725,14 @@ async fn a_v2_reservation_prevents_stale_queued_cancellation() {
             .execute(ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL)
             .await
             .expect("ci_job_accounting skipped migration");
+        admin
+            .execute(ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL)
+            .await
+            .expect("ci_job_accounting v4 disposition migration");
+        admin
+            .execute(ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL)
+            .await
+            .expect("ci_job_accounting v4 disposition verdict migration");
         admin
             .execute(CREATE_CHECK_ATTEMPT_DDL)
             .await

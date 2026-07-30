@@ -335,6 +335,10 @@ fn completion_receipt_binds_claim_authority_stage_accounting_and_ordered_refs() 
         lease_epoch: 7,
         claim_nonce: nonce,
     });
+    assert_eq!(
+        receipt, "v3:0e5c53438ce1802a45aef3077bd7864a97594051e0fb383f70f1e1546c4a782d",
+        "the legacy v3 encoder is byte-frozen for durable replay"
+    );
     let mut reversed = refs.clone();
     reversed.reverse();
     let changed = completion_receipt(CompletionReceiptInput {
@@ -391,6 +395,76 @@ fn completion_receipt_binds_claim_authority_stage_accounting_and_ordered_refs() 
         claim_nonce: nonce,
     });
     assert_ne!(receipt, changed_usage, "actual usage is receipt authority");
+}
+
+#[test]
+fn v4_receipt_and_result_summary_bind_the_closed_disposition() {
+    let tenant = TenantId("acme".into());
+    let run = RunId("11111111-1111-1111-1111-111111111111".into());
+    let refs = [ArtifactRef("myelin://acme/ci/artifact/first".into())];
+    let input = CompletionReceiptInput {
+        tenant: &tenant,
+        region: "fr-par",
+        run: &run,
+        job_id: "22222222-2222-2222-2222-222222222222",
+        idem_token: "idem-1",
+        stage: "build",
+        passed: false,
+        timed_out: false,
+        usage: ResourceUsage {
+            cpu_seconds: 17,
+            mem_byte_seconds: 4_096,
+        },
+        result_refs: &refs,
+        lease_owner: "worker-1",
+        lease_epoch: 7,
+        claim_nonce: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    };
+    let failed = completion_receipts_v4(input, CiJobTerminalDisposition::WorkloadFailed);
+    let cancelled = completion_receipts_v4(
+        input,
+        CiJobTerminalDisposition::CancelledAfterWorkloadLaunch,
+    );
+    assert_eq!(failed.legacy_v3, cancelled.legacy_v3);
+    assert_ne!(failed.current_v4, cancelled.current_v4);
+    assert_eq!(
+        failed.current_v4, "v4:5a3efebb3fe3a1aebebfcb23146b871674c2b795fef9ad40c8f44a1e557a7cea",
+        "the disposition-bound v4 encoder is externally pinned"
+    );
+
+    let report = TerminalReport {
+        passed: false,
+        timed_out: false,
+        usage: input.usage,
+        result_refs: refs.to_vec(),
+    };
+    assert_eq!(
+        terminal_result_summary(&report, Some(CiJobTerminalDisposition::WorkloadFailed)),
+        serde_json::json!({
+            "passed": false,
+            "timed_out": false,
+            "disposition": "workload_failed",
+            "workload_started": true,
+        })
+    );
+    assert_eq!(
+        terminal_result_summary(&report, None),
+        serde_json::json!({"passed": false, "timed_out": false}),
+        "a historical v3 replay retains the exact legacy summary shape"
+    );
+    assert_eq!(
+        preparation_terminal_result_summary(
+            myelin_ci_sandbox::PreparationTerminalDisposition::TimedOut {
+                phase: myelin_ci_sandbox::PreparationPhase::CheckoutTransport,
+            }
+        ),
+        serde_json::json!({
+            "passed": false,
+            "timed_out": true,
+            "disposition": "checkout_transport_timed_out",
+            "workload_started": false,
+        })
+    );
 }
 
 #[test]

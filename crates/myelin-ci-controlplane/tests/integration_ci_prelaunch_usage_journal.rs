@@ -7,7 +7,15 @@
 
 use std::time::Duration;
 
-use myelin_ci_controlplane::{ci_region_queue_store_test_support, JobQueueReaper};
+use myelin_ci_controlplane::{
+    ci_region_queue_store_test_support, CiJobAccountingRecord, CiJobAccountingStore,
+    CiJobAccountingWrite, CiJobAccountingWriteVersion, CiJobTerminalDisposition, JobQueueReaper,
+};
+use myelin_ci_sandbox::ResourceUsage;
+use myelin_flow::MinorUnits;
+use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use myelin_storage::TenantScope;
+use myelin_tenancy::{Region, TenantId};
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 use sqlx::{Executor, PgPool};
 
@@ -422,6 +430,93 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         .execute(&scheduler)
         .await,
         "the scheduler never gets write access to the immutable parent-attempt journal",
+    );
+
+    // 5b.3-5a compatibility proof: after the additive disposition/v4 migration, an immutable
+    // historical v3-only accounting row still inserts and replays byte-for-byte unchanged.
+    let accounting = CiJobAccountingStore::with_pg(app.clone(), Region("fr-par".into()));
+    let accounting_tenant = TenantId::from_token(tenant);
+    let accounting_region = Region("fr-par".into());
+    let principal = Principal::new(
+        accounting_tenant.clone(),
+        accounting_region.clone(),
+        PrincipalId("prelaunch-accounting-test".into()),
+        PrincipalKind::Service,
+        DataRole::Processor,
+        PrincipalStatus::Active,
+    );
+    let scope = TenantScope::from_verified_token(&principal, accounting_region);
+    let legacy = CiJobAccountingRecord {
+        tenant: TenantId::from_token(tenant),
+        job_id: "70000000-0000-0000-0000-000000000003".into(),
+        wf_run_id: wf_run_id.into(),
+        ci_run_id: run_id.into(),
+        reserve_handle: "ci-reserve:v1:legacy".into(),
+        passed: false,
+        timed_out: false,
+        skipped: true,
+        usage: ResourceUsage {
+            cpu_seconds: 0,
+            mem_byte_seconds: 0,
+        },
+        pricing_revision: "ci-skipped:v1".into(),
+        billed: MinorUnits::ZERO,
+        refunded: MinorUnits(1),
+        disposition: None,
+        completion_receipt: format!("v3:{}", "a".repeat(64)),
+        legacy_completion_receipt_v3: None,
+    };
+    assert_eq!(
+        accounting.record(&scope, &legacy).await.unwrap(),
+        CiJobAccountingWrite::Inserted
+    );
+    assert_eq!(
+        accounting.record(&scope, &legacy).await.unwrap(),
+        CiJobAccountingWrite::ExactReplay,
+        "the additive v4 columns never force or reinterpret an historical v3 receipt"
+    );
+    let mut accounting_conn = app.acquire().await.unwrap();
+    let loaded = accounting
+        .load_in_tx(&mut accounting_conn, &scope, &legacy.job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded, legacy);
+    drop(accounting_conn);
+
+    let v4_accounting = CiJobAccountingStore::with_pg_and_write_version(
+        app.clone(),
+        Region("fr-par".into()),
+        CiJobAccountingWriteVersion::V4,
+    );
+    let v4 = CiJobAccountingRecord {
+        tenant: TenantId::from_token(tenant),
+        job_id: "70000000-0000-0000-0000-000000000004".into(),
+        wf_run_id: wf_run_id.into(),
+        ci_run_id: run_id.into(),
+        reserve_handle: "ci-reserve:v1:v4-explicit".into(),
+        passed: false,
+        timed_out: false,
+        skipped: false,
+        usage: ResourceUsage {
+            cpu_seconds: 1,
+            mem_byte_seconds: 2,
+        },
+        pricing_revision: "ci-test:v1".into(),
+        billed: MinorUnits(1),
+        refunded: MinorUnits::ZERO,
+        disposition: Some(CiJobTerminalDisposition::WorkloadFailed),
+        completion_receipt: format!("v4:{}", "b".repeat(64)),
+        legacy_completion_receipt_v3: Some(format!("v3:{}", "c".repeat(64))),
+    };
+    assert_eq!(
+        v4_accounting.record(&scope, &v4).await.unwrap(),
+        CiJobAccountingWrite::Inserted,
+        "v4 remains explicitly activatable after the default writer is pinned to v3"
+    );
+    assert_eq!(
+        v4_accounting.record(&scope, &v4).await.unwrap(),
+        CiJobAccountingWrite::ExactReplay
     );
 
     scheduler.close().await;

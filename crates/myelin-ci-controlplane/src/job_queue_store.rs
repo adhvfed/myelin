@@ -271,6 +271,9 @@ pub(crate) struct ClaimConsumeSpec<'a> {
     pub claim_nonce: Uuid,
     pub stage: &'a str,
     pub completion_receipt: &'a str,
+    /// The other recognized receipt generation, accepted only by the already-terminal replay read.
+    /// It is never written by the live-generation CAS.
+    pub alternate_replay_receipt: Option<&'a str>,
 }
 
 // =================================================================================================
@@ -743,7 +746,10 @@ impl CiJobQueueStore {
         };
         let state: String = row.get("state");
         let stored_receipt: Option<String> = row.get("completion_receipt");
-        if state == "terminal" && stored_receipt.as_deref() == Some(spec.completion_receipt) {
+        if state == "terminal"
+            && (stored_receipt.as_deref() == Some(spec.completion_receipt)
+                || stored_receipt.as_deref() == spec.alternate_replay_receipt)
+        {
             Ok(ClaimConsumeOutcome::AlreadyConsumed)
         } else {
             Ok(ClaimConsumeOutcome::Refused)

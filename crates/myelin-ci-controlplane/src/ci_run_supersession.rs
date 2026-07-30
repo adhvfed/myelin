@@ -33,7 +33,10 @@ use crate::ci_pipeline_driver::{
 };
 use crate::ci_prelaunch_usage_journal::{
     resolve_prelaunch_usage_on_conn, CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity,
-    CiPrelaunchUnresolvedPolicy, CiPrelaunchUsageJournalError,
+    CiPrelaunchUnresolvedPolicy, CiPrelaunchUsageAccrual, CiPrelaunchUsageJournalError,
+};
+use crate::job_accounting_store::{
+    disposition_receipt_v4, versioned_accounting_receipt, CiJobTerminalDisposition,
 };
 use crate::{
     CiCostEventStore, CiDriveManifestStore, CiJobAccountingPricer, CiJobAccountingRecord,
@@ -677,7 +680,7 @@ impl PgCiRunSupersession {
                 cpu_seconds: 0,
                 mem_byte_seconds: 0,
             });
-        let accounted_floor = self
+        let (accounted_floor, prelaunch) = self
             .resolve_job_usage_on_conn(
                 conn,
                 CiPrelaunchSettlementIdentity {
@@ -701,18 +704,37 @@ impl PgCiRunSupersession {
             checked_accounting_usage(existing.usage).map_err(CiRunSupersessionError::Usage)?;
         let contains_floor = usage.cpu_seconds >= accounted_floor.cpu_seconds
             && usage.mem_byte_seconds >= accounted_floor.mem_byte_seconds;
+        let legacy_superseded_receipt = superseded_receipt(
+            &self.scope,
+            &peer.run_id,
+            &peer.wf_run_id,
+            &job.job_id,
+            &job.reserve_handle,
+            usage,
+            existing.skipped,
+        );
+        let superseded_disposition = if existing.skipped {
+            if prelaunch.parent_attempts == 0 {
+                CiJobTerminalDisposition::SkippedBeforeStart
+            } else {
+                CiJobTerminalDisposition::CancelledDuringPreparation
+            }
+        } else {
+            CiJobTerminalDisposition::CancelledAfterWorkloadLaunch
+        };
         let exact_superseded = matches!(replay_kind, ReplayKind::Superseded)
             && usage == accounted_floor
-            && existing.completion_receipt
-                == superseded_receipt(
-                    &self.scope,
-                    &peer.run_id,
-                    &peer.wf_run_id,
-                    &job.job_id,
-                    &job.reserve_handle,
-                    usage,
-                    existing.skipped,
-                );
+            && match existing.disposition {
+                None => existing.completion_receipt == legacy_superseded_receipt,
+                Some(disposition) => {
+                    disposition == superseded_disposition
+                        && existing.completion_receipt
+                            == disposition_receipt_v4(
+                                &legacy_superseded_receipt,
+                                superseded_disposition,
+                            )
+                }
+            };
         match replay_kind {
             ReplayKind::Reported if !contains_floor => {
                 return Err(CiRunSupersessionError::CorruptState(
@@ -787,7 +809,7 @@ impl PgCiRunSupersession {
         {
             return Err(CiRunSupersessionError::Settlement);
         }
-        let usage = self
+        let (usage, prelaunch) = self
             .resolve_job_usage_on_conn(
                 conn,
                 CiPrelaunchSettlementIdentity {
@@ -807,6 +829,24 @@ impl PgCiRunSupersession {
                 CiPrelaunchUnresolvedPolicy::SealToCeiling,
             )
             .await?;
+        let disposition = if skipped {
+            if prelaunch.parent_attempts == 0 {
+                CiJobTerminalDisposition::SkippedBeforeStart
+            } else {
+                CiJobTerminalDisposition::CancelledDuringPreparation
+            }
+        } else {
+            CiJobTerminalDisposition::CancelledAfterWorkloadLaunch
+        };
+        let legacy_completion_receipt_v3 = superseded_receipt(
+            &self.scope,
+            &manifest.ci_run_id,
+            &manifest.wf_run_id,
+            &job.job_id,
+            &job.reserve_handle,
+            usage,
+            skipped,
+        );
         let priced = TierPOperationalCiJobPricer
             .price(usage)
             .map_err(|_| CiRunSupersessionError::Pricing)?;
@@ -846,6 +886,11 @@ impl PgCiRunSupersession {
             .settle_in_tx(conn, &self.scope, &rows)
             .await
             .map_err(|_| CiRunSupersessionError::Accounting)?;
+        let receipt = versioned_accounting_receipt(
+            self.accounting.write_version(),
+            legacy_completion_receipt_v3,
+            disposition,
+        );
         self.accounting
             .record_in_tx(
                 conn,
@@ -863,15 +908,9 @@ impl PgCiRunSupersession {
                     pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
                     billed: settled.billed_total,
                     refunded: settled.refunded,
-                    completion_receipt: superseded_receipt(
-                        &self.scope,
-                        &manifest.ci_run_id,
-                        &manifest.wf_run_id,
-                        &job.job_id,
-                        &job.reserve_handle,
-                        usage,
-                        skipped,
-                    ),
+                    disposition: receipt.disposition,
+                    completion_receipt: receipt.completion_receipt,
+                    legacy_completion_receipt_v3: receipt.legacy_completion_receipt_v3,
                 },
             )
             .await
@@ -886,13 +925,14 @@ impl PgCiRunSupersession {
         base_usage: ResourceUsage,
         parent_expectation: CiPrelaunchParentExpectation,
         unresolved_policy: CiPrelaunchUnresolvedPolicy,
-    ) -> Result<ResourceUsage, CiRunSupersessionError> {
+    ) -> Result<(ResourceUsage, CiPrelaunchUsageAccrual), CiRunSupersessionError> {
         let prelaunch =
             resolve_prelaunch_usage_on_conn(conn, identity, parent_expectation, unresolved_policy)
                 .await
                 .map_err(CiRunSupersessionError::Prelaunch)?;
-        checked_add_accounting_usage(base_usage, prelaunch.usage)
-            .map_err(CiRunSupersessionError::Usage)
+        let usage = checked_add_accounting_usage(base_usage, prelaunch.usage)
+            .map_err(CiRunSupersessionError::Usage)?;
+        Ok((usage, prelaunch))
     }
 
     /// Reconcile one cancelled launched job whose execution lease expired before its runner could
