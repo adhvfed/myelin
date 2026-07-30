@@ -48,6 +48,13 @@ use myelin_storage::{
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
 
+/// Concurrent `#[tokio::test]` functions in this file each run their own `PgMigrator` sequence
+/// against the same live PostgreSQL instance; running two migration sequences at once can hit a
+/// genuine advisory-lock deadlock (not just contention) rather than a benign wait, so every test
+/// that runs migrations serializes on this guard for its migration-touching span, mirroring
+/// `MIGRATION_SCENARIO_LOCK` in `integration_ci_terminal_accounting_atomic.rs`.
+static MIGRATION_SCENARIO_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const BODY_HASH: &str = "blake3:ci-pg-body-v1";
 const BODY_HASH_V2: &str = "blake3:ci-pg-body-v2";
 /// A syntactically valid (40-hex-char, SHA-1-shaped) placeholder commit id. The real production
@@ -1088,6 +1095,7 @@ async fn seed_exact_workflow(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
     let schema = schema_name();
     let bare = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -3620,6 +3628,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
 /// `PgCiStarterError::Supersession`) instead of returning the clean `StartQueuedOutcome::Superseded`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_v2_reservation_prevents_stale_queued_cancellation() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
     let schema = format!("ci_pg_starter_v2res_{}", std::process::id());
     let bare = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
