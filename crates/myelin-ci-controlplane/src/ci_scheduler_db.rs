@@ -263,6 +263,10 @@ struct SchedulerProbe {
     workflow_select_state: bool,
     workflow_select_partition: bool,
     workflow_select_created_at: bool,
+    parent_attempt_select: bool,
+    prelaunch_usage_select: bool,
+    prelaunch_usage_update_status: bool,
+    prelaunch_usage_update_resolved_at: bool,
     mapping_function_execute: bool,
     excess_privilege: bool,
 }
@@ -366,6 +370,10 @@ fn validate_probe_before_mapping(
         && scheduler.workflow_select_state
         && scheduler.workflow_select_partition
         && scheduler.workflow_select_created_at
+        && scheduler.parent_attempt_select
+        && scheduler.prelaunch_usage_select
+        && scheduler.prelaunch_usage_update_status
+        && scheduler.prelaunch_usage_update_resolved_at
         && scheduler.mapping_function_execute)
     {
         return Err(CiSchedulerDbError::InsufficientPrivileges);
@@ -478,6 +486,10 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                 pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'state', 'SELECT') AS workflow_select_state,
                 pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'partition', 'SELECT') AS workflow_select_partition,
                 pg_catalog.has_column_privilege(session_user, 'public.workflow_run', 'created_at', 'SELECT') AS workflow_select_created_at,
+                pg_catalog.has_table_privilege(session_user, 'public.ci_job_parent_attempt', 'SELECT') AS parent_attempt_select,
+                pg_catalog.has_table_privilege(session_user, 'public.ci_job_prelaunch_usage', 'SELECT') AS prelaunch_usage_select,
+                pg_catalog.has_column_privilege(session_user, 'public.ci_job_prelaunch_usage', 'status', 'UPDATE') AS prelaunch_usage_update_status,
+                pg_catalog.has_column_privilege(session_user, 'public.ci_job_prelaunch_usage', 'resolved_at', 'UPDATE') AS prelaunch_usage_update_resolved_at,
                 pg_catalog.has_function_privilege(
                   session_user, 'public.myelin_ci_scheduler_region()'::regprocedure, 'EXECUTE'
                 ) AS mapping_function_execute,
@@ -540,6 +552,8 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                          'public.fair_deficit'::regclass,
                          'public.ci_run'::regclass,
                          'public.workflow_run'::regclass,
+                         'public.ci_job_parent_attempt'::regclass,
+                         'public.ci_job_prelaunch_usage'::regclass,
                          'public.myelin_ci_scheduler_region_map'::regclass
                        )
                        AND (
@@ -550,6 +564,43 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                          OR pg_catalog.has_table_privilege(session_user, unrelated.oid, 'TRUNCATE')
                          OR pg_catalog.has_table_privilege(session_user, unrelated.oid, 'REFERENCES')
                          OR pg_catalog.has_table_privilege(session_user, unrelated.oid, 'TRIGGER')
+                       )
+                  )
+                  OR pg_catalog.has_table_privilege(
+                       session_user, 'public.ci_job_parent_attempt', 'INSERT')
+                  OR pg_catalog.has_table_privilege(
+                       session_user, 'public.ci_job_parent_attempt', 'UPDATE')
+                  OR pg_catalog.has_table_privilege(
+                       session_user, 'public.ci_job_parent_attempt', 'DELETE')
+                  OR pg_catalog.has_table_privilege(
+                       session_user, 'public.ci_job_parent_attempt', 'TRUNCATE')
+                  OR pg_catalog.has_table_privilege(
+                       session_user, 'public.ci_job_parent_attempt', 'REFERENCES')
+                  OR pg_catalog.has_table_privilege(
+                       session_user, 'public.ci_job_parent_attempt', 'TRIGGER')
+                  OR pg_catalog.has_table_privilege(
+                       session_user, 'public.ci_job_prelaunch_usage', 'INSERT')
+                  OR pg_catalog.has_table_privilege(
+                       session_user, 'public.ci_job_prelaunch_usage', 'UPDATE')
+                  OR pg_catalog.has_table_privilege(
+                       session_user, 'public.ci_job_prelaunch_usage', 'DELETE')
+                  OR pg_catalog.has_table_privilege(
+                       session_user, 'public.ci_job_prelaunch_usage', 'TRUNCATE')
+                  OR pg_catalog.has_table_privilege(
+                       session_user, 'public.ci_job_prelaunch_usage', 'REFERENCES')
+                  OR pg_catalog.has_table_privilege(
+                       session_user, 'public.ci_job_prelaunch_usage', 'TRIGGER')
+                  OR EXISTS (
+                    SELECT 1
+                      FROM pg_catalog.pg_attribute AS prelaunch_column
+                     WHERE prelaunch_column.attrelid =
+                           'public.ci_job_prelaunch_usage'::regclass
+                       AND prelaunch_column.attnum > 0
+                       AND NOT prelaunch_column.attisdropped
+                       AND prelaunch_column.attname NOT IN ('status', 'resolved_at')
+                       AND pg_catalog.has_column_privilege(
+                         session_user, prelaunch_column.attrelid,
+                         prelaunch_column.attnum, 'UPDATE'
                        )
                   )
                   OR pg_catalog.has_table_privilege(session_user, 'public.workflow_run', 'INSERT')
@@ -671,6 +722,10 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
         workflow_select_state: row.get("workflow_select_state"),
         workflow_select_partition: row.get("workflow_select_partition"),
         workflow_select_created_at: row.get("workflow_select_created_at"),
+        parent_attempt_select: row.get("parent_attempt_select"),
+        prelaunch_usage_select: row.get("prelaunch_usage_select"),
+        prelaunch_usage_update_status: row.get("prelaunch_usage_update_status"),
+        prelaunch_usage_update_resolved_at: row.get("prelaunch_usage_update_resolved_at"),
         mapping_function_execute: row.get("mapping_function_execute"),
         excess_privilege: row.get("excess_privilege"),
     })

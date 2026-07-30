@@ -244,6 +244,14 @@ pub const CI_JOB_PRELAUNCH_USAGE_REAPER_INDEX_MIGRATION_ID: &str =
 /// preceding index implies.
 pub const CI_SCHEDULER_PRELAUNCH_USAGE_REAP_GRANT_MIGRATION_ID: &str =
     "ci_0020b_scheduler_prelaunch_usage_reap_grant";
+/// Expand-phase, nullable deadline column for topology-aware prelaunch sealing. New writers always
+/// populate it; a NULL legacy row is never guessed abandoned and therefore fails closed until a
+/// later bounded backfill/contract migration.
+pub const CI_JOB_PRELAUNCH_USAGE_SEAL_DEADLINE_MIGRATION_ID: &str =
+    "ci_0020c_ci_job_prelaunch_usage_seal_deadline";
+/// Additive, non-blocking partial index for the topology-aware deadline scan.
+pub const CI_JOB_PRELAUNCH_USAGE_SEAL_DEADLINE_INDEX_MIGRATION_ID: &str =
+    "ci_0020d_ci_job_prelaunch_usage_seal_deadline_reaper";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -812,6 +820,48 @@ pub const CREATE_CI_JOB_PRELAUNCH_USAGE_REAPER_INDEX_DDL: &str =
     "CREATE INDEX CONCURRENTLY IF NOT EXISTS ci_job_prelaunch_usage_reaper \
 ON ci_job_prelaunch_usage (region, started_at) WHERE status = 'started'";
 
+/// CT-007 slice 5b.3-4b.1 expand step: add an immutable, server-derived phase deadline without a
+/// blocking hot-table rewrite. The column stays nullable in this deployment so an already-populated
+/// journal can roll forward safely; new Rust writers always supply it, the resolver refuses a NULL,
+/// and the regional sealer never treats NULL as abandoned. A later bounded backfill/contract can
+/// make it structurally NOT NULL after fleet convergence.
+pub const ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL: &str = "\
+ALTER TABLE ci_job_prelaunch_usage
+  ADD COLUMN IF NOT EXISTS seal_after timestamptz;
+ALTER TABLE ci_job_prelaunch_usage
+  ADD CONSTRAINT ci_job_prelaunch_usage_seal_after_order
+  CHECK (seal_after IS NULL OR seal_after >= started_at) NOT VALID;
+ALTER TABLE ci_job_prelaunch_usage
+  VALIDATE CONSTRAINT ci_job_prelaunch_usage_seal_after_order;
+CREATE OR REPLACE FUNCTION myelin_guard_ci_job_prelaunch_usage_transition()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+BEGIN
+  IF OLD.status <> 'started' THEN
+    RAISE EXCEPTION 'ci_job_prelaunch_usage phase % is already resolved (%)', OLD.phase, OLD.status;
+  END IF;
+  IF NEW.status = 'started' THEN
+    RAISE EXCEPTION 'ci_job_prelaunch_usage phase % cannot revert to started', OLD.phase;
+  END IF;
+  IF NEW.tenant_id <> OLD.tenant_id OR NEW.region <> OLD.region OR NEW.job_id <> OLD.job_id
+     OR NEW.lease_epoch <> OLD.lease_epoch OR NEW.claim_nonce <> OLD.claim_nonce OR NEW.phase <> OLD.phase
+     OR NEW.ceiling_cpu_seconds <> OLD.ceiling_cpu_seconds
+     OR NEW.ceiling_mem_byte_seconds <> OLD.ceiling_mem_byte_seconds
+     OR NEW.started_at <> OLD.started_at
+     OR NEW.seal_after IS DISTINCT FROM OLD.seal_after THEN
+    RAISE EXCEPTION 'ci_job_prelaunch_usage identity, ceiling, and deadline are immutable';
+  END IF;
+  RETURN NEW;
+END
+$myelin$";
+
+/// Deadline-led replacement for the original started-at discovery index. The old index remains
+/// usable during rolling deployment; this new index alone drives 4b.1's safe regional sealer.
+pub const CREATE_CI_JOB_PRELAUNCH_USAGE_SEAL_DEADLINE_INDEX_DDL: &str =
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS ci_job_prelaunch_usage_seal_deadline_reaper \
+ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal_after IS NOT NULL";
+
 /// The reaper (CT-007 slice 5b.3-4b) scans for unresolved `started` phase rows CROSS-TENANT within
 /// one region -- the same server-mapped, empty-tenant scheduler boundary as `job_queue`'s reap query
 /// (Sol's review: the `(region, started_at)` partial index implies exactly this cross-tenant access
@@ -1314,6 +1364,16 @@ pub fn ci_controlplane_migrations() -> Migrations {
                 GRANT_SCHEDULER_CI_JOB_PRELAUNCH_USAGE_REAP_DDL,
                 CI_JOB_PRELAUNCH_USAGE_TABLE,
             ));
+            migrations.push(Migration::plain_on(
+                CI_JOB_PRELAUNCH_USAGE_SEAL_DEADLINE_MIGRATION_ID,
+                ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL,
+                CI_JOB_PRELAUNCH_USAGE_TABLE,
+            ));
+            migrations.push(Migration::plain_on(
+                CI_JOB_PRELAUNCH_USAGE_SEAL_DEADLINE_INDEX_MIGRATION_ID,
+                CREATE_CI_JOB_PRELAUNCH_USAGE_SEAL_DEADLINE_INDEX_DDL,
+                CI_JOB_PRELAUNCH_USAGE_TABLE,
+            ));
         }
     }
     migrations.push(Migration::plain_on(
@@ -1632,6 +1692,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prelaunch_seal_deadline_is_an_immutable_online_expand_with_a_partial_index() {
+        let ddl = ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL;
+        for required in [
+            "ADD COLUMN IF NOT EXISTS seal_after timestamptz",
+            "CHECK (seal_after IS NULL OR seal_after >= started_at) NOT VALID",
+            "VALIDATE CONSTRAINT ci_job_prelaunch_usage_seal_after_order",
+            "NEW.seal_after IS DISTINCT FROM OLD.seal_after",
+            "identity, ceiling, and deadline are immutable",
+        ] {
+            assert!(
+                ddl.contains(required),
+                "seal-deadline DDL pins `{required}`"
+            );
+        }
+        assert!(
+            !ddl.contains("seal_after timestamptz NOT NULL"),
+            "the hot-table expand remains nullable until a later bounded backfill/contract"
+        );
+        assert_eq!(
+            CREATE_CI_JOB_PRELAUNCH_USAGE_SEAL_DEADLINE_INDEX_DDL,
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ci_job_prelaunch_usage_seal_deadline_reaper \
+ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal_after IS NOT NULL"
+        );
+    }
+
     /// **The migration set applies forward-only (no DROP, no down) — the contract-1.5 floor.** Every
     /// assembled DDL is forward-only-legal (`is_destructive` is false) and carries the platform RLS
     /// scoping. The runner / lint enforce this at boot / source-scan; this is the in-module proof.
@@ -1640,8 +1726,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            48,
-            "20 table/RLS + 3 ci_run ALTERs + 8 concurrent-index + 1 index-validation + 4 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 3 scheduler ci_run/workflow discovery grants + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant"
+            50,
+            "20 table/RLS + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 4 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 3 scheduler claim grants + 3 scheduler ci_run/workflow discovery grants + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand"
         );
         for m in &migrations.0 {
             assert!(
@@ -1697,6 +1783,8 @@ mod tests {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CI_JOB_REAP_RESET_DDL);
             } else if m.id == CI_SCHEDULER_PRELAUNCH_USAGE_REAP_GRANT_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CI_JOB_PRELAUNCH_USAGE_REAP_DDL);
+            } else if m.id == CI_JOB_PRELAUNCH_USAGE_SEAL_DEADLINE_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL);
             } else if m.id == CI_REGION_SCHEDULER_RLS_MIGRATION_ID {
                 assert_eq!(m.ddl, CREATE_CI_REGION_SCHEDULER_RLS_DDL);
             } else {
@@ -1729,8 +1817,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            48,
-            "the runner applied all 20 table/RLS, 3 ci_run ALTERs, 8 concurrent-index, 1 index-validation, 4 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, and 1 scheduler prelaunch-usage reap grant"
+            50,
+            "the runner applied all 20 table/RLS, 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 4 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, and 1 prelaunch deadline expand"
         );
         assert_eq!(
             runner.applied()[0],

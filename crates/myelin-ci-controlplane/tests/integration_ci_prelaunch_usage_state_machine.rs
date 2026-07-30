@@ -8,12 +8,13 @@ use std::num::NonZeroU32;
 
 use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
-    CiAttemptBudgetPolicy, CiAttemptBudgetRevision, CiDriveManifestStore, CiDriveManifestV1,
-    CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest, CiJobSpecStore,
-    CiJobTokenRequest, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
-    CiManifestTrustTierV1, CiManifestWorkspaceV1, CiPrelaunchJournalOutcome,
-    CiPrelaunchUsageJournal, CiPrelaunchUsageJournalError, CiPrelaunchUsagePhase,
-    DurableCiJobLaunchTemplate, DurableEnqueue, GrantedCiJobV1, Lane,
+    resolve_prelaunch_usage_on_conn, CiAttemptBudgetPolicy, CiAttemptBudgetRevision,
+    CiDriveManifestStore, CiDriveManifestV1, CiJobBudgetReservationProvider,
+    CiJobRuntimeAuthorityRequest, CiJobSpecStore, CiJobTokenRequest, CiManifestLaneV1,
+    CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1,
+    CiPrelaunchJournalOutcome, CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity,
+    CiPrelaunchUnresolvedPolicy, CiPrelaunchUsageJournal, CiPrelaunchUsageJournalError,
+    CiPrelaunchUsagePhase, DurableCiJobLaunchTemplate, DurableEnqueue, GrantedCiJobV1, Lane,
     ManifestBoundCiJobTokenAuthority, OperationalReservationWriteVersion,
     PgTierPCiJobBudgetReservation,
 };
@@ -451,6 +452,54 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
         .unwrap();
         assert_eq!(attempts, 1);
 
+        // Two simultaneous acknowledgers serialize on the reservation/advisory boundary: exactly
+        // one inserts and the other recovers the same immutable generation.
+        let concurrent = seed_fixture(
+            &app,
+            &admin,
+            8,
+            CiAttemptBudgetPolicy::production(),
+            FixtureMutation::None,
+        )
+        .await;
+        let left = journal.clone();
+        let right = journal.clone();
+        let left_claim = concurrent.claim.clone();
+        let right_claim = concurrent.claim.clone();
+        let left_handle = concurrent.reserve_handle.clone();
+        let right_handle = concurrent.reserve_handle.clone();
+        let (left_result, right_result) = tokio::join!(
+            async move { left.begin_parent_attempt(&left_claim, &left_handle).await },
+            async move {
+                right
+                    .begin_parent_attempt(&right_claim, &right_handle)
+                    .await
+            }
+        );
+        let left_outcome = left_result.unwrap().1;
+        let right_outcome = right_result.unwrap().1;
+        assert!(
+            matches!(
+                (left_outcome, right_outcome),
+                (
+                    CiPrelaunchJournalOutcome::Applied,
+                    CiPrelaunchJournalOutcome::Replayed
+                ) | (
+                    CiPrelaunchJournalOutcome::Replayed,
+                    CiPrelaunchJournalOutcome::Applied
+                )
+            ),
+            "one concurrent begin applies and the other exactly replays"
+        );
+        let concurrent_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ci_job_parent_attempt WHERE job_id = $1::uuid",
+        )
+        .bind(&concurrent.claim.job_id)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(concurrent_rows, 1);
+
         assert_eq!(
             journal
                 .begin_phase(&attempt, CiPrelaunchUsagePhase::CheckoutTransport)
@@ -536,6 +585,160 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
                 .await
                 .unwrap_err(),
             CiPrelaunchUsageJournalError::IllegalPhaseTransition
+        );
+
+        let mut resolve_tx = app.begin().await.unwrap();
+        sqlx::query(
+            "SELECT set_config('myelin.tenant_id', $1, true),
+                    set_config('myelin.region', $2, true)",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .execute(&mut *resolve_tx)
+        .await
+        .unwrap();
+        let accrual = resolve_prelaunch_usage_on_conn(
+            &mut resolve_tx,
+            CiPrelaunchSettlementIdentity {
+                tenant_id: TENANT,
+                region: REGION,
+                job_id: &exact.claim.job_id,
+                wf_run_id: &exact.claim.wf_run_id,
+                ci_run_id: &exact.claim.ci_run_id,
+                reserve_handle: &exact.reserve_handle,
+            },
+            CiPrelaunchParentExpectation::Required,
+            CiPrelaunchUnresolvedPolicy::Refuse,
+        )
+        .await
+        .unwrap();
+        resolve_tx.commit().await.unwrap();
+        assert_eq!(accrual.parent_attempts, 1);
+        assert_eq!(accrual.measured_phases, 1);
+        assert_eq!(accrual.sealed_phases, 1);
+        assert_eq!(
+            accrual.usage,
+            ResourceUsage {
+                cpu_seconds: 127,
+                mem_byte_seconds: 32_212_254_729,
+            },
+            "exact transport usage plus the materialization ceiling is consumed once"
+        );
+
+        // A terminal owner may either refuse an unresolved phase or atomically seal it to the
+        // immutable ceiling while holding the same queue/advisory lock order.
+        let unresolved = seed_fixture(
+            &app,
+            &admin,
+            9,
+            CiAttemptBudgetPolicy::production(),
+            FixtureMutation::None,
+        )
+        .await;
+        let (unresolved_attempt, _) = journal
+            .begin_parent_attempt(&unresolved.claim, &unresolved.reserve_handle)
+            .await
+            .unwrap();
+        journal
+            .begin_phase(
+                &unresolved_attempt,
+                CiPrelaunchUsagePhase::CheckoutMaterialization,
+            )
+            .await
+            .unwrap();
+        let mut refuse_tx = app.begin().await.unwrap();
+        sqlx::query(
+            "SELECT set_config('myelin.tenant_id', $1, true),
+                    set_config('myelin.region', $2, true)",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .execute(&mut *refuse_tx)
+        .await
+        .unwrap();
+        let unresolved_identity = CiPrelaunchSettlementIdentity {
+            tenant_id: TENANT,
+            region: REGION,
+            job_id: &unresolved.claim.job_id,
+            wf_run_id: &unresolved.claim.wf_run_id,
+            ci_run_id: &unresolved.claim.ci_run_id,
+            reserve_handle: &unresolved.reserve_handle,
+        };
+        assert_eq!(
+            resolve_prelaunch_usage_on_conn(
+                &mut refuse_tx,
+                unresolved_identity,
+                CiPrelaunchParentExpectation::Required,
+                CiPrelaunchUnresolvedPolicy::Refuse,
+            )
+            .await
+            .unwrap_err(),
+            CiPrelaunchUsageJournalError::UnresolvedPhase
+        );
+        refuse_tx.rollback().await.unwrap();
+
+        let mut seal_tx = app.begin().await.unwrap();
+        sqlx::query(
+            "SELECT set_config('myelin.tenant_id', $1, true),
+                    set_config('myelin.region', $2, true)",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .execute(&mut *seal_tx)
+        .await
+        .unwrap();
+        let sealed_accrual = resolve_prelaunch_usage_on_conn(
+            &mut seal_tx,
+            unresolved_identity,
+            CiPrelaunchParentExpectation::Required,
+            CiPrelaunchUnresolvedPolicy::SealToCeiling,
+        )
+        .await
+        .unwrap();
+        seal_tx.commit().await.unwrap();
+        assert_eq!(sealed_accrual.measured_phases, 0);
+        assert_eq!(sealed_accrual.sealed_phases, 1);
+        assert_eq!(
+            sealed_accrual.usage,
+            ResourceUsage {
+                cpu_seconds: 120,
+                mem_byte_seconds: 32_212_254_720,
+            }
+        );
+
+        // Worker-side phase mutation re-verifies the exact live queue generation before touching
+        // the journal. A requeued/stale generation is refused before an INSERT can occur.
+        let stale = seed_fixture(
+            &app,
+            &admin,
+            10,
+            CiAttemptBudgetPolicy::production(),
+            FixtureMutation::None,
+        )
+        .await;
+        let (stale_attempt, _) = journal
+            .begin_parent_attempt(&stale.claim, &stale.reserve_handle)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE job_queue SET state = 'queued', lease_owner = NULL, lease_expires = NULL
+             WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(&stale.claim.job_id)
+        .execute(&admin)
+        .await
+        .unwrap();
+        assert_eq!(
+            journal
+                .begin_phase(
+                    &stale_attempt,
+                    CiPrelaunchUsagePhase::CheckoutMaterialization,
+                )
+                .await
+                .unwrap_err(),
+            CiPrelaunchUsageJournalError::ClaimUnavailable
         );
 
         // Each authority/refusal seam is exercised independently.

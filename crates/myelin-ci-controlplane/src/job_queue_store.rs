@@ -848,13 +848,41 @@ impl JobQueueReaper {
         self.interval
     }
 
-    /// **One recovery sweep** — re-queue expired active leases and reconcile one bounded, rotating
-    /// page of expired cancelled launches. Returns the total rows changed, or reports accumulated
-    /// candidate failures only after all other candidates in the page were attempted.
+    /// **One recovery sweep** — seal expired prelaunch phases, re-queue expired active leases, and
+    /// reconcile one bounded, rotating page of expired cancelled launches. The prelaunch deadline
+    /// is topology-aware and independent of the flat queue lease. Sealing and lease reaping are
+    /// attempted independently so a transient failure in either recovery surface cannot suppress
+    /// the other. Returns the total rows changed, or reports accumulated failures after every
+    /// independently safe operation was attempted.
     pub async fn reap_once(&self) -> Result<u64, JobQueueStoreError> {
-        let mut changed = self.store.reap(&self.region).await?;
+        let mut changed = 0_u64;
+        let mut failures = 0_u64;
+        let mut first_failure = None;
+        match self.store.seal_expired_prelaunch_usage(&self.region).await {
+            Ok(sealed) => changed = changed.saturating_add(sealed),
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                first_failure
+                    .get_or_insert_with(|| format!("prelaunch-usage sealing failed: {error}"));
+            }
+        }
+        match self.store.reap(&self.region).await {
+            Ok(reaped) => changed = changed.saturating_add(reaped),
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                first_failure.get_or_insert_with(|| format!("lease recovery failed: {error}"));
+            }
+        }
         let Some((pool, ledger)) = &self.cancelled_accounting else {
-            return Ok(changed);
+            return if failures == 0 {
+                Ok(changed)
+            } else {
+                Err(JobQueueStoreError::Db(format!(
+                    "{failures} reaper operation(s) failed after {changed} row(s) were recovered; \
+                     first failure: {}",
+                    first_failure.unwrap_or_else(|| "unknown recovery failure".into())
+                )))
+            };
         };
         let after = self
             .cancelled_cursor
@@ -879,8 +907,7 @@ impl JobQueueReaper {
             JobQueueStoreError::Db("cancelled-recovery cursor lock poisoned".into())
         })? = next_cursor;
 
-        let mut failures = 0_u64;
-        let mut first_failure = None;
+        let mut cancelled_failures = 0_u64;
         for candidate in candidates {
             let authority = match crate::PgCiRunSupersession::new(
                 pool.clone(),
@@ -892,6 +919,7 @@ impl JobQueueReaper {
                 Ok(authority) => authority,
                 Err(error) => {
                     failures = failures.saturating_add(1);
+                    cancelled_failures = cancelled_failures.saturating_add(1);
                     first_failure.get_or_insert_with(|| error.to_string());
                     continue;
                 }
@@ -904,16 +932,24 @@ impl JobQueueReaper {
                 Ok(false) => {}
                 Err(error) => {
                     failures = failures.saturating_add(1);
+                    cancelled_failures = cancelled_failures.saturating_add(1);
                     first_failure.get_or_insert_with(|| error.to_string());
                 }
             }
         }
         if failures > 0 {
-            return Err(JobQueueStoreError::Db(format!(
-                "{failures} cancelled recovery candidate(s) failed after {changed} row(s) were \
-                 recovered; first failure: {}",
-                first_failure.unwrap_or_else(|| "unknown reconciliation failure".into())
-            )));
+            let first = first_failure.unwrap_or_else(|| "unknown reconciliation failure".into());
+            return if failures == cancelled_failures {
+                Err(JobQueueStoreError::Db(format!(
+                    "{cancelled_failures} cancelled recovery candidate(s) failed after {changed} \
+                     row(s) were recovered; first failure: {first}"
+                )))
+            } else {
+                Err(JobQueueStoreError::Db(format!(
+                    "{failures} recovery operation(s) failed after {changed} row(s) were recovered; \
+                     first failure: {first}"
+                )))
+            };
         }
         Ok(changed)
     }
@@ -928,7 +964,7 @@ impl JobQueueReaper {
                 Ok(n) => {
                     eprintln!(
                         "ci-controlplane reaper: recovered {n} expired lease(s) in region \
-                         `{}` (active requeue or cancelled settlement)",
+                         `{}` (prelaunch sealing, active requeue, or cancelled settlement)",
                         self.region
                     );
                 }
@@ -965,7 +1001,7 @@ impl JobQueueReaper {
                         Ok(n) => {
                             eprintln!(
                                 "ci-controlplane reaper: recovered {n} expired lease(s) in region \
-                                 `{}` (active requeue or cancelled settlement)",
+                                 `{}` (prelaunch sealing, active requeue, or cancelled settlement)",
                                 self.region
                             );
                         }

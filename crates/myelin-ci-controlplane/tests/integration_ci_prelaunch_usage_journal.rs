@@ -5,6 +5,9 @@
 //! scheduler role can SELECT/seal what the reaper (CT-007 slice 5b.3-4b) needs and nothing more.
 #![cfg(feature = "integration")]
 
+use std::time::Duration;
+
+use myelin_ci_controlplane::{ci_region_queue_store_test_support, JobQueueReaper};
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 use sqlx::{Executor, PgPool};
 
@@ -300,9 +303,9 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
     let transport2 = sqlx::query(
         "INSERT INTO ci_job_prelaunch_usage (\
          tenant_id, region, job_id, lease_epoch, claim_nonce, phase, status, \
-         ceiling_cpu_seconds, ceiling_mem_byte_seconds) \
+         ceiling_cpu_seconds, ceiling_mem_byte_seconds, seal_after) \
          VALUES ($1, 'fr-par', $2::uuid, 1, '90000000-0000-0000-0000-000000000002'::uuid, \
-         'checkout_transport', 'started', 100, 200)",
+         'checkout_transport', 'started', 100, 200, now() + interval '1 day')",
     )
     .bind(tenant)
     .bind(job_b)
@@ -322,6 +325,20 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         .await,
         "the transition cannot also tamper with the recorded ceiling",
     );
+
+    let expired_materialization = sqlx::query(
+        "INSERT INTO ci_job_prelaunch_usage (\
+         tenant_id, region, job_id, lease_epoch, claim_nonce, phase, status, \
+         ceiling_cpu_seconds, ceiling_mem_byte_seconds, started_at, seal_after) \
+         VALUES ($1, 'fr-par', $2::uuid, 1, '90000000-0000-0000-0000-000000000002'::uuid, \
+         'checkout_materialization', 'started', 300, 400, now() - interval '2 minutes', \
+         now() - interval '1 minute')",
+    )
+    .bind(tenant)
+    .bind(job_b)
+    .execute(&app)
+    .await;
+    assert!(expired_materialization.is_ok());
 
     // DELETE is forbidden outright, resolved or not.
     assert_permission_denied(
@@ -345,7 +362,35 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         .fetch_one(&scheduler)
         .await
         .expect("scheduler SELECT on ci_job_prelaunch_usage");
-    assert_eq!(visible_usage, 3);
+    assert_eq!(visible_usage, 4);
+
+    let region_store = ci_region_queue_store_test_support(scheduler.clone());
+    let reaper = JobQueueReaper::new(region_store, "fr-par", Duration::from_secs(15));
+    assert_eq!(
+        reaper
+            .reap_once()
+            .await
+            .expect("topology-aware full regional reaper sweep"),
+        1,
+        "only the phase whose own immutable deadline elapsed is sealed"
+    );
+    let reaped_statuses: (String, String) = sqlx::query_as(
+        "SELECT
+           max(status) FILTER (WHERE phase = 'checkout_transport'),
+           max(status) FILTER (WHERE phase = 'checkout_materialization')
+         FROM ci_job_prelaunch_usage
+         WHERE tenant_id = $1 AND job_id = $2::uuid",
+    )
+    .bind(tenant)
+    .bind(job_b)
+    .fetch_one(&scheduler)
+    .await
+    .unwrap();
+    assert_eq!(
+        reaped_statuses,
+        ("started".into(), "sealed_ceiling".into()),
+        "the future-deadline phase remains live even though the parent claim timestamps are old"
+    );
 
     let sealed_by_reaper = sqlx::query(
         "UPDATE ci_job_prelaunch_usage SET status = 'sealed_ceiling', resolved_at = now() \
