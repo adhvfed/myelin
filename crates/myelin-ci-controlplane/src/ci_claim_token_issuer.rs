@@ -156,7 +156,7 @@ impl CiJobTokenIssuer for LockedManifestCiJobTokenIssuer {
     }
 }
 
-fn verify_locked_claim(
+pub(crate) fn verify_locked_claim(
     request: &CiJobTokenRequest,
     locked: &LockedJobClaim,
 ) -> Result<(), CiJobTokenIssueError> {
@@ -182,32 +182,17 @@ impl From<PgError> for CiJobTokenIssueError {
     }
 }
 
-fn authority_from_durable_claim(
+pub(crate) fn authority_from_durable_claim(
     claim: &CiJobTokenRequest,
     run: &CiRunRecord,
     manifest: &CiDriveManifestV1,
     launch_template: &DurableCiJobLaunchTemplate,
 ) -> Result<CiJobRuntimeAuthorityRequest, CiJobTokenIssueError> {
-    manifest
-        .validate()
-        .map_err(|_| refused("immutable CI manifest is invalid"))?;
-    if run.state != "running" {
-        return Err(refused("CI run is not live for token minting"));
-    }
-    if run.tenant_id != claim.tenant_id
-        || run.region != claim.region
-        || run.run_id != claim.ci_run_id
-        || run.wf_run_id != claim.wf_run_id
-        || manifest.tenant_id != run.tenant_id
-        || manifest.region != run.region
-        || manifest.ci_run_id != run.run_id
-        || manifest.wf_run_id != run.wf_run_id
-        || manifest.repo_ref != run.repo_ref.as_deref().unwrap_or_default()
-        || manifest.commit_oid != run.commit_oid.as_deref().unwrap_or_default()
-        || manifest_trust_token(manifest.trust_tier) != run.trust_tier
-    {
-        return Err(refused("durable CI run and manifest authority diverged"));
-    }
+    let authorities = runtime_authorities_from_durable_claim(claim, run, manifest)?;
+    let authority = authorities
+        .into_iter()
+        .find(|authority| authority.job_id == claim.job_id)
+        .ok_or_else(|| refused("claimed job is absent from the immutable CI manifest"))?;
     let job = manifest
         .jobs
         .iter()
@@ -230,9 +215,45 @@ fn authority_from_durable_claim(
             "durable ci_job_spec launch template identity differs from the locked claim/run/manifest",
         ));
     }
-    let checkout = checkout_scope_for_manifest_job(&job.workspace)?;
-    verify_checkout_scope_tenant(&checkout, &run.tenant_id)?;
     verify_dispatched_spec_matches_granted_workspace(&launch_template.spec, &job.workspace)?;
+    if !ManifestBoundCiJobTokenAuthority::verifies(&authority, &claim.token_authority_handle) {
+        return Err(refused(
+            "manifest-bound CI token authority verification failed",
+        ));
+    }
+    Ok(authority)
+}
+
+/// Reconstruct every immutable runtime-authority request in the exact canonical manifest order.
+///
+/// Both claim-time credential minting and the prelaunch-usage journal's v2 reservation verifier use
+/// this one function. The latter must recompute the COMPLETE reservation batch because the durable
+/// v2 batch digest binds every job, not only the currently claimed one.
+pub(crate) fn runtime_authorities_from_durable_claim(
+    claim: &CiJobTokenRequest,
+    run: &CiRunRecord,
+    manifest: &CiDriveManifestV1,
+) -> Result<Vec<CiJobRuntimeAuthorityRequest>, CiJobTokenIssueError> {
+    manifest
+        .validate()
+        .map_err(|_| refused("immutable CI manifest is invalid"))?;
+    if run.state != "running" {
+        return Err(refused("CI run is not live for token minting"));
+    }
+    if run.tenant_id != claim.tenant_id
+        || run.region != claim.region
+        || run.run_id != claim.ci_run_id
+        || run.wf_run_id != claim.wf_run_id
+        || manifest.tenant_id != run.tenant_id
+        || manifest.region != run.region
+        || manifest.ci_run_id != run.run_id
+        || manifest.wf_run_id != run.wf_run_id
+        || manifest.repo_ref != run.repo_ref.as_deref().unwrap_or_default()
+        || manifest.commit_oid != run.commit_oid.as_deref().unwrap_or_default()
+        || manifest_trust_token(manifest.trust_tier) != run.trust_tier
+    {
+        return Err(refused("durable CI run and manifest authority diverged"));
+    }
     let snapshot = myelin_refs::parse_scoped(&manifest.source_snapshot_ref)
         .map_err(|_| refused("manifest source snapshot authority is invalid"))?;
     let source_snapshot_digest = snapshot
@@ -240,30 +261,30 @@ fn authority_from_durable_claim(
         .strip_prefix("snapshot-")
         .ok_or_else(|| refused("manifest source snapshot authority is invalid"))?
         .to_owned();
-    let authority = CiJobRuntimeAuthorityRequest {
-        tenant_id: run.tenant_id.clone(),
-        region: run.region.clone(),
-        ci_run_id: run.run_id.clone(),
-        wf_run_id: run.wf_run_id.clone(),
-        project_id: run.project_id.clone(),
-        job_id: job.job_id.clone(),
-        stage: job.stage.clone(),
-        concrete_name: job.name.clone(),
-        trigger_kind: run.trigger_kind.clone(),
-        trust_tier: run.trust_tier.clone(),
-        source_snapshot_digest,
-        workflow_definition_version: manifest.workflow_definition_version,
-        workflow_code_hash: manifest.workflow_code_hash.clone(),
-        policy_revision: manifest.authority_policy_revision.clone(),
-        limits: job.limits.clone(),
-        checkout,
-    };
-    if !ManifestBoundCiJobTokenAuthority::verifies(&authority, &claim.token_authority_handle) {
-        return Err(refused(
-            "manifest-bound CI token authority verification failed",
-        ));
+    let mut authorities = Vec::with_capacity(manifest.jobs.len());
+    for job in &manifest.jobs {
+        let checkout = checkout_scope_for_manifest_job(&job.workspace)?;
+        verify_checkout_scope_tenant(&checkout, &run.tenant_id)?;
+        authorities.push(CiJobRuntimeAuthorityRequest {
+            tenant_id: run.tenant_id.clone(),
+            region: run.region.clone(),
+            ci_run_id: run.run_id.clone(),
+            wf_run_id: run.wf_run_id.clone(),
+            project_id: run.project_id.clone(),
+            job_id: job.job_id.clone(),
+            stage: job.stage.clone(),
+            concrete_name: job.name.clone(),
+            trigger_kind: run.trigger_kind.clone(),
+            trust_tier: run.trust_tier.clone(),
+            source_snapshot_digest: source_snapshot_digest.clone(),
+            workflow_definition_version: manifest.workflow_definition_version,
+            workflow_code_hash: manifest.workflow_code_hash.clone(),
+            policy_revision: manifest.authority_policy_revision.clone(),
+            limits: job.limits.clone(),
+            checkout,
+        });
     }
-    Ok(authority)
+    Ok(authorities)
 }
 
 /// CT-007 slice 5b.3-2b: derive the checkout scope the manifest GRANTED this job, via the sandbox's

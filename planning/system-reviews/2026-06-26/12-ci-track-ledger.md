@@ -2766,3 +2766,72 @@ warranting its own multi-round design/review cycle), 5b.3-4b (reaper/reconciliat
 consumers), and task #91 (credential binding). The `v1`→`v2` fleet-convergence flip in `lib.rs`
 remains a separate follow-up. 5b.3-5 through 5b.3-7 and the rest of ledger 12's open items are
 unchanged.
+
+---
+
+## 2026-07-30 — CT-007 slice 5b.3-4a.2 complete: the Rust `begin_parent_attempt`/`begin_phase`/
+`complete_phase`/`seal_phase` state machine (Sol, implementation; Sonnet, independent review)
+
+Sol implemented the narrow verified resolver its own prior design round specified, directly in
+`crates/myelin-ci-controlplane/src/ci_prelaunch_usage_journal.rs`. I (Sonnet) read the full diff and
+independently re-ran the gate rather than trust the self-report, per this ledger's evidence-over-
+assertion rule; Sol was the builder here, not the reviewer, so the adversarial-verifier role fell to
+me for this slice.
+
+**What landed:** `CiPrelaunchUsageJournal::begin_parent_attempt` admits one exact live claim
+generation inside a single tenant transaction: it locks the scheduler claim and run-of-record (the
+same lock order as `LockedManifestCiJobTokenIssuer::mint`), loads the immutable manifest and durable
+launch template, cross-checks the caller-supplied `reserve_handle` against both the manifest job's
+own `reserve_handle` and the durable `ci_job_spec.spec.meter_to.reserve_id`, locks the
+`cost_reservation` row `FOR UPDATE`, recomputes the policy from the `v2` handle and rebuilds the
+*complete* candidate batch (every job in the manifest, not only the claimed one — the batch digest
+binds all of them) to compare the expected handle and amount byte-for-byte against the durable row,
+requires `inflight` or atomically advances `reserved`→`inflight`, and refuses `v1` outright. A
+tenant/region/job-scoped advisory lock plus an exact epoch/nonce replay check make a second call with
+the same claim generation return the existing row (`Replayed`) rather than double-insert; a genuinely
+new generation is admitted only under the policy's `max_parent_attempts` cap, which counts durable
+attempt ROWS (a zero-preparation generation still counts). `begin_phase`/`complete_phase`/`seal_phase`
+follow the schema's own `started→{measured,sealed_ceiling}` monotonic contract: exact retries replay,
+divergent measurements or illegal crossings (e.g. sealing after measuring, completing after sealing)
+refuse — the DB trigger's `P0001` is mapped to a typed `IllegalPhaseTransition`, never leaked raw.
+
+To support this, `ci_claim_token_issuer::authority_from_durable_claim` was refactored (behavior-
+preserving for its existing claim-token-minting caller) into a shared
+`runtime_authorities_from_durable_claim` that reconstructs every manifest job's runtime-authority
+request in canonical order; both the original minting path and the new journal's batch-digest
+resolver now consume the same reconstruction, so there is exactly one place that builds this
+authority list from durable facts. `ci_launch_authority` gained the actual narrow resolver,
+`verify_v2_operational_reservation`, plus `raw_execution_usage_ceiling` (exposed so the journal
+derives phase ceilings from the same checked arithmetic as the `v2` reservation itself, scaled by
+each phase's known execution count — 2 for checkout transport, 1 for materialization).
+
+**Sol's own self-review caught the one bug that mattered:** its first draft recomputed the expected
+`v2` handle from only the claimed job's authority; since `build_v2_candidates` binds a batch digest
+over every job in the manifest, that would have refused every real multi-job manifest. Fixed by
+reconstructing the complete batch before recomputing the candidate for the claimed job specifically.
+
+**My independent review:** read the full diff (`ci_prelaunch_usage_journal.rs` new, plus the
+`ci_claim_token_issuer.rs`/`ci_launch_authority.rs` diffs) against the checkout-authority-chain
+precedent and the `reserve_operational_batch_on_conn` locking convention gathered beforehand. Traced
+each of the five admission requirements to its exact code path and confirmed the batch-digest fix is
+real (`verify_v2_operational_reservation` takes the complete `requests` slice, not a single job).
+Confirmed the `lib.rs` diff is a clean two-line addition (module + re-export) — the crate-root
+rustfmt mistake from earlier sessions was not repeated. Re-ran independently rather than trust the
+report: `cargo test -p myelin-ci-controlplane --lib` → 533 passed; the new
+`integration_ci_prelaunch_usage_state_machine.rs` against live Postgres → 1 passed (a single
+comprehensive test exercising fresh admission, exact replay for all four functions, every one of the
+five refusal seams individually, both illegal-transition directions, the attempt cap counting a
+zero-preparation generation, and a full `u64::MAX` round-trip through the `numeric` text-cast path);
+the neighboring `integration_ci_prelaunch_usage_journal.rs` and `integration_ci_operational_reservation.rs`
+suites → 6 passed, no regressions; `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` clean; `cargo check --workspace --tests --all-features` clean.
+
+**Not covered, flagged as a non-blocking gap:** the test suite is single-threaded/sequential: no
+concurrency test exercises two simultaneous `begin_parent_attempt` calls racing on the same
+reservation or the same fresh generation. The `FOR UPDATE` lock plus the advisory lock give good
+reason to expect this is race-safe, but it is asserted from code reading, not measured under real
+concurrency — worth a dedicated concurrency drill before this path carries production traffic.
+
+**Still open:** 5b.3-4b (reaper/reconciliation/settlement consumers of this journal — the natural
+next slice), task #91 (credential binding), and the `v1`→`v2` fleet-convergence flip in `lib.rs`.
+5b.3-5 through 5b.3-7 and the rest of ledger 12's open items are unchanged.

@@ -70,6 +70,8 @@ pub mod ci_manifest_job_runner;
 /// Production manifest resolver and DAG-native durable `ci.pipeline` body.
 pub mod ci_manifest_pipeline;
 pub mod ci_pipeline;
+/// Durable parent-attempt admission and checkout-preparation usage journal.
+pub mod ci_prelaunch_usage_journal;
 pub mod ci_result_signal;
 pub mod ci_runner_composition;
 pub mod ci_runner_host;
@@ -121,6 +123,10 @@ pub use ci_runtime_composition::{
     CiProductionWorkflowPoller, CiRuntimeCompositionError, CiWorkflowFanoutBatch,
     CI_FLOW_OUTBOX_SCHEMA_VERSION, CI_FLOW_WORKER_LEASE_TTL_SECS, CI_MANIFEST_PIPELINE_VERSION,
     MAX_CI_WORKFLOW_DRIVES_PER_SCOPE, MAX_CI_WORKFLOW_SCOPES_PER_PASS,
+};
+pub use ci_prelaunch_usage_journal::{
+    CiJobParentAttempt, CiPrelaunchJournalOutcome, CiPrelaunchUsageJournal,
+    CiPrelaunchUsageJournalError, CiPrelaunchUsagePhase,
 };
 /// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
 /// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`
