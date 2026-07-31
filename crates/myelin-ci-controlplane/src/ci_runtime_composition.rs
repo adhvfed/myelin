@@ -230,13 +230,14 @@ impl std::error::Error for CiSupersededDefinitionGuardError {}
 async fn local_superseded_runs(
     discovery: &CiRegionRunDiscovery,
     region: &str,
+    predecessor_version: i32,
 ) -> (Vec<crate::SupersededCiPipelineRun>, bool) {
     // One OVER the report bound: fetching exactly the bound cannot distinguish "16 stranded rows"
     // from "16 and more", so the probe asks for 17 and reports 16.
     match discovery
         .superseded_definition_runs(
             region,
-            CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
+            predecessor_version,
             MAX_SUPERSEDED_CI_PIPELINE_RUN_PROBE,
         )
         .await
@@ -248,6 +249,66 @@ async fn local_superseded_runs(
         }
         // A failed DIAGNOSTIC must not change the verdict the global probe already reached.
         Err(_) => (Vec::new(), false),
+    }
+}
+
+/// **A typed (predecessor, current) definition-cutover plan.**
+///
+/// The cutover fence was originally hard-coded to the single v2→v3 transition. Generalizing it to a
+/// typed plan lets a future v3→v4 cutover (CT-007 slice 6e) reuse the EXACT same fence — the
+/// `wf_definition FOR UPDATE` serialization, the database-wide backlog probe, and every fail-closed
+/// path (missing predecessor, divergent current hash, lock timeout, commit ambiguity) — without
+/// editing a single line of the heavily-reviewed fence body.
+///
+/// **Production still constructs and runs ONLY the v2→v3 plan.**
+/// [`CiProductionRuntimeFactory::cutover_definition`] builds it through
+/// [`CiProductionRuntimeFactory::production_cutover_plan`] from this binary's own source-derived pin;
+/// nothing else runs a cutover. The v3→v4 plan exists exclusively in synthetic tests until slice 6e
+/// activates it (and ships the retired-v3 fresh-DB sentinel migration this slice deliberately does
+/// not).
+///
+/// The three fields are the complete set the fence parameterizes over:
+/// - `predecessor_version` — the version drained and fenced (`FOR UPDATE`d, then backlog-probed);
+/// - `current_version` / `current_code_hash` — the version activated and hash-verified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CutoverPlan {
+    predecessor_version: i32,
+    current_version: i32,
+    current_code_hash: String,
+}
+
+impl CutoverPlan {
+    /// The predecessor version this plan drains and fences.
+    pub fn predecessor_version(&self) -> i32 {
+        self.predecessor_version
+    }
+
+    /// The current version this plan activates.
+    pub fn current_version(&self) -> i32 {
+        self.current_version
+    }
+
+    /// The source-derived pin hash the activated current version is required to carry.
+    pub fn current_code_hash(&self) -> &str {
+        &self.current_code_hash
+    }
+
+    /// **Construct an ARBITRARY (predecessor, current) plan — test-support only.** Production
+    /// constructs exactly the v2→v3 plan through
+    /// [`CiProductionRuntimeFactory::production_cutover_plan`] from its own source-derived pin; this
+    /// seam exists so the synthetic v3→v4 fence tests can drive the generalized cutover over
+    /// in-test-seeded `wf_definition` rows before slice 6e activates that transition in production.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests(
+        predecessor_version: i32,
+        current_version: i32,
+        current_code_hash: impl Into<String>,
+    ) -> Self {
+        Self {
+            predecessor_version,
+            current_version,
+            current_code_hash: current_code_hash.into(),
+        }
     }
 }
 
@@ -360,6 +421,50 @@ impl CiProductionRuntimeFactory {
         &self,
         diagnostics: &CiRegionRunDiscovery,
     ) -> Result<(), CiSupersededDefinitionGuardError> {
+        // PRODUCTION runs EXACTLY ONE plan: the v2→v3 transition mechanically derived from this
+        // binary's source pin. The fence body below is fully generalized over an arbitrary
+        // (predecessor, current) plan so slice 6e can add v3→v4 without re-touching it, but there is
+        // no production code path that constructs any plan other than this one.
+        self.cutover_with_plan(&self.production_cutover_plan(), diagnostics)
+            .await
+    }
+
+    /// **The production v2→v3 cutover plan, mechanically derived from this binary's source pin.** The
+    /// predecessor is the compiled-in [`CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION`]; the current version
+    /// and hash are the exact source-derived pin the starter and `worker_for` also register. This is
+    /// the ONLY plan any production root runs — [`Self::cutover_definition`] constructs it and nothing
+    /// else can. For the v2→v3 pair its three fields are byte-identical to the values the fence
+    /// formerly hard-coded, so the generalized fence produces byte/behavior-identical SQL, binds, and
+    /// refusals to the frozen cutover.
+    fn production_cutover_plan(&self) -> CutoverPlan {
+        CutoverPlan {
+            predecessor_version: CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
+            current_version: self.definition.version(),
+            current_code_hash: self.definition.code_hash().to_string(),
+        }
+    }
+
+    /// **Drive the generalized cutover fence over an arbitrary (predecessor, current) plan —
+    /// test-support only.** Production always runs [`Self::cutover_definition`]'s v2→v3 plan; this
+    /// seam lets the synthetic v3→v4 fence tests exercise the IDENTICAL fence body over
+    /// in-test-seeded rows before slice 6e activates that transition.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn cutover_definition_with_plan(
+        &self,
+        plan: &CutoverPlan,
+        diagnostics: &CiRegionRunDiscovery,
+    ) -> Result<(), CiSupersededDefinitionGuardError> {
+        self.cutover_with_plan(plan, diagnostics).await
+    }
+
+    /// The generalized fence body shared by the production v2→v3 wrapper and the test-support seam.
+    /// Every version/hash the fence touches comes from `plan`; the queries, lock modes, ordering, and
+    /// fail-closed paths are the frozen cutover's, unchanged.
+    async fn cutover_with_plan(
+        &self,
+        plan: &CutoverPlan,
+        diagnostics: &CiRegionRunDiscovery,
+    ) -> Result<(), CiSupersededDefinitionGuardError> {
         let mut transaction = self.pool.begin().await.map_err(|error| {
             CiSupersededDefinitionGuardError::ProbeFailed(format!(
                 "begin definition cutover: {error}"
@@ -392,7 +497,7 @@ impl CiProductionRuntimeFactory {
              /* global registry: tenant_id and region do not apply */",
         )
         .bind(CI_PIPELINE_WF_TYPE)
-        .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+        .bind(plan.predecessor_version)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|error| {
@@ -431,7 +536,7 @@ impl CiProductionRuntimeFactory {
         // backlog probe answers a database-wide question by construction. Neither has a tenant
         // column to bind; the fence's whole purpose is that it is not tenant-scoped.
         let backlog: bool = sqlx::query_scalar(self.backlog_probe_call.as_ref())
-            .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+            .bind(plan.predecessor_version)
             .fetch_one(&mut *transaction)
             .await
             .map_err(|error| {
@@ -443,17 +548,18 @@ impl CiProductionRuntimeFactory {
             // Roll the fence back FIRST so the old fleet resumes immediately, then gather local ids
             // purely to make the refusal actionable.
             let _ = transaction.rollback().await;
-            let (runs, truncated) = local_superseded_runs(diagnostics, &self.region.0).await;
+            let (runs, truncated) =
+                local_superseded_runs(diagnostics, &self.region.0, plan.predecessor_version).await;
             return Err(CiSupersededDefinitionGuardError::Backlog(
                 CiSupersededDefinitionBacklog {
-                    version: CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
+                    version: plan.predecessor_version,
                     runs,
                     truncated,
                 },
             ));
         }
 
-        self.commit_activation(transaction).await
+        self.commit_activation(plan, transaction).await
     }
 
     /// Substitute the backlog-probe call for a SCHEMA-ISOLATED live test. Production resolution stays
@@ -465,9 +571,13 @@ impl CiProductionRuntimeFactory {
         self
     }
 
-    /// The transition half of [`Self::cutover_definition`], still inside the fenced transaction.
+    /// The transition half of [`Self::cutover_with_plan`], still inside the fenced transaction. Every
+    /// version and hash comes from `plan`; for the production v2→v3 plan these equal the values this
+    /// method formerly hard-coded, so the drained/activated queries, binds, and refusals are
+    /// byte-identical.
     async fn commit_activation(
         &self,
+        plan: &CutoverPlan,
         mut transaction: sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> Result<(), CiSupersededDefinitionGuardError> {
         let refuse = |detail: String| CiSupersededDefinitionGuardError::ActivationRefused(detail);
@@ -481,7 +591,7 @@ impl CiProductionRuntimeFactory {
              /* global registry: tenant_id and region do not apply */",
         )
         .bind(CI_PIPELINE_WF_TYPE)
-        .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+        .bind(plan.predecessor_version)
         .execute(&mut *transaction)
         .await
         .map_err(|error| refuse(format!("drain the superseded definition: {error}")))?;
@@ -495,8 +605,8 @@ impl CiProductionRuntimeFactory {
              /* global registry: tenant_id and region do not apply */",
         )
         .bind(CI_PIPELINE_WF_TYPE)
-        .bind(self.definition.version())
-        .bind(self.definition.code_hash())
+        .bind(plan.current_version)
+        .bind(plan.current_code_hash())
         .execute(&mut *transaction)
         .await
         .map_err(|error| refuse(format!("activate the current definition: {error}")))?;
@@ -512,7 +622,7 @@ impl CiProductionRuntimeFactory {
              /* global registry: tenant_id and region do not apply */",
         )
         .bind(CI_PIPELINE_WF_TYPE)
-        .bind(self.definition.version())
+        .bind(plan.current_version)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|error| refuse(format!("verify the activated definition: {error}")))?
@@ -523,18 +633,18 @@ impl CiProductionRuntimeFactory {
         let current_status: String = current
             .try_get("status")
             .map_err(|error| refuse(format!("decode activated status: {error}")))?;
-        if current_hash != self.definition.code_hash() {
+        if current_hash != plan.current_code_hash() {
             return Err(refuse(format!(
                 "{CI_PIPELINE_WF_TYPE}@{} is registered with a DIFFERENT code hash than this \
                  binary's embedded pin — refusing to activate a definition whose source is not the \
                  source this process would run",
-                self.definition.version()
+                plan.current_version
             )));
         }
         if current_status != "active" {
             return Err(refuse(format!(
                 "{CI_PIPELINE_WF_TYPE}@{} is `{current_status}`, not `active`",
-                self.definition.version()
+                plan.current_version
             )));
         }
         // The post-state requirement is that the superseded version is NOT admissible for a fresh
@@ -549,14 +659,15 @@ impl CiProductionRuntimeFactory {
              /* global registry: tenant_id and region do not apply */",
         )
         .bind(CI_PIPELINE_WF_TYPE)
-        .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+        .bind(plan.predecessor_version)
         .fetch_one(&mut *transaction)
         .await
         .map_err(|error| refuse(format!("verify the drained definition: {error}")))?;
         if !matches!(drained.as_str(), "draining" | "retired") {
             return Err(refuse(format!(
-                "{CI_PIPELINE_WF_TYPE}@{CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION} is `{drained}` \
-                 after the cutover, expected `draining` or `retired`"
+                "{CI_PIPELINE_WF_TYPE}@{} is `{drained}` after the cutover, expected `draining` or \
+                 `retired`",
+                plan.predecessor_version
             )));
         }
         transaction.commit().await.map_err(|error| {
