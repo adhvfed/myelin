@@ -3432,3 +3432,74 @@ against injected authorities), 6d (dormant control-plane adapter + the ParentAtt
 AttemptsExhausted recovery fix), 6e (the atomic activating cutover incl. the selection gate + the
 v1→v2 reservation flip + credential-store construction + accounting V4 + ci.pipeline v3→v4 fence).
 Then 5b.3-7, task #91, gate-2 vertical slice. The rest of ledger 12's open items are unchanged.
+
+---
+
+## 2026-07-31 — CT-007 slice 5b.3-6c landed: the dormant sandbox checkout orchestrator
+(Fable orchestrating; Opus, implementation; Sol, design rulings + 7 adversarial review rounds to "no
+merge blockers")
+
+The largest dormant sub-slice: the full checkout body (Hop A → renewal → Hop B → workload) against
+INJECTED authorities, plus the sandbox-side capability vocabulary, fleshing the launch_checkout_
+continuation stub 6b left. Still dormant: production RunnerHooks stay legacy, zero production callers,
+launch_with never shape-diverts.
+
+**Design rulings first (a builder STOP surfaced 3 frozen-surface decisions).** The builder traced
+that the workload lease bind needs the real cgroup identity that only exists INSIDE run, that Hop B
+had no injectable executor seam, and that the launch_checkout_continuation boundary was ambiguous.
+Sol ruled: (1) Hop-B test seam = a #[cfg(test)] consuming transition into_prepared_for_tests (keeps
+the production run_checkout_preparation_v2 frozen); (2) workload bind = RuntimeBinding::EnabledPrepared
++ a CLOSED run_retained_workload that REPLACES the standalone bind_workload allowlist entry (capsule
+stays at 5 accessors); (3) boundary (i) — launch_checkout_continuation stays Hop-B-onward, a separate
+outer launch_checkout_orchestrated_with owns Hop A + parent-admission + acquire, with a strict
+resource-ownership handoff at capsule acquisition.
+
+**What landed (new checkout_orchestration.rs + workload_spec.rs + gvisor.rs/checkout_runtime.rs/lib.rs,
+no control-plane dep):** the capability vocabulary (ParentAttemptReserveHook alongside legacy
+ReserveHook with existing ctors keeping it None = dormancy; ParentAttemptAdmission; opaque
+AttemptAuthority trait with begin/complete/seal-phase + renew + mint_phase_credential +
+mint_workload_credential + should_requeue; PhaseCredentialCarrier + type-distinct
+WorkloadCredentialCarrier; typed outcomes wrapping the existing disposition vocabulary); the outer
+orchestrator + Hop-B-onward continuation implementing Sol's exact 26-step order; per-phase spec
+rotation (phase-local JobSpec differing from base ONLY in credential+context, full-spec clone-replace);
+the workload-core extraction (shared settle_enabled_finalization tail, compute path byte-identical);
+one shared cancellation threaded through Hop A/B/workload (killing Hop B's NEVER_CANCELLED); the full
+failure-routing matrix (terminal/refused/retryable/usage-unrepresentable/teardown-unproven/pre-bind/
+post-bind/success) mapped to typed outcomes.
+
+**Review arc (7 rounds).** r1 = 6 correctness blockers — the standout: phase credentials minted but
+never installed into the phase-local spec + no workload mint, which a missing test seam had MASKED and
+which would have made the entire checkout path fail at 6e activation (caught cheaply in dormant
+scaffolding); plus capsule-drop-poison on bare `?`, unresolved begun phases, discarded reconciliation
+diagnostics, and Uncommitted-vs-committed workload misclassification. r2-r3 = error-path corners
+(typed AcquisitionFailure distinguishing clean-refusal from unproven-rollback; immediate seal on
+Hop-B teardown-unproven; reconciliation routing) + test rigor (distinct-context rotation tests;
+always-run non-soft-skipping matrices). r4-r7 = making the call-site fences NON-EVADABLE — Sol
+compiled a fresh evasion each round (counting pins slipped by drop()/panic()/base_spec@alias/implicit-
+scope-drop/executor-clone-substitution) until the fixes reached the LANGUAGE-ENFORCED terminal forms:
+an RAII NotStartedCapsuleGuard whose Drop performs the SAFE NotStarted cleanup (poison→safe on any
+early exit) with direct disarm-to-consume (no window), and a sealed workload_spec module
+(WorkloadRotatedSpec, private field, no as_job_spec, production calls the fixed runner itself, generic
+executor cfg(test)-only, closed-world AST-walked audit rejecting any JobSpec-mentioning return). Same
+principle as 6a: enforce "must-cleanup"/"must-not-escape" via ownership/module structure, not
+syntactic pins. Sol's final judgment: no compiling production substitution or ownership-gap evasion.
+
+**Gates (orchestrator ran independently):** sandbox --lib 503, --features test-support 552 (incl. the
+guard-safe-dispose + full-success + failure-matrix tests), the entire integration matrix green except
+the known firecracker escape skip (852bc7ae), controlplane --lib 583, occurrence-table 14, clippy -D
+warnings clean, check clean, myelin-lints green, git diff --check clean.
+
+**Dormant + preserved:** launch_checkout_orchestrated_with 0 production callers; parent_attempt_reserve
+None default; compute path byte-identical (6b golden traces); the 6a capsule's 5-accessor compile-time
+inseparability intact (ALLOWLIST evolved deliberately: bind_workload→run_retained_workload). Sol
+confirms a clean AttemptAuthority/WorkloadCredentialCarrier/mint_workload_credential seam for 6d.
+
+**Still open:** 6d (the REAL control-plane adapter feeding these injected authorities — V2 phase-store
+factory over CiJobCredentialGenerationStore + IdentityCiJobCredentialMinter, the CiJobParentAttempt→
+AttemptAuthority adapter, DurablePreparationLeaseCheckpoint construction, parent-admission via
+begin_parent_attempt in one tenant tx, preparation-retry CAS, and the ParentAttemptLimitExceeded/
+report_preparation_terminal(AttemptsExhausted) recovery fix); 6e (the atomic activating cutover:
+selection gate + reservation V2 + credential-store construction + accounting V4 + ci.pipeline v3→v4
+fence, all together). Then 5b.3-7 live drill, task #91, gate-2 vertical slice. FORWARD NOTE for 6d/6e:
+brief for LANGUAGE-LEVEL enforcement (RAII / module privacy) of must-cleanup/must-not-escape
+properties from the start — never counting pins. The rest of ledger 12's open items are unchanged.

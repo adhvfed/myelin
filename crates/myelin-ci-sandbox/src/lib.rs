@@ -62,6 +62,7 @@
 pub mod asset_registry;
 pub mod canonical_tar;
 mod checkout_authorization;
+pub mod checkout_orchestration;
 mod dirlock;
 pub mod escape_corpus;
 pub mod events;
@@ -1270,6 +1271,10 @@ pub struct RunnerHooks {
     /// `RunnerHooks::authorize_checkout_phase` refuses outright on `None`, and never falls back to
     /// the legacy claim-bound hook.
     checkout_phase_authorization: Option<CheckoutPhaseAuthorizationHook>,
+    /// CT-007 slice 5b.3-6c: the V2 parent-attempt reservation mode. `None` for every caller today
+    /// (all production constructors keep it `None`, selecting the legacy [`ReserveHook`]);
+    /// [`Self::reserve_parent_attempt`] refuses outright on `None`. Installing it is 5b.3-6e's job.
+    parent_attempt_reserve: Option<ParentAttemptReserveHook>,
 }
 
 /// Single durable owner of successful completion settlement.
@@ -1286,6 +1291,19 @@ pub enum CompletionSettlementOwner {
 /// durable implementation can bind the reservation to the same tenant, region, workflow, job, and
 /// claim generation as final attribution; a bare caller-controlled meter string is insufficient.
 pub type ReserveHook = Box<dyn Fn(&JobSpec) -> Result<ReserveHandle, HookError> + Send + Sync>;
+/// **CT-007 slice 5b.3-6c: the V2 parent-attempt reservation mode, alongside the legacy
+/// [`ReserveHook`].** Unlike `ReserveHook` (which returns a bare handle), this one performs the exact
+/// claim/v2-reservation validation, transitions the reservation to inflight, and inserts/replays the
+/// exact parent-attempt row — all in one tenant transaction — returning a
+/// [`ParentAttemptAdmission`](crate::checkout_orchestration::ParentAttemptAdmission) that also carries
+/// the opaque per-attempt [`AttemptAuthority`](crate::checkout_orchestration::AttemptAuthority). `None`
+/// on every `RunnerHooks` today; the dormant checkout orchestrator refuses outright when it is not
+/// configured, so no production job can enter the V2 path until 5b.3-6e installs the real adapter.
+pub type ParentAttemptReserveHook = Box<
+    dyn Fn(&JobSpec) -> Result<crate::checkout_orchestration::ParentAttemptAdmission, HookError>
+        + Send
+        + Sync,
+>;
 /// Guarantee #1b hook type (contract 11.7 settle_budget): settle/release the exact scoped job
 /// reservation. The complete [`JobSpec`] remains present at both successful completion and
 /// pre-spawn refusal, so the hook never has to recover tenant scope from an opaque handle.
@@ -1528,6 +1546,7 @@ impl RunnerHooks {
             isolation_floor,
             checkout_authorization: None,
             checkout_phase_authorization: None,
+            parent_attempt_reserve: None,
         }
     }
 
@@ -1548,6 +1567,7 @@ impl RunnerHooks {
             isolation_floor,
             checkout_authorization: None,
             checkout_phase_authorization: None,
+            parent_attempt_reserve: None,
         }
     }
 
@@ -1571,6 +1591,34 @@ impl RunnerHooks {
     ) -> Self {
         self.checkout_phase_authorization = Some(hook);
         self
+    }
+
+    /// CT-007 slice 5b.3-6c: attach the V2 parent-attempt reservation mode. Additive exactly like the
+    /// other builders — every existing caller stays byte-unchanged and keeps `None`, so the whole
+    /// parent-attempt admission path is unreachable until a caller (5b.3-6e) explicitly opts in.
+    #[allow(dead_code)]
+    pub fn with_parent_attempt_reservation(mut self, hook: ParentAttemptReserveHook) -> Self {
+        self.parent_attempt_reserve = Some(hook);
+        self
+    }
+
+    /// CT-007 slice 5b.3-6c: admit/reserve a parent attempt through the V2 reservation mode. Refuses
+    /// outright when no parent-attempt reserve hook was configured — a missing hook is never treated
+    /// as "admitted", and the legacy [`Self::reserve`] is deliberately NOT a fallback (a bare reserve
+    /// handle carries no parent-attempt row, which every V2 settlement owner requires).
+    #[allow(dead_code)]
+    pub(crate) fn reserve_parent_attempt(
+        &self,
+        spec: &JobSpec,
+    ) -> Result<crate::checkout_orchestration::ParentAttemptAdmission, HookError> {
+        match &self.parent_attempt_reserve {
+            Some(hook) => hook(spec),
+            None => Err(HookError(
+                "checkout parent-attempt admission requires a configured parent-attempt reservation \
+                 hook, but none was provided (this RunnerHooks selects the legacy reserve mode)"
+                    .to_string(),
+            )),
+        }
     }
 
     /// The one configured owner of successful completion settlement.
@@ -1745,6 +1793,59 @@ pub fn agent_job(
         meter_to,
         idem_token,
     )
+}
+
+/// CT-007 slice 5b.3-6c: a crate-level `#[cfg(test)]` checkout-bearing [`JobSpec`] carrying the
+/// resolved run-token authorization context (region) the dormant orchestrator derives — shared by the
+/// `gvisor` and `checkout_orchestration` unit tests. Uses a bare digest-pinned image (no rootfs
+/// fixture needed — these tests never launch a real `runsc`).
+#[cfg(test)]
+pub(crate) fn checkout_job_spec_for_tests() -> JobSpec {
+    let mut spec = JobSpec::new(
+        JobKind::Ci,
+        ImageRef::pinned(format!("test.local/checkout@sha256:{}", "a".repeat(64))).unwrap(),
+        vec!["true".into()],
+        vec![],
+        vec![],
+        EgressPolicy { allow: vec![] },
+        ResourceLimits {
+            cpu_millis: 1000,
+            mem_bytes: 256 << 20,
+            disk_bytes: 1 << 30,
+            tmpfs_bytes: 1 << 30,
+            pids_max: 64,
+            timeout_secs: 120,
+        },
+        WorkspaceSpec {
+            repo_ref: Some("myelin://acme/git/repo/widgets".to_string()),
+            commit: Some("a".repeat(40)),
+        },
+        TrustTier::UntrustedFork,
+        RunTokenCredential::new("test-bearer", "advertise-jti", 300).unwrap(),
+        MeterTarget {
+            reserve_id: "r".into(),
+        },
+        IdemToken("idem-checkout-6c".into()),
+    )
+    .unwrap();
+    spec.run_token_authorization = Some(RunTokenAuthorizationContext::CiJob(
+        CiJobAuthorizationContext {
+            tenant_id: "acme".to_string(),
+            region: "fr-par".to_string(),
+            principal_id: "p".to_string(),
+            wf_run_id: "wf".to_string(),
+            job_id: "j".to_string(),
+            lease_owner: "o".to_string(),
+            lease_epoch: 1,
+            claim_nonce: "n".to_string(),
+            claim_started_at_epoch_secs: 0,
+            claim_expires_at_epoch_secs: 1,
+            required_capabilities: vec![],
+            checkout_scope: None,
+            credential_binding: None,
+        },
+    ));
+    spec
 }
 
 #[cfg(test)]

@@ -1382,6 +1382,20 @@ enum RuntimeBinding<'a> {
         expected_root_identity: (u64, u64),
         context: &'a mut EnabledLaunchContext,
     },
+    /// CT-007 slice 5b.3-6c: the checkout WORKLOAD binding, over a lease already durably `Prepared`
+    /// by Hop B. Carries only disjoint, scoped mutable borrows of the capsule's own lease, session,
+    /// and bind-state (never the whole `EnabledLaunchContext`, never the `OciConfig`) — the borrows
+    /// are constructed INSIDE [`checkout_runtime::PreparedCheckoutRuntime::run_retained_workload`] and
+    /// never outlive that closed transition. At the real cgroup boundary the bind is
+    /// `session.bind_workload` (durable `Prepared → Bound`), NOT `lease.bind` (which is `Allocated →
+    /// Bound` and would refuse a `Prepared` lease). Compute never constructs this arm, so the ordinary
+    /// compute path is byte-unchanged.
+    EnabledPrepared {
+        expected_root_identity: (u64, u64),
+        lease: &'a mut crate::user_namespace::UserNamespaceLease,
+        session: &'a mut crate::user_namespace::CheckoutPreparationSession,
+        bind_state: &'a mut LeaseBindState,
+    },
 }
 
 /// The single validated runtime-preparation handle threaded into the run closure (CT-007 slice 3,
@@ -1403,6 +1417,17 @@ impl<'a> RuntimePreparation<'a> {
                 context,
             } => PreparedRuntimeMode::ExplicitUserNamespace {
                 config: context.lease.config(),
+                expected_root_identity: *expected_root_identity,
+            },
+            // CT-007 slice 5b.3-6c: the checkout workload's OCI layout is the SAME
+            // ExplicitUserNamespaceWithWorkspace mode the capsule's retained `workload_cfg` was built
+            // in — the config comes from the same lease, so the mode/layout check matches exactly.
+            RuntimeBinding::EnabledPrepared {
+                expected_root_identity,
+                lease,
+                ..
+            } => PreparedRuntimeMode::ExplicitUserNamespace {
+                config: lease.config(),
                 expected_root_identity: *expected_root_identity,
             },
         };
@@ -1498,6 +1523,44 @@ fn join_diagnostics(base: String, diagnostics: &[String]) -> String {
         .fold(base, |acc, d| format!("{acc} AND {d}"))
 }
 
+/// CT-007 slice 5b.3-6c (Sol's r2 finding 1): a typed workspace/lease acquisition failure that carries
+/// whether the acquisition's OWN rollback was PROVEN clean. `reconciliation_required` is `true` iff a
+/// workspace could not be proven deleted, a lease could not be proven released, or a rollback failed —
+/// i.e. the manager may be poisoned and/or the userns slot quarantined, so the caller MUST route to
+/// `ReconciliationRequired` (never ordinary retry/exhaustion, which would strand a live resource with
+/// no typed signal). A clean refusal (capacity/lease refused, or a provisioning failure whose rollback
+/// was proven) is ordinary-retryable.
+#[derive(Debug)]
+pub(crate) struct AcquisitionFailure {
+    pub message: String,
+    pub reconciliation_required: bool,
+}
+
+impl AcquisitionFailure {
+    fn clean(message: String) -> Self {
+        Self {
+            message,
+            reconciliation_required: false,
+        }
+    }
+    fn reconcile(message: String) -> Self {
+        Self {
+            message,
+            reconciliation_required: true,
+        }
+    }
+    /// A post-provisioning rollback (`delete_workspace_then_release_lease_if_absent`): EMPTY diagnostics
+    /// = the delete + release were proven clean → ordinary refusal; ANY diagnostic = a quarantine /
+    /// unproven-absence → reconciliation-required.
+    fn from_rollback_diagnostics(base: String, diagnostics: Vec<String>) -> Self {
+        let reconciliation_required = !diagnostics.is_empty();
+        Self {
+            message: join_diagnostics(base, &diagnostics),
+            reconciliation_required,
+        }
+    }
+}
+
 /// CT-007 slice 3, piece 7c: acquire capacity, a userns lease, and a real disk-backed workspace,
 /// then build the `ExplicitUserNamespaceWithWorkspace` OCI layout from them — the Enabled path's
 /// counterpart to `OciConfig::from_spec`'s plain Rootless construction. Every failure hands back a
@@ -1510,7 +1573,7 @@ fn acquire_enabled_workspace(
     absolute_rootfs: PathBuf,
     workspace_manager: &WorkspaceManager,
     userns_allocator: &UserNamespaceAllocator,
-) -> Result<(OciConfig, EnabledLaunchContext), String> {
+) -> Result<(OciConfig, EnabledLaunchContext), AcquisitionFailure> {
     acquire_enabled_workspace_given(
         spec,
         profile,
@@ -1553,14 +1616,17 @@ fn acquire_enabled_workspace_given(
         CapacityLease,
     ) -> Result<ManagedWorkspace, WorkspaceProvisionError>,
     delete_workspace: impl FnOnce(ManagedWorkspace) -> Result<(), DeleteWorkspaceError>,
-) -> Result<(OciConfig, EnabledLaunchContext), String> {
-    let capacity = acquire_capacity(spec.limits.disk_bytes)
-        .map_err(|refusal| format!("workspace capacity refused: {refusal}"))?;
+) -> Result<(OciConfig, EnabledLaunchContext), AcquisitionFailure> {
+    let capacity = acquire_capacity(spec.limits.disk_bytes).map_err(|refusal| {
+        AcquisitionFailure::clean(format!("workspace capacity refused: {refusal}"))
+    })?;
     let lease = match lease_fn() {
         Ok(lease) => lease,
         Err(refusal) => {
             capacity.release();
-            return Err(format!("userns lease refused: {refusal}"));
+            return Err(AcquisitionFailure::clean(format!(
+                "userns lease refused: {refusal}"
+            )));
         }
     };
     let workspace = match create_workspace(
@@ -1574,11 +1640,13 @@ fn acquire_enabled_workspace_given(
         Err(WorkspaceProvisionError::Refused(refusal)) => {
             let message = format!("workspace creation refused: {refusal}");
             refusal.into_capacity().release();
+            // Release proven clean → ordinary refusal; a FAILED release means the slot may still be
+            // live → reconciliation-required (Sol's finding 1).
             return Err(match lease.release_unused() {
-                Ok(()) => message,
-                Err(e) => {
-                    format!("{message} AND releasing the unused userns lease also failed: {e}")
-                }
+                Ok(()) => AcquisitionFailure::clean(message),
+                Err(e) => AcquisitionFailure::reconcile(format!(
+                    "{message} AND releasing the unused userns lease also failed: {e}"
+                )),
             });
         }
         Err(WorkspaceProvisionError::Storage(WorkspaceStorageError::UnrecoverableLeak {
@@ -1587,30 +1655,32 @@ fn acquire_enabled_workspace_given(
         })) => {
             // Capacity was already abandoned internally (poisoning the workspace manager); the
             // subvolume may still exist on disk, so the lease must NOT be released — drop it
-            // (quarantine) rather than risk reissuing this subordinate uid over live data.
+            // (quarantine) rather than risk reissuing this subordinate uid over live data. The
+            // rollback is UNPROVEN → reconciliation-required.
             drop(lease);
-            return Err(format!(
+            return Err(AcquisitionFailure::reconcile(format!(
                 "workspace creation left an unrecoverable leak at {path:?} — the userns lease is \
                  left unreleased (quarantined) since disk absence is not proven"
-            ));
+            )));
         }
         Err(WorkspaceProvisionError::Storage(e)) => {
             // A real attempt failed, but `WorkspaceManager`'s own rollback already proved no
             // subvolume survives — capacity was already released internally.
             let message = format!("workspace-storage provisioning failed: {e}");
             return Err(match lease.release_unused() {
-                Ok(()) => message,
-                Err(release_error) => format!(
+                Ok(()) => AcquisitionFailure::clean(message),
+                Err(release_error) => AcquisitionFailure::reconcile(format!(
                     "{message} AND releasing the unused userns lease also failed: {release_error}"
-                ),
+                )),
             });
         }
         Err(WorkspaceProvisionError::InternalInvariantViolated { reason, workspace }) => {
             let diagnostics =
                 delete_workspace_then_release_lease_if_absent(*workspace, lease, delete_workspace);
-            return Err(join_diagnostics(
+            // Non-empty diagnostics = the delete/release could not be PROVEN → reconciliation-required.
+            return Err(AcquisitionFailure::from_rollback_diagnostics(
                 format!("workspace creation violated an internal invariant: {reason}"),
-                &diagnostics,
+                diagnostics,
             ));
         }
     };
@@ -1623,9 +1693,9 @@ fn acquire_enabled_workspace_given(
         Err(reason) => {
             let diagnostics =
                 delete_workspace_then_release_lease_if_absent(workspace, lease, delete_workspace);
-            return Err(join_diagnostics(
+            return Err(AcquisitionFailure::from_rollback_diagnostics(
                 format!("building the explicit-userns workspace OCI layout failed: {reason}"),
-                &diagnostics,
+                diagnostics,
             ));
         }
     };
@@ -1767,6 +1837,55 @@ fn settle_enabled_workspace_and_lease(
             drop(lease);
             Err(diagnostic)
         }
+    }
+}
+
+/// CT-007 slice 5b.3-6c: the shared finalization→settle tail, extracted BYTE-FOR-BYTE out of the old
+/// inline `launch_compute_with` `Ok(finalization)` body so the checkout workload can settle the
+/// CAPSULE's own [`EnabledLaunchContext`] through the exact same audited path. Workspace/lease cleanup
+/// is a SEPARATE safety domain from `finalize_runtime`'s own runtime-teardown checks: its outcome is
+/// captured here and applied to the ALREADY-SETTLED `Result`, never folded back into a
+/// `RuntimeFinalization`/`RuntimeTeardownError` (which would misleadingly claim "runtime teardown
+/// failed" even when the runtime tore down perfectly cleanly). `enabled_context` is `Some` only for
+/// the Enabled workspace path; `workspace_manager` MUST then be `Some` (the same-integration
+/// invariant compute already relied on).
+fn settle_enabled_finalization(
+    finalization: RuntimeFinalization<Result<ContainerRun, RunFailure>>,
+    enabled_context: Option<EnabledLaunchContext>,
+    workspace_manager: Option<&WorkspaceManager>,
+) -> Result<ContainerRun, RunFailure> {
+    let enabled_cleanup_failure = match (enabled_context, &finalization) {
+        (Some(context), RuntimeFinalization::Finalized(finalized)) => {
+            let workspace_manager = workspace_manager.expect(
+                "an enabled context is only ever present alongside its workspace manager (Enabled)",
+            );
+            settle_enabled_workspace_and_lease(context, workspace_manager, &finalized.evidence).err()
+        }
+        (Some(context), RuntimeFinalization::Failed { .. }) => {
+            // Runtime finalization itself failed (no full quiescence evidence exists) — never delete
+            // the workspace or release the lease; let both quarantine/poison through their own
+            // existing `Drop` machinery.
+            drop(context);
+            None
+        }
+        (None, _) => None,
+    };
+
+    let settled = settle_finalization(
+        finalization,
+        |run: &ContainerRun| run.result.usage,
+        discard_container_run_after_teardown_failure,
+    );
+    match enabled_cleanup_failure {
+        None => settled,
+        Some(diagnostic) => augment_settled_result_with_enabled_cleanup_failure(
+            settled,
+            |run: &ContainerRun| run.result.usage,
+            // This run already finalized VALIDLY (namespace never drifted) -- discard it directly via
+            // `discard_container_run`, never a fabricated empty `RuntimeTeardownError`.
+            |run: ContainerRun| discard_container_run(run, false),
+            diagnostic,
+        ),
     }
 }
 
@@ -2126,16 +2245,18 @@ impl GvisorBackend {
                     enabled_context = Some(context);
                     cfg
                 }
-                Err(message) => {
+                Err(failure) => {
                     // Sol's round-2 review: route through `dispose_run_failure` so a
                     // `release_unused` failure COMPOUNDS with the original acquisition failure
                     // (never silently replaces it via a bare `?`) — this acquisition failure
-                    // never spawned anything, so `Uncommitted` is the correct phase.
+                    // never spawned anything, so `Uncommitted` is the correct phase. (Compute does not
+                    // consume the 6c `reconciliation_required` signal — the reservation-owned
+                    // reconciliation reaper is the compute path's existing owner; behaviour unchanged.)
                     return Err(self.dispose_run_failure(
                         spec,
                         hooks,
                         &reserve,
-                        RunFailure::uncommitted(message),
+                        RunFailure::uncommitted(failure.message),
                     ));
                 }
             },
@@ -2276,58 +2397,17 @@ impl GvisorBackend {
                 return Err(self.dispose_run_failure(spec, hooks, &reserve, run_failure));
             }
             Ok(finalization) => {
-                // CT-007 slice 3, piece 7c (Sol's round-1 review, blocker 3): workspace/lease
-                // cleanup is a SEPARATE safety domain from `finalize_runtime`'s own runtime-
-                // teardown checks — its outcome is captured here and applied to the ALREADY-
-                // SETTLED `Result` below, never folded back into a `RuntimeFinalization`/
-                // `RuntimeTeardownError` (which would misleadingly claim "runtime teardown
-                // failed" even when the runtime tore down perfectly cleanly).
-                let enabled_cleanup_failure = match (enabled_context, &finalization) {
-                    (Some(context), RuntimeFinalization::Finalized(finalized)) => {
-                        let workspace_manager = match &self.workspace_integration {
-                            WorkspaceIntegration::Enabled {
-                                workspace_manager, ..
-                            } => workspace_manager,
-                            WorkspaceIntegration::Disabled => {
-                                unreachable!("enabled_context is only Some when Enabled")
-                            }
-                        };
-                        settle_enabled_workspace_and_lease(
-                            context,
-                            workspace_manager,
-                            &finalized.evidence,
-                        )
-                        .err()
-                    }
-                    (Some(context), RuntimeFinalization::Failed { .. }) => {
-                        // Runtime finalization itself failed (no full quiescence evidence exists)
-                        // — never delete the workspace or release the lease; let both quarantine/
-                        // poison through their own existing `Drop` machinery.
-                        drop(context);
-                        None
-                    }
-                    (None, _) => None,
+                // CT-007 slice 5b.3-6c: the finalization→settle tail is now the shared
+                // `settle_enabled_finalization` (BYTE-IDENTICAL logic to the pre-6c inline body) so
+                // the checkout workload path can settle the capsule's OWN enabled context through the
+                // exact same audited tail. Compute passes its own `Some`/`None` context + manager.
+                let workspace_manager = match &self.workspace_integration {
+                    WorkspaceIntegration::Enabled {
+                        workspace_manager, ..
+                    } => Some(workspace_manager),
+                    WorkspaceIntegration::Disabled => None,
                 };
-
-                let settled = settle_finalization(
-                    finalization,
-                    |run: &ContainerRun| run.result.usage,
-                    discard_container_run_after_teardown_failure,
-                );
-                match enabled_cleanup_failure {
-                    None => settled,
-                    Some(diagnostic) => augment_settled_result_with_enabled_cleanup_failure(
-                        settled,
-                        |run: &ContainerRun| run.result.usage,
-                        // Sol's round-2 review: this run already finalized VALIDLY (namespace never
-                        // drifted) -- discard it directly via `discard_container_run`, never a
-                        // fabricated empty `RuntimeTeardownError` just to reuse the teardown-specific
-                        // entry point (that would violate its non-empty invariant AND misleadingly
-                        // imply a runtime-teardown failure that never happened).
-                        |run: ContainerRun| discard_container_run(run, false),
-                        diagnostic,
-                    ),
-                }
+                settle_enabled_finalization(finalization, enabled_context, workspace_manager)
             }
         };
 
@@ -2449,6 +2529,54 @@ impl GvisorBackend {
     }
 }
 
+/// **CT-007 slice 5b.3-6c (Sol's r5 finding 1): an RAII guard that disposes a still-retained NotStarted
+/// checkout capsule SAFELY on ANY early exit or unwind before Hop B.** The 6a capsule's bare `Drop`
+/// POISONS the workspace manager + quarantines the userns slot; this guard instead performs the SAFE
+/// NotStarted cleanup (delete workspace + `release_unused`) via `dispose_checkout_runtime`, converting
+/// poison-on-bare-drop into safe-cleanup-on-any-exit. The continuation moves the capsule INTO the guard
+/// immediately; the success path [`disarm`](NotStartedCapsuleGuard::disarm)s it into `hop_b`; every
+/// other `return`/`?`/`panic!` before Hop B runs this `Drop` — the resource-safety property is
+/// RAII-enforced (no syntactic pin can be evaded). `Drop` cannot return diagnostics, so the EXPLICIT
+/// failure paths `disarm` and dispose explicitly to produce the typed `ReconciliationRequired`/requeue
+/// outcome; this `Drop` is the BACKSTOP for genuinely-unexpected exits/unwinds.
+struct NotStartedCapsuleGuard<'a> {
+    capsule: Option<checkout_runtime::AcquiredCheckoutRuntime>,
+    workspace_manager: &'a WorkspaceManager,
+}
+
+impl<'a> NotStartedCapsuleGuard<'a> {
+    fn new(
+        capsule: checkout_runtime::AcquiredCheckoutRuntime,
+        workspace_manager: &'a WorkspaceManager,
+    ) -> Self {
+        Self {
+            capsule: Some(capsule),
+            workspace_manager,
+        }
+    }
+
+    /// Take the (still-NotStarted) capsule out — for the success path (move into Hop B) or the explicit
+    /// failure path (dispose explicitly to produce the typed outcome). The consumed guard's `Drop` then
+    /// runs with `None` (harmless).
+    fn disarm(mut self) -> checkout_runtime::AcquiredCheckoutRuntime {
+        self.capsule
+            .take()
+            .expect("the guard still holds the capsule")
+    }
+}
+
+impl Drop for NotStartedCapsuleGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(capsule) = self.capsule.take() {
+            // SAFE NotStarted cleanup (delete workspace + release_unused) — NEVER the poisoning bare
+            // drop. An unexpected early-exit/unwind before Hop B lands here. Diagnostics cannot be
+            // returned from `Drop`; the explicit failure paths already produced the typed outcome, so
+            // this is the backstop for genuinely-unexpected exits only.
+            let _diagnostics = capsule.dispose_checkout_runtime(self.workspace_manager);
+        }
+    }
+}
+
 /// CT-007 slice 5b.3-6b: the dormant checkout-continuation seam lives in its OWN `impl` block, kept
 /// OUT of the compute `impl` above. The closed-world dormancy pins scope `launch_with`/
 /// `launch_compute_with` by source SPAN (signature → the impl's column-0 close), so a capsule-naming
@@ -2476,34 +2604,705 @@ impl GvisorBackend {
     /// them here would exceed this behavior-preserving slice. So 6b pins ONLY the seam's SIGNATURE and
     /// leaves the body to 6c (the orchestrator), with 6e selecting it — nothing here NAMES a capsule
     /// field, so 6a's module-private inseparability guarantee (and its module-shape audit) is untouched.
-    #[allow(dead_code)]
-    fn launch_checkout_continuation<F>(
+    /// CT-007 slice 5b.3-6c: **the Hop-B-onward checkout continuation (steps 15–25), DORMANT.** Takes
+    /// the post-Hop-A capsule BY VALUE and, lending the parent-attempt `authority` the outer
+    /// orchestrator retains, drives: begin the materialization phase (15); mint+authorize the
+    /// materialization credential (16); run Hop B fused into `Acquired → Prepared` (17–18); then the
+    /// ONE closed capsule workload transition (19–25). It is production-shaped (fixed real Hop B +
+    /// fixed real workload runner, threading the SAME `cancellation` + output sink), but has ZERO
+    /// production callers until 5b.3-6e selects it. `launch_with` still never shape-diverts.
+    #[allow(dead_code, clippy::too_many_arguments, clippy::result_large_err)]
+    fn launch_checkout_continuation(
         &self,
         spec: &JobSpec,
         hooks: &RunnerHooks,
+        authority: &dyn crate::checkout_orchestration::AttemptAuthority,
+        scope: &CheckoutAuthorizationScope,
         runtime: checkout_runtime::AcquiredCheckoutRuntime,
-        run: F,
-    ) -> Result<SandboxLaunch, SandboxLaunchError<GvisorError>>
-    where
-        F: FnOnce(
-            &JobSpec,
-            &OciConfig,
-            LaunchPermit,
-            &Path,
-            &str,
-            RuntimePreparation<'_>,
+        preparation_spec: CheckoutPreparationSpec,
+        workspace_manager: &WorkspaceManager,
+        rootfs: &Path,
+        cancellation: &SandboxCancellation,
+        output: Option<Arc<dyn SandboxOutputSink>>,
+    ) -> Result<
+        crate::checkout_orchestration::CheckoutContinuationOutcome,
+        crate::checkout_orchestration::CheckoutOrchestrationError,
+    > {
+        self.launch_checkout_continuation_given(
+            spec,
+            hooks,
+            authority,
+            scope,
+            runtime,
+            preparation_spec,
+            workspace_manager,
+            rootfs,
+            // Fixed real Hop B — the fused V2 preparation, threading the SAME cancellation + sink.
+            |runtime, prep_spec, run_token, authorization| {
+                checkout_runtime::run_checkout_preparation_v2(
+                    runtime,
+                    prep_spec,
+                    run_token,
+                    authorization,
+                    cancellation.as_atomic(),
+                    output.clone(),
+                )
+            },
+            // Fixed real workload runner — the closed capsule op, threading the SAME cancellation + sink.
+            |prepared, authority, hooks, spec, workspace_manager, rootfs| {
+                prepared.run_retained_workload(
+                    authority,
+                    hooks,
+                    spec,
+                    workspace_manager,
+                    rootfs,
+                    cancellation.clone(),
+                    output.clone(),
+                )
+            },
         )
-            -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure>,
+    }
+
+    /// The shared body of [`Self::launch_checkout_continuation`] over an injectable Hop B op and an
+    /// injectable workload runner op — both with the EXACT production ownership signature. Production
+    /// hardwires the two ops to the fused V2 preparation + the closed capsule workload transition; the
+    /// deterministic unit tests inject fakes (a capsule test transition + a fake workload spawn) so the
+    /// full steps 15–25 sequence runs with no `runsc`.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_checkout_continuation_given<HopB, RunWorkload>(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        authority: &dyn crate::checkout_orchestration::AttemptAuthority,
+        scope: &CheckoutAuthorizationScope,
+        runtime: checkout_runtime::AcquiredCheckoutRuntime,
+        preparation_spec: CheckoutPreparationSpec,
+        workspace_manager: &WorkspaceManager,
+        rootfs: &Path,
+        hop_b: HopB,
+        run_workload: RunWorkload,
+    ) -> Result<
+        crate::checkout_orchestration::CheckoutContinuationOutcome,
+        crate::checkout_orchestration::CheckoutOrchestrationError,
+    >
+    where
+        HopB: FnOnce(
+            checkout_runtime::AcquiredCheckoutRuntime,
+            CheckoutPreparationSpec,
+            RunTokenCredential,
+            PhaseAuthorization,
+        ) -> Result<
+            checkout_runtime::PreparedCheckoutRuntime,
+            (
+                checkout_runtime::AcquiredCheckoutRuntime,
+                CheckoutPreparationError,
+            ),
+        >,
+        RunWorkload: FnOnce(
+            checkout_runtime::PreparedCheckoutRuntime,
+            &dyn crate::checkout_orchestration::AttemptAuthority,
+            &RunnerHooks,
+            &JobSpec,
+            &WorkspaceManager,
+            &Path,
+        ) -> RetainedWorkloadOutcome,
     {
-        // Never reached in 6b: `launch_with` does not shape-divert, so no caller ever constructs a
-        // capsule and enters here. 5b.3-6c implements this body (the dormant orchestrator: real Hop B +
-        // workload sequence against the capsule); 5b.3-6e selects it in production.
-        let _ = (spec, hooks, run);
-        let _dormant_capsule = runtime;
-        unimplemented!(
-            "CT-007 slice 5b.3-6b: dormant checkout-continuation seam — 5b.3-6e wires Hop B through \
-             the capsule and the workload bind/spawn; unreachable in 6b (launch_with never selects \
-             the checkout path)"
+        use crate::checkout_orchestration::{
+            requeue_or_exhausted, route_after_disposal, CheckoutContinuationOutcome,
+            CheckoutOrchestrationError,
+        };
+        use crate::runner::PreparationPhase;
+        use crate::CheckoutPhase;
+
+        const MATERIALIZATION: PreparationPhase = PreparationPhase::CheckoutMaterialization;
+
+        // **Sol's r5 finding 1 (RAII GUARD — the terminal, language-enforced fence).** Move the acquired
+        // NotStarted capsule INTO an RAII guard IMMEDIATELY. From here, EVERY early `return`/`?`/`panic!`
+        // before Hop B runs the guard's `Drop`, which performs the SAFE NotStarted cleanup (delete
+        // workspace + release_unused) — the manager stays healthy, the slot reusable — instead of the
+        // capsule's poison-on-bare-drop. No syntactic pin is required and none can be evaded: even
+        // Sol's `if cond { return Ok(...); }` (an implicit drop with no `drop(runtime)` token) now
+        // disposes safely, and any `drop(runtime)` is a use-after-move compile error (the capsule was
+        // moved into the guard). `runtime` is no longer separately owned by this scope.
+        let capsule_guard = NotStartedCapsuleGuard::new(runtime, workspace_manager);
+
+        // The fallible pre-Hop-B authority steps run in a closure that BORROWS `authority`/`hooks`/
+        // `spec`/`scope` (it never names the guard/capsule). `Err(bool)` carries `phase_was_begun` for
+        // the disposal routing (begin failure → false; mint/authorize → true).
+        let prepare_materialization =
+            || -> Result<(RunTokenCredential, PhaseAuthorization), bool> {
+                authority.begin_phase(MATERIALIZATION).map_err(|_| false)?;
+                let carrier = authority
+                    .mint_phase_credential(CheckoutPhase::Materialization)
+                    .map_err(|_| true)?;
+                // Authorize against, and thread, the MATERIALIZATION generation's OWN phase-local spec —
+                // never the stale advertise-bound base, whose JTI a real Identity gate would reject.
+                crate::checkout_orchestration::authorize_phase_generation(
+                    hooks,
+                    spec,
+                    scope,
+                    CheckoutPhase::Materialization,
+                    carrier,
+                )
+                .map_err(|_| true)
+            };
+        let (run_token, authorization) = match prepare_materialization() {
+            Ok(pair) => pair,
+            Err(phase_was_begun) => {
+                // Explicit failure disposal producing the typed outcome (with diagnostics →
+                // reconciliation). `disarm()` is consumed DIRECTLY as the argument expression (Sol's r6
+                // finding 1): there is NO intervening bare capsule local, so no early-exit can be
+                // inserted between the disarm and the consume to drop a bare capsule.
+                return Ok(resolve_post_acquisition_authority_failure(
+                    authority,
+                    capsule_guard.disarm(),
+                    workspace_manager,
+                    phase_was_begun,
+                ));
+            }
+        };
+
+        // Steps 17–18: run Hop B, fused with the `Acquired → Prepared` type transition, threading the
+        // SAME materialization credential its authorization retained. SUCCESS: `capsule_guard.disarm()`
+        // is consumed DIRECTLY as `hop_b`'s first argument — no intermediate bare local, no window.
+        let prepared = match hop_b(
+            capsule_guard.disarm(),
+            preparation_spec,
+            run_token,
+            authorization,
+        ) {
+            Ok(prepared) => prepared,
+            Err((runtime, error)) => {
+                // Hop B failed — dispose the capsule along its exact session disposition FIRST (no
+                // error crosses back until it is safely disposed/quarantined). The materialization
+                // journal row is `started`, so it MUST be resolved: `route_preparation_disposition`
+                // completes it (measured usage) or SEALS it at ceiling per the disposition — including
+                // the teardown-unproven/unreleasable Hop B errors (Sol's finding 2: those must seal
+                // IMMEDIATELY, not wait for a later sealer sweep). If disposal ALSO quarantined a
+                // resource, the resource may still be live, so the OUTCOME is `ReconciliationRequired`
+                // (Sol's finding 4) — but the phase is resolved either way.
+                let disposition = error.attempt_disposition();
+                let usage = checkout_preparation_error_usage(&error);
+                let diagnostics = runtime.dispose_checkout_runtime(workspace_manager);
+                return Ok(crate::checkout_orchestration::resolve_hop_b_failure(
+                    authority,
+                    disposition,
+                    usage,
+                    diagnostics,
+                )?);
+            }
+        };
+
+        // Steps 19–25: the closed capsule workload transition (which mints/rotates the workload
+        // generation internally — finding 1). Every failure branch already disposed the capsule and
+        // carries its disposal diagnostics; honour a quarantine as reconciliation (finding 4).
+        let outcome = run_workload(prepared, authority, hooks, spec, workspace_manager, rootfs);
+        match outcome {
+            RetainedWorkloadOutcome::Ran(Ok(container_run)) => {
+                // Success into workload: the ordinary SandboxLaunch takes over. NEVER call
+                // preparation-terminal reporting — the existing workload finalization/reporter (step
+                // 26) settles workload usage + every parent-attempt journal row once.
+                let ContainerRun {
+                    child,
+                    bundle_dir,
+                    result,
+                    run_error,
+                } = container_run;
+                let guest_id = format!("runsc-{}", spec.idem_token.0);
+                self.live
+                    .lock()
+                    .unwrap()
+                    .insert(guest_id.clone(), RunscProc { child, bundle_dir });
+                Ok(CheckoutContinuationOutcome::WorkloadLaunched(SandboxLaunch {
+                    handle: SandboxHandle { guest_id },
+                    result,
+                    output_complete: run_error.is_none(),
+                }))
+            }
+            RetainedWorkloadOutcome::Ran(Err(run_failure)) => {
+                // The workload bound + ran, then a post-settle failure surfaced. Classify by whether the
+                // launch CAS committed (finding 5): pre-CAS `Uncommitted` → preparation requeue; a
+                // committed running claim → the reporter-owned workload retry path.
+                Ok(classify_bound_workload_failure(authority, run_failure))
+            }
+            RetainedWorkloadOutcome::RunFailed {
+                failure,
+                disposal_diagnostics,
+            } => {
+                // A pre-finalization workload failure — the capsule was disposed. If disposal
+                // quarantined, reconcile (finding 4); else classify the failure (finding 5): a pre-CAS
+                // `Uncommitted` (the row is still leased) is a PREPARATION requeue, never a workload
+                // running-claim attempt.
+                Ok(route_after_disposal(
+                    disposal_diagnostics,
+                    MATERIALIZATION,
+                    classify_bound_workload_failure(authority, failure),
+                ))
+            }
+            RetainedWorkloadOutcome::PermitRefused {
+                disposal_diagnostics,
+                ..
+            } => {
+                // The workload launch permit was refused after materialization completed — the workload
+                // never launched. Reconcile on a quarantined disposal, else requeue-or-exhausted.
+                Ok(route_after_disposal(
+                    disposal_diagnostics,
+                    MATERIALIZATION,
+                    requeue_or_exhausted(authority, MATERIALIZATION),
+                ))
+            }
+            RetainedWorkloadOutcome::PhaseAuthorityFailed {
+                error,
+                disposal_diagnostics,
+            } => {
+                // A workload journal/mint op failed structurally, capsule disposed. A quarantined
+                // disposal reconciles (finding 4); an otherwise-clean disposal surfaces the structural
+                // authority error.
+                if disposal_diagnostics.is_empty() {
+                    Err(CheckoutOrchestrationError::Authority(error))
+                } else {
+                    Ok(CheckoutContinuationOutcome::ReconciliationRequired {
+                        phase: MATERIALIZATION,
+                        teardown_unproven: true,
+                        usage_unrepresentable: false,
+                        quarantine_required: true,
+                    })
+                }
+            }
+            RetainedWorkloadOutcome::LeaseLost {
+                lost,
+                disposal_diagnostics,
+            } => {
+                if disposal_diagnostics.is_empty() {
+                    Err(CheckoutOrchestrationError::LeaseLost(lost))
+                } else {
+                    Ok(CheckoutContinuationOutcome::ReconciliationRequired {
+                        phase: MATERIALIZATION,
+                        teardown_unproven: true,
+                        usage_unrepresentable: false,
+                        quarantine_required: true,
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// CT-007 slice 5b.3-6c (Sol's findings 2/3/4): resolve a post-acquisition materialization-phase
+/// authority failure that owns an acquired capsule. Disposes the capsule ALWAYS (finding 2 — never a
+/// bare `?` that would drop+poison it); if the phase was begun, completes it with zero so the sealer
+/// never charges a ceiling (finding 3); routes a quarantined disposal to reconciliation, an otherwise-
+/// clean disposal to the structural error's typed outcome (finding 4). A `complete_phase` that itself
+/// fails leaves the phase unresolvable → reconciliation.
+/// CT-007 slice 5b.3-6c (Sol's finding 3): resolve a begun CheckoutTransport phase when advertise
+/// mint/authorization fails BEFORE Hop A acquires anything (no capsule exists). Completes the begun
+/// phase with zero so the sealer never charges a ceiling, then routes requeue/exhaustion. A
+/// `complete_phase` that itself fails leaves the phase unresolvable → reconciliation.
+fn resolve_begun_transport_failure(
+    authority: &dyn crate::checkout_orchestration::AttemptAuthority,
+) -> crate::checkout_orchestration::CheckoutContinuationOutcome {
+    use crate::checkout_orchestration::CheckoutContinuationOutcome;
+    use crate::runner::PreparationPhase;
+    if authority
+        .complete_phase(
+            PreparationPhase::CheckoutTransport,
+            ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            },
+        )
+        .is_err()
+    {
+        return CheckoutContinuationOutcome::ReconciliationRequired {
+            phase: PreparationPhase::CheckoutTransport,
+            teardown_unproven: false,
+            usage_unrepresentable: false,
+            quarantine_required: false,
+        };
+    }
+    crate::checkout_orchestration::requeue_or_exhausted(
+        authority,
+        PreparationPhase::CheckoutTransport,
+    )
+}
+
+fn resolve_post_acquisition_authority_failure(
+    authority: &dyn crate::checkout_orchestration::AttemptAuthority,
+    runtime: checkout_runtime::AcquiredCheckoutRuntime,
+    workspace_manager: &WorkspaceManager,
+    phase_was_begun: bool,
+) -> crate::checkout_orchestration::CheckoutContinuationOutcome {
+    // Dispose the capsule FIRST — the capsule is NotStarted (never bound), so this is the clean
+    // delete + release_unused path unless the delete/release cannot be proven — then delegate to the
+    // pure (deterministically-tested) router.
+    let diagnostics = runtime.dispose_checkout_runtime(workspace_manager);
+    crate::checkout_orchestration::route_post_acquisition_authority_failure(
+        authority,
+        diagnostics,
+        phase_was_begun,
+    )
+}
+
+/// CT-007 slice 5b.3-6c: the exact measured usage a Hop B [`CheckoutPreparationError`] carries (zero
+/// for the genuinely-free / pre-spawn variants). The disposition routing settles this exact figure.
+fn checkout_preparation_error_usage(error: &CheckoutPreparationError) -> ResourceUsage {
+    let zero = ResourceUsage {
+        cpu_seconds: 0,
+        mem_byte_seconds: 0,
+    };
+    match error {
+        CheckoutPreparationError::Refused(_) => zero,
+        CheckoutPreparationError::Unreleasable { usage, .. } => usage.unwrap_or(zero),
+        CheckoutPreparationError::TeardownUnproven { usage, .. } => *usage,
+        CheckoutPreparationError::RejectedAfterQuiescence { usage, .. } => *usage,
+    }
+}
+
+/// CT-007 slice 5b.3-6c: the exact measured usage a Hop A [`CheckoutTransportError`] carries.
+fn checkout_transport_error_usage(error: &CheckoutTransportError) -> ResourceUsage {
+    let zero = ResourceUsage {
+        cpu_seconds: 0,
+        mem_byte_seconds: 0,
+    };
+    match error {
+        CheckoutTransportError::Refused { .. } => zero,
+        CheckoutTransportError::Failed { usage, .. }
+        | CheckoutTransportError::TeardownUnproven { usage, .. }
+        | CheckoutTransportError::UsageUnrepresentable { usage, .. } => *usage,
+    }
+}
+
+/// CT-007 slice 5b.3-6c (Sol's finding 5): classify a workload `RunFailure` by whether the workload
+/// launch CAS committed. `EnabledPrepared` binds the lease BEFORE `run_and_capture` commits the permit,
+/// so a pre-CAS failure (`Uncommitted` — gate construction, runsc spawn, readiness) leaves the queue
+/// row `leased`: it belongs to PREPARATION requeue/exhaustion, NOT the workload reporter (whose
+/// running-generation accounting requires a durable `running` claim). Only `CommittedButNotExecuted`
+/// and `Executed` — where the CAS committed a running claim — go to workload reporting.
+fn classify_bound_workload_failure(
+    authority: &dyn crate::checkout_orchestration::AttemptAuthority,
+    failure: RunFailure,
+) -> crate::checkout_orchestration::CheckoutContinuationOutcome {
+    use crate::checkout_orchestration::{requeue_or_exhausted, CheckoutContinuationOutcome};
+    let zero = ResourceUsage {
+        cpu_seconds: 0,
+        mem_byte_seconds: 0,
+    };
+    match failure {
+        // Pre-CAS: the workload CAS never committed, so the row is still leased — this is a PREPARATION
+        // requeue/exhaustion, never a running-claim workload attempt.
+        RunFailure::Uncommitted { .. } => {
+            requeue_or_exhausted(authority, PreparationPhase::CheckoutMaterialization)
+        }
+        RunFailure::CommitOutcomeUnknown { .. } => {
+            CheckoutContinuationOutcome::ReconciliationRequired {
+                phase: PreparationPhase::CheckoutMaterialization,
+                teardown_unproven: true,
+                usage_unrepresentable: false,
+                quarantine_required: false,
+            }
+        }
+        // Post-CAS (a durable running claim exists) → the existing reporter-owned workload retry path.
+        RunFailure::Executed { usage, message } => CheckoutContinuationOutcome::WorkloadRetryable {
+            cause: RetryableAttemptCause::SandboxInfrastructure,
+            usage,
+            message,
+        },
+        RunFailure::CommittedButNotExecuted { message } => {
+            CheckoutContinuationOutcome::WorkloadRetryable {
+                cause: RetryableAttemptCause::SandboxInfrastructure,
+                usage: zero,
+                message,
+            }
+        }
+    }
+}
+
+/// CT-007 slice 5b.3-6c: the DORMANT outer checkout orchestrator lives in its OWN impl block (kept
+/// out of the compute impl, exactly like the continuation seam) so the compute closed-world span stays
+/// capsule-free.
+impl GvisorBackend {
+    /// **The DORMANT outer checkout orchestrator (steps 1–14).** It owns preflight, parent-attempt
+    /// admission, Hop A (transport) with the shared renewal checkpoint, transport-phase completion, and
+    /// — only AFTER Hop A succeeds — the ONE capsule acquisition, before transferring the capsule BY
+    /// VALUE into [`Self::launch_checkout_continuation`] (steps 15–25). It RETAINS the parent-attempt
+    /// authority and LENDS it to the continuation. ZERO production callers until 5b.3-6e selects it;
+    /// production `RunnerHooks` never install a parent-attempt reservation, so
+    /// [`RunnerHooks::reserve_parent_attempt`](crate::RunnerHooks) refuses and nothing reaches here.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn launch_checkout_orchestrated_with(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        repo_root: &Path,
+        cancellation: &SandboxCancellation,
+        output: Option<Arc<dyn SandboxOutputSink>>,
+    ) -> Result<
+        crate::checkout_orchestration::CheckoutContinuationOutcome,
+        crate::checkout_orchestration::CheckoutOrchestrationError,
+    > {
+        self.launch_checkout_orchestrated_with_given(
+            spec,
+            hooks,
+            repo_root,
+            cancellation,
+            output,
+            &|job, cfg, stdin, rootfs, cancellation, permit| {
+                run_git_wire_container_raw(job, cfg, stdin, rootfs, cancellation, permit)
+            },
+        )
+    }
+
+    /// The shared body over an injectable Hop A transport executor. Production hardwires the real
+    /// git-wire spawn; the deterministic unit tests inject a fake transport (no `runsc`) to exercise
+    /// admission, the transport phase, the shared cancellation, and every Hop A failure-routing branch.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_checkout_orchestrated_with_given(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        repo_root: &Path,
+        cancellation: &SandboxCancellation,
+        output: Option<Arc<dyn SandboxOutputSink>>,
+        transport_execute: GitWireHopExecutor,
+    ) -> Result<
+        crate::checkout_orchestration::CheckoutContinuationOutcome,
+        crate::checkout_orchestration::CheckoutOrchestrationError,
+    > {
+        use crate::checkout_orchestration::{
+            authorize_phase_generation, requeue_or_exhausted, route_after_disposal,
+            route_preparation_disposition, AttemptAuthorityLeaseCheckpoint,
+            CheckoutContinuationOutcome, CheckoutOrchestrationError, ParentAttemptAdmission,
+        };
+        use crate::runner::{PreparationPhase, PreparationTerminalDisposition};
+        use crate::CheckoutPhase;
+
+        // Step 1/5: preflight — isolation floor, hardening assert, image resolution, workspace health.
+        // Checkout REQUIRES the Enabled workspace integration (its capsule owns a workspace+lease).
+        hooks
+            .enforce_isolation_floor(spec)
+            .map_err(CheckoutOrchestrationError::Hook)?;
+        let profile = HardeningProfile::derive(spec);
+        profile
+            .assert_enforced()
+            .map_err(|e| CheckoutOrchestrationError::Hook(HookError(e.to_string())))?;
+        let registry = self.registry.as_ref().ok_or_else(|| {
+            CheckoutOrchestrationError::Hook(HookError(
+                "checkout orchestration requires an asset registry for the workload image".to_string(),
+            ))
+        })?;
+        let verified_rootfs = registry
+            .resolve(&spec.image)
+            .map_err(|e| CheckoutOrchestrationError::Hook(HookError(e.to_string())))?;
+        let (workspace_manager, userns_allocator) = match &self.workspace_integration {
+            WorkspaceIntegration::Enabled {
+                workspace_manager,
+                userns_allocator,
+            } => {
+                workspace_manager.check_health().map_err(|e| {
+                    CheckoutOrchestrationError::Hook(HookError(format!(
+                        "workspace manager health check failed: {e}"
+                    )))
+                })?;
+                userns_allocator.check_identity().map_err(|e| {
+                    CheckoutOrchestrationError::Hook(HookError(format!(
+                        "userns allocator identity check failed: {e}"
+                    )))
+                })?;
+                (workspace_manager, userns_allocator)
+            }
+            WorkspaceIntegration::Disabled => {
+                return Err(CheckoutOrchestrationError::Hook(HookError(
+                    "checkout orchestration requires the Enabled workspace integration".to_string(),
+                )))
+            }
+        };
+
+        // Step 2: derive the checkout scope from the SAME spec Hop A/Hop B run against; refuse a
+        // non-checkout job. The region comes from the resolved authorization context.
+        let scope = match crate::derive_checkout_authorization_scope(spec.kind, &spec.workspace) {
+            Ok(Some(scope)) => scope,
+            Ok(None) => {
+                return Err(CheckoutOrchestrationError::Hook(HookError(
+                    "checkout orchestration called for a non-checkout job".to_string(),
+                )))
+            }
+            Err(reason) => {
+                return Err(CheckoutOrchestrationError::Hook(HookError(format!(
+                    "deriving the checkout scope failed: {reason}"
+                ))))
+            }
+        };
+        let region = match &spec.run_token_authorization {
+            Some(crate::RunTokenAuthorizationContext::CiJob(ctx)) => ctx.region.clone(),
+            None => {
+                return Err(CheckoutOrchestrationError::Hook(HookError(
+                    "checkout orchestration requires a resolved run-token authorization context \
+                     (for the region)"
+                        .to_string(),
+                )))
+            }
+        };
+        let tenant = scope.tenant().0.clone();
+        let repo = scope.repo_id().to_string();
+        let expected = crate::workspace_intent::ExpectedGitCommitId::new(
+            scope.commit_hex().to_string(),
+            scope.commit_format(),
+        )
+        .map_err(|e| CheckoutOrchestrationError::Hook(HookError(e)))?;
+
+        // Step 6: parent-attempt admission (reserve + inflight transition + parent row, one txn).
+        let (_reserve, attempt_authority) = match hooks
+            .reserve_parent_attempt(spec)
+            .map_err(CheckoutOrchestrationError::Hook)?
+        {
+            ParentAttemptAdmission::Admitted {
+                reserve,
+                attempt_authority,
+            } => (reserve, attempt_authority),
+            ParentAttemptAdmission::AttemptsExhausted { reserve: _reserve } => {
+                // The durable parent-attempt budget is already exhausted — terminalize.
+                return Ok(CheckoutContinuationOutcome::PreparationTerminal {
+                    disposition: PreparationTerminalDisposition::AttemptsExhausted,
+                });
+            }
+        };
+        let authority = attempt_authority.as_ref();
+
+        // Step 7: begin the transport phase. A failure here begins nothing and owns no capsule.
+        if authority
+            .begin_phase(PreparationPhase::CheckoutTransport)
+            .is_err()
+        {
+            return Ok(requeue_or_exhausted(
+                authority,
+                PreparationPhase::CheckoutTransport,
+            ));
+        }
+
+        // Step 8: mint + authorize the advertise credential, threading its OWN phase-local spec
+        // (finding 1). A mint/authorize failure AFTER the transport phase began must RESOLVE that begun
+        // phase (complete zero) and route the typed outcome — never leave it started for the sealer to
+        // charge a ceiling (finding 3). No capsule exists yet.
+        let advertise_carrier = match authority.mint_phase_credential(CheckoutPhase::Advertise) {
+            Ok(carrier) => carrier,
+            Err(_error) => return Ok(resolve_begun_transport_failure(authority)),
+        };
+        let (advertise_credential, advertise_authorization) = match authorize_phase_generation(
+            hooks,
+            spec,
+            &scope,
+            CheckoutPhase::Advertise,
+            advertise_carrier,
+        ) {
+            Ok(pair) => pair,
+            Err(_error) => return Ok(resolve_begun_transport_failure(authority)),
+        };
+
+        // Step 10: the fetch leg mints + authorizes its OWN generation mid-transport (only after the
+        // advertisement retires and the lease renews — the transport drives that ordering internally),
+        // against the fetch generation's OWN phase-local spec (finding 1).
+        let mut fetch_leg =
+            || -> Result<(RunTokenCredential, PhaseAuthorization), HookError> {
+                let carrier = authority
+                    .mint_phase_credential(CheckoutPhase::Fetch)
+                    .map_err(|e| HookError(e.to_string()))?;
+                authorize_phase_generation(hooks, spec, &scope, CheckoutPhase::Fetch, carrier)
+            };
+
+        // Step 9/13: the ONE renewal checkpoint composed from the attempt authority (replaces the
+        // Hop A transport's historical `None`).
+        let lease_checkpoint = AttemptAuthorityLeaseCheckpoint(authority);
+
+        // Steps 8–11: Hop A V2 transport, under the SAME cancellation object threaded everywhere.
+        let transport = fetch_checkout_pack_within_parent_attempt_v2_given(
+            repo_root,
+            &tenant,
+            &region,
+            &repo,
+            &expected,
+            spec.limits,
+            advertise_credential,
+            advertise_authorization,
+            &mut fetch_leg,
+            cancellation.as_atomic(),
+            Some(&lease_checkpoint),
+            transport_execute,
+        );
+        let (pack, transport_usage) = match transport {
+            Ok(outcome) => outcome.into_parts(),
+            Err(error) => {
+                // Hop A failed — no capsule exists yet, so no capsule cleanup. Complete/seal the
+                // transport phase per the disposition and route the typed outcome.
+                let disposition = error.attempt_disposition();
+                let usage = checkout_transport_error_usage(&error);
+                return Ok(route_preparation_disposition(authority, disposition, usage)?);
+            }
+        };
+
+        // Step 12: complete the transport phase with the exact aggregate Hop A usage.
+        authority.complete_phase(PreparationPhase::CheckoutTransport, transport_usage)?;
+        // Step 13: renew before Hop B.
+        if let Err(lost) = authority.renew_preparation_lease() {
+            return Err(CheckoutOrchestrationError::LeaseLost(lost));
+        }
+
+        // Step 14: acquire the ONE workspace/lease capsule — AFTER Hop A (which never touches it).
+        // `acquire` owns rollback of any partial acquisition; materialization has not begun yet.
+        let runtime = match checkout_runtime::AcquiredCheckoutRuntime::acquire(
+            spec,
+            &profile,
+            verified_rootfs.path().to_path_buf(),
+            workspace_manager,
+            userns_allocator,
+        ) {
+            Ok(runtime) => runtime,
+            Err(failure) => {
+                // Sol's finding 1: `acquire` reports whether its OWN rollback was PROVEN clean. An
+                // unproven rollback (workspace leak / failed lease release / failed rollback) means the
+                // manager may be poisoned and/or the slot quarantined — the resource may still be live,
+                // so route ReconciliationRequired, never an ordinary retry that would strand it.
+                // Materialization has not begun, so there is no journal phase to resolve either way.
+                if failure.reconciliation_required {
+                    return Ok(CheckoutContinuationOutcome::ReconciliationRequired {
+                        phase: PreparationPhase::CheckoutMaterialization,
+                        teardown_unproven: true,
+                        usage_unrepresentable: false,
+                        quarantine_required: true,
+                    });
+                }
+                return Ok(requeue_or_exhausted(
+                    authority,
+                    PreparationPhase::CheckoutMaterialization,
+                ));
+            }
+        };
+
+        let preparation_spec = match CheckoutPreparationSpec::new(expected, pack, spec.limits) {
+            Ok(spec) => spec,
+            Err(_reason) => {
+                // The capsule is acquired (NotStarted) — dispose it, and honour a quarantined disposal
+                // as reconciliation rather than an ordinary requeue (finding 4).
+                let diagnostics = runtime.dispose_checkout_runtime(workspace_manager);
+                return Ok(route_after_disposal(
+                    diagnostics,
+                    PreparationPhase::CheckoutMaterialization,
+                    requeue_or_exhausted(authority, PreparationPhase::CheckoutMaterialization),
+                ));
+            }
+        };
+
+        // Steps 15–25: transfer the capsule BY VALUE into the continuation.
+        self.launch_checkout_continuation(
+            spec,
+            hooks,
+            authority,
+            &scope,
+            runtime,
+            preparation_spec,
+            workspace_manager,
+            verified_rootfs.path(),
+            cancellation,
+            output,
         )
     }
 }
@@ -2664,6 +3463,57 @@ fn bind_enabled_lease_given(
     }
 }
 
+/// CT-007 slice 5b.3-6c: durably bind the checkout WORKLOAD to `container_id`/`cgroup_identity`
+/// through the capsule's session (`Prepared → Bound`), classifying any bind failure into the correct
+/// [`LeaseBindState`] — the `EnabledPrepared` counterpart to [`bind_enabled_lease_given`]. The
+/// `LeaseBindState::Bound` is constructed EXCLUSIVELY from the returned
+/// [`WorkloadBindingIdentity::into_parts`](crate::user_namespace::WorkloadBindingIdentity::into_parts),
+/// never by re-deriving the arguments, so the in-memory bind state can never diverge from what the
+/// durable rewrite wrote. On a caller-fixable failure the session stays `Prepared` (so prepared
+/// cleanup stays valid); on a poisoning failure the local bind state becomes `Unreleasable`.
+fn bind_prepared_lease_given(
+    lease: &mut crate::user_namespace::UserNamespaceLease,
+    session: &mut crate::user_namespace::CheckoutPreparationSession,
+    bind_state: &mut LeaseBindState,
+    expected_root_identity: (u64, u64),
+    container_id: &str,
+    cgroup_identity: (u64, u64),
+    revalidate_root_identity: impl FnOnce() -> Result<(u64, u64), String>,
+) -> Result<(), String> {
+    let current = revalidate_root_identity()?;
+    if current != expected_root_identity {
+        return Err(format!(
+            "runsc-root identity drifted before workload bind (expected \
+             {expected_root_identity:?}, found {current:?})"
+        ));
+    }
+    match session.bind_workload(lease, container_id.to_string(), current, cgroup_identity) {
+        Ok(identity) => {
+            let (container_id, runsc_root_identity, cgroup_identity) = identity.into_parts();
+            *bind_state = LeaseBindState::Bound {
+                container_id,
+                runsc_root_identity,
+                cgroup_identity,
+            };
+            Ok(())
+        }
+        Err(bind_error) => {
+            *bind_state = match bind_error {
+                crate::user_namespace::UserNamespaceBindError::InvalidContainerId
+                | crate::user_namespace::UserNamespaceBindError::MarkerTooLarge => {
+                    // Caller-fixable — the lease/session are provably still Prepared and untouched.
+                    LeaseBindState::Allocated
+                }
+                crate::user_namespace::UserNamespaceBindError::MarkerMismatch
+                | crate::user_namespace::UserNamespaceBindError::Poisoned => {
+                    LeaseBindState::Unreleasable
+                }
+            };
+            Err(format!("durable workload lease bind failed: {bind_error}"))
+        }
+    }
+}
+
 /// The exact composition boundary this piece's whole security property rests on: bind (if
 /// `Enabled`; a no-op for `Rootless`) and invoke `continuation` ONLY if that succeeds — a bind
 /// failure (or a live identity-drift refusal) must NEVER be followed by the capture/spawn
@@ -2750,47 +3600,77 @@ fn run_production_container_streaming(
     // counting closure, with no real runsc spawn involved.
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
     let redaction = RedactionPlan::for_job(spec);
-    let enabled = match &mut prep.binding {
-        RuntimeBinding::Rootless => None,
-        RuntimeBinding::Enabled {
-            expected_root_identity,
-            context,
-        } => Some((
-            &mut context.lease,
-            &mut context.bind_state,
-            *expected_root_identity,
-        )),
+    // The single `run_and_capture` continuation — invoked at most once, by whichever bind path below
+    // succeeds (mutually-exclusive match arms, so the moved `launch_permit`/`output` are fine).
+    let revalidate = || {
+        revalidated_explicit_userns_root_identity()
+            .map_err(|reason| format!("runsc-root identity revalidation failed: {reason}"))
     };
-    let bind_and_capture_result = bind_then_continue(
-        enabled,
-        container_id,
-        cgroup.identity(),
-        || {
-            revalidated_explicit_userns_root_identity()
-                .map_err(|reason| format!("runsc-root identity revalidation failed: {reason}"))
-        },
-        || {
-            run_and_capture(
-                bin,
-                &bundle_dir,
+    let capture = || {
+        run_and_capture(
+            bin,
+            &bundle_dir,
+            container_id,
+            timeout,
+            spec.limits.mem_bytes,
+            RunCaptureOptions {
+                stdin: None, // CI/agent jobs receive no stdin (the git-wire path supplies the body).
+                stdout_mode: StdoutMode::CappedHead,
+                cancellation: cancellation.as_atomic(),
+                output: output.map(|sink| StreamingOutput {
+                    sink,
+                    redaction: redaction.clone(),
+                }),
+            },
+            Some(launch_permit),
+            mode,
+            &cgroup,
+        )
+    };
+    let bind_and_capture_result = match &mut prep.binding {
+        // CT-007 slice 5b.3-6c: the checkout workload binds through the session (`Prepared → Bound`)
+        // at this exact cgroup boundary, never `lease.bind`. Same never-exec-after-a-failed-bind
+        // composition as `bind_then_continue`, but over `bind_prepared_lease_given`.
+        RuntimeBinding::EnabledPrepared {
+            expected_root_identity,
+            lease,
+            session,
+            bind_state,
+        } => {
+            let expected_root_identity = *expected_root_identity;
+            match bind_prepared_lease_given(
+                lease,
+                session,
+                bind_state,
+                expected_root_identity,
                 container_id,
-                timeout,
-                spec.limits.mem_bytes,
-                RunCaptureOptions {
-                    stdin: None, // CI/agent jobs receive no stdin (the git-wire path supplies the body).
-                    stdout_mode: StdoutMode::CappedHead,
-                    cancellation: cancellation.as_atomic(),
-                    output: output.map(|sink| StreamingOutput {
-                        sink,
-                        redaction: redaction.clone(),
-                    }),
-                },
-                Some(launch_permit),
-                mode,
-                &cgroup,
-            )
-        },
-    );
+                cgroup.identity(),
+                revalidate,
+            ) {
+                Ok(()) => Ok(capture()),
+                Err(message) => Err(message),
+            }
+        }
+        // The ordinary compute path — byte-identical behaviour: `Rootless` binds nothing, `Enabled`
+        // binds via `lease.bind` (`Allocated → Bound`), through the unchanged `bind_then_continue`.
+        binding => {
+            let enabled = match binding {
+                RuntimeBinding::Rootless => None,
+                RuntimeBinding::Enabled {
+                    expected_root_identity,
+                    context,
+                } => Some((
+                    &mut context.lease,
+                    &mut context.bind_state,
+                    *expected_root_identity,
+                )),
+                RuntimeBinding::EnabledPrepared { .. } => {
+                    unreachable!("EnabledPrepared is handled in the arm above")
+                }
+            };
+            bind_then_continue(enabled, container_id, cgroup.identity(), revalidate, capture)
+        }
+    };
     let (result, child_retirement) = match bind_and_capture_result {
         Ok(pair) => pair,
         Err(message) => {
@@ -3976,8 +4856,12 @@ struct RunscOutcome {
 /// construct `Executed` with a genuinely zero `ResourceUsage`; every real call site computes it via
 /// `executed_fallback_usage`, which floors elapsed wall-time at 1 second precisely so that never
 /// happens in practice.
+// CT-007 slice 5b.3-6c: `pub(crate)` so the closed capsule workload transition
+// (`PreparedCheckoutRuntime::run_retained_workload`, in the child `checkout_runtime` module) can carry
+// it in its owned `RetainedWorkloadOutcome` — the parent module cannot reach a private child method, so
+// the accessor must be `pub(crate)`, and its return type therefore must be too.
 #[derive(Debug)]
-enum RunFailure {
+pub(crate) enum RunFailure {
     /// No durable launch CAS committed. Safe to release the reservation at zero cost.
     Uncommitted { message: String },
     /// The durable launch CAS returned an error, but whether it actually committed durably is
@@ -6141,6 +7025,26 @@ pub(crate) struct PrefetchedCheckoutPack {
     shallow: bool,
 }
 
+#[cfg(test)]
+impl PrefetchedCheckoutPack {
+    /// CT-007 slice 5b.3-6c: a test-only pack so a 6c continuation test can build a
+    /// [`CheckoutPreparationSpec`] without a real Hop A. `#[cfg(test)]` only — `fetch_checkout_pack`
+    /// stays the sole production constructor.
+    pub(crate) fn for_tests() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "myelin-test-pack-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let file = std::fs::File::create(&path).expect("a temp file for the test pack");
+        let _ = std::fs::remove_file(&path); // unlink; the handle stays valid.
+        PrefetchedCheckoutPack {
+            file,
+            shallow: false,
+        }
+    }
+}
+
 /// CT-007 slice 5b.2, Hop A: fetch exactly one commit's pack through the EXISTING, unchanged,
 /// already-hardened git-wire serving path (`GvisorBackend::launch_git_wire`) — a REAL, billed use of
 /// that path (it reserves/settles through `hooks` exactly like any other git-wire caller). Never
@@ -7542,6 +8446,19 @@ impl PreparedCheckoutEvidence {
     pub(crate) fn preparation_usage(&self) -> ResourceUsage {
         self.preparation_usage
     }
+
+    /// CT-007 slice 5b.3-6c: a test-only constructor so `into_prepared_for_tests` can supply evidence
+    /// deterministically. `#[cfg(test)]` is absent from every ordinary build (incl. `test-support`),
+    /// so `run_checkout_preparation` remains the ONLY production constructor.
+    #[cfg(test)]
+    pub(crate) fn for_tests(preparation_usage: ResourceUsage) -> Self {
+        PreparedCheckoutEvidence {
+            commit_hex: "a".repeat(40),
+            tree_oid: "b".repeat(40),
+            cargo_lock_sha256_hex: "c".repeat(64),
+            preparation_usage,
+        }
+    }
 }
 
 /// Every way CT-007 slice 5b.2's checkout-preparation runtime can fail to produce a
@@ -8064,7 +8981,16 @@ pub(crate) fn run_checkout_preparation(
     workspace: &ManagedWorkspace,
     spec: CheckoutPreparationSpec,
 ) -> Result<PreparedCheckoutEvidence, CheckoutPreparationError> {
-    run_checkout_preparation_inner(lease, session, workspace, spec, LaunchPermit::immediate())
+    // Legacy Hop B keeps its historical behaviour: never cancelled, no incremental output sink.
+    run_checkout_preparation_inner(
+        lease,
+        session,
+        workspace,
+        spec,
+        LaunchPermit::immediate(),
+        &NEVER_CANCELLED,
+        None,
+    )
 }
 
 /// The ONE cleanup a checkout capsule's session disposition permits, as a PURE value (CT-007 slice
@@ -8262,6 +9188,55 @@ pub(crate) use checkout_runtime::{
     run_checkout_preparation_v2, AcquiredCheckoutRuntime, PreparedCheckoutRuntime,
 };
 
+// CT-007 slice 5b.3-6c (Sol's r5 finding 2): the workload-rotated spec wrapper lives in its own module
+// so the inner `JobSpec` never escapes to be cloned/substituted (module-privacy fence). Re-exported so
+// `checkout_runtime` can name the sealed wrapper + its refusal type without reaching the inner spec.
+mod workload_spec;
+#[allow(unused_imports)]
+pub(crate) use workload_spec::{BoundWorkloadRefusal, WorkloadRotatedSpec};
+
+/// CT-007 slice 5b.3-6c: the OWNED typed outcome of the closed capsule op
+/// [`checkout_runtime::PreparedCheckoutRuntime::run_retained_workload`]. The op returns ONLY this —
+/// never a borrow of the capsule's retained `OciConfig`/lease/session/workspace, never a
+/// `RuntimePreparation` — so nothing that could reconstitute or cross-wire the 6a capsule ever
+/// escapes the call. Defined here in the parent module (the capsule submodule's own shape is
+/// closed-world audited and may not add types), and every disposal branch already disposed the
+/// capsule along its exact session disposition before returning.
+#[allow(dead_code)]
+pub(crate) enum RetainedWorkloadOutcome {
+    /// The workload's `run` produced a settled result and the capsule's workspace/lease were settled
+    /// through the audited `settle_enabled_finalization` tail. `Ok` carries a real [`ContainerRun`]
+    /// (the continuation does the live-map insert + completion settle + `SandboxLaunch`); `Err` is a
+    /// post-settle [`RunFailure`] the continuation routes through the existing workload machinery.
+    Ran(Result<ContainerRun, RunFailure>),
+    /// `run` returned a pre-finalization [`RunFailure`] (bundle staging, cgroup, the durable workload
+    /// bind, or a spawn failure before a trustworthy result). The capsule was disposed along its
+    /// session disposition; the `RunFailure` phase tells the continuation whether this is a pre-bind
+    /// requeue/exhaust or a post-bind reporter retryable.
+    RunFailed {
+        failure: RunFailure,
+        disposal_diagnostics: Vec<String>,
+    },
+    /// The materialization-phase completion op failed structurally; the capsule was disposed
+    /// (`Prepared → release_prepared`).
+    PhaseAuthorityFailed {
+        error: crate::checkout_orchestration::AttemptAuthorityError,
+        disposal_diagnostics: Vec<String>,
+    },
+    /// The preparation lease renewal was refused (the generation is no longer ours); the capsule was
+    /// disposed (`Prepared → release_prepared`).
+    LeaseLost {
+        lost: crate::runner::PreparationLeaseLost,
+        disposal_diagnostics: Vec<String>,
+    },
+    /// The workload launch permit was refused before execution; the capsule was disposed
+    /// (`Prepared → release_prepared`).
+    PermitRefused {
+        message: String,
+        disposal_diagnostics: Vec<String>,
+    },
+}
+
 /// Hop B's ENTIRE pre-spawn V2 authorization decision, extracted so it is unit-testable without a
 /// real lease/session/workspace/`runsc` (the same convention [`evaluate_checkout_finalization`]
 /// follows). Consumes the authorization against the capsule's FULL derived scope (Sol's r1 blocker 1),
@@ -8279,12 +9254,18 @@ fn resolve_checkout_preparation_permit(
 }
 
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn run_checkout_preparation_inner(
     lease: &mut UserNamespaceLease,
     session: &mut CheckoutPreparationSession,
     workspace: &ManagedWorkspace,
     spec: CheckoutPreparationSpec,
     launch_permit: LaunchPermit,
+    // CT-007 slice 5b.3-6c: the SAME cancellation object threaded through Hop A / Hop B / workload —
+    // Hop B no longer hardcodes `NEVER_CANCELLED`. And the SAME bounded/redacted output sink the
+    // workload uses, so preparation diagnostics stream durably rather than surfacing only in errors.
+    cancellation: &AtomicBool,
+    output: Option<Arc<dyn SandboxOutputSink>>,
 ) -> Result<PreparedCheckoutEvidence, CheckoutPreparationError> {
     let bin = runsc_bin();
     let rootfs = resolved_gvisor_git_rootfs();
@@ -8411,8 +9392,11 @@ fn run_checkout_preparation_inner(
         RunCaptureOptions {
             stdin: Some(StdinSource::File(spec.pack.file)),
             stdout_mode: StdoutMode::CappedHead,
-            cancellation: &NEVER_CANCELLED,
-            output: None,
+            cancellation,
+            output: output.map(|sink| StreamingOutput {
+                sink,
+                redaction: RedactionPlan::none(),
+            }),
         },
         Some(launch_permit),
         mode,
@@ -8958,12 +9942,28 @@ mod tests {
             "acquired",
             "prepared_checkout_evidence",
         ];
+        // CT-007 slice 5b.3-6c: the standalone `PreparedCheckoutRuntime::bind_workload` synthetic-identity
+        // helper was FOLDED into the ONE closed `run_retained_workload` transition — its allowlist entry
+        // is REPLACED (still exactly FIVE accessors). This is deliberate audited-API evolution: a caller
+        // can request the whole sanctioned workload transition, but can no longer extract or substitute
+        // its constituent bind capability.
         const ALLOWLIST: [&str; 5] = [
             "AcquiredCheckoutRuntime::acquire",
             "AcquiredCheckoutRuntime::dispose_checkout_runtime",
-            "PreparedCheckoutRuntime::bind_workload",
             "PreparedCheckoutRuntime::dispose_checkout_runtime",
+            "PreparedCheckoutRuntime::run_retained_workload",
             "run_checkout_preparation_v2",
+        ];
+        // CT-007 slice 5b.3-6c: the EXACT `#[cfg(test)]`-only method inventory. The audit already
+        // excludes the whole test-only impl from the production accessor surface; pinning the test set
+        // exactly keeps that exception explicit — a new test-only capsule method fails until reviewed.
+        // CT-007 slice 5b.3-6c (Sol's finding 6): the exact `#[cfg(test)]`-only capsule method set —
+        // the session driver, the into-prepared type-state transition, and the injectable workload
+        // execution seam. Pinned exactly so a new test-only capsule method fails until reviewed.
+        const TEST_METHODS: [&str; 3] = [
+            "drive_session_for_tests",
+            "into_prepared_for_tests",
+            "run_retained_workload_given",
         ];
         // Closed-world (Sol's r5): the EXACT set of free functions permitted at module top level. Any
         // other free fn — even a private helper — is a violation until reviewed and added here.
@@ -9046,6 +10046,7 @@ mod tests {
         // definitions of an approved name land as TWO list entries — making the list LONGER than its
         // allowlist and failing, rather than collapsing into one set entry.
         let mut accessor_surface: Vec<String> = Vec::new();
+        let mut test_method_names: Vec<String> = Vec::new();
         let mut free_fn_names: Vec<String> = Vec::new();
         let mut struct_names: Vec<String> = Vec::new();
 
@@ -9148,7 +10149,12 @@ mod tests {
                             for it in &im.items {
                                 match it {
                                     syn::ImplItem::Fn(m) => {
-                                        if !test_only && !is_private(&m.vis) {
+                                        if test_only {
+                                            // CT-007 slice 5b.3-6c: the whole `#[cfg(test)]` impl is
+                                            // excluded from the production accessor surface — but its
+                                            // method set is pinned EXACTLY (see `TEST_METHODS`).
+                                            test_method_names.push(m.sig.ident.to_string());
+                                        } else if !is_private(&m.vis) {
                                             accessor_surface
                                                 .push(format!("{name}::{}", m.sig.ident));
                                         }
@@ -9210,44 +10216,90 @@ mod tests {
             "the checkout_runtime module's non-private accessor surface changed — every accessor must \
              be an explicitly-reviewed capsule entry, counted with multiplicity"
         );
+        assert_eq!(
+            sorted(test_method_names),
+            sorted(TEST_METHODS.iter().map(|s| s.to_string()).collect()),
+            "the checkout_runtime module's `#[cfg(test)]`-only method set changed — every test-only \
+             capsule method (the session driver, the into_prepared transition, the workload _given \
+             seam) must be an explicitly-reviewed entry, counted with multiplicity"
+        );
     }
 
-    /// **The 5b.3-6a capsule stays fully dormant, and its workload `OciConfig` is never detached.**
-    /// No production code constructs a capsule, runs the fused Hop B entry, or wires either capsule
-    /// type into `launch_with`'s control flow (that composition is 5b.3-6b/6c). The capsule now lives
-    /// in the `checkout_runtime` submodule (Sol's r4), so the dormancy proof reads that file too.
+    /// **CT-007 slice 5b.3-6c: the checkout orchestrator + continuation are fully composed but DORMANT,
+    /// and the capsule's workload `OciConfig` is never detached.** 6c gives the continuation a real body
+    /// (Hop B through the capsule + the closed workload transition) and adds the outer orchestrator, so
+    /// the capsule IS now constructed/consumed — but ONLY through the single dormant entry
+    /// `launch_checkout_orchestrated_with`, which has ZERO production callers (the composition-root
+    /// zero). `launch_with` still never shape-diverts; 5b.3-6e is the slice that selects the dormant
+    /// path. Every capsule construction/consumption is reachable ONLY from that unreachable entry.
     #[test]
     fn the_checkout_runtime_capsule_has_no_production_caller() {
         let prod = production_source();
-        // The fused V2 Hop B entry moved OUT of gvisor.rs into the submodule — gvisor.rs production
-        // now only RE-EXPORTS the name (no `(` call/def), and the submodule holds exactly ONE
-        // definition with no caller.
+        // The composition-root ZERO: the ONE dormant entry the whole checkout path hangs off has no
+        // production caller. `launch_with` never selects it; installing it is 5b.3-6e's job.
         assert_eq!(
-            prod.matches("run_checkout_preparation_v2(").count(),
+            prod.matches(".launch_checkout_orchestrated_with(").count(),
             0,
-            "the v2 definition moved to the checkout_runtime submodule; gvisor.rs only re-exports it"
+            "the dormant outer orchestrator has ZERO production callers — the composition-root zero"
         );
+        assert_eq!(
+            prod.matches("fn launch_checkout_orchestrated_with(").count(),
+            1,
+            "the dormant outer orchestrator is defined exactly once"
+        );
+        assert_eq!(
+            prod.matches("fn launch_checkout_orchestrated_with_given").count(),
+            1,
+            "its shared injectable body is defined exactly once"
+        );
+        // The fused V2 Hop B entry lives in the submodule (ONE definition); the continuation is its ONE
+        // production caller — reachable only through the (uncalled) orchestrator.
         assert_eq!(
             CHECKOUT_RUNTIME_SOURCE
                 .matches("run_checkout_preparation_v2(")
                 .count(),
             1,
-            "run_checkout_preparation_v2 is a dormant definition with no caller"
+            "run_checkout_preparation_v2 is defined exactly once in the submodule"
         );
-        // No caller of the constructor anywhere (its own def is `pub(crate) fn acquire(`, not the
-        // qualified call form; the one qualified mention is the error-message string, no `(`).
-        for (label, src) in [("gvisor.rs", prod), ("checkout_runtime.rs", CHECKOUT_RUNTIME_SOURCE)] {
-            assert_eq!(
-                src.matches("AcquiredCheckoutRuntime::acquire(").count(),
-                0,
-                "nothing constructs the capsule ({label})"
-            );
-            assert_eq!(
-                src.matches("fn into_prepared").count(),
-                0,
-                "no free-standing prepared transition — Hop B and the transition are fused ({label})"
-            );
-        }
+        assert_eq!(
+            prod.matches("run_checkout_preparation_v2(").count(),
+            1,
+            "the continuation is the ONLY production caller of the fused Hop B entry"
+        );
+        // The capsule constructor is called ONLY by the (uncalled) orchestrator.
+        assert_eq!(
+            prod.matches("AcquiredCheckoutRuntime::acquire(").count(),
+            1,
+            "the capsule is constructed only by the dormant orchestrator"
+        );
+        assert_eq!(
+            CHECKOUT_RUNTIME_SOURCE
+                .matches("AcquiredCheckoutRuntime::acquire(")
+                .count(),
+            0,
+            "the submodule only DEFINES `acquire`, never calls the qualified form"
+        );
+        // The closed workload transition is invoked ONLY by the (uncalled) continuation.
+        assert_eq!(
+            prod.matches(".run_retained_workload(").count(),
+            1,
+            "the closed workload transition is invoked only by the dormant continuation"
+        );
+        // The old free-standing `into_prepared`/`bind_workload` seams are gone: the ONLY prepared
+        // transition is the fused Hop B entry (production) plus the audited `#[cfg(test)]`
+        // `into_prepared_for_tests` (exactly one, test-only).
+        assert_eq!(
+            prod.matches("fn into_prepared").count(),
+            0,
+            "no production free-standing prepared transition — Hop B and the transition are fused"
+        );
+        assert_eq!(
+            CHECKOUT_RUNTIME_SOURCE
+                .matches("fn into_prepared_for_tests(")
+                .count(),
+            1,
+            "the ONLY prepared transition outside the fused Hop B entry is the test-only one"
+        );
         // The fused Hop B entry consumes the capsule by value and returns the prepared capsule.
         let v2_entry = source_of_in(
             CHECKOUT_RUNTIME_SOURCE,
@@ -9260,21 +10312,11 @@ mod tests {
                 ),
             "the fused Hop B entry consumes the capsule by value and returns the prepared capsule"
         );
-        // The `.dispose_checkout_runtime(` calls are exactly two internal ones (in the submodule) —
-        // `acquire`'s hard-job_key-check safe cleanup and the `PreparedCheckoutRuntime` delegation —
-        // never a real disposal driven by a live external caller.
-        assert_eq!(
-            CHECKOUT_RUNTIME_SOURCE
-                .matches(".dispose_checkout_runtime(")
-                .count(),
-            2,
-            "the only dispose_checkout_runtime calls are acquire's safe cleanup and the delegation"
-        );
-        // 5b.3-6a/6b: launch_with's OWN control flow never names either capsule type. In 6b
+        // 5b.3-6a/6b/6c: launch_with's OWN control flow never names either capsule type. In 6b
         // launch_with became a plain delegating wrapper and the compute body moved to
         // launch_compute_with; the span source_of captures for `fn launch_with<F>(` runs to this
         // impl's close (launch_with + launch_compute_with + dispose_run_failure) — the checkout seam
-        // lives in a SEPARATE impl, so it is deliberately outside this span.
+        // lives in SEPARATE impls, so it is deliberately outside this span.
         let launch_with = source_of("fn launch_with<F>(");
         assert!(
             !launch_with.contains("AcquiredCheckoutRuntime")
@@ -9285,25 +10327,22 @@ mod tests {
             launch_with.contains("self.launch_compute_with(spec, hooks, run)"),
             "launch_with is a plain delegating wrapper — it performs NO shape dispatch on spec.workspace"
         );
-        // 5b.3-6b: the dormant checkout-continuation seam is DEFINED exactly once, consumes the 6a
-        // capsule BY VALUE, and has ZERO callers — it is an unreachable `unimplemented!` stub 5b.3-6e
-        // fleshes out. Naming the capsule type in a signature is NOT calling it: no construction, no
-        // fused Hop B, no disposal is reachable through it in 6b.
+        // 5b.3-6c: the continuation is DEFINED once and called ONLY by the (uncalled) orchestrator —
+        // never by any production dispatch. It consumes the 6a capsule BY VALUE.
         assert_eq!(
-            prod.matches("fn launch_checkout_continuation<F>(").count(),
+            prod.matches("fn launch_checkout_continuation(").count(),
             1,
-            "the dormant checkout-continuation seam is defined exactly once in production"
+            "the checkout continuation is defined exactly once in production"
         );
         assert_eq!(
             prod.matches(".launch_checkout_continuation(").count(),
-            0,
-            "nothing calls the dormant checkout-continuation seam in 6b"
+            1,
+            "the continuation's ONLY caller is the (uncalled) dormant orchestrator"
         );
-        let seam = source_of("fn launch_checkout_continuation<F>(");
+        let seam = source_of("fn launch_checkout_continuation(");
         assert!(
-            seam.contains("runtime: checkout_runtime::AcquiredCheckoutRuntime")
-                && seam.contains("unimplemented!("),
-            "the seam consumes the capsule by value and is an unreachable stub 5b.3-6e replaces"
+            seam.contains("runtime: checkout_runtime::AcquiredCheckoutRuntime"),
+            "the continuation consumes the capsule by value"
         );
         // Blocker 2/5: `acquire` retains the workload OciConfig INSIDE the capsule — its signature
         // returns the bare capsule, never `(OciConfig, ..)` detached.
@@ -9315,9 +10354,176 @@ mod tests {
             &rest[..rest.find(" {\n").expect("acquire signature ends")]
         };
         assert!(
-            acquire_sig.contains("-> Result<AcquiredCheckoutRuntime, String>")
+            // CT-007 5b.3-6c (Sol's r2 finding 1): acquire now returns a TYPED `AcquisitionFailure`
+            // (clean-refusal vs reconciliation-required), never a bare `String` — still the bare capsule
+            // on success, never a detached `OciConfig`.
+            acquire_sig.contains("-> Result<AcquiredCheckoutRuntime, AcquisitionFailure>")
                 && !acquire_sig.contains("OciConfig"),
             "acquire must return the capsule alone — never the workload OciConfig detached"
+        );
+    }
+
+    // CT-007 slice 5b.3-6c: the r3/r4 COUNTING pins were all REMOVED — Sol compiled evasions of each.
+    // The terminal fences are LANGUAGE-ENFORCED (mirroring 6a's RAII + module-privacy discipline):
+    //   - FINDING 1 (resource safety): an RAII `NotStartedCapsuleGuard` owns the capsule before Hop B;
+    //     its `Drop` performs the SAFE NotStarted cleanup (delete + release_unused), so EVERY early
+    //     return / `?` / unwind before Hop B disposes safely — the manager stays healthy, the slot
+    //     reusable — with no syntactic pin. The success path `disarm()`s it into `hop_b`. See
+    //     `launch_checkout_continuation_given` + the always-run
+    //     `not_started_capsule_guard_disposes_safely_on_any_early_exit` proof.
+    //   - FINDING 2 (credential substitution): `WorkloadRotatedSpec` lives in the sealed `workload_spec`
+    //     module (private field, no `as_job_spec`, no `Clone`/`From`), and its inner `JobSpec` is
+    //     consumed ONLY by its own `acquire_permit_and_run` — so no outer code can obtain a `&JobSpec`
+    //     to clone/substitute (`error[E0599]: no method named as_job_spec`). See
+    //     `the_workload_spec_module_shape_is_pinned`.
+
+    /// **Sol's r5/r6 finding 2 (CLOSED-WORLD module audit): the workload-spec wrapper never leaks its
+    /// inner `JobSpec`.** Mirrors the 6a `checkout_runtime` module discipline. `workload_spec.rs`'s
+    /// ENTIRE surface is EXACTLY the `WorkloadRotatedSpec` struct (private field, no `Clone`/`Copy`), the
+    /// `BoundWorkloadRefusal` enum, and ONE inherent impl whose PRODUCTION methods are `{from_carrier,
+    /// acquire_permit_and_run}`, whose private helper is `{acquire_permit_and_prep}`, and whose
+    /// `#[cfg(test)]`-only method is `{acquire_permit_and_run_given}` — every set pinned EXACTLY. NO
+    /// method (production, private, OR test) may return a type that MENTIONS `JobSpec` at ANY nesting
+    /// (`&JobSpec`, `Result<&JobSpec,_>`, a tuple containing one, `Option<&JobSpec>`, `impl
+    /// Deref<Target=JobSpec>`, …) — the whole return-type AST is walked for the `JobSpec` ident. And NO
+    /// trait impl (a `Clone`/`From`/`Deref` could hand out the inner spec). Any leak-adding item/accessor
+    /// fails this audit BY NAME, fail-closed.
+    #[test]
+    fn the_workload_spec_module_shape_is_pinned() {
+        const SOURCE: &str = include_str!("gvisor/workload_spec.rs");
+        let file = syn::parse_file(SOURCE).expect("workload_spec.rs parses as a File");
+
+        fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().any(|a| {
+                let mut hit = false;
+                if a.path().is_ident("cfg") {
+                    let _ = a.parse_nested_meta(|meta| {
+                        if meta.path.is_ident("test") {
+                            hit = true;
+                        }
+                        Ok(())
+                    });
+                }
+                hit
+            })
+        }
+        // Walk the ENTIRE return-type AST for the `JobSpec` ident — nested/opaque returns included.
+        fn type_mentions_job_spec(ty: &syn::Type) -> bool {
+            use syn::visit::Visit;
+            struct Scan {
+                found: bool,
+            }
+            impl<'ast> Visit<'ast> for Scan {
+                fn visit_ident(&mut self, id: &'ast syn::Ident) {
+                    if id == "JobSpec" {
+                        self.found = true;
+                    }
+                }
+            }
+            let mut scan = Scan { found: false };
+            scan.visit_type(ty);
+            scan.found
+        }
+
+        let mut struct_seen = false;
+        let mut enum_seen = false;
+        let mut production_methods: Vec<String> = Vec::new();
+        let mut private_methods: Vec<String> = Vec::new();
+        let mut test_methods: Vec<String> = Vec::new();
+        let mut violations: Vec<String> = Vec::new();
+        for item in &file.items {
+            match item {
+                syn::Item::Use(_) => {}
+                syn::Item::Struct(s) if s.ident == "WorkloadRotatedSpec" => {
+                    struct_seen = true;
+                    for f in &s.fields {
+                        if !matches!(f.vis, syn::Visibility::Inherited) {
+                            violations.push("WorkloadRotatedSpec field is not private".to_string());
+                        }
+                    }
+                    for attr in &s.attrs {
+                        if attr.path().is_ident("derive") {
+                            let _ = attr.parse_nested_meta(|m| {
+                                if m.path.is_ident("Clone") || m.path.is_ident("Copy") {
+                                    violations.push(
+                                        "WorkloadRotatedSpec derives Clone/Copy — could duplicate the \
+                                         inner spec"
+                                            .to_string(),
+                                    );
+                                }
+                                Ok(())
+                            });
+                        }
+                    }
+                }
+                syn::Item::Enum(e) if e.ident == "BoundWorkloadRefusal" => enum_seen = true,
+                syn::Item::Impl(im) if im.trait_.is_some() => violations.push(
+                    "a trait impl in the workload_spec module could hand out the inner spec (e.g. \
+                     Clone/From/Deref)"
+                        .to_string(),
+                ),
+                syn::Item::Impl(im) => {
+                    for it in &im.items {
+                        match it {
+                            syn::ImplItem::Fn(m) => {
+                                let name = m.sig.ident.to_string();
+                                // NO method may return a type MENTIONING `JobSpec` at any nesting.
+                                if let syn::ReturnType::Type(_, ty) = &m.sig.output {
+                                    if type_mentions_job_spec(ty) {
+                                        violations.push(format!(
+                                            "method `{name}` returns a type mentioning `JobSpec` — the \
+                                             inner spec must never escape to be cloned/substituted"
+                                        ));
+                                    }
+                                }
+                                if is_cfg_test(&m.attrs) {
+                                    test_methods.push(name);
+                                } else if matches!(m.vis, syn::Visibility::Inherited) {
+                                    private_methods.push(name);
+                                } else {
+                                    production_methods.push(name);
+                                }
+                            }
+                            _ => violations.push(
+                                "non-fn associated item in the WorkloadRotatedSpec impl".to_string(),
+                            ),
+                        }
+                    }
+                }
+                other => violations.push(format!(
+                    "unexpected top-level item in workload_spec (closed-world): {:?}",
+                    std::mem::discriminant(other)
+                )),
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "workload_spec module shape violated: {violations:#?}"
+        );
+        assert!(struct_seen && enum_seen, "the two sanctioned types must be present");
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        assert_eq!(
+            sorted(production_methods),
+            vec![
+                "acquire_permit_and_run".to_string(),
+                "from_carrier".to_string()
+            ],
+            "the workload_spec PRODUCTION surface is EXACTLY the sealed constructor + the fixed-runner \
+             method (which calls run_production_container_streaming itself — no caller `execute`)"
+        );
+        assert_eq!(
+            sorted(private_methods),
+            vec!["acquire_permit_and_prep".to_string()],
+            "the ONLY private helper is the shared permit+prep step"
+        );
+        assert_eq!(
+            sorted(test_methods),
+            vec!["acquire_permit_and_run_given".to_string()],
+            "the ONLY `#[cfg(test)]` method is the injectable execution seam — the sole place an \
+             `execute` closure receiving `&JobSpec` exists, absent from every ordinary build"
         );
     }
 
@@ -11394,6 +12600,276 @@ mod tests {
         let _ = std::fs::remove_dir_all(&leases_dir);
     }
 
+    // ───────── CT-007 slice 5b.3-6c: parent-attempt reservation mode (always-run) ─────────
+
+    /// A minimal recording fake [`AttemptAuthority`] for the 6c continuation/orchestrator tests, with
+    /// optional injected failures for the post-acquisition authority-failure matrix.
+    struct FakeAttemptAuthority {
+        ops: Mutex<Vec<String>>,
+        should_requeue: bool,
+        fail_begin_phase: bool,
+        fail_mint_phase: bool,
+    }
+    impl FakeAttemptAuthority {
+        fn new(should_requeue: bool) -> Self {
+            Self {
+                ops: Mutex::new(Vec::new()),
+                should_requeue,
+                fail_begin_phase: false,
+                fail_mint_phase: false,
+            }
+        }
+        fn failing_begin_phase() -> Self {
+            Self {
+                fail_begin_phase: true,
+                ..Self::new(true)
+            }
+        }
+        fn failing_mint_phase() -> Self {
+            Self {
+                fail_mint_phase: true,
+                ..Self::new(true)
+            }
+        }
+    }
+    impl crate::checkout_orchestration::AttemptAuthority for FakeAttemptAuthority {
+        fn begin_phase(
+            &self,
+            phase: PreparationPhase,
+        ) -> Result<(), crate::checkout_orchestration::AttemptAuthorityError> {
+            self.ops.lock().unwrap().push(format!("begin:{phase:?}"));
+            if self.fail_begin_phase {
+                return Err(crate::checkout_orchestration::AttemptAuthorityError(
+                    "injected begin_phase failure".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        fn complete_phase(
+            &self,
+            phase: PreparationPhase,
+            usage: ResourceUsage,
+        ) -> Result<(), crate::checkout_orchestration::AttemptAuthorityError> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(format!("complete:{phase:?}:{}", usage.cpu_seconds));
+            Ok(())
+        }
+        fn seal_phase(
+            &self,
+            phase: PreparationPhase,
+        ) -> Result<(), crate::checkout_orchestration::AttemptAuthorityError> {
+            self.ops.lock().unwrap().push(format!("seal:{phase:?}"));
+            Ok(())
+        }
+        fn renew_preparation_lease(&self) -> Result<(), crate::runner::PreparationLeaseLost> {
+            self.ops.lock().unwrap().push("renew".to_string());
+            Ok(())
+        }
+        fn mint_phase_credential(
+            &self,
+            phase: crate::CheckoutPhase,
+        ) -> Result<
+            crate::checkout_orchestration::PhaseCredentialCarrier,
+            crate::checkout_orchestration::AttemptAuthorityError,
+        > {
+            self.ops.lock().unwrap().push(format!("mint:{phase:?}"));
+            if self.fail_mint_phase {
+                return Err(crate::checkout_orchestration::AttemptAuthorityError(
+                    "injected mint_phase_credential failure".to_string(),
+                ));
+            }
+            Ok(crate::checkout_orchestration::PhaseCredentialCarrier::new(
+                RunTokenCredential::new("bearer", format!("jti-{phase:?}"), 300).unwrap(),
+                fake_authorization_context(),
+                format!("gen-{phase:?}"),
+            ))
+        }
+        fn mint_workload_credential(
+            &self,
+        ) -> Result<
+            crate::checkout_orchestration::WorkloadCredentialCarrier,
+            crate::checkout_orchestration::AttemptAuthorityError,
+        > {
+            self.ops.lock().unwrap().push("mint:Workload".to_string());
+            Ok(crate::checkout_orchestration::WorkloadCredentialCarrier::new(
+                RunTokenCredential::new("bearer", "jti-Workload", 300).unwrap(),
+                fake_authorization_context(),
+                "gen-Workload",
+            ))
+        }
+        fn should_requeue(&self) -> bool {
+            self.should_requeue
+        }
+    }
+
+    fn fake_authorization_context() -> crate::RunTokenAuthorizationContext {
+        crate::RunTokenAuthorizationContext::CiJob(crate::CiJobAuthorizationContext {
+            tenant_id: "acme".to_string(),
+            region: "fr-par".to_string(),
+            principal_id: "p".to_string(),
+            wf_run_id: "wf".to_string(),
+            job_id: "j".to_string(),
+            lease_owner: "o".to_string(),
+            lease_epoch: 1,
+            claim_nonce: "n".to_string(),
+            claim_started_at_epoch_secs: 0,
+            claim_expires_at_epoch_secs: 1,
+            required_capabilities: vec![],
+            checkout_scope: None,
+            credential_binding: None,
+        })
+    }
+
+    /// The legacy-mode `RunnerHooks` (every production constructor) selects the legacy reserve and
+    /// REFUSES parent-attempt admission — the dormancy gate that keeps the V2 path unreachable.
+    #[test]
+    fn reserve_parent_attempt_refuses_in_legacy_mode() {
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|s| Ok(ReserveHandle(s.meter_to.reserve_id.clone()))),
+            Box::new(|_, _, _| Ok(())),
+            Box::new(|_| Ok(())),
+            Box::new(|_| Ok(())),
+        );
+        assert!(matches!(
+            hooks.reserve_parent_attempt(&spec(vec![])),
+            Err(HookError(_))
+        ));
+    }
+
+    /// Once the V2 reservation mode is installed, admission returns the injected
+    /// [`ParentAttemptAdmission`] (both arms carry the reserve handle).
+    #[test]
+    fn reserve_parent_attempt_returns_the_installed_admission() {
+        use crate::checkout_orchestration::ParentAttemptAdmission;
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|s| Ok(ReserveHandle(s.meter_to.reserve_id.clone()))),
+            Box::new(|_, _, _| Ok(())),
+            Box::new(|_| Ok(())),
+            Box::new(|_| Ok(())),
+        )
+        .with_parent_attempt_reservation(Box::new(|_spec| {
+            Ok(ParentAttemptAdmission::Admitted {
+                reserve: ReserveHandle("ci-reserve:v2:a".to_string()),
+                attempt_authority: Box::new(FakeAttemptAuthority::new(true)),
+            })
+        }));
+        match hooks
+            .reserve_parent_attempt(&spec(vec![]))
+            .expect("admitted")
+        {
+            ParentAttemptAdmission::Admitted { reserve, .. } => {
+                assert_eq!(reserve.0, "ci-reserve:v2:a")
+            }
+            ParentAttemptAdmission::AttemptsExhausted { .. } => panic!("expected Admitted"),
+        }
+    }
+
+    // ───────── CT-007 slice 5b.3-6c: workload failure-phase + begun-phase routing (always-run) ─────────
+
+    /// Sol's finding 5 + finding 6(c): the workload failure-phase matrix. `EnabledPrepared` binds the
+    /// lease BEFORE the launch CAS commits, so a pre-CAS `Uncommitted` failure leaves the row `leased`
+    /// → PREPARATION requeue, NEVER a running-claim workload attempt. Only `CommittedButNotExecuted` and
+    /// `Executed` (a committed running claim) go to the reporter-owned workload path.
+    #[test]
+    fn classify_bound_workload_failure_splits_pre_and_post_cas() {
+        use crate::checkout_orchestration::CheckoutContinuationOutcome;
+        let authority = FakeAttemptAuthority::new(true);
+
+        // Uncommitted (pre-CAS, row still leased) → preparation requeue.
+        let out = classify_bound_workload_failure(&authority, RunFailure::uncommitted("gate failed"));
+        assert!(
+            matches!(
+                out,
+                CheckoutContinuationOutcome::PreparationRetryable {
+                    phase: PreparationPhase::CheckoutMaterialization
+                }
+            ),
+            "a pre-CAS Uncommitted workload failure is a preparation requeue, got {out:?}"
+        );
+
+        // CommitOutcomeUnknown → reconciliation (never guessed).
+        let out = classify_bound_workload_failure(
+            &authority,
+            RunFailure::commit_outcome_unknown("ambiguous"),
+        );
+        assert!(matches!(
+            out,
+            CheckoutContinuationOutcome::ReconciliationRequired { .. }
+        ));
+
+        // CommittedButNotExecuted (running claim) → workload retryable, zero usage.
+        let out = classify_bound_workload_failure(
+            &authority,
+            RunFailure::committed_but_not_executed("never execed"),
+        );
+        assert!(matches!(
+            out,
+            CheckoutContinuationOutcome::WorkloadRetryable {
+                usage: ResourceUsage { cpu_seconds: 0, mem_byte_seconds: 0 },
+                ..
+            }
+        ));
+
+        // Executed (running claim, real usage) → workload retryable carrying that usage.
+        let out = classify_bound_workload_failure(
+            &authority,
+            RunFailure::executed(
+                "teardown infra failed",
+                ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 6,
+                },
+            ),
+        );
+        assert!(matches!(
+            out,
+            CheckoutContinuationOutcome::WorkloadRetryable {
+                usage: ResourceUsage { cpu_seconds: 5, mem_byte_seconds: 6 },
+                ..
+            }
+        ));
+    }
+
+    /// Sol's finding 5: when the parent-attempt budget is exhausted, a pre-CAS `Uncommitted` workload
+    /// failure terminalizes `AttemptsExhausted` rather than requeueing.
+    #[test]
+    fn classify_uncommitted_terminalizes_when_attempts_are_exhausted() {
+        use crate::checkout_orchestration::CheckoutContinuationOutcome;
+        let authority = FakeAttemptAuthority::new(false);
+        let out = classify_bound_workload_failure(&authority, RunFailure::uncommitted("gate failed"));
+        assert!(matches!(
+            out,
+            CheckoutContinuationOutcome::PreparationTerminal {
+                disposition: crate::runner::PreparationTerminalDisposition::AttemptsExhausted
+            }
+        ));
+    }
+
+    /// Sol's finding 3: an advertise mint/authorization failure after `begin_phase(CheckoutTransport)`
+    /// must COMPLETE the begun transport phase with zero (never leave it started for the sealer) and
+    /// route requeue/exhaustion.
+    #[test]
+    fn resolve_begun_transport_failure_completes_zero_then_requeues() {
+        use crate::checkout_orchestration::CheckoutContinuationOutcome;
+        let authority = FakeAttemptAuthority::new(true);
+        let out = resolve_begun_transport_failure(&authority);
+        assert_eq!(
+            authority.ops.lock().unwrap().clone(),
+            vec!["complete:CheckoutTransport:0"],
+            "the begun transport phase is completed with zero"
+        );
+        assert!(matches!(
+            out,
+            CheckoutContinuationOutcome::PreparationRetryable {
+                phase: PreparationPhase::CheckoutTransport
+            }
+        ));
+    }
+
     // ───────── CT-007 slice 5b.3-6a: the dispose_checkout_runtime BEHAVIORAL cleanup matrix ─────────
     //
     // Sol's r1 blocker 6: the pure `checkout_cleanup_plan` pin (above, always-run) proves the
@@ -11478,6 +12954,453 @@ mod tests {
             userns_allocator,
             leases_dir,
         ))
+    }
+
+    /// CT-007 slice 5b.3-6c: the DORMANT continuation (steps 15–18) over a REAL capsule with an
+    /// INJECTED terminal Hop B failure — proves the continuation begins/authorizes the materialization
+    /// phase, disposes the capsule along its session disposition (Prepared → delete + release_prepared),
+    /// and routes the terminal disposition through the journal (`complete_phase` + `PreparationTerminal`)
+    /// — all with no `runsc`. Gated like the 6a dispose matrix (real Btrfs+userns); soft-skips otherwise.
+    /// CT-007 slice 5b.3-6c: the `#[cfg(test)]` `into_prepared_for_tests` consuming transition drives
+    /// the REAL session/lease durable state to `Prepared` and yields a `PreparedCheckoutRuntime` — so a
+    /// subsequent `dispose_checkout_runtime` takes the `Prepared → delete + release_prepared` path,
+    /// returning the slot to the pool. Proves the test transition is honest (real durable state), not a
+    /// wrapped `NotStarted` capsule. Gated like the 6a dispose matrix; soft-skips otherwise.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn into_prepared_for_tests_drives_the_real_lease_to_prepared() {
+        let Some((runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("into-prepared")
+        else {
+            return;
+        };
+        let prepared = runtime.into_prepared_for_tests(PreparedCheckoutEvidence::for_tests(
+            ResourceUsage {
+                cpu_seconds: 2,
+                mem_byte_seconds: 3,
+            },
+        ));
+        let diagnostics = prepared.dispose_checkout_runtime(&workspace_manager);
+        assert!(
+            diagnostics.is_empty(),
+            "a clean Prepared disposal must produce no diagnostics, got {diagnostics:?}"
+        );
+        assert!(workspace_manager.is_healthy());
+        assert!(
+            userns_allocator.lease().is_ok(),
+            "release_prepared must return the slot to the pool"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn continuation_routes_a_terminal_hop_b_failure_and_disposes_the_prepared_capsule() {
+        use crate::checkout_orchestration::CheckoutContinuationOutcome;
+        let Some((runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("continuation-terminal-hopb")
+        else {
+            return;
+        };
+        let backend = GvisorBackend::new(test_registry());
+        let spec = checkout_spec();
+        let scope = crate::derive_checkout_authorization_scope(spec.kind, &spec.workspace)
+            .expect("scope derives")
+            .expect("checkout-bearing");
+        // The V2 phase-authorization hook returns the retained (here immediate) permit.
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|s| Ok(ReserveHandle(s.meter_to.reserve_id.clone()))),
+            Box::new(|_, _, _| Ok(())),
+            Box::new(|_| Ok(())),
+            Box::new(|_| Ok(())),
+        )
+        .with_checkout_phase_authorization(Box::new(|_spec, _scope, _phase| {
+            Ok(LaunchPermit::immediate())
+        }));
+        let authority = FakeAttemptAuthority::new(false);
+        let preparation_spec = CheckoutPreparationSpec::new(
+            crate::workspace_intent::ExpectedGitCommitId::new(
+                scope.commit_hex().to_string(),
+                scope.commit_format(),
+            )
+            .unwrap(),
+            PrefetchedCheckoutPack::for_tests(),
+            spec.limits,
+        )
+        .unwrap();
+
+        let outcome = backend
+            .launch_checkout_continuation_given(
+                &spec,
+                &hooks,
+                &authority,
+                &scope,
+                runtime,
+                preparation_spec,
+                &workspace_manager,
+                std::path::Path::new("/abs/staged-rootfs"),
+                // Injected Hop B: a terminal materialization failure that hands the capsule back.
+                |runtime, _spec, _run_token, _authorization| {
+                    Err((
+                        runtime,
+                        CheckoutPreparationError::RejectedAfterQuiescence {
+                            message: "injected terminal checkout rejection".to_string(),
+                            usage: ResourceUsage {
+                                cpu_seconds: 4,
+                                mem_byte_seconds: 8,
+                            },
+                            disposition: PreparationAttemptDisposition::Terminal(
+                                PreparationTerminalDisposition::Failed {
+                                    phase: PreparationPhase::CheckoutMaterialization,
+                                },
+                            ),
+                        },
+                    ))
+                },
+                // The workload runner op must never be reached on a Hop B failure.
+                |_prepared, _authority, _hooks, _spec, _wm, _rootfs| {
+                    panic!("the workload transition must not run after a Hop B failure")
+                },
+            )
+            .expect("the continuation routes a terminal Hop B failure without a structural error");
+
+        assert!(
+            matches!(
+                outcome,
+                CheckoutContinuationOutcome::PreparationTerminal {
+                    disposition: PreparationTerminalDisposition::Failed {
+                        phase: PreparationPhase::CheckoutMaterialization
+                    }
+                }
+            ),
+            "a terminal Hop B failure becomes a preparation-terminal outcome, got {outcome:?}"
+        );
+        let ops = authority.ops.lock().unwrap().clone();
+        assert!(
+            ops.contains(&"begin:CheckoutMaterialization".to_string())
+                && ops.contains(&"mint:Materialization".to_string())
+                && ops.contains(&"complete:CheckoutMaterialization:4".to_string()),
+            "the continuation began, authorized, and completed the materialization phase, got {ops:?}"
+        );
+        // The capsule was disposed along its session disposition BEFORE the error crossed back — the
+        // slot is reusable and the managers stay healthy (this fake hands the capsule back in its
+        // as-acquired NotStarted state, so disposal is the delete + release_unused path).
+        assert!(workspace_manager.is_healthy());
+        assert!(
+            userns_allocator.lease().is_ok(),
+            "disposing the capsule must return the slot to the pool"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// **Sol's r5 finding 1 proof: the RAII guard disposes a NotStarted capsule SAFELY on any early
+    /// exit before Hop B.** Simulates Sol's evasion (an early `return`/`?`/`panic!` that implicitly drops
+    /// the capsule) by creating the guard and letting it drop WITHOUT disarming — the guard's `Drop` must
+    /// run the SAFE NotStarted cleanup (delete workspace + `release_unused`), leaving the workspace
+    /// manager HEALTHY and the userns slot REUSABLE — NOT the capsule's poison-on-bare-drop. Gated like
+    /// the 6a dispose matrix (real Btrfs+userns); soft-skips otherwise.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn not_started_capsule_guard_disposes_safely_on_any_early_exit() {
+        let Some((runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("guard-early-exit")
+        else {
+            return;
+        };
+        // An early exit before Hop B: the guard is created and DROPPED without `disarm` (exactly what an
+        // injected `if cond { return Ok(...); }` / `?` / panic would do). Its Drop performs safe cleanup.
+        {
+            let _guard = NotStartedCapsuleGuard::new(runtime, &workspace_manager);
+        }
+        assert!(
+            workspace_manager.is_healthy(),
+            "the guard's Drop must NOT poison the manager — it performs the safe NotStarted cleanup"
+        );
+        assert!(
+            userns_allocator.lease().is_ok(),
+            "the guard's Drop must release_unused the slot — the pool slot is reusable"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// The success path DISARMS the guard: `disarm` hands the capsule back (Drop then a no-op), so the
+    /// capsule survives to be moved into Hop B — no double-dispose. Proven by disposing the disarmed
+    /// capsule explicitly and observing the slot free exactly once.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn not_started_capsule_guard_disarm_hands_back_the_capsule() {
+        let Some((runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("guard-disarm")
+        else {
+            return;
+        };
+        let runtime = NotStartedCapsuleGuard::new(runtime, &workspace_manager).disarm();
+        // The disarmed guard dropped harmlessly; the capsule is intact — dispose it exactly once.
+        let diagnostics = runtime.dispose_checkout_runtime(&workspace_manager);
+        assert!(diagnostics.is_empty(), "a clean NotStarted disposal, got {diagnostics:?}");
+        assert!(workspace_manager.is_healthy());
+        assert!(userns_allocator.lease().is_ok());
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// Sol's finding 6(a): the DETERMINISTIC full-success continuation sequence — begin materialization,
+    /// mint + authorize the MATERIALIZATION generation (asserting the phase hook is handed the ROTATED
+    /// materialization spec, not the advertise base — finding 1), fused Hop B → Prepared, then a workload
+    /// that launches → `WorkloadLaunched`. Uses a real capsule (gated like the 6a matrix) but a synthetic
+    /// workload op (no `runsc`/userns policy needed); the workload's OWN generation threading is proven
+    /// separately by `run_retained_workload_given` below.
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn continuation_full_success_threads_materialization_generation_and_launches() {
+        use crate::checkout_orchestration::CheckoutContinuationOutcome;
+        let Some((runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("continuation-full-success")
+        else {
+            return;
+        };
+        let backend = GvisorBackend::new(test_registry());
+        let spec = checkout_spec();
+        let scope = crate::derive_checkout_authorization_scope(spec.kind, &spec.workspace)
+            .expect("scope derives")
+            .expect("checkout-bearing");
+        let seen_materialization_jti = Arc::new(Mutex::new(None::<String>));
+        let seen = seen_materialization_jti.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|s| Ok(ReserveHandle(s.meter_to.reserve_id.clone()))),
+            Box::new(|_, _, _| Ok(())),
+            Box::new(|_| Ok(())),
+            Box::new(|_| Ok(())),
+        )
+        .with_checkout_phase_authorization(Box::new(move |s, _scope, phase| {
+            if phase == crate::CheckoutPhase::Materialization {
+                *seen.lock().unwrap() = Some(s.run_token.jti.clone());
+            }
+            Ok(LaunchPermit::immediate())
+        }));
+        let authority = FakeAttemptAuthority::new(false);
+        let preparation_spec = CheckoutPreparationSpec::new(
+            crate::workspace_intent::ExpectedGitCommitId::new(
+                scope.commit_hex().to_string(),
+                scope.commit_format(),
+            )
+            .unwrap(),
+            PrefetchedCheckoutPack::for_tests(),
+            spec.limits,
+        )
+        .unwrap();
+
+        let outcome = backend
+            .launch_checkout_continuation_given(
+                &spec,
+                &hooks,
+                &authority,
+                &scope,
+                runtime,
+                preparation_spec,
+                &workspace_manager,
+                std::path::Path::new("/abs/staged-rootfs"),
+                // Hop B success: drive the real session/lease to Prepared, wrapping test evidence.
+                |runtime, _spec, _run_token, _authorization| {
+                    Ok(runtime.into_prepared_for_tests(PreparedCheckoutEvidence::for_tests(
+                        ResourceUsage {
+                            cpu_seconds: 3,
+                            mem_byte_seconds: 7,
+                        },
+                    )))
+                },
+                // Synthetic workload success: dispose the Prepared capsule CLEANLY (no runsc/userns
+                // policy) and report a launched workload. The continuation maps Ran(Ok) → WorkloadLaunched.
+                |prepared, _authority, _hooks, _spec, wm, _rootfs| {
+                    let diagnostics = prepared.dispose_checkout_runtime(wm);
+                    assert!(
+                        diagnostics.is_empty(),
+                        "the Prepared capsule disposes cleanly (release_prepared), got {diagnostics:?}"
+                    );
+                    RetainedWorkloadOutcome::Ran(Ok(fake_run()))
+                },
+            )
+            .expect("the full-success continuation returns a launched workload");
+
+        assert!(
+            matches!(outcome, CheckoutContinuationOutcome::WorkloadLaunched(_)),
+            "the full success sequence launches the workload, got {outcome:?}"
+        );
+        // Finding 1: the materialization phase hook was handed the ROTATED materialization generation.
+        assert_eq!(
+            seen_materialization_jti.lock().unwrap().as_deref(),
+            Some("jti-Materialization"),
+            "the materialization phase authorized against its OWN rotated spec, not the advertise base"
+        );
+        let ops = authority.ops.lock().unwrap().clone();
+        assert!(
+            ops.contains(&"begin:CheckoutMaterialization".to_string())
+                && ops.contains(&"mint:Materialization".to_string()),
+            "the continuation began + minted the materialization generation, got {ops:?}"
+        );
+        // The workload launched, then the synthetic op disposed the capsule cleanly → slot reusable.
+        assert!(workspace_manager.is_healthy());
+        assert!(userns_allocator.lease().is_ok());
+        drop(backend);
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// Sol's finding 2 + 6(b): a post-acquisition authority failure (begin_phase OR mint) must DISPOSE
+    /// the NotStarted capsule cleanly (delete workspace + release_unused) rather than dropping it (which
+    /// would poison the manager + quarantine the slot), and return a clean typed requeue outcome — never
+    /// permanently halt workspace admission.
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn continuation_disposes_capsule_on_authority_failure_without_poisoning() {
+        use crate::checkout_orchestration::CheckoutContinuationOutcome;
+        for (label, authority) in [
+            ("begin_phase", FakeAttemptAuthority::failing_begin_phase()),
+            ("mint_phase", FakeAttemptAuthority::failing_mint_phase()),
+        ] {
+            let Some((runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+                acquire_real_checkout_capsule(&format!("continuation-authfail-{label}"))
+            else {
+                return;
+            };
+            let backend = GvisorBackend::new(test_registry());
+            let spec = checkout_spec();
+            let scope = crate::derive_checkout_authorization_scope(spec.kind, &spec.workspace)
+                .unwrap()
+                .unwrap();
+            let hooks = RunnerHooks::new(
+                CompletionSettlementOwner::TerminalReporter,
+                Box::new(|s| Ok(ReserveHandle(s.meter_to.reserve_id.clone()))),
+                Box::new(|_, _, _| Ok(())),
+                Box::new(|_| Ok(())),
+                Box::new(|_| Ok(())),
+            )
+            .with_checkout_phase_authorization(Box::new(|_s, _scope, _phase| {
+                Ok(LaunchPermit::immediate())
+            }));
+            let preparation_spec = CheckoutPreparationSpec::new(
+                crate::workspace_intent::ExpectedGitCommitId::new(
+                    scope.commit_hex().to_string(),
+                    scope.commit_format(),
+                )
+                .unwrap(),
+                PrefetchedCheckoutPack::for_tests(),
+                spec.limits,
+            )
+            .unwrap();
+
+            let outcome = backend
+                .launch_checkout_continuation_given(
+                    &spec,
+                    &hooks,
+                    &authority,
+                    &scope,
+                    runtime,
+                    preparation_spec,
+                    &workspace_manager,
+                    std::path::Path::new("/abs/staged-rootfs"),
+                    |_runtime, _spec, _rt, _auth| panic!("Hop B must not run after an authority failure"),
+                    |_prepared, _a, _h, _s, _wm, _r| panic!("the workload must not run"),
+                )
+                .unwrap_or_else(|e| panic!("{label}: authority failure must be a typed outcome, not {e:?}"));
+
+            // The capsule was disposed cleanly (NotStarted → delete + release_unused) — NOT poisoned.
+            assert!(
+                matches!(
+                    outcome,
+                    CheckoutContinuationOutcome::PreparationRetryable { .. }
+                        | CheckoutContinuationOutcome::PreparationTerminal { .. }
+                ),
+                "{label}: a clean-disposal authority failure yields a typed requeue/terminal, got {outcome:?}"
+            );
+            assert!(
+                workspace_manager.is_healthy(),
+                "{label}: the manager must NOT be poisoned by a dropped capsule"
+            );
+            assert!(
+                userns_allocator.lease().is_ok(),
+                "{label}: the slot must be released (not quarantined) — workspace admission stays open"
+            );
+            drop(backend);
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            let _ = std::fs::remove_dir_all(&leases_dir);
+        }
+    }
+
+    /// Sol's finding 1 (workload) + 6(a): the closed workload transition mints the WORKLOAD generation
+    /// (step 21) and runs the workload under its OWN rotated spec — the executor observes the workload
+    /// JTI, never the advertise base. Uses `run_retained_workload_given` (the restored `#[cfg(test)]`
+    /// execution seam) so no `runsc` is needed. Soft-skips when the explicit-userns revalidation policy
+    /// is not installed on this host (the workload bind boundary re-revalidates the runsc-root identity
+    /// live; without the policy the transition refuses BEFORE the executor — that is 5b.3-7's real drill).
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn run_retained_workload_threads_the_workload_generation() {
+        let Some((runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("workload-generation-threading")
+        else {
+            return;
+        };
+        let prepared = runtime.into_prepared_for_tests(PreparedCheckoutEvidence::for_tests(
+            ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 1,
+            },
+        ));
+        let spec = checkout_spec();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|s| Ok(ReserveHandle(s.meter_to.reserve_id.clone()))),
+            Box::new(|_, _, _| Ok(())),
+            Box::new(|_| Ok(())),
+            Box::new(|_| Ok(())),
+        );
+        let authority = FakeAttemptAuthority::new(true);
+        let seen_workload_jti = Arc::new(Mutex::new(None::<String>));
+        let seen = seen_workload_jti.clone();
+
+        let outcome = prepared.run_retained_workload_given(
+            &authority,
+            &hooks,
+            &spec,
+            &workspace_manager,
+            std::path::Path::new("/abs/staged-rootfs"),
+            move |workload_spec, _cfg, permit, _rootfs, _container_id, _prep| {
+                // Finding 1: the workload runs under its OWN generation, not the advertise base.
+                *seen.lock().unwrap() = Some(workload_spec.run_token.jti.clone());
+                drop(permit);
+                // Assert-only executor: a synthetic pre-CAS Uncommitted so the capsule disposes cleanly.
+                Err(RunFailure::uncommitted("synthetic assert-only workload executor"))
+            },
+        );
+
+        if seen_workload_jti.lock().unwrap().is_none() {
+            // The revalidation policy is not installed — the transition refused before the executor and
+            // already disposed the capsule. Soft-skip (the real bind is 5b.3-7's runsc drill).
+            let _ = outcome;
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            let _ = std::fs::remove_dir_all(&leases_dir);
+            return;
+        }
+        assert_eq!(
+            seen_workload_jti.lock().unwrap().as_deref(),
+            Some("jti-Workload"),
+            "the workload must run under its OWN rotated generation spec (step 21 mint)"
+        );
+        // The synthetic pre-CAS failure disposed the Prepared capsule (release_prepared) → slot reusable.
+        assert!(matches!(outcome, RetainedWorkloadOutcome::RunFailed { .. }));
+        assert!(workspace_manager.is_healthy());
+        assert!(userns_allocator.lease().is_ok());
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
     }
 
     /// NeverBound (session NotStarted): dispose deletes the workspace and `release_unused`s the lease,

@@ -1914,7 +1914,7 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
     /// absent from this table must have ZERO occurrences.
     /// `(crate, file, marker) -> exact allowed CODE occurrence count` in PRODUCTION source.
     /// Everything absent from this table must have ZERO occurrences in EITHER crate.
-    const ALLOWED: [(&str, &str, &str, usize); 29] = [
+    const ALLOWED: [(&str, &str, &str, usize); 34] = [
         // --- the definition sites ---
         ("myelin-ci-controlplane", "ci_credential_generation.rs", "mint_phase_credential(", 1),
         ("myelin-ci-controlplane", "ci_credential_generation.rs", "acquire_phase_generation_ownership(", 1),
@@ -1936,7 +1936,28 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         // `gvisor/checkout_runtime.rs` submodule so module privacy enforces field inseparability.
         // `run_checkout_preparation_v2(` and one `PhaseAuthorization` (the v2 signature) moved with it;
         // the submodule also imports `PhaseAuthorization` (its own `use`), so its count is 2.
-        ("myelin-ci-sandbox", "gvisor.rs", "PhaseAuthorization", 8),
+        // CT-007 5b.3-6c: the DORMANT orchestrator + continuation (in gvisor.rs) now CALL the V2 phase
+        // surface — mint the advertise/fetch/materialization generations and run the fused Hop B — so
+        // gvisor.rs's `PhaseAuthorization` count is 10, it gains `mint_phase_credential` (advertise +
+        // fetch + materialization = 3) and one `run_checkout_preparation_v2(` call. The actual
+        // `authorize_checkout_phase(` calls live in the `checkout_orchestration::authorize_phase_generation`
+        // helper (Sol's finding 1: authorize the per-phase ROTATED spec), so gvisor.rs no longer calls it
+        // directly. These are dormant CALL sites in NON-composition-root modules (the outer orchestrator
+        // itself has zero production callers — see the sandbox dormancy pin
+        // `the_checkout_runtime_capsule_has_no_production_caller`), NOT a production activation. The
+        // composition-root zeros below stay zero.
+        // 11 (not 10): CT-007 5b.3-6c Sol's r4 finding-1 control inversion added the
+        // `prepare_materialization` closure whose return type names `PhaseAuthorization` once more.
+        ("myelin-ci-sandbox", "gvisor.rs", "PhaseAuthorization", 11),
+        ("myelin-ci-sandbox", "gvisor.rs", "mint_phase_credential(", 3),
+        ("myelin-ci-sandbox", "gvisor.rs", "run_checkout_preparation_v2(", 1),
+        // CT-007 5b.3-6c: the sandbox-side capability vocabulary + the per-phase authorization helper.
+        // `mint_phase_credential(` is the `AttemptAuthority` trait method DEFINITION (1); the helper
+        // `authorize_phase_generation` holds the ONE `authorize_checkout_phase(` call site + one
+        // `PhaseAuthorization` in its return type — no control-plane dependency crosses the boundary.
+        ("myelin-ci-sandbox", "checkout_orchestration.rs", "mint_phase_credential(", 1),
+        ("myelin-ci-sandbox", "checkout_orchestration.rs", "authorize_checkout_phase(", 1),
+        ("myelin-ci-sandbox", "checkout_orchestration.rs", "PhaseAuthorization", 1),
         ("myelin-ci-sandbox", "gvisor/checkout_runtime.rs", "run_checkout_preparation_v2(", 1),
         ("myelin-ci-sandbox", "gvisor/checkout_runtime.rs", "PhaseAuthorization", 2),
         ("myelin-ci-sandbox", "lib.rs", "with_checkout_phase_authorization(", 1),
