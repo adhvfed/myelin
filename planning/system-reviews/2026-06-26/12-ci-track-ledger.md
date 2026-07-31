@@ -3560,3 +3560,61 @@ CiJobParentAttempt→AttemptAuthority adapter, DurablePreparationLeaseCheckpoint
 spec rotation; the RunnerAgent reporter-seam extension + definition-cutover generalization); then 6e
 (the atomic activating cutover). Then 5b.3-7, task #91, gate-2 vertical slice. The rest of ledger 12's
 open items are unchanged.
+
+---
+
+## 2026-07-31 — CT-007 slice 5b.3-6d STEP 2 landed: the preparation-retry CAS (Fable orchestrating;
+Opus, implementation; Sol, 3 adversarial review rounds to "no merge blockers")
+
+Second of 6d's risk-sequenced units (step 1 = the exhaustion core, committed 32e80a00). Dormant: no
+production caller.
+
+**What landed (additive, 4 src + 1 test file, myelin-ci-controlplane):** REQUEUE_PREPARATION_CLAIM_QUERY
+(leased→queued, clears lease_owner/lease_expires/claim_nonce) whose WHERE...RETURNING block is
+BYTE-IDENTICAL to the shipped CONSUME_PREPARATION_CLAIM_QUERY (a retryable failure was an admitted
+attempt, so the current-generation parent predicate applies exactly), differing only in the SET action;
+RESET_REQUEUED_PREPARATION_CI_JOB_SURFACE_QUERY; requeue_preparation_claim_on_conn (CAS + surface reset
+in one caller tx, never writes workload retry_attempts); report_preparation_retry
+(verify_preparation_retry_permitted_on_conn → the requeue CAS, one tenant tx). PreparationRetryGate
+{live-permitted / NotLive→NoOp / unpermitted→Err}.
+
+**The real bug Sol caught (r1): a begin_phase race.** report_preparation_retry originally read journal
+status BEFORE locking the queue row, so a concurrent begin_phase could lock the still-leased row, insert
+a `started` phase, and commit BETWEEN the retry's status read and its CAS — leaving a freshly-queued job
+with an unresolved old-generation started phase (exactly what the lease-slice reaper-sealer prevents).
+FIX: verify_preparation_retry_permitted_on_conn now locks the exact queue generation FOR UPDATE + takes
+the per-job advisory lock BEFORE any journal read, held through the CAS in one tx — restoring the
+canonical queue→advisory→journal order (Sol confirmed no inversion vs begin_phase/complete_phase/reaper).
+
+**The test-rigor arc (the recurring session lesson, twice more):** r1 also = masked probes + boundary
+gaps; r2 = TWO probes STILL masked (the immutable parent row's frozen expiry/owner masked the queue
+predicate deletions — fixed via same-expired-expiry + separated queue-only/parent-only owner probes) +
+missing max-1 boundary + missing started-phase refusal; r2-confirm = the race DRILL was
+non-deterministic (a simultaneous-release barrier only HOPED to hit the harmful interleaving, so it
+passed against the pre-fix code on benign schedules). FINAL drill FORCES the schedule: the phase writer
+holds queue-FOR-UPDATE + advisory + an UNCOMMITTED started row; the reporter (on a uniquely
+application_name-tagged pool) is proven LOCK-WAITING on the queue row via pg_stat_activity (panics if it
+never blocks, so it runs not skips); then the writer commits and the reporter is asserted to REFUSE.
+Against the pre-fix code the reporter reads the uncommitted started row as absent, doesn't lock-wait,
+requeues → is_err() turns red. LESSON: a race drill that OBSERVES a race isn't a regression fence; it
+must FORCE the harmful ordering + assert lock-wait.
+
+**Anti-forgery (store-layer, per step-1's lesson):** a byte-pin proving the requeue CAS shares the
+shipped WHERE...RETURNING + the complete SET action; store-layer run_requeue_cas probes (expired/receipt/
+running/surface/queue-owner/parent-owner) each deletion-sensitive BENEATH the reporter verifiers; the
+4/5 requeue vs 5/5 terminalize boundary; retry_attempts JSONB byte-identical before/after (preparation
+retry and workload retry are independent counters).
+
+**Gates (orchestrator ran independently):** controlplane --lib 585, the entire --features integration
+matrix green (terminal-accounting-atomic 24, incl. the deterministic race drill which RAN not skipped),
+sandbox --lib 503 / test-support 552 (6c seam intact), clippy -D warnings clean, check clean,
+myelin-lints green, git diff --check clean.
+
+**Still open:** 6d steps 3-4 (the dormant composition module — V2 phase-store factory + the real
+CiJobParentAttempt→AttemptAuthority adapter over the credential store + DurablePreparationLeaseCheckpoint,
+per-phase spec rotation, parent admission via admit_parent_attempt in one tx; + the RunnerAgent
+reporter-seam extension + definition-cutover generalization). The builder confirmed the one design point:
+the ParentAttemptReserveHook reconstructs the full CiJobTokenRequest from the phase auth context's
+CiJobCredentialBinding (ci_run_id/token_authority_handle/idem_token) + spec.meter_to.reserve_id. Then 6e
+(the atomic activating cutover). Then 5b.3-7, task #91, gate-2 vertical slice. The rest of ledger 12's
+open items are unchanged.

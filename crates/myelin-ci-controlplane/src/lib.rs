@@ -655,8 +655,8 @@ pub use ci_claim_window::{
 pub use ci_pipeline_driver::{fixed_command_spec_builder, CiPipelineDriver, StartRunError};
 pub use ci_pipeline_driver::{
     unresolved_stage_spec_builder, CiJobAccountingPricer, CiJobPricingError, CiPipelineReporter,
-    ClaimRefusal, DurableCiJobAccounting, DurableJobRunner, PricedCiJobUsage, StageSpecBuilder,
-    TIER_P_OPERATIONAL_PRICING_REVISION,
+    ClaimRefusal, DurableCiJobAccounting, DurableJobRunner, PreparationRetryOutcome,
+    PricedCiJobUsage, StageSpecBuilder, TIER_P_OPERATIONAL_PRICING_REVISION,
 };
 pub use ci_pipeline_reporter_router::{
     CiPipelineReporterFactory, CiPipelineReporterFactoryError, CiPipelineReporterRouter,

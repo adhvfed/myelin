@@ -75,6 +75,7 @@ use crate::scheduler::{
     EnqueueOutcome, Lane, AUTHORIZE_JOB_LAUNCH_QUERY, COMPLETE_JOB_QUERY, CONSUME_CLAIM_QUERY,
     CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY, CONSUME_PREPARATION_CLAIM_QUERY, HEARTBEAT_QUERY,
     INSERT_JOB_QUEUE_QUERY, READ_COMPLETION_DISPOSITION_QUERY, RENEW_PREPARATION_LEASE_QUERY,
+    REQUEUE_PREPARATION_CLAIM_QUERY, RESET_REQUEUED_PREPARATION_CI_JOB_SURFACE_QUERY,
     VERIFY_JOB_LAUNCH_LIVE_QUERY,
 };
 
@@ -307,6 +308,37 @@ pub(crate) struct PreparationClaimConsumeSpec<'a> {
     pub claim_expires_at_epoch_secs: i64,
     pub reserve_handle: &'a str,
     pub completion_receipt: &'a str,
+}
+
+/// Exact authority for the preparation-RETRY `leased -> queued` CAS (CT-007 5b.3-6d step 2). Same
+/// generation identity as [`PreparationClaimConsumeSpec`] minus the completion receipt: a requeue is
+/// not a terminal outcome, so it settles nothing and writes no receipt.
+pub(crate) struct PreparationRequeueSpec<'a> {
+    pub tenant_id: &'a str,
+    pub region: &'a str,
+    /// The uuid identity fields are bound as text against the CAS's own `$N::uuid` casts (the same
+    /// convention the disposition verifier uses), so they carry the claim's string forms.
+    pub job_id: &'a str,
+    pub wf_run_id: &'a str,
+    pub ci_run_id: &'a str,
+    pub idem_token: &'a str,
+    pub lease_owner: &'a str,
+    pub lease_epoch: i64,
+    pub claim_nonce: &'a str,
+    pub stage: &'a str,
+    pub claim_started_at_epoch_secs: i64,
+    pub claim_expires_at_epoch_secs: i64,
+    pub reserve_handle: &'a str,
+}
+
+/// The outcome of the preparation-retry CAS (CT-007 5b.3-6d step 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreparationRequeueOutcome {
+    /// THIS call returned the exact leased generation to `queued` for re-claim.
+    Requeued,
+    /// No live leased generation matched the presented identity — already requeued/reclaimed, or
+    /// never the current generation. Fail-closed benign no-op: nothing changed.
+    NoOp,
 }
 
 // =================================================================================================
@@ -1042,6 +1074,48 @@ impl CiJobQueueStore {
         } else {
             ClaimConsumeOutcome::Refused
         })
+    }
+
+    /// **CT-007 slice 5b.3-6d step 2: return an exact still-leased preparation generation to `queued`
+    /// for re-claim.** Drives [`REQUEUE_PREPARATION_CLAIM_QUERY`] (the byte-identical twin of the
+    /// shipped preparation CAS, differing only in the requeue action) and, on success, resets the
+    /// pre-workload `ci_job` surface — both on the caller's ONE transaction. It NEVER writes
+    /// `retry_attempts`: the parent-attempt journal is the preparation retry authority, so the workload
+    /// retry path is untouched. A 0-row CAS is a benign [`PreparationRequeueOutcome::NoOp`] (the
+    /// generation is no longer the live leased one — already requeued or reclaimed).
+    pub(crate) async fn requeue_preparation_claim_on_conn(
+        conn: &mut sqlx::PgConnection,
+        spec: PreparationRequeueSpec<'_>,
+    ) -> Result<PreparationRequeueOutcome, PgError> {
+        let requeued = sqlx::query(REQUEUE_PREPARATION_CLAIM_QUERY)
+            .bind(spec.tenant_id)
+            .bind(spec.region)
+            .bind(spec.job_id)
+            .bind(spec.wf_run_id)
+            .bind(spec.idem_token)
+            .bind(spec.lease_owner)
+            .bind(spec.lease_epoch)
+            .bind(spec.claim_nonce)
+            .bind(spec.stage)
+            .bind(spec.claim_started_at_epoch_secs)
+            .bind(spec.claim_expires_at_epoch_secs)
+            .bind(spec.ci_run_id)
+            .bind(spec.reserve_handle)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+        if requeued.is_none() {
+            return Ok(PreparationRequeueOutcome::NoOp);
+        }
+        // Reset the public DAG surface so a fresh generation can re-win the launch fence, in the SAME
+        // transaction as the requeue (mirrors the workload retryable + dead-runner reaper resets).
+        sqlx::query(RESET_REQUEUED_PREPARATION_CI_JOB_SURFACE_QUERY)
+            .bind(spec.tenant_id)
+            .bind(spec.job_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+        Ok(PreparationRequeueOutcome::Requeued)
     }
 
     /// **Heartbeat — a live runner extends its lease ([`HEARTBEAT_QUERY`]).** Tenant-scoped. Only the

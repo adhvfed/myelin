@@ -108,7 +108,7 @@ use crate::job_accounting_store::{
 use crate::job_queue_store::{trust_from_token, JobQueueStoreError};
 use crate::job_queue_store::{
     CiJobQueueStore, ClaimConsumeOutcome, ClaimConsumeSpec, DurableEnqueue,
-    PreparationClaimConsumeSpec,
+    PreparationClaimConsumeSpec, PreparationRequeueOutcome, PreparationRequeueSpec,
 };
 use crate::job_spec_store::{
     CiJobSpecStore, CiJobSpecStoreError, ClaimedDispatchIdentity, DurableCiJobLaunchTemplate,
@@ -1375,6 +1375,152 @@ async fn verify_preparation_disposition_on_conn(
     Ok(())
 }
 
+/// **CT-007 5b.3-6d step 2: a preparation RETRY is permitted only for an ADMITTED current generation
+/// whose journal is fully RESOLVED and whose exact-policy budget still permits another attempt.** The
+/// current generation's exact parent row is required (a retryable failure was, by definition, an
+/// admitted attempt); any still-`started` phase for this generation refuses (the failing attempt must
+/// have completed/sealed its phase first); and `count < max` under the same immutable policy is what
+/// makes this a REQUEUE rather than an exhaustion (that boundary is terminalized elsewhere).
+/// The gate a preparation-retry verification resolves to (CT-007 5b.3-6d step 2, round 2).
+/// `Proceed` = the exact generation is live-leased AND permitted (run the requeue CAS). `NotLive` =
+/// the generation is no longer the live leased one (already requeued/reclaimed, or never the current
+/// generation) — a benign `NoOp`, distinct from an `Err` refusal (a live generation that is exhausted
+/// or has an unresolved started phase).
+enum PreparationRetryGate {
+    Proceed,
+    NotLive,
+}
+
+async fn verify_preparation_retry_permitted_on_conn(
+    conn: &mut sqlx::PgConnection,
+    claim: &CiJobTokenRequest,
+    reserve_handle: &str,
+) -> Result<PreparationRetryGate, CompletionTxError> {
+    // **Round-2 blocker 1: lock the exact queue generation FOR UPDATE BEFORE reading journal
+    // status/count, preserving the canonical queue -> advisory -> journal lock order.** Without this,
+    // a concurrent `begin_phase` (which locks this same row via `require_live_parent_attempt_on_conn`)
+    // could insert a `started` phase AFTER this verification read no `started` phase but BEFORE the
+    // requeue CAS — leaving a freshly-`queued` job with an unresolved old-generation phase. Holding
+    // the row here forces that ordering: a phase writer already past its own queue lock has committed
+    // its `started` row (this then sees it and refuses); otherwise it BLOCKS on this lock until the
+    // requeue clears the generation (its own re-verify then fails). This is the exact discipline
+    // `require_live_parent_attempt_on_conn` and the lease-slice deadline sealer use.
+    let live = sqlx::query_scalar::<_, String>(
+        "SELECT q.job_id::text
+         FROM job_queue AS q
+         WHERE q.tenant_id = $1 AND q.region = $2 AND q.job_id = $3::uuid AND q.run_id = $4::uuid
+           AND q.state = 'leased' AND q.lease_owner = $5 AND q.lease_epoch = $6
+           AND q.claim_nonce = $7::uuid
+           AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $8
+           AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $9
+           AND q.claim_expires_at > statement_timestamp()
+           AND q.completion_receipt IS NULL
+         FOR UPDATE",
+    )
+    .bind(&claim.tenant_id)
+    .bind(&claim.region)
+    .bind(&claim.job_id)
+    .bind(&claim.wf_run_id)
+    .bind(&claim.lease_owner)
+    .bind(claim.lease_epoch)
+    .bind(&claim.claim_nonce)
+    .bind(claim.claim_started_at_epoch_secs)
+    .bind(claim.claim_expires_at_epoch_secs)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|_| CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database))?;
+    if live.is_none() {
+        // Not the live leased generation (already requeued/reclaimed, or a stale/forged identity):
+        // a benign NoOp, never a hard refusal.
+        return Ok(PreparationRetryGate::NotLive);
+    }
+    // The per-job advisory lock, in the canonical order (queue row already held above), so this shares
+    // the exact serialization domain the journal's phase writers take.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "myelin.ci.parent-attempt.v1:{}:{}:{}",
+            claim.tenant_id, claim.region, claim.job_id
+        ))
+        .execute(&mut *conn)
+        .await
+        .map_err(|_| CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database))?;
+
+    let current = sqlx::query(
+        "SELECT budget_revision, max_parent_attempts
+         FROM ci_job_parent_attempt
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+           AND wf_run_id = $4::uuid AND ci_run_id = $5::uuid
+           AND reserve_handle = $6 AND lease_owner = $7
+           AND lease_epoch = $8 AND claim_nonce = $9::uuid
+           AND claim_started_at_epoch_secs = $10
+           AND claim_expires_at_epoch_secs = $11",
+    )
+    .bind(&claim.tenant_id)
+    .bind(&claim.region)
+    .bind(&claim.job_id)
+    .bind(&claim.wf_run_id)
+    .bind(&claim.ci_run_id)
+    .bind(reserve_handle)
+    .bind(&claim.lease_owner)
+    .bind(claim.lease_epoch)
+    .bind(&claim.claim_nonce)
+    .bind(claim.claim_started_at_epoch_secs)
+    .bind(claim.claim_expires_at_epoch_secs)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|_| CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database))?
+    .ok_or(CompletionTxError::Refused)?;
+    let revision: i16 = current
+        .try_get("budget_revision")
+        .map_err(|_| CompletionTxError::Refused)?;
+    let maximum: i64 = current
+        .try_get("max_parent_attempts")
+        .map_err(|_| CompletionTxError::Refused)?;
+
+    // No unresolved phase may remain for this generation.
+    let unresolved = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM ci_job_prelaunch_usage
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+           AND lease_epoch = $4 AND claim_nonce = $5::uuid AND status = 'started'
+         LIMIT 1",
+    )
+    .bind(&claim.tenant_id)
+    .bind(&claim.region)
+    .bind(&claim.job_id)
+    .bind(claim.lease_epoch)
+    .bind(&claim.claim_nonce)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|_| CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database))?;
+    if unresolved.is_some() {
+        return Err(CompletionTxError::Refused);
+    }
+
+    // Another parent attempt must still be permitted under the exact immutable policy.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+         FROM ci_job_parent_attempt
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+           AND wf_run_id = $4::uuid AND ci_run_id = $5::uuid
+           AND reserve_handle = $6 AND budget_revision = $7 AND max_parent_attempts = $8",
+    )
+    .bind(&claim.tenant_id)
+    .bind(&claim.region)
+    .bind(&claim.job_id)
+    .bind(&claim.wf_run_id)
+    .bind(&claim.ci_run_id)
+    .bind(reserve_handle)
+    .bind(revision)
+    .bind(maximum)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|_| CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database))?;
+    if count >= maximum {
+        return Err(CompletionTxError::Refused);
+    }
+    Ok(PreparationRetryGate::Proceed)
+}
+
 async fn settle_ci_job_surface_on_conn(
     conn: &mut sqlx::PgConnection,
     tenant: &TenantId,
@@ -1552,6 +1698,18 @@ pub(crate) async fn close_cancelled_run_if_accounted(
     .await
     .map_err(|_| CompletionTxError::CancelledClosure)?;
     Ok(())
+}
+
+/// The outcome of a dormant preparation-retry report (CT-007 5b.3-6d step 2).
+///
+/// A requeue is not a terminal outcome, so there is no `Buffered`/`Duplicate` signal vocabulary here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationRetryOutcome {
+    /// The exact leased generation was returned to `queued` for a fresh attempt.
+    Requeued,
+    /// The presented generation was no longer the live leased one (already requeued/reclaimed) — a
+    /// benign no-op that changed nothing.
+    NoOp,
 }
 
 /// **The [`TerminalReporter`] that VERIFIES durable claimed-job identity before signalling a verdict
@@ -1901,6 +2059,143 @@ impl CiPipelineReporter {
             ))),
             Err(error) => Err(ExecutorError::Storage(format!(
                 "preparation completion transaction failed: {error:?}"
+            ))),
+        }
+    }
+
+    /// **CT-007 slice 5b.3-6d step 2: report a RETRYABLE preparation failure — requeue the exact
+    /// still-`leased` generation for a fresh attempt.** Distinct from
+    /// [`report_preparation_terminal`](Self::report_preparation_terminal): a requeue is not terminal, so
+    /// it emits NO `job.done` signal, settles NO accounting, and — critically — writes NO
+    /// `retry_attempts` (the parent-attempt journal, not the workload retry counter, is the authority
+    /// for preparation retries). In one tenant transaction it re-verifies the claimed dispatch
+    /// identity, that the generation was ADMITTED (its exact parent row exists) with a fully RESOLVED
+    /// journal, and that the exact-policy budget still permits another attempt, then drives the requeue
+    /// CAS + `ci_job` surface reset. A stale/redelivered request that no longer matches the live leased
+    /// generation is a benign [`PreparationRetryOutcome::NoOp`]. No production caller is wired.
+    pub fn report_preparation_retry(
+        &self,
+        claim: &CiJobTokenRequest,
+    ) -> Result<PreparationRetryOutcome, ExecutorError> {
+        claim.validate().map_err(|error| {
+            ExecutorError::InvalidInput(format!("ci.pipeline preparation retry refused: {}", error.0))
+        })?;
+        if claim.tenant_id != self.tenant.0 || claim.region != self.region {
+            return Err(ExecutorError::InvalidInput(
+                "ci.pipeline preparation retry refused: reporter scope mismatch".into(),
+            ));
+        }
+        // The `get_dispatch_identity_on_conn` read parses the job UUID; the claim's own `validate()`
+        // (above) rejects malformed identity UUIDs, and every identity field is bound as text against
+        // the CAS's `$N::uuid` casts.
+        let job_uuid = Uuid::parse_str(&claim.job_id)
+            .map_err(|_| ExecutorError::InvalidInput("invalid job UUID".into()))?;
+        let claim = claim.clone();
+        let refusal_job = claim.job_id.clone();
+        let refusal_owner = claim.lease_owner.clone();
+        let refusal_epoch = claim.lease_epoch;
+        let tenant = self.tenant.clone();
+        let region = self.region.clone();
+        let transaction_tenant = tenant.0.clone();
+        let transaction_region = region.clone();
+        let spec_store = self.spec_store.clone();
+
+        let durable = bridge(
+            &self.rt,
+            with_tenant_tx_error(
+                self.queue_store.pool(),
+                &transaction_tenant,
+                &transaction_region,
+                move |conn| {
+                    Box::pin(async move {
+                        let identity = spec_store
+                            .get_dispatch_identity_on_conn(
+                                conn,
+                                tenant.as_str(),
+                                job_uuid,
+                                &claim.job_id,
+                            )
+                            .await
+                            .map_err(CompletionTxError::Spec)?;
+                        let reserve_handle = identity
+                            .as_ref()
+                            .map(|identity| identity.reserve_handle.clone())
+                            .ok_or(CompletionTxError::Refused)?;
+                        let stage = verify_claimed_identity(
+                            &tenant,
+                            &tenant,
+                            &claim.wf_run_id,
+                            &claim.job_id,
+                            &claim.idem_token,
+                            identity,
+                        )
+                        .map_err(|_| CompletionTxError::Refused)?;
+                        let launch = spec_store
+                            .get_launch_template_on_conn(conn, tenant.as_str(), &claim.job_id)
+                            .await
+                            .map_err(CompletionTxError::Spec)?;
+                        if launch.ci_run_id != claim.ci_run_id
+                            || launch.token_authority_handle != claim.token_authority_handle
+                            || launch.spec.idem_token.0 != claim.idem_token
+                            || launch.spec.meter_to.reserve_id != reserve_handle
+                            || derive_checkout_authorization_scope(
+                                JobKind::Ci,
+                                &launch.spec.workspace,
+                            )
+                            .map_err(|_| CompletionTxError::Refused)?
+                            .is_none()
+                        {
+                            return Err(CompletionTxError::Refused);
+                        }
+                        // A not-live generation short-circuits to NoOp WITHOUT the CAS (the FOR UPDATE
+                        // lock above already found nothing to protect); a live-but-unpermitted one has
+                        // already returned Err.
+                        if let PreparationRetryGate::NotLive =
+                            verify_preparation_retry_permitted_on_conn(conn, &claim, &reserve_handle)
+                                .await?
+                        {
+                            return Ok(PreparationRequeueOutcome::NoOp);
+                        }
+                        let outcome = CiJobQueueStore::requeue_preparation_claim_on_conn(
+                            conn,
+                            PreparationRequeueSpec {
+                                tenant_id: tenant.as_str(),
+                                region: &region,
+                                job_id: &claim.job_id,
+                                wf_run_id: &claim.wf_run_id,
+                                ci_run_id: &claim.ci_run_id,
+                                idem_token: &claim.idem_token,
+                                lease_owner: &claim.lease_owner,
+                                lease_epoch: claim.lease_epoch,
+                                claim_nonce: &claim.claim_nonce,
+                                stage: &stage,
+                                claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
+                                claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
+                                reserve_handle: &reserve_handle,
+                            },
+                        )
+                        .await?;
+                        Ok(outcome)
+                    })
+                },
+            ),
+        );
+        match durable {
+            Ok(PreparationRequeueOutcome::Requeued) => Ok(PreparationRetryOutcome::Requeued),
+            Ok(PreparationRequeueOutcome::NoOp) => Ok(PreparationRetryOutcome::NoOp),
+            Err(CompletionTxError::Refused) => Err(ExecutorError::InvalidInput(format!(
+                "ci.pipeline preparation retry refused (stale or divergent generation): job `{}` \
+                 owner `{}` epoch `{}`",
+                refusal_job, refusal_owner, refusal_epoch
+            ))),
+            Err(CompletionTxError::Spec(error)) => Err(ExecutorError::Storage(format!(
+                "durable preparation dispatch read refused: {error}"
+            ))),
+            Err(CompletionTxError::Prelaunch(error)) => Err(ExecutorError::Storage(format!(
+                "preparation retry verification refused: {error}"
+            ))),
+            Err(error) => Err(ExecutorError::Storage(format!(
+                "preparation retry transaction failed: {error:?}"
             ))),
         }
     }
