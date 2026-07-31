@@ -42,9 +42,12 @@ use myelin_ci_controlplane::{
     MintedPhaseCredential, OperationalReservationWriteVersion, PgTierPCiJobBudgetReservation,
     CI_PHASE_CREDENTIAL_BINDING_V1,
 };
+use myelin_ci_controlplane::ci_checkout_composition::V2CheckoutComposition;
+use myelin_ci_sandbox::checkout_orchestration::ParentAttemptAdmission;
 use myelin_ci_sandbox::{
-    derive_checkout_authorization_scope, EgressPolicy, IdemToken, ImageRef, JobKind,
-    JobSpecTemplate, MeterTarget, ResourceLimits, RunTokenCredential, TrustTier, WorkspaceSpec,
+    derive_checkout_authorization_scope, CheckoutPhase, EgressPolicy, IdemToken, ImageRef, JobKind,
+    JobSpec, JobSpecTemplate, MeterTarget, PreparationPhase, ResourceLimits, ResourceUsage,
+    RunTokenCredential, TrustTier, WorkspaceSpec,
 };
 use myelin_identity_service::{
     CellTokenAuthority, PasetoCapabilitySigner, RevocationStore, RunTokenMinter,
@@ -1890,7 +1893,7 @@ async fn a_sealed_ceiling_phase_satisfies_no_purpose_and_retires_its_own_credent
 #[test]
 fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
     /// Every token that would constitute reaching (or composing) the dormant V2 surface.
-    const MARKERS: [&str; 15] = [
+    const MARKERS: [&str; 19] = [
         // control plane
         "mint_phase_credential(",
         "authorize_workload_v2_retained(",
@@ -1902,6 +1905,13 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         "acquire_phase_generation_ownership(",
         "V2PhaseBound",
         "CiJobCredentialGenerationStore",
+        // CT-007 5b.3-6d STEP 3: the dormant composition FAÇADE. Wiring ANY of these into a
+        // production composition root activates the V2 checkout path WITHOUT touching the credential
+        // markers above — so the dormancy guarantee requires the scan to cover them directly.
+        "V2CheckoutComposition",
+        "v2_phase_credential_store(",
+        "mint_initial_phase_credential(",
+        "parent_attempt_reserve_hook(",
         // sandbox
         "authorize_checkout_phase(",
         "with_checkout_phase_authorization(",
@@ -1914,7 +1924,7 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
     /// absent from this table must have ZERO occurrences.
     /// `(crate, file, marker) -> exact allowed CODE occurrence count` in PRODUCTION source.
     /// Everything absent from this table must have ZERO occurrences in EITHER crate.
-    const ALLOWED: [(&str, &str, &str, usize); 34] = [
+    const ALLOWED: [(&str, &str, &str, usize); 61] = [
         // --- the definition sites ---
         ("myelin-ci-controlplane", "ci_credential_generation.rs", "mint_phase_credential(", 1),
         ("myelin-ci-controlplane", "ci_credential_generation.rs", "acquire_phase_generation_ownership(", 1),
@@ -1929,6 +1939,48 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         ("myelin-ci-controlplane", "job_queue_store.rs", "authorize_launch_v2(", 1),
         ("myelin-ci-controlplane", "job_queue_store.rs", "authorize_launch_v2_retained(", 2),
         ("myelin-ci-controlplane", "lib.rs", "CiJobCredentialGenerationStore", 1),
+        // CT-007 5b.3-6d STEP 3: the DORMANT control-plane composition module. It is the real
+        // durable backing for the sandbox `AttemptAuthority`/resolver seam — a NEW definition site,
+        // NOT a composition root (no production root constructs `V2CheckoutComposition`, and
+        // production `RunnerHooks` never install its parent-attempt reserve hook), so the
+        // composition-root zeros below stay zero. `V2PhaseBound` (the phase-store factory) x1,
+        // `CiJobCredentialGenerationStore` (import + factory return + factory body + the two durable-
+        // authority struct fields) x5, `mint_phase_credential(` (the initial resolver mint + the
+        // per-generation mint + the `AttemptAuthority` trait method) x3.
+        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "V2PhaseBound", 1),
+        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "CiJobCredentialGenerationStore", 5),
+        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "mint_phase_credential(", 3),
+        // CT-007 5b.3-6d STEP 3: the composition-façade DEFINITION sites (all in the dormant module).
+        // `V2CheckoutComposition` = the struct def + its `impl` block; `v2_phase_credential_store(` =
+        // the factory def + its one call inside `V2CheckoutComposition::new`; the resolver seam and the
+        // reserve-hook constructor are each defined once. These are the exact symbols whose appearance
+        // in ANY composition root below means the V2 checkout path was activated.
+        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "V2CheckoutComposition", 2),
+        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "v2_phase_credential_store(", 2),
+        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "mint_initial_phase_credential(", 1),
+        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "parent_attempt_reserve_hook(", 1),
+        // ...and EXPLICITLY ZERO in every production composition root: constructing the façade, minting
+        // the initial credential, or installing the reserve hook from any of these turns the scan RED.
+        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "V2CheckoutComposition", 0),
+        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "v2_phase_credential_store(", 0),
+        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "mint_initial_phase_credential(", 0),
+        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "parent_attempt_reserve_hook(", 0),
+        ("myelin-ci-controlplane", "ci_runner_composition.rs", "V2CheckoutComposition", 0),
+        ("myelin-ci-controlplane", "ci_runner_composition.rs", "v2_phase_credential_store(", 0),
+        ("myelin-ci-controlplane", "ci_runner_composition.rs", "mint_initial_phase_credential(", 0),
+        ("myelin-ci-controlplane", "ci_runner_composition.rs", "parent_attempt_reserve_hook(", 0),
+        ("myelin-ci-controlplane", "runner_bind.rs", "V2CheckoutComposition", 0),
+        ("myelin-ci-controlplane", "runner_bind.rs", "v2_phase_credential_store(", 0),
+        ("myelin-ci-controlplane", "runner_bind.rs", "mint_initial_phase_credential(", 0),
+        ("myelin-ci-controlplane", "runner_bind.rs", "parent_attempt_reserve_hook(", 0),
+        ("myelin-ci-controlplane", "main.rs", "V2CheckoutComposition", 0),
+        ("myelin-ci-controlplane", "main.rs", "v2_phase_credential_store(", 0),
+        ("myelin-ci-controlplane", "main.rs", "mint_initial_phase_credential(", 0),
+        ("myelin-ci-controlplane", "main.rs", "parent_attempt_reserve_hook(", 0),
+        ("myelin-ci-controlplane", "lib.rs", "V2CheckoutComposition", 0),
+        ("myelin-ci-controlplane", "lib.rs", "v2_phase_credential_store(", 0),
+        ("myelin-ci-controlplane", "lib.rs", "mint_initial_phase_credential(", 0),
+        ("myelin-ci-controlplane", "lib.rs", "parent_attempt_reserve_hook(", 0),
         ("myelin-ci-sandbox", "checkout_authorization.rs", "authorize_checkout_phase(", 1),
         ("myelin-ci-sandbox", "checkout_authorization.rs", "PhaseAuthorization", 6),
         ("myelin-ci-sandbox", "gvisor.rs", "fetch_checkout_pack_within_parent_attempt_v2(", 1),
@@ -2410,3 +2462,557 @@ async fn retained_ownership_freezes_the_journal_status_against_the_production_se
     .await;
 }
 
+
+// =================================================================================================
+// 11. CT-007 5b.3-6d STEP 3: the DORMANT durable checkout-composition adapter, live-PG.
+//
+// These prove the `DurableAttemptAuthority`/parent-attempt reserve hook COMPOSE the journal, lease,
+// credential, and reservation authorities correctly — state predicates, RLS role, lock ordering,
+// Identity invocation, and the synchronous off-runtime bridge — which the component tests (each
+// exercising one authority in isolation) and 6c's fake authorities do not.
+// =================================================================================================
+
+/// Build the dormant composition over one pool, injecting the call-counting Identity minter.
+fn adapter_composition(pool: &PgPool, minter: Arc<CountingPhaseMinter>) -> V2CheckoutComposition {
+    V2CheckoutComposition::new(
+        pool.clone(),
+        REGION,
+        minter,
+        ci_job_queue_store(pool.clone()),
+        tokio::runtime::Handle::current(),
+    )
+    .expect("compose the dormant V2 checkout authorities")
+}
+
+/// Drive the V2 resolver seam (mint the initial `CheckoutAdvertise`) and build the resolved checkout
+/// [`JobSpec`] the parent-attempt reserve hook reconstructs its claim from — exactly what the runner
+/// would hand `RunnerAgent`.
+fn resolved_checkout_spec(comp: &V2CheckoutComposition, fixture: &Fixture) -> JobSpec {
+    let scope = checkout_scope();
+    let (minted, context) = comp
+        .mint_initial_phase_credential(&fixture.claim, Some(&scope))
+        .expect("the resolver mints the initial advertise credential");
+    let mut spec = JobSpec::new(
+        JobKind::Ci,
+        ImageRef::pinned(format!("registry.example/ci@sha256:{}", "b".repeat(64))).unwrap(),
+        vec!["true".into()],
+        Vec::new(),
+        Vec::new(),
+        EgressPolicy::deny_all(),
+        ResourceLimits {
+            cpu_millis: 1_000,
+            mem_bytes: 256 * 1024 * 1024,
+            disk_bytes: 1024 * 1024 * 1024,
+            tmpfs_bytes: 1024 * 1024 * 1024,
+            pids_max: 128,
+            timeout_secs: 120,
+        },
+        WorkspaceSpec {
+            repo_ref: Some(REPO_REF.into()),
+            commit: Some(COMMIT_OID.into()),
+        },
+        TrustTier::Trusted,
+        minted.credential,
+        MeterTarget {
+            reserve_id: fixture.reserve_handle.clone(),
+        },
+        IdemToken(fixture.claim.idem_token.clone()),
+    )
+    .expect("resolve the checkout job spec");
+    spec.run_token_authorization = Some(context);
+    spec
+}
+
+async fn reservation_state(admin: &PgPool, reserve_handle: &str) -> String {
+    sqlx::query_scalar::<_, String>(
+        "SELECT state FROM cost_reservation WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(reserve_handle)
+    .fetch_one(admin)
+    .await
+    .unwrap()
+}
+
+async fn parent_row_count(admin: &PgPool, fixture: &Fixture) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM ci_job_parent_attempt
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(&fixture.claim.job_id)
+    .fetch_one(admin)
+    .await
+    .unwrap()
+}
+
+struct LeaseFacts {
+    claim_started: i64,
+    claim_expires: i64,
+    claim_nonce: String,
+    lease_owner: String,
+    lease_epoch: i64,
+    lease_expires: i64,
+}
+
+async fn lease_facts(admin: &PgPool, fixture: &Fixture) -> LeaseFacts {
+    let row = sqlx::query(
+        "SELECT EXTRACT(EPOCH FROM claim_started_at)::bigint AS cs,
+                EXTRACT(EPOCH FROM claim_expires_at)::bigint AS ce,
+                claim_nonce::text AS nonce, lease_owner, lease_epoch,
+                EXTRACT(EPOCH FROM lease_expires)::bigint AS le
+         FROM job_queue WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(&fixture.claim.job_id)
+    .fetch_one(admin)
+    .await
+    .unwrap();
+    LeaseFacts {
+        claim_started: row.get("cs"),
+        claim_expires: row.get("ce"),
+        claim_nonce: row.get("nonce"),
+        lease_owner: row.get("lease_owner"),
+        lease_epoch: row.get("lease_epoch"),
+        lease_expires: row.get("le"),
+    }
+}
+
+/// The generation id the carrier's ephemeral authorization CONTEXT binds — proves the context (not
+/// just the returned string) names the exact durable generation.
+fn binding_generation_of(context: &myelin_ci_sandbox::RunTokenAuthorizationContext) -> String {
+    match context {
+        myelin_ci_sandbox::RunTokenAuthorizationContext::CiJob(c) => c
+            .credential_binding
+            .as_ref()
+            .expect("a V2 context carries a credential binding")
+            .generation_id
+            .clone(),
+    }
+}
+
+/// Insert one prior (superseded) parent-attempt row under the SAME reserve/policy but a distinct
+/// generation, so a later admission counts it toward the exact-policy budget.
+async fn insert_prior_parent(admin: &PgPool, fixture: &Fixture, lease_epoch: i64, nonce: &str) {
+    sqlx::query(
+        "INSERT INTO ci_job_parent_attempt (
+           tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle, lease_owner,
+           lease_epoch, claim_nonce, claim_started_at_epoch_secs, claim_expires_at_epoch_secs,
+           budget_revision, max_parent_attempts
+         ) VALUES ($1, $2, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8, $9::uuid, $10, $11, 1, 5)",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(&fixture.claim.job_id)
+    .bind(&fixture.claim.wf_run_id)
+    .bind(&fixture.claim.ci_run_id)
+    .bind(&fixture.reserve_handle)
+    .bind(format!("worker-{lease_epoch}"))
+    .bind(lease_epoch)
+    .bind(nonce)
+    .bind(fixture.claim.claim_started_at_epoch_secs)
+    .bind(fixture.claim.claim_expires_at_epoch_secs)
+    .execute(admin)
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_checkout_adapter_drives_the_full_phase_sequence() {
+    let (schema, bootstrap, admin, app) = migrated_schema("adapter_full").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        let (minter, calls) = real_minter();
+        let comp = adapter_composition(&app, minter);
+        let fixture = seed_fixture(&app, &admin, 1, 5).await;
+
+        // Resolver seam: the initial CheckoutAdvertise is minted before any parent attempt exists.
+        let spec = resolved_checkout_spec(&comp, &fixture);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the resolver seam mints advertise exactly once"
+        );
+        let before = lease_facts(&admin, &fixture).await;
+
+        // Drive the WHOLE adapter phase sequence from a dedicated OFF-runtime thread (the runner
+        // thread `CiRunnerLoop::spawn` uses — where the sync bridge does a direct `block_on`).
+        let comp_t = comp.clone();
+        let spec_t = spec.clone();
+        let gens = std::thread::spawn(move || {
+            let hook = comp_t.parent_attempt_reserve_hook();
+            let authority = match hook(&spec_t).expect("admission succeeds") {
+                ParentAttemptAdmission::Admitted {
+                    attempt_authority, ..
+                } => attempt_authority,
+                ParentAttemptAdmission::AttemptsExhausted { .. } => {
+                    panic!("a fresh generation must be admitted, not exhausted")
+                }
+            };
+            let usage = ResourceUsage {
+                cpu_seconds: 3,
+                mem_byte_seconds: 7,
+            };
+            // transport: begin -> advertise REPLAY -> fetch mint -> complete
+            authority
+                .begin_phase(PreparationPhase::CheckoutTransport)
+                .expect("begin transport");
+            let advertise = authority
+                .mint_phase_credential(CheckoutPhase::Advertise)
+                .expect("advertise replays under the same generation");
+            let fetch = authority
+                .mint_phase_credential(CheckoutPhase::Fetch)
+                .expect("fetch mints");
+            authority
+                .complete_phase(PreparationPhase::CheckoutTransport, usage)
+                .expect("complete transport");
+            authority
+                .renew_preparation_lease()
+                .expect("renew after transport");
+            // materialization: begin -> mint -> complete -> renew -> workload mint
+            authority
+                .begin_phase(PreparationPhase::CheckoutMaterialization)
+                .expect("begin materialization");
+            let materialization = authority
+                .mint_phase_credential(CheckoutPhase::Materialization)
+                .expect("materialization mints");
+            authority
+                .complete_phase(PreparationPhase::CheckoutMaterialization, usage)
+                .expect("complete materialization");
+            authority
+                .renew_preparation_lease()
+                .expect("renew before workload");
+            let workload = authority
+                .mint_workload_credential()
+                .expect("workload mints");
+            (
+                advertise.generation_id().to_string(),
+                fetch.generation_id().to_string(),
+                materialization.generation_id().to_string(),
+                workload.generation_id().to_string(),
+                binding_generation_of(advertise.authorization_context()),
+            )
+        })
+        .join()
+        .expect("the runner thread drove the sequence");
+
+        // The ADAPTER performed the reservation transition and inserted exactly one parent row.
+        assert_eq!(
+            reservation_state(&admin, &fixture.reserve_handle).await,
+            "inflight",
+            "admission drove reserved -> inflight"
+        );
+        assert_eq!(parent_row_count(&admin, &fixture).await, 1);
+
+        // Both journal phases are measured.
+        assert_eq!(
+            phase_status(&admin, &fixture, "checkout_transport")
+                .await
+                .as_deref(),
+            Some("measured")
+        );
+        assert_eq!(
+            phase_status(&admin, &fixture, "checkout_materialization")
+                .await
+                .as_deref(),
+            Some("measured")
+        );
+
+        // Exactly four generation rows in order, and the adapter's carriers name each durable
+        // generation (the ephemeral context binds the same generation id).
+        let rows = generation_rows(&admin, &fixture).await;
+        let purposes: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            purposes,
+            [
+                "checkout_advertise",
+                "checkout_fetch",
+                "checkout_materialization",
+                "workload"
+            ]
+        );
+        let (adv, fet, mat, wl, adv_ctx_gen) = &gens;
+        assert_eq!(adv, &rows[0].2, "advertise carrier names the durable advertise generation");
+        assert_eq!(fet, &rows[1].2, "fetch carrier names the durable fetch generation");
+        assert_eq!(mat, &rows[2].2, "materialization carrier names its generation");
+        assert_eq!(wl, &rows[3].2, "workload carrier names its generation");
+        assert_eq!(
+            adv_ctx_gen, &rows[0].2,
+            "the carrier's authorization context binds the same generation"
+        );
+
+        // Identity was invoked once per mint call — advertise(apply) + advertise(replay) + fetch +
+        // materialization + workload = 5 — yet only FOUR generation rows exist: the replay reproduced
+        // the advertise generation deterministically, it did not create a fifth row.
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+
+        // Renew moved ONLY the execution lease; every immutable claim fact is unchanged.
+        let after = lease_facts(&admin, &fixture).await;
+        assert_eq!(after.claim_started, before.claim_started);
+        assert_eq!(after.claim_expires, before.claim_expires);
+        assert_eq!(after.claim_nonce, before.claim_nonce);
+        assert_eq!(after.lease_owner, before.lease_owner);
+        assert_eq!(after.lease_epoch, before.lease_epoch);
+        assert_ne!(
+            after.lease_expires, before.lease_expires,
+            "renew_preparation_lease moved lease_expires and nothing else"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn adapter_admission_loses_cleanly_to_claim_generation_change() {
+    let (schema, bootstrap, admin, app) = migrated_schema("adapter_race").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        // Control: a clean admission proves the ADAPTER (not a mock) performs the transition.
+        {
+            let (minter, _calls) = real_minter();
+            let comp = adapter_composition(&app, minter);
+            let fixture = seed_fixture(&app, &admin, 10, 5).await;
+            let spec = resolved_checkout_spec(&comp, &fixture);
+            let comp_t = comp.clone();
+            let spec_t = spec.clone();
+            let admitted = std::thread::spawn(move || {
+                matches!(
+                    comp_t.parent_attempt_reserve_hook()(&spec_t),
+                    Ok(ParentAttemptAdmission::Admitted { .. })
+                )
+            })
+            .join()
+            .unwrap();
+            assert!(admitted, "the control admission succeeds");
+            assert_eq!(
+                reservation_state(&admin, &fixture.reserve_handle).await,
+                "inflight"
+            );
+            assert_eq!(parent_row_count(&admin, &fixture).await, 1);
+        }
+
+        // Race: hold the exact queue row lock, prove admission is Lock-waiting, then reclaim the
+        // generation and commit — admission must refuse with NO durable mutation.
+        let tag = format!("myelin-adapter-admit-{}", std::process::id());
+        let admit_pool = tagged_pool(&app_url(), &schema, &tag).await;
+        let (minter, _calls) = real_minter();
+        let comp = adapter_composition(&admit_pool, minter);
+        let fixture = seed_fixture(&app, &admin, 11, 5).await;
+        let spec = resolved_checkout_spec(&comp, &fixture);
+
+        let holder = pinned_pool(&admin_url(), &schema).await;
+        let mut held = holder.begin().await.unwrap();
+        sqlx::query(
+            "SELECT 1 FROM job_queue WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid FOR UPDATE",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(&fixture.claim.job_id)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+
+        let comp_t = comp.clone();
+        let spec_t = spec.clone();
+        let admission = std::thread::spawn(move || comp_t.parent_attempt_reserve_hook()(&spec_t));
+
+        let observer = pinned_pool(&admin_url(), &schema).await;
+        await_lock_waiter(&observer, &tag).await;
+
+        // Reclaim: a reaper-style generation bump, then commit — releases the lock and supersedes
+        // the claim the admission is reconstructing.
+        sqlx::query(
+            "UPDATE job_queue SET lease_epoch = 2 WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(&fixture.claim.job_id)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+        held.commit().await.unwrap();
+
+        let result = admission.join().unwrap();
+        assert!(
+            result.is_err(),
+            "admission must refuse a claim whose generation changed under the lock"
+        );
+        assert_eq!(
+            reservation_state(&admin, &fixture.reserve_handle).await,
+            "reserved",
+            "a lost admission performs NO reservation transition"
+        );
+        assert_eq!(
+            parent_row_count(&admin, &fixture).await,
+            0,
+            "a lost admission inserts NO parent row"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adapter_exhaustion_retry_and_stale_authority_matrix() {
+    let (schema, bootstrap, admin, app) = migrated_schema("adapter_matrix").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        // (A) The should_requeue() boundary is EXACT at `count < max` (production max = 5). Both
+        // sides are pinned so a `count < max - 1` regression (which would wrongly refuse the legal
+        // 4/5 requeue) and a `count <= max` regression (which would wrongly permit 5/5) each turn RED.
+        //
+        // (A1) count == max - 1 (== 4): admitted, should_requeue() == TRUE. Three prior rows + the
+        // admitted current row = 4/5. A `count < max - 1` regression refuses here → caught.
+        {
+            let (minter, _calls) = real_minter();
+            let comp = adapter_composition(&app, minter);
+            let fixture = seed_fixture(&app, &admin, 20, 5).await;
+            insert_prior_parent(&admin, &fixture, 90, &uuid(0x61, 20)).await;
+            insert_prior_parent(&admin, &fixture, 91, &uuid(0x62, 20)).await;
+            insert_prior_parent(&admin, &fixture, 92, &uuid(0x63, 20)).await;
+            let spec = resolved_checkout_spec(&comp, &fixture);
+            let comp_t = comp.clone();
+            let spec_t = spec.clone();
+            let requeue = std::thread::spawn(move || {
+                match comp_t.parent_attempt_reserve_hook()(&spec_t).expect("admitted") {
+                    ParentAttemptAdmission::Admitted {
+                        attempt_authority, ..
+                    } => attempt_authority.should_requeue(),
+                    ParentAttemptAdmission::AttemptsExhausted { .. } => panic!("not exhausted yet"),
+                }
+            })
+            .join()
+            .unwrap();
+            assert_eq!(parent_row_count(&admin, &fixture).await, 4, "three priors + admitted current");
+            assert!(requeue, "count(4) < max(5) still permits another attempt");
+        }
+
+        // (A2) count == max (== 5): admitted (the fifth attempt IS the last legal admission), but
+        // should_requeue() == FALSE — the budget is now spent. Four prior rows + the admitted current
+        // = 5/5. A `count <= max` regression would wrongly requeue here → caught.
+        {
+            let (minter, _calls) = real_minter();
+            let comp = adapter_composition(&app, minter);
+            let fixture = seed_fixture(&app, &admin, 23, 5).await;
+            insert_prior_parent(&admin, &fixture, 90, &uuid(0x61, 23)).await;
+            insert_prior_parent(&admin, &fixture, 91, &uuid(0x62, 23)).await;
+            insert_prior_parent(&admin, &fixture, 92, &uuid(0x63, 23)).await;
+            insert_prior_parent(&admin, &fixture, 93, &uuid(0x64, 23)).await;
+            let spec = resolved_checkout_spec(&comp, &fixture);
+            let comp_t = comp.clone();
+            let spec_t = spec.clone();
+            let requeue = std::thread::spawn(move || {
+                match comp_t.parent_attempt_reserve_hook()(&spec_t).expect("admitted") {
+                    ParentAttemptAdmission::Admitted {
+                        attempt_authority, ..
+                    } => attempt_authority.should_requeue(),
+                    ParentAttemptAdmission::AttemptsExhausted { .. } => {
+                        panic!("the fifth attempt is still admitted; exhaustion is the SIXTH")
+                    }
+                }
+            })
+            .join()
+            .unwrap();
+            assert_eq!(parent_row_count(&admin, &fixture).await, 5, "four priors + admitted current");
+            assert!(!requeue, "count(5) == max(5) permits NO further attempt");
+        }
+
+        // (B) exhaustion: the typed exhausted admission, reservation inflight, no new parent row.
+        // Production `max_parent_attempts` is 5, so five prior rows exhaust the exact-policy budget.
+        {
+            let (minter, _calls) = real_minter();
+            let comp = adapter_composition(&app, minter);
+            let fixture = seed_fixture(&app, &admin, 21, 5).await;
+            insert_prior_parent(&admin, &fixture, 90, &uuid(0x61, 21)).await;
+            insert_prior_parent(&admin, &fixture, 91, &uuid(0x62, 21)).await;
+            insert_prior_parent(&admin, &fixture, 92, &uuid(0x63, 21)).await;
+            insert_prior_parent(&admin, &fixture, 93, &uuid(0x64, 21)).await;
+            insert_prior_parent(&admin, &fixture, 94, &uuid(0x65, 21)).await;
+            let spec = resolved_checkout_spec(&comp, &fixture);
+            let comp_t = comp.clone();
+            let spec_t = spec.clone();
+            let reserve = std::thread::spawn(move || {
+                match comp_t.parent_attempt_reserve_hook()(&spec_t).expect("typed admission") {
+                    ParentAttemptAdmission::AttemptsExhausted { reserve } => reserve.0,
+                    ParentAttemptAdmission::Admitted { .. } => panic!("must be exhausted at max"),
+                }
+            })
+            .join()
+            .unwrap();
+            assert_eq!(reserve, fixture.reserve_handle, "the exhausted admission surfaces the settleable reserve");
+            assert_eq!(
+                reservation_state(&admin, &fixture.reserve_handle).await,
+                "inflight",
+                "exhaustion still commits reserved -> inflight so the terminal report can settle"
+            );
+            assert_eq!(
+                parent_row_count(&admin, &fixture).await,
+                5,
+                "no parent row was created for the exhausted generation"
+            );
+        }
+
+        // (C) a stale authority (its generation reclaimed) refuses renew/begin/mint, touches no
+        // durable row, and never reaches Identity.
+        {
+            let (minter, calls) = real_minter();
+            let comp = adapter_composition(&app, minter);
+            let fixture = seed_fixture(&app, &admin, 22, 5).await;
+            let spec = resolved_checkout_spec(&comp, &fixture);
+            let after_resolve = calls.load(Ordering::SeqCst);
+
+            let comp_t = comp.clone();
+            let spec_t = spec.clone();
+            let authority = std::thread::spawn(move || {
+                match comp_t.parent_attempt_reserve_hook()(&spec_t).expect("admitted") {
+                    ParentAttemptAdmission::Admitted {
+                        attempt_authority, ..
+                    } => attempt_authority,
+                    ParentAttemptAdmission::AttemptsExhausted { .. } => panic!("admitted"),
+                }
+            })
+            .join()
+            .unwrap();
+
+            // Reclaim: bump the generation so the authority's bound claim is now stale.
+            sqlx::query(
+                "UPDATE job_queue SET lease_epoch = 2 WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(&fixture.claim.job_id)
+            .execute(&admin)
+            .await
+            .unwrap();
+            let gens_before = generation_rows(&admin, &fixture).await.len();
+
+            let (renew_err, begin_err, mint_err) = std::thread::spawn(move || {
+                let renew = authority.renew_preparation_lease().is_err();
+                let begin = authority
+                    .begin_phase(PreparationPhase::CheckoutTransport)
+                    .is_err();
+                let mint = authority.mint_phase_credential(CheckoutPhase::Fetch).is_err();
+                (renew, begin, mint)
+            })
+            .join()
+            .unwrap();
+            assert!(renew_err, "a stale lease renewal refuses");
+            assert!(begin_err, "a stale begin_phase refuses");
+            assert!(mint_err, "a stale credential mint refuses");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                after_resolve,
+                "a refused mint never reaches Identity"
+            );
+            assert_eq!(
+                generation_rows(&admin, &fixture).await.len(),
+                gens_before,
+                "a refused stale mint creates no generation row"
+            );
+            assert_eq!(
+                phase_status(&admin, &fixture, "checkout_transport").await,
+                None,
+                "a refused stale begin_phase creates no journal row"
+            );
+        }
+    })
+    .await;
+}

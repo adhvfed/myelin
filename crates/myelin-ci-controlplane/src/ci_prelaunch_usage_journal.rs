@@ -563,6 +563,99 @@ impl CiPrelaunchUsageJournal {
         .await
     }
 
+    /// **CT-007 slice 5b.3-6d STEP 3: the live `count < max` requeue policy.** Read-only: whether the
+    /// exact-policy parent-attempt budget for this reserve still permits ANOTHER attempt. The dormant
+    /// [`AttemptAuthority::should_requeue`](myelin_ci_sandbox::checkout_orchestration::AttemptAuthority)
+    /// routes on exactly this — a permitted budget requeues the leased generation, an exhausted one
+    /// terminalizes `AttemptsExhausted`. It mirrors the counting the exhaustion CAS
+    /// ([`verify_preparation_disposition_on_conn`](crate::ci_pipeline_driver)) re-verifies under lock:
+    /// exactly ONE immutable governing policy must exist for the reserve, and `count < max` under it.
+    /// A divergent or absent policy fails CLOSED (not permitted) — the same fail-closed posture the
+    /// exhaustion CAS takes for `policies.len() != 1` — so a routing decision is never made on an
+    /// ambiguous budget. It takes ONLY the per-job advisory lock (it never acquires the queue row, so
+    /// this is not the queue → advisory order the phase writers hold); that is sufficient because this
+    /// is a non-mutating routing hint, and the durable requeue/exhaustion CAS the reporter runs later
+    /// re-verifies the count under its own transaction (with the full queue → advisory ordering)
+    /// before any state change.
+    pub async fn parent_attempt_retry_permitted(
+        &self,
+        claim: &CiJobTokenRequest,
+        reserve_handle: &str,
+    ) -> Result<bool, CiPrelaunchUsageJournalError> {
+        claim
+            .validate()
+            .map_err(|_| CiPrelaunchUsageJournalError::InvalidClaim)?;
+        if claim.region != self.region {
+            return Err(CiPrelaunchUsageJournalError::WrongRegion);
+        }
+        let claim = claim.clone();
+        let reserve_handle = reserve_handle.to_owned();
+        let region = self.region.clone();
+        with_tenant_tx_error(
+            &self.pool,
+            &claim.tenant_id.clone(),
+            &region,
+            move |connection| {
+                Box::pin(async move {
+                    lock_parent_attempt_job_on_conn(
+                        connection,
+                        &claim.tenant_id,
+                        &claim.region,
+                        &claim.job_id,
+                    )
+                    .await?;
+                    let policies = sqlx::query(
+                        "SELECT budget_revision, max_parent_attempts
+                         FROM ci_job_parent_attempt
+                         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+                           AND wf_run_id = $4::uuid AND ci_run_id = $5::uuid AND reserve_handle = $6
+                         GROUP BY budget_revision, max_parent_attempts",
+                    )
+                    .bind(&claim.tenant_id)
+                    .bind(&claim.region)
+                    .bind(&claim.job_id)
+                    .bind(&claim.wf_run_id)
+                    .bind(&claim.ci_run_id)
+                    .bind(&reserve_handle)
+                    .fetch_all(&mut *connection)
+                    .await
+                    .map_err(map_sql_error)?;
+                    // Exactly one immutable policy must govern this reserve; divergence (or no rows
+                    // at all) fails closed to "not permitted", never a routing decision on ambiguity.
+                    if policies.len() != 1 {
+                        return Ok(false);
+                    }
+                    let revision: i16 = policies[0]
+                        .try_get("budget_revision")
+                        .map_err(|_| CiPrelaunchUsageJournalError::Database)?;
+                    let maximum: i64 = policies[0]
+                        .try_get("max_parent_attempts")
+                        .map_err(|_| CiPrelaunchUsageJournalError::Database)?;
+                    let count: i64 = sqlx::query_scalar(
+                        "SELECT count(*)
+                         FROM ci_job_parent_attempt
+                         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+                           AND wf_run_id = $4::uuid AND ci_run_id = $5::uuid AND reserve_handle = $6
+                           AND budget_revision = $7 AND max_parent_attempts = $8",
+                    )
+                    .bind(&claim.tenant_id)
+                    .bind(&claim.region)
+                    .bind(&claim.job_id)
+                    .bind(&claim.wf_run_id)
+                    .bind(&claim.ci_run_id)
+                    .bind(&reserve_handle)
+                    .bind(revision)
+                    .bind(maximum)
+                    .fetch_one(&mut *connection)
+                    .await
+                    .map_err(map_sql_error)?;
+                    Ok(count < maximum)
+                })
+            },
+        )
+        .await
+    }
+
     fn require_attempt_scope(
         &self,
         attempt: &CiJobParentAttempt,
