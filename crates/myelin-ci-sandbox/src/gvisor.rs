@@ -1968,6 +1968,40 @@ impl GvisorBackend {
         Ok(OciConfig::from_spec(spec, &profile))
     }
 
+    /// CT-007 slice 5b.3-6b: the launch entry point `launch`/`launch_streaming` call. Today it is a
+    /// PLAIN DELEGATING WRAPPER around [`Self::launch_compute_with`] — EVERY spec, compute or
+    /// checkout-bearing, runs the ordinary compute path byte-for-byte (a checkout-bearing job's
+    /// `spec.workspace` is still silently ignored here, exactly as before this slice). That is the
+    /// current dormant reality, verified structurally: checkout-bearing specs ALREADY reach this method
+    /// in production — the manifest dispatch (`ci_manifest_job_runner::manifest_dispatch_parts`) builds
+    /// `(Some, Some)` workspaces and the durable spec resolver (`runner_bind`) admits them once their
+    /// checkout claim window is set — and they run as compute. `launch_with` deliberately does NOT
+    /// shape-divert on `spec.workspace`: per Sol's design, SELECTING the checkout-aware path is
+    /// 5b.3-6e's single activating cutover (which flips reservation/credential/accounting write
+    /// versions atomically and only THEN routes valid checkout jobs through
+    /// [`checkout_runtime::AcquiredCheckoutRuntime`] + [`Self::launch_checkout_continuation`]).
+    /// Introducing a shape branch here in 6b would change production behavior for every manifest CI job
+    /// (turning a run-as-compute into a refusal/panic), which this behavior-preserving slice forbids.
+    fn launch_with<F>(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        run: F,
+    ) -> Result<SandboxLaunch, SandboxLaunchError<GvisorError>>
+    where
+        F: FnOnce(
+            &JobSpec,
+            &OciConfig,
+            LaunchPermit,
+            &Path,
+            &str,
+            RuntimePreparation<'_>,
+        )
+            -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure>,
+    {
+        self.launch_compute_with(spec, hooks, run)
+    }
+
     /// Drive the four-guarantee seam in the mandated order — **isolation floor → hardening assert →
     /// image resolution (now a cheap, already-verified lookup) → reserve → final attribution/claim
     /// CAS → run → settle** — fail-closed at every step, then hand the captured [`SandboxResult`]
@@ -1989,7 +2023,13 @@ impl GvisorBackend {
     /// invoked AFTER reserve succeeds, so an exhausted wallet / unmet isolation floor refuses-to-start
     /// and `runsc` never spawns (CT-002b: the result is CONSUMED from the run, never hardcoded —
     /// reconciles with the Firecracker `launch_with`).
-    fn launch_with<F>(
+    ///
+    /// CT-007 slice 5b.3-6b: extracted BYTE-FOR-BYTE out of the old `launch_with` (same
+    /// signature/generics/hook-order/workspace-acquisition/run-closure/cleanup). It is the ordinary
+    /// COMPUTE path — every production launch, compute or checkout-bearing, currently reaches it via
+    /// the [`Self::launch_with`] wrapper. `spec.workspace` is intentionally never read here; making it
+    /// checkout-aware is 5b.3-6e's job, not this slice's.
+    fn launch_compute_with<F>(
         &self,
         spec: &JobSpec,
         hooks: &RunnerHooks,
@@ -2406,6 +2446,65 @@ impl GvisorBackend {
                 }
             },
         }
+    }
+}
+
+/// CT-007 slice 5b.3-6b: the dormant checkout-continuation seam lives in its OWN `impl` block, kept
+/// OUT of the compute `impl` above. The closed-world dormancy pins scope `launch_with`/
+/// `launch_compute_with` by source SPAN (signature → the impl's column-0 close), so a capsule-naming
+/// method sharing that impl would be swept into the "compute path names no capsule" assertion and
+/// break it. A separate impl keeps the compute span capsule-free while still proving this seam
+/// dormant with its own pins.
+impl GvisorBackend {
+    /// CT-007 slice 5b.3-6b: the DORMANT checkout-continuation seam — 5b.3-6c implements its body (the
+    /// dormant sandbox orchestrator) and 5b.3-6e selects/activates it — NOT wired into
+    /// [`Self::launch_with`]'s dispatch, ZERO callers, so it introduces no reachable behavior (a
+    /// checkout-bearing job still runs the ordinary compute path via `launch_with` today). It accepts
+    /// the 5b.3-6a provenance capsule ([`checkout_runtime::AcquiredCheckoutRuntime`]) BY VALUE — the
+    /// single `ManagedWorkspace`+`UserNamespaceLease`+`CheckoutPreparationSession` the whole
+    /// preparation→workload sequence shares — so 6e can drive Hop B through the capsule
+    /// (`Acquired → Prepared`), bind the workload lease (`Prepared → Bound`), and spawn the workload
+    /// under `run` against the capsule's OWN retained workspace/`OciConfig`, rather than acquiring a
+    /// fresh one (the very workspace/lease collision `launch_compute_with`'s own acquisition would
+    /// otherwise create for a checkout job).
+    ///
+    /// It is deliberately a PURE STUB in 6b. Fleshing it out requires reaching the capsule's retained
+    /// `enabled_context`/`workload_cfg`/`session` to run the workload core against a PRE-BUILT context
+    /// — i.e. a workload-core extraction (splitting `launch_compute_with`'s run/settle/finalize tail
+    /// from its own workspace-acquisition head) plus, potentially, a new capsule accessor. Both are
+    /// 5b.3-6c/6e changes that would touch the 6a capsule's closed-world inseparability surface; doing
+    /// them here would exceed this behavior-preserving slice. So 6b pins ONLY the seam's SIGNATURE and
+    /// leaves the body to 6c (the orchestrator), with 6e selecting it — nothing here NAMES a capsule
+    /// field, so 6a's module-private inseparability guarantee (and its module-shape audit) is untouched.
+    #[allow(dead_code)]
+    fn launch_checkout_continuation<F>(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        runtime: checkout_runtime::AcquiredCheckoutRuntime,
+        run: F,
+    ) -> Result<SandboxLaunch, SandboxLaunchError<GvisorError>>
+    where
+        F: FnOnce(
+            &JobSpec,
+            &OciConfig,
+            LaunchPermit,
+            &Path,
+            &str,
+            RuntimePreparation<'_>,
+        )
+            -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure>,
+    {
+        // Never reached in 6b: `launch_with` does not shape-divert, so no caller ever constructs a
+        // capsule and enters here. 5b.3-6c implements this body (the dormant orchestrator: real Hop B +
+        // workload sequence against the capsule); 5b.3-6e selects it in production.
+        let _ = (spec, hooks, run);
+        let _dormant_capsule = runtime;
+        unimplemented!(
+            "CT-007 slice 5b.3-6b: dormant checkout-continuation seam — 5b.3-6e wires Hop B through \
+             the capsule and the workload bind/spawn; unreachable in 6b (launch_with never selects \
+             the checkout path)"
+        )
     }
 }
 
@@ -9171,12 +9270,40 @@ mod tests {
             2,
             "the only dispose_checkout_runtime calls are acquire's safe cleanup and the delegation"
         );
-        // 5b.3-6a does NOT touch launch_with: its control flow never names either capsule type.
+        // 5b.3-6a/6b: launch_with's OWN control flow never names either capsule type. In 6b
+        // launch_with became a plain delegating wrapper and the compute body moved to
+        // launch_compute_with; the span source_of captures for `fn launch_with<F>(` runs to this
+        // impl's close (launch_with + launch_compute_with + dispose_run_failure) — the checkout seam
+        // lives in a SEPARATE impl, so it is deliberately outside this span.
         let launch_with = source_of("fn launch_with<F>(");
         assert!(
             !launch_with.contains("AcquiredCheckoutRuntime")
                 && !launch_with.contains("PreparedCheckoutRuntime"),
-            "launch_with's control flow is untouched by 5b.3-6a"
+            "the compute launch path (launch_with wrapper + launch_compute_with) names no capsule type"
+        );
+        assert!(
+            launch_with.contains("self.launch_compute_with(spec, hooks, run)"),
+            "launch_with is a plain delegating wrapper — it performs NO shape dispatch on spec.workspace"
+        );
+        // 5b.3-6b: the dormant checkout-continuation seam is DEFINED exactly once, consumes the 6a
+        // capsule BY VALUE, and has ZERO callers — it is an unreachable `unimplemented!` stub 5b.3-6e
+        // fleshes out. Naming the capsule type in a signature is NOT calling it: no construction, no
+        // fused Hop B, no disposal is reachable through it in 6b.
+        assert_eq!(
+            prod.matches("fn launch_checkout_continuation<F>(").count(),
+            1,
+            "the dormant checkout-continuation seam is defined exactly once in production"
+        );
+        assert_eq!(
+            prod.matches(".launch_checkout_continuation(").count(),
+            0,
+            "nothing calls the dormant checkout-continuation seam in 6b"
+        );
+        let seam = source_of("fn launch_checkout_continuation<F>(");
+        assert!(
+            seam.contains("runtime: checkout_runtime::AcquiredCheckoutRuntime")
+                && seam.contains("unimplemented!("),
+            "the seam consumes the capsule by value and is an unreachable stub 5b.3-6e replaces"
         );
         // Blocker 2/5: `acquire` retains the workload OciConfig INSIDE the capsule — its signature
         // returns the bare capsule, never `(OciConfig, ..)` detached.
@@ -13006,6 +13133,201 @@ mod tests {
             r,
             Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))
         ));
+    }
+
+    // ───────── CT-007 slice 5b.3-6b: golden compute event-trace regression fence ─────────
+    //
+    // These three tests pin the OBSERVABLE ordered sequence of the ordinary compute path as it flows
+    // through the `launch_with` wrapper into the extracted `launch_compute_with` body. 5b.3-6b moved
+    // that body byte-for-byte and made `launch_with` a plain delegator; the point of these tests is a
+    // regression fence — any future edit that reorders, drops, or duplicates an OBSERVABLE hook/run
+    // step (isolation floor → reserve → launch permit → run spawn → settle) changes the recorded trace
+    // and fails here. The fence covers the observable hook/run ordering and the two early-refusal
+    // boundaries; it does NOT independently detect a reorder among non-observed internal steps (e.g.
+    // moving container-id minting relative to reserve, or a duplicated registry lookup) — those are
+    // covered by the mechanical byte-identity of the extraction plus the existing compute unit tests.
+    // The Disabled (no-privilege) backend is used deliberately: the
+    // Enabled-only steps (workspace-manager health check, `acquire_enabled_workspace`, Enabled
+    // `RuntimePreparation`) are already fenced by the 6a acquire/settle + dispose matrices, and the
+    // compute ORDERING these tests fence is identical regardless of workspace integration.
+
+    /// Golden success trace: the exact ordered hook/run sequence for a compute launch, plus the stable
+    /// `myelin-prod-*` workload id the run closure sees, the single live-map insert, and the
+    /// byte-identical measured usage handed to `settle_completed`.
+    #[test]
+    fn golden_compute_trace_through_launch_with_is_byte_stable() {
+        let backend = GvisorBackend::new(test_registry());
+        let trace = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed_container_id = Arc::new(Mutex::new(None::<String>));
+
+        let t_iso = trace.clone();
+        let t_res = trace.clone();
+        let t_settle = trace.clone();
+        let t_attr = trace.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(move |spec| {
+                t_res.lock().unwrap().push("reserve".into());
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(move |_spec, _h, usage| {
+                t_settle
+                    .lock()
+                    .unwrap()
+                    .push(format!("settle:{}:{}", usage.cpu_seconds, usage.mem_byte_seconds));
+                Ok(())
+            }),
+            Box::new(move |_spec| {
+                t_attr.lock().unwrap().push("acquire_launch_permit".into());
+                Ok(())
+            }),
+            Box::new(move |_spec| {
+                t_iso.lock().unwrap().push("isolation_floor".into());
+                Ok(())
+            }),
+        );
+
+        let t_run = trace.clone();
+        let seen_id = observed_container_id.clone();
+        let launch = backend
+            .launch_with(
+                &spec(vec![]),
+                &hooks,
+                move |_spec, _cfg, _permit, _rootfs, container_id, _prep| {
+                    t_run.lock().unwrap().push("run_spawn".into());
+                    *seen_id.lock().unwrap() = Some(container_id.to_string());
+                    Ok(fake_finalization())
+                },
+            )
+            .expect("the ordinary compute path launches");
+
+        assert_eq!(
+            *trace.lock().unwrap(),
+            vec![
+                "isolation_floor".to_string(),
+                "reserve".to_string(),
+                "acquire_launch_permit".to_string(),
+                "run_spawn".to_string(),
+                // `fake_run` measures {cpu:1, mem:1}; `settle_completed` receives it VERBATIM.
+                "settle:1:1".to_string(),
+            ],
+            "the ordered compute sequence through launch_with -> launch_compute_with is the fence"
+        );
+
+        // The container id the run closure receives is the freshly minted stable workload id.
+        let observed = observed_container_id
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the run closure observed a container id");
+        assert!(
+            observed.starts_with(&format!("myelin-prod-{}-", std::process::id())),
+            "the run closure sees the stable myelin-prod-* workload id, got {observed:?}"
+        );
+        // The successful run is inserted into the live map exactly once (keyed by runsc-<idem>).
+        assert_eq!(
+            backend.live.lock().unwrap().len(),
+            1,
+            "a successful compute launch inserts exactly one live entry"
+        );
+        assert!(launch.output_complete);
+    }
+
+    /// Golden failure variant 1 — a `git_wire_only()` backend (no registry) refuses an image-bearing
+    /// job at registry resolve, AFTER the isolation floor but BEFORE `reserve`; the run closure never
+    /// spawns. This fences the registry-None ordering (resolve precedes reserve).
+    #[test]
+    fn golden_git_wire_only_refuses_at_registry_before_reserve() {
+        let backend = GvisorBackend::git_wire_only();
+        let trace = Arc::new(Mutex::new(Vec::<String>::new()));
+        let t_iso = trace.clone();
+        let t_res = trace.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(move |spec| {
+                t_res.lock().unwrap().push("reserve".into());
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_spec| Ok(())),
+            Box::new(move |_spec| {
+                t_iso.lock().unwrap().push("isolation_floor".into());
+                Ok(())
+            }),
+        );
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_at = ran.clone();
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                ran_at.store(true, Ordering::SeqCst);
+                Ok(fake_finalization())
+            },
+        );
+        assert!(
+            matches!(result, Err(SandboxLaunchError::Failed(GvisorError::Image(_)))),
+            "a git_wire_only backend refuses an image-bearing job at registry resolve, got {result:?}"
+        );
+        assert_eq!(
+            *trace.lock().unwrap(),
+            vec!["isolation_floor".to_string()],
+            "isolation floor runs, then registry resolve refuses BEFORE reserve is ever called"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the run closure never spawns on a pre-reserve refusal"
+        );
+    }
+
+    /// Golden failure variant 2 — a `reserve` refusal stops the sequence after the isolation floor and
+    /// reserve, before the launch permit and the run spawn. Fences that reserve gates the launch.
+    #[test]
+    fn golden_reserve_failure_stops_before_launch_permit_and_run() {
+        let backend = GvisorBackend::new(test_registry());
+        let trace = Arc::new(Mutex::new(Vec::<String>::new()));
+        let t_iso = trace.clone();
+        let t_res = trace.clone();
+        let t_attr = trace.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(move |_spec| {
+                t_res.lock().unwrap().push("reserve".into());
+                Err(crate::HookError("reserve exhausted".into()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(move |_spec| {
+                t_attr.lock().unwrap().push("acquire_launch_permit".into());
+                Ok(())
+            }),
+            Box::new(move |_spec| {
+                t_iso.lock().unwrap().push("isolation_floor".into());
+                Ok(())
+            }),
+        );
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_at = ran.clone();
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                ran_at.store(true, Ordering::SeqCst);
+                Ok(fake_finalization())
+            },
+        );
+        assert!(
+            matches!(result, Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))),
+            "a reserve refusal surfaces as a Hook failure, got {result:?}"
+        );
+        assert_eq!(
+            *trace.lock().unwrap(),
+            vec!["isolation_floor".to_string(), "reserve".to_string()],
+            "isolation floor then reserve; the reserve failure stops before the launch permit and run"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the run closure never spawns when reserve refuses"
+        );
     }
 
     #[test]
