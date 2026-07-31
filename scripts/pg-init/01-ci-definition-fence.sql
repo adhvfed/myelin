@@ -57,11 +57,13 @@
 -- SCOPE OF THE AUTHORITY THIS CREATES
 --
 -- The fence role is NOLOGIN (never connectable), NOINHERIT, owns exactly one schema
--- (`myelin_ci_security`) and — after `ci_0020h` — exactly one boolean-returning function. It is
--- deliberately given NO privilege on `public` and NO table grants here: `ci_0020h` grants it SELECT
--- on exactly three non-payload columns of `workflow_run`, once that table exists. `BYPASSRLS` does
--- not itself grant access to any table, so the role's reach is the intersection of "can see past
--- RLS" and "has SELECT on three columns" — which is exactly the question it must answer.
+-- (`myelin_ci_security`) and — after `ci_0020h`/`ci_0022c` — exactly two aggregate/boolean-returning
+-- functions (the superseded-run backlog probe and the CT-007 5b.3-6e.1 activation-readiness probe). It
+-- is deliberately given NO privilege on `public` and NO table grants here: `ci_0020h` grants it SELECT
+-- on exactly three non-payload columns of `workflow_run`, and `ci_0022c` on exactly four non-payload
+-- columns of `job_queue`, once those tables exist. `BYPASSRLS` does not itself grant access to any
+-- table, so the role's reach is the intersection of "can see past RLS" and "has SELECT on those
+-- columns" — which is exactly the two questions it must answer.
 
 \set ON_ERROR_STOP on
 
@@ -106,6 +108,10 @@ DECLARE
   intended_probe constant text :=
     'myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs(integer)';
   intended_probe_oid oid;
+  -- CT-007 5b.3-6e.1: the SECOND fence-owned function — the activation-readiness probe (`ci_0022c`).
+  intended_readiness_probe constant text :=
+    'myelin_ci_security.myelin_ci_v2_activation_readiness_unsafe_count()';
+  intended_readiness_probe_oid oid;
   security_schema_owner text;
   offending text;
 BEGIN
@@ -133,6 +139,7 @@ BEGIN
     RETURN;  -- fresh database: no role means no ownership, no grants and no membership edges
   END IF;
   intended_probe_oid := pg_catalog.to_regprocedure(intended_probe);
+  intended_readiness_probe_oid := pg_catalog.to_regprocedure(intended_readiness_probe);
 
   -- (1b) OWNERSHIP. Identity is the exact `regprocedure` (name AND argument types), never `proname`:
   -- a colliding `...has_nonterminal_runs(text)` overload would otherwise be accepted here, never
@@ -152,7 +159,8 @@ BEGIN
       SELECT 'routine ' || p.oid::regprocedure::text
         FROM pg_proc p
        WHERE p.proowner = fence
-         AND (intended_probe_oid IS NULL OR p.oid <> intended_probe_oid)
+         AND p.oid IS DISTINCT FROM intended_probe_oid
+         AND p.oid IS DISTINCT FROM intended_readiness_probe_oid
       UNION ALL
       SELECT 'type ' || n.nspname || '.' || t.typname
         FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
@@ -172,8 +180,9 @@ BEGIN
   -- (1c) PRIVILEGES GRANTED **TO** the fence role. Read with `aclexplode` filtered to this grantee:
   -- `has_*_privilege` would also report privileges held via PUBLIC (every function is
   -- PUBLIC-executable by default), which would make this refuse on any ordinary database.
-  -- `public.workflow_run` is excluded because `ci_0020h` owns that grant; `myelin_ci_security` and
-  -- the intended probe are excluded because they are this provisioning surface.
+  -- `public.workflow_run` (`ci_0020h`) and `public.job_queue` (`ci_0022c`) are excluded because those
+  -- migrations own those grants; `myelin_ci_security` and the two intended probes are excluded because
+  -- they are this provisioning surface.
   SELECT string_agg(identity, ', ' ORDER BY identity)
     INTO offending
     FROM (
@@ -182,7 +191,7 @@ BEGIN
         JOIN pg_namespace n ON n.oid = c.relnamespace
         CROSS JOIN LATERAL aclexplode(c.relacl) AS acl
        WHERE c.relacl IS NOT NULL AND acl.grantee = fence
-         AND NOT (n.nspname = 'public' AND c.relname = 'workflow_run')
+         AND NOT (n.nspname = 'public' AND c.relname IN ('workflow_run', 'job_queue'))
       UNION ALL
       SELECT 'column ' || n.nspname || '.' || c.relname || '.' || a.attname
         FROM pg_attribute a
@@ -190,7 +199,7 @@ BEGIN
         JOIN pg_namespace n ON n.oid = c.relnamespace
         CROSS JOIN LATERAL aclexplode(a.attacl) AS acl
        WHERE a.attacl IS NOT NULL AND acl.grantee = fence
-         AND NOT (n.nspname = 'public' AND c.relname = 'workflow_run')
+         AND NOT (n.nspname = 'public' AND c.relname IN ('workflow_run', 'job_queue'))
       UNION ALL
       SELECT 'schema ' || n.nspname
         FROM pg_namespace n
@@ -202,7 +211,8 @@ BEGIN
         FROM pg_proc p
         CROSS JOIN LATERAL aclexplode(p.proacl) AS acl
        WHERE p.proacl IS NOT NULL AND acl.grantee = fence
-         AND (intended_probe_oid IS NULL OR p.oid <> intended_probe_oid)
+         AND p.oid IS DISTINCT FROM intended_probe_oid
+         AND p.oid IS DISTINCT FROM intended_readiness_probe_oid
     ) AS held;
   IF offending IS NOT NULL THEN
     RAISE EXCEPTION

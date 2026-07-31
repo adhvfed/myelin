@@ -56,7 +56,8 @@ use crate::{
     IdemToken, ImageRef, JobKind, JobSpec, LaunchPermit, MeterTarget, PhaseAuthorization,
     ReserveHandle,
     ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend,
-    SandboxCancellation, SandboxHandle, SandboxLaunch, SandboxLaunchError, SandboxOutputSink,
+    SandboxCancellation, SandboxCycleOutcome, SandboxHandle, SandboxLaunch, SandboxLaunchError,
+    SandboxOutputSink,
     SandboxOutputStream, SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
 use sha2::{Digest, Sha256};
@@ -925,7 +926,9 @@ impl CgroupQuiescenceEvidence {
         self.cgroup_identity
     }
 
-    #[cfg(test)]
+    // CT-007 slice 5b.3-6e.1: also available to the `test-support` runsc-driver seam so a
+    // hardware-independent cycle can fabricate finalization evidence without a real teardown.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn assert_for_tests(cgroup_identity: (u64, u64)) -> Self {
         CgroupQuiescenceEvidence { cgroup_identity }
     }
@@ -1315,6 +1318,11 @@ pub struct GvisorBackend {
     /// piece). `new`/`git_wire_only` always construct `Disabled`; only the not-yet-public
     /// [`GvisorBackend::try_new`] can construct `Enabled`.
     workspace_integration: WorkspaceIntegration,
+    /// CT-007 slice 5b.3-6e.1 (DORMANT): the boot-validated checkout repository root selection. EVERY
+    /// existing constructor initializes this [`GvisorCheckoutConfig::disabled`]; only the dormant
+    /// [`GvisorBackend::with_checkout_config`] can set an enabled config, and no production root does so
+    /// until the activating slice (6e.2). Nothing reads it yet.
+    checkout: GvisorCheckoutConfig,
 }
 
 /// Backend-level workspace/user-namespace integration — a SINGLE enum, never two independent
@@ -1907,6 +1915,144 @@ pub enum GvisorWorkspaceConfig {
     },
 }
 
+/// **The checkout repository-root selection for [`GvisorBackend`] (CT-007 slice 5b.3-6e.1 —
+/// DORMANT).**
+///
+/// Hop A of a checkout preparation fetches from a BARE repository on the host. Production needs an
+/// EXPLICIT, boot-validated absolute path for that root — never a relative, defaulted, or
+/// symlink-redirectable one an attacker-influenced working directory could point elsewhere.
+///
+/// **The invalid state is UNCONSTRUCTABLE (Sol's 6e.1 blocker 1).** The payload is OPAQUE: an enabled
+/// selection wraps a PRIVATE [`CheckoutConfigState`], so external code cannot fabricate an
+/// `Enabled { repo_root }` with an unvalidated path. The ONLY way to obtain an enabled config is
+/// [`GvisorCheckoutConfig::enabled`], which validates at boot (absolute, existing, directory,
+/// canonical). [`GvisorBackend::with_checkout_config`] therefore takes an ALREADY-validated value and
+/// never sees an unchecked path. Every existing [`GvisorBackend`] constructor uses
+/// [`GvisorCheckoutConfig::disabled`]; the activating slice (5b.3-6e.2) is the one that selects an
+/// enabled config and routes a checkout-bearing spec through
+/// [`GvisorBackend::launch_checkout_orchestrated_with`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GvisorCheckoutConfig(CheckoutConfigState);
+
+/// The PRIVATE state a [`GvisorCheckoutConfig`] wraps. Private so `Enabled` is unconstructable outside
+/// this module — the boot-validating [`GvisorCheckoutConfig::enabled`] is the sole path to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CheckoutConfigState {
+    /// No checkout root selected — the backend does not enter the checkout path.
+    Disabled,
+    /// A boot-validated bare-repository root for Hop A. Reachable ONLY through the validating
+    /// constructor, so `repo_root` is always absolute, existing, a directory, and canonical.
+    Enabled {
+        /// The absolute, existing, canonical bare-repository root.
+        repo_root: PathBuf,
+    },
+}
+
+/// Why [`GvisorCheckoutConfig::enabled`] refused a proposed checkout repository root at boot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GvisorCheckoutConfigError {
+    /// The configured path was relative. A checkout root must be absolute so no working-directory
+    /// context can reinterpret it.
+    NotAbsolute(PathBuf),
+    /// The configured path does not resolve to an existing directory (missing, or a non-directory).
+    NotADirectory {
+        /// The configured path.
+        path: PathBuf,
+        /// The underlying reason.
+        detail: String,
+    },
+    /// The configured path is not already canonical — it differs from its own canonicalization (a
+    /// symlinked or `..`-bearing root). Refused so the durable root is byte-for-byte the audited path.
+    NotCanonical {
+        /// The configured path.
+        configured: PathBuf,
+        /// What it canonicalizes to.
+        canonical: PathBuf,
+    },
+}
+
+impl std::fmt::Display for GvisorCheckoutConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GvisorCheckoutConfigError::NotAbsolute(path) => write!(
+                f,
+                "checkout repository root {path:?} is not absolute — a checkout root must be an \
+                 absolute path so no working-directory context can redirect it"
+            ),
+            GvisorCheckoutConfigError::NotADirectory { path, detail } => write!(
+                f,
+                "checkout repository root {path:?} is not an existing directory: {detail}"
+            ),
+            GvisorCheckoutConfigError::NotCanonical {
+                configured,
+                canonical,
+            } => write!(
+                f,
+                "checkout repository root {configured:?} is not canonical (it resolves to \
+                 {canonical:?}) — refusing a symlinked or `..`-bearing root so the durable root is \
+                 exactly the audited path"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GvisorCheckoutConfigError {}
+
+impl GvisorCheckoutConfig {
+    /// The checkout-disabled selection — the state of every production backend until 6e.2.
+    pub fn disabled() -> Self {
+        GvisorCheckoutConfig(CheckoutConfigState::Disabled)
+    }
+
+    /// **Validate and select a checkout repository root AT BOOT.** The ONLY constructor of an enabled
+    /// config (the wrapped state is private), so an enabled `GvisorCheckoutConfig` can never carry an
+    /// unvalidated path. Refuses a relative, nonexistent, non-directory, or non-canonical path. There
+    /// is deliberately NO default fallback: an unconfigured or malformed root fails closed here rather
+    /// than defaulting to some ambient path.
+    pub fn enabled(repo_root: impl Into<PathBuf>) -> Result<Self, GvisorCheckoutConfigError> {
+        let repo_root = repo_root.into();
+        if !repo_root.is_absolute() {
+            return Err(GvisorCheckoutConfigError::NotAbsolute(repo_root));
+        }
+        let metadata = std::fs::metadata(&repo_root).map_err(|error| {
+            GvisorCheckoutConfigError::NotADirectory {
+                path: repo_root.clone(),
+                detail: error.to_string(),
+            }
+        })?;
+        if !metadata.is_dir() {
+            return Err(GvisorCheckoutConfigError::NotADirectory {
+                path: repo_root.clone(),
+                detail: "path exists but is not a directory".to_string(),
+            });
+        }
+        let canonical = std::fs::canonicalize(&repo_root).map_err(|error| {
+            GvisorCheckoutConfigError::NotADirectory {
+                path: repo_root.clone(),
+                detail: format!("canonicalization failed: {error}"),
+            }
+        })?;
+        if canonical != repo_root {
+            return Err(GvisorCheckoutConfigError::NotCanonical {
+                configured: repo_root,
+                canonical,
+            });
+        }
+        Ok(GvisorCheckoutConfig(CheckoutConfigState::Enabled { repo_root }))
+    }
+
+    /// The boot-validated checkout root, if this config is enabled. `pub(crate)` — the sandbox's own
+    /// (dormant) checkout selection reads it; external code never sees the raw path. Dormant in 6e.1:
+    /// 6e.2 is the first reader.
+    #[allow(dead_code)]
+    pub(crate) fn repo_root(&self) -> Option<&Path> {
+        match &self.0 {
+            CheckoutConfigState::Disabled => None,
+            CheckoutConfigState::Enabled { repo_root } => Some(repo_root),
+        }
+    }
+}
+
 /// Why [`GvisorBackend::try_new`] failed to construct an `Enabled` [`WorkspaceIntegration`].
 #[derive(Debug)]
 pub enum GvisorBackendInitError {
@@ -1971,6 +2117,7 @@ impl GvisorBackend {
             live: Mutex::new(std::collections::HashMap::new()),
             registry: Some(registry),
             workspace_integration: WorkspaceIntegration::Disabled,
+            checkout: GvisorCheckoutConfig::disabled(),
         }
     }
 
@@ -1987,6 +2134,7 @@ impl GvisorBackend {
             live: Mutex::new(std::collections::HashMap::new()),
             registry: None,
             workspace_integration: WorkspaceIntegration::Disabled,
+            checkout: GvisorCheckoutConfig::disabled(),
         }
     }
 
@@ -2076,7 +2224,20 @@ impl GvisorBackend {
             live: Mutex::new(std::collections::HashMap::new()),
             registry: Some(registry),
             workspace_integration,
+            checkout: GvisorCheckoutConfig::disabled(),
         })
+    }
+
+    /// **Select a validated checkout repository root (CT-007 slice 5b.3-6e.1 — DORMANT).** Returns the
+    /// backend with its [`checkout`](GvisorBackend::checkout) selection replaced. No production
+    /// composition root calls this — the occurrence pin holds it at zero — so every production backend
+    /// stays checkout-`Disabled`; the activating slice (6e.2) is the one reviewed edit that selects
+    /// [`GvisorCheckoutConfig::Enabled`] here and thereby routes a checkout-bearing spec through
+    /// [`Self::launch_checkout_orchestrated_with`].
+    #[allow(dead_code)]
+    pub fn with_checkout_config(mut self, checkout: GvisorCheckoutConfig) -> GvisorBackend {
+        self.checkout = checkout;
+        self
     }
 
     /// Build the OCI config a launch WOULD use for `spec` (the hardened profile derived + the OCI
@@ -2165,6 +2326,44 @@ impl GvisorBackend {
         )
             -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure>,
     {
+        // CT-007 slice 5b.3-6e.1: BYTE/BEHAVIOR-IDENTICAL to the pre-6e.1 compute path — the shared
+        // preflight, the LEGACY `reserve`, the same container id, then the shared post-reservation
+        // common body. The three operations happen in the exact prior order with the exact prior side
+        // effects; only the surrounding boilerplate moved into named helpers so the dormant
+        // `launch_compute_orchestrated_with` reuses this identical preflight and body.
+        let (profile, verified_rootfs) = self.compute_launch_preflight(spec, hooks)?;
+        let reserve = hooks
+            .reserve(spec)
+            .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
+        // CT-007 slice 3, piece 7a: generated HERE, not deep inside the run closure — the
+        // `Enabled`-workspace path needs this same value before it ever calls `run`, to durably
+        // bind a `UserNamespaceLease` to it ahead of exec (piece 7c), and (piece 7c) as the
+        // workspace's own `job_key` — already a safe, unique path component.
+        let container_id = format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
+        self.launch_compute_common_body(
+            spec,
+            hooks,
+            run,
+            profile,
+            verified_rootfs,
+            reserve,
+            container_id,
+        )
+    }
+
+    /// **Shared launch PREFLIGHT for both compute entries (CT-007 slice 5b.3-6e.1).** The isolation
+    /// floor, the derived+asserted hardening profile, the registry rootfs resolution, and (for
+    /// `Enabled`) both managers' independent health checks — everything BEFORE any reservation. Every
+    /// refusal here is an ordinary pre-commit `Failed`: nothing durable has been claimed yet. The
+    /// `VerifiedRootfs` is returned by borrow so the common body reuses the EXACT same resolution.
+    fn compute_launch_preflight(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+    ) -> Result<
+        (HardeningProfile, &crate::asset_registry::VerifiedRootfs),
+        SandboxLaunchError<GvisorError>,
+    > {
         // #4 isolation floor FIRST — the hardening profile must hold before any code (including the
         // registry lookup) runs. Mirrors the Firecracker backend's own ordering. Every early refusal
         // here is an ordinary pre-commit `Failed` — nothing durable has been claimed yet.
@@ -2213,15 +2412,38 @@ impl GvisorBackend {
             })?;
         }
 
-        let reserve = hooks
-            .reserve(spec)
-            .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
-        // CT-007 slice 3, piece 7a: generated HERE, not deep inside the run closure — the
-        // `Enabled`-workspace path needs this same value before it ever calls `run`, to durably
-        // bind a `UserNamespaceLease` to it ahead of exec (piece 7c), and (piece 7c) as the
-        // workspace's own `job_key` — already a safe, unique path component.
-        let container_id = format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
+        Ok((profile, verified_rootfs))
+    }
 
+    /// **The SHARED, source-identical post-reservation compute body (CT-007 slice 5b.3-6e.1).** Runs
+    /// the workspace acquisition, runtime preparation, launch-permit CAS, the ONE legitimate `runsc`
+    /// spawn (via `run`), the checked finalization/settlement tail, guest registration, and completion
+    /// settlement — exactly the body [`Self::launch_compute_with`] ran inline before 6e.1. BOTH the
+    /// legacy compute entry and the dormant [`Self::launch_compute_orchestrated_with`] run this exact
+    /// code after their (identical) preflight; the ONLY difference between the two is which reservation
+    /// mode produced `reserve`.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_compute_common_body<F>(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        run: F,
+        profile: HardeningProfile,
+        verified_rootfs: &crate::asset_registry::VerifiedRootfs,
+        reserve: ReserveHandle,
+        container_id: String,
+    ) -> Result<SandboxLaunch, SandboxLaunchError<GvisorError>>
+    where
+        F: FnOnce(
+            &JobSpec,
+            &OciConfig,
+            LaunchPermit,
+            &Path,
+            &str,
+            RuntimePreparation<'_>,
+        )
+            -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure>,
+    {
         // CT-007 slice 3, piece 7c: acquire capacity + a userns lease + a real workspace, and
         // build the explicit-userns OCI layout from them — `Disabled` keeps the plain Rootless
         // `cfg` unchanged. `enabled_context` is `Some` for the REST of this call's lifetime
@@ -2442,6 +2664,82 @@ impl GvisorBackend {
             result,
             output_complete: run_error.is_none(),
         })
+    }
+
+    /// **The DORMANT compute-V2 orchestrated entry (CT-007 slice 5b.3-6e.1).**
+    ///
+    /// A compute job under V2 cannot merely use the legacy [`ReserveHook`](crate::ReserveHook): it
+    /// must create a durable PARENT-ATTEMPT row (so exhaustion is expressible) before any workload
+    /// launches. This entry runs the IDENTICAL [`compute_launch_preflight`](Self::compute_launch_preflight)
+    /// as the legacy [`launch_compute_with`](Self::launch_compute_with), then reserves through
+    /// [`RunnerHooks::reserve_parent_attempt`] instead of `reserve`:
+    ///
+    /// - [`ParentAttemptAdmission::Admitted`](crate::checkout_orchestration::ParentAttemptAdmission::Admitted):
+    ///   discard ONLY the unused [`AttemptAuthority`](crate::checkout_orchestration::AttemptAuthority)
+    ///   (a compute workload never drives per-phase preparation credentials), RETAIN the durable parent
+    ///   row (already inserted by the admission) and the `reserve`, and run the SAME source-identical
+    ///   [`launch_compute_common_body`](Self::launch_compute_common_body) — its `SandboxLaunch` becomes
+    ///   [`SandboxCycleOutcome::WorkloadLaunched`](crate::SandboxCycleOutcome::WorkloadLaunched).
+    /// - [`ParentAttemptAdmission::AttemptsExhausted`](crate::checkout_orchestration::ParentAttemptAdmission::AttemptsExhausted):
+    ///   the durable budget is spent, so NOTHING spawns — return a typed
+    ///   [`SandboxCycleOutcome::PreparationTerminal`](crate::SandboxCycleOutcome::PreparationTerminal)
+    ///   carrying the reporting `claim` and [`AttemptsExhausted`](crate::runner::PreparationTerminalDisposition::AttemptsExhausted).
+    ///   The `reserve` is settled later by the preparation reporter against the claim's durable
+    ///   identity (the in-hand [`ReserveHandle`] is only an id string, not an RAII guard), so dropping
+    ///   it here leaks nothing.
+    ///
+    /// **Zero production callers** — the occurrence pin holds it at 0 — so `launch_compute_with`
+    /// remains the sole LIVE compute path until the activating slice (6e.2) routes production
+    /// `RunnerAgent` through the typed cycle seam.
+    #[allow(dead_code)]
+    fn launch_compute_orchestrated_with<F>(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        run: F,
+    ) -> Result<SandboxCycleOutcome, SandboxLaunchError<GvisorError>>
+    where
+        F: FnOnce(
+            &JobSpec,
+            &OciConfig,
+            LaunchPermit,
+            &Path,
+            &str,
+            RuntimePreparation<'_>,
+        )
+            -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure>,
+    {
+        use crate::checkout_orchestration::ParentAttemptAdmission;
+        let (profile, verified_rootfs) = self.compute_launch_preflight(spec, hooks)?;
+        // Same generated container id as the legacy path — a safe, unique path component.
+        let container_id = format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
+        match hooks
+            .reserve_parent_attempt(spec)
+            .map_err(|e| SandboxLaunchError::Failed(e.into()))?
+        {
+            ParentAttemptAdmission::Admitted {
+                claim: _,
+                reserve,
+                attempt_authority: _,
+            } => self
+                .launch_compute_common_body(
+                    spec,
+                    hooks,
+                    run,
+                    profile,
+                    verified_rootfs,
+                    reserve,
+                    container_id,
+                )
+                .map(SandboxCycleOutcome::WorkloadLaunched),
+            ParentAttemptAdmission::AttemptsExhausted { claim, reserve: _ } => {
+                Ok(SandboxCycleOutcome::PreparationTerminal {
+                    claim,
+                    disposition:
+                        crate::runner::PreparationTerminalDisposition::AttemptsExhausted,
+                })
+            }
+        }
     }
 
     /// Dispose of a post-`reserve` [`RunFailure`] into the correct [`SandboxLaunchError`] variant,
@@ -4431,7 +4729,8 @@ impl RuntimeQuiescenceEvidence {
         self.cgroup
     }
 
-    #[cfg(test)]
+    // CT-007 slice 5b.3-6e.1: also available to the `test-support` runsc-driver seam.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn assert_for_tests(
         container_id: String,
         namespace: RuntimeNamespaceQuiescence,
@@ -9220,6 +9519,15 @@ pub(crate) use checkout_runtime::{
     run_checkout_preparation_v2, AcquiredCheckoutRuntime, PreparedCheckoutRuntime,
 };
 
+// CT-007 slice 5b.3-6e.1 (DORMANT): the hardware-independent runsc-driver test seam. A SEPARATE
+// module, gated `#[cfg(feature = "test-support")]`, so it is ABSENT from the ordinary dependency
+// graph AND from the `gvisor.rs` production-source dormancy pins (which read `include_str!("gvisor.rs")`
+// and never see this file). It substitutes ONLY the runtime executions (the workload `runsc` spawn)
+// while driving the REAL preflight, REAL parent-attempt reservation (real hooks/authorities), REAL
+// shared compute body, and REAL `SandboxCycleOutcome` routing — no Btrfs / /etc/subuid / KVM / runsc.
+#[cfg(feature = "test-support")]
+mod runsc_driver;
+
 // CT-007 slice 5b.3-6c (Sol's r5 finding 2): the workload-rotated spec wrapper lives in its own module
 // so the inner `JobSpec` never escapes to be cloned/substituted (module-privacy fence). Re-exported so
 // `checkout_runtime` can name the sealed wrapper + its refusal type without reaching the inner spec.
@@ -10392,6 +10700,154 @@ mod tests {
             acquire_sig.contains("-> Result<AcquiredCheckoutRuntime, AcquisitionFailure>")
                 && !acquire_sig.contains("OciConfig"),
             "acquire must return the capsule alone — never the workload OciConfig detached"
+        );
+
+        // ── CT-007 slice 5b.3-6e.1 (DORMANT): the compute-V2 orchestrated entry + checkout config ──
+        // The dormant orchestrated compute entry is DEFINED once and has ZERO production callers (the
+        // composition-root zero). Its ONLY caller anywhere is the `#[cfg(feature = "test-support")]`
+        // runsc-driver seam, which lives in the SEPARATE `gvisor/runsc_driver.rs` file this scan never
+        // reads — so production source sees exactly the definition and no call.
+        assert_eq!(
+            prod.matches("fn launch_compute_orchestrated_with").count(),
+            1,
+            "the dormant compute-V2 orchestrated entry is defined exactly once"
+        );
+        assert_eq!(
+            prod.matches(".launch_compute_orchestrated_with(").count(),
+            0,
+            "the compute-V2 orchestrated entry has ZERO production callers — the composition-root zero"
+        );
+        // The shared post-reservation body is extracted ONCE and used by BOTH compute entries; the
+        // preflight is extracted once and used by both. The legacy `launch_compute_with` remains the
+        // sole LIVE compute entry (called by the plain `launch_with` wrapper and streaming).
+        assert_eq!(
+            prod.matches("fn launch_compute_common_body").count(),
+            1,
+            "the shared post-reservation compute body is defined exactly once"
+        );
+        assert_eq!(
+            prod.matches(".launch_compute_common_body(").count(),
+            2,
+            "both compute entries (legacy + dormant orchestrated) run the ONE shared common body"
+        );
+        assert_eq!(
+            prod.matches("fn compute_launch_preflight").count(),
+            1,
+            "the shared compute preflight is defined exactly once"
+        );
+        assert_eq!(
+            prod.matches(".compute_launch_preflight(").count(),
+            2,
+            "both compute entries run the ONE shared preflight"
+        );
+        // The checkout repository-root config: every production GvisorBackend constructor leaves it
+        // `disabled()`. This is a gvisor.rs-LOCAL invariant; the CROSS-CRATE composition-root zero for
+        // the `with_checkout_config` selector (which a controlplane root could call) is enforced by the
+        // recursive both-crates dormancy scan `the_v2_phase_credential_surface_has_exactly_its_known_occurrences`.
+        assert_eq!(
+            prod.matches("checkout: GvisorCheckoutConfig::disabled()").count(),
+            3,
+            "every production GvisorBackend constructor leaves checkout disabled()"
+        );
+    }
+
+    /// CT-007 slice 5b.3-6e.1: the checkout repository-root config validates at boot — no default
+    /// fallback, and a relative / nonexistent / non-directory / non-canonical root fails closed.
+    #[test]
+    fn gvisor_checkout_config_validates_the_repo_root_at_boot() {
+        // A relative path is refused.
+        assert!(matches!(
+            GvisorCheckoutConfig::enabled("relative/repo"),
+            Err(GvisorCheckoutConfigError::NotAbsolute(_))
+        ));
+        // A nonexistent absolute path is refused.
+        let missing = std::env::temp_dir().join(format!(
+            "myelin-checkout-root-missing-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        assert!(matches!(
+            GvisorCheckoutConfig::enabled(&missing),
+            Err(GvisorCheckoutConfigError::NotADirectory { .. })
+        ));
+        // An absolute path to a FILE (not a directory) is refused.
+        let file_path = std::env::temp_dir().join(format!(
+            "myelin-checkout-root-file-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::write(&file_path, b"not a dir").unwrap();
+        assert!(matches!(
+            GvisorCheckoutConfig::enabled(&file_path),
+            Err(GvisorCheckoutConfigError::NotADirectory { .. })
+        ));
+        let _ = std::fs::remove_file(&file_path);
+        // A real, canonical directory is ACCEPTED and retains the exact root.
+        let base = std::env::temp_dir()
+            .join(format!(
+                "myelin-checkout-root-ok-{}-{}",
+                std::process::id(),
+                unique_suffix()
+            ))
+            .canonicalize()
+            .unwrap_or_else(|_| {
+                let p = std::env::temp_dir().join(format!(
+                    "myelin-checkout-root-ok-{}-{}",
+                    std::process::id(),
+                    unique_suffix()
+                ));
+                std::fs::create_dir_all(&p).unwrap();
+                std::fs::canonicalize(&p).unwrap()
+            });
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let accepted = GvisorCheckoutConfig::enabled(&base)
+            .expect("a canonical directory must be accepted");
+        assert_eq!(
+            accepted.repo_root(),
+            Some(base.as_path()),
+            "an enabled config exposes exactly the validated root"
+        );
+        // A non-canonical path (a `..`-bearing route to the same real dir) is refused, even though it
+        // resolves to an existing directory.
+        let non_canonical = base.join("..").join(base.file_name().unwrap());
+        assert!(matches!(
+            GvisorCheckoutConfig::enabled(&non_canonical),
+            Err(GvisorCheckoutConfigError::NotCanonical { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **CT-007 slice 5b.3-6e.1 (Sol's blocker 1): the invalid state is UNCONSTRUCTABLE.** `enabled()`
+    /// is structurally the ONLY path to an enabled config — the wrapped `CheckoutConfigState` is
+    /// private, so no external construction of `Enabled { repo_root: <unvalidated> }` is possible, and
+    /// `with_checkout_config` therefore can only ever receive an already-validated value. This test
+    /// pins the two facts a reviewer can check: `disabled()` carries no root, and the ONLY
+    /// `CheckoutConfigState::Enabled` construction in production source is inside `fn enabled(` (the
+    /// validating constructor). A future `CheckoutConfigState::Enabled { .. }` built anywhere else —
+    /// bypassing validation — trips this pin.
+    #[test]
+    fn an_enabled_checkout_config_can_only_arise_from_the_validating_constructor() {
+        assert_eq!(GvisorCheckoutConfig::disabled().repo_root(), None);
+
+        // Every enabled-state CONSTRUCTION in production source (test module stripped) must sit inside
+        // the validating `fn enabled(`. The construction is uniquely spelled
+        // `GvisorCheckoutConfig(CheckoutConfigState::Enabled {` (the wrapper prefix distinguishes it
+        // from `repo_root()`'s bare `CheckoutConfigState::Enabled { .. } =>` match pattern). There is
+        // exactly ONE, and it is that site.
+        let prod = production_source();
+        let construction = "GvisorCheckoutConfig(CheckoutConfigState::Enabled {";
+        assert_eq!(
+            prod.matches(construction).count(),
+            1,
+            "there must be exactly one enabled-config construction site in production source"
+        );
+        let enabled_fn = source_of("pub fn enabled(");
+        assert_eq!(
+            enabled_fn.matches(construction).count(),
+            1,
+            "the sole enabled-config construction lives inside the boot-validating `enabled()` — no \
+             other code path can build an enabled config with an unvalidated path"
         );
     }
 
@@ -13981,6 +14437,7 @@ mod tests {
                 workspace_manager,
                 userns_allocator,
             },
+            checkout: GvisorCheckoutConfig::disabled(),
         };
         let reserve_called = Arc::new(AtomicBool::new(false));
         let reserve_called_in_hook = reserve_called.clone();

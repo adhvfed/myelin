@@ -254,6 +254,11 @@ struct SchedulerProbe {
     /// `claim_expires_at`. The dynamic excess-column check below would also catch a stray grant, but
     /// a named probe makes the intent unmissable to the next person adding a column grant.
     job_update_claim_window: bool,
+    /// **CT-007 slice 5b.3-6e.1: an EXPLICIT negative.** The operational-reservation write-version
+    /// marker is written ONLY by the app role's V2 reserve writer (6e.2); the scheduler never touches
+    /// it. The dynamic excess-column check below would also catch a stray UPDATE grant, but a named
+    /// probe makes the intent unmissable to the next person adding a column grant.
+    job_update_reservation_write_version: bool,
     fair_select: bool,
     run_select_tenant: bool,
     run_select_region: bool,
@@ -399,6 +404,12 @@ fn validate_probe_before_mapping(
     if scheduler.job_update_claim_window {
         return Err(CiSchedulerDbError::ExcessPrivileges);
     }
+    // CT-007 slice 5b.3-6e.1: the reservation write-version marker is written only by the app role's
+    // V2 reserve writer; the scheduler must never hold UPDATE on it. Named alongside the dynamic
+    // excess-column check that already covers it.
+    if scheduler.job_update_reservation_write_version {
+        return Err(CiSchedulerDbError::ExcessPrivileges);
+    }
     // CT-007 phase-credential generations: the credential log is invisible to the scheduler role.
     if scheduler.credential_generation_privilege {
         return Err(CiSchedulerDbError::ExcessPrivileges);
@@ -498,6 +509,7 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'claim_started_at', 'UPDATE') AS job_update_claim_started_at,
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'claim_expires_at', 'UPDATE') AS job_update_claim_expires_at,
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'claim_window_secs', 'UPDATE') AS job_update_claim_window,
+                pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'reservation_write_version', 'UPDATE') AS job_update_reservation_write_version,
                 pg_catalog.has_table_privilege(session_user, 'public.fair_deficit', 'SELECT') AS fair_select,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'tenant_id', 'SELECT') AS run_select_tenant,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'region', 'SELECT') AS run_select_region,
@@ -779,6 +791,8 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
         job_update_claim_started_at: row.get("job_update_claim_started_at"),
         job_update_claim_expires_at: row.get("job_update_claim_expires_at"),
         job_update_claim_window: row.get("job_update_claim_window"),
+        job_update_reservation_write_version: row
+            .get("job_update_reservation_write_version"),
         fair_select: row.get("fair_select"),
         run_select_tenant: row.get("run_select_tenant"),
         run_select_region: row.get("run_select_region"),

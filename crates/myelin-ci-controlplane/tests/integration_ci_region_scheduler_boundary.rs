@@ -645,6 +645,27 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         "the claim must be able to READ the durable window it sizes claim_expires_at from"
     );
 
+    // CT-007 slice 5b.3-6e.1: the reservation write-version marker is written only by the app role's
+    // V2 reserve writer; the scheduler role must hold neither UPDATE nor even SELECT on it (it is
+    // never covered by the scheduler's table-level SELECT-column set).
+    assert_permission_denied(
+        sqlx::query("UPDATE job_queue SET reservation_write_version = 2 WHERE true")
+            .execute(&raw_scheduler)
+            .await,
+        "scheduler reservation_write_version mutation must be denied",
+    );
+    let scheduler_can_update_reservation_marker: bool = sqlx::query_scalar(
+        "SELECT pg_catalog.has_column_privilege(
+           session_user, 'public.job_queue', 'reservation_write_version', 'UPDATE')",
+    )
+    .fetch_one(&raw_scheduler)
+    .await
+    .expect("inspect scheduler reservation-marker update privilege");
+    assert!(
+        !scheduler_can_update_reservation_marker,
+        "the scheduler must never hold UPDATE on the reservation write-version marker"
+    );
+
     // CT-007 round-2 blocker 4: a POSITIVE, real-role proof — not merely "the query is permitted".
     // Seed a VISIBLE superseded-version run, observe it through the exact production scheduler
     // provider's discovery, remediate it through the REAL `DurableExecutor::cancel`, and prove the

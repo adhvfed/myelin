@@ -72,6 +72,35 @@ async fn seed_workflow_run(admin: &PgPool, run_id: &str, version: i32, state: &s
     .expect("seed a workflow run as the cluster admin");
 }
 
+/// Seed one `public.job_queue` row as the cluster admin (bypassing FORCE RLS). `claim_window_secs`
+/// NULL or `reservation_write_version` other than 2 makes a non-terminal row UNSAFE for a v2
+/// activation. The `= 2` marker CHECK is enforced on inserts, so an unsafe marker is expressed as
+/// NULL, never a forbidden literal.
+async fn seed_job_queue_row(
+    admin: &PgPool,
+    job_id: &str,
+    claim_window_secs: Option<i64>,
+    reservation_write_version: Option<i16>,
+    state: &str,
+) {
+    sqlx::query(
+        "INSERT INTO job_queue (
+           tenant_id, region, job_id, run_id, lane, trust_tier, fair_key, idem_token, state,
+           claim_window_secs, reservation_write_version
+         ) VALUES ($1, $2, $3::uuid, gen_random_uuid(), 'batch', 'trusted', $1, $4, $5, $6, $7)",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(job_id)
+    .bind(job_id) // idem_token: the uuid string is unique text
+    .bind(state)
+    .bind(claim_window_secs)
+    .bind(reservation_write_version)
+    .execute(admin)
+    .await
+    .expect("seed a job_queue row as the cluster admin");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the disposable container from drill-ci-definition-fence-fresh-postgres.sh"]
 async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_non_superuser_migrator()
@@ -266,6 +295,112 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
          fence role for one transaction and resets"
     );
 
+    // ── (6e.1) CT-007 5b.3-6e.1: the SECOND fence-owned function — the activation-readiness probe.
+    // Identical hardening to the backlog probe, over job_queue's four scoped columns.
+    let (rp_schema_owner, rp_fn_owner, rp_config, rp_body, rp_secdef, rp_volatility, rp_rettype): (
+        String,
+        String,
+        Vec<String>,
+        String,
+        bool,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT pg_get_userbyid(n.nspowner), pg_get_userbyid(p.proowner), p.proconfig,
+                btrim(p.prosrc), p.prosecdef, p.provolatile::text, p.prorettype::regtype::text
+           FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+          WHERE n.nspname = 'myelin_ci_security'
+            AND p.proname = 'myelin_ci_v2_activation_readiness_unsafe_count'",
+    )
+    .fetch_one(&migrator)
+    .await
+    .expect("the readiness probe exists in the dedicated security schema");
+    assert_eq!(rp_schema_owner, "myelin_ci_definition_fence");
+    assert_eq!(
+        rp_fn_owner, "myelin_ci_definition_fence",
+        "the readiness probe must be BORN fence-owned under the non-superuser migrator"
+    );
+    assert_eq!(
+        rp_config,
+        vec!["search_path=pg_catalog", "row_security=off"],
+        "exact proconfig"
+    );
+    assert!(rp_secdef, "SECURITY DEFINER");
+    assert_eq!(rp_volatility, "s", "STABLE");
+    assert_eq!(rp_rettype, "bigint", "the readiness probe returns an aggregate count");
+    assert!(rp_body.contains("FROM public.job_queue"));
+    assert!(rp_body.contains("state <> 'terminal'"));
+    assert!(rp_body.contains("reservation_write_version IS DISTINCT FROM 2"));
+
+    // Exactly the four scoped job_queue columns, SELECT only, zero payload, zero table-level grant.
+    let rp_granted: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname || ':' || acl.privilege_type
+           FROM pg_attribute a CROSS JOIN LATERAL aclexplode(a.attacl) acl
+          WHERE a.attrelid = 'public.job_queue'::regclass
+            AND acl.grantee = 'myelin_ci_definition_fence'::regrole::oid
+          ORDER BY 1",
+    )
+    .fetch_all(&migrator)
+    .await
+    .unwrap();
+    assert_eq!(
+        rp_granted,
+        vec![
+            "claim_window_secs:SELECT",
+            "region:SELECT",
+            "reservation_write_version:SELECT",
+            "state:SELECT"
+        ],
+        "exactly the four non-payload columns, SELECT only"
+    );
+    for payload in ["tenant_id", "idem_token", "lease_owner", "run_id"] {
+        let visible: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege(
+               'myelin_ci_definition_fence', 'public.job_queue', $1, 'SELECT')",
+        )
+        .bind(payload)
+        .fetch_one(&migrator)
+        .await
+        .unwrap();
+        assert!(
+            !visible,
+            "the fence role must not read the `{payload}` job_queue column"
+        );
+    }
+    let rp_table_level: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) acl
+          WHERE c.oid = 'public.job_queue'::regclass
+            AND acl.grantee = 'myelin_ci_definition_fence'::regrole::oid",
+    )
+    .fetch_one(&migrator)
+    .await
+    .unwrap();
+    assert_eq!(rp_table_level, 0, "no table-level privilege on job_queue, only column grants");
+
+    // PUBLIC cannot execute the readiness probe; the runtime app role can.
+    let rp_oid: i64 = sqlx::query_scalar(
+        "SELECT p.oid::bigint FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+          WHERE n.nspname = 'myelin_ci_security'
+            AND p.proname = 'myelin_ci_v2_activation_readiness_unsafe_count'",
+    )
+    .fetch_one(&migrator)
+    .await
+    .unwrap();
+    let rp_public_execute: bool =
+        sqlx::query_scalar("SELECT has_function_privilege('public', $1::oid, 'EXECUTE')")
+            .bind(rp_oid)
+            .fetch_one(&migrator)
+            .await
+            .unwrap();
+    assert!(!rp_public_execute, "PUBLIC must never execute the readiness probe");
+    let rp_app_execute: bool =
+        sqlx::query_scalar("SELECT has_function_privilege('myelin_app', $1::oid, 'EXECUTE')")
+            .bind(rp_oid)
+            .fetch_one(&migrator)
+            .await
+            .unwrap();
+    assert!(rp_app_execute, "the runtime role executes the readiness probe");
+
     // ── (7) The crash window: delete only the ledger row, reapply, adopt without rewriting ──────
     let before_oid = probe_oid;
     sqlx::query(
@@ -402,6 +537,60 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
         .await
         .expect("the app role executes the probe");
     assert!(probe_sees, "the probe must see the live v2 run database-wide");
+
+    // ── (8b) CT-007 5b.3-6e.1 (Sol's 6e.1 major 3): the SAME real-role boundary for the ACTIVATION-
+    // READINESS probe over `job_queue`. This is the one proof the fail-OPEN risk is genuinely closed
+    // under the real non-superuser posture — the schema-local readiness tests elsewhere drive an
+    // admin-backed fixture, which cannot exercise the myelin_app/FORCE-RLS boundary the production
+    // function exists to cross.
+    //
+    // Seed an UNSAFE non-terminal row (a NULL claim window; marker a valid 2, isolating the cause) as
+    // the cluster admin.
+    seed_job_queue_row(&admin, "11111111-1111-1111-1111-111111111111", None, Some(2), "queued").await;
+    // (b) The app's OWN read sees NOTHING: FORCE RLS + no tenant scope hides the row entirely.
+    let app_direct_jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM job_queue WHERE state <> 'terminal' \
+         AND (claim_window_secs IS NULL OR reservation_write_version IS DISTINCT FROM 2)",
+    )
+    .fetch_one(&app)
+    .await
+    .expect("the app role can SELECT job_queue (RLS filters the rows, it does not deny the read)");
+    assert_eq!(
+        app_direct_jobs, 0,
+        "FORCE RLS hides the unsafe job_queue row from the runtime role's OWN read — which is exactly \
+         why the readiness probe must be SECURITY DEFINER, owned by the bypass fence role"
+    );
+    // (c) The SCHEMA-QUALIFIED PRODUCTION readiness function, called AS myelin_app, counts it as 1 —
+    // it sees, through the bypass-RLS fence owner, the very row the app itself cannot.
+    let unsafe_seen: i64 = sqlx::query_scalar(
+        "SELECT myelin_ci_security.myelin_ci_v2_activation_readiness_unsafe_count()",
+    )
+    .fetch_one(&app)
+    .await
+    .expect("the app role executes the production readiness probe");
+    assert_eq!(
+        unsafe_seen, 1,
+        "the production readiness probe counts the unsafe row the app itself cannot see — the \
+         fail-open guard is real under the non-superuser posture"
+    );
+    // (d) Make the row SAFE (a bounded window + the exact marker 2); the probe drops to 0.
+    sqlx::query(
+        "UPDATE job_queue SET claim_window_secs = 600, reservation_write_version = 2 \
+         WHERE job_id = '11111111-1111-1111-1111-111111111111'::uuid",
+    )
+    .execute(&admin)
+    .await
+    .expect("make the seeded row safe as the cluster admin");
+    let unsafe_after: i64 = sqlx::query_scalar(
+        "SELECT myelin_ci_security.myelin_ci_v2_activation_readiness_unsafe_count()",
+    )
+    .fetch_one(&app)
+    .await
+    .unwrap();
+    assert_eq!(
+        unsafe_after, 0,
+        "making the row safe (window set + marker 2) clears the production readiness count"
+    );
 
     // ── (9) The cutover refuses while that row is live ──────────────────────────────────────────
     let mut config = MyelinConfig::dev();

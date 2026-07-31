@@ -3775,3 +3775,57 @@ journal/renewal/reporter adapters, run the v3→v4 definition cutover through th
 all together, coordinated-convergence deploy (deploy 6d everywhere, quiesce old runner intake, drain, deploy
 6e), NOT online mixed-runner. Then 5b.3-7 (the real-runsc drill), task #91, gate-2 vertical slice. The rest
 of ledger 12's open items are unchanged.
+
+---
+
+## 2026-07-31 — CT-007 slice 5b.3-6e.1 landed: the dormant activation chassis
+(Fable orchestrating; Opus, implementation; Sol, 2 review rounds to "no merge blockers")
+
+6e (the single atomic activation) is SPLIT into 6e.1 (dormant additive chassis) + 6e.2 (the one
+activating commit). This is 6e.1 — every piece dormant/additive, nothing selects the V2 checkout path,
+production reservation/credential/accounting stay V1/legacy/V3.
+
+**What landed (Sol §1, all 7 pieces):** (1) migrations ci_0022/a/b/c — nullable
+job_queue.reservation_write_version smallint (CHECK(=2) NOT VALID → VALIDATE, concurrent partial index over
+unsafe nonterminal rows WHERE state<>'terminal' AND (claim_window_secs IS NULL OR reservation_write_version
+IS DISTINCT FROM 2)); legacy writers leave it NULL; scheduler gets NO update priv (excess-probe extended).
+(2) the global activation-readiness probe ci_0022c — a SECURITY DEFINER myelin_ci_security function returning
+a bigint unsafe-count, born fence-owned (BYPASSRLS), row_security=off, column-scoped to exactly 4 job_queue
+columns, REVOKE PUBLIC / GRANT EXECUTE myelin_app — mirroring the ci_0020h fence-role hardening EXACTLY;
+pg-init + privilege + fresh-drill extended. (3) an optional CutoverPlan.activation_readiness predicate that
+runs INSIDE the cutover tx (after predecessor FOR UPDATE + the backlog probe, before drain) and rolls back
+on error/NULL/unsafe — production plan stays None (v2/v3 byte-equiv; the cutover suite passes unchanged).
+(4) the typed SandboxCycleOutcome{WorkloadLaunched|WorkloadRetryable|PreparationTerminal|PreparationRetryable|
+ReconciliationRequired} + a default run_cycle wrapping launch_streaming (no backend/double forced to change).
+(5) the dormant compute-V2 entry launch_compute_orchestrated_with sharing a source-identical
+launch_compute_common_body with the legacy path (byte-identical; 6b golden traces pass). (6)
+GvisorCheckoutConfig boot-validated. (7) a hardware-independent runsc-driver test seam (compute cycle, no
+capsule field access).
+
+**Review (2 rounds).** r1 verified everything sound but found: a BLOCKER — GvisorCheckoutConfig::Enabled was
+a PUBLIC enum variant, so external code could construct an unvalidated repo_root, bypassing the boot check
+(6e.2 would activate an unvalidated Hop-A root); 2 MAJORs — two dormancy pins scanned only one file / missed
+UFCS (no real composition-root tripwire), and the fresh-drill didn't behaviorally exercise the PRODUCTION
+readiness probe (the fail-open guard). r2 = no blockers: GvisorCheckoutConfig made an OPAQUE struct wrapping
+a private enum so Enabled is unconstructable except via the validating enabled() (source-pinned to the sole
+construction — the session's recurring "make invalid state unconstructable" lesson); the dormancy markers
+moved to the recursive per-file bare-symbol occurrence table across both crates + the local pin fixed for
+lib.rs/UFCS, PROVEN to trip by planting-and-reverting a compiling main.rs wiring; the fresh drill gained the
+real-role boundary proof (seed an unsafe row → myelin_app direct read sees 0 under FORCE RLS → the
+bypass-owned production probe as myelin_app returns 1 → safe→0).
+
+**Sol piece-7 ruling (carried to 6e.2):** the §4 hardware-independent checkout-success test uses a
+SEALED-MODULE test DRIVER inside checkout_runtime.rs (writes/reads the Hop-B sentinel INSIDE the module,
+returns only owned observations, never leaks a workspace path/lease/OciConfig/evidence), with an exact
+test-support accessor inventory added to the closed-world audit and the production multiset held at five.
+Must land WITH 6e.2's active-path test, not deferred to 5b.3-7.
+
+**Gates (orchestrator ran independently):** controlplane --lib 598, the entire --features integration matrix
+green (0 failed; dormancy scan + definition-cutover + region-scheduler-boundary + migration/upgrade all
+green), sandbox --lib 510 / test-support 559, sandbox integration all pass except the known firecracker skip
+(852bc7ae), clippy -D warnings clean, check clean, myelin-lints green, git diff --check clean, the fresh-volume
+drill PASS (with the new real-role readiness-probe assertion). The config-inseparability + both dormancy pins
+verified independently.
+
+**Still open: 6e.2 — the one activating commit** (Sol §2-5 + the piece-7 ruling, task #22). Then 5b.3-7
+(the real-runsc drill), task #91, gate-2 vertical slice. The rest of ledger 12's open items are unchanged.

@@ -1893,7 +1893,7 @@ async fn a_sealed_ceiling_phase_satisfies_no_purpose_and_retires_its_own_credent
 #[test]
 fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
     /// Every token that would constitute reaching (or composing) the dormant V2 surface.
-    const MARKERS: [&str; 19] = [
+    const MARKERS: [&str; 22] = [
         // control plane
         "mint_phase_credential(",
         "authorize_workload_v2_retained(",
@@ -1912,6 +1912,14 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         "v2_phase_credential_store(",
         "mint_initial_phase_credential(",
         "parent_attempt_reserve_hook(",
+        // CT-007 5b.3-6e.1: the activation-chassis SELECTORS. These are BARE symbols (no leading `.`
+        // and no trailing `(`), so the scan catches BOTH method-call `x.with_checkout_config(y)` AND
+        // UFCS `GvisorBackend::with_checkout_config(x, y)` forms (Sol's 6e.1 major 2). Selecting a
+        // checkout config, the readiness predicate, or the production readiness probe from ANY
+        // composition root is exactly what these trip on.
+        "with_checkout_config",
+        "with_activation_readiness",
+        "ActivationReadinessProbe::production",
         // sandbox
         "authorize_checkout_phase(",
         "with_checkout_phase_authorization(",
@@ -1924,7 +1932,7 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
     /// absent from this table must have ZERO occurrences.
     /// `(crate, file, marker) -> exact allowed CODE occurrence count` in PRODUCTION source.
     /// Everything absent from this table must have ZERO occurrences in EITHER crate.
-    const ALLOWED: [(&str, &str, &str, usize); 61] = [
+    const ALLOWED: [(&str, &str, &str, usize); 79] = [
         // --- the definition sites ---
         ("myelin-ci-controlplane", "ci_credential_generation.rs", "mint_phase_credential(", 1),
         ("myelin-ci-controlplane", "ci_credential_generation.rs", "acquire_phase_generation_ownership(", 1),
@@ -2023,6 +2031,32 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         ("myelin-ci-controlplane", "runner_bind.rs", "mint_phase_credential(", 0),
         ("myelin-ci-controlplane", "main.rs", "CiJobCredentialGenerationStore", 0),
         ("myelin-ci-sandbox", "runner.rs", "PhaseAuthorization", 0),
+        // --- CT-007 5b.3-6e.1 activation-chassis selectors (Sol's major 2) ---
+        // Definition sites: the selector methods are DEFINED once each (dormant). `with_checkout_config`
+        // is the sandbox GvisorBackend builder; `with_activation_readiness` is the control-plane
+        // CutoverPlan builder. `ActivationReadinessProbe::production` (the qualified CALL form) never
+        // appears at its own definition (`fn production(`), so it is ZERO everywhere until a caller wires
+        // it — the pure composition-root zero.
+        ("myelin-ci-sandbox", "gvisor.rs", "with_checkout_config", 1),
+        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "with_activation_readiness", 1),
+        // ...and EXPLICITLY ZERO in every composition root that could select them (the same set the
+        // V2CheckoutComposition zeros cover). A premature selection in ANY of these turns the scan RED.
+        ("myelin-ci-controlplane", "main.rs", "with_checkout_config", 0),
+        ("myelin-ci-controlplane", "runner_bind.rs", "with_checkout_config", 0),
+        ("myelin-ci-controlplane", "ci_runner_composition.rs", "with_checkout_config", 0),
+        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "with_checkout_config", 0),
+        ("myelin-ci-controlplane", "lib.rs", "with_checkout_config", 0),
+        ("myelin-ci-sandbox", "lib.rs", "with_checkout_config", 0),
+        ("myelin-ci-sandbox", "runner.rs", "with_checkout_config", 0),
+        ("myelin-ci-controlplane", "main.rs", "with_activation_readiness", 0),
+        ("myelin-ci-controlplane", "runner_bind.rs", "with_activation_readiness", 0),
+        ("myelin-ci-controlplane", "ci_runner_composition.rs", "with_activation_readiness", 0),
+        ("myelin-ci-controlplane", "lib.rs", "with_activation_readiness", 0),
+        ("myelin-ci-controlplane", "main.rs", "ActivationReadinessProbe::production", 0),
+        ("myelin-ci-controlplane", "runner_bind.rs", "ActivationReadinessProbe::production", 0),
+        ("myelin-ci-controlplane", "ci_runner_composition.rs", "ActivationReadinessProbe::production", 0),
+        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "ActivationReadinessProbe::production", 0),
+        ("myelin-ci-controlplane", "lib.rs", "ActivationReadinessProbe::production", 0),
     ];
 
     fn production_of(source: &str) -> &str {
