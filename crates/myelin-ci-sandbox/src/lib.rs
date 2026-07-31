@@ -1146,6 +1146,30 @@ pub trait SandboxBackend: Sync {
         Ok(launch)
     }
 
+    /// **The typed sandbox/runner CYCLE seam (CT-007 slice 5b.3-6e.1 — DORMANT).**
+    ///
+    /// [`SandboxLaunch`] can only ever describe a launched workload; it cannot represent a checkout
+    /// PREPARATION that terminalized (`AttemptsExhausted`, a Hop-B failure), requeued, or demanded
+    /// reconciliation before any workload ran. [`SandboxCycleOutcome`] is the strictly wider result a
+    /// single sandbox cycle can produce once the checkout path is selected.
+    ///
+    /// **The default is a byte-faithful compatibility wrapper:** it performs the ordinary streaming
+    /// launch and maps its `Ok` into [`SandboxCycleOutcome::WorkloadLaunched`], so EVERY existing
+    /// backend and test double satisfies the seam without changing a line. No production
+    /// [`RunnerAgent`](crate::runner::RunnerAgent) routes through this method yet — the activating
+    /// slice (5b.3-6e.2) is what makes production `RunnerAgent` call `run_cycle` and the gVisor
+    /// backend override it to produce the preparation variants for a checkout-bearing spec.
+    fn run_cycle(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        output: Arc<dyn SandboxOutputSink>,
+        cancellation: SandboxCancellation,
+    ) -> Result<SandboxCycleOutcome, SandboxLaunchError<Self::Error>> {
+        self.launch_streaming(spec, hooks, output, cancellation)
+            .map(SandboxCycleOutcome::WorkloadLaunched)
+    }
+
     /// Whole-guest kill on teardown (arch 01 §2): the guest is destroyed, never reused across
     /// tenants/jobs. Idempotent (killing an already-dead guest is a no-op success).
     fn kill(&self, h: &SandboxHandle) -> Result<(), Self::Error>;
@@ -1171,6 +1195,104 @@ pub trait SandboxBackend: Sync {
     fn accept_async(&self, spec: &JobSpec) -> Result<(), Self::Error> {
         let _ = spec;
         Ok(())
+    }
+}
+
+/// **The typed outcome of ONE sandbox cycle (CT-007 slice 5b.3-6e.1 — DORMANT).**
+///
+/// The strictly-wider return of [`SandboxBackend::run_cycle`]. A compute cycle and a
+/// checkout-preparation cycle both flow through the same runner lane, but only a WORKLOAD produces a
+/// [`SandboxLaunch`]; a preparation can terminalize, requeue, or demand fail-closed reconciliation
+/// BEFORE any workload exists. This enum is the seam where the runner routes each of those.
+///
+/// It mirrors [`CheckoutContinuationOutcome`](crate::checkout_orchestration::CheckoutContinuationOutcome)'s
+/// variants exactly and offers a total [`From`] conversion, so the gVisor backend's future checkout
+/// `run_cycle` override (5b.3-6e.2) can lift the orchestration's own result into this interface type
+/// without re-deriving the disposition vocabulary. `#[allow(dead_code)]` because — like every 6e.1
+/// chassis symbol — nothing production reads these fields until the activating slice selects the
+/// checkout path.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum SandboxCycleOutcome {
+    /// Preparation (if any) succeeded and the workload launched — the ordinary [`SandboxLaunch`]
+    /// firehose/kill/report/settlement tail takes over.
+    WorkloadLaunched(SandboxLaunch),
+    /// The workload ran but failed retryably — reporter-owned workload retry accounting requeues the
+    /// exact claim and durably accounts the measured usage without emitting `job.done`.
+    WorkloadRetryable {
+        /// The typed retryable cause.
+        cause: crate::runner::RetryableAttemptCause,
+        /// The measured usage the retry transaction accounts.
+        usage: ResourceUsage,
+        /// The operator-facing detail.
+        message: String,
+    },
+    /// Preparation reached a terminal disposition (`Failed`/`TimedOut`/`AttemptsExhausted`) before any
+    /// workload — the preparation reporter settles it; the ordinary workload reporter and
+    /// `LeaseStore::settle` are NOT called.
+    PreparationTerminal {
+        /// The preparation reporting identity to settle against.
+        claim: crate::runner::PreparationReportClaim,
+        /// The terminal disposition (its own accounting/signal semantics).
+        disposition: crate::runner::PreparationTerminalDisposition,
+    },
+    /// Preparation failed retryably — the preparation requeue reporter re-queues the exact claim and
+    /// emits no `job.done`.
+    PreparationRetryable {
+        /// The preparation reporting identity to requeue.
+        claim: crate::runner::PreparationReportClaim,
+        /// The phase the retryable failure occurred in.
+        phase: crate::runner::PreparationPhase,
+    },
+    /// Preparation left resources in an unproven state (teardown unproven, usage unrepresentable, or
+    /// quarantine required) — the runner lane must stop FAIL-CLOSED and leave durable recovery to the
+    /// reaper; it must not keep claiming work with possibly-live/quarantined resources.
+    ReconciliationRequired {
+        /// The phase reconciliation is required for.
+        phase: crate::runner::PreparationPhase,
+        /// The guest teardown could not be proven complete.
+        teardown_unproven: bool,
+        /// The measured usage could not be represented for settlement.
+        usage_unrepresentable: bool,
+        /// The workspace/identity must be quarantined before reuse.
+        quarantine_required: bool,
+    },
+}
+
+impl From<crate::checkout_orchestration::CheckoutContinuationOutcome> for SandboxCycleOutcome {
+    /// Lift a checkout orchestration's own outcome into the runner-cycle interface type. Total and
+    /// variant-for-variant, so a future exhaustive `match` on either type stays in lock-step.
+    fn from(outcome: crate::checkout_orchestration::CheckoutContinuationOutcome) -> Self {
+        use crate::checkout_orchestration::CheckoutContinuationOutcome as Cco;
+        match outcome {
+            Cco::WorkloadLaunched(launch) => Self::WorkloadLaunched(launch),
+            Cco::WorkloadRetryable {
+                cause,
+                usage,
+                message,
+            } => Self::WorkloadRetryable {
+                cause,
+                usage,
+                message,
+            },
+            Cco::PreparationTerminal { claim, disposition } => {
+                Self::PreparationTerminal { claim, disposition }
+            }
+            Cco::PreparationRetryable { claim, phase } => {
+                Self::PreparationRetryable { claim, phase }
+            }
+            Cco::ReconciliationRequired {
+                phase,
+                teardown_unproven,
+                usage_unrepresentable,
+                quarantine_required,
+            } => Self::ReconciliationRequired {
+                phase,
+                teardown_unproven,
+                usage_unrepresentable,
+                quarantine_required,
+            },
+        }
     }
 }
 
@@ -2322,6 +2444,103 @@ mod tests {
         assert!(!launch.result.timed_out);
         assert!(launch.result.passed());
         backend.kill(&launch.handle).unwrap();
+    }
+
+    /// CT-007 slice 5b.3-6e.1: the default `run_cycle` is a byte-faithful compatibility wrapper — it
+    /// performs the ordinary streaming launch and maps its `Ok` into `WorkloadLaunched`, so EVERY
+    /// existing backend/test double satisfies the seam unchanged.
+    #[test]
+    fn run_cycle_default_wraps_launch_streaming_as_workload_launched() {
+        struct NoopSink;
+        impl SandboxOutputSink for NoopSink {
+            fn emit(&self, _stream: SandboxOutputStream, _frame: &[u8]) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let backend = NoopBackend;
+        let outcome = backend
+            .run_cycle(
+                &ci_spec(),
+                &test_hooks(),
+                std::sync::Arc::new(NoopSink),
+                SandboxCancellation::default(),
+            )
+            .unwrap();
+        match outcome {
+            SandboxCycleOutcome::WorkloadLaunched(launch) => {
+                assert_eq!(launch.handle.guest_id, "noop-guest");
+                backend.kill(&launch.handle).unwrap();
+            }
+            other => panic!(
+                "the default run_cycle must wrap launch_streaming as WorkloadLaunched, got {other:?}"
+            ),
+        }
+    }
+
+    /// CT-007 slice 5b.3-6e.1: the `From<CheckoutContinuationOutcome>` bridge is total and
+    /// variant-for-variant, so 6e.2's gVisor checkout `run_cycle` override can lift the orchestration's
+    /// own result into the runner-cycle interface type without re-deriving the disposition vocabulary.
+    #[test]
+    fn sandbox_cycle_outcome_lifts_every_checkout_continuation_variant() {
+        use crate::checkout_orchestration::CheckoutContinuationOutcome as Cco;
+        use crate::runner::{
+            PreparationPhase, PreparationReportClaim, PreparationTerminalDisposition,
+            RetryableAttemptCause,
+        };
+        let claim = || PreparationReportClaim {
+            tenant_id: "t".into(),
+            region: "fr-par".into(),
+            wf_run_id: "wf".into(),
+            ci_run_id: "ci".into(),
+            job_id: "job".into(),
+            token_authority_handle: "tah".into(),
+            idem_token: "idem".into(),
+            lease_owner: "owner".into(),
+            lease_epoch: 1,
+            claim_nonce: "nonce".into(),
+            claim_started_at_epoch_secs: 10,
+            claim_expires_at_epoch_secs: 20,
+        };
+        assert!(matches!(
+            SandboxCycleOutcome::from(Cco::WorkloadRetryable {
+                cause: RetryableAttemptCause::SandboxInfrastructure,
+                usage: ResourceUsage { cpu_seconds: 2, mem_byte_seconds: 3 },
+                message: "m".into(),
+            }),
+            SandboxCycleOutcome::WorkloadRetryable { cause: RetryableAttemptCause::SandboxInfrastructure, usage, .. }
+                if usage.cpu_seconds == 2 && usage.mem_byte_seconds == 3
+        ));
+        assert!(matches!(
+            SandboxCycleOutcome::from(Cco::PreparationTerminal {
+                claim: claim(),
+                disposition: PreparationTerminalDisposition::AttemptsExhausted,
+            }),
+            SandboxCycleOutcome::PreparationTerminal {
+                disposition: PreparationTerminalDisposition::AttemptsExhausted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            SandboxCycleOutcome::from(Cco::PreparationRetryable {
+                claim: claim(),
+                phase: PreparationPhase::CheckoutTransport,
+            }),
+            SandboxCycleOutcome::PreparationRetryable { phase: PreparationPhase::CheckoutTransport, .. }
+        ));
+        assert!(matches!(
+            SandboxCycleOutcome::from(Cco::ReconciliationRequired {
+                phase: PreparationPhase::CheckoutMaterialization,
+                teardown_unproven: true,
+                usage_unrepresentable: false,
+                quarantine_required: true,
+            }),
+            SandboxCycleOutcome::ReconciliationRequired {
+                phase: PreparationPhase::CheckoutMaterialization,
+                teardown_unproven: true,
+                usage_unrepresentable: false,
+                quarantine_required: true,
+            }
+        ));
     }
 
     #[test]

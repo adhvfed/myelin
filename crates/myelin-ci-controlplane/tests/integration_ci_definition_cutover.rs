@@ -20,8 +20,8 @@ use std::time::Duration;
 use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_production_runtime_factory_test_support, ci_region_run_discovery_test_support,
-    CiSupersededDefinitionGuardError, CutoverPlan, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
-    CI_MANIFEST_PIPELINE_VERSION,
+    ActivationReadinessProbe, CiSupersededDefinitionGuardError, CutoverPlan,
+    CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION, CI_MANIFEST_PIPELINE_VERSION,
 };
 use myelin_storage::{DurableCostLedger, HotTables, PgMigrator, SubstrateProvider};
 use myelin_config::MyelinConfig;
@@ -2006,6 +2006,302 @@ async fn v3v4_an_ambiguous_commit_fails_closed_and_leaves_the_registry_whole() {
             .expect("v4 is now active");
         assert_eq!(status, "active");
         assert_eq!(hash, V3V4_CURRENT_HASH);
+    })
+    .await;
+    })
+    .await;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//  v3→v4 · THE ACTIVATION-READINESS PREDICATE (CT-007 slice 5b.3-6e.1 — DORMANT).
+//
+//  The queue-safety half of the v3→v4 fence. A `CutoverPlan` may carry an optional readiness
+//  predicate that runs AFTER the FOR-UPDATE fence and the workflow-backlog probe, BEFORE drain. It
+//  counts, database-wide, the non-terminal `job_queue` rows that still lack a claim window or carry a
+//  reservation marker other than 2. A probe failure, a NULL result, or ANY unsafe row rolls the fence
+//  back with v3 still active. The production v2→v3 plan carries NO predicate, so those tests above are
+//  the byte/behavior-identical control: nothing here changes them.
+//
+//  These reuse the same `cutover_schema` fixture. Like the backlog probe, the readiness probe is
+//  installed schema-local (pointed at THIS schema's `job_queue`) and selected through the
+//  `ActivationReadinessProbe::with_call_for_tests` seam, so production resolution stays
+//  `myelin_ci_security.`-qualified.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Install a SCHEMA-LOCAL copy of the `ci_0022c` readiness probe, pointed at this schema's
+/// `job_queue`, built from the SAME hardened shape (fence-owned, `SECURITY DEFINER`, `row_security =
+/// off`). The PRODUCTION shape over `public.job_queue`/`myelin_ci_security` is asserted separately by
+/// the fresh-volume drill and the migration DDL-shape unit test.
+async fn install_schema_local_readiness_probe(admin: &PgPool, schema: &str) {
+    admin
+        .execute(
+            format!(
+                "GRANT SELECT (region, state, claim_window_secs, reservation_write_version)
+                   ON TABLE {schema}.job_queue TO myelin_ci_definition_fence;
+                 SET LOCAL ROLE myelin_ci_definition_fence;
+                 CREATE FUNCTION {schema}.myelin_ci_v2_activation_readiness_unsafe_count()
+                 RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER
+                 SET search_path = pg_catalog SET row_security = off
+                 AS $probe$SELECT count(*) FROM {schema}.job_queue
+                   WHERE state <> 'terminal'
+                     AND (claim_window_secs IS NULL
+                          OR reservation_write_version IS DISTINCT FROM 2)$probe$;
+                 RESET ROLE;"
+            )
+            .as_str(),
+        )
+        .await
+        .expect("install the schema-local readiness probe as the fence role");
+}
+
+/// The schema-local readiness call the fixtures point the plan at.
+fn schema_local_readiness_call(schema: &str) -> String {
+    format!("SELECT {schema}.myelin_ci_v2_activation_readiness_unsafe_count()")
+}
+
+/// A v3→v4 plan carrying the schema-local readiness predicate.
+fn v3_to_v4_plan_with_readiness(schema: &str) -> CutoverPlan {
+    v3_to_v4_plan()
+        .with_activation_readiness(ActivationReadinessProbe::with_call_for_tests(
+            schema_local_readiness_call(schema),
+        ))
+}
+
+/// Seed one `job_queue` row with the given (claim_window_secs, reservation_write_version, state). The
+/// `= 2` marker CHECK is enforced on inserts, so an "unsafe marker" row is expressed as `NULL`
+/// (`IS DISTINCT FROM 2`), never a forbidden literal like 1.
+async fn seed_job_queue_row(
+    admin: &PgPool,
+    job_id: &str,
+    claim_window_secs: Option<i64>,
+    reservation_write_version: Option<i16>,
+    state: &str,
+) {
+    sqlx::query(
+        "INSERT INTO job_queue (
+           tenant_id, region, job_id, run_id, lane, trust_tier, fair_key, idem_token, state,
+           claim_window_secs, reservation_write_version
+         ) VALUES ($1, $2, $3::uuid, gen_random_uuid(), 'batch', 'trusted', $1, $4, $5, $6, $7)",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(job_id)
+    .bind(job_id) // idem_token unique per row
+    .bind(state)
+    .bind(claim_window_secs)
+    .bind(reservation_write_version)
+    .execute(admin)
+    .await
+    .unwrap();
+}
+
+// ─── v3→v4 · readiness · a NULL-claim-window non-terminal row refuses ─────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_readiness_refuses_on_a_nonterminal_null_claim_window_row() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_ready_nullwin").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+        install_schema_local_readiness_probe(&admin, &schema).await;
+        // Unsafe: a non-terminal row with NO claim window (marker is a valid 2, isolating the cause).
+        seed_job_queue_row(&admin, "11111111-1111-1111-1111-111111111111", None, Some(2), "queued")
+            .await;
+
+        let factory = cutover_factory(&pinned_pool(&admin_url(), &schema, 2).await, &schema).await;
+        let error = factory
+            .cutover_definition_with_plan(&v3_to_v4_plan_with_readiness(&schema), &diagnostics(&admin))
+            .await
+            .expect_err("a NULL-claim-window non-terminal row must refuse the activation");
+        assert!(
+            matches!(error, CiSupersededDefinitionGuardError::ActivationNotReady { unsafe_rows } if unsafe_rows == 1),
+            "the readiness predicate refuses with the unsafe-row count, got {error:?}"
+        );
+        // v3 stays active; v4 was never registered.
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("active".into()),
+            "the fence rolled back: v3 remains active"
+        );
+        assert_eq!(definition_row(&admin, V3V4_CURRENT_VERSION).await, None, "v4 was never activated");
+    })
+    .await;
+    })
+    .await;
+}
+
+// ─── v3→v4 · readiness · a non-terminal row with a marker other than 2 refuses ────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_readiness_refuses_on_a_nonterminal_non_two_reservation_marker() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_ready_marker").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+        install_schema_local_readiness_probe(&admin, &schema).await;
+        // Unsafe: a valid claim window but NO reservation marker (NULL `IS DISTINCT FROM 2`).
+        seed_job_queue_row(&admin, "22222222-2222-2222-2222-222222222222", Some(600), None, "running")
+            .await;
+
+        let factory = cutover_factory(&pinned_pool(&admin_url(), &schema, 2).await, &schema).await;
+        let error = factory
+            .cutover_definition_with_plan(&v3_to_v4_plan_with_readiness(&schema), &diagnostics(&admin))
+            .await
+            .expect_err("a non-2 reservation marker must refuse the activation");
+        assert!(
+            matches!(error, CiSupersededDefinitionGuardError::ActivationNotReady { unsafe_rows } if unsafe_rows == 1),
+            "the readiness predicate refuses with the unsafe-row count, got {error:?}"
+        );
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("active".into()),
+            "the fence rolled back: v3 remains active"
+        );
+        assert_eq!(definition_row(&admin, V3V4_CURRENT_VERSION).await, None, "v4 was never activated");
+    })
+    .await;
+    })
+    .await;
+}
+
+// ─── v3→v4 · readiness · a NULL probe result fails closed ─────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_readiness_fails_closed_on_a_null_probe_result() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_ready_null").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+        // A degenerate probe that returns NULL — a shadowing `SELECT NULL` must never read as "safe".
+        let plan = v3_to_v4_plan().with_activation_readiness(
+            ActivationReadinessProbe::with_call_for_tests("SELECT NULL::bigint"),
+        );
+        let factory = cutover_factory(&pinned_pool(&admin_url(), &schema, 2).await, &schema).await;
+        let error = factory
+            .cutover_definition_with_plan(&plan, &diagnostics(&admin))
+            .await
+            .expect_err("a NULL readiness result must fail closed");
+        assert!(
+            matches!(&error, CiSupersededDefinitionGuardError::ProbeFailed(detail) if detail.contains("NULL")),
+            "a NULL count is fail-closed, got {error:?}"
+        );
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("active".into()),
+            "the fence rolled back: v3 remains active"
+        );
+        assert_eq!(definition_row(&admin, V3V4_CURRENT_VERSION).await, None, "v4 was never activated");
+    })
+    .await;
+    })
+    .await;
+}
+
+// ─── v3→v4 · readiness · a probe FAILURE fails closed ─────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_readiness_fails_closed_on_a_probe_error() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_ready_err").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+        // A probe naming a function that does not exist — a broken probe is never a passed probe.
+        let plan = v3_to_v4_plan().with_activation_readiness(
+            ActivationReadinessProbe::with_call_for_tests(
+                "SELECT myelin_ci_security.readiness_probe_that_does_not_exist()",
+            ),
+        );
+        let factory = cutover_factory(&pinned_pool(&admin_url(), &schema, 2).await, &schema).await;
+        let error = factory
+            .cutover_definition_with_plan(&plan, &diagnostics(&admin))
+            .await
+            .expect_err("a readiness probe error must fail closed");
+        assert!(
+            matches!(error, CiSupersededDefinitionGuardError::ProbeFailed(_)),
+            "a probe error is fail-closed, got {error:?}"
+        );
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("active".into()),
+            "the fence rolled back: v3 remains active"
+        );
+    })
+    .await;
+    })
+    .await;
+}
+
+// ─── v3→v4 · readiness · a CLEAN queue activates ──────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_readiness_activates_over_a_safe_queue() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_ready_clean").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+        install_schema_local_readiness_probe(&admin, &schema).await;
+        // Only SAFE rows: a non-terminal V2 row (window set, marker 2) and an already-terminal row
+        // (excluded regardless of its columns). The predicate must NOT block this activation.
+        seed_job_queue_row(&admin, "33333333-3333-3333-3333-333333333333", Some(600), Some(2), "running")
+            .await;
+        seed_job_queue_row(&admin, "44444444-4444-4444-4444-444444444444", None, None, "terminal").await;
+
+        let factory = cutover_factory(&pinned_pool(&admin_url(), &schema, 2).await, &schema).await;
+        factory
+            .cutover_definition_with_plan(&v3_to_v4_plan_with_readiness(&schema), &diagnostics(&admin))
+            .await
+            .expect("a safe queue must let the v3→v4 activation proceed");
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("draining".into()),
+            "the clean activation drains v3"
+        );
+        let (hash, status) = definition_row(&admin, V3V4_CURRENT_VERSION).await.expect("v4 active");
+        assert_eq!(status, "active");
+        assert_eq!(hash, V3V4_CURRENT_HASH);
+    })
+    .await;
+    })
+    .await;
+}
+
+// ─── v3→v4 · readiness · a `None` plan IGNORES unsafe rows (production control) ───────────────────
+
+/// The byte/behavior-identical control: a plan with NO readiness predicate never runs the probe, so
+/// even an unsafe queue does not block it. This is exactly the production v2→v3 posture — the frozen
+/// fence — expressed on the synthetic pair so the two live side by side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_a_none_readiness_plan_ignores_unsafe_rows() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_ready_none").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+        // An unsafe row that WOULD refuse a readiness-bearing plan.
+        seed_job_queue_row(&admin, "55555555-5555-5555-5555-555555555555", None, None, "queued").await;
+
+        let plan = v3_to_v4_plan();
+        assert!(!plan.has_activation_readiness(), "the control plan carries no predicate");
+        let factory = cutover_factory(&pinned_pool(&admin_url(), &schema, 2).await, &schema).await;
+        factory
+            .cutover_definition_with_plan(&plan, &diagnostics(&admin))
+            .await
+            .expect("a None-readiness plan proceeds regardless of unsafe queue rows");
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("draining".into()),
+            "the None-readiness cutover drains v3 despite the unsafe row"
+        );
+        assert_eq!(
+            definition_row(&admin, V3V4_CURRENT_VERSION).await.map(|(_, s)| s),
+            Some("active".into()),
+            "v4 activates: the readiness probe was never consulted"
+        );
     })
     .await;
     })

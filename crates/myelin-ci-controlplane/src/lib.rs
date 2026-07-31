@@ -138,7 +138,7 @@ pub use ci_runner_composition::{
 #[doc(hidden)]
 pub use ci_runtime_composition::ci_production_runtime_factory_test_support;
 pub use ci_runtime_composition::{
-    ci_manifest_pipeline_definition, ci_production_runtime_factory,
+    ci_manifest_pipeline_definition, ci_production_runtime_factory, ActivationReadinessProbe,
     CiProductionRuntimeFactory,
     CiProductionWorkflowPoller, CiRuntimeCompositionError, CiSupersededDefinitionBacklog,
     CutoverPlan,
@@ -1130,8 +1130,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            58,
-            "all 21 tables (incl. the CT-007 credential-generation log), three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 6 job_queue ALTERs (4 claim/completion + the claim-window expand and its validation), the ci_job_spec-stage and three accounting ALTERs, scheduler RLS boundary, 3 claim-column grants, 4 ci_run/workflow discovery grants (incl. the wf_version grant the cutover fence needs), 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, the prelaunch deadline expand, and the cutover fence's database-wide backlog probe plus its predecessor-row seed are present"
+            62,
+            "all 21 tables (incl. the CT-007 credential-generation log), three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 6 job_queue ALTERs (4 claim/completion + the claim-window expand and its validation), the ci_job_spec-stage and three accounting ALTERs, scheduler RLS boundary, 3 claim-column grants, 4 ci_run/workflow discovery grants (incl. the wf_version grant the cutover fence needs), 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, the prelaunch deadline expand, the cutover fence's database-wide backlog probe plus its predecessor-row seed, and the 4 CT-007 5b.3-6e.1 activation-chassis migrations (reservation-marker expand + validate + readiness index + readiness probe) are present"
         );
         assert!(
             spec.consumers.is_empty(),

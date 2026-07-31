@@ -296,6 +296,34 @@ pub const CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
 /// NO privilege on it at all (neither reaping nor renewal needs it), so the startup
 /// excess-privilege probe treats ANY privilege here as excess.
 pub const CI_JOB_CREDENTIAL_GENERATION_MIGRATION_ID: &str = "ci_0021_ci_job_credential_generation";
+/// **CT-007 slice 5b.3-6e.1 (DORMANT).** The nullable operational-reservation write-version marker.
+/// Legacy/V3 writers leave it `NULL`; the eventual V2 writer stores exactly `2`. Nullable so an
+/// already-populated hot queue takes no rewrite and older-writer rows stay readable. Appended after
+/// every previously applied id — never inserted among the checksum-immutable `ci_0004*` queue
+/// migrations. The scheduler receives NO update privilege on it (the excess-privilege probe asserts
+/// it explicitly); only the app role's V2 reserve writer ever sets it, in 6e.2.
+pub const CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID: &str =
+    "ci_0022_job_queue_reservation_write_version";
+/// The online second half of the reservation-marker expand: validate the bounded `= 2` CHECK the
+/// expand added `NOT VALID`, so the full-table verification scan runs without the write-blocking lock
+/// a validated-on-add constraint would take.
+pub const CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID: &str =
+    "ci_0022a_job_queue_reservation_write_version_validate";
+/// Additive, non-blocking partial index over the UNSAFE non-terminal rows a v3→v4 activation must be
+/// clear of: a null claim window OR a reservation marker that is not exactly `2`. The activation
+/// readiness probe (`ci_0022c`) and the cutover predicate both count through it, so the clean path
+/// never seq-scans the hot queue.
+pub const CI_JOB_QUEUE_ACTIVATION_READINESS_INDEX_MIGRATION_ID: &str =
+    "ci_0022b_job_queue_activation_readiness_index";
+/// The database-wide, aggregate-only activation-readiness probe the v3→v4 cutover fence calls while
+/// holding the `wf_definition` row lock. Mirrors the `ci_0020h` backlog-probe fence-role hardening
+/// EXACTLY (born fence-owned, `SECURITY DEFINER`, `row_security=off`, column-scoped to
+/// `job_queue(region, state, claim_window_secs, reservation_write_version)`, `REVOKE PUBLIC`, `GRANT
+/// EXECUTE` to `myelin_app`). Returns only an unsafe-row COUNT — never a row, tenant, or payload — so
+/// it cannot become a cross-region exfiltration path. DORMANT: no production cutover selects it until
+/// 6e.2.
+pub const CI_V2_ACTIVATION_READINESS_PROBE_MIGRATION_ID: &str =
+    "ci_0022c_ci_v2_activation_readiness_probe";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -1447,6 +1475,270 @@ INSERT INTO wf_definition (wf_type, version, code_hash, status)
 VALUES ('ci.pipeline', 2, 'sentinel:ci-pipeline-v2-never-deployed-on-this-database', 'retired')
 ON CONFLICT (wf_type, version) DO NOTHING";
 
+/// **CT-007 slice 5b.3-6e.1 (DORMANT). The operational-reservation write-version marker.** Nullable
+/// so an already-populated hot queue takes no rewrite: legacy/V3 writers leave it `NULL`, the eventual
+/// V2 writer stores exactly `2`. The CHECK is added `NOT VALID` here and validated by `ci_0022a`, the
+/// online idiom for a declared-hot table.
+///
+/// The constraint add is wrapped in a `DO` block for the SAME reason `claim_window` is: several
+/// live-Postgres fixtures re-execute this exact DDL text against an already-migrated shared
+/// `job_queue`, where a bare `ADD CONSTRAINT` would raise `duplicate_object`. The exception branch
+/// does NOT swallow that — it compares `pg_get_constraintdef` against the exact expected text and
+/// re-raises on any divergence, so the idempotence is "this precise constraint already exists", never
+/// "some constraint by that name".
+pub const ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL: &str = "\
+ALTER TABLE job_queue ADD COLUMN IF NOT EXISTS reservation_write_version smallint;
+DO $myelin$
+DECLARE
+  expected_definition constant text :=
+    'CHECK ((reservation_write_version = 2)) NOT VALID';
+  existing_definition text;
+BEGIN
+  ALTER TABLE job_queue
+    ADD CONSTRAINT job_queue_reservation_write_version_marker
+    CHECK (reservation_write_version = 2) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN
+  SELECT pg_catalog.pg_get_constraintdef(constraint_catalog.oid)
+    INTO existing_definition
+    FROM pg_catalog.pg_constraint AS constraint_catalog
+   WHERE constraint_catalog.conrelid = 'job_queue'::regclass
+     AND constraint_catalog.conname = 'job_queue_reservation_write_version_marker';
+  IF existing_definition IS DISTINCT FROM expected_definition
+     AND existing_definition IS DISTINCT FROM replace(expected_definition, ' NOT VALID', '') THEN
+    RAISE EXCEPTION
+      'job_queue_reservation_write_version_marker already exists with a DIVERGENT definition: % (expected: %)',
+      existing_definition, expected_definition;
+  END IF;
+END
+$myelin$";
+
+/// The online second half of the reservation-marker expand: verify the existing rows against the
+/// bounded `= 2` CHECK without the write-blocking lock a validated-on-add constraint would have taken.
+pub const VALIDATE_JOB_QUEUE_RESERVATION_WRITE_VERSION_DDL: &str = "\
+ALTER TABLE job_queue VALIDATE CONSTRAINT job_queue_reservation_write_version_marker";
+
+/// **The activation-readiness partial index (CT-007 slice 5b.3-6e.1).** Covers exactly the UNSAFE
+/// non-terminal rows a v3→v4 activation must be clear of — a null claim window, or a reservation
+/// marker that is not exactly `2` — so both the database-wide readiness probe (`ci_0022c`) and the
+/// cutover predicate answer through an index lookup rather than a hot-queue seq-scan. Non-blocking
+/// (`CONCURRENTLY`), one top-level command. The predicate is byte-identical to the probe's `WHERE`.
+pub const CREATE_JOB_QUEUE_ACTIVATION_READINESS_INDEX_DDL: &str = "\
+CREATE INDEX CONCURRENTLY IF NOT EXISTS job_queue_activation_readiness \
+ON job_queue (region) \
+WHERE state <> 'terminal' AND (claim_window_secs IS NULL OR reservation_write_version IS DISTINCT FROM 2)";
+
+/// **The v3→v4 activation-readiness probe (CT-007 slice 5b.3-6e.1, DORMANT).** The cutover fence calls
+/// this DATABASE-WIDE while holding the `wf_definition` row lock, to answer one aggregate question:
+/// "does any non-terminal queue row still lack a claim window or carry a reservation marker other than
+/// 2?". `job_queue` is FORCE ROW LEVEL SECURITY `(tenant_id, region)`, and at cutover time there is no
+/// tenant/region scope, so a `NOBYPASSRLS` caller could only ever count its own slice — a fail-OPEN
+/// activation. This function is the global authority, hardened IDENTICALLY to the `ci_0020h` backlog
+/// probe (round-3 blocker 2):
+///
+/// - **Ownership is load-bearing.** A `SECURITY DEFINER` function runs as its OWNER, so its RLS
+///   authority is the owner's. It is BORN owned by the dedicated `myelin_ci_definition_fence`
+///   `BYPASSRLS` role (adopted for one transaction via its explicit `SET TRUE` membership), never
+///   ownership-transferred, so the silent-adoption hazard of `CREATE OR REPLACE` over a
+///   foreign-owned function cannot arise. A pre-existing function is adopted only when every catalog
+///   field matches exactly; any divergence raises.
+/// - `SET row_security = off` is belt-and-braces: if this were ever owned by a role without bypass
+///   authority, PostgreSQL raises LOUDLY on the RLS-affected read instead of quietly returning a
+///   false-negative (fail-closed beats fail-open under provisioning drift).
+/// - `SET search_path = pg_catalog` plus fully-qualified object names; a fixed query, NO dynamic SQL,
+///   NO bound parameter; a BIGINT aggregate result — it returns "how many unsafe rows", never a row,
+///   a tenant, or a payload, so it cannot become a cross-region exfiltration path.
+/// - `REVOKE ALL … FROM PUBLIC`, then `GRANT EXECUTE` to exactly the one runtime role that runs the
+///   cutover; the regional scheduler is NEVER granted cross-region authority.
+///
+/// The predicate matches the `job_queue_activation_readiness` partial index's own, for index
+/// eligibility. The production caller names this function SCHEMA-QUALIFIED
+/// (`myelin_ci_security.myelin_ci_v2_activation_readiness_unsafe_count`); schema-isolated live tests
+/// substitute the call through a dedicated seam rather than weakening production resolution.
+pub const CREATE_CI_V2_ACTIVATION_READINESS_PROBE_DDL: &str = "\
+-- ATOMICITY: this whole script is ONE transaction, the IMPLICIT one PostgreSQL opens around a
+-- multi-statement simple query — NOT an explicit `BEGIN`/`COMMIT`, which would leave the pooled
+-- migration connection in an aborted transaction block on refusal (the exact `ci_0020h` reasoning).
+
+-- (1) PROVISIONING PREFLIGHT. The migration VERIFIES; it never creates or alters a cluster role.
+-- BYPASSRLS provisioning is an operator-controlled action, and migration behaviour must not vary
+-- with accidental excess privilege.
+DO $myelin$
+DECLARE
+  remediation constant text :=
+    'run scripts/pg-init/01-ci-definition-fence.sql as the database provisioning administrator, '
+    'passing migration_role=<DATABASE_MIGRATION_URL role>, then retry boot';
+  role_ok boolean;
+  schema_owner text;
+  edge record;
+  extra text;
+BEGIN
+  SELECT rolcanlogin = false AND rolsuper = false AND rolbypassrls = true
+         AND rolcreatedb = false AND rolcreaterole = false AND rolreplication = false
+         AND rolinherit = false
+    INTO role_ok
+    FROM pg_catalog.pg_roles
+   WHERE rolname = 'myelin_ci_definition_fence';
+  IF role_ok IS NULL THEN
+    RAISE EXCEPTION 'the myelin_ci_definition_fence role is absent: %', remediation;
+  END IF;
+  IF NOT role_ok THEN
+    RAISE EXCEPTION
+      'the myelin_ci_definition_fence role does not carry the exact provisioned attributes '
+      '(NOLOGIN NOSUPERUSER BYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT): %',
+      remediation;
+  END IF;
+
+  SELECT pg_catalog.pg_get_userbyid(n.nspowner) INTO schema_owner
+    FROM pg_catalog.pg_namespace n WHERE n.nspname = 'myelin_ci_security';
+  IF schema_owner IS NULL THEN
+    RAISE EXCEPTION 'the myelin_ci_security schema is absent: %', remediation;
+  END IF;
+  IF schema_owner <> 'myelin_ci_definition_fence' THEN
+    RAISE EXCEPTION
+      'the myelin_ci_security schema is owned by % rather than myelin_ci_definition_fence: %',
+      schema_owner, remediation;
+  END IF;
+
+  SELECT a.admin_option, a.inherit_option, a.set_option INTO edge
+    FROM pg_catalog.pg_auth_members a
+   WHERE a.roleid = 'myelin_ci_definition_fence'::regrole::oid
+     AND a.member = current_user::regrole::oid;
+  IF edge IS NULL THEN
+    RAISE EXCEPTION
+      'the migration role % has no direct membership in myelin_ci_definition_fence, so it cannot '
+      'create the probe function as its final owner: %', current_user, remediation;
+  END IF;
+  IF NOT edge.set_option OR edge.inherit_option OR edge.admin_option THEN
+    RAISE EXCEPTION
+      'the migration role % membership in myelin_ci_definition_fence must be '
+      '(set_option=true, inherit_option=false, admin_option=false), found (%, %, %): %',
+      current_user, edge.set_option, edge.inherit_option, edge.admin_option, remediation;
+  END IF;
+
+  -- BOTH DIRECTIONS, exactly as ci_0020h: another role holding SET TRUE could adopt the same
+  -- BYPASSRLS authority, and the fence role being a member of anything else would silently widen it.
+  SELECT string_agg(m.rolname, ', ' ORDER BY m.rolname) INTO extra
+    FROM pg_catalog.pg_auth_members a
+    JOIN pg_catalog.pg_roles m ON m.oid = a.member
+   WHERE a.roleid = 'myelin_ci_definition_fence'::regrole::oid
+     AND a.member <> current_user::regrole::oid;
+  IF extra IS NOT NULL THEN
+    RAISE EXCEPTION
+      'role(s) % may also adopt myelin_ci_definition_fence; exactly one migration role may hold '
+      'that authority: %', extra, remediation;
+  END IF;
+  SELECT string_agg(g.rolname, ', ' ORDER BY g.rolname) INTO extra
+    FROM pg_catalog.pg_auth_members a
+    JOIN pg_catalog.pg_roles g ON g.oid = a.roleid
+   WHERE a.member = 'myelin_ci_definition_fence'::regrole::oid;
+  IF extra IS NOT NULL THEN
+    RAISE EXCEPTION
+      'myelin_ci_definition_fence is a member of %, which widens its reach beyond the one '
+      'question it exists to answer: %', extra, remediation;
+  END IF;
+END
+$myelin$;
+
+-- (2) TABLE ACCESS, established only now that `job_queue` exists. Table-level REVOKE does not remove
+-- separately granted COLUMN ACLs, so every live column is revoked explicitly before the four-column
+-- grant is (re)issued — this is what makes an adopted role's stale column grants go.
+REVOKE ALL PRIVILEGES ON TABLE public.job_queue FROM myelin_ci_definition_fence;
+DO $myelin$
+DECLARE
+  column_name text;
+BEGIN
+  FOR column_name IN
+    SELECT a.attname
+      FROM pg_catalog.pg_attribute a
+     WHERE a.attrelid = 'public.job_queue'::regclass
+       AND a.attnum > 0
+       AND NOT a.attisdropped
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL (%I) ON TABLE public.job_queue FROM myelin_ci_definition_fence', column_name);
+  END LOOP;
+END
+$myelin$;
+GRANT USAGE ON SCHEMA public TO myelin_ci_definition_fence;
+GRANT SELECT (region, state, claim_window_secs, reservation_write_version)
+  ON public.job_queue TO myelin_ci_definition_fence;
+
+-- (3) BECOME THE FINAL OWNER. The function is BORN fence-owned, so no ownership transfer is ever
+-- needed and the silent-adoption hazard of a foreign-owned replace cannot arise.
+SET LOCAL ROLE myelin_ci_definition_fence;
+
+-- (4) EXACT ADOPT-OR-CREATE. Never CREATE OR REPLACE: an existing function is accepted only when
+-- every catalog field agrees exactly, and ANY divergence raises rather than overwriting.
+DO $myelin$
+DECLARE
+  probe constant text :=
+    'myelin_ci_security.myelin_ci_v2_activation_readiness_unsafe_count()';
+  expected_body constant text :=
+    'SELECT count(*) FROM public.job_queue '
+    'WHERE state <> ''terminal'' '
+    'AND (claim_window_secs IS NULL OR reservation_write_version IS DISTINCT FROM 2)';
+  existing oid := pg_catalog.to_regprocedure(probe);
+  found record;
+BEGIN
+  IF existing IS NULL THEN
+    EXECUTE format(
+      'CREATE FUNCTION %s RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER '
+      'SET search_path = pg_catalog SET row_security = off AS $body$%s$body$',
+      probe, expected_body);
+  ELSE
+    SELECT p.proowner, p.prolang, p.prokind, p.prorettype, p.proargtypes::text,
+           p.provolatile, p.prosecdef, p.proconfig, btrim(p.prosrc) AS body
+      INTO found
+      FROM pg_catalog.pg_proc p
+     WHERE p.oid = existing;
+    IF found.proowner <> 'myelin_ci_definition_fence'::regrole::oid
+       OR found.prolang <> (SELECT oid FROM pg_catalog.pg_language WHERE lanname = 'sql')
+       OR found.prokind <> 'f'
+       OR found.prorettype <> 'bigint'::regtype::oid
+       OR found.proargtypes <> ''
+       OR found.provolatile <> 's'
+       OR found.prosecdef <> true
+       OR found.proconfig IS DISTINCT FROM
+          ARRAY['search_path=pg_catalog', 'row_security=off']
+       OR found.body <> expected_body THEN
+      RAISE EXCEPTION
+        'a function already exists at % but diverges from the expected activation-readiness probe '
+        '(owner/language/kind/return/args/volatility/security/config/body). Refusing to overwrite '
+        'it. Inspect it, then remove or reconcile it deliberately.', probe;
+    END IF;
+  END IF;
+END
+$myelin$;
+
+-- (5) FUNCTION AND SCHEMA ACLs, normalized. Every non-owner grant is stripped first so an adopted
+-- object cannot retain an execute grant from another purpose.
+DO $myelin$
+DECLARE
+  probe constant text :=
+    'myelin_ci_security.myelin_ci_v2_activation_readiness_unsafe_count()';
+  grantee text;
+BEGIN
+  FOR grantee IN
+    SELECT pg_catalog.pg_get_userbyid(acl.grantee)
+      FROM pg_catalog.pg_proc p
+      CROSS JOIN LATERAL pg_catalog.aclexplode(p.proacl) AS acl
+     WHERE p.oid = pg_catalog.to_regprocedure(probe)
+       AND acl.grantee <> 'myelin_ci_definition_fence'::regrole::oid
+       AND acl.grantee <> 0
+  LOOP
+    EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I', probe, grantee);
+  END LOOP;
+END
+$myelin$;
+REVOKE ALL ON FUNCTION myelin_ci_security.myelin_ci_v2_activation_readiness_unsafe_count()
+  FROM PUBLIC;
+-- The security schema's USAGE grant to myelin_app was established by ci_0020h and is left intact;
+-- this migration only adds the EXECUTE on its own function.
+GRANT EXECUTE ON FUNCTION
+  myelin_ci_security.myelin_ci_v2_activation_readiness_unsafe_count() TO myelin_app;
+
+RESET ROLE;";
+
 /// Accumulate exact, immutable failed-attempt receipts on the durable queue row until a later
 /// terminal generation settles their aggregate usage. A constant empty-object default is an
 /// expand-only metadata change on supported PostgreSQL and keeps existing hot rows readable.
@@ -1988,6 +2280,30 @@ pub fn ci_controlplane_migrations() -> Migrations {
         CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID,
         SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL,
     ));
+    // CT-007 slice 5b.3-6e.1 (DORMANT). The activation chassis: the nullable reservation-marker
+    // column + its online validate, the unsafe-row partial index, and the database-wide readiness
+    // probe. Appended after every previously shipped id. No scheduler grant accompanies the column:
+    // the scheduler never writes it (the excess-privilege probe asserts it explicitly), and the
+    // readiness probe reads it through the bypass-RLS fence role, not the regional scheduler.
+    migrations.push(Migration::plain_on(
+        CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID,
+        ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL,
+        JOB_QUEUE_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID,
+        VALIDATE_JOB_QUEUE_RESERVATION_WRITE_VERSION_DDL,
+        JOB_QUEUE_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_JOB_QUEUE_ACTIVATION_READINESS_INDEX_MIGRATION_ID,
+        CREATE_JOB_QUEUE_ACTIVATION_READINESS_INDEX_DDL,
+        JOB_QUEUE_TABLE,
+    ));
+    migrations.push(Migration::plain(
+        CI_V2_ACTIVATION_READINESS_PROBE_MIGRATION_ID,
+        CREATE_CI_V2_ACTIVATION_READINESS_PROBE_DDL,
+    ));
     Migrations::of(migrations)
 }
 
@@ -2412,6 +2728,121 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         );
     }
 
+    /// **CT-007 5b.3-6e.1: the activation-readiness probe mirrors the ci_0020h fence-role hardening
+    /// EXACTLY** — born fence-owned, `SECURITY DEFINER`, `row_security=off`, column-scoped to exactly
+    /// the four `job_queue` columns, aggregate-only, `REVOKE PUBLIC`, `GRANT EXECUTE` to `myelin_app`
+    /// only, never `CREATE OR REPLACE`, never a cluster-authority provision, never a scheduler grant.
+    #[test]
+    fn the_activation_readiness_probe_is_born_fence_owned_and_column_scoped_to_job_queue() {
+        let ddl = CREATE_CI_V2_ACTIVATION_READINESS_PROBE_DDL;
+        for required in [
+            // Born fence-owned: adopt the role, create the function, reset the role.
+            "SET LOCAL ROLE myelin_ci_definition_fence;",
+            "RESET ROLE;",
+            // The dedicated security schema, never `public`, and the aggregate-only function.
+            "myelin_ci_security.myelin_ci_v2_activation_readiness_unsafe_count",
+            "RETURNS bigint",
+            "SECURITY DEFINER",
+            "SET search_path = pg_catalog",
+            "SET row_security = off",
+            // Verify-and-refuse provisioning with the exact operator remediation.
+            "run scripts/pg-init/01-ci-definition-fence.sql as the database provisioning administrator",
+            "passing migration_role=<DATABASE_MIGRATION_URL role>, then retry boot",
+            // Exact adopt-or-create, never a blind replace.
+            "to_regprocedure",
+            "diverges from the expected activation-readiness probe",
+            // Column-scoped table access on job_queue, established only once the table exists.
+            "REVOKE ALL PRIVILEGES ON TABLE public.job_queue FROM myelin_ci_definition_fence",
+            "GRANT SELECT (region, state, claim_window_secs, reservation_write_version)",
+            "ON public.job_queue TO myelin_ci_definition_fence",
+            // The aggregate unsafe-row body — the SAME predicate as the partial index.
+            "SELECT count(*) FROM public.job_queue",
+            "state <> ''terminal''",
+            "claim_window_secs IS NULL OR reservation_write_version IS DISTINCT FROM 2",
+        ] {
+            assert!(
+                ddl.contains(required),
+                "the activation-readiness probe pins `{required}`"
+            );
+        }
+        assert!(
+            !ddl.contains("BEGIN;") && !ddl.contains("COMMIT;"),
+            "atomicity comes from the implicit multi-statement transaction, as in ci_0020h"
+        );
+        assert!(
+            !ddl.contains("ALTER FUNCTION") && !ddl.contains("CREATE OR REPLACE FUNCTION"),
+            "the function is BORN fence-owned and never blind-replaced"
+        );
+        for forbidden in ["CREATE ROLE", "ALTER ROLE", "GRANT myelin_ci_definition_fence TO"] {
+            assert!(
+                !ddl.contains(forbidden),
+                "a migration must never provision cluster authority (`{forbidden}`)"
+            );
+        }
+        assert!(
+            ddl.contains("TO myelin_app") && !ddl.contains("myelin_ci_region_scheduler"),
+            "only myelin_app may execute the readiness probe; the regional scheduler gets no \
+             cross-region authority"
+        );
+        // The probe reads ONLY the four scoped columns — never a payload/identity column.
+        for forbidden_column in ["tenant_id", "idem_token", "lease_owner", "job_id", "meter_to"] {
+            assert!(
+                !ddl.contains(&format!(
+                    "GRANT SELECT (region, state, claim_window_secs, reservation_write_version, {forbidden_column}"
+                )),
+                "the readiness probe grant must never widen to `{forbidden_column}`"
+            );
+        }
+    }
+
+    /// **CT-007 5b.3-6e.1: the reservation-marker expand is online, additive, and marks exactly 2.**
+    #[test]
+    fn reservation_write_version_expand_is_online_and_marks_exactly_two() {
+        let expand = ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL;
+        assert!(expand.contains("ADD COLUMN IF NOT EXISTS reservation_write_version smallint"));
+        assert!(expand.contains("ADD CONSTRAINT job_queue_reservation_write_version_marker"));
+        assert!(expand.contains("CHECK (reservation_write_version = 2) NOT VALID"));
+        assert!(
+            !expand.contains("reservation_write_version smallint NOT NULL"),
+            "legacy/V3 writers leave the marker NULL; the hot-table expand stays nullable"
+        );
+        assert!(
+            !myelin_substrate::is_blocking_alter(expand)
+                && !myelin_substrate::is_blocking_alter(
+                    VALIDATE_JOB_QUEUE_RESERVATION_WRITE_VERSION_DDL
+                ),
+            "neither half of the reservation-marker expand may take a blocking lock on the hot queue"
+        );
+        // The idempotent re-apply branch VERIFIES the existing constraint, never adopts it.
+        assert!(expand.contains("pg_get_constraintdef"));
+        assert!(expand.contains("DIVERGENT definition"));
+        assert!(expand.contains("CHECK ((reservation_write_version = 2)) NOT VALID"));
+        assert_eq!(
+            VALIDATE_JOB_QUEUE_RESERVATION_WRITE_VERSION_DDL,
+            "ALTER TABLE job_queue VALIDATE CONSTRAINT job_queue_reservation_write_version_marker"
+        );
+    }
+
+    /// **CT-007 5b.3-6e.1: the activation-readiness partial index is non-blocking and covers exactly
+    /// the unsafe non-terminal rows (same predicate as the probe).**
+    #[test]
+    fn the_activation_readiness_index_is_concurrent_and_covers_unsafe_rows() {
+        let index = CREATE_JOB_QUEUE_ACTIVATION_READINESS_INDEX_DDL;
+        assert!(index.starts_with("CREATE INDEX CONCURRENTLY IF NOT EXISTS job_queue_activation_readiness"));
+        assert_eq!(
+            index.matches(';').count(),
+            0,
+            "a concurrent index must be one top-level command"
+        );
+        for required in [
+            "ON job_queue (region)",
+            "WHERE state <> 'terminal'",
+            "claim_window_secs IS NULL OR reservation_write_version IS DISTINCT FROM 2",
+        ] {
+            assert!(index.contains(required), "the readiness index pins `{required}`");
+        }
+    }
+
     /// The provisioning script is the ONLY place cluster authority is granted, and the migration's
     /// refusal names it exactly — so an operator reading the failure knows what to run.
     #[test]
@@ -2522,12 +2953,26 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .iter()
             .position(|id| *id == CI_JOB_QUEUE_CLAIM_WINDOW_VALIDATE_MIGRATION_ID)
             .expect("the claim-window validation is in the set");
-        assert_eq!(expand, ids.len() - 5);
-        assert_eq!(validate, ids.len() - 4);
+        // The claim-window pair sits immediately before the wf_version grant, the backlog probe, the
+        // cutover fence-row seed, and the CT-007 5b.3-6e.1 activation-chassis tail (4 migrations).
+        assert_eq!(expand, ids.len() - 9);
+        assert_eq!(validate, ids.len() - 8);
+        // The activation chassis (ci_0022*) is appended AFTER the cutover fence-row seed, in order,
+        // and the readiness probe is now the last of all.
         assert_eq!(
-            ids.last().copied(),
-            Some(CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID),
-            "the cutover fence's predecessor-row seed is appended last of all"
+            ids[ids.len() - 5],
+            CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID,
+            "the cutover fence's predecessor-row seed precedes only the ci_0022* chassis"
+        );
+        assert_eq!(
+            &ids[ids.len() - 4..],
+            &[
+                CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID,
+                CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID,
+                CI_JOB_QUEUE_ACTIVATION_READINESS_INDEX_MIGRATION_ID,
+                CI_V2_ACTIVATION_READINESS_PROBE_MIGRATION_ID,
+            ],
+            "the CT-007 5b.3-6e.1 activation chassis is appended last, in expand→validate→index→probe order"
         );
         assert!(
             expand
@@ -2547,8 +2992,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            58,
-            "21 table/RLS (incl. the CT-007 credential-generation log) + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate) + 1 ci_job_spec-stage ALTER + 3 ci_job_accounting ALTERs + 1 scheduler-boundary + 3 scheduler claim grants + 4 scheduler ci_run/workflow discovery grants (incl. wf_version) + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand"
+            62,
+            "21 table/RLS (incl. the CT-007 credential-generation log) + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate) + 1 ci_job_spec-stage ALTER + 3 ci_job_accounting ALTERs + 1 scheduler-boundary + 3 scheduler claim grants + 4 scheduler ci_run/workflow discovery grants (incl. wf_version) + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand + 4 CT-007 5b.3-6e.1 activation-chassis (reservation-marker expand + validate + readiness index + readiness probe)"
         );
         for m in &migrations.0 {
             assert!(
@@ -2621,6 +3066,12 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL);
             } else if m.id == CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID {
                 assert_eq!(m.ddl, SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL);
+            } else if m.id == CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL);
+            } else if m.id == CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID {
+                assert_eq!(m.ddl, VALIDATE_JOB_QUEUE_RESERVATION_WRITE_VERSION_DDL);
+            } else if m.id == CI_V2_ACTIVATION_READINESS_PROBE_MIGRATION_ID {
+                assert_eq!(m.ddl, CREATE_CI_V2_ACTIVATION_READINESS_PROBE_DDL);
             } else if m.id == CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_LEASE_EPOCH_DDL);
             } else if m.id == CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID {
@@ -2671,8 +3122,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            58,
-            "the runner applied all 21 table/RLS (incl. the CT-007 credential-generation log), 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate), 1 ci_job_spec-stage ALTER, 3 ci_job_accounting ALTERs, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, and 1 prelaunch deadline expand"
+            62,
+            "the runner applied all 21 table/RLS (incl. the CT-007 credential-generation log), 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate), 1 ci_job_spec-stage ALTER, 3 ci_job_accounting ALTERs, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, 1 prelaunch deadline expand, and the 4 CT-007 5b.3-6e.1 activation-chassis migrations (reservation-marker expand + validate + readiness index + readiness probe)"
         );
         assert_eq!(
             runner.applied()[0],
@@ -2736,9 +3187,9 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             workflow_id_grant.ddl,
             GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL
         );
-        let ci_job_reap_reset_grant = migrations.0.iter().rev().nth(5).expect(
-            "the ci_job reap-reset grant precedes only the claim-window pair and the wf_version \
-             grant",
+        let ci_job_reap_reset_grant = migrations.0.iter().rev().nth(9).expect(
+            "the ci_job reap-reset grant precedes only the claim-window pair, the wf_version grant, \
+             the backlog probe, the cutover fence-row seed, and the 4-migration 5b.3-6e.1 chassis",
         );
         assert_eq!(
             ci_job_reap_reset_grant.id,
