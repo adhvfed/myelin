@@ -151,6 +151,15 @@ myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
 # production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
+# CT-007 5b.3-6e.2 (Stage A §4): enable `test-support` on the sandbox crate for THIS crate's DEV/TEST
+# targets ONLY — the four live-PG §4 active-path tests reach the sandbox's `pub` `test-support`
+# checkout-cycle driver (`drive_checkout_cycle_with_substituted_runsc_given`) to drive the REAL
+# `launch_checkout_orchestrated_with_given` orchestrator (steps 1-14 single-sourced) under a
+# deterministic hardware-independent Enabled backend, injecting the REAL `DurableAttemptAuthority`
+# obtained the production way (`reserve_parent_attempt` → `Admitted`). DEV-ONLY, resolver-v2 safe: the
+# normal `[dependencies]` edge above stays feature-less, so `cargo tree -e no-dev` / a `--release`
+# production build carries NO test-support edge (same posture as the events/storage dev-deps above).
+myelin-ci-sandbox = { path = "../myelin-ci-sandbox", features = ["test-support"] }
 # The architecture-lint ratchet (contract 1.6): CI-P6's own red+green confirmation that the
 # `no-untagged-personal-data` lint REJECTS an untagged PII CI field and ADMITS the tagged CI schema
 # (tests/lint_no_untagged_personal_data.rs). A test-support crate (NOT a production DAG node) — it

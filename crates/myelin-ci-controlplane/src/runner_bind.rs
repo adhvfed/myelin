@@ -790,6 +790,73 @@ fn durable_spec_resolver_with_issuer(
     })
 }
 
+/// **CT-007 slice 5b.3-6e.2: the V2 spec resolver (DORMANT).** Identical claim reconstruction,
+/// trust/null-window checks, and scope derivation as [`durable_spec_resolver`], but the resolved
+/// spec's INITIAL run-token authorization is minted through the V2 phase-credential path:
+/// [`V2CheckoutComposition::mint_initial_phase_credential`](crate::ci_checkout_composition::V2CheckoutComposition::mint_initial_phase_credential)
+/// mints a `CheckoutAdvertise` generation for a checkout-bearing job (or a `Workload` generation for a
+/// compute job) and returns the phase-authorization context — with the credential binding — that the
+/// parent-attempt reserve hook later reconstructs the exact durable claim from. No production
+/// composition root builds this until 5b.3-6e.2 Stage B selects `ci_runner_v2_wiring`.
+pub fn durable_v2_spec_resolver(
+    store: CiJobSpecStore,
+    region: impl Into<String>,
+    rt: tokio::runtime::Handle,
+    checkout_composition: crate::ci_checkout_composition::V2CheckoutComposition,
+) -> JobSpecResolver {
+    let region = region.into();
+    Arc::new(move |leased: &LeasedJob| {
+        let launch = bridge(
+            &rt,
+            store.get_launch_template(&leased.tenant_id, &region, &leased.job_id.to_string()),
+        )
+        .map_err(|e| e.to_string())?;
+        if launch.spec.trust_tier != leased.trust_tier {
+            return Err("claimed trust tier differs from the durable launch template".into());
+        }
+        // The SAME mechanical per-job null-window refusal the V1 resolver performs: a checkout-bearing
+        // job claimed on a legacy row has no durable four-execution ceiling — refuse before the mint.
+        if leased.claim_window_secs.is_none()
+            && crate::ci_claim_window::is_checkout_bearing(launch.spec.kind, &launch.spec.workspace)
+                .map_err(|e| e.to_string())?
+        {
+            return Err(
+                "checkout-bearing job was claimed on a legacy row with no durable claim window; \
+                 refusing before mint (its claim would expire mid-preparation)"
+                    .into(),
+            );
+        }
+        let request = CiJobTokenRequest {
+            tenant_id: leased.tenant_id.clone(),
+            region: region.clone(),
+            wf_run_id: leased.run_id.to_string(),
+            ci_run_id: launch.ci_run_id,
+            job_id: leased.job_id.to_string(),
+            token_authority_handle: launch.token_authority_handle.clone(),
+            idem_token: launch.spec.idem_token.0.clone(),
+            lease_owner: leased.lease_owner.clone(),
+            lease_epoch: leased.lease_epoch,
+            claim_nonce: leased.claim_nonce.clone(),
+            claim_started_at_epoch_secs: leased.claim_started_at_epoch_secs,
+            claim_expires_at_epoch_secs: leased.claim_expires_at_epoch_secs,
+        };
+        request.validate().map_err(|e| e.to_string())?;
+        let checkout_scope =
+            derive_checkout_authorization_scope(JobKind::Ci, &launch.spec.workspace)
+                .map_err(|e| e.to_string())?;
+        // The V2 initial mint: CheckoutAdvertise for a checkout job, Workload for a compute job. The
+        // returned authorization context carries the credential binding the parent-attempt reserve
+        // hook reconstructs the exact durable claim from.
+        let (minted, authorization) = checkout_composition
+            .mint_initial_phase_credential(&request, checkout_scope.as_ref())
+            .map_err(|e| e.to_string())?;
+        validate_run_token(&minted.credential, &launch.token_authority_handle).map_err(|e| e.0)?;
+        Ok(launch
+            .spec
+            .resolve_with_authorization(minted.credential, Some(authorization)))
+    })
+}
+
 /// **The durable backing for the sandbox's preparation-lease checkpoint seam (CT-007 lease/topology
 /// reconciliation).** Binds ONE exact claim generation and renews its execution lease through
 /// [`CiJobQueueStore::renew_preparation_lease`], bridging the sync sandbox call onto the runner

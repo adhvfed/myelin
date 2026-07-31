@@ -142,6 +142,24 @@ impl WorkloadRotatedSpec {
         ))
     }
 
+    /// **`test`/`test-support` ONLY: acquire the workload launch permit against the ROTATED spec,
+    /// without building the `RuntimePreparation`.** The hardware-independent workload-launch CONTROL-PLANE
+    /// fence — for V2 this is `authorize_workload_v2_retained` + the queue→running launch CAS carried by
+    /// the returned [`LaunchPermit`]. Split out of [`Self::acquire_permit_and_prep`] so the deterministic
+    /// runsc-driver seam can drive the REAL permit fence while faking ONLY the hardware
+    /// (`revalidated_explicit_userns_root_identity` + the runsc spawn). The `&self.spec` is used exactly
+    /// as line 73's production acquisition does and is NEVER returned — the seal holds.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn acquire_launch_permit_for_test_support(
+        &self,
+        hooks: &RunnerHooks,
+    ) -> Result<LaunchPermit, BoundWorkloadRefusal> {
+        hooks
+            .acquire_launch_permit(&self.spec)
+            .map_err(|hook_error| BoundWorkloadRefusal::PermitRefused(hook_error.to_string()))
+    }
+
     /// **`#[cfg(test)]` ONLY: the injectable execution seam.** Lets a deterministic test drive the run
     /// with a FAKE spawn (no `runsc`) — the ONE place an `execute` closure receiving `&JobSpec` exists,
     /// and it is absent from every ordinary/`test-support` build. Production callers reach only the

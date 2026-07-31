@@ -62,6 +62,11 @@ impl std::error::Error for CiRunnerIdentityCompositionError {}
 pub struct CiRunnerIdentityAuthorities {
     token_issuer: LockedManifestCiJobTokenIssuer,
     launch_authorizer: Arc<IdentityCiJobLaunchAuthorizer>,
+    /// CT-007 slice 5b.3-6e.2: the SHARED concrete Identity phase-credential minter — the SAME
+    /// `IdentityCiJobCredentialMinter` backing the V1 token issuer (never a second Identity), handed
+    /// to [`V2CheckoutComposition`](crate::ci_checkout_composition::V2CheckoutComposition) so the V2
+    /// per-phase credential path mints through one Identity.
+    phase_credential_minter: Arc<IdentityCiJobCredentialMinter>,
 }
 
 impl CiRunnerIdentityAuthorities {
@@ -71,6 +76,15 @@ impl CiRunnerIdentityAuthorities {
 
     pub fn launch_authorizer(&self) -> Arc<IdentityCiJobLaunchAuthorizer> {
         self.launch_authorizer.clone()
+    }
+
+    /// The shared Identity phase-credential minter (see the field doc). Returned as the trait object
+    /// [`V2CheckoutComposition::new`](crate::ci_checkout_composition::V2CheckoutComposition::new)
+    /// consumes.
+    pub fn phase_credential_minter(
+        &self,
+    ) -> Arc<dyn crate::ci_credential_generation::CiPhaseCredentialMinter> {
+        self.phase_credential_minter.clone()
     }
 }
 
@@ -110,6 +124,127 @@ pub fn ci_runner_hooks(
     .with_checkout_authorization(Box::new(move |spec, scope| {
         checkout_authorizer.authorize_checkout(spec, scope)
     }))
+}
+
+/// **CT-007 slice 5b.3-6e.2: the V2 runner composition root's bundled output (DORMANT).** The V2
+/// spec resolver + the V2 [`RunnerHooks`] a `CiRunnerLoop` is driven with once Stage B selects this
+/// path. Held together so `main` cannot wire a V1 resolver to V2 hooks (or vice versa) — they are one
+/// reviewed unit.
+pub struct CiRunnerV2Wiring {
+    resolver: crate::runner_bind::JobSpecResolver,
+    hooks: RunnerHooks,
+}
+
+impl CiRunnerV2Wiring {
+    /// The V2 spec resolver (checkout → initial `CheckoutAdvertise`, compute → initial `Workload`).
+    pub fn resolver(&self) -> crate::runner_bind::JobSpecResolver {
+        self.resolver.clone()
+    }
+
+    /// Consume into the exact `(resolver, hooks)` pair `CiRunnerLoop::new` takes.
+    pub fn into_parts(self) -> (crate::runner_bind::JobSpecResolver, RunnerHooks) {
+        (self.resolver, self.hooks)
+    }
+}
+
+/// **CT-007 slice 5b.3-6e.2: the ONE named V2 runner composition root (DORMANT).** Composes, for one
+/// region, the coupled V2 activation choices in a single reviewable place:
+///
+/// 1. SHARES the concrete `IdentityCiJobCredentialMinter` from `identity` (never a second Identity);
+/// 2. constructs exactly one [`V2CheckoutComposition`](crate::ci_checkout_composition::V2CheckoutComposition);
+/// 3. builds the V2 resolver ([`durable_v2_spec_resolver`](crate::runner_bind::durable_v2_spec_resolver));
+/// 4. builds the V2 hooks: the V2 workload launch fence (`authorize_workload_v2_retained`), the
+///    per-phase checkout authorization hook, and the parent-attempt reservation admission (compute
+///    AND checkout).
+///
+/// **No production composition root calls this in Stage A** — `main` still selects the V1
+/// `durable_spec_resolver` + `ci_runner_hooks`; the atomic Stage B flip is what points `main` here.
+///
+/// **CT-007 5b.3-6e.2 Stage A (Sol ruling) — the parent-attempt reserve hook's COMPUTE arm is a
+/// FUTURE / non-manifest path, DEAD-in-CI today.** The hook admits both compute `(None, None)` and
+/// checkout `(Some, Some)` jobs, but every CI manifest job is checkout-bearing: `CiDriveManifestV1`'s
+/// `workspace` mandates a `repo_ref`/`commit_oid` and `runtime_authorities_from_durable_claim` always
+/// reconstructs a `(Some, Some)` checkout authority (see the `None`-for-compute note at
+/// `ci_launch_authority.rs:68`). A compute CI job therefore cannot be seeded through this manifest-bound
+/// durable authority, so the compute arm is exercised by NO live-PG §4 proof today. It is kept
+/// intentionally — a future compute authority (workload-as-first-generation) can activate it without
+/// reshaping — and the invariant test `every_ci_manifest_authority_is_checkout_bearing`
+/// (`integration_ci_6e2_active_path.rs`) is the tripwire that forces a compute-through-V2 proof to land
+/// in the same change that first makes a compute CI authority representable.
+pub fn ci_runner_v2_wiring(
+    provider: SubstrateProvider,
+    identity: &CiRunnerIdentityAuthorities,
+    rt: tokio::runtime::Handle,
+) -> Result<CiRunnerV2Wiring, HookError> {
+    let pool = provider.db_pool().clone();
+    let region = provider.config().region.clone();
+    let composition = crate::ci_checkout_composition::V2CheckoutComposition::new(
+        pool.clone(),
+        region.clone(),
+        identity.phase_credential_minter(),
+        crate::ci_job_queue_store(pool.clone()),
+        rt.clone(),
+    )?;
+    let resolver = crate::runner_bind::durable_v2_spec_resolver(
+        crate::ci_job_spec_store(pool),
+        region,
+        rt.clone(),
+        composition.clone(),
+    );
+    let hooks = ci_runner_v2_hooks(provider, identity.launch_authorizer(), composition, rt);
+    Ok(CiRunnerV2Wiring { resolver, hooks })
+}
+
+/// The V2 runner hooks (see [`ci_runner_v2_wiring`]): the SAME scoped Tier-P lifecycle + checkout
+/// authorization as [`ci_runner_hooks`], PLUS the V2 workload launch fence, the per-phase checkout
+/// authorization hook, and the parent-attempt reservation admission.
+fn ci_runner_v2_hooks(
+    provider: SubstrateProvider,
+    launch_authorizer: Arc<IdentityCiJobLaunchAuthorizer>,
+    composition: crate::ci_checkout_composition::V2CheckoutComposition,
+    rt: tokio::runtime::Handle,
+) -> RunnerHooks {
+    use myelin_ci_sandbox::CheckoutPhase;
+    let lifecycle = Arc::new(PgTierPCiJobLifecycle::new(provider, rt));
+    let begin = lifecycle.clone();
+    let verify = lifecycle.clone();
+    let release = lifecycle;
+    let checkout_authorizer = launch_authorizer.clone();
+    let phase_authorizer = launch_authorizer.clone();
+    let workload_authorizer = launch_authorizer;
+    RunnerHooks::new_with_launch_fence(
+        CompletionSettlementOwner::TerminalReporter,
+        Box::new(move |spec| begin.begin(spec)),
+        Box::new(move |spec, handle, usage| release.release_unused(spec, handle, usage)),
+        // The V2 workload launch fence: verify the reservation is launchable, then authorize the
+        // WORKLOAD GENERATION (a V2 phase credential — any preparation credential is refused here by
+        // purpose/generation), NOT the legacy claim-bound credential.
+        Box::new(move |spec| {
+            verify.verify_for_launch(spec)?;
+            workload_authorizer.authorize_workload_v2_retained(spec)
+        }),
+        Box::new(|spec| {
+            HardeningProfile::derive(spec)
+                .assert_enforced()
+                .map_err(|_| HookError("mandatory sandbox isolation profile is unavailable".into()))
+        }),
+    )
+    .with_checkout_authorization(Box::new(move |spec, scope| {
+        checkout_authorizer.authorize_checkout(spec, scope)
+    }))
+    // The per-phase Hop A/Hop B authorization: each preparation generation is authorized against its
+    // OWN retained boundary (advertise / fetch / materialization).
+    .with_checkout_phase_authorization(Box::new(move |spec, scope, phase| match phase {
+        CheckoutPhase::Advertise => {
+            phase_authorizer.authorize_checkout_advertise_retained(spec, scope)
+        }
+        CheckoutPhase::Fetch => phase_authorizer.authorize_checkout_fetch_retained(spec, scope),
+        CheckoutPhase::Materialization => {
+            phase_authorizer.authorize_checkout_materialization_retained(spec, scope)
+        }
+    }))
+    // Parent-attempt admission (reserve → inflight + parent row) — for compute AND checkout.
+    .with_parent_attempt_reservation(composition.parent_attempt_reserve_hook())
 }
 
 /// Test-support job-local cancellation coordinator for Tier-P reservation crash probes.
@@ -728,10 +863,14 @@ pub async fn ci_runner_identity_authorities(
     let minter = RunTokenMinter::with_signer_and_tuples(revocations.clone(), None, signer);
     let verifier = Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor()));
     let region = provider.config().region.clone();
+    // CT-007 slice 5b.3-6e.2: build the Identity phase-credential minter ONCE and share it — the V1
+    // token issuer and (via `ci_runner_v2_wiring`) the V2 checkout composition mint through the SAME
+    // `IdentityCiJobCredentialMinter`, never two divergent Identities.
+    let phase_credential_minter = Arc::new(IdentityCiJobCredentialMinter::new(minter));
     let token_issuer = LockedManifestCiJobTokenIssuer::new(
         provider.db_pool().clone(),
         region.clone(),
-        Arc::new(IdentityCiJobCredentialMinter::new(minter)),
+        phase_credential_minter.clone(),
     );
     let launch_authorizer = Arc::new(IdentityCiJobLaunchAuthorizer::new(
         RunTokenAuthorizer::new(verifier, revocations),
@@ -743,6 +882,7 @@ pub async fn ci_runner_identity_authorities(
     Ok(CiRunnerIdentityAuthorities {
         token_issuer,
         launch_authorizer,
+        phase_credential_minter,
     })
 }
 
