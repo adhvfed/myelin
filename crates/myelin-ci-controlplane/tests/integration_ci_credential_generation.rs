@@ -1914,7 +1914,7 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
     /// absent from this table must have ZERO occurrences.
     /// `(crate, file, marker) -> exact allowed CODE occurrence count` in PRODUCTION source.
     /// Everything absent from this table must have ZERO occurrences in EITHER crate.
-    const ALLOWED: [(&str, &str, &str, usize); 28] = [
+    const ALLOWED: [(&str, &str, &str, usize); 29] = [
         // --- the definition sites ---
         ("myelin-ci-controlplane", "ci_credential_generation.rs", "mint_phase_credential(", 1),
         ("myelin-ci-controlplane", "ci_credential_generation.rs", "acquire_phase_generation_ownership(", 1),
@@ -1932,8 +1932,13 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         ("myelin-ci-sandbox", "checkout_authorization.rs", "authorize_checkout_phase(", 1),
         ("myelin-ci-sandbox", "checkout_authorization.rs", "PhaseAuthorization", 6),
         ("myelin-ci-sandbox", "gvisor.rs", "fetch_checkout_pack_within_parent_attempt_v2(", 1),
-        ("myelin-ci-sandbox", "gvisor.rs", "run_checkout_preparation_v2(", 1),
-        ("myelin-ci-sandbox", "gvisor.rs", "PhaseAuthorization", 9),
+        // CT-007 5b.3-6a (Sol's r4): the capsule + reshaped Hop B entry relocated to the dedicated
+        // `gvisor/checkout_runtime.rs` submodule so module privacy enforces field inseparability.
+        // `run_checkout_preparation_v2(` and one `PhaseAuthorization` (the v2 signature) moved with it;
+        // the submodule also imports `PhaseAuthorization` (its own `use`), so its count is 2.
+        ("myelin-ci-sandbox", "gvisor.rs", "PhaseAuthorization", 8),
+        ("myelin-ci-sandbox", "gvisor/checkout_runtime.rs", "run_checkout_preparation_v2(", 1),
+        ("myelin-ci-sandbox", "gvisor/checkout_runtime.rs", "PhaseAuthorization", 2),
         ("myelin-ci-sandbox", "lib.rs", "with_checkout_phase_authorization(", 1),
         ("myelin-ci-sandbox", "lib.rs", "PhaseAuthorization", 4),
         // --- explicitly ZERO everywhere they could be composed into production ---
@@ -1977,17 +1982,36 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
     let mut scanned_files = 0_usize;
     let mut observed: std::collections::BTreeMap<(String, String, &str), usize> =
         std::collections::BTreeMap::new();
+    // Walk `src` RECURSIVELY (CT-007 5b.3-6a, Sol's r4: the checkout capsule now lives in the
+    // `gvisor/checkout_runtime.rs` submodule, so a non-recursive `read_dir` would leave it unscanned).
+    // The `name` is the path RELATIVE to `src` (e.g. "gvisor/checkout_runtime.rs"), so files directly
+    // in `src` keep their bare basenames.
+    fn collect_rs(
+        dir: &std::path::Path,
+        base: &std::path::Path,
+        out: &mut Vec<(String, std::path::PathBuf)>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|_| panic!("{dir:?} is a directory")) {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rs(&path, base, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .replace('\\', "/");
+                out.push((rel, path));
+            }
+        }
+    }
     for krate in ["myelin-ci-controlplane", "myelin-ci-sandbox"] {
         let source_dir = workspace.join(krate).join("src");
-        for entry in std::fs::read_dir(&source_dir)
-            .unwrap_or_else(|_| panic!("{krate} has a src directory"))
-        {
-            let path = entry.unwrap().path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
+        let mut files = Vec::new();
+        collect_rs(&source_dir, &source_dir, &mut files);
+        for (name, path) in files {
             scanned_files += 1;
-            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
             let source = std::fs::read_to_string(&path).unwrap();
             for marker in MARKERS {
                 let count = code_occurrences(&source, marker);

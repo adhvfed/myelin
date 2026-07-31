@@ -3315,3 +3315,72 @@ slice). **v1→v2 reservation flip must land before 5b.3-6** (begin_parent_attem
 writer→v2, wires the dormant renewal checkpoints + phase mint paths + PhaseAuthorization V2 entry
 points, binds workspace provenance per the criterion above), 5b.3-7 live drill, task #91. Then the
 gate-2 vertical slice. The rest of ledger 12's open items are unchanged.
+
+---
+
+## 2026-07-31 — CT-007 slice 5b.3-6a landed: the shared checkout-runtime provenance capsule
+(Fable orchestrating; Opus, implementation; Sol, design + 7 adversarial review rounds to "no merge
+blockers")
+
+**Context.** 5b.3-6 (compose checkout into launch_with) was decomposed by Sol into five sub-slices —
+four pure-dormant scaffolding (6a-6d) then one atomic activating cutover (6e). Full decomposition in
+the working session's design doc. 6a is the first and smallest: the workspace/lease provenance
+capsule that makes cross-wiring one job's workspace into another's checkout structurally impossible.
+
+**What landed (pure dormant — zero production callers, launch_with untouched).** A new dedicated
+private module `crates/myelin-ci-sandbox/src/gvisor/checkout_runtime.rs` holding the non-Clone
+type-state capsule `AcquiredCheckoutRuntime` → (via the fused Hop-B entry) `PreparedCheckoutRuntime`,
+bundling one workload container id, the EnabledLaunchContext (workspace + userns lease), the
+CheckoutPreparationSession, the checkout scope, the workload OciConfig, and prepared evidence. ONE
+acquire() constructor (single acquire_enabled_workspace; job_key()==workload_container_id is a HARD
+fallible check that disposes on mismatch). Hop B is FUSED with the type transition
+(run_checkout_preparation_v2 consumes the AcquiredCheckoutRuntime and returns the
+PreparedCheckoutRuntime, so substituted evidence is unrepresentable). checkout_scope is derived from
+spec and enforced at consumption via PhaseAuthorization::into_preparation_permit_for_scope (the
+weaker commit-only consumer was deleted). State-correct cleanup keyed on the session's own durable
+disposition, with the wrong release made unrepresentable and an injected CheckoutCleanupExecutor so
+an always-run trace test proves each disposition's exact op sequence without CAP_SYS_ADMIN. Two
+distinct runsc ids (Hop B myelin-checkout-*, workload myelin-prod-*=job_key); durable lease
+transition Allocated→PreparationBound→Prepared→Bound. The `evidence` field renamed
+prepared_checkout_evidence for collision-free confinement.
+
+**The review arc (7 rounds — the capsule is THE invariant the whole 5b.3-6 sequence relies on, so
+its inseparability was hardened to a compile-time guarantee):** r1 = store-vs-enforce (scope/OciConfig/
+evidence stored but not enforced; OciConfig detachable+Clone; evidence substitutable; no behavioral
+cleanup tests) → r2 = residual bypass (weaker commit-only permit still callable; text pin evadable —
+Sol compiled a multi-line Deref) → r3 = AST pin still evadable (type-alias+Deref, free-fn field
+access, leaking associated const — all compiled) → r4 = field-access confinement still leaky
+(descendant-module accessor redefinition, r.evidence on collision-named field, macro expansion) →
+r5 = THE REFRAME: a syn walk cannot soundly enforce "no field escape" while fields are private to
+the 12k-line gvisor.rs; MOVE the capsule to a dedicated private module so LANGUAGE privacy enforces
+it (Sol's 3 prior bypasses became E0616 compile errors) → r6 = in-module leak via top-level static/
+const → CLOSED-WORLD item-kind inventory (fail-closed incl. Item::Verbatim + future non-exhaustive
+syn variants) → r7 = multiplicity (cfg-gated duplicate of an approved name collapsed a BTreeSet) →
+multiplicity-exact sorted-multiset inventory. Final judgment (Sol, explicit): enclosure COMPLETE —
+capsule inseparability = module privacy (outside code cannot name the fields) + the exhaustive,
+fail-closed, multiplicity-exact export inventory (only the five audited-clean accessors expose
+behavior); no remaining safe-Rust escape class. LESSON captured for reuse (the credential slice's
+PhaseAuthorization uses the same syntactic-guard approach and likely shares the holes — re-audit
+tracked): enforce no-escape invariants with a dedicated private module, not a syntactic guard over a
+huge module.
+
+**Gates (orchestrator ran independently):** sandbox --lib 480, --features test-support 522 (incl. the
+4 always-run dispose behavioral tests + the trace test), the entire integration matrix green except
+the known pre-existing firecracker escape test (bisected provisionally to 852bc7ae, a Firecracker/KVM
+host issue tracked separately, skip-green in normal CI), controlplane --lib 583, the cross-crate
+occurrence-table (recursive-scan fix + relocated counts) 14, clippy -D warnings clean, check clean,
+myelin-lints fully green. syn/proc-macro2 added as sandbox DEV-dependencies only (no production DAG
+edge).
+
+**INCIDENT (2026-07-31, recovered no-loss):** during this slice a concurrently-launched firecracker
+investigator ran git bisect in the shared main tree, colliding with the builder. Recovery was clean
+(main intact at its tip, WIP safe in a named stash, no active bisect); lesson recorded — only one
+tree-mutating agent in the main tree at a time, bisect/checkout investigators get a worktree.
+
+**Still open:** 6b (compute-preserving launch_with extraction — move the body to launch_compute_with
+byte-for-byte behind a workspace-shape dispatch, dormant checkout continuation), 6c (dormant sandbox
+orchestrator), 6d (dormant control-plane adapter + the ParentAttemptLimitExceeded/AttemptsExhausted
+recovery fix), 6e (the atomic activating cutover: reservation V2 + begin_parent_attempt + credential
+store construction + accounting V4 + ci.pipeline v3→v4 fence, all together). The v1→v2 reservation
+flip is PART of 6e (proven this session it cannot land standalone). 5b.3-7 live drill, task #91, and
+the gate-2 vertical slice follow. The rest of ledger 12's open items are unchanged.
