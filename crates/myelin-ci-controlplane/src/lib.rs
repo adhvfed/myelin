@@ -59,6 +59,9 @@ pub mod ci_claim_token_issuer;
 /// The immutable, topology-derived scheduler claim window — the per-generation hard ceiling the
 /// heartbeat-extendable execution lease is renewed inside.
 pub mod ci_claim_window;
+/// CT-007 slice 5b.3-6d STEP 3: the dormant control-plane composition for the sandbox checkout
+/// orchestrator — the real durable `AttemptAuthority`/resolver/parent-admission backings.
+pub mod ci_checkout_composition;
 /// CT-007 phase-credential generations: the append-only per-purpose credential log, its
 /// digest-form signed generation binding, and the retained per-boundary execution gates.
 pub mod ci_credential_generation;

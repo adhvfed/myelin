@@ -3618,3 +3618,67 @@ the ParentAttemptReserveHook reconstructs the full CiJobTokenRequest from the ph
 CiJobCredentialBinding (ci_run_id/token_authority_handle/idem_token) + spec.meter_to.reserve_id. Then 6e
 (the atomic activating cutover). Then 5b.3-7, task #91, gate-2 vertical slice. The rest of ledger 12's
 open items are unchanged.
+
+---
+
+## 2026-07-31 — CT-007 slice 5b.3-6d STEP 3 landed: the dormant control-plane composition module
+(Fable orchestrating; Opus, implementation; Sol, design rulings + 2 adversarial review rounds to "no
+merge blockers")
+
+Third of 6d's risk-sequenced units (steps 1/2 = the exhaustion + retry CAS, committed 32e80a00/3e386935).
+The dormant durable adapter that feeds 6c's injected AttemptAuthority its real backing. Dormant: no
+production root constructs or selects it.
+
+**What landed (new ci_checkout_composition.rs + read-helper/comment in ci_prelaunch_usage_journal.rs +
+bridge promotion in runner_bind.rs + lib.rs mod):** V2 phase-store factory
+(CiJobCredentialGenerationStore::with_pg_and_write_version(V2PhaseBound) + Arc<dyn CiPhaseCredentialMinter>
+— production passes the concrete IdentityCiJobCredentialMinter); the V2 resolver seam (checkout→initial
+CheckoutAdvertise, compute→initial Workload); DurableAttemptAuthority impl of the sandbox AttemptAuthority
+(begin/complete/seal_phase→the journal; renew→DurablePreparationLeaseCheckpoint; mint_phase/workload_credential
+→the credential store; should_requeue→the new advisory-only parent_attempt_retry_permitted count<max);
+parent-attempt admission via admit_parent_attempt (step 1) in one tenant tx, mapped to ParentAttemptAdmission.
+
+**Sol's design rulings that shaped it:** (1) step 3 REQUIRES a live-PG gate (component tests + 6c's fakes
+don't prove the COMPOSITION); (2) the reporter claim = a dedicated PreparationReportClaim (the exact 12
+CiJobTokenRequest fields), NOT enlarging CompletionClaim — that's step 4; (3) the reporter seam (step 4) +
+cutover generalization (step 5) STAY in 6d as separately-reviewed dormant units, NOT folded into 6e (which
+would overload the single activating slice).
+
+**Two real bugs Sol caught in the initial build (fixed):** (a) reconstruct_claim returned the credential
+context's checkout_scope WITHOUT deriving+comparing it from spec.workspace — a commit-substitution gap the
+auth chain exists to prevent (the fixture even accepted a checkout workspace with None scope); fixed to
+derive from spec via derive_checkout_authorization_scope + require exact structural equality across all 5
+scope fields + require binding.purpose==the expected initial purpose + binding.idem_token==spec.idem_token,
+with 3 negative refusal tests. (b) the async→sync bridge's block_in_place PANICS on a current-thread Tokio
+runtime — the builder had FORKED a copy rather than reusing the canonical helper; fixed to reuse the one
+pub(crate) runner_bind::bridge, with the off-runtime precondition (two distinct off-runtime OS threads:
+the runner's CiRunnerLoop::spawn thread for the reserve hook + initial resolve, the sandbox scoped-launch
+std::thread for the authority calls; neither a Tokio worker) documented accurately.
+
+**Live-PG composition suite (Sol-mandated, all green):** durable_checkout_adapter_drives_the_full_phase_sequence
+(the real reserve hook from an off-runtime thread drives reserved→inflight + 1 parent row; the full
+transport→materialization→workload phase sequence; 4 exact generation rows, both phases measured, 5 Identity
+calls yet 4 rows = replay-not-recreate, renew moves ONLY lease_expires); adapter_admission_loses_cleanly_to
+_claim_generation_change (a control proves the ADAPTER transitions; then admission is proven Lock-waiting via
+pg_stat_activity, and after reclaim refuses with no parent row + no reservation transition);
+adapter_exhaustion_retry_and_stale_authority_matrix (exact 4/5→should_requeue true, 5/5→false, exhaustion→typed
+AttemptsExhausted with reservation inflight, and a stale authority after reclaim refuses renew/begin/mint —
+zero journal/generation writes, zero Identity).
+
+**Review rounds:** r1 (the rulings pass) caught the 2 bugs; r2 = 2 additive-rigor blockers — the count==max-1
+test actually seeded count(2) not 4/5 (fixed to exact 4/5 and 5/5 boundaries), and the DORMANCY SCAN didn't
+cover the new façade (a root could construct V2CheckoutComposition / mint_initial_phase_credential /
+parent_attempt_reserve_hook without tripping it) — extended with the 4 new markers + explicit
+composition-root zeros across all 5 roots (double-guarded: set-equality + per-root explicit-0). Then no
+blockers.
+
+**Gates (orchestrator ran independently):** controlplane --lib 593, the entire --features integration matrix
+green (837 passed incl. the 3 adapter composition tests + the extended dormancy scan), sandbox --lib 503 /
+test-support 552 (sandbox crate byte-untouched), clippy -D warnings clean, check clean, myelin-lints green,
+git diff --check clean.
+
+**Still open:** 6d step 4 (reporter-seam extension: the PreparationReportClaim + RunnerAgent-owns-the-terminal-
+path per Sol's option-c design — task #19) and step 5 (definition-cutover generalization for a v3→v4
+predecessor/current pair, active pair staying v2/v3 — task #20), each dormant + separately live-PG-gated.
+Then 6e (the atomic activating cutover). Then 5b.3-7, task #91, gate-2 vertical slice. The rest of ledger 12's
+open items are unchanged.

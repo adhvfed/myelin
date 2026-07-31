@@ -164,7 +164,12 @@ pub type JobSpecResolver = Arc<dyn Fn(&LeasedJob) -> Result<JobSpec, String> + S
 /// back to `block_in_place` only if ever driven on a multi-thread runtime worker (the SAME convention
 /// as `myelin_storage::kms_durable`). NEVER call this from a current-thread runtime (drive the runner
 /// on its own thread — `CiRunnerLoop::spawn`).
-fn bridge<F: std::future::Future>(rt: &tokio::runtime::Handle, fut: F) -> F::Output {
+///
+/// **CT-007 5b.3-6d STEP 3:** this is the ONE shared off-runtime bridge;
+/// [`ci_checkout_composition`](crate::ci_checkout_composition)'s dormant `DurableAttemptAuthority` and
+/// parent-attempt reserve hook reuse it (both are driven from this same `CiRunnerLoop::spawn` dedicated
+/// off-runtime thread), rather than forking a second, subtly-different copy.
+pub(crate) fn bridge<F: std::future::Future>(rt: &tokio::runtime::Handle, fut: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(_) => tokio::task::block_in_place(|| rt.block_on(fut)),
         Err(_) => rt.block_on(fut),
