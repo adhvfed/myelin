@@ -2438,7 +2438,14 @@ impl UserNamespaceAllocator {
     /// — the real, process-lifetime allocator (`try_new`) must keep failing closed on the first
     /// `AlreadyLocked`, since in production that error means a second real runner process, not a
     /// transient fork-window artifact.
-    #[cfg(test)]
+    ///
+    /// CT-007 slice 5b.3-6e.1b: widened from `#[cfg(test)]` to `#[cfg(any(test, feature =
+    /// "test-support"))]` so the hardware-independent runsc-driver fixture (a `test-support`,
+    /// non-`cfg(test)` consumer) can build a deterministic allocator from its OWN fixture
+    /// `subuid`/`subgid` files — no dependence on this host's real `/etc/subuid`, so the capsule
+    /// tests RUN rather than soft-skip. The PRODUCTION constructor ([`Self::try_new`]) is NOT
+    /// relaxed; the strict-ownership/parent checks it enforces stay untouched.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn try_new_for_tests(
         leases_dir: PathBuf,
         subuid_path: &Path,

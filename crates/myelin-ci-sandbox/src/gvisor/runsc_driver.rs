@@ -96,3 +96,75 @@ impl super::GvisorBackend {
         )
     }
 }
+
+/// **CT-007 slice 5b.3-6e.1b: the checkout-capsule variant of the hardware-independent driver
+/// (DORMANT, test-support only).**
+///
+/// Drives the deterministic substituted checkout SUCCESS cycle under `root` — a fresh
+/// deterministic-directory workspace manager + a fixture-`subuid` userns allocator + a REAL capsule,
+/// then the sealed [`AcquiredCheckoutRuntime::execute_substituted_checkout_for_test_support`](super::AcquiredCheckoutRuntime)
+/// seam (real `Allocated → PreparationBound → Prepared → Bound` transitions; substituted Hop B /
+/// workload; real settle). Asserts the sentinel round-tripped through the retained OCI mount and the
+/// capsule settled cleanly, then confirms the durable step-8 state (workspace deleted, capacity zero,
+/// userns slot reusable, managers healthy). This is the building block 5b.3-6e.2's composed §4 tests
+/// extend; it is `pub` so an integration binary can call it, and it anchors the whole `test-support`
+/// substrate for the ordinary (non-`cfg(test)`) `--features test-support` build. No Btrfs / subuid /
+/// KVM / runsc is touched.
+impl super::GvisorBackend {
+    #[allow(clippy::unused_self)]
+    pub fn drive_checkout_cycle_with_substituted_runsc(&self, root: &std::path::Path) {
+        drive_checkout_cycle_with_substituted_runsc(root)
+    }
+}
+
+fn drive_checkout_cycle_with_substituted_runsc(root: &std::path::Path) {
+    let sentinel = b"myelin-6e1b-provenance-sentinel";
+    let (observation, workspace_manager, workspace_base, userns_allocator, userns_base) =
+        super::run_substituted_checkout_success(root, "checkout.sentinel", sentinel);
+
+    assert!(observation.hopb_write_ok, "the checked Hop B sentinel write must succeed");
+    assert!(
+        observation.mount_source_matched_workspace,
+        "the retained OCI mount source must equal the capsule workspace host path"
+    );
+    assert!(
+        observation.sentinel_read_through_mount,
+        "the substituted workload must read the sentinel through the OCI-recorded mount"
+    );
+    assert!(
+        observation.settled_ok,
+        "the real settle tail must succeed cleanly: {:?}",
+        observation.settle_error
+    );
+
+    // Step 8: durable state. Workspace deleted (no child dirs), capacity fully released, userns slot
+    // reusable, both managers healthy.
+    let residual: Vec<_> = std::fs::read_dir(&workspace_base)
+        .expect("workspace base is readable")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert!(residual.is_empty(), "the workspace leaf must be gone after settle");
+    assert_eq!(
+        workspace_manager.capacity_used_bytes(),
+        0,
+        "capacity must be fully released after settle"
+    );
+    assert!(workspace_manager.is_healthy(), "the workspace manager stays healthy");
+    assert!(userns_allocator.is_healthy(), "the userns allocator stays healthy");
+    // Probe reusability WITHOUT poisoning: acquire then `release_unused` (dropping an unreleased
+    // probe lease would emit a quarantine incident and poison the allocator this asserts stays clean).
+    let probe = userns_allocator
+        .lease()
+        .expect("the userns slot must be reusable after the lease was released");
+    probe
+        .release_unused()
+        .expect("the probe lease releases cleanly");
+    assert!(
+        userns_allocator.is_healthy(),
+        "the userns allocator is STILL clean after the probe"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace_base);
+    let _ = std::fs::remove_dir_all(&userns_base);
+}
