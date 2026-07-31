@@ -3384,3 +3384,51 @@ recovery fix), 6e (the atomic activating cutover: reservation V2 + begin_parent_
 store construction + accounting V4 + ci.pipeline v3→v4 fence, all together). The v1→v2 reservation
 flip is PART of 6e (proven this session it cannot land standalone). 5b.3-7 live drill, task #91, and
 the gate-2 vertical slice follow. The rest of ledger 12's open items are unchanged.
+
+---
+
+## 2026-07-31 — CT-007 slice 5b.3-6b landed: compute-preserving launch_with extraction
+(Fable orchestrating; Opus, implementation; Sol, 1 review round → "no merge blockers")
+
+The second dormant sub-slice. Behavior-preserving: zero production behavior change.
+
+**A builder STOP corrected an orchestrator briefing error before any code.** My 6b brief framed
+launch_with as becoming a "shape dispatch" ((None,None)→compute, (Some,Some)→dormant checkout arm).
+The builder traced the production path and found that would BREAK production: checkout-bearing
+(Some,Some) specs ALREADY reach launch_with today and run the compute path (workspace silently
+ignored — all checkout machinery dormant). manifest_dispatch_parts (ci_manifest_job_runner.rs:272)
+builds every manifest CI job's launch template as (Some,Some) from mandatory non-Option fields; the
+resolver's only checkout refusal (runner_bind.rs:748, claim_window_secs.is_none() && checkout) does
+NOT fire for a properly-dispatched row; launch_with never reads spec.workspace. So a shape-diverting
+launch_with would turn every manifest CI job's launch from run-as-compute into a refusal/panic. The
+builder hit its STOP directive and reported instead of improvising. Resolution (faithful to Sol's
+design, which always assigned SELECTION to 6e — "Select checkout-aware launch_with in 6e"): the
+selection gate is 6e's; 6b keeps launch_with a plain always-delegating wrapper.
+
+**What landed (single file, gvisor.rs, +319/-3):** the entire launch_with body moved BYTE-FOR-BYTE
+into launch_compute_with (Sol mechanically confirmed identity vs cb3bac52); launch_with is now a
+plain delegator (self.launch_compute_with(spec, hooks, run)); launch/launch_streaming unchanged —
+every spec runs the identical compute path. A DORMANT launch_checkout_continuation<F> stub
+(#[allow(dead_code)], unimplemented! body, ZERO callers, in its OWN impl block so the 6a span-based
+dormancy audit doesn't sweep it into the compute path) that only NAMES the 6a AcquiredCheckoutRuntime
+capsule by value — no capsule-surface change, 6a's compile-time inseparability + closed-world
+module-shape audit untouched. 3 golden compute event-trace regression tests fencing the observable
+hook/run ordering + two early-refusal boundaries (comment scoped honestly to observable
+hook/run steps per Sol's review; internal-step reorders are covered by the byte-identity + existing
+compute unit tests). Two MINOR comment-accuracy fixes applied post-review (golden coverage claim
+narrowed; the stub's "6e fleshes the body" corrected to "6c implements, 6e selects").
+
+**Sol verdict (round 1): no merge blockers** — extraction genuinely byte-preserving, wrapper a true
+no-op, continuation genuinely dormant (by-value opaque capsule exposes no field), the own-impl-block
+split sound with the compute span still fully covered, 6a + phase-credential + occurrence pins intact.
+
+**Gates (orchestrator ran independently):** sandbox --lib 483, --features test-support 525 (6a
+dispose matrix), the entire integration matrix green except the known firecracker escape test
+(852bc7ae, host/KVM), controlplane --lib 583, occurrence-table 14, clippy -D warnings clean, check
+clean, myelin-lints green.
+
+**Still open:** 6c (implement the dormant checkout-continuation body — the sandbox orchestrator
+against injected authorities), 6d (dormant control-plane adapter + the ParentAttemptLimitExceeded/
+AttemptsExhausted recovery fix), 6e (the atomic activating cutover incl. the selection gate + the
+v1→v2 reservation flip + credential-store construction + accounting V4 + ci.pipeline v3→v4 fence).
+Then 5b.3-7, task #91, gate-2 vertical slice. The rest of ledger 12's open items are unchanged.
