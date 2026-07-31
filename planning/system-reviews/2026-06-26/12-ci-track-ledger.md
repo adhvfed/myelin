@@ -3682,3 +3682,45 @@ path per Sol's option-c design — task #19) and step 5 (definition-cutover gene
 predecessor/current pair, active pair staying v2/v3 — task #20), each dormant + separately live-PG-gated.
 Then 6e (the atomic activating cutover). Then 5b.3-7, task #91, gate-2 vertical slice. The rest of ledger 12's
 open items are unchanged.
+
+---
+
+## 2026-07-31 — CT-007 slice 5b.3-6d STEP 4 landed: the reporter-seam extension
+(Fable orchestrating; Opus, implementation + its own internal review; Sol, independent review → "no
+merge blockers" (1 minor comment fix))
+
+Fourth of 6d's risk-sequenced units. Cross-crate, dormant: RunnerAgent (not RunnerHooks) owns the ONE
+terminal signal/accounting path for checkout preparation, via Sol's option-c design.
+
+**What landed (10 files, both crates):** a new sandbox PreparationReportClaim carrying EXACTLY the 12
+CiJobTokenRequest fields (nothing else — no lease_expires/claim_window/reserve/generation/scope);
+constructed once in V2CheckoutComposition::admit from the same validated CiJobTokenRequest used for
+DurableAttemptAuthority, placed in BOTH ParentAttemptAdmission arms (exhaustion has no authority but
+needs the reporting identity) and carried UNCHANGED through CheckoutContinuationOutcome::
+{PreparationTerminal, PreparationRetryable}. TerminalReporter gained two REQUIRED methods (NO blanket
+default — every impl makes a conscious refuse-or-delegate choice): report_preparation_terminal(&claim,
+disposition) + report_preparation_retry(&claim)→PreparationRetryReport{Requeued,NoOp}. All 4 impls
+updated explicitly: EngineTerminalReporter refuses both (a preparation report reaching the generic
+engine reporter is a composition error, now loud); CiPipelineReporter + CiPipelineReporterRouter
+convert PreparationReportClaim→CiJobTokenRequest (the mechanical 1:1 inverse) and delegate to the
+step-1/2 durable CAS methods; RecordingTerminalReporter records. RunnerAgent::report_preparation_outcome
+(dormant) exhaustively matches the outcome. UFCS cannot recurse (the trait methods take
+&PreparationReportClaim, the inherent take &CiJobTokenRequest — distinct types resolve to inherent).
+
+**Sol's independent review: no merge blockers** — both 12-field projections exact (round-trip fixture
+with distinct per-field values catches any swap/omission/default); UFCS recursion-safe by the type
+distinction; all four impls explicit, no default; the DTO is acceptably public (untrusted transport —
+request validation + reporter scope + dispatch verification + the exact durable CAS stay authoritative);
+dormancy intact (run_one untouched, zero production callers, the 19 markers + capsule pin unperturbed).
+One MINOR fixed post-review: the PreparationRetryable doc said "produced when a requeue actually
+happened" — reworded to a RETRY REQUEST whose reporter CAS decides Requeued vs NoOp (an activation
+author must not skip reporter dispatch).
+
+**Gates (orchestrator ran independently):** sandbox --lib 506 / test-support 555, controlplane --lib
+594, the entire --features integration matrix green both crates (incl. the 2 new live-PG router tests:
+terminal settles once, retry requeues, redelivery NoOp) except the known firecracker skip (852bc7ae),
+clippy -D warnings clean, check clean, myelin-lints green, git diff --check clean.
+
+**Still open:** 6d step 5 (definition-cutover generalization for a v3→v4 predecessor/current pair,
+active pair staying v2/v3 — task #20), dormant + live-PG-gated. Then 6e (the atomic activating cutover).
+Then 5b.3-7, task #91, gate-2 vertical slice. The rest of ledger 12's open items are unchanged.

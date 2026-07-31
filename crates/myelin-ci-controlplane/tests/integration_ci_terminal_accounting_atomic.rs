@@ -14,7 +14,8 @@ use myelin_ci_controlplane::{
     CiDriveManifestStore, CiDriveManifestV1, CiJobAccountingPricer, CiJobAccountingStore,
     CiJobAccountingWriteVersion, CiJobPricingError, CiJobRuntimeAuthorityRequest,
     CiJobTokenRequest, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
-    CiManifestTrustTierV1, CiManifestWorkspaceV1, CiPipelineReporter, CiRunFinalization,
+    CiManifestTrustTierV1, CiManifestWorkspaceV1, CiPipelineReporter, CiPipelineReporterFactory,
+    CiPipelineReporterRouter, CiRunFinalization,
     CiRunFinalizationJob, CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert, CiRunStoreError,
     CiRunTerminalState, DurableCiJobAccounting, DurableCiRunFinalizer, DurableEnqueue,
     DurableLeaseAdapter, GrantedCiJobV1, JobQueueReaper, Lane, ManifestBoundCiJobTokenAuthority,
@@ -27,9 +28,9 @@ use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     derive_checkout_authorization_scope, resolved_gvisor_rootfs, CompletionClaim,
     CompletionSettlementOwner, CountingFirehose, ImageRef, JobKind, PreparationPhase,
-    PreparationTerminalDisposition, ResourceUsage, RetryableAttemptCause, RetryableAttemptFailure,
-    RetryableAttemptOutcome, RunnerAgent, TerminalReport, TerminalReporter, TrustTier,
-    WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
+    PreparationReportClaim, PreparationRetryReport, PreparationTerminalDisposition, ResourceUsage,
+    RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome, RunnerAgent,
+    TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::{IdMinter, MonotonicMinter};
@@ -2211,6 +2212,131 @@ async fn run_reporter_scenario(
                     return;
                 }
 
+                if preparation_scenario == "preparation_router_terminal"
+                    || preparation_scenario == "preparation_router_retry"
+                {
+                    // CT-007 5b.3-6d STEP 4: drive the REGION ROUTER (a `TerminalReporter`) with a
+                    // sandbox `PreparationReportClaim`. The router maps it 1:1 onto the durable
+                    // `CiJobTokenRequest`, resolves the exact-tenant reporter, and reaches the SAME
+                    // durable preparation CAS the inherent methods make — proving the seam is genuinely
+                    // wired end-to-end, not merely type-correct.
+                    let report_claim = PreparationReportClaim {
+                        tenant_id: preparation_claim.tenant_id.clone(),
+                        region: preparation_claim.region.clone(),
+                        wf_run_id: preparation_claim.wf_run_id.clone(),
+                        ci_run_id: preparation_claim.ci_run_id.clone(),
+                        job_id: preparation_claim.job_id.clone(),
+                        token_authority_handle: preparation_claim.token_authority_handle.clone(),
+                        idem_token: preparation_claim.idem_token.clone(),
+                        lease_owner: preparation_claim.lease_owner.clone(),
+                        lease_epoch: preparation_claim.lease_epoch,
+                        claim_nonce: preparation_claim.claim_nonce.clone(),
+                        claim_started_at_epoch_secs: preparation_claim.claim_started_at_epoch_secs,
+                        claim_expires_at_epoch_secs: preparation_claim.claim_expires_at_epoch_secs,
+                    };
+                    // The factory builds the SAME v4-durable reporter `preparation_reporter()` builds,
+                    // for whatever (tenant, region) the router presents — captured by clone so the
+                    // closure is `'static`.
+                    let f_pg = pg_executor.clone();
+                    let f_pool = pool.clone();
+                    let f_scope = scope.clone();
+                    let f_manifest = manifest_store.clone();
+                    let f_ledger = ledger.clone();
+                    let f_region = region.clone();
+                    let factory: CiPipelineReporterFactory = Arc::new(move |_tenant, _region| {
+                        Ok(CiPipelineReporter::new_accounted(
+                            f_pg.clone(),
+                            ci_job_spec_store(f_pool.clone()),
+                            ci_job_queue_store(f_pool.clone()),
+                            tokio::runtime::Handle::current(),
+                            DurableCiJobAccounting::new(
+                                f_scope.clone(),
+                                f_manifest.clone(),
+                                f_ledger.clone(),
+                                myelin_ci_controlplane::CiCostEventStore::with_pg(
+                                    f_pool.clone(),
+                                    f_region.clone(),
+                                ),
+                                CiJobAccountingStore::with_pg_and_write_version(
+                                    f_pool.clone(),
+                                    f_region.clone(),
+                                    CiJobAccountingWriteVersion::V4,
+                                ),
+                                Arc::new(TestPricer { valid: true }),
+                            ),
+                        ))
+                    });
+                    let router =
+                        CiPipelineReporterRouter::new(region.clone(), factory).unwrap();
+
+                    if preparation_scenario == "preparation_router_terminal" {
+                        let disposition = refusal_disposition;
+                        let terminal_claim = report_claim.clone();
+                        let terminal_router = router.clone();
+                        let signal = tokio::task::spawn_blocking(move || {
+                            terminal_router.report_preparation_terminal(&terminal_claim, disposition)
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(
+                            signal,
+                            SignalOutcome::Buffered,
+                            "the router reaches the durable preparation-terminal CAS and settles"
+                        );
+                        assert_eq!(
+                            counts(&pool, job, wf_run).await,
+                            (1, 2, 1, "terminal".into()),
+                            "the terminal settled once through the router"
+                        );
+                    } else {
+                        // preparation_router_retry: the base generation is admitted + permitted, so a
+                        // retry through the router requeues it; a redelivery is a benign NoOp.
+                        let retry_claim = report_claim.clone();
+                        let retry_router = router.clone();
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            retry_router.report_preparation_retry(&retry_claim)
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(
+                            outcome,
+                            PreparationRetryReport::Requeued,
+                            "the router reaches the durable requeue CAS"
+                        );
+                        let state: String = sqlx::query_scalar(
+                            "SELECT state FROM job_queue WHERE job_id = $1::uuid",
+                        )
+                        .bind(job)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                        assert_eq!(state, "queued", "the generation was requeued through the router");
+                        assert_eq!(counts(&pool, job, wf_run).await, (0, 0, 0, "queued".into()));
+
+                        let redeliver_router = router.clone();
+                        let redeliver_claim = report_claim.clone();
+                        let redelivered = tokio::task::spawn_blocking(move || {
+                            redeliver_router.report_preparation_retry(&redeliver_claim)
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(
+                            redelivered,
+                            PreparationRetryReport::NoOp,
+                            "a redelivered retry of the requeued generation is a benign no-op"
+                        );
+                    }
+                    drop(pool);
+                    bootstrap
+                        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                        .await
+                        .unwrap();
+                    return;
+                }
+
                 if preparation_scenario == "preparation_requeue_exhausted_refuses" {
                     // CT-007 5b.3-6d step 2: the requeue-vs-terminalize boundary. Fill the budget to the
                     // exact max (base epoch-1 + epochs 2..=5 == 5 of 5). The base generation is still
@@ -3941,6 +4067,25 @@ async fn exhausted_terminal_requires_exactly_one_governing_policy_group() {
         Some("preparation_exhausted_multigroup"),
     )
     .await;
+}
+
+/// **CT-007 5b.3-6d STEP 4 (live PG): a preparation TERMINAL driven through the region router reaches
+/// the durable CAS.** The router maps the sandbox `PreparationReportClaim` onto the durable request,
+/// routes to the exact-tenant reporter, and settles the terminal once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preparation_terminal_through_the_region_router_reaches_the_durable_cas() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(false, false, false, true, false, Some("preparation_router_terminal"))
+        .await;
+}
+
+/// **CT-007 5b.3-6d STEP 4 (live PG): a preparation RETRY driven through the region router reaches the
+/// durable requeue CAS.** The router requeues the admitted+permitted generation and treats a
+/// redelivery as a benign no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preparation_retry_through_the_region_router_reaches_the_durable_cas() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(false, false, false, true, false, Some("preparation_router_retry")).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

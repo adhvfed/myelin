@@ -53,9 +53,9 @@ use std::sync::Mutex;
 
 use myelin_ci_sandbox::{
     derive_checkout_authorization_scope, CompletionClaim, CompletionSettlementOwner, IdemToken,
-    JobKind, JobSpec as SandboxJobSpec, PreparationTerminalDisposition, ResourceUsage,
-    RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome, TerminalReport,
-    TerminalReporter,
+    JobKind, JobSpec as SandboxJobSpec, PreparationReportClaim, PreparationRetryReport,
+    PreparationTerminalDisposition, ResourceUsage, RetryableAttemptCause, RetryableAttemptFailure,
+    RetryableAttemptOutcome, TerminalReport, TerminalReporter,
 };
 #[cfg(any(test, feature = "test-support"))]
 use myelin_ci_sandbox::{
@@ -2233,6 +2233,31 @@ impl CiPipelineReporter {
     }
 }
 
+/// **CT-007 slice 5b.3-6d STEP 4: the exact sandbox [`PreparationReportClaim`] → durable
+/// [`CiJobTokenRequest`] projection.** The mechanical 1:1 inverse of `preparation_report_claim` in
+/// `ci_checkout_composition`: the twelve fields map field-for-field with no drop or reorder, so a
+/// claim minted at admission reaches the durable preparation CAS byte-identical. The router and the
+/// `CiPipelineReporter` trait impl both use this to reach the inherent durable methods; the round-trip
+/// is proven by a unit test.
+pub(crate) fn token_request_from_preparation_report_claim(
+    claim: &PreparationReportClaim,
+) -> CiJobTokenRequest {
+    CiJobTokenRequest {
+        tenant_id: claim.tenant_id.clone(),
+        region: claim.region.clone(),
+        wf_run_id: claim.wf_run_id.clone(),
+        ci_run_id: claim.ci_run_id.clone(),
+        job_id: claim.job_id.clone(),
+        token_authority_handle: claim.token_authority_handle.clone(),
+        idem_token: claim.idem_token.clone(),
+        lease_owner: claim.lease_owner.clone(),
+        lease_epoch: claim.lease_epoch,
+        claim_nonce: claim.claim_nonce.clone(),
+        claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
+        claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
+    }
+}
+
 impl TerminalReporter for CiPipelineReporter {
     fn completion_settlement_owner(&self) -> CompletionSettlementOwner {
         match self.accounting {
@@ -2753,6 +2778,35 @@ impl TerminalReporter for CiPipelineReporter {
             Err(_) => Err(ExecutorError::Storage(
                 "retryable-attempt transaction reached an invalid accounting path".into(),
             )),
+        }
+    }
+
+    fn report_preparation_terminal(
+        &self,
+        claim: &PreparationReportClaim,
+        disposition: PreparationTerminalDisposition,
+    ) -> Result<SignalOutcome, ExecutorError> {
+        // CT-007 5b.3-6d STEP 4: map the sandbox reporting identity 1:1 onto the durable claim-bound
+        // request and delegate to the INHERENT durable method (which re-verifies scope, v4-accounting
+        // activation, and the parent attempt under the CAS). Explicit UFCS names the inherent method,
+        // never this trait method.
+        CiPipelineReporter::report_preparation_terminal(
+            self,
+            &token_request_from_preparation_report_claim(claim),
+            disposition,
+        )
+    }
+
+    fn report_preparation_retry(
+        &self,
+        claim: &PreparationReportClaim,
+    ) -> Result<PreparationRetryReport, ExecutorError> {
+        match CiPipelineReporter::report_preparation_retry(
+            self,
+            &token_request_from_preparation_report_claim(claim),
+        )? {
+            PreparationRetryOutcome::Requeued => Ok(PreparationRetryReport::Requeued),
+            PreparationRetryOutcome::NoOp => Ok(PreparationRetryReport::NoOp),
         }
     }
 }

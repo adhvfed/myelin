@@ -2617,6 +2617,7 @@ impl GvisorBackend {
         spec: &JobSpec,
         hooks: &RunnerHooks,
         authority: &dyn crate::checkout_orchestration::AttemptAuthority,
+        report_claim: &crate::runner::PreparationReportClaim,
         scope: &CheckoutAuthorizationScope,
         runtime: checkout_runtime::AcquiredCheckoutRuntime,
         preparation_spec: CheckoutPreparationSpec,
@@ -2632,6 +2633,7 @@ impl GvisorBackend {
             spec,
             hooks,
             authority,
+            report_claim,
             scope,
             runtime,
             preparation_spec,
@@ -2674,6 +2676,7 @@ impl GvisorBackend {
         spec: &JobSpec,
         hooks: &RunnerHooks,
         authority: &dyn crate::checkout_orchestration::AttemptAuthority,
+        report_claim: &crate::runner::PreparationReportClaim,
         scope: &CheckoutAuthorizationScope,
         runtime: checkout_runtime::AcquiredCheckoutRuntime,
         preparation_spec: CheckoutPreparationSpec,
@@ -2755,6 +2758,7 @@ impl GvisorBackend {
                 // inserted between the disarm and the consume to drop a bare capsule.
                 return Ok(resolve_post_acquisition_authority_failure(
                     authority,
+                    report_claim,
                     capsule_guard.disarm(),
                     workspace_manager,
                     phase_was_begun,
@@ -2786,6 +2790,7 @@ impl GvisorBackend {
                 let diagnostics = runtime.dispose_checkout_runtime(workspace_manager);
                 return Ok(crate::checkout_orchestration::resolve_hop_b_failure(
                     authority,
+                    report_claim,
                     disposition,
                     usage,
                     diagnostics,
@@ -2823,7 +2828,7 @@ impl GvisorBackend {
                 // The workload bound + ran, then a post-settle failure surfaced. Classify by whether the
                 // launch CAS committed (finding 5): pre-CAS `Uncommitted` → preparation requeue; a
                 // committed running claim → the reporter-owned workload retry path.
-                Ok(classify_bound_workload_failure(authority, run_failure))
+                Ok(classify_bound_workload_failure(authority, report_claim, run_failure))
             }
             RetainedWorkloadOutcome::RunFailed {
                 failure,
@@ -2836,7 +2841,7 @@ impl GvisorBackend {
                 Ok(route_after_disposal(
                     disposal_diagnostics,
                     MATERIALIZATION,
-                    classify_bound_workload_failure(authority, failure),
+                    classify_bound_workload_failure(authority, report_claim, failure),
                 ))
             }
             RetainedWorkloadOutcome::PermitRefused {
@@ -2848,7 +2853,7 @@ impl GvisorBackend {
                 Ok(route_after_disposal(
                     disposal_diagnostics,
                     MATERIALIZATION,
-                    requeue_or_exhausted(authority, MATERIALIZATION),
+                    requeue_or_exhausted(authority, report_claim, MATERIALIZATION),
                 ))
             }
             RetainedWorkloadOutcome::PhaseAuthorityFailed {
@@ -2900,6 +2905,7 @@ impl GvisorBackend {
 /// `complete_phase` that itself fails leaves the phase unresolvable → reconciliation.
 fn resolve_begun_transport_failure(
     authority: &dyn crate::checkout_orchestration::AttemptAuthority,
+    report_claim: &crate::runner::PreparationReportClaim,
 ) -> crate::checkout_orchestration::CheckoutContinuationOutcome {
     use crate::checkout_orchestration::CheckoutContinuationOutcome;
     use crate::runner::PreparationPhase;
@@ -2922,12 +2928,14 @@ fn resolve_begun_transport_failure(
     }
     crate::checkout_orchestration::requeue_or_exhausted(
         authority,
+        report_claim,
         PreparationPhase::CheckoutTransport,
     )
 }
 
 fn resolve_post_acquisition_authority_failure(
     authority: &dyn crate::checkout_orchestration::AttemptAuthority,
+    report_claim: &crate::runner::PreparationReportClaim,
     runtime: checkout_runtime::AcquiredCheckoutRuntime,
     workspace_manager: &WorkspaceManager,
     phase_was_begun: bool,
@@ -2938,6 +2946,7 @@ fn resolve_post_acquisition_authority_failure(
     let diagnostics = runtime.dispose_checkout_runtime(workspace_manager);
     crate::checkout_orchestration::route_post_acquisition_authority_failure(
         authority,
+        report_claim,
         diagnostics,
         phase_was_begun,
     )
@@ -2980,6 +2989,7 @@ fn checkout_transport_error_usage(error: &CheckoutTransportError) -> ResourceUsa
 /// and `Executed` — where the CAS committed a running claim — go to workload reporting.
 fn classify_bound_workload_failure(
     authority: &dyn crate::checkout_orchestration::AttemptAuthority,
+    report_claim: &crate::runner::PreparationReportClaim,
     failure: RunFailure,
 ) -> crate::checkout_orchestration::CheckoutContinuationOutcome {
     use crate::checkout_orchestration::{requeue_or_exhausted, CheckoutContinuationOutcome};
@@ -2991,7 +3001,7 @@ fn classify_bound_workload_failure(
         // Pre-CAS: the workload CAS never committed, so the row is still leased — this is a PREPARATION
         // requeue/exhaustion, never a running-claim workload attempt.
         RunFailure::Uncommitted { .. } => {
-            requeue_or_exhausted(authority, PreparationPhase::CheckoutMaterialization)
+            requeue_or_exhausted(authority, report_claim, PreparationPhase::CheckoutMaterialization)
         }
         RunFailure::CommitOutcomeUnknown { .. } => {
             CheckoutContinuationOutcome::ReconciliationRequired {
@@ -3150,23 +3160,32 @@ impl GvisorBackend {
         )
         .map_err(|e| CheckoutOrchestrationError::Hook(HookError(e)))?;
 
-        // Step 6: parent-attempt admission (reserve + inflight transition + parent row, one txn).
-        let (_reserve, attempt_authority) = match hooks
+        // Step 6: parent-attempt admission (reserve + inflight transition + parent row, one txn). The
+        // admission carries the preparation REPORTING identity in BOTH arms (CT-007 5b.3-6d STEP 4):
+        // an exhausted attempt has no authority but still needs the claim to report its terminal.
+        let (report_claim, _reserve, attempt_authority) = match hooks
             .reserve_parent_attempt(spec)
             .map_err(CheckoutOrchestrationError::Hook)?
         {
             ParentAttemptAdmission::Admitted {
+                claim,
                 reserve,
                 attempt_authority,
-            } => (reserve, attempt_authority),
-            ParentAttemptAdmission::AttemptsExhausted { reserve: _reserve } => {
-                // The durable parent-attempt budget is already exhausted — terminalize.
+            } => (claim, reserve, attempt_authority),
+            ParentAttemptAdmission::AttemptsExhausted {
+                claim,
+                reserve: _reserve,
+            } => {
+                // The durable parent-attempt budget is already exhausted — terminalize, carrying the
+                // admission's claim UNCHANGED into the report.
                 return Ok(CheckoutContinuationOutcome::PreparationTerminal {
+                    claim,
                     disposition: PreparationTerminalDisposition::AttemptsExhausted,
                 });
             }
         };
         let authority = attempt_authority.as_ref();
+        let report_claim = &report_claim;
 
         // Step 7: begin the transport phase. A failure here begins nothing and owns no capsule.
         if authority
@@ -3175,6 +3194,7 @@ impl GvisorBackend {
         {
             return Ok(requeue_or_exhausted(
                 authority,
+                report_claim,
                 PreparationPhase::CheckoutTransport,
             ));
         }
@@ -3185,7 +3205,7 @@ impl GvisorBackend {
         // charge a ceiling (finding 3). No capsule exists yet.
         let advertise_carrier = match authority.mint_phase_credential(CheckoutPhase::Advertise) {
             Ok(carrier) => carrier,
-            Err(_error) => return Ok(resolve_begun_transport_failure(authority)),
+            Err(_error) => return Ok(resolve_begun_transport_failure(authority, report_claim)),
         };
         let (advertise_credential, advertise_authorization) = match authorize_phase_generation(
             hooks,
@@ -3195,7 +3215,7 @@ impl GvisorBackend {
             advertise_carrier,
         ) {
             Ok(pair) => pair,
-            Err(_error) => return Ok(resolve_begun_transport_failure(authority)),
+            Err(_error) => return Ok(resolve_begun_transport_failure(authority, report_claim)),
         };
 
         // Step 10: the fetch leg mints + authorizes its OWN generation mid-transport (only after the
@@ -3235,7 +3255,12 @@ impl GvisorBackend {
                 // transport phase per the disposition and route the typed outcome.
                 let disposition = error.attempt_disposition();
                 let usage = checkout_transport_error_usage(&error);
-                return Ok(route_preparation_disposition(authority, disposition, usage)?);
+                return Ok(route_preparation_disposition(
+                    authority,
+                    report_claim,
+                    disposition,
+                    usage,
+                )?);
             }
         };
 
@@ -3272,6 +3297,7 @@ impl GvisorBackend {
                 }
                 return Ok(requeue_or_exhausted(
                     authority,
+                    report_claim,
                     PreparationPhase::CheckoutMaterialization,
                 ));
             }
@@ -3286,16 +3312,22 @@ impl GvisorBackend {
                 return Ok(route_after_disposal(
                     diagnostics,
                     PreparationPhase::CheckoutMaterialization,
-                    requeue_or_exhausted(authority, PreparationPhase::CheckoutMaterialization),
+                    requeue_or_exhausted(
+                        authority,
+                        report_claim,
+                        PreparationPhase::CheckoutMaterialization,
+                    ),
                 ));
             }
         };
 
-        // Steps 15–25: transfer the capsule BY VALUE into the continuation.
+        // Steps 15–25: transfer the capsule BY VALUE into the continuation (which carries the same
+        // reporting claim into any preparation outcome it produces — CT-007 5b.3-6d STEP 4).
         self.launch_checkout_continuation(
             spec,
             hooks,
             authority,
+            report_claim,
             &scope,
             runtime,
             preparation_spec,
@@ -12704,6 +12736,25 @@ mod tests {
         }
     }
 
+    /// A well-formed preparation reporting identity for the routing tests (CT-007 5b.3-6d STEP 4). The
+    /// dormant orchestrator/continuation carry it UNCHANGED into any preparation outcome.
+    fn report_claim() -> crate::runner::PreparationReportClaim {
+        crate::runner::PreparationReportClaim {
+            tenant_id: "acme".to_string(),
+            region: "fr-par".to_string(),
+            wf_run_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            ci_run_id: "44444444-4444-4444-4444-444444444444".to_string(),
+            job_id: "22222222-2222-2222-2222-222222222222".to_string(),
+            token_authority_handle: "tah-xyz".to_string(),
+            idem_token: "11111111-1111-1111-1111-111111111111/build".to_string(),
+            lease_owner: "worker-1".to_string(),
+            lease_epoch: 7,
+            claim_nonce: "33333333-3333-3333-3333-333333333333".to_string(),
+            claim_started_at_epoch_secs: 1_000,
+            claim_expires_at_epoch_secs: 1_300,
+        }
+    }
+
     fn fake_authorization_context() -> crate::RunTokenAuthorizationContext {
         crate::RunTokenAuthorizationContext::CiJob(crate::CiJobAuthorizationContext {
             tenant_id: "acme".to_string(),
@@ -12753,6 +12804,7 @@ mod tests {
         )
         .with_parent_attempt_reservation(Box::new(|_spec| {
             Ok(ParentAttemptAdmission::Admitted {
+                claim: report_claim(),
                 reserve: ReserveHandle("ci-reserve:v2:a".to_string()),
                 attempt_authority: Box::new(FakeAttemptAuthority::new(true)),
             })
@@ -12780,12 +12832,13 @@ mod tests {
         let authority = FakeAttemptAuthority::new(true);
 
         // Uncommitted (pre-CAS, row still leased) → preparation requeue.
-        let out = classify_bound_workload_failure(&authority, RunFailure::uncommitted("gate failed"));
+        let out = classify_bound_workload_failure(&authority, &report_claim(), RunFailure::uncommitted("gate failed"));
         assert!(
             matches!(
                 out,
                 CheckoutContinuationOutcome::PreparationRetryable {
-                    phase: PreparationPhase::CheckoutMaterialization
+                    phase: PreparationPhase::CheckoutMaterialization,
+                    ..
                 }
             ),
             "a pre-CAS Uncommitted workload failure is a preparation requeue, got {out:?}"
@@ -12794,6 +12847,7 @@ mod tests {
         // CommitOutcomeUnknown → reconciliation (never guessed).
         let out = classify_bound_workload_failure(
             &authority,
+            &report_claim(),
             RunFailure::commit_outcome_unknown("ambiguous"),
         );
         assert!(matches!(
@@ -12804,6 +12858,7 @@ mod tests {
         // CommittedButNotExecuted (running claim) → workload retryable, zero usage.
         let out = classify_bound_workload_failure(
             &authority,
+            &report_claim(),
             RunFailure::committed_but_not_executed("never execed"),
         );
         assert!(matches!(
@@ -12817,6 +12872,7 @@ mod tests {
         // Executed (running claim, real usage) → workload retryable carrying that usage.
         let out = classify_bound_workload_failure(
             &authority,
+            &report_claim(),
             RunFailure::executed(
                 "teardown infra failed",
                 ResourceUsage {
@@ -12840,11 +12896,12 @@ mod tests {
     fn classify_uncommitted_terminalizes_when_attempts_are_exhausted() {
         use crate::checkout_orchestration::CheckoutContinuationOutcome;
         let authority = FakeAttemptAuthority::new(false);
-        let out = classify_bound_workload_failure(&authority, RunFailure::uncommitted("gate failed"));
+        let out = classify_bound_workload_failure(&authority, &report_claim(), RunFailure::uncommitted("gate failed"));
         assert!(matches!(
             out,
             CheckoutContinuationOutcome::PreparationTerminal {
-                disposition: crate::runner::PreparationTerminalDisposition::AttemptsExhausted
+                disposition: crate::runner::PreparationTerminalDisposition::AttemptsExhausted,
+                ..
             }
         ));
     }
@@ -12856,7 +12913,7 @@ mod tests {
     fn resolve_begun_transport_failure_completes_zero_then_requeues() {
         use crate::checkout_orchestration::CheckoutContinuationOutcome;
         let authority = FakeAttemptAuthority::new(true);
-        let out = resolve_begun_transport_failure(&authority);
+        let out = resolve_begun_transport_failure(&authority, &report_claim());
         assert_eq!(
             authority.ops.lock().unwrap().clone(),
             vec!["complete:CheckoutTransport:0"],
@@ -12865,7 +12922,8 @@ mod tests {
         assert!(matches!(
             out,
             CheckoutContinuationOutcome::PreparationRetryable {
-                phase: PreparationPhase::CheckoutTransport
+                phase: PreparationPhase::CheckoutTransport,
+                ..
             }
         ));
     }
@@ -13037,6 +13095,7 @@ mod tests {
                 &spec,
                 &hooks,
                 &authority,
+                &report_claim(),
                 &scope,
                 runtime,
                 preparation_spec,
@@ -13073,7 +13132,8 @@ mod tests {
                 CheckoutContinuationOutcome::PreparationTerminal {
                     disposition: PreparationTerminalDisposition::Failed {
                         phase: PreparationPhase::CheckoutMaterialization
-                    }
+                    },
+                    ..
                 }
             ),
             "a terminal Hop B failure becomes a preparation-terminal outcome, got {outcome:?}"
@@ -13202,6 +13262,7 @@ mod tests {
                 &spec,
                 &hooks,
                 &authority,
+                &report_claim(),
                 &scope,
                 runtime,
                 preparation_spec,
@@ -13302,6 +13363,7 @@ mod tests {
                     &spec,
                     &hooks,
                     &authority,
+                    &report_claim(),
                     &scope,
                     runtime,
                     preparation_spec,

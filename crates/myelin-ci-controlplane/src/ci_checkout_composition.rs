@@ -28,8 +28,8 @@ use myelin_ci_sandbox::checkout_orchestration::{
 };
 use myelin_ci_sandbox::{
     derive_checkout_authorization_scope, CheckoutAuthorizationScope, CheckoutPhase, HookError,
-    JobSpec, PreparationLeaseCheckpoint, PreparationLeaseLost, PreparationPhase, ReserveHandle,
-    ResourceUsage, RunTokenAuthorizationContext,
+    JobSpec, PreparationLeaseCheckpoint, PreparationLeaseLost, PreparationPhase,
+    PreparationReportClaim, ReserveHandle, ResourceUsage, RunTokenAuthorizationContext,
 };
 
 use crate::ci_credential_generation::{
@@ -201,6 +201,30 @@ fn reconstruct_claim(
     Ok((claim, derived_scope))
 }
 
+/// **CT-007 slice 5b.3-6d STEP 4: the exact `CiJobTokenRequest` → sandbox [`PreparationReportClaim`]
+/// projection.** The sandbox carries this reporting identity through the (dormant) admission and
+/// continuation; the CI pipeline reporter router maps it 1:1 back onto a `CiJobTokenRequest` to reach
+/// the durable preparation CAS. It is built from the SAME validated claim
+/// [`DurableAttemptAuthority`] is constructed with — never re-derived from a different source — so the
+/// twelve fields are identical to the ones the durable admission verified. The mapping is field-for-
+/// field with no drop or reorder; the round-trip is proven in `ci_pipeline_driver` tests.
+pub(crate) fn preparation_report_claim(claim: &CiJobTokenRequest) -> PreparationReportClaim {
+    PreparationReportClaim {
+        tenant_id: claim.tenant_id.clone(),
+        region: claim.region.clone(),
+        wf_run_id: claim.wf_run_id.clone(),
+        ci_run_id: claim.ci_run_id.clone(),
+        job_id: claim.job_id.clone(),
+        token_authority_handle: claim.token_authority_handle.clone(),
+        idem_token: claim.idem_token.clone(),
+        lease_owner: claim.lease_owner.clone(),
+        lease_epoch: claim.lease_epoch,
+        claim_nonce: claim.claim_nonce.clone(),
+        claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
+        claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
+    }
+}
+
 /// The exact durable claim generation → [`CiJobLaunchClaim`] projection the preparation-lease
 /// checkpoint renews against.
 fn launch_claim(claim: &CiJobTokenRequest) -> CiJobLaunchClaim {
@@ -280,6 +304,10 @@ impl V2CheckoutComposition {
 
     fn admit(&self, spec: &JobSpec) -> Result<ParentAttemptAdmission, HookError> {
         let (claim, checkout) = reconstruct_claim(spec)?;
+        // CT-007 5b.3-6d STEP 4: derive the preparation REPORTING identity from the SAME validated
+        // claim used to build the durable authority — both arms carry it (an exhausted attempt still
+        // reports its terminal), so build it before `claim` is moved into the authority below.
+        let report_claim = preparation_report_claim(&claim);
         let reserve_handle = spec.meter_to.reserve_id.clone();
         match bridge(
             &self.rt,
@@ -304,12 +332,14 @@ impl V2CheckoutComposition {
                     rt: self.rt.clone(),
                 };
                 Ok(ParentAttemptAdmission::Admitted {
+                    claim: report_claim,
                     reserve: ReserveHandle(reserve_handle),
                     attempt_authority: Box::new(authority),
                 })
             }
             CiParentAttemptAdmission::AttemptsExhausted { reserve_handle } => {
                 Ok(ParentAttemptAdmission::AttemptsExhausted {
+                    claim: report_claim,
                     reserve: ReserveHandle(reserve_handle),
                 })
             }
