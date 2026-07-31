@@ -2191,6 +2191,35 @@ enum CheckoutPreparationSessionState {
     Unreleasable,
 }
 
+/// The ONLY correct cleanup a [`CheckoutPreparationSession`]'s current durable state permits for the
+/// workspace+lease it is paired with (CT-007 slice 5b.3-6a). A disposal caller reads this from the
+/// session's OWN authoritative state and dispatches accordingly — it must never guess the lease
+/// phase, because calling the wrong release method (`release_unused` on a `Prepared` lease, or
+/// `release_prepared`/`release_unused` on a `PreparationBound`/poisoned one) either poisons the
+/// allocator or reissues a subordinate id while its chowned workspace may still be live. Each variant
+/// names EXACTLY one safe disposition, so the wrong release is unreachable by construction rather than
+/// by the caller's own care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // temporary, see CheckoutPreparationSession's own doc above.
+pub(crate) enum CheckoutSessionCleanup {
+    /// `NotStarted` — Hop B never bound; the lease is provably still `Allocated`. Delete the
+    /// workspace, then `release_unused` the lease.
+    NeverBound,
+    /// `PreparationBound` — Hop B bound the preparation runtime but its teardown was NEVER
+    /// independently proven. Quarantine BOTH the workspace and the lease (never release, never
+    /// delete): the runtime's non-access is unproven.
+    TeardownUnproven,
+    /// `Prepared` — Hop B's teardown WAS proven but the workload never bound. Delete the workspace,
+    /// then `release_prepared` the lease.
+    Prepared,
+    /// `Done` — the workload was durably `Bound`; the existing finalization/settlement path owns this
+    /// lease. Disposal must NOT release it.
+    WorkloadBound,
+    /// `Unreleasable` — a poisoning transition already abandoned the lease on its own side.
+    /// Quarantine; never release.
+    Unreleasable,
+}
+
 #[allow(dead_code)] // temporary, see CheckoutPreparationSession's own doc above.
 impl CheckoutPreparationSession {
     pub(crate) fn new() -> Self {
@@ -2339,6 +2368,22 @@ impl CheckoutPreparationSession {
                 self.state = CheckoutPreparationSessionState::Unreleasable;
                 Err(e)
             }
+        }
+    }
+
+    /// The one safe cleanup this session's CURRENT durable state permits (CT-007 slice 5b.3-6a).
+    /// Read by the 5b.3-6 capsule's disposal routing so the correct release/quarantine is chosen from
+    /// the session's own authoritative state, never guessed. Pure — touches neither the lease nor its
+    /// marker.
+    pub(crate) fn cleanup_disposition(&self) -> CheckoutSessionCleanup {
+        match self.state {
+            CheckoutPreparationSessionState::NotStarted => CheckoutSessionCleanup::NeverBound,
+            CheckoutPreparationSessionState::PreparationBound { .. } => {
+                CheckoutSessionCleanup::TeardownUnproven
+            }
+            CheckoutPreparationSessionState::Prepared { .. } => CheckoutSessionCleanup::Prepared,
+            CheckoutPreparationSessionState::Done => CheckoutSessionCleanup::WorkloadBound,
+            CheckoutPreparationSessionState::Unreleasable => CheckoutSessionCleanup::Unreleasable,
         }
     }
 }

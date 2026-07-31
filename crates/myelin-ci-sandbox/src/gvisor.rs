@@ -41,8 +41,8 @@ use crate::runner::{
     RetryableAttemptCause,
 };
 use crate::user_namespace::{
-    CheckoutPreparationSession, PreparationQuiescenceProof, RunscInvocationMode,
-    UserNamespaceAllocator, UserNamespaceAllocatorError, UserNamespaceBindError,
+    CheckoutPreparationSession, CheckoutSessionCleanup, PreparationQuiescenceProof,
+    RunscInvocationMode, UserNamespaceAllocator, UserNamespaceAllocatorError, UserNamespaceBindError,
     UserNamespaceConfig, UserNamespaceLease, UserNamespaceQuiescenceProof, UserNamespaceRefusal,
 };
 use crate::workspace_manager::{
@@ -51,7 +51,8 @@ use crate::workspace_manager::{
 };
 use crate::workspace_storage::WorkspaceStorageError;
 use crate::{
-    drain_capped, CheckoutAuthorizationProof, CompletionSettlementOwner, EgressPolicy, HookError,
+    drain_capped, CheckoutAuthorizationProof, CheckoutAuthorizationScope, CompletionSettlementOwner,
+    EgressPolicy, HookError,
     IdemToken, ImageRef, JobKind, JobSpec, LaunchPermit, MeterTarget, PhaseAuthorization,
     ReserveHandle,
     ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend,
@@ -7967,45 +7968,214 @@ pub(crate) fn run_checkout_preparation(
     run_checkout_preparation_inner(lease, session, workspace, spec, LaunchPermit::immediate())
 }
 
-/// **The V2 (phase-bound) Hop B entry point.** Consumes the opaque [`PhaseAuthorization`] — which
-/// can only have come from one `authorize_checkout_phase` invocation — into the retained durable
-/// permit the preparation container spawns under. Consumption checks the `Materialization` phase,
-/// the authorization's privately-retained run-token JTI against `run_token`, and the exact commit
-/// this preparation is about to check out.
-///
-/// There is deliberately NO legacy/immediate option here: this entry point cannot construct or
-/// accept one, so "a V2 caller cannot select the legacy arm" is enforced by the type system rather
-/// than by a source pin (round-1 blocker 2).
+/// The ONE cleanup a checkout capsule's session disposition permits, as a PURE value (CT-007 slice
+/// 5b.3-6a, Sol's r1 blocker 6) so the state→action mapping is unit-testable WITHOUT a real
+/// workspace/lease/`CAP_SYS_ADMIN`. [`AcquiredCheckoutRuntime::dispose_checkout_runtime`] executes
+/// exactly this plan; a regression that swapped e.g. the `NeverBound` and `Prepared` release methods
+/// changes this mapping and fails the pure pin, rather than only surfacing as a production
+/// panic/allocator poison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) fn run_checkout_preparation_v2(
-    lease: &mut UserNamespaceLease,
-    session: &mut CheckoutPreparationSession,
-    workspace: &ManagedWorkspace,
-    spec: CheckoutPreparationSpec,
-    run_token: RunTokenCredential,
-    authorization: PhaseAuthorization,
-) -> Result<PreparedCheckoutEvidence, CheckoutPreparationError> {
-    // Resolve the permit BEFORE any staging, cgroup, or durable bind — a refusal leaves the caller's
-    // lease, session, and workspace completely untouched.
-    let permit = resolve_checkout_preparation_permit(
-        authorization,
-        &run_token,
-        &spec.expected_commit,
-    )?;
-    run_checkout_preparation_inner(lease, session, workspace, spec, permit)
+enum CheckoutCleanupPlan {
+    /// The lease is provably still `Allocated` — delete the workspace, then `release_unused`.
+    DeleteWorkspaceThenReleaseUnused,
+    /// Teardown proven, workload never bound — delete the workspace, then (only on proven disk
+    /// absence) `release_prepared`; otherwise quarantine the lease.
+    DeleteWorkspaceThenReleasePrepared,
+    /// Teardown unproven or the lease already poisoned — quarantine BOTH; never release, never delete.
+    QuarantineBoth,
+    /// The workload durably bound; the existing finalization path owns the resources. Disposal here
+    /// is structurally impossible — abandon BOTH and surface an invariant violation.
+    AbandonBoth,
 }
+
+/// The pure disposition→plan mapping (see [`CheckoutCleanupPlan`]).
+#[allow(dead_code)]
+fn checkout_cleanup_plan(disposition: CheckoutSessionCleanup) -> CheckoutCleanupPlan {
+    match disposition {
+        CheckoutSessionCleanup::NeverBound => CheckoutCleanupPlan::DeleteWorkspaceThenReleaseUnused,
+        CheckoutSessionCleanup::Prepared => {
+            CheckoutCleanupPlan::DeleteWorkspaceThenReleasePrepared
+        }
+        CheckoutSessionCleanup::TeardownUnproven | CheckoutSessionCleanup::Unreleasable => {
+            CheckoutCleanupPlan::QuarantineBoth
+        }
+        CheckoutSessionCleanup::WorkloadBound => CheckoutCleanupPlan::AbandonBoth,
+    }
+}
+
+/// The FOUR primitive cleanup operations a [`CheckoutCleanupPlan`] executes against the shared
+/// workspace+lease+session, behind an injectable seam (CT-007 slice 5b.3-6a, Sol's r2 blocker 3) so
+/// that an ALWAYS-RUN unit test with a recording fake can prove each plan invokes EXACTLY the right
+/// operation sequence — no Btrfs/`CAP_SYS_ADMIN` required. Swapping the `release_unused`/
+/// `release_prepared` legs of the two delete-then-release plans changes the recorded trace and fails
+/// that test, rather than only surfacing as a production panic/allocator poison. The REAL
+/// implementation ([`RealCheckoutCleanupExecutor`]) performs the genuine deletes/releases against the
+/// held resources; the privileged e2e matrix then proves those real ops release/quarantine durably.
+#[allow(dead_code)]
+trait CheckoutCleanupExecutor {
+    /// Delete the workspace; return whether disk absence is PROVEN (only then may the lease be
+    /// released) plus any diagnostics.
+    fn delete_workspace(&mut self) -> (bool, Vec<String>);
+    /// Release a provably-`Allocated` lease (`release_unused`).
+    fn release_unused(&mut self) -> Vec<String>;
+    /// Release a provably-`Prepared` lease (`session.release_prepared`).
+    fn release_prepared(&mut self) -> Vec<String>;
+    /// Quarantine the workspace — never delete (drop it; its own `Drop` poisons the manager).
+    fn quarantine_workspace(&mut self);
+    /// Quarantine the lease — never release (drop it; its own `Drop` quarantines the slot).
+    fn quarantine_lease(&mut self);
+}
+
+/// Execute one [`CheckoutCleanupPlan`] through the injected executor, returning accumulated
+/// diagnostics. This is the SINGLE place the plan→operation-sequence mapping lives, so the always-run
+/// trace test and the real disposal share exactly one implementation.
+#[allow(dead_code)]
+fn execute_cleanup_plan(
+    plan: CheckoutCleanupPlan,
+    executor: &mut dyn CheckoutCleanupExecutor,
+) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    match plan {
+        CheckoutCleanupPlan::DeleteWorkspaceThenReleaseUnused => {
+            let (proven, d) = executor.delete_workspace();
+            diagnostics.extend(d);
+            if proven {
+                diagnostics.extend(executor.release_unused());
+            } else {
+                // Disk absence NOT proven — the lease must NOT be released; quarantine it.
+                executor.quarantine_lease();
+            }
+        }
+        CheckoutCleanupPlan::DeleteWorkspaceThenReleasePrepared => {
+            let (proven, d) = executor.delete_workspace();
+            diagnostics.extend(d);
+            if proven {
+                diagnostics.extend(executor.release_prepared());
+            } else {
+                executor.quarantine_lease();
+            }
+        }
+        CheckoutCleanupPlan::QuarantineBoth => {
+            executor.quarantine_workspace();
+            executor.quarantine_lease();
+            diagnostics.push(
+                "checkout runtime disposed with an unproven teardown (or an already-abandoned \
+                 lease): the workspace and lease are both quarantined, never released"
+                    .to_string(),
+            );
+        }
+        CheckoutCleanupPlan::AbandonBoth => {
+            executor.quarantine_workspace();
+            executor.quarantine_lease();
+            diagnostics.push(
+                "dispose_checkout_runtime reached a WorkloadBound capsule — this should be \
+                 structurally impossible (a bound workload's workspace and lease are owned by the \
+                 existing finalization/settlement path); both are abandoned (quarantined) rather \
+                 than acted on"
+                    .to_string(),
+            );
+        }
+    }
+    diagnostics
+}
+
+/// The REAL [`CheckoutCleanupExecutor`]: it OWNS the capsule's disassembled resources and performs the
+/// genuine delete/release/quarantine. Each op `take`s its resource out of an `Option` exactly once —
+/// the plan sequences guarantee no op is invoked twice or on a missing resource.
+#[allow(dead_code)]
+struct RealCheckoutCleanupExecutor<'a> {
+    workspace: Option<ManagedWorkspace>,
+    lease: Option<UserNamespaceLease>,
+    // Named DISTINCTLY from the capsule's `session` field on purpose: the AST inseparability guard
+    // confines every access of a capsule inner field (`session` included) to an allowlist of capsule
+    // methods, so an unrelated struct reusing that field name would otherwise force this executor's
+    // methods onto that allowlist and weaken the guard.
+    checkout_session: Option<CheckoutPreparationSession>,
+    workspace_manager: &'a WorkspaceManager,
+}
+
+#[allow(dead_code)]
+impl CheckoutCleanupExecutor for RealCheckoutCleanupExecutor<'_> {
+    fn delete_workspace(&mut self) -> (bool, Vec<String>) {
+        let workspace = self
+            .workspace
+            .take()
+            .expect("delete_workspace invoked once, with the workspace still held");
+        match classify_workspace_deletion(self.workspace_manager.delete_workspace(workspace)) {
+            WorkspaceDeletionOutcome::ProvenAbsent { diagnostic } => {
+                (true, diagnostic.into_iter().collect())
+            }
+            WorkspaceDeletionOutcome::NotProvenAbsent { diagnostic } => (false, vec![diagnostic]),
+        }
+    }
+
+    fn release_unused(&mut self) -> Vec<String> {
+        let lease = self
+            .lease
+            .take()
+            .expect("release_unused invoked once, with the lease still held");
+        match lease.release_unused() {
+            Ok(()) => Vec::new(),
+            Err(e) => vec![format!("releasing the unused userns lease failed: {e}")],
+        }
+    }
+
+    fn release_prepared(&mut self) -> Vec<String> {
+        let session = self
+            .checkout_session
+            .take()
+            .expect("release_prepared invoked once, with the session still held");
+        let lease = self
+            .lease
+            .take()
+            .expect("release_prepared invoked once, with the lease still held");
+        match session.release_prepared(lease) {
+            Ok(()) => Vec::new(),
+            Err(e) => vec![format!("releasing the prepared userns lease failed: {e}")],
+        }
+    }
+
+    fn quarantine_workspace(&mut self) {
+        // Drop (never delete): `ManagedWorkspace::drop` poisons the workspace manager.
+        drop(self.workspace.take());
+    }
+
+    fn quarantine_lease(&mut self) {
+        // Drop (never release): `UserNamespaceLease::drop` quarantines the slot.
+        drop(self.lease.take());
+    }
+}
+
+// CT-007 slice 5b.3-6a (Sol's r4): the capsule types + their five approved accessors live in the
+// DEDICATED private submodule `checkout_runtime`, where the struct fields are MODULE-PRIVATE — Rust's
+// own module privacy, NOT a syntactic guard, forbids any other code (a sibling module, a free
+// function, a macro expansion, OR a descendant module — there are none inside it) from NAMING
+// `workload_cfg`/`enabled_context`/`session`/`acquired`/`prepared_checkout_evidence`. The reshaped Hop
+// B entry lives inside the module and hands `run_checkout_preparation_inner` (below) only &mut/&
+// borrows obtained INSIDE the module. Re-exported so the rest of `gvisor` and its tests can name the
+// types and the dormant Hop B entry without being able to reach their fields.
+mod checkout_runtime;
+// Dormant (5b.3-6a): no production caller yet — the re-export exists so 5b.3-6b/6c and the tests can
+// name the types/entry. `#[allow(unused_imports)]` mirrors the capsule's own `#[allow(dead_code)]`.
+#[allow(unused_imports)]
+pub(crate) use checkout_runtime::{
+    run_checkout_preparation_v2, AcquiredCheckoutRuntime, PreparedCheckoutRuntime,
+};
 
 /// Hop B's ENTIRE pre-spawn V2 authorization decision, extracted so it is unit-testable without a
 /// real lease/session/workspace/`runsc` (the same convention [`evaluate_checkout_finalization`]
-/// follows).
+/// follows). Consumes the authorization against the capsule's FULL derived scope (Sol's r1 blocker 1),
+/// not just the commit.
 #[allow(dead_code)]
 fn resolve_checkout_preparation_permit(
     authorization: PhaseAuthorization,
     run_token: &RunTokenCredential,
+    checkout_scope: &CheckoutAuthorizationScope,
     expected_commit: &ExpectedGitCommitId,
 ) -> Result<LaunchPermit, CheckoutPreparationError> {
     authorization
-        .into_preparation_permit(run_token, expected_commit)
+        .into_preparation_permit_for_scope(run_token, checkout_scope, expected_commit)
         .map_err(|error| CheckoutPreparationError::Refused(error.0))
 }
 
@@ -8338,6 +8508,21 @@ mod tests {
     // =============================================================================================
 
     const GVISOR_SOURCE: &str = include_str!("gvisor.rs");
+    /// The dedicated capsule submodule's source (CT-007 5b.3-6a, Sol's r4): the capsule types + the
+    /// reshaped Hop B entry moved here so module privacy enforces field inseparability.
+    const CHECKOUT_RUNTIME_SOURCE: &str = include_str!("gvisor/checkout_runtime.rs");
+
+    /// [`source_of`] against an arbitrary source string (used for the capsule submodule).
+    fn source_of_in(source: &'static str, function_signature: &str) -> &'static str {
+        let start = source
+            .find(function_signature)
+            .unwrap_or_else(|| panic!("`{function_signature}` exists"));
+        let rest = &source[start..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("`{function_signature}` has a top-level close"));
+        &rest[..end]
+    }
 
     /// This module's PRODUCTION source only. A whole-file `contains` check would otherwise match
     /// the assertion strings in these very tests — a source pin that reads its own file must
@@ -8399,7 +8584,11 @@ mod tests {
             1,
             "the LEGACY Hop B entry point is the one place an immediate preparation permit exists"
         );
-        let v2_preparation = source_of("pub(crate) fn run_checkout_preparation_v2(");
+        // The V2 Hop B entry now lives in the dedicated `checkout_runtime` submodule (Sol's r4).
+        let v2_preparation = source_of_in(
+            CHECKOUT_RUNTIME_SOURCE,
+            "pub(crate) fn run_checkout_preparation_v2(",
+        );
         assert!(
             !v2_preparation.contains("LaunchPermit::immediate()")
                 && !v2_preparation.contains("CheckoutAuthorizationProof"),
@@ -8412,8 +8601,11 @@ mod tests {
         let resolve = source_of("fn resolve_checkout_preparation_permit(");
         assert!(
             !resolve.contains("LaunchPermit::immediate()")
-                && resolve.contains("into_preparation_permit(run_token, expected_commit)"),
-            "the V2 permit is reachable ONLY by consuming the authorization through its own checks"
+                && resolve.contains(
+                    "into_preparation_permit_for_scope(run_token, checkout_scope, expected_commit)"
+                ),
+            "the V2 permit is reachable ONLY by consuming the authorization through its own checks, \
+             bound to the capsule's FULL scope (5b.3-6a blocker 1)"
         );
 
         // Hop A: the module-private authority enum means the V2 entry point cannot select a legacy
@@ -8500,7 +8692,8 @@ mod tests {
             AUTHORIZATION_SOURCE.matches("self.permit").count(),
             2,
             "the permit field is TOUCHED in exactly two places: the two consuming into_*_permit \
-             methods. A new permit-exposing method would raise this count."
+             methods (transport, and the 5b.3-6a full-scope preparation — the commit-only preparation \
+             permit was removed in r2). A new permit-exposing method would raise this count."
         );
         assert_eq!(
             AUTHORIZATION_SOURCE.matches("Ok(self.permit)").count(),
@@ -8573,7 +8766,7 @@ mod tests {
             methods,
             vec![
                 "generation_id",
-                "into_preparation_permit",
+                "into_preparation_permit_for_scope",
                 "into_transport_permit",
                 "phase",
                 "run_token_jti",
@@ -8621,6 +8814,510 @@ mod tests {
             AUTHORIZATION_SOURCE.matches("permit,\n        })").count(),
             1,
             "there is exactly ONE construction site for the fused authorization"
+        );
+    }
+
+    /// **The checkout-runtime submodule's SHAPE is audited CLOSED-WORLD (syn AST).** (CT-007 slice
+    /// 5b.3-6a, Sol's r4/r5.) The capsule types + their five approved accessors live in the dedicated
+    /// private submodule `checkout_runtime`, so **Rust's own module privacy** — not this test — forbids
+    /// any code OUTSIDE the module (sibling, free fn, macro expansion, descendant module) from NAMING
+    /// the inner fields; the compile-error bites-proofs fail to COMPILE with a privacy error, not a
+    /// test. But code INSIDE the module can still EXPORT a leak (Sol's r5: `pub(crate) static LEAK:
+    /// fn(&Cap)->&OciConfig = |c| &c.workload_cfg;` — the closure's field access is legal inside the
+    /// owning module, and a parent calls `checkout_runtime::LEAK`). So this test makes the module's
+    /// export inventory CLOSED-WORLD: parsing `checkout_runtime.rs`, EVERY production (non-`#[cfg(test)]`)
+    /// top-level item MUST be one of — `use` imports (any number); EXACTLY the two capsule structs (no
+    /// other struct/enum/union/type/alias); INHERENT impls on ONLY those two types (no trait impl, no
+    /// impl on another self-type); and ONLY the free fns in `ALLOWED_FREE_FNS`. Any other item kind —
+    /// `static`, `const`, `trait`, `macro_rules!`/macro invocation, `extern`, `mod`, type alias, union,
+    /// an extra free fn — FAILS the audit BY NAME. Together with module privacy, this audited inventory
+    /// is the compile-time guarantee: there is nowhere inside the module to hide a leaking
+    /// static/const/helper. The audit ALSO checks capsule fields private, no `Clone`/`Copy`, no non-`fn`
+    /// associated items, and the exact non-private accessor surface (the five entries).
+    ///
+    /// MULTIPLICITY-EXACT (Sol's r6): the struct-name, free-fn-name, and accessor-surface inventories
+    /// are SORTED LISTS compared with multiplicity (no dedup, no set-membership). `syn` parses BOTH
+    /// arms of a `#[cfg]`/`#[cfg(not)]` pair as two items, so a second gated definition of an approved
+    /// name (which a comment can hide from a literal occurrence pin) makes its list one entry LONGER
+    /// than the allowlist and FAILS — where a set would have collapsed it to one.
+    ///
+    /// RESIDUAL — HONEST SCOPE: `syn` does not expand macros. Any macro invocation IN THIS MODULE whose
+    /// token stream contains a capsule TYPE ident or ANY inner-field ident (all five, incl.
+    /// `prepared_checkout_evidence`) fails this test, forcing review; and a top-level `macro_rules!`/
+    /// macro invocation is itself rejected by the closed-world inventory. The remaining unexpanded
+    /// external/procedural-macro gap is acceptable for this dormant guard (Sol's r4/r5: do not move it
+    /// to `myelin-lints`).
+    #[test]
+    fn the_checkout_runtime_module_shape_is_pinned() {
+        const CAPSULES: [&str; 2] = ["AcquiredCheckoutRuntime", "PreparedCheckoutRuntime"];
+        const MACRO_REVIEW_IDENTS: [&str; 7] = [
+            "AcquiredCheckoutRuntime",
+            "PreparedCheckoutRuntime",
+            "workload_cfg",
+            "enabled_context",
+            "session",
+            "acquired",
+            "prepared_checkout_evidence",
+        ];
+        const ALLOWLIST: [&str; 5] = [
+            "AcquiredCheckoutRuntime::acquire",
+            "AcquiredCheckoutRuntime::dispose_checkout_runtime",
+            "PreparedCheckoutRuntime::bind_workload",
+            "PreparedCheckoutRuntime::dispose_checkout_runtime",
+            "run_checkout_preparation_v2",
+        ];
+        // Closed-world (Sol's r5): the EXACT set of free functions permitted at module top level. Any
+        // other free fn — even a private helper — is a violation until reviewed and added here.
+        const ALLOWED_FREE_FNS: [&str; 1] = ["run_checkout_preparation_v2"];
+
+        fn type_last_ident(ty: &syn::Type) -> Option<String> {
+            match ty {
+                syn::Type::Path(tp) => tp.path.segments.last().map(|s| s.ident.to_string()),
+                syn::Type::Reference(r) => type_last_ident(&r.elem),
+                _ => None,
+            }
+        }
+        fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().any(|a| {
+                let mut hit = false;
+                if a.path().is_ident("cfg") {
+                    let _ = a.parse_nested_meta(|meta| {
+                        if meta.path.is_ident("test") {
+                            hit = true;
+                        }
+                        Ok(())
+                    });
+                }
+                hit
+            })
+        }
+        fn is_private(vis: &syn::Visibility) -> bool {
+            matches!(vis, syn::Visibility::Inherited)
+        }
+        /// A human name for a forbidden top-level item kind (for the closed-world violation message).
+        fn describe_item(item: &syn::Item) -> String {
+            match item {
+                syn::Item::Const(c) => format!("const `{}`", c.ident),
+                syn::Item::Static(s) => format!("static `{}`", s.ident),
+                syn::Item::Trait(t) => format!("trait `{}`", t.ident),
+                syn::Item::TraitAlias(t) => format!("trait alias `{}`", t.ident),
+                syn::Item::Type(t) => format!("type alias `{}`", t.ident),
+                syn::Item::Enum(e) => format!("enum `{}`", e.ident),
+                syn::Item::Union(u) => format!("union `{}`", u.ident),
+                syn::Item::Mod(m) => format!("module `{}`", m.ident),
+                syn::Item::Macro(m) => format!(
+                    "macro `{}!`",
+                    m.mac
+                        .path
+                        .segments
+                        .last()
+                        .map(|s| s.ident.to_string())
+                        .unwrap_or_default()
+                ),
+                syn::Item::ForeignMod(_) => "an extern block".to_string(),
+                syn::Item::ExternCrate(e) => format!("extern crate `{}`", e.ident),
+                _ => "an unrecognized item kind".to_string(),
+            }
+        }
+        fn macro_mentions(ts: &proc_macro2::TokenStream, needles: &[&str]) -> Option<String> {
+            for tt in ts.clone() {
+                match tt {
+                    proc_macro2::TokenTree::Ident(id) => {
+                        let s = id.to_string();
+                        if needles.contains(&s.as_str()) {
+                            return Some(s);
+                        }
+                    }
+                    proc_macro2::TokenTree::Group(g) => {
+                        if let Some(h) = macro_mentions(&g.stream(), needles) {
+                            return Some(h);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+
+        let file =
+            syn::parse_file(CHECKOUT_RUNTIME_SOURCE).expect("checkout_runtime.rs parses as a File");
+        let mut violations: Vec<String> = Vec::new();
+        // MULTIPLICITY-EXACT inventories (Sol's r6): NO dedup. `syn` parses BOTH arms of a
+        // `#[cfg]`/`#[cfg(not)]` pair as two separate items (it never evaluates cfg), so two gated
+        // definitions of an approved name land as TWO list entries — making the list LONGER than its
+        // allowlist and failing, rather than collapsing into one set entry.
+        let mut accessor_surface: Vec<String> = Vec::new();
+        let mut free_fn_names: Vec<String> = Vec::new();
+        let mut struct_names: Vec<String> = Vec::new();
+
+        // Macro scan over the whole module (syn::visit reaches nested macros too).
+        {
+            use syn::visit::Visit;
+            struct MacroScan<'a> {
+                violations: &'a mut Vec<String>,
+            }
+            impl<'ast> Visit<'ast> for MacroScan<'_> {
+                fn visit_macro(&mut self, node: &'ast syn::Macro) {
+                    if let Some(hit) = macro_mentions(&node.tokens, &MACRO_REVIEW_IDENTS) {
+                        let path = node
+                            .path
+                            .segments
+                            .last()
+                            .map(|s| s.ident.to_string())
+                            .unwrap_or_default();
+                        self.violations.push(format!(
+                            "macro `{path}!` in the capsule module mentions `{hit}` — `syn` cannot \
+                             expand it, so it must be reviewed for a capsule-field leak"
+                        ));
+                    }
+                    syn::visit::visit_macro(self, node);
+                }
+            }
+            MacroScan {
+                violations: &mut violations,
+            }
+            .visit_file(&file);
+        }
+
+        // CLOSED-WORLD inventory (Sol's r5): module privacy stops OUTSIDE code from naming the fields,
+        // but code INSIDE the module can still export a leak (e.g. `pub(crate) static LEAK: fn(&Cap)
+        // -> &OciConfig = |c| &c.workload_cfg;` — the closure's field access is legal inside the owning
+        // module, and a parent then calls `checkout_runtime::LEAK`). So EVERY production top-level item
+        // must be one of an exact whitelist; anything else fails the audit by name. Together with
+        // module privacy this makes the audited export inventory the compile-time guarantee.
+        for item in &file.items {
+            match item {
+                // ALLOWED: any number of `use` imports.
+                syn::Item::Use(_) => {}
+
+                // ALLOWED: EXACTLY the two capsule structs (no other struct/enum/union/type/alias).
+                syn::Item::Struct(s) => {
+                    let name = s.ident.to_string();
+                    struct_names.push(name.clone());
+                    if !CAPSULES.contains(&name.as_str()) {
+                        violations.push(format!(
+                            "unexpected struct `{name}` — only the two capsule structs are permitted"
+                        ));
+                        continue;
+                    }
+                    for f in &s.fields {
+                        if !is_private(&f.vis) {
+                            violations.push(format!("{name}: a field is not private (pub/pub(..))"));
+                        }
+                    }
+                    for attr in &s.attrs {
+                        if attr.path().is_ident("derive") {
+                            let _ = attr.parse_nested_meta(|meta| {
+                                if meta.path.is_ident("Clone") || meta.path.is_ident("Copy") {
+                                    violations.push(format!("{name} derives Clone/Copy"));
+                                }
+                                Ok(())
+                            });
+                        }
+                    }
+                }
+
+                // ALLOWED: only the EXACT free-fn name set (even a private helper is rejected until
+                // reviewed and added to `ALLOWED_FREE_FNS`).
+                syn::Item::Fn(f) => {
+                    let name = f.sig.ident.to_string();
+                    free_fn_names.push(name.clone());
+                    if !ALLOWED_FREE_FNS.contains(&name.as_str()) {
+                        violations.push(format!(
+                            "unexpected free fn `{name}` — the capsule module permits only \
+                             {ALLOWED_FREE_FNS:?} at top level"
+                        ));
+                    } else if !is_cfg_test(&f.attrs) && !is_private(&f.vis) {
+                        accessor_surface.push(name);
+                    }
+                }
+
+                // ALLOWED: INHERENT impls on the two capsule types ONLY (incl. the `#[cfg(test)]`
+                // driver impl). Any trait impl, or any impl on another self-type, is rejected.
+                syn::Item::Impl(im) => {
+                    if im.trait_.is_some() {
+                        violations.push(format!(
+                            "trait impl on `{}` — forbidden (a `match self` could hand out the \
+                             inner fields)",
+                            type_last_ident(&im.self_ty).as_deref().unwrap_or("<type>")
+                        ));
+                        continue;
+                    }
+                    match type_last_ident(&im.self_ty).as_deref() {
+                        Some(name) if CAPSULES.contains(&name) => {
+                            let test_only = is_cfg_test(&im.attrs);
+                            for it in &im.items {
+                                match it {
+                                    syn::ImplItem::Fn(m) => {
+                                        if !test_only && !is_private(&m.vis) {
+                                            accessor_surface
+                                                .push(format!("{name}::{}", m.sig.ident));
+                                        }
+                                    }
+                                    _ => violations.push(format!(
+                                        "non-fn associated item in inherent impl of `{name}` — a \
+                                         const/type could hand out an inner field"
+                                    )),
+                                }
+                            }
+                        }
+                        other => violations.push(format!(
+                            "inherent impl on `{}` — only the two capsule types may be `impl`ed in \
+                             this module",
+                            other.unwrap_or("<non-path type>")
+                        )),
+                    }
+                }
+
+                // EVERYTHING ELSE is forbidden: static/const/trait/macro/extern/mod/type-alias/union/…
+                // — any of which could export a closure/const/helper that legally reads a private
+                // field. This is the terminal closed-world guarantee.
+                other => violations.push(format!(
+                    "forbidden top-level item in the capsule module: {} — its production surface is \
+                     closed-world (only `use`, the two capsule structs, their inherent impls, and \
+                     run_checkout_preparation_v2)",
+                    describe_item(other)
+                )),
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "checkout_runtime module shape violated: {violations:#?}"
+        );
+
+        // MULTIPLICITY-EXACT assertions (sorted lists, NO dedup): a second `#[cfg]`-gated definition
+        // of an approved name makes its list one entry LONGER than the allowlist and fails here, even
+        // though a comment can defeat the literal occurrence pin and a `set` would collapse it.
+        fn sorted(mut v: Vec<String>) -> Vec<String> {
+            v.sort();
+            v
+        }
+        assert_eq!(
+            sorted(struct_names),
+            sorted(CAPSULES.iter().map(|s| s.to_string()).collect()),
+            "the capsule struct-name list changed — EXACTLY the two capsule structs, no duplicate \
+             (e.g. a second cfg-gated struct reusing a capsule name)"
+        );
+        assert_eq!(
+            sorted(free_fn_names),
+            sorted(ALLOWED_FREE_FNS.iter().map(|s| s.to_string()).collect()),
+            "the top-level free-fn list changed — EXACTLY run_checkout_preparation_v2, counted with \
+             multiplicity, so a second cfg-gated definition of that name fails"
+        );
+        assert_eq!(
+            sorted(accessor_surface),
+            sorted(ALLOWLIST.iter().map(|s| s.to_string()).collect()),
+            "the checkout_runtime module's non-private accessor surface changed — every accessor must \
+             be an explicitly-reviewed capsule entry, counted with multiplicity"
+        );
+    }
+
+    /// **The 5b.3-6a capsule stays fully dormant, and its workload `OciConfig` is never detached.**
+    /// No production code constructs a capsule, runs the fused Hop B entry, or wires either capsule
+    /// type into `launch_with`'s control flow (that composition is 5b.3-6b/6c). The capsule now lives
+    /// in the `checkout_runtime` submodule (Sol's r4), so the dormancy proof reads that file too.
+    #[test]
+    fn the_checkout_runtime_capsule_has_no_production_caller() {
+        let prod = production_source();
+        // The fused V2 Hop B entry moved OUT of gvisor.rs into the submodule — gvisor.rs production
+        // now only RE-EXPORTS the name (no `(` call/def), and the submodule holds exactly ONE
+        // definition with no caller.
+        assert_eq!(
+            prod.matches("run_checkout_preparation_v2(").count(),
+            0,
+            "the v2 definition moved to the checkout_runtime submodule; gvisor.rs only re-exports it"
+        );
+        assert_eq!(
+            CHECKOUT_RUNTIME_SOURCE
+                .matches("run_checkout_preparation_v2(")
+                .count(),
+            1,
+            "run_checkout_preparation_v2 is a dormant definition with no caller"
+        );
+        // No caller of the constructor anywhere (its own def is `pub(crate) fn acquire(`, not the
+        // qualified call form; the one qualified mention is the error-message string, no `(`).
+        for (label, src) in [("gvisor.rs", prod), ("checkout_runtime.rs", CHECKOUT_RUNTIME_SOURCE)] {
+            assert_eq!(
+                src.matches("AcquiredCheckoutRuntime::acquire(").count(),
+                0,
+                "nothing constructs the capsule ({label})"
+            );
+            assert_eq!(
+                src.matches("fn into_prepared").count(),
+                0,
+                "no free-standing prepared transition — Hop B and the transition are fused ({label})"
+            );
+        }
+        // The fused Hop B entry consumes the capsule by value and returns the prepared capsule.
+        let v2_entry = source_of_in(
+            CHECKOUT_RUNTIME_SOURCE,
+            "pub(crate) fn run_checkout_preparation_v2(",
+        );
+        assert!(
+            v2_entry.contains("mut runtime: AcquiredCheckoutRuntime")
+                && v2_entry.contains(
+                    "-> Result<PreparedCheckoutRuntime, (AcquiredCheckoutRuntime, CheckoutPreparationError)>"
+                ),
+            "the fused Hop B entry consumes the capsule by value and returns the prepared capsule"
+        );
+        // The `.dispose_checkout_runtime(` calls are exactly two internal ones (in the submodule) —
+        // `acquire`'s hard-job_key-check safe cleanup and the `PreparedCheckoutRuntime` delegation —
+        // never a real disposal driven by a live external caller.
+        assert_eq!(
+            CHECKOUT_RUNTIME_SOURCE
+                .matches(".dispose_checkout_runtime(")
+                .count(),
+            2,
+            "the only dispose_checkout_runtime calls are acquire's safe cleanup and the delegation"
+        );
+        // 5b.3-6a does NOT touch launch_with: its control flow never names either capsule type.
+        let launch_with = source_of("fn launch_with<F>(");
+        assert!(
+            !launch_with.contains("AcquiredCheckoutRuntime")
+                && !launch_with.contains("PreparedCheckoutRuntime"),
+            "launch_with's control flow is untouched by 5b.3-6a"
+        );
+        // Blocker 2/5: `acquire` retains the workload OciConfig INSIDE the capsule — its signature
+        // returns the bare capsule, never `(OciConfig, ..)` detached.
+        let acquire_sig = {
+            let s = CHECKOUT_RUNTIME_SOURCE
+                .find("pub(crate) fn acquire(")
+                .expect("acquire exists in the submodule");
+            let rest = &CHECKOUT_RUNTIME_SOURCE[s..];
+            &rest[..rest.find(" {\n").expect("acquire signature ends")]
+        };
+        assert!(
+            acquire_sig.contains("-> Result<AcquiredCheckoutRuntime, String>")
+                && !acquire_sig.contains("OciConfig"),
+            "acquire must return the capsule alone — never the workload OciConfig detached"
+        );
+    }
+
+    /// **The cleanup routing is behaviorally pinned, not just structurally** (Sol's r1 blocker 6):
+    /// the pure [`checkout_cleanup_plan`] maps EVERY session disposition to exactly one action, so a
+    /// regression that swapped e.g. the `NeverBound`/`Prepared` release methods fails HERE (in the
+    /// always-run unit gate) rather than only as a production panic/allocator poison. The privileged
+    /// end-to-end matrix (`dispose_*_matrix`, below) then proves the plan's EXECUTION against real
+    /// leases/workspaces.
+    #[test]
+    fn checkout_cleanup_plan_maps_every_disposition_to_its_one_safe_action() {
+        assert_eq!(
+            checkout_cleanup_plan(CheckoutSessionCleanup::NeverBound),
+            CheckoutCleanupPlan::DeleteWorkspaceThenReleaseUnused,
+            "a never-bound (Allocated) lease is released via release_unused, never release_prepared"
+        );
+        assert_eq!(
+            checkout_cleanup_plan(CheckoutSessionCleanup::Prepared),
+            CheckoutCleanupPlan::DeleteWorkspaceThenReleasePrepared,
+            "a Prepared lease is released via release_prepared, never release_unused"
+        );
+        assert_eq!(
+            checkout_cleanup_plan(CheckoutSessionCleanup::TeardownUnproven),
+            CheckoutCleanupPlan::QuarantineBoth,
+            "PreparationBound with unproven teardown is quarantined, never released"
+        );
+        assert_eq!(
+            checkout_cleanup_plan(CheckoutSessionCleanup::Unreleasable),
+            CheckoutCleanupPlan::QuarantineBoth,
+            "an already-poisoned lease is quarantined, never released"
+        );
+        assert_eq!(
+            checkout_cleanup_plan(CheckoutSessionCleanup::WorkloadBound),
+            CheckoutCleanupPlan::AbandonBoth,
+            "a bound workload's resources are owned by finalization — disposal abandons, never releases"
+        );
+    }
+
+    /// **Each cleanup plan invokes EXACTLY the right operation sequence — ALWAYS-RUN, no
+    /// `CAP_SYS_ADMIN`** (Sol's r2 blocker 3). `execute_cleanup_plan` is the SINGLE implementation the
+    /// real disposal and this test share, driven here through a recording fake executor. Swapping the
+    /// `release_unused`/`release_prepared` legs of the two delete-then-release plans changes the
+    /// recorded trace and fails this test — the regression the privileged e2e matrix could SKIP past
+    /// (it soft-skips without Btrfs/caps) is caught here in the gate-enforced unit run.
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum RecordedCleanupOp {
+        DeleteWorkspace,
+        ReleaseUnused,
+        ReleasePrepared,
+        QuarantineWorkspace,
+        QuarantineLease,
+    }
+
+    struct RecordingCleanupExecutor {
+        ops: Vec<RecordedCleanupOp>,
+        /// What `delete_workspace` reports for disk-absence-proven.
+        delete_proven: bool,
+    }
+
+    impl CheckoutCleanupExecutor for RecordingCleanupExecutor {
+        fn delete_workspace(&mut self) -> (bool, Vec<String>) {
+            self.ops.push(RecordedCleanupOp::DeleteWorkspace);
+            (self.delete_proven, Vec::new())
+        }
+        fn release_unused(&mut self) -> Vec<String> {
+            self.ops.push(RecordedCleanupOp::ReleaseUnused);
+            Vec::new()
+        }
+        fn release_prepared(&mut self) -> Vec<String> {
+            self.ops.push(RecordedCleanupOp::ReleasePrepared);
+            Vec::new()
+        }
+        fn quarantine_workspace(&mut self) {
+            self.ops.push(RecordedCleanupOp::QuarantineWorkspace);
+        }
+        fn quarantine_lease(&mut self) {
+            self.ops.push(RecordedCleanupOp::QuarantineLease);
+        }
+    }
+
+    fn trace(plan: CheckoutCleanupPlan, delete_proven: bool) -> Vec<RecordedCleanupOp> {
+        let mut exec = RecordingCleanupExecutor {
+            ops: Vec::new(),
+            delete_proven,
+        };
+        execute_cleanup_plan(plan, &mut exec);
+        exec.ops
+    }
+
+    #[test]
+    fn each_cleanup_plan_executes_exactly_its_operation_sequence() {
+        use CheckoutCleanupPlan::*;
+        use RecordedCleanupOp::*;
+
+        // Proven deletion: the two delete-then-release plans reach their DISTINCT release op — the
+        // exact swap Sol flagged (NeverBound↔Prepared) would flip these and fail.
+        assert_eq!(
+            trace(DeleteWorkspaceThenReleaseUnused, true),
+            vec![DeleteWorkspace, ReleaseUnused],
+            "NeverBound deletes the workspace then release_unused (never release_prepared)"
+        );
+        assert_eq!(
+            trace(DeleteWorkspaceThenReleasePrepared, true),
+            vec![DeleteWorkspace, ReleasePrepared],
+            "Prepared deletes the workspace then release_prepared (never release_unused)"
+        );
+        // Unproven deletion: neither delete-then-release plan releases — the lease is quarantined.
+        assert_eq!(
+            trace(DeleteWorkspaceThenReleaseUnused, false),
+            vec![DeleteWorkspace, QuarantineLease],
+            "an unproven delete must quarantine the lease, never release_unused it"
+        );
+        assert_eq!(
+            trace(DeleteWorkspaceThenReleasePrepared, false),
+            vec![DeleteWorkspace, QuarantineLease],
+            "an unproven delete must quarantine the lease, never release_prepared it"
+        );
+        // Quarantine/abandon plans never delete or release — both resources are quarantined.
+        assert_eq!(
+            trace(QuarantineBoth, true),
+            vec![QuarantineWorkspace, QuarantineLease],
+            "QuarantineBoth never deletes the workspace or releases the lease"
+        );
+        assert_eq!(
+            trace(AbandonBoth, true),
+            vec![QuarantineWorkspace, QuarantineLease],
+            "AbandonBoth never deletes the workspace or releases the lease"
         );
     }
 
@@ -10566,6 +11263,199 @@ mod tests {
             .expect("settling a matching evidence against a Bound lease must succeed");
         assert!(workspace_manager.is_healthy());
         assert!(userns_allocator.is_healthy());
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    // ───────── CT-007 slice 5b.3-6a: the dispose_checkout_runtime BEHAVIORAL cleanup matrix ─────────
+    //
+    // Sol's r1 blocker 6: the pure `checkout_cleanup_plan` pin (above, always-run) proves the
+    // disposition→action MAPPING; these privileged end-to-end tests prove its EXECUTION against a
+    // REAL workspace+lease — after each disposition, the durable allocator/workspace state is exactly
+    // what the plan promises (a released slot is REUSABLE; a quarantined slot is NOT reissued and the
+    // workspace manager is poisoned for operator reconciliation). Gated on real Btrfs+qgroup and a
+    // usable subuid range, like the acquire/settle matrix above; the pool size is 1, so "the slot was
+    // released" is observable as "a second `lease()` now succeeds", and "quarantined" as "it fails".
+
+    /// A checkout-bearing [`JobSpec`] whose workspace derives a valid [`CheckoutAuthorizationScope`]
+    /// (`myelin://acme/git/repo/widgets` @ a 40-hex commit), so `AcquiredCheckoutRuntime::acquire`
+    /// reaches a real acquisition.
+    #[cfg(feature = "test-support")]
+    fn checkout_spec() -> JobSpec {
+        JobSpec::new(
+            JobKind::Ci,
+            fixture_image(),
+            vec!["true".into()],
+            vec![],
+            vec![],
+            EgressPolicy { allow: vec![] },
+            ResourceLimits {
+                cpu_millis: 1000,
+                mem_bytes: 256 << 20,
+                disk_bytes: 1 << 30,
+                tmpfs_bytes: 1 << 30,
+                pids_max: 64,
+                timeout_secs: 120,
+            },
+            WorkspaceSpec {
+                repo_ref: Some("myelin://acme/git/repo/widgets".to_string()),
+                commit: Some("a".repeat(40)),
+            },
+            TrustTier::UntrustedFork,
+            RunTokenCredential::new("test-bearer", "j", 300).unwrap(),
+            MeterTarget {
+                reserve_id: "r".into(),
+            },
+            IdemToken("idem-checkout-6a".into()),
+        )
+        .unwrap()
+    }
+
+    /// Acquire a REAL capsule against fresh real managers (pool size 1). Returns the capsule plus the
+    /// managers/dirs so the caller can dispose and then probe durable state. `None` = soft skip.
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::type_complexity)]
+    fn acquire_real_checkout_capsule(
+        tag: &str,
+    ) -> Option<(
+        AcquiredCheckoutRuntime,
+        WorkspaceManager,
+        PathBuf,
+        UserNamespaceAllocator,
+        PathBuf,
+    )> {
+        let (workspace_manager, workspace_base) = real_workspace_manager_for_tests(tag)?;
+        let Some((userns_allocator, leases_dir)) = real_userns_allocator_for_tests(tag) else {
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            return None;
+        };
+        let spec = checkout_spec();
+        let profile = HardeningProfile::derive(&spec);
+        let runtime = AcquiredCheckoutRuntime::acquire(
+            &spec,
+            &profile,
+            PathBuf::from("/abs/staged-rootfs"),
+            &workspace_manager,
+            &userns_allocator,
+        )
+        .expect("acquisition must succeed against a healthy real manager/allocator");
+        // Sanity: the acquisition already exhausted the size-1 pool.
+        assert!(
+            userns_allocator.lease().is_err(),
+            "the size-1 pool is exhausted while the capsule holds its lease"
+        );
+        Some((
+            runtime,
+            workspace_manager,
+            workspace_base,
+            userns_allocator,
+            leases_dir,
+        ))
+    }
+
+    /// NeverBound (session NotStarted): dispose deletes the workspace and `release_unused`s the lease,
+    /// so the slot becomes reusable and both managers stay healthy.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn dispose_never_bound_deletes_workspace_and_frees_the_slot() {
+        let Some((runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("dispose-never-bound")
+        else {
+            return;
+        };
+        let diagnostics = runtime.dispose_checkout_runtime(&workspace_manager);
+        assert!(
+            diagnostics.is_empty(),
+            "a clean NeverBound disposal must produce no diagnostics, got {diagnostics:?}"
+        );
+        assert!(workspace_manager.is_healthy());
+        assert!(userns_allocator.is_healthy());
+        assert!(
+            userns_allocator.lease().is_ok(),
+            "release_unused must return the slot to the pool — a fresh lease must now succeed"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// Prepared (session bind_preparation + confirm_prepared): dispose deletes the workspace and
+    /// `release_prepared`s the lease, so the slot becomes reusable.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn dispose_prepared_deletes_workspace_and_release_prepared_frees_the_slot() {
+        let Some((mut runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("dispose-prepared")
+        else {
+            return;
+        };
+        // Drive the session to Prepared via the module's own test-only driver — the capsule's fields
+        // are now module-private, so a sibling test can no longer reach them directly.
+        runtime.drive_session_for_tests(CheckoutSessionCleanup::Prepared);
+        let diagnostics = runtime.dispose_checkout_runtime(&workspace_manager);
+        assert!(
+            diagnostics.is_empty(),
+            "a clean Prepared disposal must produce no diagnostics, got {diagnostics:?}"
+        );
+        assert!(workspace_manager.is_healthy());
+        assert!(
+            userns_allocator.lease().is_ok(),
+            "release_prepared must return the slot to the pool — a fresh lease must now succeed"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// TeardownUnproven (session bind_preparation only — teardown never proven): dispose quarantines
+    /// BOTH — the slot is NOT reissued and the workspace manager is poisoned.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn dispose_teardown_unproven_quarantines_both() {
+        let Some((mut runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("dispose-teardown-unproven")
+        else {
+            return;
+        };
+        runtime.drive_session_for_tests(CheckoutSessionCleanup::TeardownUnproven);
+        let diagnostics = runtime.dispose_checkout_runtime(&workspace_manager);
+        assert!(
+            diagnostics.iter().any(|d| d.contains("quarantined")),
+            "a TeardownUnproven disposal must report quarantine, got {diagnostics:?}"
+        );
+        assert!(
+            !workspace_manager.is_healthy(),
+            "dropping the still-live workspace (never delete, never release) must poison the manager"
+        );
+        assert!(
+            userns_allocator.lease().is_err(),
+            "a quarantined slot must NOT be reissued — the pool stays exhausted"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// WorkloadBound (session driven all the way to Done): disposal is structurally impossible, so it
+    /// abandons BOTH and surfaces an invariant violation — slot quarantined, manager poisoned.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn dispose_workload_bound_abandons_both_with_an_invariant_violation() {
+        let Some((mut runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("dispose-workload-bound")
+        else {
+            return;
+        };
+        runtime.drive_session_for_tests(CheckoutSessionCleanup::WorkloadBound);
+        let diagnostics = runtime.dispose_checkout_runtime(&workspace_manager);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("structurally impossible")),
+            "disposing a WorkloadBound capsule must surface an invariant violation, got {diagnostics:?}"
+        );
+        assert!(!workspace_manager.is_healthy());
+        assert!(
+            userns_allocator.lease().is_err(),
+            "an abandoned slot must NOT be reissued"
+        );
         let _ = std::fs::remove_dir_all(&workspace_base);
         let _ = std::fs::remove_dir_all(&leases_dir);
     }
@@ -17304,6 +18194,10 @@ mod tests {
                     ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
                 let run_token =
                     RunTokenCredential::new("bearer", "jti-materialization", 300).unwrap();
+                // CT-007 slice 5b.3-6a (blocker 1): Hop B's permit is now resolved against the
+                // capsule's FULL derived scope, not just the commit — the capsule was acquired for
+                // exactly this scope.
+                let capsule_scope = parent_attempt_scope(&oid, GitObjectFormat::Sha1);
 
                 // The exact materialization authorization is accepted, and its permit commits.
                 resolve_checkout_preparation_permit(
@@ -17315,6 +18209,7 @@ mod tests {
                         Ok(()),
                     ),
                     &run_token,
+                    &capsule_scope,
                     &expected,
                 )
                 .expect("the exact materialization authorization authorizes Hop B")
@@ -17349,7 +18244,9 @@ mod tests {
                         crate::CheckoutPhase::Materialization,
                         "jti-materialization",
                         "ffffffffffffffffffffffffffffffffffffffff",
-                        "materialization authorization was minted for commit",
+                        // 5b.3-6a: a different commit is now a FULL-scope mismatch against the
+                        // capsule's own scope, caught before the commit-vs-preparation check.
+                        "was minted for scope",
                     ),
                 ];
                 for (label, phase, jti, commit, expected_message) in cases {
@@ -17362,6 +18259,7 @@ mod tests {
                             Ok(()),
                         ),
                         &run_token,
+                        &capsule_scope,
                         &expected,
                     )
                     .err()

@@ -132,6 +132,16 @@ optional = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# Dev-dep ONLY (CT-007 slice 5b.3-6a, Sol's r2 blocker 2): the checkout-capsule inseparability pin is
+# a SYNTAX-AWARE (AST) test — a text/substring scan cannot enforce "no trait impl / no destructuring
+# escape" against multi-line Rust (a `impl Deref for\n<capsule>` splits every substring). `syn` is
+# already a workspace dependency (myelin-lints parses Rust with it); this test-only edge adds no
+# production DAG dependency.
+syn = { workspace = true, features = ["full", "visit"] }
+# `proc-macro2` (also a workspace dep) lets the same guard scan macro token streams by Ident rather
+# than by substring, so a `unreachable!("… enabled_context …")` string literal is not a false positive
+# while a real `enabled_context` ident inside a macro body still trips the review gate.
+proc-macro2 = { workspace = true }
 # The replay unit test drives the owner reindex seam through the in-memory outbox double. Keep that
 # constructor test-only: standalone `cargo test -p myelin-ci-sandbox` must compile without relying on
 # workspace-wide feature unification from another crate.

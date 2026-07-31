@@ -195,24 +195,44 @@ impl PhaseAuthorization {
         Ok(self.permit)
     }
 
-    /// **Consume this authorization into Hop B's launch permit.** Requires the `Materialization`
-    /// phase, the retained run-token JTI, and the exact commit this preparation is about to check
-    /// out.
+    /// **Consume this authorization into Hop B's launch permit, bound to a capsule's FULL checkout
+    /// scope** (CT-007 slice 5b.3-6a, Sol's r1 blocker 1 / r2 blocker 1). This is the ONLY
+    /// preparation-permit path: a commit-only variant would let an authorization minted for scope B be
+    /// replayed against a workspace capsule acquired for scope A whenever both name commit B, so it was
+    /// removed entirely — full-scope enforcement is structural, not conventional. This variant requires
+    /// the authorization's ENTIRE scope (tenant, repo ref, repo id, commit, object format) to equal
+    /// `expected_scope` (the capsule's own derived scope), AND requires that scope to name exactly the
+    /// `expected_commit` this preparation is about to check out. A capsule for scope A therefore
+    /// refuses an authorization for scope B before any spawn, by construction.
     #[allow(dead_code)]
-    pub(crate) fn into_preparation_permit(
+    pub(crate) fn into_preparation_permit_for_scope(
         self,
         run_token: &RunTokenCredential,
+        expected_scope: &CheckoutAuthorizationScope,
         expected_commit: &ExpectedGitCommitId,
     ) -> Result<LaunchPermit, HookError> {
         self.verify_provenance(CheckoutPhase::Materialization, run_token)?;
-        if self.scope.commit_hex() != expected_commit.as_str()
-            || self.scope.commit_format() != expected_commit.format()
+        if &self.scope != expected_scope {
+            return Err(HookError(format!(
+                "materialization authorization was minted for scope (tenant {:?}, repo {:?}, commit \
+                 {:?}), but this preparation capsule was acquired for scope (tenant {:?}, repo {:?}, \
+                 commit {:?}) -- refusing before any spawn",
+                self.scope.tenant().0,
+                self.scope.repo_id(),
+                self.scope.commit_hex(),
+                expected_scope.tenant().0,
+                expected_scope.repo_id(),
+                expected_scope.commit_hex()
+            )));
+        }
+        if expected_scope.commit_hex() != expected_commit.as_str()
+            || expected_scope.commit_format() != expected_commit.format()
         {
             return Err(HookError(format!(
-                "materialization authorization was minted for commit {:?} ({:?}), but this \
-                 preparation is checking out {:?} ({:?})",
-                self.scope.commit_hex(),
-                self.scope.commit_format(),
+                "the capsule's checkout scope names commit {:?} ({:?}), but this preparation is \
+                 checking out {:?} ({:?})",
+                expected_scope.commit_hex(),
+                expected_scope.commit_format(),
                 expected_commit.as_str(),
                 expected_commit.format()
             )));
