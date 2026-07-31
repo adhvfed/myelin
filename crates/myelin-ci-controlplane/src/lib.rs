@@ -141,6 +141,7 @@ pub use ci_runtime_composition::{
     ci_manifest_pipeline_definition, ci_production_runtime_factory,
     CiProductionRuntimeFactory,
     CiProductionWorkflowPoller, CiRuntimeCompositionError, CiSupersededDefinitionBacklog,
+    CutoverPlan,
     CiSupersededDefinitionGuardError, CiWorkflowFanoutBatch, CI_FLOW_OUTBOX_SCHEMA_VERSION,
     CI_FLOW_WORKER_LEASE_TTL_SECS, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
     CI_MANIFEST_PIPELINE_VERSION, CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS,

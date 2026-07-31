@@ -20,7 +20,7 @@ use std::time::Duration;
 use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_production_runtime_factory_test_support, ci_region_run_discovery_test_support,
-    CiSupersededDefinitionGuardError, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
+    CiSupersededDefinitionGuardError, CutoverPlan, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
     CI_MANIFEST_PIPELINE_VERSION,
 };
 use myelin_storage::{DurableCostLedger, HotTables, PgMigrator, SubstrateProvider};
@@ -1418,6 +1418,594 @@ async fn a_crash_between_ddl_commit_and_ledger_insert_retries_cleanly() {
         // where tampering is free, and does so under the non-superuser migration posture as well.
         // What stays here is only the NON-DESTRUCTIVE half: the crash-window retry above, which
         // adopts the existing function without modifying it.
+    })
+    .await;
+    })
+    .await;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//  SYNTHETIC v3→v4 CUTOVER SUITE (CT-007 slice 5b.3-6d step 5).
+//
+//  The cutover fence is now GENERALIZED over a typed `CutoverPlan{predecessor, current, hash}`. The
+//  production wrapper still runs ONLY the v2→v3 plan — every test above exercises that byte/behavior-
+//  identical path unchanged. This suite drives the SAME generalized fence body over a synthetic
+//  v3→v4 plan, with the v3/v4 `wf_definition` rows seeded IN-TEST (slice 6e ships the production
+//  v3→v4 activation + the retired-v3 fresh-DB sentinel migration; this slice only proves the fence
+//  generalizes). The predecessor is v3, the current is a synthetic v4 that no production root runs.
+//
+//  Reuses the frozen fixtures above verbatim: `cutover_schema` (Flow + CI migrations, the version-
+//  parameterized schema-local backlog probe, the tagged/pinned pools, `pg_stat_activity` lock-wait
+//  hygiene, `with_privilege_fixture_lock` / `with_schema_cleanup`).
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The synthetic predecessor of the v3→v4 pair — the current production version, which a v3→v4
+/// cutover would supersede. No production code runs this plan; it exists only in this suite.
+const V3V4_PREDECESSOR_VERSION: i32 = CI_MANIFEST_PIPELINE_VERSION;
+/// The synthetic current version. Deliberately one past the production pin so nothing in this repo
+/// registers it outside these tests.
+const V3V4_CURRENT_VERSION: i32 = CI_MANIFEST_PIPELINE_VERSION + 1;
+/// The source-derived pin a real v4 binary would embed — synthetic here.
+const V3V4_CURRENT_HASH: &str = "blake3:synthetic-v4-current-code-hash";
+
+/// The (v3, v4) plan under test. Production never constructs this — only `CutoverPlan::for_tests`,
+/// the test-support seam, can build an arbitrary pair.
+fn v3_to_v4_plan() -> CutoverPlan {
+    CutoverPlan::for_tests(V3V4_PREDECESSOR_VERSION, V3V4_CURRENT_VERSION, V3V4_CURRENT_HASH)
+}
+
+/// Seed (or overwrite) a `wf_definition` row for the synthetic suite.
+async fn upsert_definition_row(admin: &PgPool, version: i32, code_hash: &str, status: &str) {
+    sqlx::query(
+        "INSERT INTO wf_definition (wf_type, version, code_hash, status)
+         VALUES ('ci.pipeline', $1, $2, $3)
+         ON CONFLICT (wf_type, version)
+         DO UPDATE SET code_hash = EXCLUDED.code_hash, status = EXCLUDED.status",
+    )
+    .bind(version)
+    .bind(code_hash)
+    .bind(status)
+    .execute(admin)
+    .await
+    .unwrap();
+}
+
+/// Seed the pre-cutover v3-active predecessor a mid-deploy v3→v4 fleet starts from. The fence never
+/// consults the predecessor hash — only its existence — so a synthetic legacy hash is honest.
+async fn seed_v3_predecessor(admin: &PgPool) {
+    upsert_definition_row(admin, V3V4_PREDECESSOR_VERSION, "blake3:synthetic-v3-predecessor", "active")
+        .await;
+}
+
+// ─── v3→v4 · 1. old admission wins the lock ──────────────────────────────────────────────────────
+
+/// The generalized-fence twin of `an_old_v2_admission_holding_the_share_lock…`: an in-flight v3
+/// admission holding `wf_definition@3 FOR SHARE` makes the v3→v4 cutover's OWN backend BLOCK on that
+/// row (proven via `pg_stat_activity`), commit a late v3 run, and the woken cutover then observes it
+/// under the fence and refuses. Proves the generalized factory takes `FOR UPDATE` on the PLAN's
+/// predecessor (v3), not a hard-coded v2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_an_old_v3_admission_holding_the_share_lock_makes_the_cutover_observe_its_workflow() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_old_wins").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+
+        // Connection A: the exact lock a v3 starter takes on the PLAN's predecessor row.
+        let mut old_admission = admin.acquire().await.unwrap();
+        let mut old_tx = old_admission.begin().await.unwrap();
+        let locked: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM wf_definition
+             WHERE wf_type = 'ci.pipeline' AND version = $1 FOR SHARE",
+        )
+        .bind(V3V4_PREDECESSOR_VERSION)
+        .fetch_optional(&mut *old_tx)
+        .await
+        .unwrap();
+        assert_eq!(locked.as_deref(), Some("active"), "the v3 binary sees v3 active and proceeds");
+
+        // Connection B: the generalized v3→v4 cutover on a uniquely tagged pool.
+        let cutover_tag = format!("myelin-cutover-v3v4-old-wins-{}", std::process::id());
+        let cutover_pool = tagged_pool(&admin_url(), &schema, &cutover_tag, 2).await;
+        let factory = cutover_factory(&cutover_pool, &schema).await;
+        let diagnostics_owned = diagnostics(&admin);
+        let cutover = tokio::spawn(async move {
+            factory
+                .cutover_definition_with_plan(&v3_to_v4_plan(), &diagnostics_owned)
+                .await
+        });
+
+        let observer = pinned_pool(&admin_url(), &schema, 2).await;
+        let mut waiting_pid = None;
+        for _ in 0..400 {
+            waiting_pid = sqlx::query_scalar::<_, i32>(
+                "SELECT pid FROM pg_stat_activity
+                 WHERE application_name = $1 AND wait_event_type = 'Lock' AND state = 'active'
+                 LIMIT 1",
+            )
+            .bind(&cutover_tag)
+            .fetch_optional(&observer)
+            .await
+            .unwrap();
+            if waiting_pid.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let waiting_pid = waiting_pid.expect(
+            "the v3→v4 cutover's OWN backend must BLOCK behind the v3 admission's FOR SHARE",
+        );
+        let blocked_on_definition: bool = sqlx::query_scalar(
+            "SELECT query ILIKE '%wf_definition%' FROM pg_stat_activity WHERE pid = $1",
+        )
+        .bind(waiting_pid)
+        .fetch_one(&observer)
+        .await
+        .unwrap();
+        assert!(blocked_on_definition, "the cutover must wait on the wf_definition fence");
+        assert!(!cutover.is_finished(), "the cutover cannot complete while v3 holds the fence");
+
+        // A commits a fresh v3 workflow — the race a preflight SELECT would miss.
+        sqlx::query(
+            "INSERT INTO workflow_run (
+               tenant_id, region, run_id, wf_type, wf_version, input, state, correlation_id,
+               depth, partition
+             ) VALUES ($1, $2, 'late-v3-run', 'ci.pipeline', $3, '[]'::jsonb, 'running', 'c', 0, 0)",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(V3V4_PREDECESSOR_VERSION)
+        .execute(&mut *old_tx)
+        .await
+        .unwrap();
+        old_tx.commit().await.unwrap();
+
+        let refusal = cutover
+            .await
+            .unwrap()
+            .expect_err("the cutover must observe the late v3 admission and refuse");
+        assert!(
+            matches!(refusal, CiSupersededDefinitionGuardError::Backlog(_)),
+            "expected a backlog refusal, got {refusal:?}"
+        );
+
+        // v3 untouched, v4 never registered.
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("active".into()),
+            "a refused cutover leaves the v3 fleet fully operational"
+        );
+        assert_eq!(
+            definition_row(&admin, V3V4_CURRENT_VERSION).await,
+            None,
+            "no v4 row may exist after a refused cutover"
+        );
+        observer.close().await;
+        cutover_pool.close().await;
+    })
+    .await;
+    })
+    .await;
+}
+
+// ─── v3→v4 · 2. cutover wins the lock ────────────────────────────────────────────────────────────
+
+/// The generalized-fence twin of `a_cutover_holding_the_update_lock…`: with the fence held on v3 by
+/// hand (so the barrier is deterministic), a fresh v3 admission's `FOR SHARE` genuinely BLOCKS, and
+/// once the transition (drain v3, activate v4) commits it wakes to `draining` — the status the
+/// deployed v3 binary refuses a fresh start on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_v3_admission() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_cutover_wins").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+
+        let mut fence_conn = admin.acquire().await.unwrap();
+        let mut fence = fence_conn.begin().await.unwrap();
+        sqlx::query(
+            "SELECT code_hash, status FROM wf_definition
+             WHERE wf_type = 'ci.pipeline' AND version = $1 FOR UPDATE",
+        )
+        .bind(V3V4_PREDECESSOR_VERSION)
+        .fetch_one(&mut *fence)
+        .await
+        .unwrap();
+
+        let admission_pool = pinned_pool(&admin_url(), &schema, 2).await;
+        let mut admission_conn = admission_pool.acquire().await.unwrap();
+        let admission_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *admission_conn)
+            .await
+            .unwrap();
+        let admission = tokio::spawn(async move {
+            let mut tx = admission_conn.begin().await.unwrap();
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM wf_definition
+                 WHERE wf_type = 'ci.pipeline' AND version = $1 FOR SHARE",
+            )
+            .bind(V3V4_PREDECESSOR_VERSION)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            let eligible = status == "active";
+            tx.rollback().await.unwrap();
+            (status, eligible)
+        });
+
+        let observer = pinned_pool(&admin_url(), &schema, 2).await;
+        wait_until_blocked(&observer, admission_pid).await;
+        assert!(!admission.is_finished(), "the fresh v3 admission must block behind the fence");
+
+        // The exact transition the generalized fence performs for a (v3, v4) plan.
+        let backlog: bool =
+            sqlx::query_scalar("SELECT myelin_ci_pipeline_version_has_nonterminal_runs($1)")
+                .bind(V3V4_PREDECESSOR_VERSION)
+                .fetch_one(&mut *fence)
+                .await
+                .unwrap();
+        assert!(!backlog, "this schema has no v3 runs");
+        sqlx::query(
+            "UPDATE wf_definition SET status='draining'
+             WHERE wf_type='ci.pipeline' AND version=$1 AND status='active'",
+        )
+        .bind(V3V4_PREDECESSOR_VERSION)
+        .execute(&mut *fence)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO wf_definition (wf_type, version, code_hash, status)
+             VALUES ('ci.pipeline', $1, $2, 'active') ON CONFLICT DO NOTHING",
+        )
+        .bind(V3V4_CURRENT_VERSION)
+        .bind(V3V4_CURRENT_HASH)
+        .execute(&mut *fence)
+        .await
+        .unwrap();
+        fence.commit().await.unwrap();
+
+        let (status, eligible) = admission.await.unwrap();
+        assert_eq!(status, "draining");
+        assert!(!eligible, "a draining v3 definition is not eligible for a FRESH start");
+
+        let v3_runs: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM workflow_run WHERE wf_type='ci.pipeline' AND wf_version=$1",
+        )
+        .bind(V3V4_PREDECESSOR_VERSION)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(v3_runs, 0, "the fenced-out admission wrote no workflow");
+        observer.close().await;
+        admission_pool.close().await;
+    })
+    .await;
+    })
+    .await;
+}
+
+// ─── v3→v4 · 3. backlog refuses ──────────────────────────────────────────────────────────────────
+
+/// A non-terminal v3 run blocks v3→v4 activation: the version-parameterized backlog probe, bound to
+/// the PLAN's predecessor (3), sees it and the generalized fence fails closed with v3 left active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_a_nonterminal_v3_run_blocks_activation_and_leaves_v3_active() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_backlog").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+        seed_workflow_run(&admin, REGION, "v3-inflight", V3V4_PREDECESSOR_VERSION, "running").await;
+
+        let factory = cutover_factory(&admin, &schema).await;
+        let refusal = factory
+            .cutover_definition_with_plan(&v3_to_v4_plan(), &diagnostics(&admin))
+            .await
+            .expect_err("a non-terminal v3 run must refuse the v3→v4 cutover");
+        assert!(
+            matches!(refusal, CiSupersededDefinitionGuardError::Backlog(_)),
+            "expected a backlog refusal, got {refusal:?}"
+        );
+        assert!(
+            refusal.to_string().contains("v3-inflight"),
+            "the refusal must name the stranding run for the operator; got: {refusal}"
+        );
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("active".into()),
+            "the refused cutover leaves v3 active"
+        );
+        assert_eq!(definition_row(&admin, V3V4_CURRENT_VERSION).await, None);
+    })
+    .await;
+    })
+    .await;
+}
+
+// ─── v3→v4 · 4. missing predecessor fails closed ─────────────────────────────────────────────────
+
+/// No v3 row → nothing to lock `FOR UPDATE` → the generalized fence returns `PredecessorMissing`
+/// rather than vacuously activating v4 over an absent fence. Mirrors the v2→v3 blocker-1 proof for
+/// the PLAN's predecessor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_a_missing_v3_predecessor_row_refuses_instead_of_skipping_the_fence() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_no_predecessor").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        // An orphaned non-terminal v3 run and NO v3 definition row — the shape that would strand.
+        seed_workflow_run(&admin, REGION, "orphaned_v3", V3V4_PREDECESSOR_VERSION, "running").await;
+        // `cutover_schema` seeds only the v2 predecessor; there is no v3 row to delete.
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await,
+            None,
+            "the synthetic v3 predecessor is deliberately absent for this case"
+        );
+
+        let factory = cutover_factory(&admin, &schema).await;
+        let refusal = factory
+            .cutover_definition_with_plan(&v3_to_v4_plan(), &diagnostics(&admin))
+            .await
+            .expect_err("a missing v3 predecessor must fail closed");
+        assert!(
+            matches!(refusal, CiSupersededDefinitionGuardError::PredecessorMissing),
+            "expected PredecessorMissing, got {refusal:?}"
+        );
+        assert_eq!(
+            definition_row(&admin, V3V4_CURRENT_VERSION).await,
+            None,
+            "v4 must NOT be activated over a missing fence"
+        );
+
+        // With the fence row present the orphaned run is now probed and the cutover refuses for the
+        // right reason.
+        seed_v3_predecessor(&admin).await;
+        let refusal = factory
+            .cutover_definition_with_plan(&v3_to_v4_plan(), &diagnostics(&admin))
+            .await
+            .expect_err("the orphaned v3 run is now probed");
+        assert!(matches!(refusal, CiSupersededDefinitionGuardError::Backlog(_)));
+        assert!(refusal.to_string().contains("orphaned_v3"));
+    })
+    .await;
+    })
+    .await;
+}
+
+// ─── v3→v4 · 5. divergent current hash refuses ───────────────────────────────────────────────────
+
+/// A pre-existing v4 row from a DIFFERENT source tree (wrong hash) makes the generalized fence refuse
+/// with `ActivationRefused`, rolling back with v3 still active — the plan's `current_code_hash` is
+/// the authority, not a hard-coded v3 pin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_a_divergent_preexisting_v4_hash_refuses_and_leaves_v3_active() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_hash_clash").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+        upsert_definition_row(&admin, V3V4_CURRENT_VERSION, "blake3:some-other-v4-binarys-hash", "active")
+            .await;
+
+        let factory = cutover_factory(&admin, &schema).await;
+        let refusal = factory
+            .cutover_definition_with_plan(&v3_to_v4_plan(), &diagnostics(&admin))
+            .await
+            .expect_err("a v4 row from a different source tree must refuse");
+        assert!(
+            matches!(refusal, CiSupersededDefinitionGuardError::ActivationRefused(_)),
+            "expected an activation refusal, got {refusal:?}"
+        );
+        assert!(refusal.to_string().contains("DIFFERENT code hash"));
+        assert!(
+            refusal.to_string().contains(&format!("ci.pipeline@{V3V4_CURRENT_VERSION}")),
+            "the refusal must name the PLAN's current version, not a hard-coded one; got: {refusal}"
+        );
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("active".into()),
+            "the rollback leaves v3 active"
+        );
+    })
+    .await;
+    })
+    .await;
+}
+
+// ─── v3→v4 · 6. idempotent reboot ────────────────────────────────────────────────────────────────
+
+/// Re-running the v3→v4 cutover after it has committed is a no-op: v3 stays `draining` (never
+/// resurrected to active), and the v4 row is byte-identical to the plan across reboots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_the_cutover_is_idempotent_across_reboots_and_never_reactivates_v3() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_idempotent").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+        let factory = cutover_factory(&admin, &schema).await;
+
+        factory
+            .cutover_definition_with_plan(&v3_to_v4_plan(), &diagnostics(&admin))
+            .await
+            .expect("first v3→v4 cutover");
+        let after_first = definition_row(&admin, V3V4_CURRENT_VERSION).await;
+        factory
+            .cutover_definition_with_plan(&v3_to_v4_plan(), &diagnostics(&admin))
+            .await
+            .expect("reboot cutover");
+        factory
+            .cutover_definition_with_plan(&v3_to_v4_plan(), &diagnostics(&admin))
+            .await
+            .expect("third cutover");
+
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("draining".into()),
+            "a reboot NEVER reactivates the superseded v3"
+        );
+        assert_eq!(
+            definition_row(&admin, V3V4_CURRENT_VERSION).await,
+            after_first,
+            "the activated v4 row is byte-identical across reboots"
+        );
+        let (hash, status) = after_first.unwrap();
+        assert_eq!(status, "active");
+        assert_eq!(hash, V3V4_CURRENT_HASH, "the plan's current hash is what was activated");
+    })
+    .await;
+    })
+    .await;
+}
+
+// ─── v3→v4 · 7. bounded fence wait times out ─────────────────────────────────────────────────────
+
+/// An indefinitely held lock on the PLAN's predecessor (v3) makes the generalized cutover reach its
+/// typed `FenceUnavailable` at the shared bound, then succeed once released — boot cannot hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_an_indefinitely_held_fence_times_the_cutover_out_and_leaves_v3_active() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_lock_timeout").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+
+        let holder_pool = pinned_pool(&admin_url(), &schema, 2).await;
+        let mut holder_conn = holder_pool.acquire().await.unwrap();
+        let mut holder = holder_conn.begin().await.unwrap();
+        sqlx::query(
+            "SELECT status FROM wf_definition
+             WHERE wf_type='ci.pipeline' AND version=$1 FOR UPDATE",
+        )
+        .bind(V3V4_PREDECESSOR_VERSION)
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+
+        let factory = cutover_factory(&admin, &schema).await;
+        let started = std::time::Instant::now();
+        let refusal = factory
+            .cutover_definition_with_plan(&v3_to_v4_plan(), &diagnostics(&admin))
+            .await
+            .expect_err("a held v3 fence must time out, not hang forever");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(refusal, CiSupersededDefinitionGuardError::FenceUnavailable(_)),
+            "expected FenceUnavailable, got {refusal:?}"
+        );
+        let bound =
+            Duration::from_millis(myelin_ci_controlplane::CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS);
+        assert!(elapsed >= bound.mul_f32(0.5), "the cutover must actually wait, waited {elapsed:?}");
+        assert!(elapsed < bound * 3, "the cutover must stop at its bound, waited {elapsed:?}");
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("active".into()),
+            "a timed-out cutover leaves v3 active"
+        );
+        assert_eq!(definition_row(&admin, V3V4_CURRENT_VERSION).await, None);
+
+        holder.rollback().await.unwrap();
+        drop(holder_conn);
+        factory
+            .cutover_definition_with_plan(&v3_to_v4_plan(), &diagnostics(&admin))
+            .await
+            .expect("the v3→v4 cutover succeeds once the fence is free");
+        holder_pool.close().await;
+    })
+    .await;
+    })
+    .await;
+}
+
+// ─── v3→v4 · 8. commit ambiguity fails closed ────────────────────────────────────────────────────
+
+/// **The fail-closed-on-ambiguous-commit path.** A DEFERRED constraint trigger on `wf_definition`
+/// lets every in-transaction statement (drain v3, insert v4, all verification reads) succeed but
+/// makes the final `COMMIT` raise — exactly the ambiguous-commit window the fence guards. The
+/// generalized cutover must surface `ProbeFailed` ("state is ambiguous; re-run to observe it") and
+/// the aborted transaction must leave the registry in its complete OLD state (v3 active, v4 absent),
+/// never half-applied. With the trigger gone the retry commits cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3v4_an_ambiguous_commit_fails_closed_and_leaves_the_registry_whole() {
+    let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
+    let (schema, bootstrap, admin) = cutover_schema("v3v4_commit_ambiguity").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        seed_v3_predecessor(&admin).await;
+
+        // A deferred constraint trigger fires only at COMMIT, so the fence's own drain/insert/verify
+        // statements all succeed and only the commit raises.
+        admin
+            .execute(
+                format!(
+                    "CREATE OR REPLACE FUNCTION {schema}.fail_wf_definition_commit()
+                       RETURNS trigger LANGUAGE plpgsql AS
+                       $$ BEGIN RAISE EXCEPTION 'injected commit-time failure'; END $$;
+                     CREATE CONSTRAINT TRIGGER myelin_v3v4_commit_ambiguity
+                       AFTER INSERT OR UPDATE ON {schema}.wf_definition
+                       DEFERRABLE INITIALLY DEFERRED
+                       FOR EACH ROW EXECUTE FUNCTION {schema}.fail_wf_definition_commit();"
+                )
+                .as_str(),
+            )
+            .await
+            .expect("install the deferred commit-failure trigger");
+
+        let factory = cutover_factory(&admin, &schema).await;
+        let refusal = factory
+            .cutover_definition_with_plan(&v3_to_v4_plan(), &diagnostics(&admin))
+            .await
+            .expect_err("a commit that raises must fail closed, not report success");
+        assert!(
+            matches!(refusal, CiSupersededDefinitionGuardError::ProbeFailed(_)),
+            "an ambiguous commit is surfaced as ProbeFailed, got {refusal:?}"
+        );
+        assert!(
+            refusal.to_string().contains("ambiguous"),
+            "the refusal must flag the ambiguous-commit window; got: {refusal}"
+        );
+
+        // The aborted transaction left the registry WHOLE: v3 still active, v4 never inserted.
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("active".into()),
+            "a failed commit rolls the entire transition back — v3 stays active"
+        );
+        assert_eq!(
+            definition_row(&admin, V3V4_CURRENT_VERSION).await,
+            None,
+            "the cutover is atomic: no half-applied v4 row survives a failed commit"
+        );
+
+        // Remove the trigger; the retry commits cleanly — proving it was the COMMIT that failed, not
+        // the transition itself.
+        admin
+            .execute(
+                format!(
+                    "DROP TRIGGER myelin_v3v4_commit_ambiguity ON {schema}.wf_definition;
+                     DROP FUNCTION {schema}.fail_wf_definition_commit();"
+                )
+                .as_str(),
+            )
+            .await
+            .expect("remove the commit-failure trigger");
+        factory
+            .cutover_definition_with_plan(&v3_to_v4_plan(), &diagnostics(&admin))
+            .await
+            .expect("with the commit trigger gone the retry commits the v3→v4 cutover");
+        assert_eq!(
+            definition_row(&admin, V3V4_PREDECESSOR_VERSION).await.map(|(_, s)| s),
+            Some("draining".into()),
+            "the successful retry drains v3"
+        );
+        let (hash, status) = definition_row(&admin, V3V4_CURRENT_VERSION)
+            .await
+            .expect("v4 is now active");
+        assert_eq!(status, "active");
+        assert_eq!(hash, V3V4_CURRENT_HASH);
     })
     .await;
     })

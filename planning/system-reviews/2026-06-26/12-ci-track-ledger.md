@@ -3724,3 +3724,54 @@ clippy -D warnings clean, check clean, myelin-lints green, git diff --check clea
 **Still open:** 6d step 5 (definition-cutover generalization for a v3→v4 predecessor/current pair,
 active pair staying v2/v3 — task #20), dormant + live-PG-gated. Then 6e (the atomic activating cutover).
 Then 5b.3-7, task #91, gate-2 vertical slice. The rest of ledger 12's open items are unchanged.
+
+---
+
+## 2026-07-31 — CT-007 slice 5b.3-6d STEP 5 landed: the definition-cutover generalization; 6d COMPLETE
+(Fable orchestrating; Opus, implementation; Sol, independent review → "no merge blockers")
+
+Fifth and final unit of 6d. Generalizes the wf_definition FOR UPDATE cutover fence (from 17d16043) over a
+typed (predecessor, current) pair so 6e can drive a v3→v4 activation without re-touching the fence, while
+the active v2→v3 production path stays byte/behavior-equivalent. DORMANT.
+
+**What landed (3 files):** CutoverPlan{predecessor_version, current_version, current_code_hash} with a
+#[cfg(test/test-support)] for_tests ctor (production cannot build an arbitrary pair); cutover_definition
+signature UNCHANGED, now building the v2/v3 plan via production_cutover_plan (the ONLY plan any production
+root builds: predecessor=2, current=3+pin) and delegating to the generalized cutover_with_plan +
+commit_activation; the backlog probe binds plan.predecessor_version. 8 synthetic v3→v4 tests (in-test-seeded
+rows) covering Sol's full list: both row-lock races (old-admission-wins invokes the REAL body + forces a
+pg_stat_activity Lock-wait, deletion-sensitive to the lock AND the predecessor bind; cutover-wins is the
+manual-lock complement, matching the accepted v2→v3 pattern), backlog, missing predecessor, divergent
+current hash, idempotence, lock timeout, commit ambiguity.
+
+**Sol independent review: no merge blockers.** Verified: production constructs exactly (2, 3, hash) equal
+to the former hard-coded values; ALL fence SQL literals unchanged (SET LOCAL lock_timeout, predecessor
+FOR UPDATE, backlog probe, draining update, current insert, both verification reads, commit) — only bind
+sources changed; the one reformatted diagnostic renders byte-identically for v2→v3; production + test both
+funnel through the SAME cutover_with_plan/commit_activation body (the 8 tests validate the code 6e will
+run, not a parallel copy); for_tests/cutover_definition_with_plan absent from production builds; no
+migration DDL changed; the deferred-trigger commit-ambiguity test proves PostgreSQL atomicity leaves NO
+partial-cutover commit path (v3 active/v4 absent on abort, clean retry after). One NOTE (informational):
+the cutover-wins drill uses a manual lock (a complement, not the real-body path) — the combined proof is
+sound.
+
+**Gates (orchestrator ran independently):** controlplane --lib 594, the entire --features integration
+matrix green (cutover file 23 = 15 existing + 8 new v3→v4), sandbox --lib 506, clippy -D warnings clean,
+check clean, myelin-lints green, git diff --check clean.
+
+**5b.3-6d IS COMPLETE** — all 5 risk-sequenced units landed: step 1 (exhaustion/disposition core,
+32e80a00), step 2 (preparation-retry CAS, 3e386935), step 3 (composition module, ef402022), step 4
+(reporter seam, f876abd6), step 5 (cutover generalization, this). The full dormant control-plane adapter
+that gives 6c's injected AttemptAuthority its real durable backing: V2 phase-store + DurableAttemptAuthority
++ admit_parent_attempt one-tx admission + the exhaustion/retry CAS pair + the PreparationReportClaim/
+RunnerAgent terminal seam + the (pred,current) cutover fence. Every piece dormant; production stays
+V1/legacy/V3, no root selects the V2 checkout path.
+
+**Still open: 6e — the SINGLE atomic activating cutover** (the only production-changing slice): flip
+OperationalReservationWriteVersion→V2, construct+select the V2 credential store, raise every accounting
+writer→V4, select checkout-aware launch_with for checkout-bearing jobs, install the phase-authorization/
+journal/renewal/reporter adapters, run the v3→v4 definition cutover through the step-5 generalized fence
+(+ the retired-v3 sentinel migration), + the null-window + fail-closed v1-reservation activation guards —
+all together, coordinated-convergence deploy (deploy 6d everywhere, quiesce old runner intake, drain, deploy
+6e), NOT online mixed-runner. Then 5b.3-7 (the real-runsc drill), task #91, gate-2 vertical slice. The rest
+of ledger 12's open items are unchanged.
