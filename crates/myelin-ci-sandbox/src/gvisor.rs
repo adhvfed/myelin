@@ -3368,29 +3368,67 @@ impl GvisorBackend {
             hooks,
             repo_root,
             cancellation,
-            output,
             &|job, cfg, stdin, rootfs, cancellation, permit| {
                 run_git_wire_container_raw(job, cfg, stdin, rootfs, cancellation, permit)
+            },
+            // Production step 15: the REAL continuation, byte-identical to the prior inline call —
+            // same live `authority`/`report_claim`/`runtime`, threading this backend's `cancellation`
+            // + `output`. `move` so the `output` sink is owned by the one-shot continuation.
+            move |authority, report_claim, scope, runtime, preparation_spec, workspace_manager, rootfs| {
+                self.launch_checkout_continuation(
+                    spec,
+                    hooks,
+                    authority,
+                    report_claim,
+                    scope,
+                    runtime,
+                    preparation_spec,
+                    workspace_manager,
+                    rootfs,
+                    cancellation,
+                    output,
+                )
             },
         )
     }
 
-    /// The shared body over an injectable Hop A transport executor. Production hardwires the real
-    /// git-wire spawn; the deterministic unit tests inject a fake transport (no `runsc`) to exercise
-    /// admission, the transport phase, the shared cancellation, and every Hop A failure-routing branch.
+    /// The shared body over an injectable Hop A transport executor AND an injectable step-15
+    /// CONTINUATION (CT-007 slice 5b.3-6e.2, the same behavior-preserving extraction pattern as 6b).
+    /// Steps 1–14 (preflight, parent-attempt admission, Hop A transport + phase, the ONE capsule
+    /// acquisition) are SINGLE-SOURCED here; ONLY the continuation differs. Production
+    /// ([`Self::launch_checkout_orchestrated_with`]) passes a `continue_with` that calls the real
+    /// [`Self::launch_checkout_continuation`] with the SAME live `authority`/`report_claim`/`runtime`
+    /// at exactly step 15; the deterministic test-support driver passes one that calls
+    /// [`Self::launch_checkout_continuation_given`] with fake Hop B / workload — so a §4 composed test
+    /// drives the identical steps 1–14 and the same live durable authority, substituting ONLY runsc.
+    /// The generic monomorphizes (zero-cost); nothing on the production path boxes or `dyn`s.
     #[allow(clippy::too_many_arguments)]
-    fn launch_checkout_orchestrated_with_given(
+    fn launch_checkout_orchestrated_with_given<Continue>(
         &self,
         spec: &JobSpec,
         hooks: &RunnerHooks,
         repo_root: &Path,
         cancellation: &SandboxCancellation,
-        output: Option<Arc<dyn SandboxOutputSink>>,
         transport_execute: GitWireHopExecutor,
+        continue_with: Continue,
     ) -> Result<
         crate::checkout_orchestration::CheckoutContinuationOutcome,
         crate::checkout_orchestration::CheckoutOrchestrationError,
-    > {
+    >
+    where
+        Continue: FnOnce(
+            &dyn crate::checkout_orchestration::AttemptAuthority,
+            &crate::runner::PreparationReportClaim,
+            &CheckoutAuthorizationScope,
+            checkout_runtime::AcquiredCheckoutRuntime,
+            CheckoutPreparationSpec,
+            &WorkspaceManager,
+            &Path,
+        ) -> Result<
+            crate::checkout_orchestration::CheckoutContinuationOutcome,
+            crate::checkout_orchestration::CheckoutOrchestrationError,
+        >,
+    {
         use crate::checkout_orchestration::{
             authorize_phase_generation, requeue_or_exhausted, route_after_disposal,
             route_preparation_disposition, AttemptAuthorityLeaseCheckpoint,
@@ -3634,11 +3672,11 @@ impl GvisorBackend {
             }
         };
 
-        // Steps 15–25: transfer the capsule BY VALUE into the continuation (which carries the same
-        // reporting claim into any preparation outcome it produces — CT-007 5b.3-6d STEP 4).
-        self.launch_checkout_continuation(
-            spec,
-            hooks,
+        // Steps 15–25: transfer the capsule BY VALUE into the injected continuation with the SAME live
+        // reporting claim / authority / runtime (CT-007 5b.3-6d STEP 4). Production's `continue_with`
+        // calls the real continuation; the test driver's calls the `_given` continuation with fakes —
+        // steps 1–14 above are identical for both.
+        continue_with(
             authority,
             report_claim,
             &scope,
@@ -3646,8 +3684,6 @@ impl GvisorBackend {
             preparation_spec,
             workspace_manager,
             verified_rootfs.path(),
-            cancellation,
-            output,
         )
     }
 }
@@ -3696,6 +3732,82 @@ impl SandboxBackend for GvisorBackend {
                 )
             },
         )
+    }
+
+    /// **CT-007 slice 5b.3-6e.2: the typed sandbox CYCLE — the shape selector (behind the cycle
+    /// method, DORMANT).** Overrides the trait default so a gVisor cycle routes on the job's workspace
+    /// shape:
+    ///
+    /// - `(None, None)` — an ordinary compute job — runs the V2 parent-attempt-admitted orchestrated
+    ///   entry, streaming exactly as [`Self::launch_streaming`] does.
+    /// - `(Some, Some)` — a checkout-bearing job — runs the full Hop A → Hop B → workload orchestration
+    ///   against the boot-validated checkout repository root; a checkout spec on a backend whose
+    ///   checkout config is `disabled()` FAILS CLOSED (it never silently runs as compute).
+    /// - a partial/malformed workspace — refused before any reserve or spawn.
+    ///
+    /// **DORMANT until 5b.3-6e.2 Stage B:** production [`RunnerAgent`](crate::runner::RunnerAgent) still
+    /// calls [`Self::launch_streaming`], never `run_cycle`, and production `RunnerHooks` install no
+    /// parent-attempt reservation — so the compute arm's `reserve_parent_attempt` would refuse and the
+    /// checkout arm's `repo_root()` is `None`. Stage B is the atomic flip that makes production
+    /// `RunnerAgent` drive `run_cycle` and installs the V2 hooks + enabled checkout root.
+    fn run_cycle(
+        &self,
+        spec: &JobSpec,
+        hooks: &RunnerHooks,
+        output: Arc<dyn SandboxOutputSink>,
+        cancellation: SandboxCancellation,
+    ) -> Result<SandboxCycleOutcome, SandboxLaunchError<Self::Error>> {
+        match crate::derive_checkout_authorization_scope(spec.kind, &spec.workspace) {
+            // (None, None): compute — the V2 orchestrated entry (parent-attempt admission), streaming.
+            //
+            // CT-007 5b.3-6e.2 Stage A (Sol ruling): this compute arm is a FUTURE / non-manifest path,
+            // DEAD-in-CI today. Every CI manifest job is checkout-bearing — `CiDriveManifestV1`'s
+            // `workspace` mandates a `repo_ref`/`commit_oid`, and the durable authority reconstruction
+            // (`runtime_authorities_from_durable_claim` in the control plane) therefore ALWAYS yields a
+            // `(Some, Some)` checkout scope (see the `None`-for-compute note at
+            // `myelin-ci-controlplane/src/ci_launch_authority.rs:68`, and the enforcing invariant test
+            // `every_ci_manifest_authority_is_checkout_bearing` in
+            // `integration_ci_6e2_active_path.rs`). The arm is kept intentionally: it lets a FUTURE
+            // compute authority (workload-as-first-generation) activate WITHOUT reshaping the selector.
+            // A live-PG compute-through-V2 proof is deferred to Stage B / whatever change first makes a
+            // compute CI authority representable — the invariant test is the tripwire that forces it.
+            Ok(None) => self.launch_compute_orchestrated_with(
+                spec,
+                hooks,
+                move |spec, cfg, permit, rootfs, container_id, prep| {
+                    run_production_container_streaming(
+                        spec, cfg, permit, rootfs, container_id, Some(output), cancellation, prep,
+                    )
+                },
+            ),
+            // (Some, Some): checkout-bearing — the full Hop A → Hop B → workload orchestration against
+            // the boot-validated repository root. No enabled root ⇒ fail closed (never run as compute).
+            Ok(Some(_)) => {
+                let repo_root = self.checkout.repo_root().ok_or_else(|| {
+                    SandboxLaunchError::Failed(GvisorError::Hook(HookError(
+                        "a checkout-bearing job requires an enabled checkout repository root, but \
+                         this backend's checkout config is disabled — refusing before reserve/spawn"
+                            .to_string(),
+                    )))
+                })?;
+                self.launch_checkout_orchestrated_with(spec, hooks, repo_root, &cancellation, Some(output))
+                    .map(SandboxCycleOutcome::from)
+                    .map_err(|error| {
+                        SandboxLaunchError::Failed(match error {
+                            crate::checkout_orchestration::CheckoutOrchestrationError::Hook(h) => {
+                                GvisorError::Hook(h)
+                            }
+                            other => GvisorError::Runtime(other.to_string()),
+                        })
+                    })
+            }
+            // A malformed workspace (mixed Some/None, unparseable ref/commit) — refuse before reserve
+            // or spawn; it is dispatched as neither compute nor checkout.
+            Err(reason) => Err(SandboxLaunchError::Failed(GvisorError::Hook(HookError(format!(
+                "run_cycle refused a malformed workspace spec (neither a clean compute nor a valid \
+                 checkout job): {reason}"
+            ))))),
+        }
     }
 
     /// Whole-container kill on teardown: best-effort destroy the container + remove its bundle temp
@@ -8793,10 +8905,13 @@ impl PreparedCheckoutEvidence {
         self.preparation_usage
     }
 
-    /// CT-007 slice 5b.3-6c: a test-only constructor so `into_prepared_for_tests` can supply evidence
-    /// deterministically. `#[cfg(test)]` is absent from every ordinary build (incl. `test-support`),
-    /// so `run_checkout_preparation` remains the ONLY production constructor.
-    #[cfg(test)]
+    /// CT-007 slice 5b.3-6c/6e.2: a test-only constructor so `into_prepared_for_tests` (`#[cfg(test)]`)
+    /// and the deterministic substituted Hop B seam (`test-support`) can supply a prepared capsule's
+    /// evidence deterministically. Gated `#[cfg(any(test, feature = "test-support"))]` — absent from
+    /// every ORDINARY (non-`test-support`) build, so `run_checkout_preparation` remains the only
+    /// production constructor (the `test-support` feature is a dev-only build flag, never selected by
+    /// any production composition root — pinned by the substrate's own production-zero source pins).
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn for_tests(preparation_usage: ResourceUsage) -> Self {
         PreparedCheckoutEvidence {
             commit_hex: "a".repeat(40),
@@ -9540,8 +9655,11 @@ pub(crate) use checkout_runtime::{
 // and never see this file). It substitutes ONLY the runtime executions (the workload `runsc` spawn)
 // while driving the REAL preflight, REAL parent-attempt reservation (real hooks/authorities), REAL
 // shared compute body, and REAL `SandboxCycleOutcome` routing — no Btrfs / /etc/subuid / KVM / runsc.
+// CT-007 5b.3-6e.2 Stage A: `pub` (still `test-support`-gated) so the cross-crate §4 active-path tests
+// can name the dormant Hop-B-injection selector by path. Every item stays gated + pinned
+// production-zero; production never selects this module.
 #[cfg(feature = "test-support")]
-mod runsc_driver;
+pub mod runsc_driver;
 
 // CT-007 slice 5b.3-6c (Sol's r5 finding 2): the workload-rotated spec wrapper lives in its own module
 // so the inner `JobSpec` never escapes to be cloned/substituted (module-privacy fence). Re-exported so
@@ -9936,6 +10054,11 @@ mod tests {
 
     use super::*;
     use crate::RunTokenCredential;
+    // CT-007 slice 5b.3-6e.2 Stage A: the git-wire fakes were lifted to a
+    // `#[cfg(any(test, feature = "test-support"))]` module (below the top-level test module) so the
+    // hardware-independent runsc-driver seam + §4 tests can reach them. Re-imported here so the
+    // existing `#[cfg(test)]` callers keep compiling.
+    use crate::gvisor::checkout_transport_test_support::FakeRunsc;
 
     // =============================================================================================
     // CT-007 phase-credential generations: SOURCE PINS.
@@ -10320,14 +10443,19 @@ mod tests {
             "into_prepared_for_tests",
             "run_retained_workload_given",
         ];
-        // CT-007 slice 5b.3-6e.1b: the EXACT `#[cfg(any(test, feature = "test-support"))]`-only
+        // CT-007 slice 5b.3-6e.1b/6e.2: the EXACT `#[cfg(any(test, feature = "test-support"))]`-only
         // method inventory. The deterministic substituted-execution seam is gated for `test-support`
         // (so the hardware-independent runsc-driver fixture can reach it), NOT `#[cfg(test)]` — so it
         // is recognized as its OWN test-support surface and does NOT count against the FIVE-entry
-        // production accessor `ALLOWLIST`. Pinned exactly so a new test-support capsule method fails
-        // until reviewed.
-        const TEST_SUPPORT_METHODS: [&str; 1] =
-            ["execute_substituted_checkout_for_test_support"];
+        // production accessor `ALLOWLIST`. 6e.2 SPLIT the single seam into its Hop B half (on
+        // `AcquiredCheckoutRuntime`, returning the fused prepared capsule) and its workload half (on
+        // `PreparedCheckoutRuntime`, driving the REAL `run_retained_workload_inner`), so the ruling-(A)
+        // workload leg runs the real authority/settle path. Pinned exactly so a new test-support
+        // capsule method fails until reviewed.
+        const TEST_SUPPORT_METHODS: [&str; 2] = [
+            "substituted_hop_b_for_test_support",
+            "substituted_workload_for_test_support",
+        ];
         // Closed-world (Sol's r5): the EXACT set of free functions permitted at module top level. Any
         // other free fn — even a private helper — is a violation until reviewed and added here.
         const ALLOWED_FREE_FNS: [&str; 1] = ["run_checkout_preparation_v2"];
@@ -10627,10 +10755,14 @@ mod tests {
         let prod = production_source();
         // The composition-root ZERO: the ONE dormant entry the whole checkout path hangs off has no
         // production caller. `launch_with` never selects it; installing it is 5b.3-6e's job.
+        // CT-007 slice 5b.3-6e.2 Stage A: the dormant typed-cycle SELECTOR `run_cycle` now calls the
+        // outer orchestrator exactly once for a checkout-bearing spec. Dormancy no longer rests on a
+        // source-occurrence zero here but on production `RunnerAgent` NOT driving `run_cycle` yet (the
+        // atomic Stage B flip) — so the selector is present but unreached in production.
         assert_eq!(
             prod.matches(".launch_checkout_orchestrated_with(").count(),
-            0,
-            "the dormant outer orchestrator has ZERO production callers — the composition-root zero"
+            1,
+            "the outer orchestrator has exactly ONE caller — the dormant `run_cycle` selector"
         );
         assert_eq!(
             prod.matches("fn launch_checkout_orchestrated_with(").count(),
@@ -10762,10 +10894,13 @@ mod tests {
             1,
             "the dormant compute-V2 orchestrated entry is defined exactly once"
         );
+        // CT-007 slice 5b.3-6e.2 Stage A: the dormant typed-cycle SELECTOR `run_cycle` now calls the
+        // compute-V2 orchestrated entry exactly once for a compute spec. As with the checkout arm,
+        // dormancy rests on production `RunnerAgent` not driving `run_cycle` until the atomic Stage B.
         assert_eq!(
             prod.matches(".launch_compute_orchestrated_with(").count(),
-            0,
-            "the compute-V2 orchestrated entry has ZERO production callers — the composition-root zero"
+            1,
+            "the compute-V2 orchestrated entry has exactly ONE caller — the dormant `run_cycle` selector"
         );
         // The shared post-reservation body is extracted ONCE and used by BOTH compute entries; the
         // preflight is extracted once and used by both. The legacy `launch_compute_with` remains the
@@ -10945,6 +11080,14 @@ mod tests {
                 hit
             })
         }
+        // Gated `#[cfg(any(test, feature = "test-support"))]` — the test-support permit-fence seam,
+        // distinct from the `#[cfg(test)]`-only injectable-execute seam. Its own pinned inventory.
+        fn is_cfg_test_support(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().any(|a| {
+                a.path().is_ident("cfg")
+                    && matches!(&a.meta, syn::Meta::List(list) if list.tokens.to_string().contains("test-support"))
+            })
+        }
         // Walk the ENTIRE return-type AST for the `JobSpec` ident — nested/opaque returns included.
         fn type_mentions_job_spec(ty: &syn::Type) -> bool {
             use syn::visit::Visit;
@@ -10968,6 +11111,7 @@ mod tests {
         let mut production_methods: Vec<String> = Vec::new();
         let mut private_methods: Vec<String> = Vec::new();
         let mut test_methods: Vec<String> = Vec::new();
+        let mut test_support_methods: Vec<String> = Vec::new();
         let mut violations: Vec<String> = Vec::new();
         for item in &file.items {
             match item {
@@ -11016,6 +11160,8 @@ mod tests {
                                 }
                                 if is_cfg_test(&m.attrs) {
                                     test_methods.push(name);
+                                } else if is_cfg_test_support(&m.attrs) {
+                                    test_support_methods.push(name);
                                 } else if matches!(m.vis, syn::Visibility::Inherited) {
                                     private_methods.push(name);
                                 } else {
@@ -11062,6 +11208,13 @@ mod tests {
             vec!["acquire_permit_and_run_given".to_string()],
             "the ONLY `#[cfg(test)]` method is the injectable execution seam — the sole place an \
              `execute` closure receiving `&JobSpec` exists, absent from every ordinary build"
+        );
+        assert_eq!(
+            sorted(test_support_methods),
+            vec!["acquire_launch_permit_for_test_support".to_string()],
+            "the ONLY `#[cfg(any(test, feature = \"test-support\"))]` method is the sealed permit-fence \
+             acquisition the deterministic runsc-driver seam drives (it acquires against `&self.spec` \
+             and returns only a LaunchPermit — the inner spec never escapes)"
         );
     }
 
@@ -11636,16 +11789,6 @@ mod tests {
         let res = build_result(&s, &o, &RedactionPlan::none());
         assert_eq!(res.stdout, b"ordinary build log line".to_vec());
         assert_eq!(res.stderr, b"warning: deprecated".to_vec());
-    }
-
-    struct FakeRunsc;
-    impl RunscChild for FakeRunsc {
-        fn kill(&mut self) -> Result<(), String> {
-            Ok(())
-        }
-        fn wait(&mut self) -> Result<i32, String> {
-            Ok(0)
-        }
     }
 
     /// A canned [`ContainerRun`] for the fake path (no real `runsc`): a clean exit-0 result + a fake
@@ -17124,10 +17267,10 @@ mod tests {
     // =============================================================================================
     mod checkout_preparation_5b2 {
         use super::*;
-
-        fn sha1_oid(byte: u8) -> String {
-            format!("{:02x}", byte).repeat(20)
-        }
+        // CT-007 slice 5b.3-6e.2 Stage A: git-wire fakes relocated to the test-support module.
+        use crate::gvisor::checkout_transport_test_support::{
+            advertisement, fake_pack, fetch_response, sha1_oid,
+        };
 
         #[test]
         fn expected_git_commit_id_accepts_a_valid_sha1_oid() {
@@ -17238,15 +17381,6 @@ mod tests {
 
         // ---- advertisement parser ----
 
-        fn advertisement(first_line: &str, extra_refs: &[&str]) -> Vec<u8> {
-            let mut buf = pkt_line_encode(first_line);
-            for line in extra_refs {
-                buf.extend(pkt_line_encode(line));
-            }
-            buf.extend_from_slice(b"0000");
-            buf
-        }
-
         #[test]
         fn advertisement_parser_finds_a_directly_advertised_oid() {
             let oid = sha1_oid(0x11);
@@ -17344,23 +17478,6 @@ mod tests {
         }
 
         // ---- fetch-response parser ----
-
-        fn fetch_response(shallow_lines: &[String], negotiation: &str, pack: &[u8]) -> Vec<u8> {
-            let mut buf = Vec::new();
-            for line in shallow_lines {
-                buf.extend(pkt_line_encode(line));
-            }
-            buf.extend_from_slice(b"0000");
-            buf.extend(pkt_line_encode(negotiation));
-            buf.extend_from_slice(pack);
-            buf
-        }
-
-        fn fake_pack(payload: &[u8]) -> Vec<u8> {
-            let mut pack = b"PACK".to_vec();
-            pack.extend_from_slice(payload);
-            pack
-        }
 
         #[test]
         fn fetch_response_parses_the_happy_path_with_no_shallow_line() {
@@ -18668,6 +18785,12 @@ mod tests {
         mod checkout_transport_5b3_3 {
             use super::*;
             use crate::CheckoutAuthorizationScope;
+            // CT-007 slice 5b.3-6e.2 Stage A: git-wire fakes relocated to the test-support module so
+            // the runsc-driver seam + §4 tests share them. Re-imported so the existing tests compile.
+            use crate::gvisor::checkout_transport_test_support::{
+                advertisement_bytes, fake_quiescence_evidence, fetch_response_bytes,
+                permit_recording_executor, sha1_oid, BoxedHopExecutor, FakeRunsc, ScriptedStep,
+            };
 
             const TENANT: &str = "acme";
             const REGION: &str = "fr-par";
@@ -18918,41 +19041,15 @@ mod tests {
                 }
             }
 
-            /// A step still returns the simple pre-finalization shape — `scripted_executor` below
-            /// auto-wraps a successful step into a `RuntimeFinalization::Finalized` (teardown proven
-            /// fine), matching what every EXISTING test needs. Tests that specifically need to
-            /// exercise a genuine teardown-unproven `RuntimeFinalization::Failed` (Sol's review,
-            /// blocker 2) build a `BoxedHopExecutor` closure directly instead of going through this
-            /// helper (see `production_shaped_teardown_failure_is_reported_as_teardown_unproven`).
-            type ScriptedStep =
-                Box<dyn FnOnce() -> Result<(ContainerRun, bool), RunFailure> + Send>;
-
-            /// A boxed stand-in for [`GitWireHopExecutor`] (a bare `&dyn Fn` can't be returned from a
-            /// function that also owns the closure's captures) — test call sites pass `&*executor`.
-            type BoxedHopExecutor = Box<
-                dyn Fn(
-                    &JobSpec,
-                    &OciConfig,
-                    Vec<u8>,
-                    &Path,
-                    &AtomicBool,
-                    LaunchPermit,
-                ) -> (
-                    Result<GitWireHopFinalization, RunFailure>,
-                    BundleCleanupProof,
-                ),
-            >;
-
-            /// A canned, always-fine teardown proof for the auto-wrapped `Finalized` case —
-            /// `RuntimeNamespaceQuiescence::Rootless` since git-wire's `prepared_mode` is always
-            /// `Rootless` (never `ExplicitUserNamespace`).
-            fn fake_quiescence_evidence() -> RuntimeQuiescenceEvidence {
-                RuntimeQuiescenceEvidence::assert_for_tests(
-                    "5b3-3-test-container".to_string(),
-                    RuntimeNamespaceQuiescence::Rootless,
-                    CgroupQuiescenceEvidence::assert_for_tests((1, 1)),
-                )
-            }
+            // A step still returns the simple pre-finalization shape — `scripted_executor` below
+            // auto-wraps a successful step into a `RuntimeFinalization::Finalized` (teardown proven
+            // fine), matching what every EXISTING test needs. Tests that specifically need to exercise a
+            // genuine teardown-unproven `RuntimeFinalization::Failed` (Sol's review, blocker 2) build a
+            // `BoxedHopExecutor` closure directly instead of going through this helper (see
+            // `production_shaped_teardown_failure_is_reported_as_teardown_unproven`).
+            //
+            // `ScriptedStep`, `BoxedHopExecutor`, and `fake_quiescence_evidence` were relocated to the
+            // `checkout_transport_test_support` module (re-imported above).
 
             /// Scripts exactly `steps.len()` executor calls, one scripted outcome each, in order.
             /// Returns the executor closure plus a handle to the number of REMAINING (not yet
@@ -18994,16 +19091,8 @@ mod tests {
                 scripted_executor(vec![])
             }
 
-            fn advertisement_bytes(oid: &str) -> Vec<u8> {
-                advertisement(
-                    &format!("{oid} refs/heads/main\0no-progress ofs-delta shallow\n"),
-                    &[],
-                )
-            }
-
-            fn fetch_response_bytes(payload: &[u8]) -> Vec<u8> {
-                fetch_response(&[], "NAK", &fake_pack(payload))
-            }
+            // `advertisement_bytes` / `fetch_response_bytes` were relocated to the
+            // `checkout_transport_test_support` module (re-imported above).
 
             // ---- proof verification happens BEFORE any spawn ----
 
@@ -20477,42 +20566,9 @@ mod tests {
             // adjacent mix-and-match attempts that ARE expressible all refuse before any spawn.
             // =================================================================================
 
-            /// An executor that COMMITS every permit it is handed and records the outcome plus the
-            /// run-token JTI of the spec it was called with — so a test can prove each leg spawned
-            /// under its OWN credential and its OWN durable phase permit.
-            #[allow(clippy::type_complexity)]
-            fn permit_recording_executor(
-                steps: Vec<ScriptedStep>,
-            ) -> (BoxedHopExecutor, Arc<Mutex<Vec<(String, bool)>>>) {
-                let seen: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
-                let seen_for_closure = Arc::clone(&seen);
-                let queue = Mutex::new(std::collections::VecDeque::from(steps));
-                let f = move |job: &JobSpec,
-                              _cfg: &OciConfig,
-                              _stdin: Vec<u8>,
-                              _rootfs: &Path,
-                              _cancellation: &AtomicBool,
-                              permit: LaunchPermit| {
-                    let committed = permit.commit_and_release().is_ok();
-                    seen_for_closure
-                        .lock()
-                        .unwrap()
-                        .push((job.run_token.jti.clone(), committed));
-                    let mut queue = queue.lock().unwrap();
-                    let step = queue
-                        .pop_front()
-                        .expect("executor invoked more times than scripted");
-                    let finalization_result = match step() {
-                        Ok((run, truncated)) => Ok(RuntimeFinalization::Finalized(FinalizedRun {
-                            primary: Ok((run, truncated)),
-                            evidence: fake_quiescence_evidence(),
-                        })),
-                        Err(run_failure) => Err(run_failure),
-                    };
-                    (finalization_result, Ok(()))
-                };
-                (Box::new(f), seen)
-            }
+            // `permit_recording_executor` was relocated to the `checkout_transport_test_support`
+            // module (re-imported above) so the runsc-driver seam + §4 tests share the ONE two-call
+            // permit-recording executor.
 
             fn advertise_authorization(oid: &str, jti: &str) -> PhaseAuthorization {
                 minted_phase_authorization(
@@ -21101,9 +21157,10 @@ mod tests {
         use super::super::{
             acquire_enabled_workspace, classify_workspace_deletion,
             deterministic_userns_allocator_for_tests, deterministic_workspace_manager_for_tests,
-            run_substituted_checkout_success, settle_enabled_workspace_and_lease,
-            substitute_checkout_spec, unique_suffix, CgroupQuiescenceEvidence, LeaseBindState,
-            RuntimeNamespaceQuiescence, RuntimeQuiescenceEvidence, WorkspaceDeletionOutcome,
+            run_substituted_checkout_mismatched_evidence, run_substituted_checkout_success,
+            settle_enabled_workspace_and_lease, substitute_checkout_spec, unique_suffix,
+            CgroupQuiescenceEvidence, LeaseBindState, RuntimeNamespaceQuiescence,
+            RuntimeQuiescenceEvidence, WorkspaceDeletionOutcome,
         };
         use crate::user_namespace::{
             CheckoutPreparationSession, PreparationQuiescenceProof, UserNamespaceQuiescenceProof,
@@ -21455,6 +21512,87 @@ mod tests {
                 "no production gvisor path constructs the deterministic-directory mode"
             );
 
+            // CT-007 5b.3-6e.2: the no-op test-support authority + the substituted-execution mode are
+            // named ONLY by the test-support substrate (below the top-level test module) — production
+            // source names neither. This keeps ruling-(A)'s substituted workload leg unreachable from
+            // every production composition root.
+            assert_eq!(
+                super::production_source()
+                    .matches("NoOpTestSupportAuthority")
+                    .count(),
+                0,
+                "no production gvisor path constructs the no-op test-support attempt authority"
+            );
+            assert_eq!(
+                super::production_source()
+                    .matches("SubstitutedEvidenceMode")
+                    .count(),
+                0,
+                "no production gvisor path names the substituted-evidence mode"
+            );
+
+            // CT-007 5b.3-6e.2 Stage A: the git-wire test-support substrate + the orchestrator-driving
+            // seam are named ONLY by test/test-support code (the module below the top-level test module,
+            // and the `#[cfg(feature = "test-support")]` runsc-driver file this scan never reads).
+            // Production source names none of them — the whole composed active path is unreachable from
+            // every production composition root until Stage B.
+            assert_eq!(
+                super::production_source()
+                    .matches("checkout_transport_test_support")
+                    .count(),
+                0,
+                "no production gvisor path names the git-wire test-support module"
+            );
+            assert_eq!(
+                super::production_source()
+                    .matches("drive_checkout_cycle_with_substituted_runsc_given")
+                    .count(),
+                0,
+                "no production gvisor path names the orchestrator-driving runsc seam"
+            );
+            // CT-007 5b.3-6e.2 Stage A: the §4 prep-terminal/prep-retry tests inject a Hop-B disposition
+            // via the new test-support driver + selector. Both live in the `#[cfg(feature =
+            // "test-support")]` `runsc_driver` file (which `production_source` never reads) and NO
+            // production composition root names them.
+            assert_eq!(
+                super::production_source()
+                    .matches("drive_checkout_cycle_with_injected_hop_b")
+                    .count(),
+                0,
+                "no production gvisor path names the Hop-B-injecting runsc seam"
+            );
+            assert_eq!(
+                super::production_source()
+                    .matches("InjectedHopBOutcome")
+                    .count(),
+                0,
+                "no production gvisor path names the injected Hop-B outcome selector"
+            );
+            assert_eq!(
+                super::production_source()
+                    .matches("deterministic_enabled_backend_for_tests")
+                    .count(),
+                0,
+                "no production gvisor path builds the deterministic Enabled test backend"
+            );
+            // CT-007 slice 5b.3-6e.2 Stage A: the two OTHER helpers the §4 tests pub-name (the checkout
+            // spec factory + the bare-repo stager) are likewise named ONLY by test/test-support code —
+            // making them `pub` for cross-crate reach must not make any production path name them.
+            assert_eq!(
+                super::production_source()
+                    .matches("checkout_spec_for_backend")
+                    .count(),
+                0,
+                "no production gvisor path builds the deterministic checkout spec"
+            );
+            assert_eq!(
+                super::production_source()
+                    .matches("stage_checkout_repo_root")
+                    .count(),
+                0,
+                "no production gvisor path stages the deterministic bare-repo root"
+            );
+
             // The mode variant is cfg-gated (absent from ordinary builds).
             assert!(
                 WORKSPACE_MANAGER_SOURCE.contains(
@@ -21588,6 +21726,261 @@ mod tests {
                 alloc.lease().is_err(),
                 "the quarantined userns slot CANNOT be reissued after an unproven delete"
             );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ── Test 11 (CT-007 5b.3-6e.2, the negative provenance pair): the substituted workload
+        //   builds runtime-quiescence evidence with a DELIBERATELY WRONG runsc_root_identity (diverging
+        //   from the durable bind's OWN recorded output). The REAL `settle_enabled_finalization` tail
+        //   MUST reject it AT SETTLE (its evidence-vs-recorded-binding provenance check), fail closed,
+        //   and — per the real contract — leave the workspace UNDELETED (capacity retained, manager
+        //   poisoned) and the userns slot unreissued. This is what proves the positive test's clean
+        //   settle is NOT vacuous: flip only the derived identity and settlement refuses. ──
+        #[test]
+        fn substituted_workload_mismatched_evidence_is_rejected_at_settle() {
+            let root = temp_root("t11");
+            let (obs, wm, workspace_base, alloc, userns_base) =
+                run_substituted_checkout_mismatched_evidence(
+                    &root,
+                    "checkout.sentinel",
+                    b"shared-provenance",
+                );
+            // Hop B + the OCI-mount round-trip still succeeded (the divergence is ONLY in the workload
+            // evidence's runsc-root identity) — isolating the failure to the settle provenance check.
+            assert!(obs.hopb_write_ok, "the checked Hop B sentinel write still succeeded");
+            assert!(
+                obs.mount_source_matched_workspace,
+                "the retained OCI mount still equals the capsule workspace host path"
+            );
+            assert!(
+                obs.sentinel_read_through_mount,
+                "the substituted workload still read the sentinel through the OCI-recorded mount"
+            );
+            // The settle tail REFUSED — the whole point.
+            assert!(
+                !obs.settled_ok,
+                "mismatched evidence must NOT settle clean (got settled_ok=true)"
+            );
+            let error = obs
+                .settle_error
+                .as_deref()
+                .expect("a refused settle carries a diagnostic");
+            assert!(
+                error.contains("does not match the recorded binding"),
+                "the rejection must come from the SETTLE-tail evidence-vs-recorded-binding provenance \
+                 check, got: {error}"
+            );
+            // Fail-closed durable state: the workspace was NEVER deleted (settle refused before the
+            // delete), so its leaf survives, capacity is retained, and the manager is poisoned.
+            let child_dirs = std::fs::read_dir(&workspace_base)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().is_dir())
+                .count();
+            assert_eq!(
+                child_dirs, 1,
+                "the workspace leaf must SURVIVE a refused settle (never deleted)"
+            );
+            assert_ne!(
+                wm.capacity_used_bytes(),
+                0,
+                "capacity must be RETAINED on a refused settle (never silently freed)"
+            );
+            assert!(
+                matches!(wm.admission(), WorkspaceAdmission::Poisoned { .. }),
+                "dropping the still-live workspace on a refused settle poisons the manager"
+            );
+            // The paired userns lease was NEVER released — the pool-1 slot cannot be reissued.
+            assert!(
+                alloc.lease().is_err(),
+                "the quarantined userns slot CANNOT be reissued after a refused settle"
+            );
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            let _ = std::fs::remove_dir_all(&userns_base);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// **CT-007 slice 5b.3-6e.2 Stage A: the composed active-path proofs (PG-free).** These drive the
+    /// REAL outer checkout orchestrator (`launch_checkout_orchestrated_with_given`, steps 1–14
+    /// single-sourced) through the hardware-independent runsc-driver seam, substituting ONLY the
+    /// hardware (the Hop-A git-container execution + the workload runsc spawn), and prove the active
+    /// path settles cleanly before Stage B ever selects it — with NO control-plane.
+    mod orchestrated_active_path_6e2 {
+        use super::*;
+        use crate::checkout_orchestration::ParentAttemptAdmission;
+        use crate::gvisor::checkout_transport_test_support::{
+            checkout_spec_for_backend, deterministic_enabled_backend_for_tests,
+        };
+        use crate::SandboxBackend;
+
+        fn unique_root(tag: &str) -> std::path::PathBuf {
+            let root = std::env::temp_dir().join(format!(
+                "myelin-6e2-{tag}-{}-{}",
+                std::process::id(),
+                unique_suffix()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            root
+        }
+
+        /// Hooks whose `reserve_parent_attempt` admits with the no-op test-support authority, and whose
+        /// checkout + per-phase authorizations pass — the minimal V2 wiring the dormant orchestrator
+        /// needs to progress the whole advertise → fetch → materialization → workload sequence PG-free.
+        fn admitting_hooks() -> RunnerHooks {
+            ok_hooks()
+                .with_checkout_authorization(Box::new(|_spec, _scope| Ok(())))
+                .with_checkout_phase_authorization(Box::new(|_spec, _scope, _phase| {
+                    Ok(LaunchPermit::immediate())
+                }))
+                .with_parent_attempt_reservation(Box::new(|_spec| {
+                    Ok(ParentAttemptAdmission::Admitted {
+                        claim: report_claim(),
+                        reserve: ReserveHandle("ci-reserve:v2:6e2".to_string()),
+                        attempt_authority: Box::new(NoOpTestSupportAuthority),
+                    })
+                }))
+        }
+
+        /// The §4 composed CHECKOUT-SUCCESS proof (PG-free variant): the REAL orchestrator drives the
+        /// two gated transport hops, the real capsule acquisition, the real Hop-B durable transitions,
+        /// and the real materialization/renewal/workload-credential/settle tail — all the way to a clean
+        /// workload launch. Substituting ONLY the runsc executions means every composition seam (the
+        /// admission handoff, transport-phase begin/complete, advertise→fetch generation ordering, the
+        /// two renewals, capsule acquisition) runs for real.
+        ///
+        /// Gated `test-support`: the runsc-driver seam it exercises lives in the
+        /// `#[cfg(feature = "test-support")]` `runsc_driver` module, so this proof EXECUTES under
+        /// `--features test-support` (the deterministic substrate this whole slice rests on).
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn orchestrated_checkout_drives_two_gated_hops_to_a_clean_workload_launch() {
+            use crate::checkout_orchestration::CheckoutContinuationOutcome;
+            use crate::gvisor::checkout_transport_test_support::stage_checkout_repo_root;
+            let root = unique_root("orchestrated");
+            let (backend, image) = deterministic_enabled_backend_for_tests(&root);
+            let repo_root = stage_checkout_repo_root(&root.join("repos"));
+            let spec = checkout_spec_for_backend(image);
+            let hooks = admitting_hooks();
+
+            let (result, recorded) = backend.drive_checkout_cycle_with_substituted_runsc_given(
+                &spec,
+                &hooks,
+                &repo_root,
+                "checkout.sentinel",
+                b"6e2-provenance-sentinel",
+            );
+
+            // Exactly the two scripted transport legs ran — no unused step, and the executor panics on a
+            // third call, so a masked extra spawn could not pass silently.
+            assert_eq!(
+                recorded.len(),
+                2,
+                "exactly two transport hops must spawn (advertise then fetch): {recorded:?}"
+            );
+            // Each leg spawned under its OWN durable credential (distinct jti) ...
+            assert_ne!(
+                recorded[0].0, recorded[1].0,
+                "advertise and fetch must spawn under DISTINCT jtis: {recorded:?}"
+            );
+            // ... and BOTH phase permits committed at the spawn boundary.
+            assert!(
+                recorded[0].1 && recorded[1].1,
+                "both transport permits must commit: {recorded:?}"
+            );
+
+            // The full steps 1–25 sequence progressed to a clean workload launch — i.e. the real settle
+            // tail succeeded (a failed settle would surface as a non-`WorkloadLaunched` outcome).
+            match result {
+                Ok(CheckoutContinuationOutcome::WorkloadLaunched(launch)) => {
+                    assert!(
+                        launch.output_complete,
+                        "the substituted workload must complete cleanly"
+                    );
+                    assert_eq!(
+                        launch.result.usage,
+                        crate::ResourceUsage {
+                            cpu_seconds: 3,
+                            mem_byte_seconds: 7,
+                        },
+                        "the settled workload carries exactly the substituted workload usage"
+                    );
+                }
+                other => panic!("expected a clean WorkloadLaunched, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// **The dormant typed-cycle SELECTOR routes on workspace shape BEFORE any reserve or spawn.** A
+        /// checkout-bearing job on a checkout-`disabled()` backend fails closed; a malformed workspace is
+        /// refused as neither compute nor checkout; a compute job reaches the compute arm (whose FIRST
+        /// admission step — `reserve_parent_attempt` — refuses under legacy hooks, proving the arm was
+        /// selected without spawning). Each arm returns a DISTINCT fail-closed diagnostic.
+        #[test]
+        fn run_cycle_selects_the_gvisor_arm_on_workspace_shape_before_reserve_or_spawn() {
+            let root = unique_root("selector");
+            let (backend, image) = deterministic_enabled_backend_for_tests(&root);
+            let sink: Arc<dyn SandboxOutputSink> = Arc::new(RecordingOutput::default());
+
+            // (Some, Some) checkout-bearing on a checkout-`disabled()` backend → fail closed before
+            // reserve/spawn (the deterministic Enabled backend leaves `checkout` disabled()).
+            let checkout_spec = checkout_spec_for_backend(image.clone());
+            let err = backend
+                .run_cycle(
+                    &checkout_spec,
+                    &admitting_hooks(),
+                    sink.clone(),
+                    SandboxCancellation::new(),
+                )
+                .expect_err("a checkout job on a checkout-disabled backend fails closed");
+            match err {
+                SandboxLaunchError::Failed(GvisorError::Hook(HookError(msg))) => assert!(
+                    msg.contains("enabled checkout repository root"),
+                    "checkout arm selected; got: {msg}"
+                ),
+                other => panic!("expected the checkout-arm fail-closed refusal, got {other:?}"),
+            }
+
+            // A malformed workspace (repo_ref present, commit absent) → refused as neither compute nor a
+            // valid checkout, before reserve/spawn.
+            let mut malformed = checkout_spec_for_backend(image.clone());
+            malformed.workspace.commit = None;
+            let err = backend
+                .run_cycle(
+                    &malformed,
+                    &admitting_hooks(),
+                    sink.clone(),
+                    SandboxCancellation::new(),
+                )
+                .expect_err("a malformed workspace is refused");
+            match err {
+                SandboxLaunchError::Failed(GvisorError::Hook(HookError(msg))) => assert!(
+                    msg.contains("malformed workspace"),
+                    "malformed arm selected; got: {msg}"
+                ),
+                other => panic!("expected the malformed-workspace refusal, got {other:?}"),
+            }
+
+            // (None, None) compute: the compute arm is reached; its first admission step
+            // (`reserve_parent_attempt`) refuses under legacy hooks (no parent-attempt reservation),
+            // proving the arm was selected without spawning. The image resolves so preflight passes.
+            let mut compute_spec = checkout_spec_for_backend(image);
+            compute_spec.workspace = crate::WorkspaceSpec::default();
+            let err = backend
+                .run_cycle(
+                    &compute_spec,
+                    &ok_hooks(),
+                    sink,
+                    SandboxCancellation::new(),
+                )
+                .expect_err("compute under legacy hooks refuses at parent-attempt admission");
+            match err {
+                SandboxLaunchError::Failed(GvisorError::Hook(HookError(msg))) => assert!(
+                    msg.contains("parent-attempt"),
+                    "compute arm selected (reached reserve_parent_attempt); got: {msg}"
+                ),
+                other => panic!("expected the compute-arm reserve refusal, got {other:?}"),
+            }
             let _ = std::fs::remove_dir_all(&root);
         }
     }
@@ -21775,6 +22168,252 @@ pub(crate) fn acquire_deterministic_checkout_capsule(
     )
 }
 
+/// Whether the substituted workload's runtime-quiescence evidence is DERIVED from the durable bind's
+/// own `Bound` output (the honest positive path) or deliberately MISMATCHED on its `runsc_root_identity`
+/// (the negative path proving the settle-tail provenance check is LIVE, not vacuous). CT-007 5b.3-6e.2.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // MismatchedRunscRoot is constructed only by the `#[cfg(test)]` negative test.
+pub(crate) enum SubstitutedEvidenceMode {
+    DerivedFromBind,
+    MismatchedRunscRoot,
+}
+
+/// **CT-007 slice 5b.3-6e.2: a no-op `test-support` [`AttemptAuthority`] for the SANDBOX substituted
+/// workload leg.** It records nothing and fails nothing — its phase/renew/mint ops all succeed as
+/// clean no-ops — so the hardware-independent 6e.1b/§4-sandbox tests can drive the REAL
+/// `run_retained_workload_inner` (materialization completion, lease renewal, workload-credential mint +
+/// rotation) without a control-plane. Distinct from the `#[cfg(test)]`-only `FakeAttemptAuthority` (it
+/// must be reachable from the ordinary `--features test-support` build, not just `#[cfg(test)]`) and
+/// from the REAL `DurableAttemptAuthority` the live-PG §4 tests inject. It is pinned production-zero:
+/// defined AFTER the top-level test module (so it is excluded from `production_source()` entirely) and
+/// asserted absent from `production_source()` by the `ordinary_build_and_production_root_pins` test.
+#[cfg(any(test, feature = "test-support"))]
+struct NoOpTestSupportAuthority;
+
+#[cfg(any(test, feature = "test-support"))]
+impl NoOpTestSupportAuthority {
+    /// A minimal well-formed ephemeral authorization context for the workload credential mint — the
+    /// substituted workload leg never verifies it (that is the control-plane's Identity gate, exercised
+    /// by the live-PG §4 tests); it only needs to rotate structurally into the workload-local spec.
+    fn authorization_context() -> crate::RunTokenAuthorizationContext {
+        crate::RunTokenAuthorizationContext::CiJob(crate::CiJobAuthorizationContext {
+            tenant_id: "acme".to_string(),
+            region: "fr-par".to_string(),
+            principal_id: "p".to_string(),
+            wf_run_id: "wf".to_string(),
+            job_id: "j".to_string(),
+            lease_owner: "o".to_string(),
+            lease_epoch: 1,
+            claim_nonce: "n".to_string(),
+            claim_started_at_epoch_secs: 0,
+            claim_expires_at_epoch_secs: 1,
+            required_capabilities: vec![],
+            checkout_scope: None,
+            credential_binding: None,
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::checkout_orchestration::AttemptAuthority for NoOpTestSupportAuthority {
+    fn begin_phase(
+        &self,
+        _phase: crate::runner::PreparationPhase,
+    ) -> Result<(), crate::checkout_orchestration::AttemptAuthorityError> {
+        Ok(())
+    }
+    fn complete_phase(
+        &self,
+        _phase: crate::runner::PreparationPhase,
+        _usage: crate::ResourceUsage,
+    ) -> Result<(), crate::checkout_orchestration::AttemptAuthorityError> {
+        Ok(())
+    }
+    fn seal_phase(
+        &self,
+        _phase: crate::runner::PreparationPhase,
+    ) -> Result<(), crate::checkout_orchestration::AttemptAuthorityError> {
+        Ok(())
+    }
+    fn renew_preparation_lease(&self) -> Result<(), crate::runner::PreparationLeaseLost> {
+        Ok(())
+    }
+    fn mint_phase_credential(
+        &self,
+        phase: crate::CheckoutPhase,
+    ) -> Result<
+        crate::checkout_orchestration::PhaseCredentialCarrier,
+        crate::checkout_orchestration::AttemptAuthorityError,
+    > {
+        // Phase-DISTINCT jti + generation so a composed test can prove each transport leg spawned under
+        // its OWN credential and its OWN durable phase permit (advertise ≠ fetch ≠ materialization) —
+        // exactly what a real `DurableAttemptAuthority` guarantees.
+        let seed = match phase {
+            crate::CheckoutPhase::Advertise => "advertise",
+            crate::CheckoutPhase::Fetch => "fetch",
+            crate::CheckoutPhase::Materialization => "materialization",
+        };
+        Ok(crate::checkout_orchestration::PhaseCredentialCarrier::new(
+            crate::RunTokenCredential::new("bearer", format!("jti-noop-{seed}"), 300).unwrap(),
+            Self::authorization_context(),
+            format!("gen-noop-{seed}"),
+        ))
+    }
+    fn mint_workload_credential(
+        &self,
+    ) -> Result<
+        crate::checkout_orchestration::WorkloadCredentialCarrier,
+        crate::checkout_orchestration::AttemptAuthorityError,
+    > {
+        Ok(crate::checkout_orchestration::WorkloadCredentialCarrier::new(
+            crate::RunTokenCredential::new("bearer", "jti-noop-workload", 300).unwrap(),
+            Self::authorization_context(),
+            "gen-noop-workload",
+        ))
+    }
+    fn should_requeue(&self) -> bool {
+        true
+    }
+}
+
+/// Run the full deterministic substituted checkout cycle under `root` in `evidence_mode`, returning
+/// the owned observation plus the residual managers/dirs so the caller can assert durable state. This
+/// composes the two sealed test-support halves — [`AcquiredCheckoutRuntime::substituted_hop_b_for_test_support`]
+/// (real Hop B durable transitions) then [`PreparedCheckoutRuntime::substituted_workload_for_test_support`]
+/// (the REAL `run_retained_workload_inner` under the no-op authority, faking ONLY the hardware-gated
+/// permit/revalidation) — so the whole path is exercised, not a fabricated transition.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::type_complexity)]
+fn run_substituted_checkout_inner(
+    root: &std::path::Path,
+    sentinel_name: &str,
+    sentinel_bytes: &[u8],
+    evidence_mode: SubstitutedEvidenceMode,
+) -> (
+    SubstitutedCheckoutObservation,
+    crate::workspace_manager::WorkspaceManager,
+    std::path::PathBuf,
+    crate::user_namespace::UserNamespaceAllocator,
+    std::path::PathBuf,
+) {
+    let (runtime, workspace_manager, workspace_base, userns_allocator, userns_base) =
+        acquire_deterministic_checkout_capsule(root);
+    let base_spec = substitute_checkout_spec();
+    let authority = NoOpTestSupportAuthority;
+    // A minimal immediate-permit hooks: this 6e.1b provenance/settle drill has no control plane, so its
+    // launch fence grants an immediate permit (a no-op `commit_and_release`) for BOTH the workload leg
+    // and the materialization phase. The REAL V2 launch-fence proof is the composed §4 path
+    // (`drive_checkout_cycle_*`), which threads the real `ci_runner_v2_wiring` hooks whose permits commit
+    // the queue→running / row-locked CAS.
+    let hooks = crate::RunnerHooks::new(
+        crate::CompletionSettlementOwner::TerminalReporter,
+        Box::new(|s| Ok(crate::ReserveHandle(s.meter_to.reserve_id.clone()))),
+        Box::new(|_, _, _| Ok(())),
+        Box::new(|_| Ok(())),
+        Box::new(|_| Ok(())),
+    )
+    .with_checkout_phase_authorization(Box::new(|_spec, _scope, _phase| {
+        Ok(crate::LaunchPermit::immediate())
+    }));
+    // Mint the materialization `PhaseAuthorization` the fused Hop-B seam consumes — bound to the
+    // capsule's OWN derived scope + the same commit it was acquired for, so `resolve_checkout_preparation_permit`
+    // ACCEPTS it (a mismatched credential is what the §4 negative variant exercises). The authorization
+    // can only come from `authorize_phase_generation`, exactly as the real orchestrator mints it.
+    let scope = crate::derive_checkout_authorization_scope(base_spec.kind, &base_spec.workspace)
+        .expect("scope derives")
+        .expect("the substituted checkout spec is checkout-bearing");
+    let expected_commit = crate::workspace_intent::ExpectedGitCommitId::new(
+        scope.commit_hex().to_string(),
+        scope.commit_format(),
+    )
+    .expect("the capsule scope's commit is a well-formed expected commit id");
+    let carrier = crate::checkout_orchestration::PhaseCredentialCarrier::new(
+        crate::RunTokenCredential::new("bearer", "materialization-6e1b-jti", 300).unwrap(),
+        NoOpTestSupportAuthority::authorization_context(),
+        "gen-mat-6e1b",
+    );
+    let (mat_run_token, mat_authorization) = crate::checkout_orchestration::authorize_phase_generation(
+        &hooks,
+        &base_spec,
+        &scope,
+        crate::CheckoutPhase::Materialization,
+        carrier,
+    )
+    .expect("mint the materialization phase authorization");
+    // Hop B half: real Allocated -> PreparationBound -> Prepared, with the REAL materialization-permit
+    // resolve (consuming the authorization) and a substituted git execution.
+    let (prepared, hopb_write_ok, used_after_hopb) = match runtime
+        .substituted_hop_b_for_test_support(
+            &mat_run_token,
+            mat_authorization,
+            &expected_commit,
+            sentinel_name,
+            sentinel_bytes,
+            None,
+        ) {
+        Ok(triple) => triple,
+        Err((_capsule, error)) => panic!(
+            "the matching materialization authorization must resolve and Hop B must prepare the \
+             capsule, but it was refused: {error}"
+        ),
+    };
+    // Workload half: the REAL run_retained_workload_inner (authority phases + the real launch permit
+    // acquire+commit + settle), faking only the explicit-userns revalidation + the runsc spawn.
+    let (outcome, used_at_workload_checkpoint, mount_source_matched_workspace, sentinel_read_through_mount) =
+        prepared.substituted_workload_for_test_support(
+            &authority,
+            &hooks,
+            &base_spec,
+            &workspace_manager,
+            sentinel_name,
+            sentinel_bytes,
+            evidence_mode,
+        );
+    // Map the REAL outcome. `Ran(Ok(_))` is a clean real settle; `Ran(Err(_))` is the settle tail
+    // refusing (the negative provenance path lands here); every other variant is a pre-settle disposal
+    // (the workload never bound/renewed) — all `settled_ok == false`.
+    let (settled_ok, settle_error) = match outcome {
+        RetainedWorkloadOutcome::Ran(Ok(_)) => (true, None),
+        RetainedWorkloadOutcome::Ran(Err(failure)) => (false, Some(format!("{failure:?}"))),
+        RetainedWorkloadOutcome::RunFailed {
+            failure,
+            disposal_diagnostics,
+        } => (false, Some(format!("RunFailed: {failure:?}; disposal={disposal_diagnostics:?}"))),
+        RetainedWorkloadOutcome::PhaseAuthorityFailed {
+            error,
+            disposal_diagnostics,
+        } => (
+            false,
+            Some(format!("PhaseAuthorityFailed: {error:?}; disposal={disposal_diagnostics:?}")),
+        ),
+        RetainedWorkloadOutcome::LeaseLost {
+            lost,
+            disposal_diagnostics,
+        } => (false, Some(format!("LeaseLost: {lost:?}; disposal={disposal_diagnostics:?}"))),
+        RetainedWorkloadOutcome::PermitRefused {
+            message,
+            disposal_diagnostics,
+        } => (false, Some(format!("PermitRefused: {message}; disposal={disposal_diagnostics:?}"))),
+    };
+    let observation = SubstitutedCheckoutObservation {
+        hopb_write_ok,
+        used_after_hopb,
+        used_at_workload_checkpoint,
+        mount_source_matched_workspace,
+        sentinel_read_through_mount,
+        settled_ok,
+        settle_error,
+    };
+    (
+        observation,
+        workspace_manager,
+        workspace_base,
+        userns_allocator,
+        userns_base,
+    )
+}
+
 /// Run the full deterministic substituted checkout SUCCESS cycle under `root`, returning the owned
 /// observation plus the residual managers/dirs so the caller can assert step-8 durable state (path
 /// absence, capacity zero/reusable, userns slot reusable, healthy manager). The ONE entry both the
@@ -21792,18 +22431,330 @@ pub(crate) fn run_substituted_checkout_success(
     crate::user_namespace::UserNamespaceAllocator,
     std::path::PathBuf,
 ) {
-    let (runtime, workspace_manager, workspace_base, userns_allocator, userns_base) =
-        acquire_deterministic_checkout_capsule(root);
-    let observation = runtime.execute_substituted_checkout_for_test_support(
-        &workspace_manager,
+    run_substituted_checkout_inner(
+        root,
         sentinel_name,
         sentinel_bytes,
-    );
-    (
-        observation,
-        workspace_manager,
-        workspace_base,
-        userns_allocator,
-        userns_base,
+        SubstitutedEvidenceMode::DerivedFromBind,
     )
+}
+
+/// Run the deterministic substituted checkout cycle under `root` with DELIBERATELY MISMATCHED workload
+/// evidence (a wrong `runsc_root_identity`, diverging from the durable bind's own recorded output), so
+/// the REAL settle tail's evidence-vs-recorded-binding provenance check MUST reject it AT SETTLE. The
+/// returned `settle_error` carries the settle-layer refusal; the residual managers let the caller
+/// assert the fail-closed contract (workspace NOT deleted, capacity retained, manager poisoned, userns
+/// slot not reissued). CT-007 5b.3-6e.2 — the negative pair to `run_substituted_checkout_success`.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::type_complexity)]
+#[allow(dead_code)] // called only by the `#[cfg(test)]` negative provenance test.
+pub(crate) fn run_substituted_checkout_mismatched_evidence(
+    root: &std::path::Path,
+    sentinel_name: &str,
+    sentinel_bytes: &[u8],
+) -> (
+    SubstitutedCheckoutObservation,
+    crate::workspace_manager::WorkspaceManager,
+    std::path::PathBuf,
+    crate::user_namespace::UserNamespaceAllocator,
+    std::path::PathBuf,
+) {
+    run_substituted_checkout_inner(
+        root,
+        sentinel_name,
+        sentinel_bytes,
+        SubstitutedEvidenceMode::MismatchedRunscRoot,
+    )
+}
+
+// ═════════════════ CT-007 slice 5b.3-6e.2 Stage A: the git-wire test-support substrate ═══════════
+//
+// The MINIMAL relocation (Sol's ruling: NOT the whole fixture cluster) of the git-wire fakes the
+// `#[cfg(test)]` `checkout_transport_5b3_3` module grew, lifted to
+// `#[cfg(any(test, feature = "test-support"))]` so the hardware-independent runsc-driver seam
+// (`gvisor/runsc_driver.rs`, `#[cfg(feature = "test-support")]`) and the cross-crate §4 active-path
+// tests can drive the REAL checkout orchestrator with a scripted two-call Hop-A executor. Appended
+// AFTER the top-level `#[cfg(test)] mod tests` block so it is excluded from `production_source()`;
+// every item is gated, ABSENT from ordinary builds, and reachable from NO production composition
+// root. The `#[cfg(test)]` callers (`checkout_preparation_5b2`, `checkout_transport_5b3_3`, the outer
+// `tests` module for `FakeRunsc`) re-import these by path so their existing tests keep compiling.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(dead_code)] // several helpers are consumed only by `#[cfg(test)]` callers and/or the driver.
+// The executor helpers name the crate-private `RuntimeFinalization`/`GitWireHopFinalization` in their
+// `pub(crate)` signatures — an intentional crate-internal seam, never a public leak.
+#[allow(private_interfaces)]
+// CT-007 slice 5b.3-6e.2 Stage A: `pub` (still `#[cfg(any(test, feature = "test-support"))]`-gated, so
+// ABSENT from ordinary/production builds) ONLY so the cross-crate §4 active-path tests can name the
+// three `pub` helpers below by path. Every OTHER item stays `pub(crate)` — an intentional crate-internal
+// seam, never a public leak — and the whole module remains excluded from `production_source()` and
+// pinned production-zero (see `ordinary_build_and_production_root_pins`).
+pub mod checkout_transport_test_support {
+    use super::*;
+
+    /// A 40-hex SHA-1-shaped commit oid built from a single repeated byte.
+    pub(crate) fn sha1_oid(byte: u8) -> String {
+        format!("{:02x}", byte).repeat(20)
+    }
+
+    /// Assemble a pkt-line `upload-pack` advertisement (first ref line + optional extra refs + flush).
+    pub(crate) fn advertisement(first_line: &str, extra_refs: &[&str]) -> Vec<u8> {
+        let mut buf = pkt_line_encode(first_line);
+        for line in extra_refs {
+            buf.extend(pkt_line_encode(line));
+        }
+        buf.extend_from_slice(b"0000");
+        buf
+    }
+
+    /// Assemble a fetch response: optional shallow lines, a flush, a negotiation line, then the pack.
+    pub(crate) fn fetch_response(shallow_lines: &[String], negotiation: &str, pack: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for line in shallow_lines {
+            buf.extend(pkt_line_encode(line));
+        }
+        buf.extend_from_slice(b"0000");
+        buf.extend(pkt_line_encode(negotiation));
+        buf.extend_from_slice(pack);
+        buf
+    }
+
+    /// A minimal well-formed pack: the `PACK` magic followed by an arbitrary payload.
+    pub(crate) fn fake_pack(payload: &[u8]) -> Vec<u8> {
+        let mut pack = b"PACK".to_vec();
+        pack.extend_from_slice(payload);
+        pack
+    }
+
+    /// A directly-advertised advertisement for `oid` with the required capabilities.
+    pub(crate) fn advertisement_bytes(oid: &str) -> Vec<u8> {
+        advertisement(
+            &format!("{oid} refs/heads/main\0no-progress ofs-delta shallow\n"),
+            &[],
+        )
+    }
+
+    /// A NAK fetch response carrying a `PACK`-wrapped payload, no shallow line.
+    pub(crate) fn fetch_response_bytes(payload: &[u8]) -> Vec<u8> {
+        fetch_response(&[], "NAK", &fake_pack(payload))
+    }
+
+    /// A canned, always-fine teardown proof for the auto-wrapped `Finalized` case —
+    /// `RuntimeNamespaceQuiescence::Rootless` since git-wire's `prepared_mode` is always `Rootless`.
+    pub(crate) fn fake_quiescence_evidence() -> RuntimeQuiescenceEvidence {
+        RuntimeQuiescenceEvidence::assert_for_tests(
+            "5b3-3-test-container".to_string(),
+            RuntimeNamespaceQuiescence::Rootless,
+            CgroupQuiescenceEvidence::assert_for_tests((1, 1)),
+        )
+    }
+
+    /// A single scripted Hop-A step: the simple pre-finalization outcome the recording executor
+    /// auto-wraps into a `RuntimeFinalization::Finalized`.
+    pub(crate) type ScriptedStep =
+        Box<dyn FnOnce() -> Result<(ContainerRun, bool), RunFailure> + Send>;
+
+    /// A boxed stand-in for [`GitWireHopExecutor`] — call sites pass `&*executor`.
+    pub(crate) type BoxedHopExecutor = Box<
+        dyn Fn(
+            &JobSpec,
+            &OciConfig,
+            Vec<u8>,
+            &Path,
+            &AtomicBool,
+            LaunchPermit,
+        ) -> (
+            Result<GitWireHopFinalization, RunFailure>,
+            BundleCleanupProof,
+        ),
+    >;
+
+    /// A deterministic stand-in for the spawned `runsc` child: `kill`/`wait` are clean no-op successes.
+    pub(crate) struct FakeRunsc;
+    impl RunscChild for FakeRunsc {
+        fn kill(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&mut self) -> Result<i32, String> {
+            Ok(0)
+        }
+    }
+
+    /// A canned [`ContainerRun`] carrying `stdout`/`usage` — a clean exit-0 result, a fake child, and a
+    /// REAL (freshly-staged, unique) bundle dir so the git-wire hop's CHECKED post-run bundle removal
+    /// proves clean (a non-existent dir would make the checked teardown fail → `TeardownUnproven`). The
+    /// test-support analog of `checkout_transport_5b3_3::fake_hop_container_run`.
+    pub(crate) fn fake_git_wire_run(stdout: Vec<u8>, usage: ResourceUsage) -> ContainerRun {
+        let bundle_dir = std::env::temp_dir().join(format!(
+            "myelin-git-wire-test-support-bundle-{}-{}",
+            std::process::id(),
+            unique_suffix(),
+        ));
+        std::fs::create_dir_all(&bundle_dir).expect("stage a real bundle dir for the git-wire hop");
+        ContainerRun {
+            child: Box::new(FakeRunsc),
+            bundle_dir,
+            result: SandboxResult {
+                exit_code: Some(0),
+                timed_out: false,
+                usage,
+                stdout,
+                stderr: Vec::new(),
+            },
+            run_error: None,
+        }
+    }
+
+    /// An executor that COMMITS every permit it is handed and records `(run-token JTI, committed)` per
+    /// call — so a test can prove each leg spawned under its OWN credential and its OWN durable phase
+    /// permit. Scripts exactly `steps.len()` calls; panics if invoked more times than scripted.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn permit_recording_executor(
+        steps: Vec<ScriptedStep>,
+    ) -> (BoxedHopExecutor, Arc<Mutex<Vec<(String, bool)>>>) {
+        let seen: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_closure = Arc::clone(&seen);
+        let queue = Mutex::new(std::collections::VecDeque::from(steps));
+        let f = move |job: &JobSpec,
+                      _cfg: &OciConfig,
+                      _stdin: Vec<u8>,
+                      _rootfs: &Path,
+                      _cancellation: &AtomicBool,
+                      permit: LaunchPermit| {
+            let committed = permit.commit_and_release().is_ok();
+            seen_for_closure
+                .lock()
+                .unwrap()
+                .push((job.run_token.jti.clone(), committed));
+            let mut queue = queue.lock().unwrap();
+            let step = queue
+                .pop_front()
+                .expect("executor invoked more times than scripted");
+            let finalization_result = match step() {
+                Ok((run, truncated)) => Ok(RuntimeFinalization::Finalized(FinalizedRun {
+                    primary: Ok((run, truncated)),
+                    evidence: fake_quiescence_evidence(),
+                })),
+                Err(run_failure) => Err(run_failure),
+            };
+            (finalization_result, Ok(()))
+        };
+        (Box::new(f), seen)
+    }
+
+    pub(crate) const CHECKOUT_TENANT: &str = "acme";
+    pub(crate) const CHECKOUT_REGION: &str = "fr-par";
+    pub(crate) const CHECKOUT_REPO: &str = "widgets";
+    /// The exact 40-hex commit the [`checkout_spec_for_backend`] job advertises — the driver scripts an
+    /// advertisement/fetch for THIS oid, and the orchestrator derives its `ExpectedGitCommitId` from it.
+    pub(crate) fn checkout_commit_oid() -> String {
+        sha1_oid(0xC7)
+    }
+
+    /// Stage the bare-repo directory both Hop A resolutions require: `root/<tenant>/<region>/<repo>.git`,
+    /// a REAL directory (never a symlink), matching `resolve_bare_repo_path`/`assert_repo_under_root`.
+    pub fn stage_checkout_repo_root(root: &Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(
+            root.join(CHECKOUT_TENANT)
+                .join(CHECKOUT_REGION)
+                .join(format!("{CHECKOUT_REPO}.git")),
+        )
+        .expect("stage bare repo root");
+        root.to_path_buf()
+    }
+
+    /// Build a deterministic **Enabled** [`GvisorBackend`] under `root` — a real-digest registry binding
+    /// (a staged empty rootfs hashed with the SAME `canonical_tree_sha256_hex` the registry uses, so the
+    /// pin genuinely resolves) plus a deterministic-directory workspace manager and a fixture-`subuid`
+    /// userns allocator. Struct-literal construction: this submodule is a descendant of the `gvisor`
+    /// module, so it may name `GvisorBackend`'s private fields. Returns the backend + the resolvable
+    /// [`ImageRef`] a matching checkout spec must carry. No Btrfs / `/etc/subuid` / KVM / runsc.
+    pub fn deterministic_enabled_backend_for_tests(root: &Path) -> (GvisorBackend, ImageRef) {
+        let rootfs = root.join("rootfs");
+        std::fs::create_dir_all(&rootfs).expect("stage the workload rootfs dir");
+        let digest = crate::canonical_tar::canonical_tree_sha256_hex(&rootfs)
+            .expect("hash the staged rootfs");
+        let image =
+            ImageRef::pinned(format!("test.local/checkout-workload@sha256:{digest}")).unwrap();
+        let registry = Arc::new(
+            crate::asset_registry::GvisorAssetRegistry::from_bindings(vec![
+                crate::asset_registry::RootfsAssetBinding {
+                    image: image.clone(),
+                    rootfs,
+                },
+            ])
+            .expect("the real-digest fixture binding verifies"),
+        );
+        let workspace_base = root.join("workspace");
+        let userns_base = root.join("userns");
+        std::fs::create_dir_all(&workspace_base).unwrap();
+        std::fs::create_dir_all(&userns_base).unwrap();
+        let workspace_manager =
+            deterministic_workspace_manager_for_tests(workspace_base, 1 << 30)
+                .expect("deterministic-directory workspace manager must construct");
+        let userns_allocator = deterministic_userns_allocator_for_tests(&userns_base, 1)
+            .expect("deterministic userns allocator must construct (a NON-root user is required)");
+        let backend = GvisorBackend {
+            live: Mutex::new(std::collections::HashMap::new()),
+            registry: Some(registry),
+            workspace_integration: WorkspaceIntegration::Enabled {
+                workspace_manager,
+                userns_allocator,
+            },
+            checkout: GvisorCheckoutConfig::disabled(),
+        };
+        (backend, image)
+    }
+
+    /// A checkout-bearing CI [`JobSpec`] for the deterministic Enabled backend: `image` is the backend's
+    /// resolvable rootfs pin, the workspace carries the repo ref + [`checkout_commit_oid`], and the
+    /// run-token authorization is a `CiJob` context whose `region` the orchestrator threads into the Hop
+    /// A bare-repo path.
+    pub fn checkout_spec_for_backend(image: ImageRef) -> crate::JobSpec {
+        let mut spec = crate::JobSpec::new(
+            crate::JobKind::Ci,
+            image,
+            vec!["true".into()],
+            vec![],
+            vec![],
+            crate::EgressPolicy { allow: vec![] },
+            crate::ResourceLimits {
+                cpu_millis: 1000,
+                mem_bytes: 256 << 20,
+                disk_bytes: 1 << 30,
+                tmpfs_bytes: 1 << 30,
+                pids_max: 64,
+                timeout_secs: 120,
+            },
+            crate::WorkspaceSpec {
+                repo_ref: Some(format!(
+                    "myelin://{CHECKOUT_TENANT}/git/repo/{CHECKOUT_REPO}"
+                )),
+                commit: Some(checkout_commit_oid()),
+            },
+            crate::TrustTier::UntrustedFork,
+            crate::RunTokenCredential::new("test-bearer", "j-checkout", 300).unwrap(),
+            crate::MeterTarget {
+                reserve_id: "r".into(),
+            },
+            crate::IdemToken("idem-6e2-checkout".into()),
+        )
+        .unwrap();
+        spec.run_token_authorization =
+            Some(crate::RunTokenAuthorizationContext::CiJob(crate::CiJobAuthorizationContext {
+                tenant_id: CHECKOUT_TENANT.to_string(),
+                region: CHECKOUT_REGION.to_string(),
+                principal_id: "p".to_string(),
+                wf_run_id: "wf".to_string(),
+                job_id: "j".to_string(),
+                lease_owner: "o".to_string(),
+                lease_epoch: 1,
+                claim_nonce: "n".to_string(),
+                claim_started_at_epoch_secs: 0,
+                claim_expires_at_epoch_secs: 1,
+                required_capabilities: vec![],
+                checkout_scope: None,
+                credential_binding: None,
+            }));
+        spec
+    }
 }

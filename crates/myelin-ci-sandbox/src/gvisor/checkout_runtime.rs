@@ -29,22 +29,23 @@ use std::sync::Arc;
 
 use super::{
     acquire_enabled_workspace, checkout_cleanup_plan, execute_cleanup_plan,
-    resolve_checkout_preparation_permit, run_checkout_preparation_inner, settle_enabled_finalization,
-    unique_suffix, AcquisitionFailure, BoundWorkloadRefusal, CheckoutPreparationError,
-    CheckoutPreparationSpec, ContainerRun, EnabledLaunchContext, LeaseBindState, OciConfig,
-    PreparedCheckoutEvidence, RealCheckoutCleanupExecutor, RetainedWorkloadOutcome, RunFailure,
-    RuntimeFinalization, WorkloadRotatedSpec,
+    resolve_checkout_preparation_permit, run_checkout_preparation_inner,
+    settle_enabled_finalization, unique_suffix, AcquisitionFailure, BoundWorkloadRefusal,
+    CheckoutPreparationError, CheckoutPreparationSpec, ContainerRun, EnabledLaunchContext,
+    LeaseBindState, OciConfig, PreparedCheckoutEvidence, RealCheckoutCleanupExecutor,
+    RetainedWorkloadOutcome, RunFailure, RuntimeFinalization, WorkloadRotatedSpec,
 };
 // `RuntimePreparation` + `LaunchPermit` are named only by the `#[cfg(test)]` injectable-executor seam
 // (production reaches the workload runner solely through the sealed wrapper's fixed-runner method).
 #[cfg(test)]
 use super::RuntimePreparation;
-// CT-007 slice 5b.3-6e.1b: the deterministic `test-support` execution seam (below) names the owned
-// observation type + the synthetic-finalization builder from the parent module.
+// CT-007 slice 5b.3-6e.1b/6e.2: the deterministic `test-support` execution seam (below) names the
+// REAL workload-bind helper + the synthetic-finalization builder + the evidence-provenance mode from
+// the parent module.
 #[cfg(any(test, feature = "test-support"))]
 use super::{
-    finalized_for_test_support, CgroupQuiescenceEvidence, RuntimeNamespaceQuiescence,
-    RuntimeQuiescenceEvidence, SubstitutedCheckoutObservation,
+    bind_prepared_lease_given, finalized_for_test_support, CgroupQuiescenceEvidence,
+    RuntimeNamespaceQuiescence, RuntimeQuiescenceEvidence, SubstitutedEvidenceMode,
 };
 use crate::checkout_orchestration::AttemptAuthority;
 use crate::hardening::HardeningProfile;
@@ -112,11 +113,9 @@ impl AcquiredCheckoutRuntime {
                             .to_string(),
                     ))
                 }
-                Err(reason) => {
-                    return Err(AcquisitionFailure::clean(format!(
-                        "deriving the checkout authorization scope from the job spec failed: {reason}"
-                    )))
-                }
+                Err(reason) => return Err(AcquisitionFailure::clean(format!(
+                    "deriving the checkout authorization scope from the job spec failed: {reason}"
+                ))),
             };
         // The stable workload identity — `myelin-prod-*`, EXACTLY the form `launch_with` mints for an
         // ordinary job (this is the workload's id, distinct from Hop B's own `myelin-checkout-*` id
@@ -280,9 +279,10 @@ impl PreparedCheckoutRuntime {
     {
         // Step 19: complete the materialization phase with the RETAINED Hop B usage (borrow only).
         let materialization_usage = self.prepared_checkout_evidence.preparation_usage();
-        if let Err(error) = authority
-            .complete_phase(PreparationPhase::CheckoutMaterialization, materialization_usage)
-        {
+        if let Err(error) = authority.complete_phase(
+            PreparationPhase::CheckoutMaterialization,
+            materialization_usage,
+        ) {
             let disposal_diagnostics = self.dispose_checkout_runtime(workspace_manager);
             return RetainedWorkloadOutcome::PhaseAuthorityFailed {
                 error,
@@ -586,42 +586,67 @@ impl AcquiredCheckoutRuntime {
     }
 }
 
-/// **CT-007 slice 5b.3-6e.1b: the deliberately-audited `test-support` EXECUTION seam.** Unlike
-/// [`AcquiredCheckoutRuntime::into_prepared_for_tests`] (which fabricates the transition with
-/// caller-supplied evidence), this seam performs the REAL durable session/lease transitions —
-/// `Allocated → PreparationBound → Prepared → Bound` — while SUBSTITUTING only the two runtime
-/// EXECUTIONS (Hop B and the workload), so the full checkout-capsule lifecycle RUNS on a host with
-/// no Btrfs/subuid/KVM/runsc. This is a SEPARATE `#[cfg(any(test, feature = "test-support"))]` impl
-/// (never the `#[cfg(test)]` driver impl): the closed-world audit inventories it as
-/// test-support-only WITHOUT enlarging the five-entry production accessor surface.
+/// **CT-007 slice 5b.3-6e.1b/6e.2: the deliberately-audited `test-support` EXECUTION seam (Hop B
+/// half).** Unlike [`AcquiredCheckoutRuntime::into_prepared_for_tests`] (which fabricates the
+/// transition with caller-supplied evidence), this seam performs the REAL durable session/lease
+/// transitions `Allocated → PreparationBound → Prepared` while SUBSTITUTING only the Hop B runtime
+/// EXECUTION (a checked byte-accounted sentinel write in place of the real `git` fetch/checkout), so
+/// the checkout-capsule preparation lifecycle RUNS on a host with no Btrfs/subuid/KVM/runsc. It is
+/// a SEPARATE `#[cfg(any(test, feature = "test-support"))]` impl (never the `#[cfg(test)]` driver
+/// impl): the closed-world audit inventories it as test-support-only WITHOUT enlarging the five-entry
+/// production accessor surface.
+///
+/// HONEST SCOPING: what is substituted here is ONLY the Hop B `git` execution + its measured usage;
+/// the materialization permit and durable `Allocated → PreparationBound → Prepared` transitions are
+/// REAL. On the workload leg, the launch permit is likewise acquired and committed for real; only
+/// explicit-userns policy revalidation and the `runsc` spawn are hardware-gated and deferred to the
+/// real-`runsc` drill 5b.3-7.
 #[cfg(any(test, feature = "test-support"))]
 impl AcquiredCheckoutRuntime {
-    /// Drive Sol's 8-step substituted checkout execution and return ONLY an owned
-    /// [`SubstitutedCheckoutObservation`] — never a workspace path, lease, session, `OciConfig`, or
-    /// evidence. In order: (2a) real `bind_preparation`; (3) the substituted Hop B writes a sentinel
-    /// into the capsule's REAL workspace via the CHECKED byte-accounted test-quota op; (2b) real
-    /// `confirm_prepared` from a matching synthetic preparation proof; (4) real `bind_workload`;
-    /// (5) the substituted workload READS the sentinel THROUGH the retained OCI config's recorded
-    /// workspace mount source; (6) matching synthetic runtime-quiescence evidence; (7) the REAL
-    /// [`settle_enabled_finalization`](super::settle_enabled_finalization) tail (delete +
-    /// evidence-validated lease release). The caller asserts path absence / capacity / userns-slot
-    /// reuse / manager health (step 8) on the handles it already owns.
-    pub(crate) fn execute_substituted_checkout_for_test_support(
+    /// Drive the REAL Hop B durable transitions with a substituted execution and return the fused
+    /// [`PreparedCheckoutRuntime`] plus two owned observations (the checked-write outcome and the
+    /// byte-accounted checkpoint) — never a workspace path, lease, session, `OciConfig`, or evidence.
+    /// In order: (2a) real `bind_preparation`; (3) the substituted Hop B writes a sentinel into the
+    /// capsule's REAL workspace via the CHECKED byte-accounted test-quota op; (2b) real
+    /// `confirm_prepared` from a matching synthetic preparation proof. The fused capsule carries a
+    /// synthetic (substituted-Hop-B) `PreparedCheckoutEvidence` usage the workload leg then completes
+    /// the materialization phase against.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn substituted_hop_b_for_test_support(
         mut self,
-        workspace_manager: &WorkspaceManager,
+        run_token: &RunTokenCredential,
+        authorization: PhaseAuthorization,
+        expected_commit: &crate::workspace_intent::ExpectedGitCommitId,
         sentinel_name: &str,
         sentinel_bytes: &[u8],
-    ) -> SubstitutedCheckoutObservation {
+        injected_disposition: Option<crate::runner::PreparationAttemptDisposition>,
+    ) -> Result<
+        (PreparedCheckoutRuntime, bool, u64),
+        (AcquiredCheckoutRuntime, CheckoutPreparationError),
+    > {
         use crate::user_namespace::PreparationQuiescenceProof;
 
-        // Synthetic-but-CONSISTENT identities: reused for BOTH the real durable transitions and the
-        // matching synthetic quiescence evidence, so the whole lifecycle validates with no runsc.
+        // Step 17 (REAL, not faked): resolve the materialization launch permit by CONSUMING the fused
+        // `PhaseAuthorization` against THIS capsule's own derived scope + the run token + the expected
+        // commit — the SAME `resolve_checkout_preparation_permit` production's `run_checkout_preparation_v2`
+        // runs BEFORE any staging or durable bind. A mismatched materialization credential (wrong JTI,
+        // scope, or commit) is rejected HERE, and the untouched capsule is handed back so the real
+        // continuation disposes + routes it exactly as production does. Only the `git` spawn is faked.
+        let permit = match resolve_checkout_preparation_permit(
+            authorization,
+            run_token,
+            &self.checkout_scope,
+            expected_commit,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => return Err((self, error)),
+        };
+
+        // Synthetic-but-CONSISTENT preparation identities: reused for BOTH the real durable
+        // transition and the matching synthetic preparation proof, so Hop B validates with no runsc.
         let prep_container = format!("myelin-checkout-substituted-{}", self.workload_container_id);
         let prep_root = (0x0011_u64, 0x0022_u64);
         let prep_cgroup = (0x0033_u64, 0x0044_u64);
-        let workload_container = self.workload_container_id.clone();
-        let workload_root = (0x0111_u64, 0x0222_u64);
-        let workload_cgroup = (0x0333_u64, 0x0444_u64);
 
         // Step 2a: REAL Allocated -> PreparationBound (durable lease + session transition).
         self.session
@@ -633,21 +658,62 @@ impl AcquiredCheckoutRuntime {
             )
             .expect("bind_preparation must succeed on a fresh Allocated lease");
 
-        // Step 3: the SUBSTITUTED Hop B writes the sentinel into the capsule's REAL workspace,
-        // routed through the CHECKED byte-accounted test-quota op (scan + checked-add, refuse before
-        // mutation).
-        let hopb_write_ok = self
-            .enabled_context
-            .workspace
-            .checked_test_quota_write(sentinel_name, sentinel_bytes)
-            .is_ok();
+        // Commit the resolved materialization permit at the substituted spawn boundary, BEFORE the
+        // fake execution and BEFORE quiescence is confirmed — the same order `run_and_capture` uses
+        // for the production Hop-B child. Thus a phase CAS/permit regression cannot be masked by a
+        // sentinel write or by prematurely moving the durable session to Prepared.
+        if let Err(error) = permit.commit_and_release() {
+            // No child was spawned, so the synthetic substrate can prove quiescence immediately and
+            // leave the already-bound session releasable. Production likewise routes a launch-boundary
+            // failure only after finalization has established quiescence.
+            let prep_evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+                prep_container.clone(),
+                RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: prep_root,
+                },
+                CgroupQuiescenceEvidence::assert_for_tests(prep_cgroup),
+            );
+            let prep_proof = PreparationQuiescenceProof::from_runtime_evidence(
+                &self.enabled_context.lease,
+                &prep_evidence,
+            )
+            .expect("a matching preparation evidence mints a proof");
+            self.session
+                .confirm_prepared(&mut self.enabled_context.lease, prep_proof)
+                .expect("confirm_prepared with matching evidence must succeed");
+            return Err((
+                self,
+                CheckoutPreparationError::RejectedAfterQuiescence {
+                    message: format!("materialization launch permit commit failed: {error}"),
+                    usage: crate::ResourceUsage {
+                        cpu_seconds: 0,
+                        mem_byte_seconds: 0,
+                    },
+                    disposition:
+                        crate::runner::PreparationAttemptDisposition::RetryableInfrastructure {
+                            phase: crate::runner::PreparationPhase::CheckoutMaterialization,
+                        },
+                },
+            ));
+        }
+
+        // Step 3: the SUBSTITUTED Hop B either injects a post-spawn result or writes the sentinel into
+        // the capsule's REAL workspace through the checked byte-accounted test-quota operation. Both
+        // arms have already consumed and committed the real materialization authorization above.
+        let hopb_write_ok = injected_disposition.is_none()
+            && self
+                .enabled_context
+                .workspace
+                .checked_test_quota_write(sentinel_name, sentinel_bytes)
+                .is_ok();
         let used_after_hopb = self
             .enabled_context
             .workspace
             .scan_used_bytes()
             .unwrap_or(0);
 
-        // Step 2b: REAL PreparationBound -> Prepared, confirmed with a matching synthetic prep proof.
+        // Step 2b: REAL PreparationBound -> Prepared, confirmed with matching synthetic evidence only
+        // after the substituted execution boundary.
         let prep_evidence = RuntimeQuiescenceEvidence::assert_for_tests(
             prep_container.clone(),
             RuntimeNamespaceQuiescence::ExplicitUserNamespace {
@@ -664,79 +730,186 @@ impl AcquiredCheckoutRuntime {
             .confirm_prepared(&mut self.enabled_context.lease, prep_proof)
             .expect("confirm_prepared with a matching proof must succeed");
 
-        // Step 4: REAL Prepared -> Bound workload transition. Build BOTH the local bind state AND the
-        // workload evidence from the RETURNED `WorkloadBindingIdentity::into_parts()` — the exact
-        // provenance invariant production consumes (gvisor.rs `bind_prepared_lease_given`), never the
-        // original arguments — so this seam genuinely exercises the path where a divergence between
-        // the durable binding and the local settlement identity WOULD surface.
-        let binding = self
-            .session
-            .bind_workload(
-                &mut self.enabled_context.lease,
-                workload_container.clone(),
-                workload_root,
-                workload_cgroup,
-            )
-            .expect("bind_workload must succeed from a durably Prepared session");
-        let (bound_container, bound_root, bound_cgroup) = binding.into_parts();
-        self.enabled_context.bind_state = LeaseBindState::Bound {
-            container_id: bound_container.clone(),
-            runsc_root_identity: bound_root,
-            cgroup_identity: bound_cgroup,
-        };
+        if let Some(disposition) = injected_disposition {
+            return Err((
+                self,
+                CheckoutPreparationError::RejectedAfterQuiescence {
+                    message: "6e.2 injected Hop-B failure (test-support)".to_string(),
+                    usage: crate::ResourceUsage {
+                        cpu_seconds: 2,
+                        mem_byte_seconds: 5,
+                    },
+                    disposition,
+                },
+            ));
+        }
 
-        // Step 5: the SUBSTITUTED workload READS the sentinel THROUGH the retained OCI config's
-        // recorded workspace mount source — proving Hop B and the workload shared the one capsule.
-        let mount_source = self
-            .workload_cfg
-            .workspace_host_source_for_tests()
-            .map(Path::to_path_buf);
-        let workspace_host = self.enabled_context.workspace.host_path().to_path_buf();
-        let mount_source_matched_workspace =
-            mount_source.as_deref() == Some(workspace_host.as_path());
-        let sentinel_read_through_mount = match &mount_source {
-            Some(src) => std::fs::read(src.join(sentinel_name))
-                .map(|bytes| bytes == sentinel_bytes)
-                .unwrap_or(false),
-            None => false,
+        // Fuse into the prepared capsule (wrapping, not re-destructuring — the trio stays inseparable
+        // across the transition). The synthetic preparation usage is the substituted Hop B's measured
+        // cost; the workload leg completes the materialization phase against it (step 19).
+        let prepared = PreparedCheckoutRuntime {
+            acquired: self,
+            prepared_checkout_evidence: PreparedCheckoutEvidence::for_tests(crate::ResourceUsage {
+                cpu_seconds: 2,
+                mem_byte_seconds: 5,
+            }),
         };
+        Ok((prepared, hopb_write_ok, used_after_hopb))
+    }
+}
+
+/// **CT-007 slice 5b.3-6e.2: the workload half of the audited `test-support` EXECUTION seam.** Drives
+/// the REAL [`PreparedCheckoutRuntime::run_retained_workload_inner`] body — so the injected
+/// [`AttemptAuthority`]'s materialization completion (step 19), preparation-lease renewal (step 20),
+/// and workload-credential mint + rotation (step 21) all RUN for real, producing the real durable
+/// rows — while the injected workload closure binds directly via the REAL
+/// [`bind_prepared_lease_given`](super::bind_prepared_lease_given) (`Prepared → Bound`) and hands back
+/// a canned exit-0 finalization, so the REAL [`settle_enabled_finalization`](super::settle_enabled_finalization)
+/// tail then runs. HONEST SCOPING: the closure acquires and commits the REAL workload launch permit;
+/// it substitutes only explicit-userns policy revalidation and the `runsc` spawn, which are the
+/// hardware boundary covered by the real-`runsc` drill 5b.3-7. It substitutes NOTHING about
+/// provenance: the workload runtime evidence is DERIVED from the bind's OWN `Bound` output
+/// ([`LeaseBindState::Bound`]'s recorded `runsc_root_identity`/`cgroup_identity`), never from an
+/// argument, so the settle tail's evidence-vs-recorded-binding provenance check is exercised LIVE.
+#[cfg(any(test, feature = "test-support"))]
+impl PreparedCheckoutRuntime {
+    /// Drive steps 19–25 with a substituted workload execution. Returns the REAL owned
+    /// [`RetainedWorkloadOutcome`](super::RetainedWorkloadOutcome) (so the §4 continuation driver can
+    /// route it exactly as production does) PLUS the three owned side-observations
+    /// `(used_at_workload_checkpoint, mount_source_matched_workspace, sentinel_read_through_mount)` —
+    /// never a workspace path, lease, session, `OciConfig`, or evidence. `evidence_mode` selects
+    /// whether the workload runtime evidence is DERIVED from the bind's own `Bound` output (the honest
+    /// positive path) or deliberately MISMATCHED on `runsc_root_identity` (the negative path proving the
+    /// settle-tail provenance check is LIVE, not vacuous). The ONE sealed workload seam both the 6e.1b
+    /// in-lib test and the §4 continuation driver share (the private `run_retained_workload_inner` it
+    /// drives is unreachable from any sibling module).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn substituted_workload_for_test_support(
+        self,
+        authority: &dyn AttemptAuthority,
+        hooks: &RunnerHooks,
+        base_spec: &JobSpec,
+        workspace_manager: &WorkspaceManager,
+        sentinel_name: &str,
+        sentinel_bytes: &[u8],
+        evidence_mode: SubstitutedEvidenceMode,
+    ) -> (RetainedWorkloadOutcome, u64, bool, bool) {
+        // Read the workspace-derived observations BEFORE the capsule is consumed by the inner body.
+        let workspace_host = self
+            .acquired
+            .enabled_context
+            .workspace
+            .host_path()
+            .to_path_buf();
         let used_at_workload_checkpoint = self
+            .acquired
             .enabled_context
             .workspace
             .scan_used_bytes()
             .unwrap_or(0);
+        // The closure runs synchronously inside `run_retained_workload_inner`; it writes its two OCI-
+        // mount observations back through these cells (it cannot return them — its type is fixed).
+        let mount_source_matched_workspace = std::cell::Cell::new(false);
+        let sentinel_read_through_mount = std::cell::Cell::new(false);
 
-        // Step 6: matching synthetic runtime-quiescence evidence for the workload bind — built from
-        // the SAME `into_parts()` triple the durable bind returned (not the original arguments), so
-        // the settle tail's evidence-vs-recorded-binding check exercises the real provenance path.
-        let workload_evidence = RuntimeQuiescenceEvidence::assert_for_tests(
-            bound_container.clone(),
-            RuntimeNamespaceQuiescence::ExplicitUserNamespace {
-                runsc_root_identity: bound_root,
+        let outcome = self.run_retained_workload_inner(
+            authority,
+            base_spec,
+            workspace_manager,
+            |workload_spec, cfg, container_id, lease, session, bind_state| {
+                // Step 22: acquire the REAL workload launch permit against the ROTATED spec — the
+                // hardware-INDEPENDENT control-plane fence (for V2: `authorize_workload_v2_retained` +
+                // the queue→running launch CAS the permit commits). This is NOT faked: a broken workload
+                // authorizer or wrong-purpose credential is refused HERE. The ONLY things this seam
+                // fakes are the explicit-userns revalidation (`|| Ok(synth_root)`) and the runsc spawn —
+                // both hardware, drilled by 5b.3-7.
+                let permit = match workload_spec.acquire_launch_permit_for_test_support(hooks) {
+                    Ok(permit) => permit,
+                    Err(refusal) => return Err(refusal),
+                };
+                // Synthetic identities the substituted workload binds to. The bind's revalidation is
+                // faked (`|| Ok(synth_root)`) — that plus the runsc spawn are the ONLY things skipped vs
+                // `run_production_container_streaming` (its live explicit-userns revalidation is the
+                // hardware boundary drilled by 5b.3-7; the permit fence above runs for real).
+                let synth_root = (0x0111_u64, 0x0222_u64);
+                let synth_cgroup = (0x0333_u64, 0x0444_u64);
+
+                // Step 5: the SUBSTITUTED workload READS the sentinel THROUGH the retained OCI config's
+                // recorded workspace mount source — proving Hop B and the workload shared one capsule.
+                let mount_source = cfg.workspace_host_source_for_tests().map(Path::to_path_buf);
+                mount_source_matched_workspace
+                    .set(mount_source.as_deref() == Some(workspace_host.as_path()));
+                sentinel_read_through_mount.set(match &mount_source {
+                    Some(src) => std::fs::read(src.join(sentinel_name))
+                        .map(|bytes| bytes == sentinel_bytes)
+                        .unwrap_or(false),
+                    None => false,
+                });
+
+                // Steps 23–24: the REAL `Prepared → Bound` durable workload bind, faking ONLY the
+                // runsc-root revalidation. `bind_state` becomes `Bound` from the bind's OWN
+                // `WorkloadBindingIdentity::into_parts()` output.
+                if let Err(message) = bind_prepared_lease_given(
+                    lease,
+                    session,
+                    bind_state,
+                    synth_root,
+                    container_id,
+                    synth_cgroup,
+                    || Ok(synth_root),
+                ) {
+                    return Ok(Err(RunFailure::uncommitted(message)));
+                }
+                // DERIVE the workload evidence from the bind's OWN recorded `Bound` output — never
+                // from the synthetic input arguments. This is the honesty line: identity flows
+                // real-bind → evidence; only the runsc execution is faked.
+                let (bound_container, bound_root, bound_cgroup) = match &*bind_state {
+                    LeaseBindState::Bound {
+                        container_id,
+                        runsc_root_identity,
+                        cgroup_identity,
+                    } => (container_id.clone(), *runsc_root_identity, *cgroup_identity),
+                    other => {
+                        return Ok(Err(RunFailure::uncommitted(format!(
+                            "substituted workload bind did not reach Bound: {other:?}"
+                        ))))
+                    }
+                };
+                let evidence_root = match evidence_mode {
+                    // The honest path: evidence's runsc-root IS the bind's recorded root.
+                    SubstitutedEvidenceMode::DerivedFromBind => bound_root,
+                    // The negative path: deliberately diverge from the recorded binding so the settle
+                    // tail's provenance check MUST reject it (and only it — container/cgroup stay
+                    // correct, isolating the runsc-root provenance comparison).
+                    SubstitutedEvidenceMode::MismatchedRunscRoot => {
+                        (bound_root.0 ^ 0xDEAD_BEEF, bound_root.1 ^ 0x0F0F)
+                    }
+                };
+                let workload_evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+                    bound_container,
+                    RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                        runsc_root_identity: evidence_root,
+                    },
+                    CgroupQuiescenceEvidence::assert_for_tests(bound_cgroup),
+                );
+                // Commit the launch permit exactly as the production `run` closure does at the spawn
+                // boundary (mirroring `drive_compute_cycle_with_substituted_runsc`) — for V2 this is the
+                // queue→running CAS. The spawn itself is the ONLY step faked past this point.
+                if let Err(error) = permit.commit_and_release() {
+                    return Ok(Err(RunFailure::uncommitted(error.to_string())));
+                }
+                Ok(Ok(finalized_for_test_support(workload_evidence)))
             },
-            CgroupQuiescenceEvidence::assert_for_tests(bound_cgroup),
-        );
-        let finalization = finalized_for_test_support(workload_evidence);
-
-        // Step 7: the REAL settle tail. Move the capsule's OWN enabled context out; the now-`Done`
-        // session and the remaining fields drop harmlessly with the `..`. The borrows above ended.
-        let AcquiredCheckoutRuntime {
-            enabled_context, ..
-        } = self;
-        let settled = settle_enabled_finalization(
-            finalization,
-            Some(enabled_context),
-            Some(workspace_manager),
         );
 
-        SubstitutedCheckoutObservation {
-            hopb_write_ok,
-            used_after_hopb,
+        // Return the REAL outcome (the caller maps it to settled_ok/settle_error, or — in the §4
+        // driver — routes it through the continuation exactly as production does) plus the three
+        // side-observations captured during the substituted execution.
+        (
+            outcome,
             used_at_workload_checkpoint,
-            mount_source_matched_workspace,
-            sentinel_read_through_mount,
-            settled_ok: settled.is_ok(),
-            settle_error: settled.err().map(|failure| format!("{failure:?}")),
-        }
+            mount_source_matched_workspace.get(),
+            sentinel_read_through_mount.get(),
+        )
     }
 }

@@ -290,7 +290,12 @@ pub(crate) fn authority_from_durable_claim(
 /// Both claim-time credential minting and the prelaunch-usage journal's v2 reservation verifier use
 /// this one function. The latter must recompute the COMPLETE reservation batch because the durable
 /// v2 batch digest binds every job, not only the currently claimed one.
-pub(crate) fn runtime_authorities_from_durable_claim(
+// CT-007 5b.3-6e.2 Stage A (Sol ruling): `pub` so the §4 invariant test
+// (`every_ci_manifest_authority_is_checkout_bearing`) can assert, cross-crate, that EVERY manifest
+// job reconstructs a `(Some, Some)` checkout authority — the durable guarantee that the compute arm is
+// dead-in-CI today. Pure reconstruction from immutable durable rows; widening it to `pub` exposes no
+// mutation surface.
+pub fn runtime_authorities_from_durable_claim(
     claim: &CiJobTokenRequest,
     run: &CiRunRecord,
     manifest: &CiDriveManifestV1,

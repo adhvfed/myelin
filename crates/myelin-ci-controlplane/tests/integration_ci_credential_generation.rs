@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use common::with_schema_cleanup;
+use myelin_ci_controlplane::ci_checkout_composition::V2CheckoutComposition;
 use myelin_ci_controlplane::{
     acquire_phase_generation_ownership, ci_job_queue_store, ci_region_queue_store_test_support,
     claim_window_secs_for_template, expected_phase_jti, phase_generation_id,
@@ -42,7 +43,6 @@ use myelin_ci_controlplane::{
     MintedPhaseCredential, OperationalReservationWriteVersion, PgTierPCiJobBudgetReservation,
     CI_PHASE_CREDENTIAL_BINDING_V1,
 };
-use myelin_ci_controlplane::ci_checkout_composition::V2CheckoutComposition;
 use myelin_ci_sandbox::checkout_orchestration::ParentAttemptAdmission;
 use myelin_ci_sandbox::{
     derive_checkout_authorization_scope, CheckoutPhase, EgressPolicy, IdemToken, ImageRef, JobKind,
@@ -618,10 +618,7 @@ async fn queue_row_lockable(admin: &PgPool, fixture: &Fixture) -> bool {
         Ok(_) => true,
         Err(error) => {
             assert_eq!(
-                error
-                    .as_database_error()
-                    .and_then(|e| e.code())
-                    .as_deref(),
+                error.as_database_error().and_then(|e| e.code()).as_deref(),
                 Some("55P03"),
                 "the only expected failure is lock_not_available, got: {error}"
             );
@@ -839,15 +836,9 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
         assert_eq!(advertise.credential.jti, advertise.binding.jti);
         assert_eq!(
             advertise.credential.ttl_secs(),
-            u64::try_from(
-                advertise.binding.expires_at_epoch_secs - advertise.binding.issued_at_epoch_secs
-            )
-            .unwrap()
+            u64::try_from(advertise.binding.expires_at_epoch_secs - advertise.binding.issued_at_epoch_secs).unwrap()
         );
-        assert!(advertise
-            .binding
-            .generation_id
-            .starts_with("ci-credential:v1:"));
+        assert!(advertise.binding.generation_id.starts_with("ci-credential:v1:"));
 
         // ---- EXACT retry: one row, identical everything, identical bearer ----
         let replay = store
@@ -864,51 +855,34 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
 
         // ---- out of order: fetch has no parent/journal yet ----
         assert_eq!(
-            store
-                .mint_phase_credential(claim, CiCredentialPurpose::CheckoutFetch)
-                .await
-                .unwrap_err(),
+            store.mint_phase_credential(claim, CiCredentialPurpose::CheckoutFetch).await.unwrap_err(),
             CiCredentialGenerationError::MissingParentAttempt
         );
         admit_parent(&admin, &fixture).await;
         assert_eq!(
-            store
-                .mint_phase_credential(claim, CiCredentialPurpose::CheckoutFetch)
-                .await
-                .unwrap_err(),
+            store.mint_phase_credential(claim, CiCredentialPurpose::CheckoutFetch).await.unwrap_err(),
             CiCredentialGenerationError::JournalPredicateUnmet,
             "fetch requires checkout_transport = started"
         );
         // Skipping a purpose is refused outright.
         assert_eq!(
-            store
-                .mint_phase_credential(claim, CiCredentialPurpose::CheckoutMaterialization)
-                .await
-                .unwrap_err(),
+            store.mint_phase_credential(claim, CiCredentialPurpose::CheckoutMaterialization).await.unwrap_err(),
             CiCredentialGenerationError::OutOfOrderGeneration
         );
         assert_eq!(
-            store
-                .mint_phase_credential(claim, CiCredentialPurpose::Workload)
-                .await
-                .unwrap_err(),
+            store.mint_phase_credential(claim, CiCredentialPurpose::Workload).await.unwrap_err(),
             CiCredentialGenerationError::OutOfOrderGeneration
         );
 
         // ---- the advertise credential's execution gate: parent + started transport ----
-        let advertise_gate =
-            gate_for(claim, CiCredentialPurpose::CheckoutAdvertise, &advertise);
+        let advertise_gate = gate_for(claim, CiCredentialPurpose::CheckoutAdvertise, &advertise);
         assert!(
-            !verify_phase_generation_live(&app, &advertise_gate)
-                .await
-                .unwrap(),
+            !verify_phase_generation_live(&app, &advertise_gate).await.unwrap(),
             "advertise is unusable until its journal phase is started"
         );
         set_phase(&admin, &fixture, "checkout_transport", "started").await;
         assert!(
-            verify_phase_generation_live(&app, &advertise_gate)
-                .await
-                .unwrap(),
+            verify_phase_generation_live(&app, &advertise_gate).await.unwrap(),
             "advertise is usable once the parent and journal phase exist"
         );
 
@@ -924,42 +898,26 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
         // **Stale-generation replay after supersession.** Appending fetch retired advertise at the
         // durable gate, in the same commit — with no revocation write anywhere.
         assert!(
-            !verify_phase_generation_live(&app, &advertise_gate)
-                .await
-                .unwrap(),
+            !verify_phase_generation_live(&app, &advertise_gate).await.unwrap(),
             "the advertise generation is retired the moment fetch is appended"
         );
-        assert!(
-            verify_phase_generation_live(
-                &app,
-                &gate_for(claim, CiCredentialPurpose::CheckoutFetch, &fetch)
-            )
+        assert!(verify_phase_generation_live(&app, &gate_for(claim, CiCredentialPurpose::CheckoutFetch, &fetch))
             .await
-            .unwrap()
-        );
+            .unwrap());
         // And a superseded purpose can never be minted again, even as a "retry".
         assert_eq!(
-            store
-                .mint_phase_credential(claim, CiCredentialPurpose::CheckoutAdvertise)
-                .await
-                .unwrap_err(),
+            store.mint_phase_credential(claim, CiCredentialPurpose::CheckoutAdvertise).await.unwrap_err(),
             CiCredentialGenerationError::OutOfOrderGeneration
         );
 
         // ---- materialization: transport measured, materialization started ----
         assert_eq!(
-            store
-                .mint_phase_credential(claim, CiCredentialPurpose::CheckoutMaterialization)
-                .await
-                .unwrap_err(),
+            store.mint_phase_credential(claim, CiCredentialPurpose::CheckoutMaterialization).await.unwrap_err(),
             CiCredentialGenerationError::JournalPredicateUnmet
         );
         set_phase(&admin, &fixture, "checkout_transport", "measured").await;
         assert_eq!(
-            store
-                .mint_phase_credential(claim, CiCredentialPurpose::CheckoutMaterialization)
-                .await
-                .unwrap_err(),
+            store.mint_phase_credential(claim, CiCredentialPurpose::CheckoutMaterialization).await.unwrap_err(),
             CiCredentialGenerationError::JournalPredicateUnmet,
             "materialization also requires its OWN journal row to be started"
         );
@@ -971,10 +929,7 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
 
         // ---- workload: both journal rows measured ----
         assert_eq!(
-            store
-                .mint_phase_credential(claim, CiCredentialPurpose::Workload)
-                .await
-                .unwrap_err(),
+            store.mint_phase_credential(claim, CiCredentialPurpose::Workload).await.unwrap_err(),
             CiCredentialGenerationError::JournalPredicateUnmet
         );
         set_phase(&admin, &fixture, "checkout_materialization", "measured").await;
@@ -986,22 +941,13 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
         // ---- exactly four rows, one per purpose, in ordinal order ----
         let rows = generation_rows(&admin, &fixture).await;
         assert_eq!(
-            rows.iter()
-                .map(|row| (row.0.as_str(), row.1))
-                .collect::<Vec<_>>(),
-            vec![
-                ("checkout_advertise", 1),
-                ("checkout_fetch", 2),
-                ("checkout_materialization", 3),
-                ("workload", 4),
-            ],
+            rows.iter().map(|row| (row.0.as_str(), row.1)).collect::<Vec<_>>(),
+            vec![("checkout_advertise", 1), ("checkout_fetch", 2), ("checkout_materialization", 3), ("workload", 4),],
             "one claim holds AT MOST four credential generations"
         );
-        let unique: std::collections::BTreeSet<&String> =
-            rows.iter().map(|row| &row.2).collect();
+        let unique: std::collections::BTreeSet<&String> = rows.iter().map(|row| &row.2).collect();
         assert_eq!(unique.len(), 4, "every generation id is distinct");
-        let unique_jtis: std::collections::BTreeSet<&String> =
-            rows.iter().map(|row| &row.3).collect();
+        let unique_jtis: std::collections::BTreeSet<&String> = rows.iter().map(|row| &row.3).collect();
         assert_eq!(unique_jtis.len(), 4, "every expected JTI is distinct");
 
         // Every preparation credential is now retired at the durable gate; only workload is current.
@@ -1011,9 +957,7 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
             (CiCredentialPurpose::CheckoutMaterialization, &materialization),
         ] {
             assert!(
-                !verify_phase_generation_live(&app, &gate_for(claim, purpose, minted))
-                    .await
-                    .unwrap(),
+                !verify_phase_generation_live(&app, &gate_for(claim, purpose, minted)).await.unwrap(),
                 "{purpose:?} is retired once the workload generation exists"
             );
         }
@@ -1035,18 +979,12 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
         let mut substituted = gate_for(claim, CiCredentialPurpose::Workload, &materialization);
         substituted.purpose = CiCredentialPurpose::Workload;
         assert!(
-            !queue
-                .authorize_launch_v2(&launch_claim, &substituted)
-                .await
-                .unwrap(),
+            !queue.authorize_launch_v2(&launch_claim, &substituted).await.unwrap(),
             "a materialization generation cannot drive the workload launch CAS"
         );
         // The exact current workload generation wins.
         let workload_gate = gate_for(claim, CiCredentialPurpose::Workload, &workload);
-        assert!(queue
-            .authorize_launch_v2(&launch_claim, &workload_gate)
-            .await
-            .unwrap());
+        assert!(queue.authorize_launch_v2(&launch_claim, &workload_gate).await.unwrap());
         let state: String = sqlx::query_scalar(
             "SELECT state FROM job_queue WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
         )
@@ -1058,15 +996,9 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
         .unwrap();
         assert_eq!(state, "running");
         // And it is one-shot: the row is no longer `leased`.
-        assert!(!queue
-            .authorize_launch_v2(&launch_claim, &workload_gate)
-            .await
-            .unwrap());
+        assert!(!queue.authorize_launch_v2(&launch_claim, &workload_gate).await.unwrap());
 
-        assert!(
-            calls.load(Ordering::SeqCst) >= 4,
-            "each accepted mint invoked the REAL Identity seam"
-        );
+        assert!(calls.load(Ordering::SeqCst) >= 4, "each accepted mint invoked the REAL Identity seam");
     })
     .await;
 }
@@ -1462,7 +1394,9 @@ async fn every_divergent_claim_fact_refuses_before_identity_is_invoked() {
             ("job", |c| {
                 c.job_id = "99000000-0000-4000-8000-000000000096".into()
             }),
-            ("idem token", |c| c.idem_token = "phase-credential-other".into()),
+            ("idem token", |c| {
+                c.idem_token = "phase-credential-other".into()
+            }),
             ("owner", |c| c.lease_owner = "runner-other".into()),
             ("epoch", |c| c.lease_epoch += 1),
             ("nonce", |c| {
@@ -1728,10 +1662,7 @@ async fn the_credential_log_is_tenant_isolated_and_structurally_immutable() {
         let (minter, _calls) = real_minter();
         let store = store(&app, minter, CiJobCredentialWriteVersion::V2PhaseBound);
         let fixture = seed_fixture(&app, &admin, 7, 5).await;
-        store
-            .mint_phase_credential(&fixture.claim, CiCredentialPurpose::CheckoutAdvertise)
-            .await
-            .unwrap();
+        store.mint_phase_credential(&fixture.claim, CiCredentialPurpose::CheckoutAdvertise).await.unwrap();
 
         // FORCE-RLS: the owning tenant sees its row; another tenant sees nothing.
         for (tenant, expected) in [(TENANT, 1_i64), ("some-other-tenant", 0)] {
@@ -1742,11 +1673,10 @@ async fn the_credential_log_is_tenant_isolated_and_structurally_immutable() {
                 .execute(&mut *connection)
                 .await
                 .unwrap();
-            let visible: i64 =
-                sqlx::query_scalar("SELECT count(*) FROM ci_job_credential_generation")
-                    .fetch_one(&mut *connection)
-                    .await
-                    .unwrap();
+            let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_job_credential_generation")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
             assert_eq!(visible, expected, "tenant {tenant} visibility");
         }
 
@@ -1767,13 +1697,11 @@ async fn the_credential_log_is_tenant_isolated_and_structurally_immutable() {
                 .as_deref(),
             Some("P0001")
         );
-        let delete = sqlx::query(
-            "DELETE FROM ci_job_credential_generation WHERE tenant_id = $1 AND region = $2",
-        )
-        .bind(TENANT)
-        .bind(REGION)
-        .execute(&admin)
-        .await;
+        let delete = sqlx::query("DELETE FROM ci_job_credential_generation WHERE tenant_id = $1 AND region = $2")
+            .bind(TENANT)
+            .bind(REGION)
+            .execute(&admin)
+            .await;
         assert_eq!(
             delete
                 .expect_err("the immutability trigger refuses a DELETE")
@@ -1932,21 +1860,97 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
     /// absent from this table must have ZERO occurrences.
     /// `(crate, file, marker) -> exact allowed CODE occurrence count` in PRODUCTION source.
     /// Everything absent from this table must have ZERO occurrences in EITHER crate.
-    const ALLOWED: [(&str, &str, &str, usize); 79] = [
+    const ALLOWED: [(&str, &str, &str, usize); 84] = [
         // --- the definition sites ---
-        ("myelin-ci-controlplane", "ci_credential_generation.rs", "mint_phase_credential(", 1),
-        ("myelin-ci-controlplane", "ci_credential_generation.rs", "acquire_phase_generation_ownership(", 1),
-        ("myelin-ci-controlplane", "ci_credential_generation.rs", "V2PhaseBound", 2),
-        ("myelin-ci-controlplane", "ci_credential_generation.rs", "CiJobCredentialGenerationStore", 2),
-        ("myelin-ci-controlplane", "ci_identity_adapter.rs", "authorize_workload_v2_retained(", 1),
-        ("myelin-ci-controlplane", "ci_identity_adapter.rs", "authorize_checkout_advertise_retained(", 1),
-        ("myelin-ci-controlplane", "ci_identity_adapter.rs", "authorize_checkout_fetch_retained(", 1),
-        ("myelin-ci-controlplane", "ci_identity_adapter.rs", "authorize_checkout_materialization_retained(", 1),
-        ("myelin-ci-controlplane", "ci_identity_adapter.rs", "authorize_launch_v2_retained(", 1),
-        ("myelin-ci-controlplane", "ci_identity_adapter.rs", "acquire_phase_generation_ownership(", 1),
-        ("myelin-ci-controlplane", "job_queue_store.rs", "authorize_launch_v2(", 1),
-        ("myelin-ci-controlplane", "job_queue_store.rs", "authorize_launch_v2_retained(", 2),
-        ("myelin-ci-controlplane", "lib.rs", "CiJobCredentialGenerationStore", 1),
+        (
+            "myelin-ci-controlplane",
+            "ci_credential_generation.rs",
+            "mint_phase_credential(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_credential_generation.rs",
+            "acquire_phase_generation_ownership(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_credential_generation.rs",
+            "V2PhaseBound",
+            2,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_credential_generation.rs",
+            "CiJobCredentialGenerationStore",
+            2,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_identity_adapter.rs",
+            "authorize_workload_v2_retained(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_identity_adapter.rs",
+            "authorize_checkout_advertise_retained(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_identity_adapter.rs",
+            "authorize_checkout_fetch_retained(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_identity_adapter.rs",
+            "authorize_checkout_materialization_retained(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_identity_adapter.rs",
+            "authorize_launch_v2_retained(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_identity_adapter.rs",
+            "acquire_phase_generation_ownership(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "job_queue_store.rs",
+            "authorize_launch_v2(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "job_queue_store.rs",
+            "authorize_launch_v2_retained(",
+            2,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "lib.rs",
+            "CiJobCredentialGenerationStore",
+            1,
+        ),
+        // CT-007 slice 5b.3-6e.2 Stage A: the protocol DESCRIPTOR records the production credential
+        // writer choice `V2PhaseBound` ONCE, as a dormant `pub const`. No production root reads it
+        // until the atomic Stage B activation (which also adds this file to the definition hash), so
+        // this is a definition-only occurrence, NOT a composition — the composition-root zeros stay
+        // zero.
+        (
+            "myelin-ci-controlplane",
+            "ci_pipeline_protocol.rs",
+            "V2PhaseBound",
+            1,
+        ),
         // CT-007 5b.3-6d STEP 3: the DORMANT control-plane composition module. It is the real
         // durable backing for the sandbox `AttemptAuthority`/resolver seam — a NEW definition site,
         // NOT a composition root (no production root constructs `V2CheckoutComposition`, and
@@ -1955,43 +1959,225 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         // `CiJobCredentialGenerationStore` (import + factory return + factory body + the two durable-
         // authority struct fields) x5, `mint_phase_credential(` (the initial resolver mint + the
         // per-generation mint + the `AttemptAuthority` trait method) x3.
-        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "V2PhaseBound", 1),
-        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "CiJobCredentialGenerationStore", 5),
-        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "mint_phase_credential(", 3),
+        (
+            "myelin-ci-controlplane",
+            "ci_checkout_composition.rs",
+            "V2PhaseBound",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_checkout_composition.rs",
+            "CiJobCredentialGenerationStore",
+            5,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_checkout_composition.rs",
+            "mint_phase_credential(",
+            3,
+        ),
         // CT-007 5b.3-6d STEP 3: the composition-façade DEFINITION sites (all in the dormant module).
         // `V2CheckoutComposition` = the struct def + its `impl` block; `v2_phase_credential_store(` =
         // the factory def + its one call inside `V2CheckoutComposition::new`; the resolver seam and the
         // reserve-hook constructor are each defined once. These are the exact symbols whose appearance
         // in ANY composition root below means the V2 checkout path was activated.
-        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "V2CheckoutComposition", 2),
-        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "v2_phase_credential_store(", 2),
-        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "mint_initial_phase_credential(", 1),
-        ("myelin-ci-controlplane", "ci_checkout_composition.rs", "parent_attempt_reserve_hook(", 1),
+        (
+            "myelin-ci-controlplane",
+            "ci_checkout_composition.rs",
+            "V2CheckoutComposition",
+            2,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_checkout_composition.rs",
+            "v2_phase_credential_store(",
+            2,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_checkout_composition.rs",
+            "mint_initial_phase_credential(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_checkout_composition.rs",
+            "parent_attempt_reserve_hook(",
+            1,
+        ),
         // ...and EXPLICITLY ZERO in every production composition root: constructing the façade, minting
         // the initial credential, or installing the reserve hook from any of these turns the scan RED.
-        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "V2CheckoutComposition", 0),
-        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "v2_phase_credential_store(", 0),
-        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "mint_initial_phase_credential(", 0),
-        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "parent_attempt_reserve_hook(", 0),
-        ("myelin-ci-controlplane", "ci_runner_composition.rs", "V2CheckoutComposition", 0),
-        ("myelin-ci-controlplane", "ci_runner_composition.rs", "v2_phase_credential_store(", 0),
-        ("myelin-ci-controlplane", "ci_runner_composition.rs", "mint_initial_phase_credential(", 0),
-        ("myelin-ci-controlplane", "ci_runner_composition.rs", "parent_attempt_reserve_hook(", 0),
-        ("myelin-ci-controlplane", "runner_bind.rs", "V2CheckoutComposition", 0),
-        ("myelin-ci-controlplane", "runner_bind.rs", "v2_phase_credential_store(", 0),
-        ("myelin-ci-controlplane", "runner_bind.rs", "mint_initial_phase_credential(", 0),
-        ("myelin-ci-controlplane", "runner_bind.rs", "parent_attempt_reserve_hook(", 0),
-        ("myelin-ci-controlplane", "main.rs", "V2CheckoutComposition", 0),
-        ("myelin-ci-controlplane", "main.rs", "v2_phase_credential_store(", 0),
-        ("myelin-ci-controlplane", "main.rs", "mint_initial_phase_credential(", 0),
-        ("myelin-ci-controlplane", "main.rs", "parent_attempt_reserve_hook(", 0),
-        ("myelin-ci-controlplane", "lib.rs", "V2CheckoutComposition", 0),
-        ("myelin-ci-controlplane", "lib.rs", "v2_phase_credential_store(", 0),
-        ("myelin-ci-controlplane", "lib.rs", "mint_initial_phase_credential(", 0),
-        ("myelin-ci-controlplane", "lib.rs", "parent_attempt_reserve_hook(", 0),
-        ("myelin-ci-sandbox", "checkout_authorization.rs", "authorize_checkout_phase(", 1),
-        ("myelin-ci-sandbox", "checkout_authorization.rs", "PhaseAuthorization", 6),
-        ("myelin-ci-sandbox", "gvisor.rs", "fetch_checkout_pack_within_parent_attempt_v2(", 1),
+        (
+            "myelin-ci-controlplane",
+            "ci_runtime_composition.rs",
+            "V2CheckoutComposition",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runtime_composition.rs",
+            "v2_phase_credential_store(",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runtime_composition.rs",
+            "mint_initial_phase_credential(",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runtime_composition.rs",
+            "parent_attempt_reserve_hook(",
+            0,
+        ),
+        // CT-007 slice 5b.3-6e.2 Stage A: `ci_runner_v2_wiring` is the DORMANT V2 runner composition
+        // root. It CONSTRUCTS the façade (`V2CheckoutComposition` x2 = the resolver's arg + the hooks'
+        // arg, one shared value), installs the ONE parent-attempt reserve hook (compute AND checkout),
+        // the per-phase checkout authorization, and the workload/advertise/fetch/materialization
+        // retained authorizers. It is a NEW definition site, NOT selected by any production root —
+        // `main.rs` / `ci_runtime_composition.rs` / `lib.rs` stay ZERO (the atomic Stage B flip points
+        // `main` here). The V2 resolver seam lives in `runner_bind.rs`: it names the composition type
+        // (its one param) once and calls `mint_initial_phase_credential` once.
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "V2CheckoutComposition",
+            2,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "v2_phase_credential_store(",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "mint_initial_phase_credential(",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "parent_attempt_reserve_hook(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "authorize_workload_v2_retained(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "authorize_checkout_advertise_retained(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "authorize_checkout_fetch_retained(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "authorize_checkout_materialization_retained(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "runner_bind.rs",
+            "V2CheckoutComposition",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "runner_bind.rs",
+            "v2_phase_credential_store(",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "runner_bind.rs",
+            "mint_initial_phase_credential(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "runner_bind.rs",
+            "parent_attempt_reserve_hook(",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "main.rs",
+            "V2CheckoutComposition",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "main.rs",
+            "v2_phase_credential_store(",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "main.rs",
+            "mint_initial_phase_credential(",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "main.rs",
+            "parent_attempt_reserve_hook(",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "lib.rs",
+            "V2CheckoutComposition",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "lib.rs",
+            "v2_phase_credential_store(",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "lib.rs",
+            "mint_initial_phase_credential(",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "lib.rs",
+            "parent_attempt_reserve_hook(",
+            0,
+        ),
+        (
+            "myelin-ci-sandbox",
+            "checkout_authorization.rs",
+            "authorize_checkout_phase(",
+            1,
+        ),
+        (
+            "myelin-ci-sandbox",
+            "checkout_authorization.rs",
+            "PhaseAuthorization",
+            6,
+        ),
+        (
+            "myelin-ci-sandbox",
+            "gvisor.rs",
+            "fetch_checkout_pack_within_parent_attempt_v2(",
+            1,
+        ),
         // CT-007 5b.3-6a (Sol's r4): the capsule + reshaped Hop B entry relocated to the dedicated
         // `gvisor/checkout_runtime.rs` submodule so module privacy enforces field inseparability.
         // `run_checkout_preparation_v2(` and one `PhaseAuthorization` (the v2 signature) moved with it;
@@ -2009,27 +2195,105 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         // 11 (not 10): CT-007 5b.3-6c Sol's r4 finding-1 control inversion added the
         // `prepare_materialization` closure whose return type names `PhaseAuthorization` once more.
         ("myelin-ci-sandbox", "gvisor.rs", "PhaseAuthorization", 11),
-        ("myelin-ci-sandbox", "gvisor.rs", "mint_phase_credential(", 3),
-        ("myelin-ci-sandbox", "gvisor.rs", "run_checkout_preparation_v2(", 1),
+        (
+            "myelin-ci-sandbox",
+            "gvisor.rs",
+            "mint_phase_credential(",
+            3,
+        ),
+        (
+            "myelin-ci-sandbox",
+            "gvisor.rs",
+            "run_checkout_preparation_v2(",
+            1,
+        ),
         // CT-007 5b.3-6c: the sandbox-side capability vocabulary + the per-phase authorization helper.
         // `mint_phase_credential(` is the `AttemptAuthority` trait method DEFINITION (1); the helper
         // `authorize_phase_generation` holds the ONE `authorize_checkout_phase(` call site + one
         // `PhaseAuthorization` in its return type — no control-plane dependency crosses the boundary.
-        ("myelin-ci-sandbox", "checkout_orchestration.rs", "mint_phase_credential(", 1),
-        ("myelin-ci-sandbox", "checkout_orchestration.rs", "authorize_checkout_phase(", 1),
-        ("myelin-ci-sandbox", "checkout_orchestration.rs", "PhaseAuthorization", 1),
-        ("myelin-ci-sandbox", "gvisor/checkout_runtime.rs", "run_checkout_preparation_v2(", 1),
-        ("myelin-ci-sandbox", "gvisor/checkout_runtime.rs", "PhaseAuthorization", 2),
-        ("myelin-ci-sandbox", "lib.rs", "with_checkout_phase_authorization(", 1),
+        (
+            "myelin-ci-sandbox",
+            "checkout_orchestration.rs",
+            "mint_phase_credential(",
+            1,
+        ),
+        (
+            "myelin-ci-sandbox",
+            "checkout_orchestration.rs",
+            "authorize_checkout_phase(",
+            1,
+        ),
+        (
+            "myelin-ci-sandbox",
+            "checkout_orchestration.rs",
+            "PhaseAuthorization",
+            1,
+        ),
+        (
+            "myelin-ci-sandbox",
+            "gvisor/checkout_runtime.rs",
+            "run_checkout_preparation_v2(",
+            1,
+        ),
+        // 6e.2 S2: the third occurrence is the explicitly test-support-gated Hop-B seam consuming
+        // the real materialization authorization; the production-zero composition-root pins below
+        // remain unchanged.
+        (
+            "myelin-ci-sandbox",
+            "gvisor/checkout_runtime.rs",
+            "PhaseAuthorization",
+            3,
+        ),
+        (
+            "myelin-ci-sandbox",
+            "lib.rs",
+            "with_checkout_phase_authorization(",
+            1,
+        ),
         ("myelin-ci-sandbox", "lib.rs", "PhaseAuthorization", 4),
         // --- explicitly ZERO everywhere they could be composed into production ---
-        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "CiJobCredentialGenerationStore", 0),
-        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "V2PhaseBound", 0),
-        ("myelin-ci-controlplane", "ci_runner_composition.rs", "with_checkout_phase_authorization(", 0),
-        ("myelin-ci-controlplane", "ci_runner_composition.rs", "CiJobCredentialGenerationStore", 0),
-        ("myelin-ci-controlplane", "runner_bind.rs", "V2PhaseBound", 0),
-        ("myelin-ci-controlplane", "runner_bind.rs", "mint_phase_credential(", 0),
-        ("myelin-ci-controlplane", "main.rs", "CiJobCredentialGenerationStore", 0),
+        (
+            "myelin-ci-controlplane",
+            "ci_runtime_composition.rs",
+            "CiJobCredentialGenerationStore",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runtime_composition.rs",
+            "V2PhaseBound",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "with_checkout_phase_authorization(",
+            1,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "CiJobCredentialGenerationStore",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "runner_bind.rs",
+            "V2PhaseBound",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "runner_bind.rs",
+            "mint_phase_credential(",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "main.rs",
+            "CiJobCredentialGenerationStore",
+            0,
+        ),
         ("myelin-ci-sandbox", "runner.rs", "PhaseAuthorization", 0),
         // --- CT-007 5b.3-6e.1 activation-chassis selectors (Sol's major 2) ---
         // Definition sites: the selector methods are DEFINED once each (dormant). `with_checkout_config`
@@ -2038,25 +2302,100 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         // appears at its own definition (`fn production(`), so it is ZERO everywhere until a caller wires
         // it — the pure composition-root zero.
         ("myelin-ci-sandbox", "gvisor.rs", "with_checkout_config", 1),
-        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "with_activation_readiness", 1),
+        (
+            "myelin-ci-controlplane",
+            "ci_runtime_composition.rs",
+            "with_activation_readiness",
+            1,
+        ),
         // ...and EXPLICITLY ZERO in every composition root that could select them (the same set the
         // V2CheckoutComposition zeros cover). A premature selection in ANY of these turns the scan RED.
-        ("myelin-ci-controlplane", "main.rs", "with_checkout_config", 0),
-        ("myelin-ci-controlplane", "runner_bind.rs", "with_checkout_config", 0),
-        ("myelin-ci-controlplane", "ci_runner_composition.rs", "with_checkout_config", 0),
-        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "with_checkout_config", 0),
-        ("myelin-ci-controlplane", "lib.rs", "with_checkout_config", 0),
+        (
+            "myelin-ci-controlplane",
+            "main.rs",
+            "with_checkout_config",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "runner_bind.rs",
+            "with_checkout_config",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "with_checkout_config",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runtime_composition.rs",
+            "with_checkout_config",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "lib.rs",
+            "with_checkout_config",
+            0,
+        ),
         ("myelin-ci-sandbox", "lib.rs", "with_checkout_config", 0),
         ("myelin-ci-sandbox", "runner.rs", "with_checkout_config", 0),
-        ("myelin-ci-controlplane", "main.rs", "with_activation_readiness", 0),
-        ("myelin-ci-controlplane", "runner_bind.rs", "with_activation_readiness", 0),
-        ("myelin-ci-controlplane", "ci_runner_composition.rs", "with_activation_readiness", 0),
-        ("myelin-ci-controlplane", "lib.rs", "with_activation_readiness", 0),
-        ("myelin-ci-controlplane", "main.rs", "ActivationReadinessProbe::production", 0),
-        ("myelin-ci-controlplane", "runner_bind.rs", "ActivationReadinessProbe::production", 0),
-        ("myelin-ci-controlplane", "ci_runner_composition.rs", "ActivationReadinessProbe::production", 0),
-        ("myelin-ci-controlplane", "ci_runtime_composition.rs", "ActivationReadinessProbe::production", 0),
-        ("myelin-ci-controlplane", "lib.rs", "ActivationReadinessProbe::production", 0),
+        (
+            "myelin-ci-controlplane",
+            "main.rs",
+            "with_activation_readiness",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "runner_bind.rs",
+            "with_activation_readiness",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "with_activation_readiness",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "lib.rs",
+            "with_activation_readiness",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "main.rs",
+            "ActivationReadinessProbe::production",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "runner_bind.rs",
+            "ActivationReadinessProbe::production",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runner_composition.rs",
+            "ActivationReadinessProbe::production",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "ci_runtime_composition.rs",
+            "ActivationReadinessProbe::production",
+            0,
+        ),
+        (
+            "myelin-ci-controlplane",
+            "lib.rs",
+            "ActivationReadinessProbe::production",
+            0,
+        ),
     ];
 
     fn production_of(source: &str) -> &str {
@@ -2152,8 +2491,7 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         if count != 0 {
             continue;
         }
-        let source =
-            std::fs::read_to_string(workspace.join(krate).join("src").join(file)).unwrap();
+        let source = std::fs::read_to_string(workspace.join(krate).join("src").join(file)).unwrap();
         assert_eq!(
             code_occurrences(&source, marker),
             0,
@@ -2274,7 +2612,6 @@ async fn the_v2_launch_cas_refuses_an_expired_execution_lease() {
     .await;
 }
 
-
 /// **Round-2 blocker 1: acquisition is cancellation-safe — an aborted future leaks no open
 /// transaction, no stale tenant scope, and no retained lock onto the pooled connection.**
 ///
@@ -2336,9 +2673,15 @@ async fn aborting_or_dropping_acquisition_leaks_no_transaction_scope_or_lock() {
             .fetch_one(&one_pool)
             .await
             .unwrap();
-        assert_eq!(scope, "", "a cancelled acquisition left no tenant scope on the connection");
+        assert_eq!(
+            scope, "",
+            "a cancelled acquisition left no tenant scope on the connection"
+        );
         // ...and a fresh statement on that connection works (it is not stuck in a leftover tx).
-        let usable: i32 = sqlx::query_scalar("SELECT 1").fetch_one(&one_pool).await.unwrap();
+        let usable: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&one_pool)
+            .await
+            .unwrap();
         assert_eq!(usable, 1);
         // ...and the queue row lock was never leaked.
         assert!(
@@ -2356,7 +2699,7 @@ async fn aborting_or_dropping_acquisition_leaks_no_transaction_scope_or_lock() {
             "while ownership is held the queue row is genuinely locked"
         );
         drop(owned); // NO release() — the RAII Transaction Drop must roll back.
-        // Force the pooled connection to flush its queued rollback, then observe a clean session.
+                     // Force the pooled connection to flush its queued rollback, then observe a clean session.
         let scope: String = sqlx::query_scalar("SELECT current_setting('myelin.tenant_id', true)")
             .fetch_one(&one_pool)
             .await
@@ -2420,12 +2763,17 @@ async fn retained_ownership_freezes_the_journal_status_against_the_production_se
             "the sealer's FOR UPDATE SKIP LOCKED skips the row held FOR SHARE by retained ownership"
         );
         assert_eq!(
-            phase_status(&admin, &fixture, "checkout_transport").await.as_deref(),
+            phase_status(&admin, &fixture, "checkout_transport")
+                .await
+                .as_deref(),
             Some("started"),
             "the phase cannot seal while ownership is retained"
         );
         // Revalidation under the held locks still holds.
-        owned.validate().await.expect("revalidation holds under the retained journal lock");
+        owned
+            .validate()
+            .await
+            .expect("revalidation holds under the retained journal lock");
 
         // Evidence the FOR SHARE lock is genuinely on the JOURNAL row: a plain (waiting) FOR UPDATE
         // on it from a tagged backend Lock-waits until release.
@@ -2489,13 +2837,14 @@ async fn retained_ownership_freezes_the_journal_status_against_the_production_se
             "after release the overdue phase seals on the next sweep"
         );
         assert_eq!(
-            phase_status(&admin, &fixture, "checkout_transport").await.as_deref(),
+            phase_status(&admin, &fixture, "checkout_transport")
+                .await
+                .as_deref(),
             Some("sealed_ceiling")
         );
     })
     .await;
 }
-
 
 // =================================================================================================
 // 11. CT-007 5b.3-6d STEP 3: the DORMANT durable checkout-composition adapter, live-PG.
@@ -2768,9 +3117,18 @@ async fn durable_checkout_adapter_drives_the_full_phase_sequence() {
             ]
         );
         let (adv, fet, mat, wl, adv_ctx_gen) = &gens;
-        assert_eq!(adv, &rows[0].2, "advertise carrier names the durable advertise generation");
-        assert_eq!(fet, &rows[1].2, "fetch carrier names the durable fetch generation");
-        assert_eq!(mat, &rows[2].2, "materialization carrier names its generation");
+        assert_eq!(
+            adv, &rows[0].2,
+            "advertise carrier names the durable advertise generation"
+        );
+        assert_eq!(
+            fet, &rows[1].2,
+            "fetch carrier names the durable fetch generation"
+        );
+        assert_eq!(
+            mat, &rows[2].2,
+            "materialization carrier names its generation"
+        );
         assert_eq!(wl, &rows[3].2, "workload carrier names its generation");
         assert_eq!(
             adv_ctx_gen, &rows[0].2,
@@ -2810,18 +3168,12 @@ async fn adapter_admission_loses_cleanly_to_claim_generation_change() {
             let comp_t = comp.clone();
             let spec_t = spec.clone();
             let admitted = std::thread::spawn(move || {
-                matches!(
-                    comp_t.parent_attempt_reserve_hook()(&spec_t),
-                    Ok(ParentAttemptAdmission::Admitted { .. })
-                )
+                matches!(comp_t.parent_attempt_reserve_hook()(&spec_t), Ok(ParentAttemptAdmission::Admitted { .. }))
             })
             .join()
             .unwrap();
             assert!(admitted, "the control admission succeeds");
-            assert_eq!(
-                reservation_state(&admin, &fixture.reserve_handle).await,
-                "inflight"
-            );
+            assert_eq!(reservation_state(&admin, &fixture.reserve_handle).await, "inflight");
             assert_eq!(parent_row_count(&admin, &fixture).await, 1);
         }
 
@@ -2836,15 +3188,13 @@ async fn adapter_admission_loses_cleanly_to_claim_generation_change() {
 
         let holder = pinned_pool(&admin_url(), &schema).await;
         let mut held = holder.begin().await.unwrap();
-        sqlx::query(
-            "SELECT 1 FROM job_queue WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid FOR UPDATE",
-        )
-        .bind(TENANT)
-        .bind(REGION)
-        .bind(&fixture.claim.job_id)
-        .execute(&mut *held)
-        .await
-        .unwrap();
+        sqlx::query("SELECT 1 FROM job_queue WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid FOR UPDATE")
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(&fixture.claim.job_id)
+            .execute(&mut *held)
+            .await
+            .unwrap();
 
         let comp_t = comp.clone();
         let spec_t = spec.clone();
@@ -2855,32 +3205,23 @@ async fn adapter_admission_loses_cleanly_to_claim_generation_change() {
 
         // Reclaim: a reaper-style generation bump, then commit — releases the lock and supersedes
         // the claim the admission is reconstructing.
-        sqlx::query(
-            "UPDATE job_queue SET lease_epoch = 2 WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
-        )
-        .bind(TENANT)
-        .bind(REGION)
-        .bind(&fixture.claim.job_id)
-        .execute(&mut *held)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE job_queue SET lease_epoch = 2 WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid")
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(&fixture.claim.job_id)
+            .execute(&mut *held)
+            .await
+            .unwrap();
         held.commit().await.unwrap();
 
         let result = admission.join().unwrap();
-        assert!(
-            result.is_err(),
-            "admission must refuse a claim whose generation changed under the lock"
-        );
+        assert!(result.is_err(), "admission must refuse a claim whose generation changed under the lock");
         assert_eq!(
             reservation_state(&admin, &fixture.reserve_handle).await,
             "reserved",
             "a lost admission performs NO reservation transition"
         );
-        assert_eq!(
-            parent_row_count(&admin, &fixture).await,
-            0,
-            "a lost admission inserts NO parent row"
-        );
+        assert_eq!(parent_row_count(&admin, &fixture).await, 0, "a lost admission inserts NO parent row");
     })
     .await;
 }
@@ -2905,16 +3246,13 @@ async fn adapter_exhaustion_retry_and_stale_authority_matrix() {
             let spec = resolved_checkout_spec(&comp, &fixture);
             let comp_t = comp.clone();
             let spec_t = spec.clone();
-            let requeue = std::thread::spawn(move || {
-                match comp_t.parent_attempt_reserve_hook()(&spec_t).expect("admitted") {
-                    ParentAttemptAdmission::Admitted {
-                        attempt_authority, ..
-                    } => attempt_authority.should_requeue(),
+            let requeue =
+                std::thread::spawn(move || match comp_t.parent_attempt_reserve_hook()(&spec_t).expect("admitted") {
+                    ParentAttemptAdmission::Admitted { attempt_authority, .. } => attempt_authority.should_requeue(),
                     ParentAttemptAdmission::AttemptsExhausted { .. } => panic!("not exhausted yet"),
-                }
-            })
-            .join()
-            .unwrap();
+                })
+                .join()
+                .unwrap();
             assert_eq!(parent_row_count(&admin, &fixture).await, 4, "three priors + admitted current");
             assert!(requeue, "count(4) < max(5) still permits another attempt");
         }
@@ -2933,18 +3271,15 @@ async fn adapter_exhaustion_retry_and_stale_authority_matrix() {
             let spec = resolved_checkout_spec(&comp, &fixture);
             let comp_t = comp.clone();
             let spec_t = spec.clone();
-            let requeue = std::thread::spawn(move || {
-                match comp_t.parent_attempt_reserve_hook()(&spec_t).expect("admitted") {
-                    ParentAttemptAdmission::Admitted {
-                        attempt_authority, ..
-                    } => attempt_authority.should_requeue(),
+            let requeue =
+                std::thread::spawn(move || match comp_t.parent_attempt_reserve_hook()(&spec_t).expect("admitted") {
+                    ParentAttemptAdmission::Admitted { attempt_authority, .. } => attempt_authority.should_requeue(),
                     ParentAttemptAdmission::AttemptsExhausted { .. } => {
                         panic!("the fifth attempt is still admitted; exhaustion is the SIXTH")
                     }
-                }
-            })
-            .join()
-            .unwrap();
+                })
+                .join()
+                .unwrap();
             assert_eq!(parent_row_count(&admin, &fixture).await, 5, "four priors + admitted current");
             assert!(!requeue, "count(5) == max(5) permits NO further attempt");
         }
@@ -2995,16 +3330,13 @@ async fn adapter_exhaustion_retry_and_stale_authority_matrix() {
 
             let comp_t = comp.clone();
             let spec_t = spec.clone();
-            let authority = std::thread::spawn(move || {
-                match comp_t.parent_attempt_reserve_hook()(&spec_t).expect("admitted") {
-                    ParentAttemptAdmission::Admitted {
-                        attempt_authority, ..
-                    } => attempt_authority,
+            let authority =
+                std::thread::spawn(move || match comp_t.parent_attempt_reserve_hook()(&spec_t).expect("admitted") {
+                    ParentAttemptAdmission::Admitted { attempt_authority, .. } => attempt_authority,
                     ParentAttemptAdmission::AttemptsExhausted { .. } => panic!("admitted"),
-                }
-            })
-            .join()
-            .unwrap();
+                })
+                .join()
+                .unwrap();
 
             // Reclaim: bump the generation so the authority's bound claim is now stale.
             sqlx::query(
@@ -3020,9 +3352,7 @@ async fn adapter_exhaustion_retry_and_stale_authority_matrix() {
 
             let (renew_err, begin_err, mint_err) = std::thread::spawn(move || {
                 let renew = authority.renew_preparation_lease().is_err();
-                let begin = authority
-                    .begin_phase(PreparationPhase::CheckoutTransport)
-                    .is_err();
+                let begin = authority.begin_phase(PreparationPhase::CheckoutTransport).is_err();
                 let mint = authority.mint_phase_credential(CheckoutPhase::Fetch).is_err();
                 (renew, begin, mint)
             })
@@ -3031,11 +3361,7 @@ async fn adapter_exhaustion_retry_and_stale_authority_matrix() {
             assert!(renew_err, "a stale lease renewal refuses");
             assert!(begin_err, "a stale begin_phase refuses");
             assert!(mint_err, "a stale credential mint refuses");
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                after_resolve,
-                "a refused mint never reaches Identity"
-            );
+            assert_eq!(calls.load(Ordering::SeqCst), after_resolve, "a refused mint never reaches Identity");
             assert_eq!(
                 generation_rows(&admin, &fixture).await.len(),
                 gens_before,
