@@ -170,6 +170,37 @@ impl CiJobParentAttempt {
     }
 }
 
+/// **CT-007 slice 5b.3-6d: the typed parent-attempt admission outcome.** The recovery gap Sol named:
+/// [`begin_parent_attempt`](CiPrelaunchUsageJournal::begin_parent_attempt) can only ever say
+/// `ParentAttemptLimitExceeded` (an error that rolls its whole transaction back), but
+/// `report_preparation_terminal(AttemptsExhausted)` needs a settleable reservation to terminalize
+/// against. This outcome is the reconciliation: an exhausted attempt still surfaces its operational
+/// `reserve_handle`, and — because [`admit_parent_attempt`](CiPrelaunchUsageJournal::admit_parent_attempt)
+/// commits the `reserved → inflight` transition inside the SAME tenant transaction that detects
+/// exhaustion — that reserve is provably `inflight`, never stranded `reserved`.
+///
+/// [`begin_parent_attempt`] keeps its exact legacy behaviour (an `Err(ParentAttemptLimitExceeded)`
+/// that rolls back); [`admit_parent_attempt`] is the NEW typed path. Both drive the identical durable
+/// admission logic ([`run_parent_admission_on_conn`]); they differ only in whether exhaustion commits
+/// (typed capability) or rolls back (legacy error).
+// One value is produced per admission call and consumed immediately — never stored in bulk — so the
+// size delta between the `CiJobParentAttempt`-bearing arm and the handle-only arm is immaterial;
+// boxing would only add an allocation + deref on the hot admitted path.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum CiParentAttemptAdmission {
+    /// The exact claim was validated, the reservation is `inflight`, and a parent-attempt row was
+    /// inserted or exactly replayed — the attempt may proceed.
+    Admitted {
+        attempt: CiJobParentAttempt,
+        outcome: CiPrelaunchJournalOutcome,
+    },
+    /// The durable parent-attempt budget is already exhausted for this exact-policy reserve. No row
+    /// was created for the newly-claimed generation; the caller terminalizes `AttemptsExhausted` and
+    /// settles `reserve_handle` (which this same transaction committed as `inflight`).
+    AttemptsExhausted { reserve_handle: String },
+}
+
 /// PostgreSQL-backed state machine for the parent-attempt and phase journal pair.
 #[derive(Clone)]
 pub struct CiPrelaunchUsageJournal {
@@ -246,11 +277,99 @@ impl CiPrelaunchUsageJournal {
     ///
     /// Exact replay returns the existing row. A distinct generation is admitted only while the
     /// policy embedded in the verified v2 handle still has capacity.
+    ///
+    /// **Legacy behaviour, byte-for-byte preserved (CT-007 5b.3-6d).** Exhaustion returns
+    /// `Err(ParentAttemptLimitExceeded)`, which rolls the whole tenant transaction back — including
+    /// the `reserved → inflight` transition. Callers that need the typed exhaustion capability (a
+    /// settleable reserve rather than an error) use [`admit_parent_attempt`](Self::admit_parent_attempt).
     pub async fn begin_parent_attempt(
         &self,
         claim: &CiJobTokenRequest,
         reserve_handle: &str,
     ) -> Result<(CiJobParentAttempt, CiPrelaunchJournalOutcome), CiPrelaunchUsageJournalError> {
+        let (claim, reserve_handle, manifest_store, spec_store) =
+            self.prepare_admission(claim, reserve_handle)?;
+        let tenant_id = claim.tenant_id.clone();
+        let region = claim.region.clone();
+        with_tenant_tx_error(&self.pool, &tenant_id, &region, move |connection| {
+            Box::pin(async move {
+                match run_parent_admission_on_conn(
+                    connection,
+                    &claim,
+                    &reserve_handle,
+                    &manifest_store,
+                    &spec_store,
+                )
+                .await?
+                {
+                    ParentAdmissionTxOutcome::Admitted(attempt, outcome) => Ok((attempt, outcome)),
+                    // Exhaustion is a legacy ERROR here: returning `Err` rolls the whole transaction
+                    // back (the `reserved → inflight` transition included), preserving the exact
+                    // pre-6d behaviour every existing caller depends on.
+                    ParentAdmissionTxOutcome::Exhausted => {
+                        Err(CiPrelaunchUsageJournalError::ParentAttemptLimitExceeded)
+                    }
+                }
+            })
+        })
+        .await
+    }
+
+    /// **CT-007 slice 5b.3-6d: the typed admission path.** Identical durable logic to
+    /// [`begin_parent_attempt`](Self::begin_parent_attempt), but exhaustion returns the typed
+    /// [`CiParentAttemptAdmission::AttemptsExhausted`] capability instead of an error. Crucially the
+    /// transaction COMMITS on that arm, so the `reserved → inflight` transition
+    /// [`run_parent_admission_on_conn`] performs BEFORE it counts the budget is durable: the exhausted
+    /// attempt's reserve is provably `inflight` and therefore settleable by
+    /// `report_preparation_terminal(AttemptsExhausted)`. See [`CiParentAttemptAdmission`] for the
+    /// invariant proof.
+    pub async fn admit_parent_attempt(
+        &self,
+        claim: &CiJobTokenRequest,
+        reserve_handle: &str,
+    ) -> Result<CiParentAttemptAdmission, CiPrelaunchUsageJournalError> {
+        let (claim, reserve_handle, manifest_store, spec_store) =
+            self.prepare_admission(claim, reserve_handle)?;
+        let tenant_id = claim.tenant_id.clone();
+        let region = claim.region.clone();
+        with_tenant_tx_error(&self.pool, &tenant_id, &region, move |connection| {
+            Box::pin(async move {
+                match run_parent_admission_on_conn(
+                    connection,
+                    &claim,
+                    &reserve_handle,
+                    &manifest_store,
+                    &spec_store,
+                )
+                .await?
+                {
+                    ParentAdmissionTxOutcome::Admitted(attempt, outcome) => {
+                        Ok(CiParentAttemptAdmission::Admitted { attempt, outcome })
+                    }
+                    // Exhaustion COMMITS: `run_parent_admission_on_conn` already transitioned the
+                    // reservation `reserved → inflight` (or found it already inflight) in THIS
+                    // transaction, so returning `Ok` durably leaves the reserve settleable.
+                    ParentAdmissionTxOutcome::Exhausted => {
+                        Ok(CiParentAttemptAdmission::AttemptsExhausted { reserve_handle })
+                    }
+                }
+            })
+        })
+        .await
+    }
+
+    /// Shared admission prologue: validate the claim + reserve-handle shape (rejecting legacy v1
+    /// handles and malformed v2 handles before any database work) and build the manifest/spec stores
+    /// both admission entry points drive [`run_parent_admission_on_conn`] with. Returns the cloned
+    /// claim + owned handle so the caller can move them into its own tenant transaction.
+    fn prepare_admission(
+        &self,
+        claim: &CiJobTokenRequest,
+        reserve_handle: &str,
+    ) -> Result<
+        (CiJobTokenRequest, String, CiDriveManifestStore, CiJobSpecStore),
+        CiPrelaunchUsageJournalError,
+    > {
         claim
             .validate()
             .map_err(|_| CiPrelaunchUsageJournalError::InvalidClaim)?;
@@ -266,156 +385,15 @@ impl CiPrelaunchUsageJournal {
         {
             return Err(CiPrelaunchUsageJournalError::ReservationAuthorityMismatch);
         }
-
         let claim = claim.clone();
-        let reserve_handle = reserve_handle.to_owned();
-        let tenant_id = claim.tenant_id.clone();
-        let region = claim.region.clone();
         let manifest_store = CiDriveManifestStore::new(
             self.pool.clone(),
-            TenantId(tenant_id.clone()),
-            Region(region.clone()),
+            TenantId(claim.tenant_id.clone()),
+            Region(claim.region.clone()),
         )
         .map_err(|_| CiPrelaunchUsageJournalError::InvalidClaim)?;
         let spec_store = CiJobSpecStore::with_pg(self.pool.clone());
-
-        with_tenant_tx_error(
-            &self.pool,
-            &tenant_id.clone(),
-            &region.clone(),
-            move |connection| {
-                Box::pin(async move {
-                    let locked_claim = CiJobQueueStore::lock_for_token_mint_on_conn(
-                        connection,
-                        &claim.tenant_id,
-                        &claim.region,
-                        &claim.job_id,
-                        &claim.wf_run_id,
-                    )
-                    .await
-                    .map_err(|_| CiPrelaunchUsageJournalError::ClaimUnavailable)?
-                    .ok_or(CiPrelaunchUsageJournalError::ClaimUnavailable)?;
-                    verify_locked_claim(&claim, &locked_claim)
-                        .map_err(|_| CiPrelaunchUsageJournalError::ClaimUnavailable)?;
-
-                    let run = CiRunStore::lock_for_token_mint_on_conn(
-                        connection,
-                        &claim.tenant_id,
-                        &claim.region,
-                        &claim.ci_run_id,
-                        &claim.wf_run_id,
-                    )
-                    .await
-                    .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?
-                    .ok_or(CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
-                    let (manifest, _) = manifest_store
-                        .load_by_identity_on_conn(connection, &claim.wf_run_id, &claim.ci_run_id)
-                        .await
-                        .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?
-                        .ok_or(CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
-                    let launch = spec_store
-                        .get_launch_template_on_conn(connection, &claim.tenant_id, &claim.job_id)
-                        .await
-                        .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
-                    let current_authority = authority_from_durable_claim(
-                        &claim, &run, &manifest, &launch,
-                    )
-                    .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
-                    let authorities = runtime_authorities_from_durable_claim(
-                        &claim, &run, &manifest,
-                    )
-                    .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
-                    let manifest_job = manifest
-                        .jobs
-                        .iter()
-                        .find(|job| job.job_id == claim.job_id)
-                        .ok_or(CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
-                    if manifest_job.reserve_handle != reserve_handle {
-                        return Err(CiPrelaunchUsageJournalError::ManifestReserveHandleMismatch);
-                    }
-                    if launch.spec.meter_to.reserve_id != reserve_handle {
-                        return Err(CiPrelaunchUsageJournalError::DispatchedReserveHandleMismatch);
-                    }
-
-                    let reservation = sqlx::query(
-                        "SELECT reserved, state FROM cost_reservation
-                     WHERE tenant_id = $1 AND region = $2 AND run_id = $3
-                     FOR UPDATE",
-                    )
-                    .bind(&claim.tenant_id)
-                    .bind(&claim.region)
-                    .bind(&reserve_handle)
-                    .fetch_optional(&mut *connection)
-                    .await
-                    .map_err(map_sql_error)?
-                    .ok_or(CiPrelaunchUsageJournalError::ReservationUnavailable)?;
-                    let durable_amount: i64 = reservation
-                        .try_get("reserved")
-                        .map_err(|_| CiPrelaunchUsageJournalError::Database)?;
-                    let reservation_state: String = reservation
-                        .try_get("state")
-                        .map_err(|_| CiPrelaunchUsageJournalError::Database)?;
-                    let policy = verify_v2_operational_reservation(
-                        &authorities,
-                        &claim.ci_run_id,
-                        &claim.job_id,
-                        &reserve_handle,
-                        durable_amount,
-                    )
-                    .map_err(|_| CiPrelaunchUsageJournalError::ReservationAuthorityMismatch)?;
-                    match reservation_state.as_str() {
-                        "inflight" => {}
-                        "reserved" => {
-                            let updated = sqlx::query(
-                                "UPDATE cost_reservation SET state = 'inflight'
-                             WHERE tenant_id = $1 AND region = $2 AND run_id = $3
-                               AND state = 'reserved'",
-                            )
-                            .bind(&claim.tenant_id)
-                            .bind(&claim.region)
-                            .bind(&reserve_handle)
-                            .execute(&mut *connection)
-                            .await
-                            .map_err(map_sql_error)?;
-                            if updated.rows_affected() != 1 {
-                                return Err(CiPrelaunchUsageJournalError::ReservationNotLaunchable);
-                            }
-                        }
-                        _ => {
-                            return Err(CiPrelaunchUsageJournalError::ReservationNotLaunchable);
-                        }
-                    }
-
-                    lock_parent_attempt_job_on_conn(
-                        connection,
-                        &claim.tenant_id,
-                        &claim.region,
-                        &claim.job_id,
-                    )
-                    .await?;
-
-                    let outcome = insert_or_replay_parent_attempt(
-                        connection,
-                        &claim,
-                        &reserve_handle,
-                        policy,
-                    )
-                    .await?;
-                    Ok((
-                        CiJobParentAttempt {
-                            tenant_id: claim.tenant_id,
-                            region: claim.region,
-                            job_id: claim.job_id,
-                            lease_epoch: claim.lease_epoch,
-                            claim_nonce: claim.claim_nonce,
-                            authority: current_authority,
-                        },
-                        outcome,
-                    ))
-                })
-            },
-        )
-        .await
+        Ok((claim, reserve_handle.to_owned(), manifest_store, spec_store))
     }
 
     /// Begin one checkout phase with the ceiling derived from the verified durable job authority.
@@ -801,12 +779,170 @@ struct DurablePhase {
     seal_window_secs: Option<u64>,
 }
 
+/// The internal result of the shared admission transaction (CT-007 5b.3-6d). The two public entry
+/// points diverge ONLY on the `Exhausted` arm: [`CiPrelaunchUsageJournal::begin_parent_attempt`] maps
+/// it to `Err` (rollback), [`CiPrelaunchUsageJournal::admit_parent_attempt`] to a committed typed
+/// capability.
+// Produced once per admission and matched immediately (never stored in bulk) — see the note on
+// [`CiParentAttemptAdmission`].
+#[allow(clippy::large_enum_variant)]
+enum ParentAdmissionTxOutcome {
+    Admitted(CiJobParentAttempt, CiPrelaunchJournalOutcome),
+    Exhausted,
+}
+
+/// The three-way result of [`insert_or_replay_parent_attempt`]: a fresh insert, an exact replay, or
+/// the durable budget already exhausted. Exhaustion is a VALUE, not an error, so the caller decides
+/// whether it commits (typed capability) or rolls back (legacy error) — the reservation transition
+/// this transaction already performed rides on that decision.
+enum InsertOrReplayOutcome {
+    Journaled(CiPrelaunchJournalOutcome),
+    Exhausted,
+}
+
+/// **CT-007 slice 5b.3-6d: the ONE durable admission transaction body**, shared verbatim by
+/// [`CiPrelaunchUsageJournal::begin_parent_attempt`] and
+/// [`CiPrelaunchUsageJournal::admit_parent_attempt`]. It runs entirely on the caller's single
+/// tenant-scoped connection (the caller owns the commit/rollback boundary), so reservation transition
+/// and parent-row insertion are one atomic unit — never split across transactions.
+///
+/// **Ordering is load-bearing for the exhaustion invariant.** The `reserved → inflight` reservation
+/// transition happens BEFORE the parent-attempt count/insert. So any path that reaches
+/// [`InsertOrReplayOutcome::Exhausted`] has ALREADY ensured the reservation is `inflight` in this same
+/// transaction: a committed exhaustion (via `admit_parent_attempt`) leaves a settleable reserve.
+async fn run_parent_admission_on_conn(
+    connection: &mut sqlx::PgConnection,
+    claim: &CiJobTokenRequest,
+    reserve_handle: &str,
+    manifest_store: &CiDriveManifestStore,
+    spec_store: &CiJobSpecStore,
+) -> Result<ParentAdmissionTxOutcome, CiPrelaunchUsageJournalError> {
+    let locked_claim = CiJobQueueStore::lock_for_token_mint_on_conn(
+        connection,
+        &claim.tenant_id,
+        &claim.region,
+        &claim.job_id,
+        &claim.wf_run_id,
+    )
+    .await
+    .map_err(|_| CiPrelaunchUsageJournalError::ClaimUnavailable)?
+    .ok_or(CiPrelaunchUsageJournalError::ClaimUnavailable)?;
+    verify_locked_claim(claim, &locked_claim)
+        .map_err(|_| CiPrelaunchUsageJournalError::ClaimUnavailable)?;
+
+    let run = CiRunStore::lock_for_token_mint_on_conn(
+        connection,
+        &claim.tenant_id,
+        &claim.region,
+        &claim.ci_run_id,
+        &claim.wf_run_id,
+    )
+    .await
+    .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?
+    .ok_or(CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
+    let (manifest, _) = manifest_store
+        .load_by_identity_on_conn(connection, &claim.wf_run_id, &claim.ci_run_id)
+        .await
+        .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?
+        .ok_or(CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
+    let launch = spec_store
+        .get_launch_template_on_conn(connection, &claim.tenant_id, &claim.job_id)
+        .await
+        .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
+    let current_authority = authority_from_durable_claim(claim, &run, &manifest, &launch)
+        .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
+    let authorities = runtime_authorities_from_durable_claim(claim, &run, &manifest)
+        .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
+    let manifest_job = manifest
+        .jobs
+        .iter()
+        .find(|job| job.job_id == claim.job_id)
+        .ok_or(CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
+    if manifest_job.reserve_handle.as_str() != reserve_handle {
+        return Err(CiPrelaunchUsageJournalError::ManifestReserveHandleMismatch);
+    }
+    if launch.spec.meter_to.reserve_id.as_str() != reserve_handle {
+        return Err(CiPrelaunchUsageJournalError::DispatchedReserveHandleMismatch);
+    }
+
+    let reservation = sqlx::query(
+        "SELECT reserved, state FROM cost_reservation
+     WHERE tenant_id = $1 AND region = $2 AND run_id = $3
+     FOR UPDATE",
+    )
+    .bind(&claim.tenant_id)
+    .bind(&claim.region)
+    .bind(reserve_handle)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or(CiPrelaunchUsageJournalError::ReservationUnavailable)?;
+    let durable_amount: i64 = reservation
+        .try_get("reserved")
+        .map_err(|_| CiPrelaunchUsageJournalError::Database)?;
+    let reservation_state: String = reservation
+        .try_get("state")
+        .map_err(|_| CiPrelaunchUsageJournalError::Database)?;
+    let policy = verify_v2_operational_reservation(
+        &authorities,
+        &claim.ci_run_id,
+        &claim.job_id,
+        reserve_handle,
+        durable_amount,
+    )
+    .map_err(|_| CiPrelaunchUsageJournalError::ReservationAuthorityMismatch)?;
+    // The `reserved → inflight` transition — performed BEFORE the budget count below, so an exhausted
+    // outcome that this transaction commits (admit_parent_attempt) always leaves an `inflight`,
+    // settleable reserve. A settled/absent reservation is `ReservationNotLaunchable`, so exhaustion
+    // is never surfaced for an unsettleable reserve.
+    match reservation_state.as_str() {
+        "inflight" => {}
+        "reserved" => {
+            let updated = sqlx::query(
+                "UPDATE cost_reservation SET state = 'inflight'
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3
+               AND state = 'reserved'",
+            )
+            .bind(&claim.tenant_id)
+            .bind(&claim.region)
+            .bind(reserve_handle)
+            .execute(&mut *connection)
+            .await
+            .map_err(map_sql_error)?;
+            if updated.rows_affected() != 1 {
+                return Err(CiPrelaunchUsageJournalError::ReservationNotLaunchable);
+            }
+        }
+        _ => {
+            return Err(CiPrelaunchUsageJournalError::ReservationNotLaunchable);
+        }
+    }
+
+    lock_parent_attempt_job_on_conn(connection, &claim.tenant_id, &claim.region, &claim.job_id)
+        .await?;
+
+    match insert_or_replay_parent_attempt(connection, claim, reserve_handle, policy).await? {
+        InsertOrReplayOutcome::Journaled(outcome) => Ok(ParentAdmissionTxOutcome::Admitted(
+            CiJobParentAttempt {
+                tenant_id: claim.tenant_id.clone(),
+                region: claim.region.clone(),
+                job_id: claim.job_id.clone(),
+                lease_epoch: claim.lease_epoch,
+                claim_nonce: claim.claim_nonce.clone(),
+                authority: current_authority,
+            },
+            outcome,
+        )),
+        InsertOrReplayOutcome::Exhausted => Ok(ParentAdmissionTxOutcome::Exhausted),
+    }
+}
+
 async fn insert_or_replay_parent_attempt(
     connection: &mut sqlx::PgConnection,
     claim: &CiJobTokenRequest,
     reserve_handle: &str,
     policy: CiAttemptBudgetPolicy,
-) -> Result<CiPrelaunchJournalOutcome, CiPrelaunchUsageJournalError> {
+) -> Result<InsertOrReplayOutcome, CiPrelaunchUsageJournalError> {
     let rows = sqlx::query(
         "SELECT wf_run_id::text AS wf_run_id, ci_run_id::text AS ci_run_id,
                 reserve_handle, lease_owner, lease_epoch, claim_nonce::text AS claim_nonce,
@@ -828,7 +964,9 @@ async fn insert_or_replay_parent_attempt(
         if rows.len() != 1 || !parent_row_matches(&rows[0], claim, reserve_handle, policy)? {
             return Err(CiPrelaunchUsageJournalError::ParentAttemptDivergence);
         }
-        return Ok(CiPrelaunchJournalOutcome::Replayed);
+        return Ok(InsertOrReplayOutcome::Journaled(
+            CiPrelaunchJournalOutcome::Replayed,
+        ));
     }
 
     let existing: i64 = sqlx::query_scalar(
@@ -845,7 +983,10 @@ async fn insert_or_replay_parent_attempt(
         .ok()
         .is_none_or(|count| count >= u64::from(policy.max_parent_attempts().get()))
     {
-        return Err(CiPrelaunchUsageJournalError::ParentAttemptLimitExceeded);
+        // The durable budget is exhausted. This is a VALUE, not an error: the caller (via
+        // `run_parent_admission_on_conn`) decides whether to commit it as a typed capability or roll
+        // it back as the legacy `ParentAttemptLimitExceeded`.
+        return Ok(InsertOrReplayOutcome::Exhausted);
     }
 
     sqlx::query(
@@ -871,7 +1012,9 @@ async fn insert_or_replay_parent_attempt(
     .execute(&mut *connection)
     .await
     .map_err(map_sql_error)?;
-    Ok(CiPrelaunchJournalOutcome::Applied)
+    Ok(InsertOrReplayOutcome::Journaled(
+        CiPrelaunchJournalOutcome::Applied,
+    ))
 }
 
 fn parent_row_matches(

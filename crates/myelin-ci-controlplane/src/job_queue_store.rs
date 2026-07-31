@@ -73,8 +73,9 @@ use crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS;
 use crate::scheduler::CANCEL_SUPERSEDED_QUERY;
 use crate::scheduler::{
     EnqueueOutcome, Lane, AUTHORIZE_JOB_LAUNCH_QUERY, COMPLETE_JOB_QUERY, CONSUME_CLAIM_QUERY,
-    CONSUME_PREPARATION_CLAIM_QUERY, HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY,
-    READ_COMPLETION_DISPOSITION_QUERY, RENEW_PREPARATION_LEASE_QUERY, VERIFY_JOB_LAUNCH_LIVE_QUERY,
+    CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY, CONSUME_PREPARATION_CLAIM_QUERY, HEARTBEAT_QUERY,
+    INSERT_JOB_QUEUE_QUERY, READ_COMPLETION_DISPOSITION_QUERY, RENEW_PREPARATION_LEASE_QUERY,
+    VERIFY_JOB_LAUNCH_LIVE_QUERY,
 };
 
 // =================================================================================================
@@ -963,6 +964,76 @@ impl CiJobQueueStore {
         .bind(spec.claim_nonce)
         .bind(spec.claim_started_at_epoch_secs)
         .bind(spec.claim_expires_at_epoch_secs)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        Ok(if replay.is_some() {
+            ClaimConsumeOutcome::AlreadyConsumed
+        } else {
+            ClaimConsumeOutcome::Refused
+        })
+    }
+
+    /// **CT-007 slice 5b.3-6d: consume an exact still-leased generation whose parent attempt was
+    /// REFUSED admission because the durable budget was already exhausted.** Identical in shape to
+    /// [`consume_preparation_claim_on_conn`](Self::consume_preparation_claim_on_conn) but drives the
+    /// exhausted-variant CAS ([`CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY`]), whose parent predicate is
+    /// "the reserve's prior exact-policy rows already equal the durable max" rather than "a parent row
+    /// exists for this exact generation" (that row is precisely what does not exist here). Used ONLY
+    /// for the `AttemptsExhausted` disposition; `Failed`/`TimedOut` keep the current-row CAS.
+    ///
+    /// The replay probe is correspondingly relaxed: an already-terminalized exhausted generation has
+    /// no current-generation parent row either, so idempotent replay is proven by the exact terminal
+    /// `completion_receipt` plus the same policy-exhaustion predicate over the reserve.
+    pub(crate) async fn consume_preparation_claim_exhausted_on_conn(
+        conn: &mut sqlx::PgConnection,
+        spec: PreparationClaimConsumeSpec<'_>,
+    ) -> Result<ClaimConsumeOutcome, PgError> {
+        let consumed = sqlx::query(CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY)
+            .bind(spec.tenant_id)
+            .bind(spec.region)
+            .bind(spec.job_id)
+            .bind(spec.wf_run_id)
+            .bind(spec.idem_token)
+            .bind(spec.lease_owner)
+            .bind(spec.lease_epoch)
+            .bind(spec.claim_nonce)
+            .bind(spec.stage)
+            .bind(spec.claim_started_at_epoch_secs)
+            .bind(spec.claim_expires_at_epoch_secs)
+            .bind(spec.ci_run_id)
+            .bind(spec.reserve_handle)
+            .bind(spec.completion_receipt)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+        if consumed.is_some() {
+            return Ok(ClaimConsumeOutcome::Consumed);
+        }
+        let replay = sqlx::query_scalar::<_, i32>(
+            "SELECT 1
+             FROM job_queue q
+             WHERE q.tenant_id = $1 AND q.region = $2 AND q.job_id = $3::uuid
+               AND q.run_id = $4::uuid AND q.idem_token = $5 AND q.stage = $6
+               AND q.state = 'terminal' AND q.completion_receipt = $7
+               AND EXISTS (
+                 SELECT 1 FROM ci_job_parent_attempt p
+                 WHERE p.tenant_id = q.tenant_id AND p.region = q.region
+                   AND p.job_id = q.job_id AND p.wf_run_id = q.run_id
+                   AND p.ci_run_id = $8::uuid AND p.reserve_handle = $9
+                 GROUP BY p.budget_revision, p.max_parent_attempts
+                 HAVING count(*) = p.max_parent_attempts
+               )",
+        )
+        .bind(spec.tenant_id)
+        .bind(spec.region)
+        .bind(spec.job_id)
+        .bind(spec.wf_run_id)
+        .bind(spec.idem_token)
+        .bind(spec.stage)
+        .bind(spec.completion_receipt)
+        .bind(spec.ci_run_id)
+        .bind(spec.reserve_handle)
         .fetch_optional(&mut *conn)
         .await
         .map_err(|error| PgError::Query(error.to_string()))?;
