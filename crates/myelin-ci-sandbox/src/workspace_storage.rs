@@ -197,6 +197,30 @@ pub enum WorkspaceStorageError {
         expected_base: PathBuf,
         actual_base: PathBuf,
     },
+    /// A capability minted by one storage backend was presented to the OTHER (a Btrfs
+    /// [`PreparedWorkspace`]/[`OrphanCandidate`] to the deterministic-directory backend, or vice
+    /// versa). Refused, never acted on — the two backends' typed identities are not
+    /// interchangeable, so a cross-backend delete can never silently succeed against the wrong
+    /// tree. The directory backend is itself `#[cfg(any(test, feature = "test-support"))]`, but
+    /// this variant is ALWAYS present so the frozen Btrfs delete path can name it when handed a
+    /// directory-identity capability.
+    BackendMismatch { detail: String },
+    /// (Deterministic-directory test backend) A deletion could not be PROVEN to have removed the
+    /// controlled leaf: a backend/base/leaf-name/symlink/`(device, inode)` mismatch, a failed
+    /// recursive removal, a failed parent `fsync`, or a post-delete re-check that STILL found the
+    /// leaf present. Absence is UNPROVEN — the caller must retain capacity and quarantine exactly
+    /// as for the Btrfs [`Self::DeleteFailed`]/[`Self::SyncPending`] paths, never treat it as a
+    /// clean settlement.
+    DirectoryAbsenceUnproven { path: PathBuf, reason: String },
+    /// (Deterministic-directory test backend) A byte-accounted test-quota checked write would push
+    /// the workspace's total regular-file bytes over its recorded per-job quota — refused BEFORE
+    /// any mutation. This is a byte-accounted TEST quota (a userspace scan + checked-add), NOT the
+    /// production Btrfs hard qgroup quota (which stays the Btrfs tests + 5b.3-7).
+    DirectoryQuotaExceeded {
+        path: PathBuf,
+        quota_bytes: u64,
+        would_be_bytes: u64,
+    },
     /// Listing `base_dir`'s entries (for orphan reconciliation) failed.
     ListFailed { base_dir: PathBuf, reason: String },
     /// An entry under the workspace base directory is not itself a Btrfs subvolume (a stray
@@ -268,6 +292,23 @@ impl fmt::Display for WorkspaceStorageError {
                 "refusing: this capability was minted against {expected_base:?}, not the \
                  storage handle's own base {actual_base:?}"
             ),
+            Self::BackendMismatch { detail } => {
+                write!(f, "cross-backend workspace capability refused: {detail}")
+            }
+            Self::DirectoryAbsenceUnproven { path, reason } => write!(
+                f,
+                "deterministic-directory workspace deletion left absence UNPROVEN at {path:?}: \
+                 {reason}"
+            ),
+            Self::DirectoryQuotaExceeded {
+                path,
+                quota_bytes,
+                would_be_bytes,
+            } => write!(
+                f,
+                "byte-accounted test-quota write refused at {path:?}: {would_be_bytes} bytes would \
+                 exceed the per-job quota of {quota_bytes} bytes"
+            ),
             Self::ListFailed { base_dir, reason } => {
                 write!(f, "list workspace base {base_dir:?} failed: {reason}")
             }
@@ -281,16 +322,42 @@ impl fmt::Display for WorkspaceStorageError {
 
 impl std::error::Error for WorkspaceStorageError {}
 
+/// CT-007 slice 5b.3-6e.1b: the PRIVATE typed backend identity a [`PreparedWorkspace`]/
+/// [`OrphanCandidate`] carries. A capability minted by ONE backend can never be acted on by the
+/// OTHER, because the delete path matches on this identity: a `Btrfs` capability handed to the
+/// deterministic-directory backend (or a `Directory` capability handed to the Btrfs backend) is a
+/// loud [`WorkspaceStorageError::BackendMismatch`] refusal, never a silent id/inode confusion. An
+/// inode is DELIBERATELY not modelled as a Btrfs `subvol_id`: the two identities are distinct
+/// variants, so no code can pretend one is the other.
+#[derive(Debug)]
+enum WorkspaceIdentity {
+    /// A real Btrfs subvolume, addressed by its persistent numeric id (the production backend).
+    Btrfs { subvol_id: u64 },
+    /// A plain directory leaf under a deterministic-directory test base, addressed by the
+    /// `(device, inode)` captured at creation plus its recorded byte-accounted per-job test quota.
+    /// ABSENT from ordinary builds.
+    #[cfg(any(test, feature = "test-support"))]
+    Directory {
+        device: u64,
+        inode: u64,
+        quota_bytes: u64,
+    },
+}
+
 /// A safe, freshly-provisioned per-job workspace. Fields are PRIVATE — a caller cannot construct
-/// or forge one; the only way to get one is [`WorkspaceStorage::create_workspace`], and the only
-/// way to delete one is [`WorkspaceStorage::delete_workspace`] (which consumes it BY VALUE and
-/// verifies `minted_from` matches the storage handle's own base — round 4's fix for a capability
-/// from storage A being usable against storage B). No `Clone`, no `Serialize`/`Deserialize` —
-/// host paths are trusted launch-time capabilities, never durable or customer-controlled data.
+/// or forge one; the only way to get one is [`WorkspaceStorage::create_workspace`] (Btrfs) or
+/// [`WorkspaceStorageBackend::create_workspace`] (either backend), and the only way to delete one
+/// is the matching backend's `delete_workspace` (which consumes it BY VALUE and verifies both
+/// `minted_from` matches the storage handle's own base AND the typed [`WorkspaceIdentity`] matches
+/// the backend kind). No `Clone`, no `Serialize`/`Deserialize` — host paths are trusted
+/// launch-time capabilities, never durable or customer-controlled data.
 #[derive(Debug)]
 pub struct PreparedWorkspace {
     host_path: PathBuf,
-    subvol_id: u64,
+    // Boxed so adding the typed backend identity does not grow `PreparedWorkspace` (and hence
+    // `ManagedWorkspace` / the `DeleteWorkspaceError::WrongManager` Err variant) past clippy's
+    // `result_large_err` threshold — the field stays one pointer wide, as the old `u64` was.
+    identity: Box<WorkspaceIdentity>,
     minted_from: PathBuf,
 }
 
@@ -300,9 +367,17 @@ impl PreparedWorkspace {
         &self.host_path
     }
 
-    /// The Btrfs subvolume id, captured at creation.
+    /// The Btrfs subvolume id, captured at creation. Only meaningful for a Btrfs-backed workspace;
+    /// panics for a deterministic-directory workspace (which has no subvolume id — its identity is
+    /// a `(device, inode)`, deliberately never conflated with a `subvol_id`).
     pub fn subvol_id(&self) -> u64 {
-        self.subvol_id
+        match self.identity.as_ref() {
+            WorkspaceIdentity::Btrfs { subvol_id } => *subvol_id,
+            #[cfg(any(test, feature = "test-support"))]
+            WorkspaceIdentity::Directory { .. } => {
+                panic!("subvol_id() is meaningless for a deterministic-directory test workspace")
+            }
+        }
     }
 
     /// CT-007 slice 3: a test-only constructor letting `workspace_manager.rs`'s own tests exercise
@@ -313,7 +388,7 @@ impl PreparedWorkspace {
     pub(crate) fn for_tests(host_path: PathBuf, subvol_id: u64, minted_from: PathBuf) -> Self {
         PreparedWorkspace {
             host_path,
-            subvol_id,
+            identity: Box::new(WorkspaceIdentity::Btrfs { subvol_id }),
             minted_from,
         }
     }
@@ -326,7 +401,7 @@ impl PreparedWorkspace {
 #[derive(Debug)]
 pub struct OrphanCandidate {
     path: PathBuf,
-    subvol_id: u64,
+    identity: Box<WorkspaceIdentity>,
     minted_from: PathBuf,
 }
 
@@ -335,8 +410,16 @@ impl OrphanCandidate {
         &self.path
     }
 
+    /// The Btrfs subvolume id. Only meaningful for a Btrfs-backed orphan (panics otherwise — see
+    /// [`PreparedWorkspace::subvol_id`]).
     pub fn subvol_id(&self) -> u64 {
-        self.subvol_id
+        match self.identity.as_ref() {
+            WorkspaceIdentity::Btrfs { subvol_id } => *subvol_id,
+            #[cfg(any(test, feature = "test-support"))]
+            WorkspaceIdentity::Directory { .. } => {
+                panic!("subvol_id() is meaningless for a deterministic-directory test orphan")
+            }
+        }
     }
 }
 
@@ -504,7 +587,7 @@ impl WorkspaceStorage {
 
         Ok(PreparedWorkspace {
             host_path: path,
-            subvol_id,
+            identity: Box::new(WorkspaceIdentity::Btrfs { subvol_id }),
             minted_from: self.canonical_base.clone(),
         })
     }
@@ -588,7 +671,8 @@ impl WorkspaceStorage {
         prepared: PreparedWorkspace,
     ) -> Result<(), WorkspaceStorageError> {
         assert_same_storage(&self.canonical_base, &prepared.minted_from)?;
-        self.delete_by_id(prepared.subvol_id)
+        let subvol_id = btrfs_identity_or_backend_mismatch(&prepared.identity)?;
+        self.delete_by_id(subvol_id)
     }
 
     /// Delete an orphan candidate found by [`Self::list_orphaned_workspaces`]. Same id-addressed,
@@ -598,7 +682,8 @@ impl WorkspaceStorage {
         candidate: OrphanCandidate,
     ) -> Result<(), WorkspaceStorageError> {
         assert_same_storage(&self.canonical_base, &candidate.minted_from)?;
-        self.delete_by_id(candidate.subvol_id)
+        let subvol_id = btrfs_identity_or_backend_mismatch(&candidate.identity)?;
+        self.delete_by_id(subvol_id)
     }
 
     /// Finish waiting for a subvolume delete that already COMMITTED but whose `subvolume sync`
@@ -706,7 +791,7 @@ impl WorkspaceStorage {
             }
             orphans.push(OrphanCandidate {
                 path,
-                subvol_id,
+                identity: Box::new(WorkspaceIdentity::Btrfs { subvol_id }),
                 minted_from: self.canonical_base.clone(),
             });
         }
@@ -794,6 +879,25 @@ fn assert_same_storage(
             expected_base: capability_base.to_path_buf(),
             actual_base: self_base.to_path_buf(),
         })
+    }
+}
+
+/// The Btrfs backend's language-level cross-backend guard: extract the `subvol_id` from a typed
+/// [`WorkspaceIdentity`], or refuse LOUDLY ([`WorkspaceStorageError::BackendMismatch`]) if the
+/// capability was minted by the deterministic-directory backend. A `Directory` capability can
+/// therefore never be deleted through the Btrfs id-addressed path (and, symmetrically, the
+/// directory backend refuses a `Btrfs` capability) — the two are not interchangeable.
+fn btrfs_identity_or_backend_mismatch(
+    identity: &WorkspaceIdentity,
+) -> Result<u64, WorkspaceStorageError> {
+    match identity {
+        WorkspaceIdentity::Btrfs { subvol_id } => Ok(*subvol_id),
+        #[cfg(any(test, feature = "test-support"))]
+        WorkspaceIdentity::Directory { .. } => Err(WorkspaceStorageError::BackendMismatch {
+            detail: "a deterministic-directory workspace capability was presented to the Btrfs \
+                     backend — the two backends' identities are not interchangeable"
+                .to_string(),
+        }),
     }
 }
 
@@ -995,6 +1099,564 @@ pub(crate) fn probe_qgroup_privilege(base_dir: &Path) -> Result<bool, WorkspaceS
                 ),
             })
         }
+    }
+}
+
+// ───────────────────── CT-007 slice 5b.3-6e.1b: the deterministic directory backend ─────────────
+//
+// A plain-directory workspace-storage backend + a CLOSED backend discriminant, so the SAME
+// `WorkspaceManager` admission/capacity/active-job/poison/reconcile logic drives a full checkout
+// lifecycle on a host WITHOUT Btrfs/CAP_SYS_ADMIN/subuid (the test env `/tmp` is tmpfs). It does
+// NOT reproduce the PRODUCTION storage-isolation primitive: it has no hard qgroup quota, no
+// subvolume identity, and no crash-durable subvolume deletion — those stay the Btrfs tests +
+// 5b.3-7. The per-job limit here is a byte-accounted TEST quota (a userspace scan + checked-add),
+// deliberately not called a hard quota. ABSENT from ordinary builds (`#[cfg(any(test,
+// feature = "test-support"))]`); never representable through any production composition root.
+
+/// A CLOSED backend discriminant over ONE workspace base directory — the production Btrfs
+/// primitive, or the deterministic plain-directory TEST substrate. The
+/// [`crate::workspace_manager::WorkspaceManager`] owns one and drives the identical
+/// admission/capacity/active-job/poison/reconcile logic over either. The two backends mint TYPED,
+/// NON-INTERCHANGEABLE capabilities: a `Directory` [`PreparedWorkspace`]/[`OrphanCandidate`] handed
+/// to the `Btrfs` arm (or vice versa) is a loud [`WorkspaceStorageError::BackendMismatch`], never a
+/// silent id/inode confusion.
+#[derive(Debug)]
+pub(crate) enum WorkspaceStorageBackend {
+    /// The production Btrfs subvolume+qgroup backend — byte-identical to its standalone behavior.
+    Btrfs(WorkspaceStorage),
+    /// The deterministic plain-directory TEST substrate. ABSENT from ordinary builds.
+    #[cfg(any(test, feature = "test-support"))]
+    DeterministicDirectoryForTests(DirectoryWorkspaceStorage),
+}
+
+impl WorkspaceStorageBackend {
+    /// The canonical workspace base directory this backend was opened over.
+    pub(crate) fn base_dir(&self) -> &Path {
+        match self {
+            Self::Btrfs(storage) => storage.base_dir(),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::DeterministicDirectoryForTests(storage) => storage.base_dir(),
+        }
+    }
+
+    /// A read-only re-verification of this backend's preconditions (Btrfs: exclusive ownership +
+    /// quota enforcing; directory: exclusive ownership only).
+    pub(crate) fn check_health(&self) -> Result<(), WorkspaceStorageError> {
+        match self {
+            Self::Btrfs(storage) => storage.check_health(),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::DeterministicDirectoryForTests(storage) => storage.check_health(),
+        }
+    }
+
+    /// Create a fresh per-job workspace through the selected backend.
+    pub(crate) fn create_workspace(
+        &mut self,
+        job_id: &str,
+        quota_bytes: u64,
+        owner_uid: u32,
+        owner_gid: u32,
+    ) -> Result<PreparedWorkspace, WorkspaceStorageError> {
+        match self {
+            Self::Btrfs(storage) => {
+                storage.create_workspace(job_id, quota_bytes, owner_uid, owner_gid)
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            Self::DeterministicDirectoryForTests(storage) => {
+                storage.create_workspace(job_id, quota_bytes, owner_uid, owner_gid)
+            }
+        }
+    }
+
+    /// Delete a workspace through the selected backend. A capability minted by the OTHER backend is
+    /// refused with [`WorkspaceStorageError::BackendMismatch`] (the delete paths match on the typed
+    /// identity), never acted on.
+    pub(crate) fn delete_workspace(
+        &mut self,
+        prepared: PreparedWorkspace,
+    ) -> Result<(), WorkspaceStorageError> {
+        match self {
+            Self::Btrfs(storage) => storage.delete_workspace(prepared),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::DeterministicDirectoryForTests(storage) => storage.delete_workspace(prepared),
+        }
+    }
+
+    /// Delete an orphan candidate through the selected backend (same cross-backend refusal).
+    pub(crate) fn delete_orphan(
+        &mut self,
+        candidate: OrphanCandidate,
+    ) -> Result<(), WorkspaceStorageError> {
+        match self {
+            Self::Btrfs(storage) => storage.delete_orphan(candidate),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::DeterministicDirectoryForTests(storage) => storage.delete_orphan(candidate),
+        }
+    }
+
+    /// Finish a Btrfs delete whose `subvolume sync` was left outstanding. The directory backend
+    /// never returns [`WorkspaceStorageError::SyncPending`] (its deletion is synchronous), so this
+    /// is a no-op there.
+    pub(crate) fn retry_pending_sync(
+        &mut self,
+        subvol_id: u64,
+    ) -> Result<(), WorkspaceStorageError> {
+        match self {
+            Self::Btrfs(storage) => storage.retry_pending_sync(subvol_id),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::DeterministicDirectoryForTests(_) => Ok(()),
+        }
+    }
+
+    /// List orphan candidates through the selected backend.
+    pub(crate) fn list_orphaned_workspaces(
+        &mut self,
+        active_job_ids: &BTreeSet<String>,
+    ) -> Result<Vec<OrphanCandidate>, WorkspaceStorageError> {
+        match self {
+            Self::Btrfs(storage) => storage.list_orphaned_workspaces(active_job_ids),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::DeterministicDirectoryForTests(storage) => {
+                storage.list_orphaned_workspaces(active_job_ids)
+            }
+        }
+    }
+}
+
+/// The deterministic-directory backend's cross-backend guard — the mirror of
+/// [`btrfs_identity_or_backend_mismatch`]: extract the `(device, inode)` from a `Directory` typed
+/// identity, or refuse LOUDLY if handed a `Btrfs` capability.
+#[cfg(any(test, feature = "test-support"))]
+fn directory_identity_or_backend_mismatch(
+    identity: &WorkspaceIdentity,
+) -> Result<(u64, u64), WorkspaceStorageError> {
+    match identity {
+        WorkspaceIdentity::Directory { device, inode, .. } => Ok((*device, *inode)),
+        WorkspaceIdentity::Btrfs { .. } => Err(WorkspaceStorageError::BackendMismatch {
+            detail: "a Btrfs workspace capability was presented to the deterministic-directory \
+                     backend — the two backends' identities are not interchangeable"
+                .to_string(),
+        }),
+    }
+}
+
+/// Sum the sizes of every REGULAR file under `dir` (recursively) — the byte-accounted test-quota
+/// scan. Directories/symlinks/other entries contribute nothing (a symlink is never followed). Used
+/// both by the checked write (before mutating) and at the controlled workload/cleanup checkpoints.
+#[cfg(any(test, feature = "test-support"))]
+fn scan_regular_file_bytes(dir: &Path) -> Result<u64, WorkspaceStorageError> {
+    use std::os::unix::fs::MetadataExt;
+    let mut total: u64 = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = std::fs::read_dir(&current).map_err(|e| WorkspaceStorageError::Io {
+            path: current.clone(),
+            reason: format!("scan read_dir: {e}"),
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| WorkspaceStorageError::Io {
+                path: current.clone(),
+                reason: format!("scan read_dir entry: {e}"),
+            })?;
+            let path = entry.path();
+            let meta =
+                std::fs::symlink_metadata(&path).map_err(|e| WorkspaceStorageError::Io {
+                    path: path.clone(),
+                    reason: format!("scan stat: {e}"),
+                })?;
+            let ft = meta.file_type();
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                total = total.checked_add(meta.size()).ok_or_else(|| {
+                    WorkspaceStorageError::Io {
+                        path: path.clone(),
+                        reason: "byte-accounting overflow while scanning workspace".to_string(),
+                    }
+                })?;
+            }
+            // symlinks / sockets / fifos / devices contribute nothing and are never followed.
+        }
+    }
+    Ok(total)
+}
+
+/// A handle over ONE deterministic-directory workspace base — the plain-directory counterpart to
+/// [`WorkspaceStorage`]. Owns only the canonical base path (there is no filesystem anchor, qgroup,
+/// or subvolume machinery). Every mutating method takes `&mut self`, so the borrow checker makes
+/// concurrent same-process calls a compile error, exactly like the Btrfs handle.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub(crate) struct DirectoryWorkspaceStorage {
+    canonical_base: PathBuf,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl DirectoryWorkspaceStorage {
+    /// Open the base directory (created if missing), canonicalize it, and require it to be
+    /// exclusively owned by this process — the SAME base-dir precondition the Btrfs backend
+    /// enforces (via the shared [`assert_base_dir_exclusively_owned`]). There is deliberately NO
+    /// Btrfs/quota check: this backend makes no claim to the production storage-isolation primitive.
+    pub(crate) fn open(base_dir: &Path) -> Result<Self, WorkspaceStorageError> {
+        if !exists_or_error(base_dir)? {
+            std::fs::create_dir_all(base_dir).map_err(|e| WorkspaceStorageError::Io {
+                path: base_dir.to_path_buf(),
+                reason: format!("create workspace base dir: {e}"),
+            })?;
+        }
+        let canonical_base =
+            std::fs::canonicalize(base_dir).map_err(|e| WorkspaceStorageError::Io {
+                path: base_dir.to_path_buf(),
+                reason: format!("canonicalize: {e}"),
+            })?;
+        assert_base_dir_exclusively_owned(&canonical_base)?;
+        Ok(Self { canonical_base })
+    }
+
+    pub(crate) fn base_dir(&self) -> &Path {
+        &self.canonical_base
+    }
+
+    pub(crate) fn check_health(&self) -> Result<(), WorkspaceStorageError> {
+        assert_base_dir_exclusively_owned(&self.canonical_base)
+    }
+
+    /// The exact CREATE lifecycle Sol's 6e.1b ruling requires: validate the job key + nonzero quota
+    /// with the SAME production rules ([`validate_job_id`], [`WorkspaceStorageError::ZeroQuota`]);
+    /// create EXACTLY ONE fresh leaf dir (refusing loudly if the name is already taken); capture its
+    /// `(device, inode)`; record the requested per-job byte-accounted test quota in the typed
+    /// `Directory` identity; return a GENUINE [`PreparedWorkspace`] (never `for_tests`). `owner_uid`/
+    /// `owner_gid` are accepted for signature parity but NOT chowned — a plain dir cannot be chowned
+    /// to another uid without `CAP_CHOWN` (which the non-root test process lacks), and this backend
+    /// deliberately owns its workspaces as the test process itself.
+    pub(crate) fn create_workspace(
+        &mut self,
+        job_id: &str,
+        quota_bytes: u64,
+        _owner_uid: u32,
+        _owner_gid: u32,
+    ) -> Result<PreparedWorkspace, WorkspaceStorageError> {
+        use std::os::unix::fs::MetadataExt;
+        validate_job_id(job_id)?;
+        if quota_bytes == 0 {
+            return Err(WorkspaceStorageError::ZeroQuota);
+        }
+        let path = self.canonical_base.join(job_id);
+        // Exactly one FRESH leaf dir: `create_dir` (not `create_dir_all`) fails if the leaf already
+        // exists. An UNEXPECTED pre-existing leaf is an untracked residual, NOT a clean refusal — it
+        // must be an `UnrecoverableLeak` so the manager RETAINS capacity and poisons (never releases
+        // capacity while a residual directory sits under a still-healthy base). Any other create
+        // error genuinely created nothing, so it is an ordinary (proven-clean) refusal.
+        if let Err(e) = std::fs::create_dir(&path) {
+            if e.kind() == ErrorKind::AlreadyExists {
+                return Err(WorkspaceStorageError::UnrecoverableLeak {
+                    path,
+                    subvol_id: None,
+                    provisioning_error: "an untracked workspace leaf already exists at this job key"
+                        .to_string(),
+                    cleanup_error: "left in place — a pre-existing residual is not this call's to \
+                                    remove; a human must reconcile"
+                        .to_string(),
+                });
+            }
+            return Err(WorkspaceStorageError::Io {
+                path,
+                reason: format!("create workspace leaf: {e}"),
+            });
+        }
+        // From here the leaf EXISTS. Any failure must roll it back with PROVEN ABSENCE; if the
+        // rollback (remove + fsync + absence re-check) cannot prove the leaf is gone, that is an
+        // `UnrecoverableLeak` (retain capacity + poison), never a recoverable `Io` that would release
+        // capacity while a residual survives (Sol 6e.1b blocker 2).
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)) {
+            return Err(self.rollback_fresh_leaf(&path, format!("chmod 0755 on the fresh leaf: {e}")));
+        }
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                return Err(self.rollback_fresh_leaf(
+                    &path,
+                    format!("capture (device, inode) of the fresh leaf: {e}"),
+                ));
+            }
+        };
+        Ok(PreparedWorkspace {
+            host_path: path,
+            identity: Box::new(WorkspaceIdentity::Directory {
+                device: meta.dev(),
+                inode: meta.ino(),
+                quota_bytes,
+            }),
+            minted_from: self.canonical_base.clone(),
+        })
+    }
+
+    /// Roll a just-created leaf back with PROVEN ABSENCE after a post-create step failed. Removes the
+    /// leaf, `fsync`s the parent, and re-checks absence. If the leaf is proven gone, the caller's
+    /// original failure was harmless → an ordinary (proven-clean) [`WorkspaceStorageError::Io`] the
+    /// manager releases capacity on. If the removal, the `fsync`, OR the absence re-check fails, the
+    /// leaf may survive untracked → [`WorkspaceStorageError::UnrecoverableLeak`], so the manager
+    /// RETAINS capacity and poisons (Sol 6e.1b blocker 2).
+    fn rollback_fresh_leaf(&self, path: &Path, provisioning_error: String) -> WorkspaceStorageError {
+        let leak = |cleanup_error: String| WorkspaceStorageError::UnrecoverableLeak {
+            path: path.to_path_buf(),
+            subvol_id: None,
+            provisioning_error: provisioning_error.clone(),
+            cleanup_error,
+        };
+        if let Err(e) = std::fs::remove_dir(path) {
+            return leak(format!("remove_dir of the fresh leaf failed: {e}"));
+        }
+        if let Err(e) = fsync_dir(&self.canonical_base) {
+            return leak(format!("fsync of the parent base after rollback failed: {e}"));
+        }
+        match exists_or_error(path) {
+            Ok(false) => WorkspaceStorageError::Io {
+                path: path.to_path_buf(),
+                reason: format!("{provisioning_error} (the fresh leaf was rolled back cleanly)"),
+            },
+            Ok(true) => leak("the leaf is STILL present after remove_dir + fsync".to_string()),
+            Err(e) => leak(format!("post-rollback absence re-check failed: {e}")),
+        }
+    }
+
+    /// The exact DELETE lifecycle: verify backend kind + canonical base + leaf name + no symlink +
+    /// exact `(device, inode)`; recursively remove the controlled test tree; `fsync` the parent
+    /// dir; re-check the leaf is absent; return `Ok` ONLY after absence is proven. ANY mismatch or
+    /// failure is [`WorkspaceStorageError::DirectoryAbsenceUnproven`] — "absence unproven," which
+    /// the manager/capsule path treats exactly like the Btrfs `DeleteFailed`/`SyncPending` (retain
+    /// capacity, poison/quarantine, refuse lease reuse), NEVER a clean settlement.
+    pub(crate) fn delete_workspace(
+        &mut self,
+        prepared: PreparedWorkspace,
+    ) -> Result<(), WorkspaceStorageError> {
+        assert_same_storage(&self.canonical_base, &prepared.minted_from)?;
+        let (device, inode) = directory_identity_or_backend_mismatch(&prepared.identity)?;
+        self.delete_verified(&prepared.host_path, device, inode)
+    }
+
+    /// Delete a directory orphan candidate — same verified, absence-proven delete.
+    pub(crate) fn delete_orphan(
+        &mut self,
+        candidate: OrphanCandidate,
+    ) -> Result<(), WorkspaceStorageError> {
+        assert_same_storage(&self.canonical_base, &candidate.minted_from)?;
+        let (device, inode) = directory_identity_or_backend_mismatch(&candidate.identity)?;
+        self.delete_verified(&candidate.path, device, inode)
+    }
+
+    /// The verified, absence-proven removal shared by [`Self::delete_workspace`]/
+    /// [`Self::delete_orphan`].
+    fn delete_verified(
+        &self,
+        leaf: &Path,
+        expected_device: u64,
+        expected_inode: u64,
+    ) -> Result<(), WorkspaceStorageError> {
+        use std::os::unix::fs::MetadataExt;
+        let unproven = |reason: String| WorkspaceStorageError::DirectoryAbsenceUnproven {
+            path: leaf.to_path_buf(),
+            reason,
+        };
+        // 1a. The leaf must be a DIRECT child of this backend's own canonical base.
+        if leaf.parent() != Some(self.canonical_base.as_path()) {
+            return Err(unproven(format!(
+                "leaf is not a direct child of the controlled base {:?}",
+                self.canonical_base
+            )));
+        }
+        // 1b. The leaf name must be a single safe path component.
+        let Some(name) = leaf.file_name().and_then(|n| n.to_str()) else {
+            return Err(unproven("leaf name is not a valid single component".to_string()));
+        };
+        if validate_job_id(name).is_err() {
+            return Err(unproven(format!("leaf name {name:?} is not a safe component")));
+        }
+        // 1c. No symlink; must be a directory; exact (device, inode).
+        let meta = std::fs::symlink_metadata(leaf)
+            .map_err(|e| unproven(format!("stat before delete: {e}")))?;
+        if meta.file_type().is_symlink() {
+            return Err(unproven("leaf is a symlink — refusing to delete".to_string()));
+        }
+        if !meta.is_dir() {
+            return Err(unproven("leaf is not a directory".to_string()));
+        }
+        if meta.dev() != expected_device || meta.ino() != expected_inode {
+            return Err(unproven(format!(
+                "leaf (device, inode) = ({}, {}) does not match the captured ({}, {})",
+                meta.dev(),
+                meta.ino(),
+                expected_device,
+                expected_inode
+            )));
+        }
+        // 2. Recursively remove the controlled test tree.
+        std::fs::remove_dir_all(leaf)
+            .map_err(|e| unproven(format!("recursive remove_dir_all: {e}")))?;
+        // 3. fsync the parent directory so the unlink is durable.
+        if let Err(e) = fsync_dir(&self.canonical_base) {
+            return Err(unproven(format!("fsync parent base dir after delete: {e}")));
+        }
+        // 4. Re-check the leaf is genuinely absent.
+        match exists_or_error(leaf) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(unproven(
+                "the leaf is STILL present after remove_dir_all + fsync".to_string(),
+            )),
+            Err(e) => Err(unproven(format!("post-delete absence re-check failed: {e}"))),
+        }
+    }
+
+    /// Boot reconciliation for this backend: every ordinary child DIRECTORY is an orphan candidate;
+    /// any file, symlink, or otherwise-malformed entry refuses LOUDLY
+    /// ([`WorkspaceStorageError::UnexpectedEntry`]) — never silently included or excluded — before
+    /// the active-set filter is applied.
+    pub(crate) fn list_orphaned_workspaces(
+        &mut self,
+        active_job_ids: &BTreeSet<String>,
+    ) -> Result<Vec<OrphanCandidate>, WorkspaceStorageError> {
+        use std::os::unix::fs::MetadataExt;
+        if !exists_or_error(&self.canonical_base)? {
+            return Ok(Vec::new());
+        }
+        let entries = std::fs::read_dir(&self.canonical_base).map_err(|e| {
+            WorkspaceStorageError::ListFailed {
+                base_dir: self.canonical_base.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+        let mut orphans = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| WorkspaceStorageError::ListFailed {
+                base_dir: self.canonical_base.clone(),
+                reason: e.to_string(),
+            })?;
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+                WorkspaceStorageError::UnexpectedEntry {
+                    path: path.clone(),
+                    reason: format!("stat: {e}"),
+                }
+            })?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(WorkspaceStorageError::UnexpectedEntry {
+                    path,
+                    reason: "not an ordinary directory (a file, symlink, or special entry)"
+                        .to_string(),
+                });
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // A malformed leaf name (not a safe component) is itself a loud refusal — the boot
+            // scanner never trusts an entry it would refuse to delete.
+            if validate_job_id(&name).is_err() {
+                return Err(WorkspaceStorageError::UnexpectedEntry {
+                    path,
+                    reason: format!("child directory name {name:?} is not a safe component"),
+                });
+            }
+            if active_job_ids.contains(&name) {
+                continue;
+            }
+            orphans.push(OrphanCandidate {
+                path,
+                identity: Box::new(WorkspaceIdentity::Directory {
+                    device: meta.dev(),
+                    inode: meta.ino(),
+                    // Orphan deletion never consults the quota; a boot orphan's original per-job
+                    // quota is unknown and irrelevant to proving its absence.
+                    quota_bytes: 0,
+                }),
+                minted_from: self.canonical_base.clone(),
+            });
+        }
+        Ok(orphans)
+    }
+}
+
+/// `fsync` a directory so a prior unlink under it is durable — the directory backend's crash
+/// boundary counterpart to the Btrfs `subvolume sync` (a much weaker guarantee, named honestly).
+#[cfg(any(test, feature = "test-support"))]
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    let file = std::fs::File::open(dir)?;
+    file.sync_all()
+}
+
+// ── The byte-accounted test-quota checked I/O, on the typed `Directory` capability itself ──
+
+#[cfg(any(test, feature = "test-support"))]
+impl PreparedWorkspace {
+    /// The recorded per-job byte-accounted test quota, if this is a directory-backed workspace.
+    pub(crate) fn directory_quota_bytes(&self) -> Option<u64> {
+        match self.identity.as_ref() {
+            WorkspaceIdentity::Directory { quota_bytes, .. } => Some(*quota_bytes),
+            WorkspaceIdentity::Btrfs { .. } => None,
+        }
+    }
+
+    /// Re-scan the total regular-file bytes currently under this workspace — the checkpoint the
+    /// caller re-runs at the controlled workload/cleanup boundaries.
+    pub(crate) fn scan_used_bytes(&self) -> Result<u64, WorkspaceStorageError> {
+        directory_identity_or_backend_mismatch(&self.identity)?;
+        scan_regular_file_bytes(&self.host_path)
+    }
+
+    /// The CHECKED byte-accounted test-quota write the substituted Hop B routes its sentinel
+    /// through: scan the current regular-file bytes, checked-add the incoming write (accounting for
+    /// overwriting an existing same-named file), and REFUSE ([`WorkspaceStorageError::DirectoryQuotaExceeded`])
+    /// BEFORE any mutation if it would exceed the per-job quota. `name` must be a single safe path
+    /// component (never a nested/escaping path). Arbitrary host writes cannot be kernel-blocked on a
+    /// plain dir — that acknowledged limitation is why this is a byte-accounted TEST quota, not the
+    /// production Btrfs hard qgroup quota.
+    pub(crate) fn checked_directory_write(
+        &self,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), WorkspaceStorageError> {
+        use std::os::unix::fs::MetadataExt;
+        directory_identity_or_backend_mismatch(&self.identity)?;
+        let quota_bytes = self
+            .directory_quota_bytes()
+            .expect("a directory identity always carries a quota");
+        // A single safe filename component: non-empty, <= 255 bytes, no path separator / NUL, and
+        // never `.`/`..` (a filename may contain a dot, unlike a job id — the sentinel is
+        // `checkout.sentinel`).
+        let safe_name = !file_name.is_empty()
+            && file_name.len() <= BTRFS_NAME_MAX
+            && !file_name.contains('/')
+            && !file_name.contains('\0')
+            && file_name != "."
+            && file_name != "..";
+        if !safe_name {
+            return Err(WorkspaceStorageError::Io {
+                path: self.host_path.join(file_name),
+                reason: format!("checked write name {file_name:?} is not a safe filename component"),
+            });
+        }
+        let target = self.host_path.join(file_name);
+        let used = scan_regular_file_bytes(&self.host_path)?;
+        // If overwriting an existing regular file, its current bytes are replaced, not added.
+        let existing = match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_file() => meta.size(),
+            _ => 0,
+        };
+        let would_be = used
+            .saturating_sub(existing)
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| WorkspaceStorageError::Io {
+                path: target.clone(),
+                reason: "byte-accounting overflow computing the post-write total".to_string(),
+            })?;
+        if would_be > quota_bytes {
+            return Err(WorkspaceStorageError::DirectoryQuotaExceeded {
+                path: target,
+                quota_bytes,
+                would_be_bytes: would_be,
+            });
+        }
+        std::fs::write(&target, bytes).map_err(|e| WorkspaceStorageError::Io {
+            path: target,
+            reason: format!("checked write: {e}"),
+        })
     }
 }
 
@@ -1295,6 +1957,38 @@ mod tests {
             matches!(err, WorkspaceStorageError::NotBtrfs { .. }),
             "a tmpfs directory must be refused as NotBtrfs, got {err:?}"
         );
+    }
+
+    /// CT-007 slice 5b.3-6e.1b (Sol blocker 2): when a fresh-leaf rollback CANNOT prove absence (the
+    /// `remove_dir` fails, e.g. because the leaf is non-empty), the error is an `UnrecoverableLeak`,
+    /// so the manager RETAINS capacity and poisons — never a recoverable `Io` that would release
+    /// capacity while a residual directory survives. Runs on any host (no Btrfs).
+    #[test]
+    fn directory_rollback_that_cannot_remove_the_leaf_is_an_unrecoverable_leak() {
+        let base = std::env::temp_dir().join(format!(
+            "myelin-dir-rollback-leak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let storage = DirectoryWorkspaceStorage::open(&base).expect("open directory backend");
+        let leaf = storage.base_dir().join("leaf");
+        std::fs::create_dir(&leaf).unwrap();
+        // A non-empty leaf makes `remove_dir` (empty-only) fail — the rollback cannot prove absence.
+        std::fs::write(leaf.join("occupant"), b"x").unwrap();
+        let err = storage.rollback_fresh_leaf(&leaf, "injected provisioning failure".to_string());
+        assert!(
+            matches!(err, WorkspaceStorageError::UnrecoverableLeak { .. }),
+            "a rollback that cannot remove the leaf is an UnrecoverableLeak, got {err:?}"
+        );
+        assert!(
+            leaf.exists(),
+            "the un-removable residual survives — surfaced via retain+poison, never a clean release"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn libc_enospc() -> i32 {

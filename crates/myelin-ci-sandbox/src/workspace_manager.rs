@@ -73,7 +73,11 @@
 //!   quietly starts provisioning real disk.
 
 use crate::dirlock::{fd_identity, path_identity};
-use crate::workspace_storage::{PreparedWorkspace, WorkspaceStorage, WorkspaceStorageError};
+use crate::workspace_storage::{
+    PreparedWorkspace, WorkspaceStorage, WorkspaceStorageBackend, WorkspaceStorageError,
+};
+#[cfg(any(test, feature = "test-support"))]
+use crate::workspace_storage::DirectoryWorkspaceStorage;
 use std::collections::BTreeSet;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -93,6 +97,19 @@ pub enum WorkspaceStorageMode {
     /// bytes concurrently leased across every in-flight job on this host — a per-job qgroup limit
     /// alone only bounds one job's own usage, not how many jobs may run at once.
     EphemeralDisk {
+        base_dir: PathBuf,
+        host_capacity_bytes: u64,
+    },
+    /// **CT-007 slice 5b.3-6e.1b (DORMANT / test-support only): the deterministic plain-directory
+    /// test substrate.** Provisions one plain directory per job under `base_dir` (no Btrfs, no
+    /// qgroup, no `CAP_SYS_ADMIN`/subuid), so the checkout-capsule lifecycle RUNS — not soft-skips —
+    /// on a host whose `/tmp` is tmpfs. `host_capacity_bytes` bounds the aggregate leased bytes
+    /// exactly as `EphemeralDisk` does (the manager's aggregate capacity accounting stays REAL); the
+    /// per-job limit becomes a byte-accounted TEST quota, deliberately not a hard quota. ABSENT from
+    /// ordinary builds and NOT representable through `GvisorWorkspaceConfig`, env config, or any
+    /// production composition root — a source pin keeps production construction at ZERO.
+    #[cfg(any(test, feature = "test-support"))]
+    DeterministicDirectoryForTests {
         base_dir: PathBuf,
         host_capacity_bytes: u64,
     },
@@ -388,7 +405,7 @@ impl std::error::Error for WorkspaceProvisionError {}
 /// this manager Healthy AND does this fit the ceiling" is always one atomic critical section
 /// (round 2's fix for the race round 1 had between an admission check and a capacity update).
 struct ManagerState {
-    storage: Option<WorkspaceStorage>,
+    storage: Option<WorkspaceStorageBackend>,
     admission: WorkspaceAdmission,
     /// Job ids with a currently-checked-out workspace — snapshotted for
     /// `list_orphaned_workspaces`'s active-set filter in a future (slice 3) periodic health pass.
@@ -629,6 +646,36 @@ impl ManagedWorkspace {
     }
 }
 
+/// CT-007 slice 5b.3-6e.1b: the byte-accounted test-quota checked I/O, exposed to the sealed
+/// checkout-capsule execution seam ONLY (`test-support`). Delegates to the workspace's private
+/// [`PreparedWorkspace`] typed `Directory` capability — the manager never lets a caller reach the
+/// capability itself, only these checked operations.
+#[cfg(any(test, feature = "test-support"))]
+impl ManagedWorkspace {
+    /// The substituted Hop B's checked sentinel write: scans + checked-adds regular-file bytes and
+    /// refuses an over-quota write BEFORE any mutation. Refuses on a non-directory-backed workspace
+    /// ([`WorkspaceStorageError::BackendMismatch`]).
+    pub(crate) fn checked_test_quota_write(
+        &self,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), WorkspaceStorageError> {
+        self.prepared
+            .as_ref()
+            .expect("checked_test_quota_write after this workspace was consumed by delete")
+            .checked_directory_write(file_name, bytes)
+    }
+
+    /// Re-scan the total regular-file bytes currently under this workspace — the checkpoint the seam
+    /// re-runs at the controlled workload/cleanup boundaries.
+    pub(crate) fn scan_used_bytes(&self) -> Result<u64, WorkspaceStorageError> {
+        self.prepared
+            .as_ref()
+            .expect("scan_used_bytes after this workspace was consumed by delete")
+            .scan_used_bytes()
+    }
+}
+
 impl Drop for ManagedWorkspace {
     fn drop(&mut self) {
         if !self.released {
@@ -681,72 +728,76 @@ impl WorkspaceManager {
         mode: WorkspaceStorageMode,
         incident_sink: IncidentSink,
     ) -> Result<Self, WorkspaceManagerError> {
-        match &mode {
-            WorkspaceStorageMode::Disabled => Ok(Self {
-                mode,
-                shared: Arc::new(SharedState {
-                    _lock: None,
-                    state: Mutex::new(ManagerState {
-                        storage: None,
-                        admission: WorkspaceAdmission::Healthy,
-                        active_job_ids: BTreeSet::new(),
-                        capacity_ceiling_bytes: 0,
-                        capacity_used_bytes: 0,
-                        locked_identity: None,
+        // The `Disabled` fast path performs no I/O; every ENABLED backend (Btrfs, or the dormant
+        // deterministic-directory test substrate) shares the SAME lock → identity → open →
+        // reconcile → health → admit sequence, differing only in which `WorkspaceStorageBackend`
+        // arm `open_enabled_backend` constructs.
+        let (base_dir, host_capacity_bytes) = match &mode {
+            WorkspaceStorageMode::Disabled => {
+                return Ok(Self {
+                    mode,
+                    shared: Arc::new(SharedState {
+                        _lock: None,
+                        state: Mutex::new(ManagerState {
+                            storage: None,
+                            admission: WorkspaceAdmission::Healthy,
+                            active_job_ids: BTreeSet::new(),
+                            capacity_ceiling_bytes: 0,
+                            capacity_used_bytes: 0,
+                            locked_identity: None,
+                        }),
+                        incident_sink,
                     }),
-                    incident_sink,
-                }),
-            }),
+                });
+            }
             WorkspaceStorageMode::EphemeralDisk {
                 base_dir,
                 host_capacity_bytes,
-            } => {
-                let lock = acquire_directory_lock(base_dir)?;
-                let locked_identity =
-                    fd_identity(&lock).map_err(|e| WorkspaceManagerError::LockFailed {
-                        base_dir: base_dir.clone(),
-                        reason: format!("fstat locked directory: {e}"),
-                    })?;
-                let shared = Arc::new(SharedState {
-                    _lock: Some(lock),
-                    state: Mutex::new(ManagerState {
-                        storage: None,
-                        admission: WorkspaceAdmission::Reconciling,
-                        active_job_ids: BTreeSet::new(),
-                        capacity_ceiling_bytes: *host_capacity_bytes,
-                        capacity_used_bytes: 0,
-                        locked_identity: Some(locked_identity),
-                    }),
-                    incident_sink,
-                });
-                let mut storage =
-                    WorkspaceStorage::open(base_dir).map_err(WorkspaceManagerError::Storage)?;
-                require_locked_identity(locked_identity, base_dir, storage.base_dir())?;
-                reconcile_orphans_at_boot(&mut storage).map_err(WorkspaceManagerError::Storage)?;
-                // Re-check identity BEFORE the post-reconciliation health check below, so that
-                // check is never run against the wrong path if something swapped underneath us
-                // during reconciliation.
-                require_locked_identity(locked_identity, base_dir, storage.base_dir())?;
-                // Boot-time orphan deletion is exactly the kind of operation
-                // `WorkspaceStorage::check_health`'s own doc warns can leave Btrfs quota
-                // inconsistent — `open()`'s original quota-enforcing check, taken before any
-                // deletion happened, does NOT prove quota is still enforcing now (Sol's round-5
-                // review). Re-validate in place before ever trusting this manager as `Healthy`.
-                storage
-                    .check_health()
-                    .map_err(WorkspaceManagerError::Storage)?;
-                // Identity may change during that external `check_health` call itself — one more
-                // recheck immediately before the ONLY point admission is ever allowed to become
-                // `Healthy`.
-                require_locked_identity(locked_identity, base_dir, storage.base_dir())?;
-                {
-                    let mut state = shared.lock_state();
-                    state.storage = Some(storage);
-                    state.admission = WorkspaceAdmission::Healthy;
-                }
-                Ok(Self { mode, shared })
-            }
+            } => (base_dir.clone(), *host_capacity_bytes),
+            #[cfg(any(test, feature = "test-support"))]
+            WorkspaceStorageMode::DeterministicDirectoryForTests {
+                base_dir,
+                host_capacity_bytes,
+            } => (base_dir.clone(), *host_capacity_bytes),
+        };
+        let lock = acquire_directory_lock(&base_dir)?;
+        let locked_identity = fd_identity(&lock).map_err(|e| WorkspaceManagerError::LockFailed {
+            base_dir: base_dir.clone(),
+            reason: format!("fstat locked directory: {e}"),
+        })?;
+        let shared = Arc::new(SharedState {
+            _lock: Some(lock),
+            state: Mutex::new(ManagerState {
+                storage: None,
+                admission: WorkspaceAdmission::Reconciling,
+                active_job_ids: BTreeSet::new(),
+                capacity_ceiling_bytes: host_capacity_bytes,
+                capacity_used_bytes: 0,
+                locked_identity: Some(locked_identity),
+            }),
+            incident_sink,
+        });
+        let mut storage = open_enabled_backend(&mode, &base_dir)?;
+        require_locked_identity(locked_identity, &base_dir, storage.base_dir())?;
+        reconcile_orphans_at_boot(&mut storage).map_err(WorkspaceManagerError::Storage)?;
+        // Re-check identity BEFORE the post-reconciliation health check below, so that check is
+        // never run against the wrong path if something swapped underneath us during reconciliation.
+        require_locked_identity(locked_identity, &base_dir, storage.base_dir())?;
+        // Boot-time orphan deletion is exactly the kind of operation `check_health`'s own doc warns
+        // can leave Btrfs quota inconsistent (Sol's round-5 review). Re-validate in place before
+        // ever trusting this manager as `Healthy`.
+        storage
+            .check_health()
+            .map_err(WorkspaceManagerError::Storage)?;
+        // Identity may change during that external `check_health` call itself — one more recheck
+        // immediately before the ONLY point admission is ever allowed to become `Healthy`.
+        require_locked_identity(locked_identity, &base_dir, storage.base_dir())?;
+        {
+            let mut state = shared.lock_state();
+            state.storage = Some(storage);
+            state.admission = WorkspaceAdmission::Healthy;
         }
+        Ok(Self { mode, shared })
     }
 
     /// Test-only constructor for the manager-STATE logic (admission, capacity leasing, poisoning)
@@ -833,7 +884,7 @@ impl WorkspaceManager {
     /// CALLER's own guard was still held for the sink call's entire duration despite a comment
     /// claiming otherwise. A reentrant sink would have deadlocked.
     pub fn check_health(&self) -> Result<(), WorkspaceManagerError> {
-        let WorkspaceStorageMode::EphemeralDisk { base_dir, .. } = &self.mode else {
+        let Some(base_dir) = enabled_base_dir(&self.mode) else {
             return Ok(());
         };
         let state = self.shared.lock_state();
@@ -853,7 +904,7 @@ impl WorkspaceManager {
             // as healthy (round 1 did — masking the invariant violation as an `Ok`).
             None => {
                 let error = WorkspaceManagerError::Storage(WorkspaceStorageError::Io {
-                    path: base_dir.clone(),
+                    path: base_dir.to_path_buf(),
                     reason: "internal invariant violated: an EphemeralDisk manager has no open \
                              WorkspaceStorage handle"
                         .to_string(),
@@ -1240,7 +1291,44 @@ impl std::error::Error for DeleteWorkspaceError {}
 /// returns to its caller), so every subvolume discovered under the base is necessarily an orphan
 /// left by a previous process instance. Each is deleted and synced; a `SyncPending` result is
 /// retried in place (a prior crash may have left a delete committed but its sync unfinished).
-fn reconcile_orphans_at_boot(storage: &mut WorkspaceStorage) -> Result<(), WorkspaceStorageError> {
+/// The base directory of an ENABLED mode (Btrfs or the dormant directory substrate), or `None` for
+/// `Disabled` — the two enabled modes share every identity/health check, keyed off this path.
+fn enabled_base_dir(mode: &WorkspaceStorageMode) -> Option<&Path> {
+    match mode {
+        WorkspaceStorageMode::Disabled => None,
+        WorkspaceStorageMode::EphemeralDisk { base_dir, .. } => Some(base_dir),
+        #[cfg(any(test, feature = "test-support"))]
+        WorkspaceStorageMode::DeterministicDirectoryForTests { base_dir, .. } => Some(base_dir),
+    }
+}
+
+/// Construct the [`WorkspaceStorageBackend`] the given ENABLED mode selects — the Btrfs primitive
+/// for `EphemeralDisk`, or the deterministic plain-directory substrate for the dormant
+/// `DeterministicDirectoryForTests`. `Disabled` never reaches here (its fast path returns before
+/// any backend is opened).
+fn open_enabled_backend(
+    mode: &WorkspaceStorageMode,
+    base_dir: &Path,
+) -> Result<WorkspaceStorageBackend, WorkspaceManagerError> {
+    match mode {
+        WorkspaceStorageMode::EphemeralDisk { .. } => Ok(WorkspaceStorageBackend::Btrfs(
+            WorkspaceStorage::open(base_dir).map_err(WorkspaceManagerError::Storage)?,
+        )),
+        #[cfg(any(test, feature = "test-support"))]
+        WorkspaceStorageMode::DeterministicDirectoryForTests { .. } => {
+            Ok(WorkspaceStorageBackend::DeterministicDirectoryForTests(
+                DirectoryWorkspaceStorage::open(base_dir).map_err(WorkspaceManagerError::Storage)?,
+            ))
+        }
+        WorkspaceStorageMode::Disabled => unreachable!(
+            "open_enabled_backend is only called for an enabled mode (Disabled returns earlier)"
+        ),
+    }
+}
+
+fn reconcile_orphans_at_boot(
+    storage: &mut WorkspaceStorageBackend,
+) -> Result<(), WorkspaceStorageError> {
     let empty_active_set = BTreeSet::new();
     let orphans = storage.list_orphaned_workspaces(&empty_active_set)?;
     for orphan in orphans {

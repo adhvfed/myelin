@@ -515,6 +515,21 @@ fn bind_mount_json(guest_dest: &str, host_source: &Path, readonly: bool) -> Stri
 }
 
 impl OciConfig {
+    /// CT-007 slice 5b.3-6e.1b (`test-support`): the host source path of this config's workspace
+    /// bind mount, if it has one. The deterministic checkout-capsule execution seam reads the
+    /// substituted Hop B sentinel through THIS path — the OCI-config-recorded mount source — and
+    /// asserts it equals the capsule's own workspace host path, proving Hop B and the workload
+    /// shared the one provenance workspace. `None` for any layout without a workspace mount.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn workspace_host_source_for_tests(&self) -> Option<&Path> {
+        match &self.layout {
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace { workspace, .. } => {
+                Some(&workspace.host_source)
+            }
+            _ => None,
+        }
+    }
+
     /// Build the OCI config from a job + its derived hardening profile (the same profile the
     /// Firecracker backend enforces — backend-independent).
     pub fn from_spec(spec: &JobSpec, profile: &HardeningProfile) -> OciConfig {
@@ -10305,6 +10320,14 @@ mod tests {
             "into_prepared_for_tests",
             "run_retained_workload_given",
         ];
+        // CT-007 slice 5b.3-6e.1b: the EXACT `#[cfg(any(test, feature = "test-support"))]`-only
+        // method inventory. The deterministic substituted-execution seam is gated for `test-support`
+        // (so the hardware-independent runsc-driver fixture can reach it), NOT `#[cfg(test)]` — so it
+        // is recognized as its OWN test-support surface and does NOT count against the FIVE-entry
+        // production accessor `ALLOWLIST`. Pinned exactly so a new test-support capsule method fails
+        // until reviewed.
+        const TEST_SUPPORT_METHODS: [&str; 1] =
+            ["execute_substituted_checkout_for_test_support"];
         // Closed-world (Sol's r5): the EXACT set of free functions permitted at module top level. Any
         // other free fn — even a private helper — is a violation until reviewed and added here.
         const ALLOWED_FREE_FNS: [&str; 1] = ["run_checkout_preparation_v2"];
@@ -10332,6 +10355,17 @@ mod tests {
         }
         fn is_private(vis: &syn::Visibility) -> bool {
             matches!(vis, syn::Visibility::Inherited)
+        }
+        /// Whether an item is gated `#[cfg(any(test, feature = "test-support"))]` (or
+        /// `#[cfg(feature = "test-support")]`) — the test-support EXECUTION seam, distinct from the
+        /// `#[cfg(test)]`-only driver impl. Detected by the `test-support` feature token inside a
+        /// `cfg(...)` attribute; recognized as its own inventory so it never counts against the
+        /// five-entry production accessor surface.
+        fn is_cfg_test_support(attrs: &[syn::Attribute]) -> bool {
+            attrs.iter().any(|a| {
+                a.path().is_ident("cfg")
+                    && matches!(&a.meta, syn::Meta::List(list) if list.tokens.to_string().contains("test-support"))
+            })
         }
         /// A human name for a forbidden top-level item kind (for the closed-world violation message).
         fn describe_item(item: &syn::Item) -> String {
@@ -10387,6 +10421,7 @@ mod tests {
         // allowlist and failing, rather than collapsing into one set entry.
         let mut accessor_surface: Vec<String> = Vec::new();
         let mut test_method_names: Vec<String> = Vec::new();
+        let mut test_support_method_names: Vec<String> = Vec::new();
         let mut free_fn_names: Vec<String> = Vec::new();
         let mut struct_names: Vec<String> = Vec::new();
 
@@ -10486,6 +10521,7 @@ mod tests {
                     match type_last_ident(&im.self_ty).as_deref() {
                         Some(name) if CAPSULES.contains(&name) => {
                             let test_only = is_cfg_test(&im.attrs);
+                            let test_support_only = is_cfg_test_support(&im.attrs);
                             for it in &im.items {
                                 match it {
                                     syn::ImplItem::Fn(m) => {
@@ -10494,6 +10530,13 @@ mod tests {
                                             // excluded from the production accessor surface — but its
                                             // method set is pinned EXACTLY (see `TEST_METHODS`).
                                             test_method_names.push(m.sig.ident.to_string());
+                                        } else if test_support_only {
+                                            // CT-007 slice 5b.3-6e.1b: the whole `#[cfg(any(test,
+                                            // feature = "test-support"))]` impl is likewise excluded
+                                            // from the production accessor surface, inventoried
+                                            // separately (see `TEST_SUPPORT_METHODS`) so the FIVE-entry
+                                            // production surface is unchanged.
+                                            test_support_method_names.push(m.sig.ident.to_string());
                                         } else if !is_private(&m.vis) {
                                             accessor_surface
                                                 .push(format!("{name}::{}", m.sig.ident));
@@ -10562,6 +10605,13 @@ mod tests {
             "the checkout_runtime module's `#[cfg(test)]`-only method set changed — every test-only \
              capsule method (the session driver, the into_prepared transition, the workload _given \
              seam) must be an explicitly-reviewed entry, counted with multiplicity"
+        );
+        assert_eq!(
+            sorted(test_support_method_names),
+            sorted(TEST_SUPPORT_METHODS.iter().map(|s| s.to_string()).collect()),
+            "the checkout_runtime module's `test-support`-only method set changed — the deterministic \
+             substituted-execution seam must be an explicitly-reviewed entry, counted with \
+             multiplicity, and it must NOT appear in the five-entry production accessor ALLOWLIST"
         );
     }
 
@@ -21040,4 +21090,720 @@ mod tests {
 
         }
     }
+
+    // ══════════ CT-007 slice 5b.3-6e.1b: the 8 mandatory deterministic-substrate tests ══════════
+    //
+    // These RUN (never soft-skip) given a NON-root user + a writable tmp base dir — no
+    // Btrfs/CAP_SYS_ADMIN/subuid/KVM/runsc. Everything they touch is `#[cfg(any(test,
+    // feature = "test-support"))]`, so they compile+run under `--lib` AND `--lib --features
+    // test-support`.
+    mod deterministic_substrate_6e1b {
+        use super::super::{
+            acquire_enabled_workspace, classify_workspace_deletion,
+            deterministic_userns_allocator_for_tests, deterministic_workspace_manager_for_tests,
+            run_substituted_checkout_success, settle_enabled_workspace_and_lease,
+            substitute_checkout_spec, unique_suffix, CgroupQuiescenceEvidence, LeaseBindState,
+            RuntimeNamespaceQuiescence, RuntimeQuiescenceEvidence, WorkspaceDeletionOutcome,
+        };
+        use crate::user_namespace::{
+            CheckoutPreparationSession, PreparationQuiescenceProof, UserNamespaceQuiescenceProof,
+        };
+        use crate::workspace_manager::{
+            DeleteWorkspaceError, WorkspaceAdmission, WorkspaceManagerError, WorkspaceProvisionError,
+        };
+        use crate::workspace_storage::{
+            DirectoryWorkspaceStorage, PreparedWorkspace, WorkspaceStorageError,
+        };
+        use std::path::PathBuf;
+
+        fn temp_root(tag: &str) -> PathBuf {
+            let root = std::env::temp_dir().join(format!(
+                "myelin-6e1b-{tag}-{}-{}",
+                std::process::id(),
+                unique_suffix()
+            ));
+            std::fs::create_dir_all(&root).expect("mk temp root");
+            root
+        }
+
+        fn open_directory_backend(tag: &str) -> (DirectoryWorkspaceStorage, PathBuf) {
+            let base = temp_root(tag).join("dir-backend");
+            std::fs::create_dir_all(&base).expect("mk base");
+            let backend = DirectoryWorkspaceStorage::open(&base)
+                .expect("directory backend opens over an exclusively-owned dir");
+            let canonical = backend.base_dir().to_path_buf();
+            (backend, canonical)
+        }
+
+        // ── Test 1: directory create → checked sentinel write/read → delete → proven absence. ──
+        #[test]
+        fn directory_create_write_read_delete_absence() {
+            let base = temp_root("t1").join("workspace");
+            std::fs::create_dir_all(&base).unwrap();
+            let wm = deterministic_workspace_manager_for_tests(base.clone(), 1 << 30).unwrap();
+            let cap = wm.acquire_capacity(1 << 20).expect("capacity");
+            let ws = wm
+                .create_workspace("job-t1", 1 << 20, 0, 0, cap)
+                .expect("create directory workspace");
+            let host = ws.host_path().to_path_buf();
+            assert!(host.is_dir(), "a fresh leaf directory exists");
+            ws.checked_test_quota_write("checkout.sentinel", b"provenance")
+                .expect("the checked byte-accounted write succeeds under quota");
+            assert_eq!(
+                std::fs::read(host.join("checkout.sentinel")).unwrap(),
+                b"provenance",
+                "the sentinel reads back byte-identical"
+            );
+            // An over-quota checked write refuses BEFORE mutating.
+            let refusal = ws.checked_test_quota_write("huge", &vec![0u8; (1 << 20) + 1]);
+            assert!(
+                matches!(refusal, Err(WorkspaceStorageError::DirectoryQuotaExceeded { .. })),
+                "an over-quota checked write refuses, got {refusal:?}"
+            );
+            assert!(
+                !host.join("huge").exists(),
+                "the refused over-quota write left nothing behind"
+            );
+            wm.delete_workspace(ws).expect("delete proves absence");
+            assert!(!host.exists(), "the leaf is gone after a proven-absence delete");
+            assert_eq!(wm.capacity_used_bytes(), 0, "capacity released after delete");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        // ── Test 2: capacity leased, exhausted, released, then reusable — real aggregate accounting. ──
+        #[test]
+        fn capacity_leased_then_released_and_reusable() {
+            let base = temp_root("t2").join("workspace");
+            std::fs::create_dir_all(&base).unwrap();
+            let wm = deterministic_workspace_manager_for_tests(base.clone(), 4 << 20).unwrap();
+            let cap = wm.acquire_capacity(4 << 20).expect("lease the whole ceiling");
+            assert_eq!(wm.capacity_used_bytes(), 4 << 20);
+            // Ceiling exhausted: a further request is refused (REAL aggregate accounting).
+            assert!(wm.acquire_capacity(1).is_err(), "the ceiling is exhausted");
+            let ws = wm
+                .create_workspace("job-t2", 4 << 20, 0, 0, cap)
+                .expect("create consumes the lease");
+            wm.delete_workspace(ws).expect("delete releases the capacity");
+            assert_eq!(wm.capacity_used_bytes(), 0, "capacity fully returned");
+            // Reusable: the freed ceiling admits a fresh lease.
+            let again = wm.acquire_capacity(4 << 20).expect("reuse the freed ceiling");
+            again.release();
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        // ── Test 3: the REAL userns preparation/bind/workload/release transitions, deterministically. ──
+        #[test]
+        fn real_userns_preparation_bind_workload_release_transitions() {
+            let base = temp_root("t3").join("userns");
+            std::fs::create_dir_all(&base).unwrap();
+            let alloc = deterministic_userns_allocator_for_tests(&base, 1)
+                .expect("a NON-root user builds the fixture allocator");
+            let mut lease = alloc.lease().expect("a fresh pool leases");
+            let mut session = CheckoutPreparationSession::new();
+            let (prep_root, prep_cgroup) = ((1_u64, 2_u64), (3_u64, 4_u64));
+            session
+                .bind_preparation(&mut lease, "c-prep".to_string(), prep_root, prep_cgroup)
+                .expect("Allocated -> PreparationBound");
+            let prep_ev = RuntimeQuiescenceEvidence::assert_for_tests(
+                "c-prep".to_string(),
+                RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: prep_root,
+                },
+                CgroupQuiescenceEvidence::assert_for_tests(prep_cgroup),
+            );
+            let prep_proof = PreparationQuiescenceProof::from_runtime_evidence(&lease, &prep_ev)
+                .expect("a matching prep evidence mints a proof");
+            session
+                .confirm_prepared(&mut lease, prep_proof)
+                .expect("PreparationBound -> Prepared");
+            let (wl_root, wl_cgroup) = ((5_u64, 6_u64), (7_u64, 8_u64));
+            session
+                .bind_workload(&mut lease, "c-workload".to_string(), wl_root, wl_cgroup)
+                .expect("Prepared -> Bound");
+            let wl_ev = RuntimeQuiescenceEvidence::assert_for_tests(
+                "c-workload".to_string(),
+                RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: wl_root,
+                },
+                CgroupQuiescenceEvidence::assert_for_tests(wl_cgroup),
+            );
+            let proof = UserNamespaceQuiescenceProof::from_runtime_evidence(&lease, &wl_ev)
+                .expect("the workload evidence mints a release proof");
+            lease.release(proof).expect("release with a matching proof");
+            assert!(alloc.is_healthy(), "the allocator stays healthy");
+            // Probe reusability WITHOUT poisoning: acquire then `release_unused` (never drop an
+            // unreleased probe lease — that would emit a quarantine incident and poison the
+            // allocator this test claims stays clean).
+            let probe = alloc.lease().expect("the slot is reusable after release");
+            probe
+                .release_unused()
+                .expect("the probe lease releases cleanly");
+            assert!(alloc.is_healthy(), "the allocator is STILL clean after the probe");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        // ── Test 4: the FULL capsule fake-Hop-B / fake-workload → real settle/delete. ──
+        #[test]
+        fn full_capsule_substituted_hopb_and_workload_then_real_settle() {
+            let root = temp_root("t4");
+            let (obs, wm, workspace_base, alloc, userns_base) =
+                run_substituted_checkout_success(&root, "checkout.sentinel", b"shared-provenance");
+            assert!(obs.hopb_write_ok, "the checked Hop B sentinel write succeeded");
+            assert!(
+                obs.used_after_hopb >= "shared-provenance".len() as u64,
+                "the byte-accounted checkpoint saw Hop B's bytes: {}",
+                obs.used_after_hopb
+            );
+            assert_eq!(
+                obs.used_at_workload_checkpoint, obs.used_after_hopb,
+                "the re-scan at the workload checkpoint agrees"
+            );
+            assert!(
+                obs.mount_source_matched_workspace,
+                "the retained OCI mount source equals the capsule workspace host path"
+            );
+            assert!(
+                obs.sentinel_read_through_mount,
+                "the substituted workload read the sentinel THROUGH the OCI-recorded mount"
+            );
+            assert!(obs.settled_ok, "the real settle tail succeeded: {:?}", obs.settle_error);
+            // Step 8: durable state.
+            let child_dirs = std::fs::read_dir(&workspace_base)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().is_dir())
+                .count();
+            assert_eq!(child_dirs, 0, "the workspace leaf was deleted by settle");
+            assert_eq!(wm.capacity_used_bytes(), 0, "capacity zero after settle");
+            assert!(wm.is_healthy(), "the workspace manager stays healthy");
+            assert!(alloc.is_healthy(), "the userns allocator stays healthy");
+            // Probe reusability WITHOUT poisoning (release the probe lease, never drop it unreleased).
+            let probe = alloc.lease().expect("the userns slot is reusable");
+            probe
+                .release_unused()
+                .expect("the probe lease releases cleanly");
+            assert!(alloc.is_healthy(), "the allocator is STILL clean after the probe");
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            let _ = std::fs::remove_dir_all(&userns_base);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ── Test 5: wrong backend / wrong base / wrong inode / symlink substitution refuse w/o delete. ──
+        #[test]
+        fn cross_backend_base_inode_and_symlink_substitutions_refuse_without_deleting() {
+            // (a) A Btrfs-identity capability handed to the directory backend → BackendMismatch.
+            let (mut backend, canonical) = open_directory_backend("t5a");
+            let btrfs_cap = PreparedWorkspace::for_tests(canonical.join("x"), 42, canonical.clone());
+            assert!(
+                matches!(
+                    backend.delete_workspace(btrfs_cap),
+                    Err(WorkspaceStorageError::BackendMismatch { .. })
+                ),
+                "a Btrfs capability is refused by the directory backend"
+            );
+
+            // (b) A directory capability from base A refused by a backend over base B → WrongStorage.
+            let (mut backend_a, _) = open_directory_backend("t5b-a");
+            let (mut backend_b, _) = open_directory_backend("t5b-b");
+            let ws_a = backend_a.create_workspace("job", 1 << 20, 0, 0).unwrap();
+            let leaf_a = ws_a.host_path().to_path_buf();
+            assert!(
+                matches!(
+                    backend_b.delete_workspace(ws_a),
+                    Err(WorkspaceStorageError::WrongStorage { .. })
+                ),
+                "backend B refuses backend A's capability"
+            );
+            assert!(leaf_a.exists(), "the refused wrong-base delete removed nothing");
+            backend_a
+                .list_orphaned_workspaces(&std::collections::BTreeSet::new())
+                .and_then(|orphans| {
+                    orphans
+                        .into_iter()
+                        .try_for_each(|o| backend_a.delete_orphan(o))
+                })
+                .unwrap();
+
+            // (c) Inode substitution: replace the leaf with a fresh dir (new inode) → absence unproven.
+            let (mut backend_c, _) = open_directory_backend("t5c");
+            let ws_c = backend_c.create_workspace("job", 1 << 20, 0, 0).unwrap();
+            let leaf_c = ws_c.host_path().to_path_buf();
+            std::fs::remove_dir_all(&leaf_c).unwrap();
+            std::fs::create_dir(&leaf_c).unwrap(); // a DIFFERENT inode at the same name.
+            assert!(
+                matches!(
+                    backend_c.delete_workspace(ws_c),
+                    Err(WorkspaceStorageError::DirectoryAbsenceUnproven { .. })
+                ),
+                "an inode-substituted leaf refuses deletion (absence unproven)"
+            );
+            assert!(leaf_c.exists(), "the substituted replacement dir was NOT deleted");
+
+            // (d) Symlink substitution: replace the leaf with a symlink → absence unproven, not followed.
+            let (mut backend_d, _) = open_directory_backend("t5d");
+            let ws_d = backend_d.create_workspace("job", 1 << 20, 0, 0).unwrap();
+            let leaf_d = ws_d.host_path().to_path_buf();
+            let decoy = leaf_d.with_file_name("decoy-target");
+            std::fs::create_dir(&decoy).unwrap();
+            std::fs::write(decoy.join("keep"), b"do not delete").unwrap();
+            std::fs::remove_dir_all(&leaf_d).unwrap();
+            std::os::unix::fs::symlink(&decoy, &leaf_d).unwrap();
+            assert!(
+                matches!(
+                    backend_d.delete_workspace(ws_d),
+                    Err(WorkspaceStorageError::DirectoryAbsenceUnproven { .. })
+                ),
+                "a symlink-substituted leaf refuses deletion"
+            );
+            assert!(
+                decoy.join("keep").exists(),
+                "the symlink was never followed — the decoy target is intact"
+            );
+        }
+
+        // ── Test 6: an injected delete failure retains capacity, poisons the manager, and the
+        //           absence-unproven outcome is what leaves a paired userns lease unreleased. ──
+        #[test]
+        fn injected_delete_failure_retains_capacity_and_poisons_the_manager() {
+            let base = temp_root("t6").join("workspace");
+            std::fs::create_dir_all(&base).unwrap();
+            let wm = deterministic_workspace_manager_for_tests(base.clone(), 1 << 30).unwrap();
+            let cap = wm.acquire_capacity(1 << 20).unwrap();
+            let ws = wm.create_workspace("job-t6", 1 << 20, 0, 0, cap).unwrap();
+            let host = ws.host_path().to_path_buf();
+            // Inject the failure: swap the leaf for a different-inode dir so the verified delete
+            // cannot prove absence.
+            std::fs::remove_dir_all(&host).unwrap();
+            std::fs::create_dir(&host).unwrap();
+            let result = wm.delete_workspace(ws);
+            assert!(
+                matches!(result, Err(DeleteWorkspaceError::Storage(_))),
+                "the delete surfaced a storage failure, got {result:?}"
+            );
+            assert!(
+                matches!(wm.admission(), WorkspaceAdmission::Poisoned { .. }),
+                "an absence-unproven delete poisons the manager"
+            );
+            assert_eq!(
+                wm.capacity_used_bytes(),
+                1 << 20,
+                "capacity is RETAINED (never silently freed) on an unproven delete"
+            );
+            // The SAME absence-unproven storage error is what the settle path classifies as
+            // NotProvenAbsent → the paired userns lease is left unreleased (never reissued).
+            let outcome = classify_workspace_deletion(Err(DeleteWorkspaceError::Storage(
+                WorkspaceStorageError::DirectoryAbsenceUnproven {
+                    path: host.clone(),
+                    reason: "injected".to_string(),
+                },
+            )));
+            assert!(
+                matches!(outcome, WorkspaceDeletionOutcome::NotProvenAbsent { .. }),
+                "an unproven delete leaves the userns lease unreleased/quarantined"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        // ── Test 7: boot orphan reconciliation deletes stray child dirs, refuses non-dir entries. ──
+        #[test]
+        fn boot_orphan_reconciliation_deletes_orphans_and_refuses_malformed_entries() {
+            // (a) Pre-seed orphan child dirs; construction reconciles them away and admits Healthy.
+            let base = temp_root("t7-ok").join("workspace");
+            std::fs::create_dir_all(base.join("orphan-a")).unwrap();
+            std::fs::create_dir_all(base.join("orphan-b")).unwrap();
+            std::fs::write(base.join("orphan-a").join("junk"), b"stale").unwrap();
+            let wm = deterministic_workspace_manager_for_tests(base.clone(), 1 << 30)
+                .expect("construction reconciles orphans");
+            assert!(matches!(wm.admission(), WorkspaceAdmission::Healthy));
+            let remaining = std::fs::read_dir(&base).unwrap().filter_map(Result::ok).count();
+            assert_eq!(remaining, 0, "every boot orphan was deleted before admission");
+            drop(wm);
+            let _ = std::fs::remove_dir_all(&base);
+
+            // (b) A stray FILE (not a directory) refuses construction LOUDLY.
+            let base2 = temp_root("t7-bad").join("workspace");
+            std::fs::create_dir_all(&base2).unwrap();
+            std::fs::write(base2.join("not-a-dir"), b"stray").unwrap();
+            let result = deterministic_workspace_manager_for_tests(base2.clone(), 1 << 30);
+            assert!(
+                matches!(
+                    result,
+                    Err(WorkspaceManagerError::Storage(
+                        WorkspaceStorageError::UnexpectedEntry { .. }
+                    ))
+                ),
+                "a non-directory boot entry is a loud UnexpectedEntry refusal"
+            );
+            drop(result);
+            let _ = std::fs::remove_dir_all(&base2);
+        }
+
+        // ── Test 8: ordinary-build + production-composition-root pins — the mode/seams are unreachable. ──
+        #[test]
+        fn ordinary_build_and_production_root_pins() {
+            const WORKSPACE_MANAGER_SOURCE: &str = include_str!("workspace_manager.rs");
+            const WORKSPACE_STORAGE_SOURCE: &str = include_str!("workspace_storage.rs");
+            const USER_NAMESPACE_SOURCE: &str = include_str!("user_namespace.rs");
+
+            // Production composition in gvisor.rs NEVER names the dormant mode (the GvisorWorkspaceConfig
+            // -> EphemeralDisk mapping is the only production selector).
+            assert_eq!(
+                super::production_source()
+                    .matches("DeterministicDirectoryForTests")
+                    .count(),
+                0,
+                "no production gvisor path constructs the deterministic-directory mode"
+            );
+
+            // The mode variant is cfg-gated (absent from ordinary builds).
+            assert!(
+                WORKSPACE_MANAGER_SOURCE.contains(
+                    "#[cfg(any(test, feature = \"test-support\"))]\n    DeterministicDirectoryForTests {"
+                ),
+                "the DeterministicDirectoryForTests mode variant is test/test-support gated"
+            );
+            // The whole directory backend + typed identity + checked quota is cfg-gated.
+            assert!(
+                WORKSPACE_STORAGE_SOURCE.contains(
+                    "#[cfg(any(test, feature = \"test-support\"))]\n#[derive(Debug)]\npub(crate) struct DirectoryWorkspaceStorage"
+                ),
+                "the directory backend struct is test/test-support gated"
+            );
+            // The userns fixture constructor was widened to test-support (NOT relaxed for production).
+            assert!(
+                USER_NAMESPACE_SOURCE.contains(
+                    "#[cfg(any(test, feature = \"test-support\"))]\n    pub(crate) fn try_new_for_tests("
+                ),
+                "try_new_for_tests is test/test-support gated, never a production constructor"
+            );
+            // The production userns constructor is fixed to /etc/subuid — never an arbitrary path.
+            assert!(
+                USER_NAMESPACE_SOURCE.contains("pub fn try_new(")
+                    && USER_NAMESPACE_SOURCE.contains("Path::new(\"/etc/subuid\")"),
+                "the production allocator constructor stays pinned to /etc/subuid"
+            );
+        }
+
+        // ── Test 9 (Sol blocker 2): an injected create failure (an untracked pre-existing leaf)
+        //   is an UnrecoverableLeak → capacity RETAINED + manager poisoned. A residual directory can
+        //   NEVER coexist with healthy admission + released capacity. ──
+        #[test]
+        fn injected_create_failure_retains_capacity_and_poisons_without_a_healthy_residual() {
+            let base = temp_root("t9").join("workspace");
+            std::fs::create_dir_all(&base).unwrap();
+            let wm = deterministic_workspace_manager_for_tests(base.clone(), 1 << 30).unwrap();
+            // Inject the failure: plant an untracked residual leaf at the job key AFTER boot
+            // reconciliation (the manager canonicalizes its base, so match that).
+            let canonical = std::fs::canonicalize(&base).unwrap();
+            std::fs::create_dir(canonical.join("job-t9")).unwrap();
+            let cap = wm.acquire_capacity(1 << 20).unwrap();
+            let result = wm.create_workspace("job-t9", 1 << 20, 0, 0, cap);
+            assert!(
+                matches!(
+                    result,
+                    Err(WorkspaceProvisionError::Storage(
+                        WorkspaceStorageError::UnrecoverableLeak { .. }
+                    ))
+                ),
+                "a pre-existing untracked leaf is an UnrecoverableLeak, got {result:?}"
+            );
+            assert!(
+                matches!(wm.admission(), WorkspaceAdmission::Poisoned { .. }),
+                "the manager is poisoned (NOT healthy) while the residual survives"
+            );
+            assert_eq!(
+                wm.capacity_used_bytes(),
+                1 << 20,
+                "capacity is RETAINED — never released while a residual directory exists"
+            );
+            assert!(
+                canonical.join("job-t9").exists(),
+                "the residual leaf is still present — surfaced via poison, not silently released"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        // ── Test 10 (Sol blocker 3): a REAL paired userns lease driven through the ACTUAL
+        //   settlement branch with an injected workspace-delete failure — the lease is NOT released
+        //   (quarantined), so the pool-1 slot cannot be reissued. ──
+        #[test]
+        fn injected_delete_failure_quarantines_the_paired_userns_lease() {
+            let root = temp_root("t10");
+            let workspace_base = root.join("workspace");
+            let userns_base = root.join("userns");
+            std::fs::create_dir_all(&workspace_base).unwrap();
+            std::fs::create_dir_all(&userns_base).unwrap();
+            let wm = deterministic_workspace_manager_for_tests(workspace_base.clone(), 1 << 30)
+                .unwrap();
+            let alloc = deterministic_userns_allocator_for_tests(&userns_base, 1).unwrap();
+            let spec = substitute_checkout_spec();
+            let profile = crate::hardening::HardeningProfile::derive(&spec);
+            let container_id = "job-t10-workload";
+            let (_cfg, mut ctx) = acquire_enabled_workspace(
+                &spec,
+                &profile,
+                container_id,
+                PathBuf::from("/abs/staged-rootfs"),
+                &wm,
+                &alloc,
+            )
+            .expect("acquire a real paired workspace + userns lease");
+            // Durably bind the lease (Allocated -> Bound) and record the Bound state settle validates.
+            let (root_id, cgroup_id) = ((5_u64, 6_u64), (7_u64, 8_u64));
+            ctx.lease
+                .bind(container_id.to_string(), root_id, cgroup_id)
+                .expect("bind the lease to a workload runtime");
+            ctx.bind_state = LeaseBindState::Bound {
+                container_id: container_id.to_string(),
+                runsc_root_identity: root_id,
+                cgroup_identity: cgroup_id,
+            };
+            // Inject the delete failure: swap the workspace leaf for a different-inode dir.
+            let host = ctx.workspace.host_path().to_path_buf();
+            std::fs::remove_dir_all(&host).unwrap();
+            std::fs::create_dir(&host).unwrap();
+            let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
+                container_id.to_string(),
+                RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                    runsc_root_identity: root_id,
+                },
+                CgroupQuiescenceEvidence::assert_for_tests(cgroup_id),
+            );
+            let result = settle_enabled_workspace_and_lease(ctx, &wm, &evidence);
+            assert!(
+                result.is_err(),
+                "an unproven workspace delete makes the paired settlement fail"
+            );
+            assert!(
+                matches!(wm.admission(), WorkspaceAdmission::Poisoned { .. }),
+                "the workspace manager is poisoned by the unproven delete"
+            );
+            assert_eq!(
+                wm.capacity_used_bytes(),
+                1 << 30,
+                "workspace capacity is retained on the unproven delete"
+            );
+            // The paired userns lease was NEVER released — quarantined. The pool-1 slot is gone.
+            assert!(
+                alloc.lease().is_err(),
+                "the quarantined userns slot CANNOT be reissued after an unproven delete"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+}
+
+// ═════════════════ CT-007 slice 5b.3-6e.1b: the deterministic checkout-capsule substrate ═════════
+//
+// test-support ONLY. Appended AFTER the top-level `#[cfg(test)] mod tests` block so it is excluded
+// from `production_source()` — its `AcquiredCheckoutRuntime::acquire(` call therefore never counts
+// against the composition-root-zero pin (which scans `production_source()` only). Every item here is
+// gated `#[cfg(any(test, feature = "test-support"))]`: ABSENT from ordinary builds. Nothing here is
+// reachable from any production composition root.
+
+/// Owned observations from the deterministic substituted-execution seam — the facts a caller cannot
+/// see for itself (Hop B's checked write, the byte-accounted checkpoints, the OCI-mounted sentinel
+/// round-trip, and the real-settle outcome). It carries NO workspace path, lease, session,
+/// `OciConfig`, or evidence.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+#[allow(dead_code)] // fields are read by the in-lib 6e.1b tests; the non-test build only constructs it.
+pub(crate) struct SubstitutedCheckoutObservation {
+    pub(crate) hopb_write_ok: bool,
+    pub(crate) used_after_hopb: u64,
+    pub(crate) used_at_workload_checkpoint: u64,
+    pub(crate) mount_source_matched_workspace: bool,
+    pub(crate) sentinel_read_through_mount: bool,
+    pub(crate) settled_ok: bool,
+    pub(crate) settle_error: Option<String>,
+}
+
+/// A deterministic stand-in for the substituted workload's spawned `runsc` child: teardown
+/// (`kill`/`wait`) is a clean no-op success.
+#[cfg(any(test, feature = "test-support"))]
+struct SubstituteWorkloadChild;
+
+#[cfg(any(test, feature = "test-support"))]
+impl RunscChild for SubstituteWorkloadChild {
+    fn kill(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn wait(&mut self) -> Result<i32, String> {
+        Ok(0)
+    }
+}
+
+/// Fabricate the already-`Finalized` envelope a successful workload run hands back, carrying the
+/// supplied (matching) workload quiescence `evidence` + a clean exit-0 result. This is the ONLY
+/// substituted runtime execution; the settle tail it feeds is REAL.
+#[cfg(any(test, feature = "test-support"))]
+fn finalized_for_test_support(
+    evidence: RuntimeQuiescenceEvidence,
+) -> RuntimeFinalization<Result<ContainerRun, RunFailure>> {
+    RuntimeFinalization::Finalized(FinalizedRun {
+        primary: Ok(ContainerRun {
+            child: Box::new(SubstituteWorkloadChild),
+            bundle_dir: std::env::temp_dir()
+                .join("myelin-substituted-checkout-fake-bundle-does-not-exist"),
+            result: SandboxResult::stub_ok(crate::ResourceUsage {
+                cpu_seconds: 3,
+                mem_byte_seconds: 7,
+            }),
+            run_error: None,
+        }),
+        evidence,
+    })
+}
+
+/// A checkout-bearing `JobSpec` for the deterministic substrate (repo_ref + commit present, so it
+/// derives a checkout scope). No real registry/rootfs is consulted — `acquire` builds the OCI layout
+/// from the spec + a synthetic absolute rootfs path.
+#[cfg(any(test, feature = "test-support"))]
+fn substitute_checkout_spec() -> crate::JobSpec {
+    crate::JobSpec::new(
+        crate::JobKind::Ci,
+        crate::ImageRef::pinned(format!("test.local/substrate@sha256:{}", "a".repeat(64))).unwrap(),
+        vec!["true".into()],
+        vec![],
+        vec![],
+        crate::EgressPolicy { allow: vec![] },
+        crate::ResourceLimits {
+            cpu_millis: 1000,
+            mem_bytes: 256 << 20,
+            disk_bytes: 1 << 30,
+            tmpfs_bytes: 1 << 30,
+            pids_max: 64,
+            timeout_secs: 120,
+        },
+        crate::WorkspaceSpec {
+            repo_ref: Some("myelin://acme/git/repo/widgets".to_string()),
+            commit: Some("a".repeat(40)),
+        },
+        crate::TrustTier::UntrustedFork,
+        crate::RunTokenCredential::new("test-bearer", "j", 300).unwrap(),
+        crate::MeterTarget {
+            reserve_id: "r".into(),
+        },
+        crate::IdemToken("idem-6e1b".into()),
+    )
+    .unwrap()
+}
+
+/// Build a deterministic-directory [`WorkspaceManager`](crate::workspace_manager::WorkspaceManager)
+/// under `base_dir` — the dormant `DeterministicDirectoryForTests` mode. No Btrfs / `CAP_SYS_ADMIN`.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn deterministic_workspace_manager_for_tests(
+    base_dir: std::path::PathBuf,
+    host_capacity_bytes: u64,
+) -> Result<crate::workspace_manager::WorkspaceManager, crate::workspace_manager::WorkspaceManagerError>
+{
+    let sink: crate::workspace_manager::IncidentSink =
+        std::sync::Arc::new(|msg: &str| eprintln!("[6e.1b workspace incident] {msg}"));
+    crate::workspace_manager::WorkspaceManager::try_new(
+        crate::workspace_manager::WorkspaceStorageMode::DeterministicDirectoryForTests {
+            base_dir,
+            host_capacity_bytes,
+        },
+        sink,
+    )
+}
+
+/// Build a deterministic userns allocator from FIXTURE `subuid`/`subgid` files written under
+/// `base_dir` (so it NEVER depends on this host's real `/etc/subuid`). It FAILS (never skips) if the
+/// process is root — `try_new_impl` refuses a privileged runner — so the CI test surfaces a violated
+/// non-root prerequisite as a hard error, exactly as Sol's 6e.1b ruling requires.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn deterministic_userns_allocator_for_tests(
+    base_dir: &std::path::Path,
+    pool_size: u32,
+) -> Result<
+    crate::user_namespace::UserNamespaceAllocator,
+    crate::user_namespace::UserNamespaceAllocatorError,
+> {
+    let uid = unsafe { libc::geteuid() };
+    let subuid = base_dir.join("subuid");
+    let subgid = base_dir.join("subgid");
+    std::fs::write(&subuid, format!("{uid}:100000:{pool_size}\n")).expect("write fixture subuid");
+    std::fs::write(&subgid, format!("{uid}:200000:{pool_size}\n")).expect("write fixture subgid");
+    let leases_dir = base_dir.join("leases");
+    let sink: crate::user_namespace::IncidentSink =
+        std::sync::Arc::new(|msg: &str| eprintln!("[6e.1b userns incident] {msg}"));
+    crate::user_namespace::UserNamespaceAllocator::try_new_for_tests(
+        leases_dir, &subuid, &subgid, pool_size, sink,
+    )
+}
+
+/// Build fresh deterministic managers under `root` and acquire a REAL checkout capsule (pool size 1)
+/// — the NON-SKIPPING analog of the Btrfs-gated `acquire_real_checkout_capsule`. Returns the capsule
+/// plus the managers/dirs so a caller can drive it and then probe durable state.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::type_complexity)]
+pub(crate) fn acquire_deterministic_checkout_capsule(
+    root: &std::path::Path,
+) -> (
+    AcquiredCheckoutRuntime,
+    crate::workspace_manager::WorkspaceManager,
+    std::path::PathBuf,
+    crate::user_namespace::UserNamespaceAllocator,
+    std::path::PathBuf,
+) {
+    let workspace_base = root.join("workspace");
+    let userns_base = root.join("userns");
+    std::fs::create_dir_all(&workspace_base).expect("mk workspace base");
+    std::fs::create_dir_all(&userns_base).expect("mk userns base");
+    let workspace_manager =
+        deterministic_workspace_manager_for_tests(workspace_base.clone(), 1 << 30)
+            .expect("deterministic directory workspace manager must construct");
+    let userns_allocator = deterministic_userns_allocator_for_tests(&userns_base, 1)
+        .expect("deterministic userns allocator must construct (a NON-root user is required)");
+    let spec = substitute_checkout_spec();
+    let profile = crate::hardening::HardeningProfile::derive(&spec);
+    let runtime = AcquiredCheckoutRuntime::acquire(
+        &spec,
+        &profile,
+        std::path::PathBuf::from("/abs/staged-rootfs"),
+        &workspace_manager,
+        &userns_allocator,
+    )
+    .expect("acquisition must succeed against a healthy deterministic manager/allocator");
+    (
+        runtime,
+        workspace_manager,
+        workspace_base,
+        userns_allocator,
+        userns_base,
+    )
+}
+
+/// Run the full deterministic substituted checkout SUCCESS cycle under `root`, returning the owned
+/// observation plus the residual managers/dirs so the caller can assert step-8 durable state (path
+/// absence, capacity zero/reusable, userns slot reusable, healthy manager). The ONE entry both the
+/// 6e.1b in-lib tests and the runsc-driver checkout seam call.
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::type_complexity)]
+pub(crate) fn run_substituted_checkout_success(
+    root: &std::path::Path,
+    sentinel_name: &str,
+    sentinel_bytes: &[u8],
+) -> (
+    SubstitutedCheckoutObservation,
+    crate::workspace_manager::WorkspaceManager,
+    std::path::PathBuf,
+    crate::user_namespace::UserNamespaceAllocator,
+    std::path::PathBuf,
+) {
+    let (runtime, workspace_manager, workspace_base, userns_allocator, userns_base) =
+        acquire_deterministic_checkout_capsule(root);
+    let observation = runtime.execute_substituted_checkout_for_test_support(
+        &workspace_manager,
+        sentinel_name,
+        sentinel_bytes,
+    );
+    (
+        observation,
+        workspace_manager,
+        workspace_base,
+        userns_allocator,
+        userns_base,
+    )
 }

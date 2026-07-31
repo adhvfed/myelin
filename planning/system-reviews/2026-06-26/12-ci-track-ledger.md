@@ -3829,3 +3829,64 @@ verified independently.
 
 **Still open: 6e.2 — the one activating commit** (Sol §2-5 + the piece-7 ruling, task #22). Then 5b.3-7
 (the real-runsc drill), task #91, gate-2 vertical slice. The rest of ledger 12's open items are unchanged.
+
+---
+
+## 2026-07-31 — CT-007 slice 5b.3-6e.1b landed: the deterministic directory-backed test substrate
+(Fable orchestrating; Opus, implementation; Sol, design ruling + 2 review rounds to "no merge blockers")
+
+A DORMANT / test-support-only PREREQUISITE for 6e.2, closing what 6e.1's design point 7 required but
+under-built. Discovered when the 6e.2 builder STOPPED: §4's hardware-independent checkout-success test
+needs to drive a REAL AcquiredCheckoutRuntime capsule, but the only capsule-acquire helpers hard-probe
+Btrfs/CAP_SYS_ADMIN/subuid and SOFT-SKIP on non-Btrfs hosts (the test env /tmp is tmpfs) — so the
+activation's own safety proof would silently no-op in CI. Sol confirmed Btrfs's PRODUCTION properties
+(hard-quota, subvol identity, crash-durable delete) are NOT consumed by the capsule/session state machine
+(the settle tail only validates identities + delete_workspace after PROVEN ABSENCE), so a plain-directory
+backend drives the full lifecycle faithfully — provided it does not CLAIM to test the production storage
+isolation primitive (that stays Btrfs-tests + 5b.3-7).
+
+**What landed (6 files, all myelin-ci-sandbox, Sol §1's 7 pieces):** a cfg(test-support)
+WorkspaceStorageMode::DeterministicDirectoryForTests (unreachable in ordinary/production builds,
+source-pinned zero); WorkspaceStorage generalized into a CLOSED WorkspaceStorageBackend{Btrfs|Directory}
+with a PRIVATE typed WorkspaceIdentity (Btrfs{subvol_id}|Directory{device,inode,quota_bytes}) — a
+capability minted by one backend is a loud BackendMismatch in the other's delete path; a real
+create/delete lifecycle (capture (device,inode); delete verifies base/leaf/no-symlink/exact-identity →
+remove → fsync → re-check absent → Ok only on proven absence; any failure → UnrecoverableLeak → the
+manager RETAINS capacity + poisons, never fakes clean settlement); boot orphan reconciliation;
+byte-accounted test quota (checked write refusing over-quota before mutation; aggregate accounting real);
+UserNamespaceAllocator::try_new_for_tests widened cfg(test)→cfg(any(test,test-support)) with its own
+fixture subuid so it RUNS for a non-root user and FAILS (not skips) as root; and the sealed capsule
+EXECUTION seam (AcquiredCheckoutRuntime::execute_substituted_checkout_for_test_support) that performs the
+REAL Allocated→PreparationBound→Prepared→Bound session transitions with only the runsc executions
+substituted — the fake Hop B writes a sentinel into the capsule's REAL workspace, the fake workload reads
+it THROUGH the retained OCI mount, then the REAL settle_enabled_finalization tail runs — returning only an
+owned observation. The 6a capsule closed-world audit gained a test-support inventory; the PRODUCTION
+accessor multiset stays exactly 5.
+
+**Review (2 rounds).** r1 verified the core mechanics sound (Btrfs path byte-equivalent, cross-backend
+unforgeable, absence-unproven→poison, sentinel-through-retained-source, dormancy, 5-accessor multiset) but
+found 4 blockers: (1) THE CRUX — the seam DISCARDED bind_workload's returned WorkloadBindingIdentity and
+re-derived LeaseBindState::Bound from the original arguments, BYPASSING the exact provenance invariant it
+exists to exercise (6e.2's checkout-success test would stay green over a durable-vs-local identity
+divergence); (2) directory create could leave an untracked residual while reporting a RECOVERABLE error →
+the manager releases capacity (a leak); (3) the delete-failure test never drove a REAL paired userns lease
+(a lease-release-after-unproven-delete regression would pass); (4) the success probes acquired-then-dropped
+a probe lease, POISONING the allocator they asserted was clean. r2 = no blockers: (1) now consumes
+into_parts() and builds BOTH the Bound state AND the workload evidence from the RETURNED parts (mirroring
+production bind_prepared_lease_given) — the seam genuinely exercises the provenance path; (2) rollback via
+rollback_fresh_leaf (remove+fsync+absence-recheck; AlreadyExists/unproven → UnrecoverableLeak → capacity
+retained+poison) + 2 tests; (3) a real paired-lease quarantine test (poisoned + capacity retained + slot
+unreissuable); (4) all 3 probe sites acquire→release_unused()→reassert health.
+
+**Gates (orchestrator ran independently):** sandbox --lib 521 / test-support 570 (the 10 substrate tests +
+the new blocker tests all RUN, no skips), sandbox integration lib 573, controlplane --lib 598 (unaffected),
+clippy -D warnings clean, check clean, myelin-lints 12 (781 files 0 violations), git diff --check clean;
+the full 6e.1b module verified independently (full-capsule real-settle + both injected-failure + paired-
+userns-lease quarantine all ok). Only the known firecracker skip (852bc7ae) remains.
+
+**Still open:** 6e.2 — the atomic activation (Sol §2-5 + piece-7, task #22) — now builds on this substrate:
+Stage A (dormant wiring + the §4 active-path tests that finally RUN via this seam), then Stage B (the one
+atomic flip: reservation V2 + ci_runner_v2_wiring + accounting V4 + checkout selection + the v3→v4 cutover +
+the ci_0022d retired-v3 sentinel). Sol §2-3 rulings recorded: reservation_write_version has 2 bind sites +
+must derive 2 from a validated V2 handle; the cutover suite retargets production→v3→v4 + renames the synthetic
+generalization suite→v4→v5 with a guard assertion. Then 5b.3-7, task #91, gate-2 vertical slice.
