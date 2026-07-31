@@ -3503,3 +3503,60 @@ selection gate + reservation V2 + credential-store construction + accounting V4 
 fence, all together). Then 5b.3-7 live drill, task #91, gate-2 vertical slice. FORWARD NOTE for 6d/6e:
 brief for LANGUAGE-LEVEL enforcement (RAII / module privacy) of must-cleanup/must-not-escape
 properties from the start — never counting pins. The rest of ledger 12's open items are unchanged.
+
+---
+
+## 2026-07-31 — CT-007 slice 5b.3-6d STEP 1 landed: the settlement-critical exhaustion/disposition
+core (Fable orchestrating; Opus, implementation; Sol, 3 adversarial review rounds to "no merge blockers")
+
+6d (the real control-plane adapter feeding 6c's injected AttemptAuthority) is being landed as a
+RISK-SEQUENCED set: step 1 = the money-path exhaustion/disposition correctness core (its own review +
+commit); steps 2-4 (preparation-retry CAS + the dormant composition module + the reporter-seam
+extension) follow. Step 1 is DORMANT — no production caller of the new typed path yet.
+
+**The gap it fixes** (the ParentAttemptLimitExceeded vs report_preparation_terminal(AttemptsExhausted)
+mismatch Sol named in the decomposition): on exhaustion the journal inserts NO row for the new
+generation, but verify_preparation_disposition_on_conn + CONSUME_PREPARATION_CLAIM_QUERY required the
+current generation's exact parent row — so a no-row exhausted generation could never terminalize.
+
+**What landed (additive, 5 src + 2 test files, all myelin-ci-controlplane):** a NEW typed
+admit_parent_attempt returning CiParentAttemptAdmission{Admitted|AttemptsExhausted{reserve_handle}}
+(exhaustion is a VALUE, not an error); begin_parent_attempt UNCHANGED (delegates to the shared
+run_parent_admission_on_conn and still maps Exhausted→Err+rollback); verify_preparation_disposition_on_conn
+now accepts a no-current-row AttemptsExhausted ONLY when the single governing exact-policy group's row
+count == max_parent_attempts (Failed/TimedOut still require the exact current row); a dedicated
+CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY that terminalizes only the exact live leased generation with
+the policy-exhaustion predicate.
+
+**The load-bearing invariant (Sol independently verified):** a no-row AttemptsExhausted case only
+arises when prior exact-policy rows == max, which means ≥1 prior attempt already committed
+reserved→inflight — so the exhaustion path needs no reservation transition and can never strand a
+`reserved` reserve. run_parent_admission_on_conn does the reserved→inflight transition BEFORE the
+serialized count; the cost_reservation state machine is monotonic; policy drift is impossible because
+revision+max are embedded in the immutable v2 reserve handle. Belt-and-suspenders: admit_parent_attempt
+COMMITS the inflight transition even if the invariant were violated.
+
+**Review arc (3 rounds — the value was in the TEST rigor, the impl was sound from r1):** r1 = 2
+test-coverage gaps (the exhaustion test didn't prove its own reserved→inflight transition; the CAS had
+no divergence matrix). r2 = the divergence tests were MASKED by earlier layers (verify_claimed_identity /
+launch-template comparison / resolve_prelaunch_usage_on_conn rejected the divergences before the CAS
+ran — false anti-forgery confidence). r3 = no blockers, after moving proof to the right layers: a
+byte-pin proving the exhausted CAS shares the shipped CAS's queue-identity/live-claim/surface predicate
+block VERBATIM (only the parent predicate differs — every shared guard load-bearing by byte-identity to
+the fully-tested shipped CAS); a store-layer raw-CAS test driving the query directly BENEATH the reporter
+verifiers so each scope predicate (job/wf_run/reserve) and guard (live-expiry/receipt-null/state=leased/
+surface) is genuinely deletion-sensitive; the multi-policy-group refusal in a clean fixture; and a
+money-atomicity assertion (cost_reservation inflight after an injected post-CAS failure, settled only
+after success). LESSON: a test that passes because an EARLIER gate rejects the input proves nothing about
+the layer under test — on a settlement CAS that's a forgery hole disguised as coverage.
+
+**Gates (orchestrator ran independently):** controlplane --lib 584, the entire --features integration
+matrix green (terminal-accounting-atomic 19, prelaunch-state-machine 1), sandbox --lib 503 / test-support
+552 (6c seam intact), clippy -D warnings clean, check clean, myelin-lints green, git diff --check clean.
+
+**Still open:** 6d steps 2-4 (preparation-retry state='leased' CAS; the new dormant composition module —
+V2 phase-store factory over CiJobCredentialGenerationStore + IdentityCiJobCredentialMinter, the
+CiJobParentAttempt→AttemptAuthority adapter, DurablePreparationLeaseCheckpoint construction, per-phase
+spec rotation; the RunnerAgent reporter-seam extension + definition-cutover generalization); then 6e
+(the atomic activating cutover). Then 5b.3-7, task #91, gate-2 vertical slice. The rest of ledger 12's
+open items are unchanged.

@@ -1246,6 +1246,11 @@ async fn verify_preparation_disposition_on_conn(
     reserve_handle: &str,
     disposition: PreparationTerminalDisposition,
 ) -> Result<(), CompletionTxError> {
+    // The parent-attempt row for THIS exact claim generation. It is REQUIRED for Failed/TimedOut (a
+    // measured/sealed terminal phase belongs to the current generation), but OPTIONAL for
+    // AttemptsExhausted: CT-007 5b.3-6d permits an exhausted terminal for a generation that was
+    // refused admission (and so has no row of its own) when the prior exact-policy rows already
+    // equal the durable max.
     let current = sqlx::query(
         "SELECT budget_revision, max_parent_attempts
          FROM ci_job_parent_attempt
@@ -1269,12 +1274,13 @@ async fn verify_preparation_disposition_on_conn(
     .bind(claim.claim_expires_at_epoch_secs)
     .fetch_optional(&mut *conn)
     .await
-    .map_err(|_| CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database))?
-    .ok_or(CompletionTxError::Refused)?;
+    .map_err(|_| CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database))?;
 
     match disposition {
         PreparationTerminalDisposition::Failed { phase }
         | PreparationTerminalDisposition::TimedOut { phase } => {
+            // Unchanged: Failed/TimedOut REQUIRE the current exact parent row.
+            current.ok_or(CompletionTxError::Refused)?;
             let terminal = sqlx::query_scalar::<_, i32>(
                 "SELECT 1
                  FROM ci_job_prelaunch_usage
@@ -1296,12 +1302,52 @@ async fn verify_preparation_disposition_on_conn(
             }
         }
         PreparationTerminalDisposition::AttemptsExhausted => {
-            let revision: i16 = current
-                .try_get("budget_revision")
-                .map_err(|_| CompletionTxError::Refused)?;
-            let maximum: i64 = current
-                .try_get("max_parent_attempts")
-                .map_err(|_| CompletionTxError::Refused)?;
+            // Determine the governing exact policy. When the current generation HAS a row, take its
+            // policy (the pre-6d behaviour). When it does NOT (refused admission), derive the single
+            // immutable policy the PRIOR rows already carry — permitting the terminal only when those
+            // prior exact-policy rows are themselves the durable max.
+            let (revision, maximum) = match &current {
+                Some(row) => (
+                    row.try_get::<i16, _>("budget_revision")
+                        .map_err(|_| CompletionTxError::Refused)?,
+                    row.try_get::<i64, _>("max_parent_attempts")
+                        .map_err(|_| CompletionTxError::Refused)?,
+                ),
+                None => {
+                    let policies = sqlx::query(
+                        "SELECT budget_revision, max_parent_attempts
+                         FROM ci_job_parent_attempt
+                         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+                           AND wf_run_id = $4::uuid AND ci_run_id = $5::uuid
+                           AND reserve_handle = $6
+                         GROUP BY budget_revision, max_parent_attempts",
+                    )
+                    .bind(&claim.tenant_id)
+                    .bind(&claim.region)
+                    .bind(&claim.job_id)
+                    .bind(&claim.wf_run_id)
+                    .bind(&claim.ci_run_id)
+                    .bind(reserve_handle)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|_| {
+                        CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database)
+                    })?;
+                    // One immutable policy must govern this reserve; divergence (or no prior rows at
+                    // all) is a fail-closed refusal.
+                    if policies.len() != 1 {
+                        return Err(CompletionTxError::Refused);
+                    }
+                    (
+                        policies[0]
+                            .try_get::<i16, _>("budget_revision")
+                            .map_err(|_| CompletionTxError::Refused)?,
+                        policies[0]
+                            .try_get::<i64, _>("max_parent_attempts")
+                            .map_err(|_| CompletionTxError::Refused)?,
+                    )
+                }
+            };
             let count: i64 = sqlx::query_scalar(
                 "SELECT count(*)
                  FROM ci_job_parent_attempt
@@ -1755,26 +1801,40 @@ impl CiPipelineReporter {
                             },
                             disposition,
                         );
-                        let claim_outcome = CiJobQueueStore::consume_preparation_claim_on_conn(
-                            conn,
-                            PreparationClaimConsumeSpec {
-                                tenant_id: tenant.as_str(),
-                                region: &region,
-                                job_id: job_uuid,
-                                wf_run_id: wf_run_uuid,
-                                ci_run_id: ci_run_uuid,
-                                idem_token: &claim.idem_token,
-                                lease_owner: &claim.lease_owner,
-                                lease_epoch: claim.lease_epoch,
-                                claim_nonce: nonce_uuid,
-                                stage: &stage,
-                                claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
-                                claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
-                                reserve_handle: &reserve_handle,
-                                completion_receipt: &receipts.current_v4,
-                            },
-                        )
-                        .await?;
+                        let consume_spec = PreparationClaimConsumeSpec {
+                            tenant_id: tenant.as_str(),
+                            region: &region,
+                            job_id: job_uuid,
+                            wf_run_id: wf_run_uuid,
+                            ci_run_id: ci_run_uuid,
+                            idem_token: &claim.idem_token,
+                            lease_owner: &claim.lease_owner,
+                            lease_epoch: claim.lease_epoch,
+                            claim_nonce: nonce_uuid,
+                            stage: &stage,
+                            claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
+                            claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
+                            reserve_handle: &reserve_handle,
+                            completion_receipt: &receipts.current_v4,
+                        };
+                        // CT-007 5b.3-6d: AttemptsExhausted may terminalize a generation that was
+                        // refused admission (no current-generation parent row), so it routes through
+                        // the exhausted-variant CAS whose parent predicate is policy-exhaustion.
+                        // Failed/TimedOut keep the current-row CAS.
+                        let claim_outcome = match disposition {
+                            PreparationTerminalDisposition::AttemptsExhausted => {
+                                CiJobQueueStore::consume_preparation_claim_exhausted_on_conn(
+                                    conn,
+                                    consume_spec,
+                                )
+                                .await?
+                            }
+                            PreparationTerminalDisposition::Failed { .. }
+                            | PreparationTerminalDisposition::TimedOut { .. } => {
+                                CiJobQueueStore::consume_preparation_claim_on_conn(conn, consume_spec)
+                                    .await?
+                            }
+                        };
                         if claim_outcome == ClaimConsumeOutcome::Refused {
                             return Err(CompletionTxError::Refused);
                         }

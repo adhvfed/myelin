@@ -615,6 +615,59 @@ WHERE q.tenant_id = $1
   )
 RETURNING q.job_id";
 
+/// **CT-007 slice 5b.3-6d: the exhausted-variant preparation-completion CAS.** Byte-for-byte
+/// [`CONSUME_PREPARATION_CLAIM_QUERY`] EXCEPT the parent-attempt predicate. The original requires a
+/// parent-attempt row for the CURRENT claim generation (`lease_owner = $6 AND lease_epoch =
+/// q.lease_epoch AND claim_nonce = q.claim_nonce`); this is exactly the row that DOES NOT exist when a
+/// generation was refused admission because the budget was already exhausted. This variant instead
+/// requires that the reserve's PRIOR exact-policy rows already equal the durable max — the same
+/// invariant [`verify_preparation_disposition_on_conn`](crate::ci_pipeline_driver) enforced one step
+/// earlier in the same transaction. The queue-row identity match (`$6/$7/$8/$10/$11`) is UNCHANGED, so
+/// only the exact current lease holder can terminalize, and `state = 'leased'` keeps it structurally
+/// exclusive with the `state = 'running'` workload CAS.
+///
+/// This is a NEW query, so the shipped-query no-credential-dependency pin is untouched; it takes NO
+/// dependency on `ci_job_credential_generation` either. It is only ever used for the
+/// `AttemptsExhausted` disposition — `Failed`/`TimedOut` still route through the current-row CAS above.
+pub const CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY: &str = "\
+UPDATE job_queue AS q
+SET state = 'terminal', completion_receipt = $14, lease_owner = NULL, lease_expires = NULL
+WHERE q.tenant_id = $1
+  AND q.region = $2
+  AND q.job_id = $3::uuid
+  AND q.run_id = $4::uuid
+  AND q.idem_token = $5
+  AND q.lease_owner = $6
+  AND q.lease_epoch = $7
+  AND q.claim_nonce = $8::uuid
+  AND q.stage = $9
+  AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $10
+  AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $11
+  AND q.claim_expires_at > statement_timestamp()
+  AND q.state = 'leased'
+  AND q.completion_receipt IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM ci_job_parent_attempt AS parent
+    WHERE parent.tenant_id = q.tenant_id
+      AND parent.region = q.region
+      AND parent.job_id = q.job_id
+      AND parent.wf_run_id = q.run_id
+      AND parent.ci_run_id = $12::uuid
+      AND parent.reserve_handle = $13
+    GROUP BY parent.budget_revision, parent.max_parent_attempts
+    HAVING count(*) = parent.max_parent_attempts
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM ci_job AS surface
+    WHERE surface.tenant_id = q.tenant_id
+      AND surface.region = q.region
+      AND surface.job_id = q.job_id
+      AND surface.state IN ('queued', 'leased')
+  )
+RETURNING q.job_id";
+
 /// **Read a job's terminal disposition for the completion CAS's 0-row branch.** When
 /// [`CONSUME_CLAIM_QUERY`] consumes nothing, this distinguishes an IDEMPOTENT redelivery (the row is
 /// already `terminal` with the SAME `completion_receipt`) from a fail-closed REFUSAL (missing row,
@@ -1763,6 +1816,75 @@ RETURNING surface.job_id";
                 && !CONSUME_CLAIM_QUERY.contains("ci_job_credential_generation")
                 && !CONSUME_PREPARATION_CLAIM_QUERY.contains("ci_job_credential_generation"),
             "no previously shipped query gains a credential-generation dependency in this slice"
+        );
+        // CT-007 5b.3-6d: the new exhausted-variant CAS is likewise free of any credential-generation
+        // dependency (it recovers on the parent-attempt policy, not on any credential row).
+        assert!(
+            !CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY.contains("ci_job_credential_generation"),
+            "the exhausted-variant preparation CAS must not depend on credential generations"
+        );
+    }
+
+    /// **CT-007 5b.3-6d: the exhausted CAS shares the shipped preparation CAS's predicate block
+    /// BYTE-FOR-BYTE, differing ONLY in the parent-attempt predicate.** The queue-identity + live-claim
+    /// block (tenant/region/job/run/idem/owner/epoch/nonce/stage/claim-start/claim-expiry/live-expiry/
+    /// `state='leased'`/`completion_receipt IS NULL`) and the `ci_job` surface guard + `RETURNING` are
+    /// the SAME bytes as [`CONSUME_PREPARATION_CLAIM_QUERY`], which is already fully behaviorally
+    /// tested. So every shared predicate is load-bearing here by byte-identity: dropping or editing any
+    /// of them fails this pin. The ONLY sanctioned difference is the parent predicate — the shipped CAS
+    /// binds the exact current generation's row; the exhausted CAS recovers on the policy-exhaustion
+    /// group and must NOT bind the current generation.
+    #[test]
+    fn the_exhausted_cas_shares_the_shipped_predicate_block_byte_for_byte() {
+        const PARENT_MARKER: &str =
+            "  AND EXISTS (\n    SELECT 1\n    FROM ci_job_parent_attempt AS parent";
+        const SURFACE_MARKER: &str = "  AND EXISTS (\n    SELECT 1\n    FROM ci_job AS surface";
+
+        let shipped_parent = CONSUME_PREPARATION_CLAIM_QUERY
+            .find(PARENT_MARKER)
+            .expect("the shipped CAS opens a parent-attempt EXISTS block");
+        let exhausted_parent = CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY
+            .find(PARENT_MARKER)
+            .expect("the exhausted CAS opens a parent-attempt EXISTS block");
+        // Identical PREFIX: the UPDATE/SET and the entire queue-identity + live-claim predicate block.
+        assert_eq!(
+            &CONSUME_PREPARATION_CLAIM_QUERY[..shipped_parent],
+            &CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY[..exhausted_parent],
+            "the exhausted CAS must share the shipped queue-identity/live-claim block byte-for-byte"
+        );
+
+        let shipped_surface = CONSUME_PREPARATION_CLAIM_QUERY
+            .find(SURFACE_MARKER)
+            .expect("the shipped CAS has a ci_job surface guard");
+        let exhausted_surface = CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY
+            .find(SURFACE_MARKER)
+            .expect("the exhausted CAS has a ci_job surface guard");
+        // Identical SUFFIX: the ci_job surface guard and the RETURNING.
+        assert_eq!(
+            &CONSUME_PREPARATION_CLAIM_QUERY[shipped_surface..],
+            &CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY[exhausted_surface..],
+            "the exhausted CAS must share the shipped ci_job surface guard + RETURNING byte-for-byte"
+        );
+
+        // The ONLY sanctioned divergence is the parent predicate.
+        let shipped_parent_block = &CONSUME_PREPARATION_CLAIM_QUERY[shipped_parent..shipped_surface];
+        let exhausted_parent_block =
+            &CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY[exhausted_parent..exhausted_surface];
+        assert!(
+            shipped_parent_block.contains("parent.claim_nonce = q.claim_nonce"),
+            "the shipped CAS binds the exact current generation's parent row"
+        );
+        assert!(!shipped_parent_block.contains("GROUP BY"));
+        assert!(
+            exhausted_parent_block
+                .contains("GROUP BY parent.budget_revision, parent.max_parent_attempts")
+                && exhausted_parent_block.contains("HAVING count(*) = parent.max_parent_attempts"),
+            "the exhausted CAS recovers on the policy-exhaustion group"
+        );
+        assert!(
+            !exhausted_parent_block.contains("q.claim_nonce"),
+            "the exhausted parent predicate must NOT bind the current generation (that is the row \
+             that does not exist for a refused generation)"
         );
     }
 }

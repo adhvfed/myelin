@@ -282,6 +282,50 @@ async fn counts(pool: &PgPool, job: &str, wf_run: &str) -> (i64, i64, i64, Strin
     (accounting, projection, signals, state)
 }
 
+/// The 14 binds of the exhausted-variant preparation CAS, so a store-layer test can drive
+/// [`myelin_ci_controlplane::scheduler::CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY`] DIRECTLY — beneath
+/// `report_preparation_terminal`'s verifiers — and observe exactly which rows the CAS itself admits.
+struct ExhaustedCasBinds<'a> {
+    tenant: &'a str,
+    region: &'a str,
+    job: &'a str,
+    wf_run: &'a str,
+    idem: &'a str,
+    owner: &'a str,
+    epoch: i64,
+    nonce: &'a str,
+    stage: &'a str,
+    started: i64,
+    expires: i64,
+    ci_run: &'a str,
+    reserve: &'a str,
+    receipt: &'a str,
+}
+
+/// Run the exhausted CAS on a caller-owned connection and return the rows it consumed (0 = refused,
+/// 1 = terminalized). Callers wrap this in a rolled-back transaction so each guard probe is isolated.
+async fn run_exhausted_cas(conn: &mut sqlx::PgConnection, b: &ExhaustedCasBinds<'_>) -> u64 {
+    sqlx::query(myelin_ci_controlplane::scheduler::CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY)
+        .bind(b.tenant)
+        .bind(b.region)
+        .bind(b.job)
+        .bind(b.wf_run)
+        .bind(b.idem)
+        .bind(b.owner)
+        .bind(b.epoch)
+        .bind(b.nonce)
+        .bind(b.stage)
+        .bind(b.started)
+        .bind(b.expires)
+        .bind(b.ci_run)
+        .bind(b.reserve)
+        .bind(b.receipt)
+        .execute(conn)
+        .await
+        .unwrap()
+        .rows_affected()
+}
+
 async fn drive_clock(pool: &PgPool) -> (i64, String) {
     sqlx::query_as(
         "SELECT extract(epoch FROM instant)::bigint,
@@ -1161,6 +1205,678 @@ async fn run_reporter_scenario(
             .await
             .unwrap();
                     assert_eq!(disposition, "preparation_attempts_exhausted");
+                    drop(pool);
+                    bootstrap
+                        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                        .await
+                        .unwrap();
+                    return;
+                }
+
+                if preparation_scenario == "preparation_exhausted_norow" {
+                    // CT-007 slice 5b.3-6d: the NO-current-row exhaustion path. Fill the exact-policy
+                    // budget (base epoch-1 row + epochs 2..=5 == max 5), then repoint the queue at a
+                    // FRESH generation (epoch 6) that was REFUSED admission and so has NO parent row of
+                    // its own. `report_preparation_terminal(AttemptsExhausted)` must still terminalize,
+                    // recovering on "prior exact-policy rows == durable max" rather than a current row.
+                    for epoch in 2_i64..=5 {
+                        let nonce = format!("bbbbbbbb-bbbb-4bbb-8bbb-{epoch:012}");
+                        sqlx::query(
+                            "INSERT INTO ci_job_parent_attempt (
+                       tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle,
+                       lease_owner, lease_epoch, claim_nonce, claim_started_at_epoch_secs,
+                       claim_expires_at_epoch_secs, budget_revision, max_parent_attempts
+                     ) VALUES (
+                       $1, $2, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8, $9::uuid,
+                       $10, $11, 1, 5
+                     )",
+                        )
+                        .bind(&tenant.0)
+                        .bind(&region.0)
+                        .bind(job)
+                        .bind(wf_run)
+                        .bind(ci_run)
+                        .bind(&reserve_handle)
+                        .bind(format!("prior-runner-{epoch}"))
+                        .bind(epoch)
+                        .bind(nonce)
+                        .bind(preparation_claim.claim_started_at_epoch_secs - epoch)
+                        .bind(preparation_claim.claim_expires_at_epoch_secs - epoch)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    }
+                    // Repoint the queue at epoch 6 — a generation with NO parent-attempt row.
+                    sqlx::query(
+                        "UPDATE job_queue
+                 SET lease_owner = 'exhausted-runner-6', lease_epoch = 6,
+                     claim_nonce = 'bbbbbbbb-bbbb-4bbb-8bbb-000000000006'::uuid,
+                     claim_started_at = to_timestamp($2),
+                     claim_expires_at = to_timestamp($3),
+                     lease_expires = to_timestamp($3)
+                 WHERE tenant_id = $4 AND region = $5 AND job_id = $1::uuid",
+                    )
+                    .bind(job)
+                    .bind(preparation_claim.claim_started_at_epoch_secs - 6)
+                    .bind(preparation_claim.claim_expires_at_epoch_secs)
+                    .bind(&tenant.0)
+                    .bind(&region.0)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    let no_row: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM ci_job_parent_attempt
+                         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
+                           AND lease_epoch = 6",
+                    )
+                    .bind(&tenant.0)
+                    .bind(&region.0)
+                    .bind(job)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(no_row, 0, "the refused generation must have no parent row");
+                    let total: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM ci_job_parent_attempt
+                         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+                    )
+                    .bind(&tenant.0)
+                    .bind(&region.0)
+                    .bind(job)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(total, 5, "prior exact-policy rows equal the durable max");
+
+                    let exhausted_claim = sqlx::query(
+                        "SELECT lease_owner, lease_epoch, claim_nonce::text AS claim_nonce,
+                        EXTRACT(EPOCH FROM claim_started_at)::bigint AS claim_started,
+                        EXTRACT(EPOCH FROM claim_expires_at)::bigint AS claim_expires
+                 FROM job_queue WHERE job_id = $1::uuid",
+                    )
+                    .bind(job)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    let mut exhausted_claim_request = preparation_claim.clone();
+                    exhausted_claim_request.lease_owner = exhausted_claim.get("lease_owner");
+                    exhausted_claim_request.lease_epoch = exhausted_claim.get("lease_epoch");
+                    exhausted_claim_request.claim_nonce = exhausted_claim.get("claim_nonce");
+                    exhausted_claim_request.claim_started_at_epoch_secs =
+                        exhausted_claim.get("claim_started");
+                    exhausted_claim_request.claim_expires_at_epoch_secs =
+                        exhausted_claim.get("claim_expires");
+
+                    // ---- CT-007 5b.3-6d: end-to-end DEFENSE-IN-DEPTH divergence matrix ----
+                    // Every exact-generation identity divergence must be refused SOMEWHERE in the
+                    // reporter pipeline with zero durable effect. This is NOT a CAS-isolation proof —
+                    // idem/ci_run/token-authority/reserve divergences are caught by earlier verifiers
+                    // (verify_claimed_identity / launch-template / prelaunch settlement identity), while
+                    // owner/epoch/nonce/both-timestamps reach the CAS. The exhausted CAS's own predicate
+                    // set is proven load-bearing by the byte-pin in scheduler.rs plus the direct
+                    // store-layer guard/scope tests (scenarios `preparation_exhausted_cas_direct` /
+                    // `preparation_exhausted_multigroup`).
+                    let mut divergent_claims = Vec::new();
+                    let mutations: [fn(&mut CiJobTokenRequest); 8] = [
+                        |c: &mut CiJobTokenRequest| c.lease_owner.push_str("-different"),
+                        |c: &mut CiJobTokenRequest| c.lease_epoch += 1,
+                        |c: &mut CiJobTokenRequest| {
+                            c.claim_nonce = "aaaaaaaa-cccc-4ccc-8ccc-cccccccccccc".into()
+                        },
+                        |c: &mut CiJobTokenRequest| c.claim_started_at_epoch_secs += 1,
+                        |c: &mut CiJobTokenRequest| c.claim_expires_at_epoch_secs += 1,
+                        |c: &mut CiJobTokenRequest| c.idem_token.push_str("-different"),
+                        |c: &mut CiJobTokenRequest| {
+                            c.ci_run_id = "aaaaaaaa-dddd-4ddd-8ddd-dddddddddddd".into()
+                        },
+                        |c: &mut CiJobTokenRequest| c.token_authority_handle.push_str("-different"),
+                    ];
+                    for mutate in mutations {
+                        let mut divergent = exhausted_claim_request.clone();
+                        mutate(&mut divergent);
+                        divergent_claims.push(divergent);
+                    }
+                    for divergent in divergent_claims {
+                        assert!(
+                            preparation_reporter()
+                                .report_preparation_terminal(
+                                    &divergent,
+                                    PreparationTerminalDisposition::AttemptsExhausted,
+                                )
+                                .is_err(),
+                            "the exhausted CAS refuses every exact-generation identity divergence"
+                        );
+                        assert_eq!(
+                            counts(&pool, job, wf_run).await,
+                            (0, 0, 0, "leased".into()),
+                            "a refused exhausted divergence mutates nothing"
+                        );
+                    }
+
+                    // A dispatched meter target diverging from the manifest/parent reserve is refused.
+                    let original_spec: serde_json::Value =
+                        sqlx::query_scalar("SELECT spec FROM ci_job_spec WHERE job_id = $1::uuid")
+                            .bind(job)
+                            .fetch_one(&pool)
+                            .await
+                            .unwrap();
+                    sqlx::query(
+                        "UPDATE ci_job_spec
+                 SET spec = jsonb_set(spec, '{spec,meter_to,reserve_id}', '\"different-reserve\"')
+                 WHERE job_id = $1::uuid",
+                    )
+                    .bind(job)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    assert!(preparation_reporter()
+                        .report_preparation_terminal(
+                            &exhausted_claim_request,
+                            PreparationTerminalDisposition::AttemptsExhausted,
+                        )
+                        .is_err());
+                    assert_eq!(counts(&pool, job, wf_run).await, (0, 0, 0, "leased".into()));
+                    sqlx::query("UPDATE ci_job_spec SET spec = $2 WHERE job_id = $1::uuid")
+                        .bind(job)
+                        .bind(&original_spec)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+
+                    // state='running' (not 'leased') is refused by the CAS's `state = 'leased'` guard.
+                    sqlx::query("UPDATE job_queue SET state = 'running' WHERE job_id = $1::uuid")
+                        .bind(job)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    assert!(preparation_reporter()
+                        .report_preparation_terminal(
+                            &exhausted_claim_request,
+                            PreparationTerminalDisposition::AttemptsExhausted,
+                        )
+                        .is_err());
+                    assert_eq!(counts(&pool, job, wf_run).await, (0, 0, 0, "running".into()));
+                    sqlx::query("UPDATE job_queue SET state = 'leased' WHERE job_id = $1::uuid")
+                        .bind(job)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+
+                    // ---- Post-CAS accounting failure rolls the whole exhausted terminal back ----
+                    // The signal buffers and the CAS consumes BEFORE the accounting receipt insert; a
+                    // failure there must roll every durable effect back (queue stays leased, zero
+                    // signal/accounting/projection), proving the single-transaction boundary holds for
+                    // the exhausted path too.
+                    sqlx::raw_sql(
+                        "CREATE FUNCTION fail_exhausted_accounting_receipt() RETURNS trigger
+                           LANGUAGE plpgsql AS $$
+                           BEGIN
+                             RAISE EXCEPTION 'injected exhausted receipt failure';
+                           END $$;
+                         CREATE TRIGGER fail_exhausted_accounting_receipt
+                           BEFORE INSERT ON ci_job_accounting
+                           FOR EACH ROW EXECUTE FUNCTION fail_exhausted_accounting_receipt();",
+                    )
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    assert!(preparation_reporter()
+                        .report_preparation_terminal(
+                            &exhausted_claim_request,
+                            PreparationTerminalDisposition::AttemptsExhausted,
+                        )
+                        .is_err());
+                    assert_eq!(
+                        counts(&pool, job, wf_run).await,
+                        (0, 0, 0, "leased".into()),
+                        "a post-CAS receipt failure rolls the exhausted terminal fully back"
+                    );
+                    // Finding 4: the MONEY settlement (`money_ledger.settle_in_tx`) runs BEFORE the
+                    // receipt insert, so it too must be inside the one rolled-back transaction. Prove
+                    // the reservation is STILL `inflight` after the injected failure — a regression
+                    // moving settlement onto an independently-committed tx would show `settled` here.
+                    let reservation_after_failure: String = sqlx::query_scalar(
+                        "SELECT state FROM cost_reservation
+                         WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+                    )
+                    .bind(&tenant.0)
+                    .bind(&region.0)
+                    .bind(&reserve_handle)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        reservation_after_failure, "inflight",
+                        "the money settlement is inside the SAME rolled-back transaction"
+                    );
+                    sqlx::raw_sql(
+                        "DROP TRIGGER fail_exhausted_accounting_receipt ON ci_job_accounting;
+                         DROP FUNCTION fail_exhausted_accounting_receipt();",
+                    )
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+
+                    // First delivery terminalizes; the second is an idempotent replay (terminal/requeue
+                    // exclusivity for the exhausted path — one terminal owner, exact replay after).
+                    assert_eq!(
+                        preparation_reporter()
+                            .report_preparation_terminal(
+                                &exhausted_claim_request,
+                                PreparationTerminalDisposition::AttemptsExhausted,
+                            )
+                            .unwrap(),
+                        SignalOutcome::Buffered
+                    );
+                    assert_eq!(
+                        preparation_reporter()
+                            .report_preparation_terminal(
+                                &exhausted_claim_request,
+                                PreparationTerminalDisposition::AttemptsExhausted,
+                            )
+                            .unwrap(),
+                        SignalOutcome::Duplicate
+                    );
+                    let disposition: String = sqlx::query_scalar(
+                "SELECT terminal_disposition FROM ci_job_accounting WHERE job_id = $1::uuid",
+            )
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+                    assert_eq!(disposition, "preparation_attempts_exhausted");
+                    // Finding 4: ONLY the successful terminal settles the money reservation
+                    // (`inflight` -> `settled`), proving the settlement committed with the terminal.
+                    let reservation_after_success: String = sqlx::query_scalar(
+                        "SELECT state FROM cost_reservation
+                         WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+                    )
+                    .bind(&tenant.0)
+                    .bind(&region.0)
+                    .bind(&reserve_handle)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        reservation_after_success, "settled",
+                        "the successful exhausted terminal settles the reservation in the same tx"
+                    );
+                    // Still no row for the refused generation, and exactly one terminal outcome.
+                    let final_total: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM ci_job_parent_attempt
+                         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+                    )
+                    .bind(&tenant.0)
+                    .bind(&region.0)
+                    .bind(job)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(final_total, 5);
+                    drop(pool);
+                    bootstrap
+                        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                        .await
+                        .unwrap();
+                    return;
+                }
+
+                if preparation_scenario == "preparation_exhausted_cas_direct" {
+                    // CT-007 5b.3-6d: drive CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY DIRECTLY (the
+                    // store layer, beneath report_preparation_terminal's verifiers), so each CAS
+                    // predicate is genuinely deletion-sensitive rather than masked by an earlier layer.
+                    // Base seeded the epoch-1 parent row; add epochs 2..=4 → 4 rows, ONE BELOW max.
+                    for epoch in 2_i64..=4 {
+                        let nonce = format!("bbbbbbbb-bbbb-4bbb-8bbb-{epoch:012}");
+                        sqlx::query(
+                            "INSERT INTO ci_job_parent_attempt (
+                       tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle,
+                       lease_owner, lease_epoch, claim_nonce, claim_started_at_epoch_secs,
+                       claim_expires_at_epoch_secs, budget_revision, max_parent_attempts
+                     ) VALUES ($1,$2,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9::uuid,$10,$11,1,5)",
+                        )
+                        .bind(&tenant.0)
+                        .bind(&region.0)
+                        .bind(job)
+                        .bind(wf_run)
+                        .bind(ci_run)
+                        .bind(&reserve_handle)
+                        .bind(format!("prior-runner-{epoch}"))
+                        .bind(epoch)
+                        .bind(nonce)
+                        .bind(preparation_claim.claim_started_at_epoch_secs - epoch)
+                        .bind(preparation_claim.claim_expires_at_epoch_secs - epoch)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    }
+                    // Repoint the queue at epoch 6 — a fresh generation with no parent row.
+                    sqlx::query(
+                        "UPDATE job_queue
+                 SET lease_owner = 'exhausted-runner-6', lease_epoch = 6,
+                     claim_nonce = 'bbbbbbbb-bbbb-4bbb-8bbb-000000000006'::uuid,
+                     claim_started_at = to_timestamp($2),
+                     claim_expires_at = to_timestamp($3),
+                     lease_expires = to_timestamp($3)
+                 WHERE tenant_id = $4 AND region = $5 AND job_id = $1::uuid",
+                    )
+                    .bind(job)
+                    .bind(preparation_claim.claim_started_at_epoch_secs - 6)
+                    .bind(preparation_claim.claim_expires_at_epoch_secs)
+                    .bind(&tenant.0)
+                    .bind(&region.0)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    // Cross-scope rows (another run / another reserve / another job), each (rev 1, max
+                    // 5), reusing the real ci_run (the only FK is `(tenant, ci_run)`). If ANY scope
+                    // predicate in the CAS's parent EXISTS were dropped, one of these would join the
+                    // (1,5) group and forge count==max.
+                    for (other_job, other_wf, other_reserve, epoch, nonce) in [
+                        (
+                            job,
+                            "dddddddd-1111-4111-8111-111111111111",
+                            reserve_handle.as_str(),
+                            71_i64,
+                            "dddddddd-eeee-4eee-8eee-000000000001",
+                        ),
+                        (
+                            job,
+                            wf_run,
+                            "ci-reserve:v2:dddddddd-3333-4333-8333-333333333333:budget-v1:a5:batch:other:usage",
+                            72,
+                            "dddddddd-eeee-4eee-8eee-000000000002",
+                        ),
+                        (
+                            "dddddddd-4444-4444-8444-444444444444",
+                            wf_run,
+                            reserve_handle.as_str(),
+                            73,
+                            "dddddddd-eeee-4eee-8eee-000000000003",
+                        ),
+                    ] {
+                        sqlx::query(
+                            "INSERT INTO ci_job_parent_attempt (
+                       tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle,
+                       lease_owner, lease_epoch, claim_nonce, claim_started_at_epoch_secs,
+                       claim_expires_at_epoch_secs, budget_revision, max_parent_attempts
+                     ) VALUES ($1,$2,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9::uuid,$10,$11,1,5)",
+                        )
+                        .bind(&tenant.0)
+                        .bind(&region.0)
+                        .bind(other_job)
+                        .bind(other_wf)
+                        .bind(ci_run)
+                        .bind(other_reserve)
+                        .bind("cross-scope-runner")
+                        .bind(epoch)
+                        .bind(nonce)
+                        .bind(preparation_claim.claim_started_at_epoch_secs - epoch)
+                        .bind(preparation_claim.claim_expires_at_epoch_secs - epoch)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    }
+                    // The exact epoch-6 queue identity for the CAS binds.
+                    let q = sqlx::query(
+                        "SELECT idem_token, stage, lease_owner, lease_epoch,
+                                claim_nonce::text AS claim_nonce,
+                                EXTRACT(EPOCH FROM claim_started_at)::bigint AS started,
+                                EXTRACT(EPOCH FROM claim_expires_at)::bigint AS expires
+                         FROM job_queue WHERE job_id = $1::uuid",
+                    )
+                    .bind(job)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    let idem: String = q.get("idem_token");
+                    let stage: String = q.get("stage");
+                    let owner: String = q.get("lease_owner");
+                    let epoch6: i64 = q.get("lease_epoch");
+                    let nonce6: String = q.get("claim_nonce");
+                    let started: i64 = q.get("started");
+                    let expires: i64 = q.get("expires");
+                    let binds = ExhaustedCasBinds {
+                        tenant: &tenant.0,
+                        region: &region.0,
+                        job,
+                        wf_run,
+                        idem: &idem,
+                        owner: &owner,
+                        epoch: epoch6,
+                        nonce: &nonce6,
+                        stage: &stage,
+                        started,
+                        expires,
+                        ci_run,
+                        reserve: &reserve_handle,
+                        receipt: "exhausted-cas-receipt",
+                    };
+
+                    // (a) COUNT-SCOPING: below max (4 of 5) with cross-scope rows present → the CAS
+                    // itself refuses. A dropped job/wf_run/reserve scope predicate would let a cross
+                    // row forge count==max and this returns 1.
+                    let mut tx = pool.begin().await.unwrap();
+                    assert_eq!(
+                        run_exhausted_cas(&mut tx, &binds).await,
+                        0,
+                        "below max with cross-scope rows: the CAS refuses"
+                    );
+                    tx.rollback().await.unwrap();
+
+                    // Add the 5th same-scope row → the reserve is exact-policy exhausted (one group of 5).
+                    sqlx::query(
+                        "INSERT INTO ci_job_parent_attempt (
+                       tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle,
+                       lease_owner, lease_epoch, claim_nonce, claim_started_at_epoch_secs,
+                       claim_expires_at_epoch_secs, budget_revision, max_parent_attempts
+                     ) VALUES ($1,$2,$3::uuid,$4::uuid,$5::uuid,$6,'prior-runner-5',5,
+                       'bbbbbbbb-bbbb-4bbb-8bbb-000000000005'::uuid,$7,$8,1,5)",
+                    )
+                    .bind(&tenant.0)
+                    .bind(&region.0)
+                    .bind(job)
+                    .bind(wf_run)
+                    .bind(ci_run)
+                    .bind(&reserve_handle)
+                    .bind(preparation_claim.claim_started_at_epoch_secs - 5)
+                    .bind(preparation_claim.claim_expires_at_epoch_secs - 5)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+
+                    // Positive control: a satisfiable exhausted generation IS consumed (rolled back so
+                    // it does not affect the guard probes below).
+                    let mut tx = pool.begin().await.unwrap();
+                    assert_eq!(
+                        run_exhausted_cas(&mut tx, &binds).await,
+                        1,
+                        "an exact-policy-exhausted generation is consumed by the CAS"
+                    );
+                    tx.rollback().await.unwrap();
+
+                    // Guard predicates, each isolated in a rolled-back tx that mutates ONE row fact so
+                    // the OTHER predicates still match — proving that exact predicate is load-bearing.
+                    // live-expiry: an expired claim (EXTRACT still matches $11) → the `claim_expires_at
+                    // > statement_timestamp()` guard refuses.
+                    let mut tx = pool.begin().await.unwrap();
+                    sqlx::query(
+                        "UPDATE job_queue SET claim_expires_at = to_timestamp($2),
+                             lease_expires = to_timestamp($2) WHERE job_id = $1::uuid",
+                    )
+                    .bind(job)
+                    .bind(started - 1)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                    let expired = ExhaustedCasBinds {
+                        expires: started - 1,
+                        ..binds
+                    };
+                    assert_eq!(
+                        run_exhausted_cas(&mut tx, &expired).await,
+                        0,
+                        "an expired claim is refused by the live-expiry guard"
+                    );
+                    tx.rollback().await.unwrap();
+
+                    // completion_receipt already set → the `completion_receipt IS NULL` guard refuses.
+                    let mut tx = pool.begin().await.unwrap();
+                    sqlx::query(
+                        "UPDATE job_queue SET completion_receipt = 'already-set'
+                         WHERE job_id = $1::uuid",
+                    )
+                    .bind(job)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        run_exhausted_cas(&mut tx, &binds).await,
+                        0,
+                        "an already-consumed generation is refused by the receipt-null guard"
+                    );
+                    tx.rollback().await.unwrap();
+
+                    // state='running' → the `state = 'leased'` guard refuses (exclusive with workload).
+                    let mut tx = pool.begin().await.unwrap();
+                    sqlx::query("UPDATE job_queue SET state = 'running' WHERE job_id = $1::uuid")
+                        .bind(job)
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        run_exhausted_cas(&mut tx, &binds).await,
+                        0,
+                        "a running generation is refused by the state='leased' guard"
+                    );
+                    tx.rollback().await.unwrap();
+
+                    // ci_job surface not pre-workload → the surface EXISTS guard refuses.
+                    let mut tx = pool.begin().await.unwrap();
+                    sqlx::query(
+                        "UPDATE ci_job SET state = 'succeeded'
+                         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+                    )
+                    .bind(&tenant.0)
+                    .bind(&region.0)
+                    .bind(job)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        run_exhausted_cas(&mut tx, &binds).await,
+                        0,
+                        "a non-pre-workload ci_job surface is refused by the surface guard"
+                    );
+                    tx.rollback().await.unwrap();
+
+                    drop(pool);
+                    bootstrap
+                        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                        .await
+                        .unwrap();
+                    return;
+                }
+
+                if preparation_scenario == "preparation_exhausted_multigroup" {
+                    // CT-007 5b.3-6d: the "exactly one governing policy group" requirement, in a CLEAN
+                    // fixture (all rows share the settlement identity, so resolve_prelaunch_usage does
+                    // NOT pre-reject). Base seeded epoch-1 (rev 1, max 5); fill (1,5) to 5 rows AND add
+                    // a second (rev 2, max 2) group of 2 rows. BOTH groups independently satisfy
+                    // count==max, so the ONLY thing that refuses is disposition verification's
+                    // `policies.len() != 1`; removing it would let one group through and terminalize.
+                    for epoch in 2_i64..=5 {
+                        let nonce = format!("bbbbbbbb-bbbb-4bbb-8bbb-{epoch:012}");
+                        sqlx::query(
+                            "INSERT INTO ci_job_parent_attempt (
+                       tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle,
+                       lease_owner, lease_epoch, claim_nonce, claim_started_at_epoch_secs,
+                       claim_expires_at_epoch_secs, budget_revision, max_parent_attempts
+                     ) VALUES ($1,$2,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9::uuid,$10,$11,1,5)",
+                        )
+                        .bind(&tenant.0)
+                        .bind(&region.0)
+                        .bind(job)
+                        .bind(wf_run)
+                        .bind(ci_run)
+                        .bind(&reserve_handle)
+                        .bind(format!("prior-runner-{epoch}"))
+                        .bind(epoch)
+                        .bind(nonce)
+                        .bind(preparation_claim.claim_started_at_epoch_secs - epoch)
+                        .bind(preparation_claim.claim_expires_at_epoch_secs - epoch)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    }
+                    for nonce_tail in 1_i64..=2 {
+                        sqlx::query(
+                            "INSERT INTO ci_job_parent_attempt (
+                       tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle,
+                       lease_owner, lease_epoch, claim_nonce, claim_started_at_epoch_secs,
+                       claim_expires_at_epoch_secs, budget_revision, max_parent_attempts
+                     ) VALUES ($1,$2,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9::uuid,$10,$11,2,2)",
+                        )
+                        .bind(&tenant.0)
+                        .bind(&region.0)
+                        .bind(job)
+                        .bind(wf_run)
+                        .bind(ci_run)
+                        .bind(&reserve_handle)
+                        .bind(format!("group2-runner-{nonce_tail}"))
+                        .bind(80 + nonce_tail)
+                        .bind(format!("dddddddd-ffff-4fff-8fff-00000000000{nonce_tail}"))
+                        .bind(preparation_claim.claim_started_at_epoch_secs - 80 - nonce_tail)
+                        .bind(preparation_claim.claim_expires_at_epoch_secs - 80 - nonce_tail)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    }
+                    sqlx::query(
+                        "UPDATE job_queue
+                 SET lease_owner = 'exhausted-runner-6', lease_epoch = 6,
+                     claim_nonce = 'bbbbbbbb-bbbb-4bbb-8bbb-000000000006'::uuid,
+                     claim_started_at = to_timestamp($2),
+                     claim_expires_at = to_timestamp($3),
+                     lease_expires = to_timestamp($3)
+                 WHERE tenant_id = $4 AND region = $5 AND job_id = $1::uuid",
+                    )
+                    .bind(job)
+                    .bind(preparation_claim.claim_started_at_epoch_secs - 6)
+                    .bind(preparation_claim.claim_expires_at_epoch_secs)
+                    .bind(&tenant.0)
+                    .bind(&region.0)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    let exhausted_claim = sqlx::query(
+                        "SELECT lease_owner, lease_epoch, claim_nonce::text AS claim_nonce,
+                        EXTRACT(EPOCH FROM claim_started_at)::bigint AS claim_started,
+                        EXTRACT(EPOCH FROM claim_expires_at)::bigint AS claim_expires
+                 FROM job_queue WHERE job_id = $1::uuid",
+                    )
+                    .bind(job)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    let mut exhausted_claim_request = preparation_claim.clone();
+                    exhausted_claim_request.lease_owner = exhausted_claim.get("lease_owner");
+                    exhausted_claim_request.lease_epoch = exhausted_claim.get("lease_epoch");
+                    exhausted_claim_request.claim_nonce = exhausted_claim.get("claim_nonce");
+                    exhausted_claim_request.claim_started_at_epoch_secs =
+                        exhausted_claim.get("claim_started");
+                    exhausted_claim_request.claim_expires_at_epoch_secs =
+                        exhausted_claim.get("claim_expires");
+                    assert!(
+                        preparation_reporter()
+                            .report_preparation_terminal(
+                                &exhausted_claim_request,
+                                PreparationTerminalDisposition::AttemptsExhausted,
+                            )
+                            .is_err(),
+                        "two governing policy groups fail closed (exactly one is required)"
+                    );
+                    assert_eq!(counts(&pool, job, wf_run).await, (0, 0, 0, "leased".into()));
                     drop(pool);
                     bootstrap
                         .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
@@ -2520,6 +3236,48 @@ async fn attempts_exhausted_requires_and_accepts_the_exact_durable_cap() {
         true,
         false,
         Some("preparation_exhausted"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attempts_exhausted_terminalizes_a_refused_generation_with_no_parent_row() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(
+        false,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_exhausted_norow"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exhausted_cas_predicates_are_deletion_sensitive_at_the_store_layer() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(
+        false,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_exhausted_cas_direct"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exhausted_terminal_requires_exactly_one_governing_policy_group() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    run_reporter_scenario(
+        false,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_exhausted_multigroup"),
     )
     .await;
 }

@@ -144,10 +144,10 @@ pub use ci_runtime_composition::{
     MAX_CI_WORKFLOW_DRIVES_PER_SCOPE, MAX_CI_WORKFLOW_SCOPES_PER_PASS,
 };
 pub use ci_prelaunch_usage_journal::{
-    resolve_prelaunch_usage_on_conn, CiJobParentAttempt, CiPrelaunchJournalOutcome,
-    CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity, CiPrelaunchUnresolvedPolicy,
-    CiPrelaunchUsageAccrual, CiPrelaunchUsageJournal, CiPrelaunchUsageJournalError,
-    CiPrelaunchUsagePhase,
+    resolve_prelaunch_usage_on_conn, CiJobParentAttempt, CiParentAttemptAdmission,
+    CiPrelaunchJournalOutcome, CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity,
+    CiPrelaunchUnresolvedPolicy, CiPrelaunchUsageAccrual, CiPrelaunchUsageJournal,
+    CiPrelaunchUsageJournalError, CiPrelaunchUsagePhase,
 };
 /// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
 /// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`

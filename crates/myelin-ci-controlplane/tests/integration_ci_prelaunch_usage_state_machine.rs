@@ -12,6 +12,7 @@ use myelin_ci_controlplane::{
     resolve_prelaunch_usage_on_conn, CiAttemptBudgetPolicy, CiAttemptBudgetRevision,
     CiDriveManifestStore, CiDriveManifestV1, CiJobBudgetReservationProvider,
     CiJobRuntimeAuthorityRequest, CiJobSpecStore, CiJobTokenRequest, CiManifestLaneV1,
+    CiParentAttemptAdmission,
     CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1,
     CiPrelaunchJournalOutcome, CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity,
     CiPrelaunchUnresolvedPolicy, CiPrelaunchUsageJournal, CiPrelaunchUsageJournalError,
@@ -876,6 +877,237 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
                 .unwrap_err(),
             CiPrelaunchUsageJournalError::ParentAttemptLimitExceeded
         );
+
+        // ---- CT-007 slice 5b.3-6d: the typed exhaustion capability ----
+        // The FIRST admitted attempt transitioned the reservation reserved -> inflight, and that
+        // committed. This is the load-bearing invariant: a reserve that has ANY committed parent row
+        // is already inflight, so an exhausted terminal never strands a `reserved` reservation.
+        let reservation_state = |handle: String| {
+            let admin = admin.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT state FROM cost_reservation
+                     WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+                )
+                .bind(TENANT)
+                .bind(REGION)
+                .bind(handle)
+                .fetch_one(&admin)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(
+            reservation_state(capped.reserve_handle.clone()).await,
+            "inflight",
+            "the first admitted attempt transitioned the reserve to inflight"
+        );
+        let parent_rows = |job_id: String| {
+            let admin = admin.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM ci_job_parent_attempt
+                     WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+                )
+                .bind(TENANT)
+                .bind(REGION)
+                .bind(job_id)
+                .fetch_one(&admin)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(parent_rows(capped.claim.job_id.clone()).await, 1);
+
+        // `admit_parent_attempt` for the SAME exhausted, never-admitted replacement generation returns
+        // the typed AttemptsExhausted capability (NOT an error), carrying the settleable reserve.
+        match journal
+            .admit_parent_attempt(&replacement, &capped.reserve_handle)
+            .await
+            .unwrap()
+        {
+            CiParentAttemptAdmission::AttemptsExhausted { reserve_handle } => {
+                assert_eq!(reserve_handle, capped.reserve_handle);
+            }
+            CiParentAttemptAdmission::Admitted { .. } => {
+                panic!("an exhausted budget must not admit a new parent attempt")
+            }
+        }
+        // The commit created NO row for the refused generation, and left the reserve inflight (never
+        // stranded reserved): the exhausted terminal path can settle it.
+        assert_eq!(parent_rows(capped.claim.job_id.clone()).await, 1);
+        assert_eq!(
+            reservation_state(capped.reserve_handle.clone()).await,
+            "inflight",
+            "an exhausted admission commits, leaving the reserve inflight and settleable"
+        );
+
+        // The Admitted arm: a fresh, non-exhausted claim admits through `admit_parent_attempt` and
+        // transitions its own reserve to inflight in the same tenant transaction.
+        let admittable = seed_fixture(
+            &app,
+            &admin,
+            11,
+            CiAttemptBudgetPolicy::production(),
+            FixtureMutation::None,
+        )
+        .await;
+        match journal
+            .admit_parent_attempt(&admittable.claim, &admittable.reserve_handle)
+            .await
+            .unwrap()
+        {
+            CiParentAttemptAdmission::Admitted { attempt, outcome } => {
+                assert_eq!(outcome, CiPrelaunchJournalOutcome::Applied);
+                assert_eq!(attempt.job_id(), admittable.claim.job_id);
+            }
+            CiParentAttemptAdmission::AttemptsExhausted { .. } => {
+                panic!("a fresh claim within budget must admit")
+            }
+        }
+        assert_eq!(parent_rows(admittable.claim.job_id.clone()).await, 1);
+        assert_eq!(
+            reservation_state(admittable.reserve_handle.clone()).await,
+            "inflight"
+        );
+        // Exact replay of the admitted generation is idempotent (Replayed, still one row).
+        assert!(matches!(
+            journal
+                .admit_parent_attempt(&admittable.claim, &admittable.reserve_handle)
+                .await
+                .unwrap(),
+            CiParentAttemptAdmission::Admitted {
+                outcome: CiPrelaunchJournalOutcome::Replayed,
+                ..
+            }
+        ));
+        assert_eq!(parent_rows(admittable.claim.job_id.clone()).await, 1);
+
+        // ---- CT-007 slice 5b.3-6d: the exhausted admission COMMITS its OWN reserved -> inflight
+        // transition. A regression moving the transition AFTER exhaustion detection would strand the
+        // reserve as `reserved`. Construct a full budget whose reservation is DELIBERATELY still
+        // `reserved` (max prior rows inserted directly, never through the admit path that flips it). ----
+        let stranded = seed_fixture(
+            &app,
+            &admin,
+            12,
+            CiAttemptBudgetPolicy::production(),
+            FixtureMutation::None,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE cost_reservation SET state = 'reserved'
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(&stranded.reserve_handle)
+        .execute(&admin)
+        .await
+        .unwrap();
+        // Five parent rows for OTHER generations (epochs 2..=6) fill the exact-policy budget without
+        // ever transitioning the reservation. The fixture's own claim (epoch 1) has no row.
+        for epoch in 2_i64..=6 {
+            sqlx::query(
+                "INSERT INTO ci_job_parent_attempt (
+                   tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle, lease_owner,
+                   lease_epoch, claim_nonce, claim_started_at_epoch_secs,
+                   claim_expires_at_epoch_secs, budget_revision, max_parent_attempts
+                 ) VALUES ($1,$2,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9::uuid,$10,$11,1,5)",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(&stranded.claim.job_id)
+            .bind(&stranded.claim.wf_run_id)
+            .bind(&stranded.claim.ci_run_id)
+            .bind(&stranded.reserve_handle)
+            .bind(format!("prior-runner-{epoch}"))
+            .bind(epoch)
+            .bind(uuid(0x6b, epoch as u64))
+            .bind(stranded.claim.claim_started_at_epoch_secs - epoch)
+            .bind(stranded.claim.claim_expires_at_epoch_secs - epoch)
+            .execute(&admin)
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            reservation_state(stranded.reserve_handle.clone()).await,
+            "reserved",
+            "budget is full but the reservation is deliberately still reserved"
+        );
+        match journal
+            .admit_parent_attempt(&stranded.claim, &stranded.reserve_handle)
+            .await
+            .unwrap()
+        {
+            CiParentAttemptAdmission::AttemptsExhausted { reserve_handle } => {
+                assert_eq!(reserve_handle, stranded.reserve_handle);
+            }
+            CiParentAttemptAdmission::Admitted { .. } => panic!("a full budget must not admit"),
+        }
+        // THE regression catch: the committed exhaustion transitioned the reserve to inflight.
+        assert_eq!(
+            reservation_state(stranded.reserve_handle.clone()).await,
+            "inflight",
+            "an exhausted admission COMMITS its own reserved -> inflight transition"
+        );
+        // No row was created for the refused (current) generation.
+        assert_eq!(parent_rows(stranded.claim.job_id.clone()).await, 5);
+        let epoch_one_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ci_job_parent_attempt
+             WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid AND lease_epoch = 1",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(&stranded.claim.job_id)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(epoch_one_rows, 0, "the refused generation has no parent row");
+
+        // settled / cancelled / absent reservations NEVER yield the capability and are left unchanged.
+        for forced in ["settled", "cancelled"] {
+            sqlx::query(
+                "UPDATE cost_reservation SET state = $4
+                 WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(&stranded.reserve_handle)
+            .bind(forced)
+            .execute(&admin)
+            .await
+            .unwrap();
+            assert_eq!(
+                journal
+                    .admit_parent_attempt(&stranded.claim, &stranded.reserve_handle)
+                    .await
+                    .unwrap_err(),
+                CiPrelaunchUsageJournalError::ReservationNotLaunchable
+            );
+            assert_eq!(
+                reservation_state(stranded.reserve_handle.clone()).await,
+                forced,
+                "a non-launchable reservation is refused before exhaustion and left unchanged"
+            );
+        }
+        sqlx::query(
+            "DELETE FROM cost_reservation WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(&stranded.reserve_handle)
+        .execute(&admin)
+        .await
+        .unwrap();
+        assert_eq!(
+            journal
+                .admit_parent_attempt(&stranded.claim, &stranded.reserve_handle)
+                .await
+                .unwrap_err(),
+            CiPrelaunchUsageJournalError::ReservationUnavailable
+        );
+        assert_eq!(parent_rows(stranded.claim.job_id.clone()).await, 5);
 
         // The Rust text-cast path preserves the complete u64 domain introduced by the schema slice.
         let max_usage = seed_fixture(
