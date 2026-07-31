@@ -13,12 +13,16 @@
 use std::sync::Arc;
 
 use myelin_ci_sandbox::{
-    CompletionClaim, CompletionSettlementOwner, RetryableAttemptFailure, RetryableAttemptOutcome,
-    TerminalReport, TerminalReporter,
+    CompletionClaim, CompletionSettlementOwner, PreparationReportClaim, PreparationRetryReport,
+    PreparationTerminalDisposition, RetryableAttemptFailure, RetryableAttemptOutcome, TerminalReport,
+    TerminalReporter,
 };
 use myelin_flow::{ExecutorError, SignalOutcome};
 use myelin_tenancy::{Region, TenantId};
 
+use crate::ci_pipeline_driver::{
+    token_request_from_preparation_report_claim, PreparationRetryOutcome,
+};
 use crate::CiPipelineReporter;
 
 /// Credential-free refusal from a reporter factory. Concrete construction errors stay inside the
@@ -73,6 +77,34 @@ impl CiPipelineReporterRouter {
 
     pub fn region(&self) -> &Region {
         &self.region
+    }
+
+    /// **CT-007 slice 5b.3-6d STEP 4: resolve + verify the exact-tenant reporter for a preparation
+    /// report.** Applies the SAME empty-tenant, factory-scope, and accounting-owner checks
+    /// [`Self::report_done`] applies before any durable access — a preparation report never weakens
+    /// completion authority. The claim's tenant (one of its twelve fields) is the routing key.
+    fn preparation_reporter(&self, tenant_id: &str) -> Result<CiPipelineReporter, ExecutorError> {
+        if tenant_id.trim().is_empty() {
+            return Err(ExecutorError::InvalidInput(
+                "ci.pipeline preparation report refused: claimed tenant is empty".into(),
+            ));
+        }
+        let tenant = TenantId(tenant_id.to_string());
+        let reporter = (self.factory)(&tenant, &self.region).map_err(|_| {
+            ExecutorError::InvalidInput(
+                "ci.pipeline preparation report refused: exact-tenant reporter is unavailable".into(),
+            )
+        })?;
+        if reporter.tenant() != &tenant
+            || reporter.region() != self.region.0
+            || reporter.completion_settlement_owner() != self.completion_settlement_owner()
+        {
+            return Err(ExecutorError::InvalidInput(
+                "ci.pipeline preparation report refused: reporter scope or accounting owner mismatch"
+                    .into(),
+            ));
+        }
+        Ok(reporter)
     }
 }
 
@@ -138,6 +170,36 @@ impl TerminalReporter for CiPipelineReporterRouter {
             ));
         }
         reporter.report_retryable_attempt(claim, failure)
+    }
+
+    fn report_preparation_terminal(
+        &self,
+        claim: &PreparationReportClaim,
+        disposition: PreparationTerminalDisposition,
+    ) -> Result<SignalOutcome, ExecutorError> {
+        // CT-007 5b.3-6d STEP 4: route to the exact-tenant reporter, then map the sandbox reporting
+        // identity 1:1 onto the durable request and delegate to the inherent durable CAS. UFCS names
+        // the inherent method, never the reporter's trait method.
+        let reporter = self.preparation_reporter(&claim.tenant_id)?;
+        CiPipelineReporter::report_preparation_terminal(
+            &reporter,
+            &token_request_from_preparation_report_claim(claim),
+            disposition,
+        )
+    }
+
+    fn report_preparation_retry(
+        &self,
+        claim: &PreparationReportClaim,
+    ) -> Result<PreparationRetryReport, ExecutorError> {
+        let reporter = self.preparation_reporter(&claim.tenant_id)?;
+        match CiPipelineReporter::report_preparation_retry(
+            &reporter,
+            &token_request_from_preparation_report_claim(claim),
+        )? {
+            PreparationRetryOutcome::Requeued => Ok(PreparationRetryReport::Requeued),
+            PreparationRetryOutcome::NoOp => Ok(PreparationRetryReport::NoOp),
+        }
     }
 }
 

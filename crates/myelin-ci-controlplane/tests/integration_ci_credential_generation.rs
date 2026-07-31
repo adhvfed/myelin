@@ -2931,7 +2931,7 @@ async fn adapter_exhaustion_retry_and_stale_authority_matrix() {
             let spec_t = spec.clone();
             let reserve = std::thread::spawn(move || {
                 match comp_t.parent_attempt_reserve_hook()(&spec_t).expect("typed admission") {
-                    ParentAttemptAdmission::AttemptsExhausted { reserve } => reserve.0,
+                    ParentAttemptAdmission::AttemptsExhausted { reserve, .. } => reserve.0,
                     ParentAttemptAdmission::Admitted { .. } => panic!("must be exhausted at max"),
                 }
             })

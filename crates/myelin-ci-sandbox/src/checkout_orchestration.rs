@@ -12,7 +12,7 @@
 
 use crate::runner::{
     PreparationAttemptDisposition, PreparationLeaseCheckpoint, PreparationLeaseLost,
-    PreparationPhase, PreparationTerminalDisposition,
+    PreparationPhase, PreparationReportClaim, PreparationTerminalDisposition,
 };
 use crate::{
     CheckoutPhase, JobSpec, ReserveHandle, ResourceUsage, RunTokenAuthorizationContext,
@@ -265,14 +265,22 @@ impl PreparationLeaseCheckpoint for AttemptAuthorityLeaseCheckpoint<'_> {
 /// that its terminal `AttemptsExhausted` report must settle against.
 pub enum ParentAttemptAdmission {
     /// The exact claim was validated, the reservation transitioned to inflight, and a parent-attempt
-    /// row was inserted/replayed — the attempt may proceed under `attempt_authority`.
+    /// row was inserted/replayed — the attempt may proceed under `attempt_authority`. `claim` is the
+    /// preparation REPORTING identity (CT-007 5b.3-6d STEP 4) carried into any preparation outcome the
+    /// orchestrator/continuation produces for this attempt.
     Admitted {
+        claim: PreparationReportClaim,
         reserve: ReserveHandle,
         attempt_authority: Box<dyn AttemptAuthority>,
     },
     /// The reservation exists but the durable parent-attempt budget is already exhausted — nothing
-    /// may spawn; the caller terminalizes `AttemptsExhausted` and settles `reserve`.
-    AttemptsExhausted { reserve: ReserveHandle },
+    /// may spawn; the caller terminalizes `AttemptsExhausted` and settles `reserve`. `claim` carries
+    /// the reporting identity even though there is no attempt authority: an exhausted attempt STILL
+    /// reports its terminal (CT-007 5b.3-6d STEP 4).
+    AttemptsExhausted {
+        claim: PreparationReportClaim,
+        reserve: ReserveHandle,
+    },
 }
 
 /// A structural failure of the dormant checkout orchestration that is NOT an ordinary preparation
@@ -333,15 +341,26 @@ pub enum CheckoutContinuationOutcome {
         message: String,
     },
     /// Preparation reached a terminal disposition (`Failed`/`TimedOut`/`AttemptsExhausted`) before
-    /// any workload launched — the caller reports `report_preparation_terminal(disposition)`.
+    /// any workload launched — the caller reports `report_preparation_terminal(claim, disposition)`.
+    /// `claim` is the reporting identity carried UNCHANGED from the parent-attempt admission (CT-007
+    /// 5b.3-6d STEP 4).
     PreparationTerminal {
+        claim: PreparationReportClaim,
         disposition: PreparationTerminalDisposition,
     },
-    /// A nonterminal preparation failure — requeue the exact leased generation (`requeued == true`)
-    /// or, when the parent-attempt budget is exhausted, terminalize `AttemptsExhausted`
-    /// (`requeued == false`, surfaced as [`Self::PreparationTerminal`] instead — this variant is only
-    /// produced when a requeue actually happened).
-    PreparationRetryable { phase: PreparationPhase },
+    /// A nonterminal preparation failure that is a RETRY REQUEST, not a completed requeue: it is
+    /// produced after the ADVISORY `should_requeue()` check (budget not yet exhausted). The caller
+    /// MUST dispatch `report_preparation_retry(claim)`, whose authoritative leased-generation CAS
+    /// decides `Requeued` (the generation was actually re-queued) vs `NoOp` (already
+    /// requeued/reclaimed/stale) — an activation author must NOT assume a requeue happened and skip the
+    /// reporter, or the generation is left leased. When the budget IS exhausted the orchestrator
+    /// surfaces [`Self::PreparationTerminal`] with `AttemptsExhausted` instead, never this variant.
+    /// `claim` is the reporting identity carried UNCHANGED from the parent-attempt admission (CT-007
+    /// 5b.3-6d STEP 4).
+    PreparationRetryable {
+        claim: PreparationReportClaim,
+        phase: PreparationPhase,
+    },
     /// An invariant requires reconciliation — a teardown could not be proven and/or exact usage is
     /// unrepresentable, so resources may still be live. No ordinary terminal/requeue report; the
     /// reaper/reconciliation owner takes over.
@@ -360,6 +379,7 @@ pub enum CheckoutContinuationOutcome {
 #[allow(dead_code)]
 pub(crate) fn route_preparation_disposition(
     authority: &dyn AttemptAuthority,
+    claim: &PreparationReportClaim,
     disposition: PreparationAttemptDisposition,
     usage: ResourceUsage,
 ) -> Result<CheckoutContinuationOutcome, AttemptAuthorityError> {
@@ -369,6 +389,7 @@ pub(crate) fn route_preparation_disposition(
             // then report the preparation terminal.
             authority.complete_phase(terminal_phase(terminal), usage)?;
             Ok(CheckoutContinuationOutcome::PreparationTerminal {
+                claim: claim.clone(),
                 disposition: terminal,
             })
         }
@@ -381,12 +402,12 @@ pub(crate) fn route_preparation_disposition(
                     mem_byte_seconds: 0,
                 },
             )?;
-            Ok(requeue_or_exhausted(authority, phase))
+            Ok(requeue_or_exhausted(authority, claim, phase))
         }
         PreparationAttemptDisposition::RetryableInfrastructure { phase } => {
             // Retryable infrastructure: complete with the exact measured usage, then requeue-or-exhausted.
             authority.complete_phase(phase, usage)?;
-            Ok(requeue_or_exhausted(authority, phase))
+            Ok(requeue_or_exhausted(authority, claim, phase))
         }
         PreparationAttemptDisposition::ReconciliationRequired {
             phase,
@@ -440,11 +461,12 @@ pub(crate) fn route_after_disposal(
 #[allow(dead_code)]
 pub(crate) fn resolve_hop_b_failure(
     authority: &dyn AttemptAuthority,
+    claim: &PreparationReportClaim,
     disposition: PreparationAttemptDisposition,
     usage: ResourceUsage,
     disposal_diagnostics: Vec<String>,
 ) -> Result<CheckoutContinuationOutcome, AttemptAuthorityError> {
-    let routed = route_preparation_disposition(authority, disposition, usage)?;
+    let routed = route_preparation_disposition(authority, claim, disposition, usage)?;
     if disposal_diagnostics.is_empty() {
         Ok(routed)
     } else {
@@ -466,6 +488,7 @@ pub(crate) fn resolve_hop_b_failure(
 #[allow(dead_code)]
 pub(crate) fn route_post_acquisition_authority_failure(
     authority: &dyn AttemptAuthority,
+    claim: &PreparationReportClaim,
     disposal_diagnostics: Vec<String>,
     phase_was_begun: bool,
 ) -> CheckoutContinuationOutcome {
@@ -496,23 +519,29 @@ pub(crate) fn route_post_acquisition_authority_failure(
             quarantine_required: true,
         }
     } else {
-        requeue_or_exhausted(authority, PreparationPhase::CheckoutMaterialization)
+        requeue_or_exhausted(authority, claim, PreparationPhase::CheckoutMaterialization)
     }
 }
 
 /// Requeue the exact leased generation when another parent attempt is permitted, else terminalize
 /// `AttemptsExhausted` (CT-007 5b.3-6c). The parent-attempt journal — via
 /// [`AttemptAuthority::should_requeue`] — is the sole retry authority; this never appends to workload
-/// retry attempts.
+/// retry attempts. `claim` is carried UNCHANGED into whichever preparation outcome is produced (CT-007
+/// 5b.3-6d STEP 4).
 #[allow(dead_code)]
 pub(crate) fn requeue_or_exhausted(
     authority: &dyn AttemptAuthority,
+    claim: &PreparationReportClaim,
     phase: PreparationPhase,
 ) -> CheckoutContinuationOutcome {
     if authority.should_requeue() {
-        CheckoutContinuationOutcome::PreparationRetryable { phase }
+        CheckoutContinuationOutcome::PreparationRetryable {
+            claim: claim.clone(),
+            phase,
+        }
     } else {
         CheckoutContinuationOutcome::PreparationTerminal {
+            claim: claim.clone(),
             disposition: PreparationTerminalDisposition::AttemptsExhausted,
         }
     }
@@ -652,6 +681,25 @@ mod tests {
         }
     }
 
+    /// A well-formed preparation reporting identity for the routing tests (CT-007 5b.3-6d STEP 4). The
+    /// routers carry it UNCHANGED into whichever preparation outcome they build.
+    fn report_claim() -> PreparationReportClaim {
+        PreparationReportClaim {
+            tenant_id: "acme".into(),
+            region: "fr-par".into(),
+            wf_run_id: "11111111-1111-1111-1111-111111111111".into(),
+            ci_run_id: "44444444-4444-4444-4444-444444444444".into(),
+            job_id: "22222222-2222-2222-2222-222222222222".into(),
+            token_authority_handle: "tah-xyz".into(),
+            idem_token: "11111111-1111-1111-1111-111111111111/build".into(),
+            lease_owner: "worker-1".into(),
+            lease_epoch: 7,
+            claim_nonce: "33333333-3333-3333-3333-333333333333".into(),
+            claim_started_at_epoch_secs: 1_000,
+            claim_expires_at_epoch_secs: 1_300,
+        }
+    }
+
     #[test]
     fn phase_credential_carrier_rotates_only_the_credential_and_context() {
         let base = crate::checkout_job_spec_for_tests();
@@ -778,6 +826,7 @@ mod tests {
         let authority = RecordingAuthority::new(true);
         let outcome = resolve_hop_b_failure(
             &authority,
+            &report_claim(),
             PreparationAttemptDisposition::ReconciliationRequired {
                 phase: PreparationPhase::CheckoutMaterialization,
                 teardown_unproven: true,
@@ -812,6 +861,7 @@ mod tests {
         let authority = RecordingAuthority::new(true);
         let outcome = resolve_hop_b_failure(
             &authority,
+            &report_claim(),
             PreparationAttemptDisposition::Terminal(PreparationTerminalDisposition::Failed {
                 phase: PreparationPhase::CheckoutMaterialization,
             }),
@@ -832,7 +882,7 @@ mod tests {
     fn post_acquisition_authority_failure_routing_matrix() {
         // begin_phase failure (phase NOT begun), clean disposal → requeue.
         let authority = RecordingAuthority::new(true);
-        let out = route_post_acquisition_authority_failure(&authority, vec![], false);
+        let out = route_post_acquisition_authority_failure(&authority, &report_claim(), vec![], false);
         assert!(authority.ops().is_empty(), "no begun phase to complete");
         assert!(matches!(
             out,
@@ -841,7 +891,7 @@ mod tests {
 
         // mint/authorize failure (phase begun), clean disposal → complete-zero then requeue.
         let authority = RecordingAuthority::new(true);
-        let out = route_post_acquisition_authority_failure(&authority, vec![], true);
+        let out = route_post_acquisition_authority_failure(&authority, &report_claim(), vec![], true);
         assert_eq!(authority.ops(), vec!["complete:CheckoutMaterialization:0:0"]);
         assert!(matches!(
             out,
@@ -850,12 +900,13 @@ mod tests {
 
         // authorize failure (phase begun), clean disposal, budget exhausted → complete-zero, terminalize.
         let authority = RecordingAuthority::new(false);
-        let out = route_post_acquisition_authority_failure(&authority, vec![], true);
+        let out = route_post_acquisition_authority_failure(&authority, &report_claim(), vec![], true);
         assert_eq!(authority.ops(), vec!["complete:CheckoutMaterialization:0:0"]);
         assert!(matches!(
             out,
             CheckoutContinuationOutcome::PreparationTerminal {
-                disposition: PreparationTerminalDisposition::AttemptsExhausted
+                disposition: PreparationTerminalDisposition::AttemptsExhausted,
+                ..
             }
         ));
 
@@ -863,6 +914,7 @@ mod tests {
         let authority = RecordingAuthority::new(true);
         let out = route_post_acquisition_authority_failure(
             &authority,
+            &report_claim(),
             vec!["slot quarantined".to_string()],
             true,
         );
@@ -876,10 +928,42 @@ mod tests {
     }
 
     #[test]
+    fn requeue_or_exhausted_carries_the_exact_claim_into_both_outcomes() {
+        // CT-007 5b.3-6d STEP 4: the reporting identity threads UNCHANGED into whichever preparation
+        // outcome the router builds — a requeue (should_requeue == true) and an exhaustion terminal.
+        let claim = report_claim();
+        let requeued = requeue_or_exhausted(
+            &RecordingAuthority::new(true),
+            &claim,
+            PreparationPhase::CheckoutTransport,
+        );
+        match requeued {
+            CheckoutContinuationOutcome::PreparationRetryable { claim: carried, phase } => {
+                assert_eq!(carried, claim, "the retry outcome carries the exact claim");
+                assert_eq!(phase, PreparationPhase::CheckoutTransport);
+            }
+            other => panic!("expected a retryable, got {other:?}"),
+        }
+        let exhausted = requeue_or_exhausted(
+            &RecordingAuthority::new(false),
+            &claim,
+            PreparationPhase::CheckoutTransport,
+        );
+        match exhausted {
+            CheckoutContinuationOutcome::PreparationTerminal { claim: carried, disposition } => {
+                assert_eq!(carried, claim, "the exhausted terminal carries the exact claim");
+                assert_eq!(disposition, PreparationTerminalDisposition::AttemptsExhausted);
+            }
+            other => panic!("expected an exhausted terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn route_terminal_completes_the_active_phase_with_exact_usage() {
         let authority = RecordingAuthority::new(true);
         let outcome = route_preparation_disposition(
             &authority,
+            &report_claim(),
             PreparationAttemptDisposition::Terminal(PreparationTerminalDisposition::Failed {
                 phase: PreparationPhase::CheckoutTransport,
             }),
@@ -892,7 +976,8 @@ mod tests {
             CheckoutContinuationOutcome::PreparationTerminal {
                 disposition: PreparationTerminalDisposition::Failed {
                     phase: PreparationPhase::CheckoutTransport
-                }
+                },
+                ..
             }
         ));
     }
@@ -902,6 +987,7 @@ mod tests {
         let authority = RecordingAuthority::new(true);
         let outcome = route_preparation_disposition(
             &authority,
+            &report_claim(),
             PreparationAttemptDisposition::Terminal(PreparationTerminalDisposition::TimedOut {
                 phase: PreparationPhase::CheckoutMaterialization,
             }),
@@ -912,7 +998,8 @@ mod tests {
         assert!(matches!(
             outcome,
             CheckoutContinuationOutcome::PreparationTerminal {
-                disposition: PreparationTerminalDisposition::TimedOut { .. }
+                disposition: PreparationTerminalDisposition::TimedOut { .. },
+                ..
             }
         ));
     }
@@ -922,6 +1009,7 @@ mod tests {
         let authority = RecordingAuthority::new(true);
         let outcome = route_preparation_disposition(
             &authority,
+            &report_claim(),
             PreparationAttemptDisposition::RefusedBeforeExecution {
                 phase: PreparationPhase::CheckoutTransport,
             },
@@ -932,7 +1020,8 @@ mod tests {
         assert!(matches!(
             outcome,
             CheckoutContinuationOutcome::PreparationRetryable {
-                phase: PreparationPhase::CheckoutTransport
+                phase: PreparationPhase::CheckoutTransport,
+                ..
             }
         ));
     }
@@ -942,6 +1031,7 @@ mod tests {
         let authority = RecordingAuthority::new(false);
         let outcome = route_preparation_disposition(
             &authority,
+            &report_claim(),
             PreparationAttemptDisposition::RefusedBeforeExecution {
                 phase: PreparationPhase::CheckoutTransport,
             },
@@ -952,7 +1042,8 @@ mod tests {
         assert!(matches!(
             outcome,
             CheckoutContinuationOutcome::PreparationTerminal {
-                disposition: PreparationTerminalDisposition::AttemptsExhausted
+                disposition: PreparationTerminalDisposition::AttemptsExhausted,
+                ..
             }
         ));
     }
@@ -962,6 +1053,7 @@ mod tests {
         let authority = RecordingAuthority::new(true);
         let outcome = route_preparation_disposition(
             &authority,
+            &report_claim(),
             PreparationAttemptDisposition::RetryableInfrastructure {
                 phase: PreparationPhase::CheckoutMaterialization,
             },
@@ -972,7 +1064,8 @@ mod tests {
         assert!(matches!(
             outcome,
             CheckoutContinuationOutcome::PreparationRetryable {
-                phase: PreparationPhase::CheckoutMaterialization
+                phase: PreparationPhase::CheckoutMaterialization,
+                ..
             }
         ));
     }
@@ -983,6 +1076,7 @@ mod tests {
         let authority = RecordingAuthority::new(true);
         let outcome = route_preparation_disposition(
             &authority,
+            &report_claim(),
             PreparationAttemptDisposition::ReconciliationRequired {
                 phase: PreparationPhase::CheckoutTransport,
                 teardown_unproven: false,
@@ -1009,12 +1103,14 @@ mod tests {
         // ordinary requeue with ReconciliationRequired — never a requeued generation alongside a live
         // unreconciled resource.
         let clean = CheckoutContinuationOutcome::PreparationRetryable {
+            claim: report_claim(),
             phase: PreparationPhase::CheckoutMaterialization,
         };
         let quarantined = route_after_disposal(
             vec!["slot quarantined; workspace manager poisoned".to_string()],
             PreparationPhase::CheckoutMaterialization,
             CheckoutContinuationOutcome::PreparationRetryable {
+                claim: report_claim(),
                 phase: PreparationPhase::CheckoutMaterialization,
             },
         );
@@ -1043,6 +1139,7 @@ mod tests {
         let authority = RecordingAuthority::new(true);
         let outcome = route_preparation_disposition(
             &authority,
+            &report_claim(),
             PreparationAttemptDisposition::ReconciliationRequired {
                 phase: PreparationPhase::CheckoutMaterialization,
                 teardown_unproven: true,

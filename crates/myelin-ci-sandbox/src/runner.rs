@@ -649,6 +649,36 @@ pub struct CompletionClaim {
     pub claim_nonce: String,
 }
 
+/// **CT-007 slice 5b.3-6d STEP 4: the reporting identity for one checkout PREPARATION outcome.**
+///
+/// A preparation terminal/retry report re-verifies the parent attempt under the durable CAS, which
+/// needs the FULL claim-bound token request — not the seven-field [`CompletionClaim`] a workload
+/// `job.done` carries. This type carries EXACTLY the twelve control-plane `CiJobTokenRequest` fields
+/// (the seven [`CompletionClaim`] identity fields — `tenant`/`run`(=`wf_run_id`)/`job_id`/`idem_token`
+/// /`lease_owner`/`lease_epoch`/`claim_nonce`) plus the five the workload path never needs
+/// (`region`/`ci_run_id`/`token_authority_handle`/`claim_started_at_epoch_secs`/
+/// `claim_expires_at_epoch_secs`) — and NO others (no lease-expiry, claim-window, reserve handle,
+/// credential generation, or checkout scope). The control-plane router maps it 1:1 back onto its
+/// `CiJobTokenRequest` to reach the durable preparation CAS; this crate never names that type.
+///
+/// **Dormant.** It is minted only inside the (dormant) checkout admission and reaches a reporter only
+/// via the (dormant) checkout continuation; a production compute cycle never constructs one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparationReportClaim {
+    pub tenant_id: String,
+    pub region: String,
+    pub wf_run_id: String,
+    pub ci_run_id: String,
+    pub job_id: String,
+    pub token_authority_handle: String,
+    pub idem_token: String,
+    pub lease_owner: String,
+    pub lease_epoch: i64,
+    pub claim_nonce: String,
+    pub claim_started_at_epoch_secs: i64,
+    pub claim_expires_at_epoch_secs: i64,
+}
+
 /// A measured sandbox attempt that must be retried without emitting `job.done`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetryableAttemptFailure {
@@ -709,6 +739,18 @@ pub enum RetryableAttemptOutcome {
     ExactReplay,
 }
 
+/// **CT-007 slice 5b.3-6d STEP 4: the sandbox-visible outcome of a PREPARATION-retry report.** Mirrors
+/// the durable requeue CAS's two benign results without this crate naming the control-plane
+/// `PreparationRetryOutcome`. A [`TerminalReporter`] that reaches the durable CAS maps one onto the
+/// other 1:1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationRetryReport {
+    /// The exact leased generation was returned to the queue for a fresh attempt.
+    Requeued,
+    /// The presented generation was no longer the live leased one — a benign no-op that changed nothing.
+    NoOp,
+}
+
 /// **The terminal-report sink — the runner ECHOES `job.done` through it (the ONE signal path).** A
 /// thin seam so the runner depends on an abstraction, with the production impl
 /// ([`EngineTerminalReporter`]) routing onto the ENGINE's [`DurableExecutor::signal`] — there is NO
@@ -744,6 +786,30 @@ pub trait TerminalReporter {
         claim: &CompletionClaim,
         failure: &RetryableAttemptFailure,
     ) -> Result<RetryableAttemptOutcome, ExecutorError>;
+
+    /// **CT-007 slice 5b.3-6d STEP 4: report a checkout PREPARATION terminal (dormant).** Carries the
+    /// full [`PreparationReportClaim`] (the twelve claim-bound identity fields) because a preparation
+    /// terminal re-verifies the parent attempt under the durable CAS — the seven-field
+    /// [`CompletionClaim`] a workload `job.done` carries is insufficient. A CI-pipeline reporter maps
+    /// the claim onto its durable request and settles/terminalizes; a generic engine reporter (which is
+    /// NOT on the CI pipeline path) EXPLICITLY refuses.
+    ///
+    /// This is a REQUIRED method with no default: every implementor makes a conscious refuse-or-delegate
+    /// choice, so an incomplete production reporter fails to compile rather than silently refusing.
+    fn report_preparation_terminal(
+        &self,
+        claim: &PreparationReportClaim,
+        disposition: PreparationTerminalDisposition,
+    ) -> Result<SignalOutcome, ExecutorError>;
+
+    /// **CT-007 slice 5b.3-6d STEP 4: report a checkout PREPARATION retry — requeue the exact leased
+    /// generation (dormant).** Emits no `job.done` and settles no accounting; the parent-attempt
+    /// journal is the retry authority. REQUIRED (no default), for the same conscious-choice reason as
+    /// [`Self::report_preparation_terminal`].
+    fn report_preparation_retry(
+        &self,
+        claim: &PreparationReportClaim,
+    ) -> Result<PreparationRetryReport, ExecutorError>;
 }
 
 /// **The production terminal reporter — `job.done` onto the ENGINE's [`DurableExecutor::signal`]
@@ -807,6 +873,30 @@ impl<E: DurableExecutor> TerminalReporter for EngineTerminalReporter<E> {
             "retryable measured CI attempts require a claim-aware durable reporter".into(),
         ))
     }
+
+    fn report_preparation_terminal(
+        &self,
+        _claim: &PreparationReportClaim,
+        _disposition: PreparationTerminalDisposition,
+    ) -> Result<SignalOutcome, ExecutorError> {
+        // The generic engine reporter is NOT the CI pipeline path: it has no parent-attempt journal,
+        // no preparation CAS, and no claim-bound token request to re-verify. Preparation reporting
+        // belongs to the CI pipeline reporter (router); refuse EXPLICITLY, never silently.
+        Err(ExecutorError::InvalidInput(
+            "checkout preparation terminals require the CI pipeline reporter, not the engine reporter"
+                .into(),
+        ))
+    }
+
+    fn report_preparation_retry(
+        &self,
+        _claim: &PreparationReportClaim,
+    ) -> Result<PreparationRetryReport, ExecutorError> {
+        Err(ExecutorError::InvalidInput(
+            "checkout preparation retries require the CI pipeline reporter, not the engine reporter"
+                .into(),
+        ))
+    }
 }
 
 // =================================================================================================
@@ -833,6 +923,21 @@ pub struct RunOutcome {
     pub lease_epoch: i64,
     /// Opaque claim nonce echoed on an exact terminal-report retry.
     pub claim_nonce: String,
+}
+
+/// **CT-007 slice 5b.3-6d STEP 4: what [`RunnerAgent::report_preparation_outcome`] delivered.** A
+/// checkout continuation surfaces a [`CheckoutContinuationOutcome`](crate::checkout_orchestration::CheckoutContinuationOutcome);
+/// only the two preparation variants are a preparation report. The non-preparation variants
+/// (`WorkloadLaunched`/`WorkloadRetryable`/`ReconciliationRequired`) have OTHER owners and deliver
+/// nothing here — surfaced explicitly so the exhaustive match stays language-enforced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationOutcomeDispatch {
+    /// A preparation terminal was reported; carries the `job.done` idempotency outcome.
+    Terminalized(SignalOutcome),
+    /// A preparation retry was reported; carries the durable requeue result.
+    Retried(PreparationRetryReport),
+    /// The outcome is not a preparation report — a different owner settles it; nothing was delivered.
+    NotAPreparationReport,
 }
 
 /// An error a runner cycle can surface — loud, never swallowed (EI-02 §4). A backend launch failure
@@ -984,6 +1089,41 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
     /// The runner's worker id (the lease owner).
     pub fn worker_id(&self) -> &str {
         &self.worker_id
+    }
+
+    /// **CT-007 slice 5b.3-6d STEP 4: dispatch a checkout PREPARATION outcome to the terminal reporter
+    /// (DORMANT).** The dormant checkout continuation produces a
+    /// [`CheckoutContinuationOutcome`](crate::checkout_orchestration::CheckoutContinuationOutcome); its
+    /// two preparation variants carry the [`PreparationReportClaim`] this echoes through the reporter's
+    /// required preparation methods — a terminal or a requeue. The three non-preparation variants have
+    /// other owners (the workload finalizer / the reaper-reconciliation path), so they deliver nothing
+    /// here. The match is exhaustive: a future outcome variant will not compile until it is classified.
+    ///
+    /// This has NO production caller until 5b.3-6e selects the checkout path; a compute cycle
+    /// ([`Self::run_one`]) never produces a checkout preparation outcome, so this method is never
+    /// reached in production.
+    pub fn report_preparation_outcome(
+        &self,
+        outcome: &crate::checkout_orchestration::CheckoutContinuationOutcome,
+    ) -> Result<PreparationOutcomeDispatch, ExecutorError> {
+        use crate::checkout_orchestration::CheckoutContinuationOutcome;
+        match outcome {
+            CheckoutContinuationOutcome::PreparationTerminal { claim, disposition } => Ok(
+                PreparationOutcomeDispatch::Terminalized(
+                    self.reporter.report_preparation_terminal(claim, *disposition)?,
+                ),
+            ),
+            CheckoutContinuationOutcome::PreparationRetryable { claim, .. } => Ok(
+                PreparationOutcomeDispatch::Retried(
+                    self.reporter.report_preparation_retry(claim)?,
+                ),
+            ),
+            CheckoutContinuationOutcome::WorkloadLaunched(_)
+            | CheckoutContinuationOutcome::WorkloadRetryable { .. }
+            | CheckoutContinuationOutcome::ReconciliationRequired { .. } => {
+                Ok(PreparationOutcomeDispatch::NotAPreparationReport)
+            }
+        }
     }
 
     /// **Claim → launch → heartbeat → terminal report — one runner cycle (arch 00 §4 / §2.1).**
@@ -1431,6 +1571,11 @@ mod tests {
         /// `settlements` (which mixes usage from BOTH `report_done` and `report_retryable_attempt`)
         /// so a test can assert the precise cause a launch-level `RetryableAttempt` carried through.
         retry_causes: Arc<Mutex<Vec<RetryableAttemptCause>>>,
+        /// CT-007 5b.3-6d STEP 4: every `report_preparation_terminal` call's exact claim + disposition,
+        /// so the dormant dispatch test can assert the reporter received the outcome's own claim.
+        prep_terminals: Arc<Mutex<Vec<(PreparationReportClaim, PreparationTerminalDisposition)>>>,
+        /// CT-007 5b.3-6d STEP 4: every `report_preparation_retry` call's exact claim.
+        prep_retries: Arc<Mutex<Vec<PreparationReportClaim>>>,
         fail: bool,
     }
 
@@ -1442,6 +1587,8 @@ mod tests {
                 retry_reports: AtomicUsize::new(0),
                 settlements,
                 retry_causes: Arc::new(Mutex::new(Vec::new())),
+                prep_terminals: Arc::new(Mutex::new(Vec::new())),
+                prep_retries: Arc::new(Mutex::new(Vec::new())),
                 fail,
             }
         }
@@ -1481,6 +1628,36 @@ mod tests {
             self.settlements.lock().unwrap().push(failure.usage);
             self.retry_causes.lock().unwrap().push(failure.cause);
             Ok(RetryableAttemptOutcome::Requeued)
+        }
+
+        fn report_preparation_terminal(
+            &self,
+            claim: &PreparationReportClaim,
+            disposition: PreparationTerminalDisposition,
+        ) -> Result<SignalOutcome, ExecutorError> {
+            if self.fail {
+                return Err(ExecutorError::Storage(
+                    "injected preparation-terminal transaction rollback".into(),
+                ));
+            }
+            self.prep_terminals
+                .lock()
+                .unwrap()
+                .push((claim.clone(), disposition));
+            Ok(SignalOutcome::Buffered)
+        }
+
+        fn report_preparation_retry(
+            &self,
+            claim: &PreparationReportClaim,
+        ) -> Result<PreparationRetryReport, ExecutorError> {
+            if self.fail {
+                return Err(ExecutorError::Storage(
+                    "injected preparation-retry transaction rollback".into(),
+                ));
+            }
+            self.prep_retries.lock().unwrap().push(claim.clone());
+            Ok(PreparationRetryReport::Requeued)
         }
     }
 
@@ -1745,6 +1922,123 @@ mod tests {
     }
 
     // ───────────────────── the runner agent: claim → launch → terminal report ────────────────────
+
+    /// A well-formed preparation reporting identity for the dormant-dispatch test (CT-007 5b.3-6d
+    /// STEP 4).
+    fn prep_report_claim() -> PreparationReportClaim {
+        PreparationReportClaim {
+            tenant_id: "acme".into(),
+            region: "fr-par".into(),
+            wf_run_id: "11111111-1111-1111-1111-111111111111".into(),
+            ci_run_id: "44444444-4444-4444-4444-444444444444".into(),
+            job_id: "22222222-2222-2222-2222-222222222222".into(),
+            token_authority_handle: "tah-xyz".into(),
+            idem_token: "11111111-1111-1111-1111-111111111111/build".into(),
+            lease_owner: "worker-1".into(),
+            lease_epoch: 7,
+            claim_nonce: "33333333-3333-3333-3333-333333333333".into(),
+            claim_started_at_epoch_secs: 1_000,
+            claim_expires_at_epoch_secs: 1_300,
+        }
+    }
+
+    /// **CT-007 5b.3-6d STEP 4 (DORMANT).** `report_preparation_outcome` dispatches the two preparation
+    /// variants to the reporter's REQUIRED preparation methods — carrying the outcome's exact claim —
+    /// and classifies every non-preparation variant as delivering nothing. Proven with the recording
+    /// reporter directly (no claim/launch: this path is never reached by `run_one`).
+    #[test]
+    fn report_preparation_outcome_dispatches_terminal_retry_and_ignores_non_preparation() {
+        use crate::checkout_orchestration::CheckoutContinuationOutcome;
+        let backend = RecordingBackend::default();
+        let firehose = CountingFirehose::new();
+        let reporter =
+            RecordingTerminalReporter::reporter_owned(Arc::new(Mutex::new(Vec::new())), false);
+        let agent = RunnerAgent::new(
+            "worker-1",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            JobLeaseStore::new(),
+            &backend,
+            &firehose,
+            &reporter,
+            test_hooks(),
+        );
+        let claim = prep_report_claim();
+
+        // PreparationTerminal → report_preparation_terminal(claim, disposition), carried unchanged.
+        let disposition = PreparationTerminalDisposition::Failed {
+            phase: PreparationPhase::CheckoutTransport,
+        };
+        let dispatched = agent
+            .report_preparation_outcome(&CheckoutContinuationOutcome::PreparationTerminal {
+                claim: claim.clone(),
+                disposition,
+            })
+            .expect("dispatches the terminal");
+        assert_eq!(
+            dispatched,
+            PreparationOutcomeDispatch::Terminalized(SignalOutcome::Buffered)
+        );
+        {
+            let recorded = reporter.prep_terminals.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].0, claim, "the reporter got the outcome's exact claim");
+            assert_eq!(recorded[0].1, disposition);
+        }
+
+        // PreparationRetryable → report_preparation_retry(claim).
+        let dispatched = agent
+            .report_preparation_outcome(&CheckoutContinuationOutcome::PreparationRetryable {
+                claim: claim.clone(),
+                phase: PreparationPhase::CheckoutMaterialization,
+            })
+            .expect("dispatches the retry");
+        assert_eq!(
+            dispatched,
+            PreparationOutcomeDispatch::Retried(PreparationRetryReport::Requeued)
+        );
+        assert_eq!(*reporter.prep_retries.lock().unwrap(), vec![claim.clone()]);
+
+        // A non-preparation outcome delivers nothing and records nothing new.
+        let dispatched = agent
+            .report_preparation_outcome(&CheckoutContinuationOutcome::WorkloadRetryable {
+                cause: RetryableAttemptCause::SandboxInfrastructure,
+                usage: ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0,
+                },
+                message: "post-settle failure".into(),
+            })
+            .expect("classifies the non-preparation outcome");
+        assert_eq!(dispatched, PreparationOutcomeDispatch::NotAPreparationReport);
+        assert_eq!(reporter.prep_terminals.lock().unwrap().len(), 1);
+        assert_eq!(reporter.prep_retries.lock().unwrap().len(), 1);
+    }
+
+    /// **CT-007 5b.3-6d STEP 4: the generic engine reporter EXPLICITLY refuses BOTH preparation
+    /// methods.** It is not the CI pipeline path (no parent-attempt journal, no preparation CAS); the
+    /// required-method contract forces this conscious refusal rather than a silent default.
+    #[test]
+    fn engine_terminal_reporter_refuses_both_preparation_reports() {
+        let (ex, _run) = started_run();
+        let reporter = EngineTerminalReporter::new(ex);
+        let claim = prep_report_claim();
+        assert!(
+            reporter
+                .report_preparation_terminal(
+                    &claim,
+                    PreparationTerminalDisposition::AttemptsExhausted,
+                )
+                .is_err(),
+            "the engine reporter must refuse a preparation terminal"
+        );
+        assert!(
+            reporter.report_preparation_retry(&claim).is_err(),
+            "the engine reporter must refuse a preparation retry"
+        );
+    }
 
     /// **The runner agent runs a job end-to-end: claim → launch (four guarantees) → kill → terminal
     /// `job.done` (arch 00 §4).** One claim, one launch, one whole-guest kill, frames streamed, and a
@@ -2188,6 +2482,8 @@ mod tests {
             retry_reports: AtomicUsize::new(0),
             settlements: reporter_settlements.clone(),
             retry_causes: Arc::new(Mutex::new(Vec::new())),
+            prep_terminals: Arc::new(Mutex::new(Vec::new())),
+            prep_retries: Arc::new(Mutex::new(Vec::new())),
             fail: false,
         };
         let unowned = RunnerAgent::new(
