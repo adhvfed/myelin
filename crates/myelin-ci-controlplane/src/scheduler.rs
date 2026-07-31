@@ -668,6 +668,71 @@ WHERE q.tenant_id = $1
   )
 RETURNING q.job_id";
 
+/// **CT-007 slice 5b.3-6d step 2: the preparation-RETRY CAS.** When a checkout preparation attempt
+/// fails RETRYABLY and another parent attempt is permitted, the exact still-`leased` generation is
+/// returned to `queued` for a fresh runner to re-claim. This shares
+/// [`CONSUME_PREPARATION_CLAIM_QUERY`]'s entire `WHERE … RETURNING` block BYTE-FOR-BYTE — including
+/// the current-generation parent-attempt predicate (a retryable failure was, by definition, an
+/// admitted attempt whose exact row exists) and the pre-workload `ci_job` surface guard — and differs
+/// ONLY in the action: it clears the lease and the claim nonce and moves the row back to `queued`
+/// rather than terminalizing with a completion receipt. There is NO `$14` (no receipt): a requeue is
+/// not a terminal outcome and settles nothing.
+///
+/// Crucially this NEVER touches `retry_attempts`: the parent-attempt journal — not the workload
+/// retry counter — is the authority for preparation retries, so the workload retry path stays wholly
+/// independent. Bind `$1..$13` exactly as the shipped preparation CAS binds them (minus the receipt).
+pub const REQUEUE_PREPARATION_CLAIM_QUERY: &str = "\
+UPDATE job_queue AS q
+SET state = 'queued', lease_owner = NULL, lease_expires = NULL, claim_nonce = NULL
+WHERE q.tenant_id = $1
+  AND q.region = $2
+  AND q.job_id = $3::uuid
+  AND q.run_id = $4::uuid
+  AND q.idem_token = $5
+  AND q.lease_owner = $6
+  AND q.lease_epoch = $7
+  AND q.claim_nonce = $8::uuid
+  AND q.stage = $9
+  AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $10
+  AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $11
+  AND q.claim_expires_at > statement_timestamp()
+  AND q.state = 'leased'
+  AND q.completion_receipt IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM ci_job_parent_attempt AS parent
+    WHERE parent.tenant_id = q.tenant_id
+      AND parent.region = q.region
+      AND parent.job_id = q.job_id
+      AND parent.wf_run_id = q.run_id
+      AND parent.ci_run_id = $12::uuid
+      AND parent.reserve_handle = $13
+      AND parent.lease_owner = $6
+      AND parent.lease_epoch = q.lease_epoch
+      AND parent.claim_nonce = q.claim_nonce
+      AND parent.claim_started_at_epoch_secs = $10
+      AND parent.claim_expires_at_epoch_secs = $11
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM ci_job AS surface
+    WHERE surface.tenant_id = q.tenant_id
+      AND surface.region = q.region
+      AND surface.job_id = q.job_id
+      AND surface.state IN ('queued', 'leased')
+  )
+RETURNING q.job_id";
+
+/// **CT-007 5b.3-6d step 2: reset the `ci_job` DAG surface after a preparation requeue.** Mirrors the
+/// dead-runner reaper's [`RESET_REAPED_CI_JOB_SURFACE_QUERY`](crate::job_queue_region) and the workload
+/// retryable-attempt reset: a requeued preparation generation must leave the public surface pre-workload
+/// so a fresh generation can re-win the launch fence. Preparation never crosses the surface to
+/// `running` (only [`AUTHORIZE_JOB_LAUNCH_QUERY`] does), so this only ever needs to undo a `leased`
+/// surface; a terminal DAG state (`succeeded`/`failed`/…) is never reopened. Bind `$1 tenant`, `$2 job`.
+pub const RESET_REQUEUED_PREPARATION_CI_JOB_SURFACE_QUERY: &str = "\
+UPDATE ci_job SET state = 'queued'
+WHERE tenant_id = $1 AND job_id = $2::uuid AND state = 'leased'";
+
 /// **Read a job's terminal disposition for the completion CAS's 0-row branch.** When
 /// [`CONSUME_CLAIM_QUERY`] consumes nothing, this distinguishes an IDEMPOTENT redelivery (the row is
 /// already `terminal` with the SAME `completion_receipt`) from a fail-closed REFUSAL (missing row,
@@ -1885,6 +1950,47 @@ RETURNING surface.job_id";
             !exhausted_parent_block.contains("q.claim_nonce"),
             "the exhausted parent predicate must NOT bind the current generation (that is the row \
              that does not exist for a refused generation)"
+        );
+    }
+
+    /// **CT-007 5b.3-6d step 2: the requeue CAS shares the shipped preparation CAS's ENTIRE
+    /// `WHERE … RETURNING` block BYTE-FOR-BYTE, differing ONLY in the action.** The queue-identity +
+    /// live-claim + current-generation parent + `ci_job` surface predicates are the SAME bytes as the
+    /// already-fully-tested [`CONSUME_PREPARATION_CLAIM_QUERY`], so every admission/guard predicate is
+    /// load-bearing here by identity; the only sanctioned difference is the `SET` (requeue-to-queued +
+    /// clear nonce, no completion receipt) rather than terminalize.
+    #[test]
+    fn the_requeue_cas_shares_the_shipped_where_block_byte_for_byte() {
+        const WHERE_MARKER: &str = "WHERE q.tenant_id = $1";
+        let shipped_where = CONSUME_PREPARATION_CLAIM_QUERY
+            .find(WHERE_MARKER)
+            .expect("the shipped preparation CAS opens its WHERE block");
+        let requeue_where = REQUEUE_PREPARATION_CLAIM_QUERY
+            .find(WHERE_MARKER)
+            .expect("the requeue CAS opens its WHERE block");
+        // The entire predicate block through `RETURNING q.job_id` is byte-identical: any predicate
+        // drop/edit fails here. (The shipped CAS carries `$14` only in its SET, so the WHERE blocks
+        // themselves share the SAME parameter references.)
+        assert_eq!(
+            &CONSUME_PREPARATION_CLAIM_QUERY[shipped_where..],
+            &REQUEUE_PREPARATION_CLAIM_QUERY[requeue_where..],
+            "the requeue CAS must admit EXACTLY what the shipped preparation CAS admits"
+        );
+        // The action differs: requeue returns the row to `queued`, RELEASES the lease
+        // (`lease_owner`/`lease_expires` NULL), and clears the nonce; it never terminalizes and never
+        // writes a completion receipt. The COMPLETE SET is fenced byte-for-byte so removing any one
+        // assignment (e.g. `lease_expires = NULL`) fails here.
+        let requeue_set = &REQUEUE_PREPARATION_CLAIM_QUERY[..requeue_where];
+        assert_eq!(
+            requeue_set,
+            "UPDATE job_queue AS q\n\
+             SET state = 'queued', lease_owner = NULL, lease_expires = NULL, claim_nonce = NULL\n",
+            "the requeue action releases the lease and clears the nonce, in full"
+        );
+        assert!(!REQUEUE_PREPARATION_CLAIM_QUERY.contains("completion_receipt = $14"));
+        assert!(
+            !REQUEUE_PREPARATION_CLAIM_QUERY.contains("retry_attempts"),
+            "a preparation requeue NEVER touches the workload retry counter"
         );
     }
 }
