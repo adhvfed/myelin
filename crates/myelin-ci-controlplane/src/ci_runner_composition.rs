@@ -1,4 +1,4 @@
-//! Production Identity composition for the dormant CI runner lane.
+//! Production Identity composition for the CI runner lane.
 //!
 //! This module owns the one construction path from the sealed durable cell token root and durable
 //! S7 store to the claim-time issuer, scoped Tier-P reservation lifecycle, and final pre-spawn
@@ -126,10 +126,9 @@ pub fn ci_runner_hooks(
     }))
 }
 
-/// **CT-007 slice 5b.3-6e.2: the V2 runner composition root's bundled output (DORMANT).** The V2
-/// spec resolver + the V2 [`RunnerHooks`] a `CiRunnerLoop` is driven with once Stage B selects this
-/// path. Held together so `main` cannot wire a V1 resolver to V2 hooks (or vice versa) — they are one
-/// reviewed unit.
+/// **CT-007 slice 5b.3-6e.2: the V2 runner composition root's bundled output.** The V2 spec resolver
+/// and V2 [`RunnerHooks`] selected by Stage B stay together so `main` cannot wire a V1 resolver to V2
+/// hooks (or vice versa).
 pub struct CiRunnerV2Wiring {
     resolver: crate::runner_bind::JobSpecResolver,
     hooks: RunnerHooks,
@@ -147,7 +146,7 @@ impl CiRunnerV2Wiring {
     }
 }
 
-/// **CT-007 slice 5b.3-6e.2: the ONE named V2 runner composition root (DORMANT).** Composes, for one
+/// **CT-007 slice 5b.3-6e.2: the ONE named V2 runner composition root.** Composes, for one
 /// region, the coupled V2 activation choices in a single reviewable place:
 ///
 /// 1. SHARES the concrete `IdentityCiJobCredentialMinter` from `identity` (never a second Identity);
@@ -157,8 +156,8 @@ impl CiRunnerV2Wiring {
 ///    per-phase checkout authorization hook, and the parent-attempt reservation admission (compute
 ///    AND checkout).
 ///
-/// **No production composition root calls this in Stage A** — `main` still selects the V1
-/// `durable_spec_resolver` + `ci_runner_hooks`; the atomic Stage B flip is what points `main` here.
+/// The Stage-B composition root selects this as one atomic unit; it never pairs a V1 resolver with
+/// V2 hooks (or vice versa).
 ///
 /// **CT-007 5b.3-6e.2 Stage A (Sol ruling) — the parent-attempt reserve hook's COMPUTE arm is a
 /// FUTURE / non-manifest path, DEAD-in-CI today.** The hook admits both compute `(None, None)` and

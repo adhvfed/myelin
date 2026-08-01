@@ -451,6 +451,9 @@ async fn seed_fixture(app: &PgPool, admin: &PgPool, seed: u64, claim_age_secs: i
                 idem_token: idem_token.clone(),
                 stage: "build".into(),
                 claim_window_secs: window,
+                reservation_write_version: myelin_ci_controlplane::ReservationWriteVersionMarker::derive_from_reserve_handle(
+                    &launch.spec.meter_to.reserve_id,
+                ),
             },
             &launch,
             "build",
@@ -1808,7 +1811,7 @@ async fn a_sealed_ceiling_phase_satisfies_no_purpose_and_retires_its_own_credent
     .await;
 }
 
-/// **Dormancy — round-1 major 5: exact allowed occurrences across BOTH crates.**
+/// **Activation surface — exact allowed occurrences across BOTH crates.**
 ///
 /// The earlier version scanned only `myelin-ci-controlplane/src`, excluded the four defining modules
 /// wholesale, and never looked at `myelin-ci-sandbox` at all — so an activation added inside an
@@ -1833,9 +1836,8 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         "acquire_phase_generation_ownership(",
         "V2PhaseBound",
         "CiJobCredentialGenerationStore",
-        // CT-007 5b.3-6d STEP 3: the dormant composition FAÇADE. Wiring ANY of these into a
-        // production composition root activates the V2 checkout path WITHOUT touching the credential
-        // markers above — so the dormancy guarantee requires the scan to cover them directly.
+        // CT-007 5b.3-6e.2: the V2 composition FAÇADE is activated only through the named wiring
+        // root. These markers pin that exact surface and reject any second composition path.
         "V2CheckoutComposition",
         "v2_phase_credential_store(",
         "mint_initial_phase_credential(",
@@ -2296,11 +2298,7 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         ),
         ("myelin-ci-sandbox", "runner.rs", "PhaseAuthorization", 0),
         // --- CT-007 5b.3-6e.1 activation-chassis selectors (Sol's major 2) ---
-        // Definition sites: the selector methods are DEFINED once each (dormant). `with_checkout_config`
-        // is the sandbox GvisorBackend builder; `with_activation_readiness` is the control-plane
-        // CutoverPlan builder. `ActivationReadinessProbe::production` (the qualified CALL form) never
-        // appears at its own definition (`fn production(`), so it is ZERO everywhere until a caller wires
-        // it — the pure composition-root zero.
+        // Definition sites remain exactly once; activated calls are separately pinned below.
         ("myelin-ci-sandbox", "gvisor.rs", "with_checkout_config", 1),
         (
             "myelin-ci-controlplane",
@@ -2308,8 +2306,8 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             "with_activation_readiness",
             1,
         ),
-        // ...and EXPLICITLY ZERO in every composition root that could select them (the same set the
-        // V2CheckoutComposition zeros cover). A premature selection in ANY of these turns the scan RED.
+        // Every root not named by the activation remains explicitly zero. The named activated roots
+        // carry exact nonzero counts, so an alternate selection turns the scan red.
         (
             "myelin-ci-controlplane",
             "main.rs",
@@ -2320,7 +2318,7 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             "myelin-ci-controlplane",
             "runner_bind.rs",
             "with_checkout_config",
-            0,
+            1,
         ),
         (
             "myelin-ci-controlplane",
@@ -2388,7 +2386,7 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             "myelin-ci-controlplane",
             "ci_runtime_composition.rs",
             "ActivationReadinessProbe::production",
-            0,
+            1,
         ),
         (
             "myelin-ci-controlplane",
@@ -2495,11 +2493,11 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         assert_eq!(
             code_occurrences(&source, marker),
             0,
-            "{krate}/src/{file} must never contain `{marker}` while production is V1-pinned"
+            "{krate}/src/{file} must remain outside the exact Stage-B activation surface for `{marker}`"
         );
     }
 
-    // Belt and braces: the production composition roots construct the V1 store shape only.
+    // Belt and braces: the four production accounting sites all select the V4 store explicitly.
     let composition = std::fs::read_to_string(
         workspace
             .join("myelin-ci-controlplane")
@@ -2507,11 +2505,8 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             .join("ci_runtime_composition.rs"),
     )
     .unwrap();
-    assert!(
-        code_occurrences(&composition, "CiJobAccountingStore::with_pg(") > 0
-            && code_occurrences(&composition, "with_pg_and_write_version") == 0,
-        "the production runtime composition root builds default (V1/V3) stores only"
-    );
+    assert_eq!(code_occurrences(&composition, "CiJobAccountingStore::with_pg("), 0);
+    assert_eq!(code_occurrences(&composition, "with_pg_and_write_version"), 2);
 }
 
 /// **Round-1 blocker 3: the V2 workload CAS may never resurrect an expired execution lease.**

@@ -111,6 +111,7 @@ SELECT q.region, q.job_id::text AS queue_job_id, q.run_id::text AS queue_run_id,
        q.lane, q.labels, q.trust_tier, q.concurrency_group, q.fair_key,
        q.idem_token AS queue_idem_token, q.stage AS queue_stage,
        q.claim_window_secs AS queue_claim_window_secs,
+       q.reservation_write_version AS queue_reservation_write_version,
        s.region AS spec_region, s.run_id::text AS spec_run_id,
        s.idem_token AS spec_idem_token, s.spec, s.stage AS spec_stage
 FROM job_queue q
@@ -405,6 +406,7 @@ impl CiJobSpecStore {
         let idem = enq.idem_token.clone();
         let workflow_run_id = enq.run_id.clone();
         let claim_window_secs = enq.claim_window_secs;
+        let reservation_write_version = enq.reservation_write_version.value();
         if enq.stage != stage {
             return Err(CiJobSpecStoreError::Db(
                 "durable dispatch stage differs between queue authority and spec identity".into(),
@@ -445,6 +447,7 @@ impl CiJobSpecStore {
                         .bind(&idem) // $10 idem_token
                         .bind(&stage) // $11 stage (regional guard + completion authority)
                         .bind(claim_window_secs) // $12 immutable dispatch-derived claim window
+                        .bind(reservation_write_version) // $13 reserve writer marker
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|e| PgError::Query(e.to_string()))?;
@@ -485,6 +488,7 @@ impl CiJobSpecStore {
                         &idem,
                         &stage,
                         claim_window_secs,
+                        reservation_write_version,
                         &spec_json,
                     )?;
                     Ok((jq_row.is_some(), spec_row.is_some()))
@@ -649,9 +653,12 @@ fn verify_exact_dispatch(
     idem_token: &str,
     stage: &str,
     claim_window_secs: i64,
+    reservation_write_version: Option<i16>,
     spec: &serde_json::Value,
 ) -> Result<(), PgError> {
     let exact = row.get::<Option<i64>, _>("queue_claim_window_secs") == Some(claim_window_secs)
+        && row.get::<Option<i16>, _>("queue_reservation_write_version")
+            == reservation_write_version
         && row.get::<String, _>("region") == region
         && row.get::<String, _>("queue_job_id") == job_id.to_string()
         && row.get::<String, _>("queue_run_id") == run_id.to_string()

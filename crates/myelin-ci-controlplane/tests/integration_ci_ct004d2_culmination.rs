@@ -45,7 +45,8 @@ use myelin_ci_controlplane::{
     ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
-    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_SPEC_DDL,
+    ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    CREATE_CI_JOB_DDL, CREATE_CI_JOB_SPEC_DDL,
     CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
@@ -194,6 +195,10 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
         .await
         .expect("add the durable claim window");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL)
+        .await
+        .expect("add the reservation writer marker");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin.execute(idx.as_str()).await.expect("index");
@@ -311,7 +316,8 @@ fn bridge<F: Future>(rt: &tokio::runtime::Handle, future: F) -> F::Output {
 /// the same durable `leased` -> `running` CAS as production. The permit defers that CAS until the
 /// real gVisor backend has armed its child launch gate.
 fn durable_launch_hooks(queue_store: CiJobQueueStore, rt: tokio::runtime::Handle) -> RunnerHooks {
-    RunnerHooks::new_with_launch_fence(
+    common::with_stage_b_compute_admission_for_legacy_runsc_test(
+        RunnerHooks::new_with_launch_fence(
         myelin_ci_sandbox::CompletionSettlementOwner::Hook,
         Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
         Box::new(|_spec, _h, _u| Ok(())),
@@ -346,7 +352,8 @@ fn durable_launch_hooks(queue_store: CiJobQueueStore, rt: tokio::runtime::Handle
                 Ok(LaunchOwnership::immediate())
             }))
         }),
-        Box::new(|_s| Ok(())),
+            Box::new(|_s| Ok(())),
+        ),
     )
 }
 

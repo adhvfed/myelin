@@ -230,6 +230,9 @@ async fn dispatch(
                 idem_token: format!("lease-topology-{seed}"),
                 stage: "build".into(),
                 claim_window_secs: window,
+                reservation_write_version: myelin_ci_controlplane::ReservationWriteVersionMarker::derive_from_reserve_handle(
+                    &launch.spec.meter_to.reserve_id,
+                ),
             },
             &launch,
             "build",

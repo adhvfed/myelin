@@ -321,6 +321,9 @@ async fn seed_fixture(
                 idem_token: idem_token.clone(),
                 stage: "build".into(),
                 claim_window_secs: claim_window_secs_for_template(&launch.spec).unwrap(),
+                reservation_write_version: myelin_ci_controlplane::ReservationWriteVersionMarker::derive_from_reserve_handle(
+                    &launch.spec.meter_to.reserve_id,
+                ),
             },
             &launch,
             "build",

@@ -5,7 +5,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use common::with_schema_cleanup;
+use common::{legacy_streaming_hooks, with_schema_cleanup, LegacyStreamingGvisor};
 use myelin_ci_controlplane::{
     ci_artifact_ref, ci_controlplane_hot_tables, ci_controlplane_migrations, ci_job_queue_store,
     ci_job_spec_store, ci_manifest_pipeline_definition, ci_production_runtime_factory_test_support,
@@ -30,7 +30,8 @@ use myelin_ci_sandbox::{
     CompletionSettlementOwner, CountingFirehose, ImageRef, JobKind, PreparationPhase,
     PreparationReportClaim, PreparationRetryReport, PreparationTerminalDisposition, ResourceUsage,
     RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome, RunnerAgent,
-    TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
+    TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec,
+    LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::{IdMinter, MonotonicMinter};
@@ -3100,6 +3101,7 @@ async fn run_reporter_scenario(
                     idem_token: "poison-cancelled-recovery".into(),
                     stage: "build".into(),
                     claim_window_secs: CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
+                    reservation_write_version: myelin_ci_controlplane::ReservationWriteVersionMarker::legacy(),
                 })
                 .await
                 .unwrap();
@@ -3658,12 +3660,17 @@ async fn run_reporter_scenario(
         tokio::runtime::Handle::current(),
         resolver,
     );
-    let hooks = ci_runner_hooks(
-        provider.clone(),
-        identity.launch_authorizer(),
-        tokio::runtime::Handle::current(),
+    let hooks = legacy_streaming_hooks(
+        ci_runner_hooks(
+            provider.clone(),
+            identity.launch_authorizer(),
+            tokio::runtime::Handle::current(),
+        ),
+        format!("myelin://{}/git/repo/core", tenant.0),
+        "deadbeef00deadbeef00deadbeef00deadbeef00".into(),
     );
     let backend = GvisorBackend::new(test_registry());
+    let legacy_streaming_backend = LegacyStreamingGvisor(&backend);
     let firehose = CountingFirehose::new();
     let recovered_worker = "runner-recovered";
     let agent = RunnerAgent::new(
@@ -3676,7 +3683,7 @@ async fn run_reporter_scenario(
         region.clone(),
         CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
         leases,
-        &backend,
+        &legacy_streaming_backend,
         &firehose,
         &production_reporter,
         hooks,
@@ -3758,12 +3765,14 @@ async fn run_reporter_scenario(
         .starts_with("v3:"));
     assert_eq!(
         accounting.get::<Option<String>, _>("terminal_disposition"),
-        None,
-        "production reporter and supersession owners remain pinned to v3 until fleet convergence"
+        Some("workload_failed".into()),
+        "the activated production reporter records the closed V4 workload disposition"
     );
-    assert_eq!(
-        accounting.get::<Option<String>, _>("completion_receipt_v4"),
-        None
+    assert!(
+        accounting
+            .get::<Option<String>, _>("completion_receipt_v4")
+            .is_some_and(|receipt| receipt.starts_with("v4:")),
+        "the activated production reporter writes the authoritative V4 receipt"
     );
     let storage_events: i64 =
         sqlx::query_scalar("SELECT count(*) FROM cost_event WHERE run_id = $1")

@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::with_schema_cleanup;
+use common::{legacy_streaming_hooks, with_schema_cleanup, LegacyStreamingGvisor};
 use myelin_ci_controlplane::{
     ci_job_authorization_context, ci_region_queue_store_test_support,
     ci_runner_cancellation_coordinator, ci_runner_hooks, ci_runner_identity_authorities,
@@ -1044,16 +1044,26 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     launch_authorizer
         .authorize_checkout(&spawn_spec, &checkout_scope())
         .expect("the fresh reminted generation passes checkout authorization before real launch");
+    let recovered_hooks = legacy_streaming_hooks(
+        ci_runner_hooks(
+            provider.clone(),
+            second_identity.launch_authorizer(),
+            tokio::runtime::Handle::current(),
+        ),
+        expected.jobs[0].workspace.repo_ref.clone(),
+        expected.jobs[0].workspace.commit_oid.clone(),
+    );
     let backend = GvisorBackend::new(test_registry());
-    let launch = backend
-        .launch(&spawn_spec, &runner_hooks)
+    let legacy_streaming_backend = LegacyStreamingGvisor(&backend);
+    let launch = legacy_streaming_backend
+        .launch(&spawn_spec, &recovered_hooks)
         .expect("the recovered generation reaches the real production gVisor spawn");
     assert!(launch.result.passed(), "the recovered guest passes");
     assert_eq!(
         launch.result.stdout, b"crash-recovered",
         "the immutable recovered command ran inside the real guest"
     );
-    backend
+    legacy_streaming_backend
         .kill(&launch.handle)
         .expect("the recovered one-job guest tears down");
     let recovered_shape: (String, i64, String, i64, i64) = sqlx::query_as(

@@ -455,6 +455,37 @@ fn parse_v2_handle(handle: &str) -> Option<ParsedV2Handle> {
     })
 }
 
+/// The durable reservation-writer marker carried by one `job_queue` dispatch.
+///
+/// This is derived from the reserve handle's exact wire shape rather than supplied as an unrelated
+/// integer beside it. A legacy/V1 (or malformed/unknown) handle produces `NULL`; only an exactly
+/// parseable V2 handle produces the protocol descriptor's marker `2`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservationWriteVersionMarker(Option<i16>);
+
+impl ReservationWriteVersionMarker {
+    /// Derive the queue marker from the actual durable reserve handle.
+    pub fn derive_from_reserve_handle(handle: &str) -> Self {
+        if parse_v2_handle(handle).is_some() {
+            Self(Some(
+                crate::ci_pipeline_protocol::PRODUCTION_RESERVATION_QUEUE_MARKER,
+            ))
+        } else {
+            Self::legacy()
+        }
+    }
+
+    /// Historical/V1 dispatch marker (`NULL`).
+    pub const fn legacy() -> Self {
+        Self(None)
+    }
+
+    /// The SQL value persisted in `job_queue.reservation_write_version`.
+    pub const fn value(self) -> Option<i16> {
+        self.0
+    }
+}
+
 /// Verify one durable v2 reservation against the complete immutable authority batch.
 ///
 /// Parsing only recovers the policy descriptor; it grants no authority. This resolver reconstructs

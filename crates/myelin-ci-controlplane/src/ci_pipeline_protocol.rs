@@ -7,11 +7,10 @@
 //! composition root reads THESE constants so the four choices cannot silently diverge across the
 //! starter, the runner, and the reporter/accounting roots.
 //!
-//! **Stage A (dormant): defined, selected by NOTHING.** No production root reads these yet, and this
-//! file is NOT part of [`ci_manifest_pipeline_definition`](crate::ci_runtime_composition::ci_manifest_pipeline_definition)'s
-//! hashed source set — adding it there (and pointing every production root at these constants) is the
-//! ATOMIC Stage B activation, which also bumps `CI_MANIFEST_PIPELINE_VERSION` so the recorded manifest
-//! digest binds the reservation/credential/accounting protocol without hashing all of `lib.rs`.
+//! **Stage B activation:** the starter, runner, accounting stores, queue marker, and cutover pin read
+//! these choices as one reviewed protocol descriptor. This file is included in the v4 definition hash.
+//! The version bump means the recorded manifest digest binds the reservation/credential/accounting
+//! protocol without hashing broad composition files such as `lib.rs`.
 //!
 //! **The queue marker is DERIVED, never hardcoded beside an unchecked handle** (Sol's 6e.2 ruling 2):
 //! the enqueue path proves a reserve handle is genuinely V2-shaped and only THEN persists

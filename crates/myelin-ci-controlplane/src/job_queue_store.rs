@@ -176,6 +176,9 @@ pub struct DurableEnqueue {
     /// [`claim_window_secs`](crate::ci_claim_window::claim_window_secs). NOT an `Option`: a NULL
     /// window is legacy-only, so a Rust writer that could produce one must not exist.
     pub claim_window_secs: i64,
+    /// Reservation protocol marker derived from this dispatch's actual reserve handle. V2 is `2`;
+    /// historical/V1 is `NULL`.
+    pub reservation_write_version: crate::ReservationWriteVersionMarker,
 }
 
 /// A leased `job_queue` row (the `CLAIM_QUERY` `RETURNING` shape) — the claimed job's identity + the
@@ -506,6 +509,7 @@ impl CiJobQueueStore {
         let idem = job.idem_token.clone();
         let stage = job.stage.clone();
         let claim_window_secs = job.claim_window_secs;
+        let reservation_write_version = job.reservation_write_version.value();
         if !(1..=MAX_CI_JOB_CLAIM_WINDOW_SECS as i64).contains(&claim_window_secs) {
             return Err(JobQueueStoreError::InvalidInput(format!(
                 "claim window {claim_window_secs}s is outside the durable 1..={MAX_CI_JOB_CLAIM_WINDOW_SECS}s bound"
@@ -526,6 +530,7 @@ impl CiJobQueueStore {
                     .bind(&idem) // $10 idem_token
                     .bind(&stage) // $11 durable pipeline stage
                     .bind(claim_window_secs) // $12 immutable dispatch-derived claim window
+                    .bind(reservation_write_version) // $13 reserve writer marker (V2=2, legacy=NULL)
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(|e| PgError::Query(e.to_string()))?;
@@ -1438,9 +1443,10 @@ mod tests {
     /// column, a changed bind order) is loud here, before the live integration test.
     #[test]
     fn the_bound_sql_matches_the_store_binds() {
-        // INSERT: twelve binds ($1..$12), including queue-authority stage + the claim window.
-        assert!(INSERT_JOB_QUEUE_QUERY.contains("$12") && !INSERT_JOB_QUEUE_QUERY.contains("$13"));
+        // INSERT: thirteen binds ($1..$13), including claim window + reservation marker.
+        assert!(INSERT_JOB_QUEUE_QUERY.contains("$13") && !INSERT_JOB_QUEUE_QUERY.contains("$14"));
         assert!(INSERT_JOB_QUEUE_QUERY.contains("claim_window_secs"));
+        assert!(INSERT_JOB_QUEUE_QUERY.contains("reservation_write_version"));
         assert!(INSERT_JOB_QUEUE_QUERY.contains("ON CONFLICT (tenant_id, idem_token) DO NOTHING"));
         assert!(INSERT_JOB_QUEUE_QUERY.contains("RETURNING job_id"));
         // CLAIM: five binds ($1..$5), RETURNING every column leased_from_row reads.

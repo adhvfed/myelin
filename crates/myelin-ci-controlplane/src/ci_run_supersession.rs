@@ -172,7 +172,11 @@ impl PgCiRunSupersession {
             region: region.clone(),
             scope,
             manifest,
-            accounting: CiJobAccountingStore::with_pg(pool.clone(), region.clone()),
+            accounting: CiJobAccountingStore::with_pg_and_write_version(
+                pool.clone(),
+                region.clone(),
+                crate::ci_pipeline_protocol::PRODUCTION_ACCOUNTING_WRITE_VERSION,
+            ),
             costs: CiCostEventStore::with_pg(pool.clone(), region.clone()),
             ledger,
             executor: PgFlowExecutor::new(

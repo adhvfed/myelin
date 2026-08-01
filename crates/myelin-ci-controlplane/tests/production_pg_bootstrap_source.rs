@@ -119,12 +119,13 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let runner_identity = source
         .find("ci_runner_identity_authorities(")
         .expect("the real CI Identity authorities must be composed at the root");
-    let runner_hooks = source
-        .find("ci_runner_hooks(")
-        .expect("the scoped durable CI runner hooks must be composed at the root");
-    let runner_resolver = source
-        .find("durable_spec_resolver(")
-        .expect("the claim-bound durable spec resolver must be composed at the root");
+    let runner_wiring = source
+        .find("ci_runner_v2_wiring(")
+        .expect("the coupled V2 resolver/hooks wiring must be selected at the root");
+    assert_eq!(source.matches("ci_runner_v2_wiring(").count(), 1);
+    assert_eq!(runner_bind_source.matches(".run_one_cycle(").count(), 1);
+    assert!(!source.contains("myelin_ci_controlplane::ci_runner_hooks("));
+    assert!(!source.contains("myelin_ci_controlplane::durable_spec_resolver("));
     let runner_loop = source
         .find("CiRunnerLoop::new(")
         .expect("the real sandbox runner loop must be composed at the dormant root");
@@ -158,8 +159,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         ("workflow poller", workflow_poller),
         ("reporter router", reporter_router),
         ("runner identity", runner_identity),
-        ("runner hooks", runner_hooks),
-        ("runner resolver", runner_resolver),
+        ("V2 runner wiring", runner_wiring),
         ("runner loop", runner_loop),
     ] {
         assert!(
@@ -169,7 +169,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     }
     assert!(
         definition_cutover < runner_host,
-        "the cutover fence must be the last gate before the v3 lane is spawned"
+        "the cutover fence must be the last gate before the v4 lane is spawned"
     );
 
     assert!(!source.contains("spawn_until_shutdown"));
@@ -265,6 +265,40 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
             "production exact-tenant runtime must retain {production_runtime_dependency}"
         );
     }
+    assert_eq!(
+        runtime_composition_source
+            .matches("CiJobAccountingStore::with_pg_and_write_version(")
+            .count(),
+        2,
+        "worker and reporter-router accounting both select V4"
+    );
+    assert_eq!(
+        supersession_source
+            .matches("CiJobAccountingStore::with_pg_and_write_version(")
+            .count(),
+        1,
+        "supersession accounting selects V4 exactly once"
+    );
+    assert_eq!(
+        library_source
+            .matches("CiJobAccountingStore::with_pg_and_write_version(")
+            .count(),
+        1,
+        "the public accounting factory selects V4 exactly once"
+    );
+    for (name, production_source) in [
+        ("runtime composition", runtime_composition_source),
+        ("supersession composition", supersession_source),
+        ("public factory", library_source),
+    ] {
+        assert_eq!(
+            production_source
+                .matches("CiJobAccountingStore::with_pg(")
+                .count(),
+            0,
+            "{name} must not retain a legacy V3 accounting constructor"
+        );
+    }
     assert!(claim_issuer_source.contains("request.region != self.region"));
     assert!(identity_adapter_source.contains("context.region != self.region.0"));
     assert!(job_queue_store_source.contains(
@@ -340,6 +374,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     }
     assert!(dogfood_source.contains("export MYELIN_GVISOR_ROOTFS="));
     assert!(dogfood_source.contains("export MYELIN_CI_RUNNER=1"));
+    assert!(dogfood_source.contains("export MYELIN_CI_CHECKOUT_REPO_ROOT="));
     assert!(dogfood_source
         .contains("exec cargo run --quiet -p myelin-ci-controlplane --bin ci-controlplane"));
     for production_supersession_dependency in [
@@ -433,6 +468,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(source.contains("fn parse_workspace_activation_given("));
     assert!(source.contains("fn prepare_runner_host_given("));
     assert!(source.contains("gvisor_workspace_config"));
+    assert!(source.contains("MYELIN_CI_CHECKOUT_REPO_ROOT"));
+    assert!(source.contains("prepare_checkout_config()"));
+    assert!(source.contains("gvisor_checkout_config"));
     let workspace_prep = source
         .find("let gvisor_workspace_config = if runner_host_requested {")
         .expect("workspace activation must be parsed/preflighted exactly once, before bootstrap");
@@ -479,12 +517,11 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(starter_poller < workflow_poller);
     assert!(workflow_poller < reporter_router);
     assert!(reporter_router < runner_identity);
-    assert!(runner_identity < runner_resolver);
-    assert!(runner_resolver < runner_hooks);
-    assert!(runner_hooks < runner_loop);
+    assert!(runner_identity < runner_wiring);
+    assert!(runner_wiring < runner_loop);
     assert!(runner_loop < runner_host);
     assert!(runner_host < service);
-    assert!(runner_hooks < service);
+    assert!(runner_wiring < service);
     assert!(starter_lane < service);
 }
 
@@ -660,9 +697,9 @@ async fn boot_time_sigterm_is_latched_before_the_real_runner_host_can_claim() {
     let seeded_job_id: String = sqlx::query_scalar(
         "INSERT INTO public.job_queue \
            (tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group, \
-            fair_key, idem_token, stage, state) \
+            fair_key, idem_token, stage, state, claim_window_secs, reservation_write_version) \
          VALUES ($1, 'fr-par', gen_random_uuid(), gen_random_uuid(), 'interactive', \
-                 ARRAY[]::text[], 'trusted', NULL, $1, $2, 'shutdown-proof', 'queued') \
+                 ARRAY[]::text[], 'trusted', NULL, $1, $2, 'shutdown-proof', 'queued', 900, 2) \
          RETURNING job_id::text",
     )
     .bind(&tenant_id)
@@ -671,6 +708,8 @@ async fn boot_time_sigterm_is_latched_before_the_real_runner_host_can_claim() {
     .await
     .expect("seed one uniquely-owned queued job behind the startup signal gate");
     let cell_id = format!("ci-runner-activation-{suffix}");
+    let checkout_repo_root = std::env::temp_dir().join(format!("myelin-ci-checkout-{suffix}"));
+    std::fs::create_dir_all(&checkout_repo_root).expect("create checkout repository root");
     let mut child = Command::new(env!("CARGO_BIN_EXE_ci-controlplane"))
         .env_clear()
         .env(
@@ -700,6 +739,7 @@ async fn boot_time_sigterm_is_latched_before_the_real_runner_host_can_claim() {
         .env(myelin_ci_sandbox::gvisor::ENV_RUNSC_BIN, &runsc)
         .env(myelin_ci_sandbox::gvisor::ENV_GVISOR_ROOTFS, &rootfs)
         .env("MYELIN_CI_RUNNER", "1")
+        .env("MYELIN_CI_CHECKOUT_REPO_ROOT", &checkout_repo_root)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -732,6 +772,7 @@ async fn boot_time_sigterm_is_latched_before_the_real_runner_host_can_claim() {
     let status = child.wait().expect("wait for the bounded production drain");
     reader.join().expect("join child stderr reader");
     let stderr = captured.lock().unwrap().clone();
+    std::fs::remove_dir_all(&checkout_repo_root).expect("remove checkout repository root");
 
     let untouched_state: Option<(String, Option<String>)> = sqlx::query_as(
         "SELECT state, lease_owner FROM public.job_queue \

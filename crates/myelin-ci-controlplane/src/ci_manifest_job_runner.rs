@@ -297,6 +297,8 @@ fn manifest_dispatch_parts(
         idem_token: flow.idem_token.clone(),
         stage: job.name.clone(),
         claim_window_secs,
+        reservation_write_version:
+            crate::ReservationWriteVersionMarker::derive_from_reserve_handle(&job.reserve_handle),
     };
     Ok((
         enqueue,

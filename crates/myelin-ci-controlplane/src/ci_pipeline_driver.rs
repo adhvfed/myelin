@@ -285,6 +285,10 @@ fn build_dispatch_parts(
         idem_token: flow_spec.idem_token.clone(),
         stage: flow_spec.target.clone(),
         claim_window_secs,
+        reservation_write_version:
+            crate::ReservationWriteVersionMarker::derive_from_reserve_handle(
+                &spec.meter_to.reserve_id,
+            ),
     };
     Ok((enq, spec))
 }

@@ -40,13 +40,17 @@ use crate::{
 /// `ci_manifest_job_runner.rs`'s hashed bytes. The dispatch writer's durable output genuinely
 /// changed — every new `job_queue` row now carries a window a v2 dispatch would not have written —
 /// so this is exactly the deliberate bump the pin exists to force.
-pub const CI_MANIFEST_PIPELINE_VERSION: i32 = 3;
+///
+/// Bumped 3 -> 4 (2026-07-31): CT-007 6e.2 atomically activates V2 reservations/credentials,
+/// checkout-aware runner cycles, queue marker 2, and V4 terminal accounting. The protocol
+/// descriptor is now part of the source hash below.
+pub const CI_MANIFEST_PIPELINE_VERSION: i32 = 4;
 
 /// **The definition version this binary supersedes, and therefore refuses to strand.**
 ///
 /// A version bump is not free: [`PgFlowWorker::register_definition`] registers only the CURRENT
 /// body, `run_once` claims only locally-registered `(wf_type, version)` keys, and `drive_claimed`
-/// requires an exact version match. So a non-terminal `ci.pipeline@2` row under a v3-only binary is
+/// requires an exact version match. So a non-terminal `ci.pipeline@3` row under a v4-only binary is
 /// not merely delayed — it is PERMANENTLY unclaimable, silently, with no worker ever erroring. The
 /// alternative (keeping a frozen v2 body compiled in forever) is worse debt: duplicated legacy
 /// dispatch code that must be maintained in lock-step with the live one.
@@ -55,7 +59,7 @@ pub const CI_MANIFEST_PIPELINE_VERSION: i32 = 3;
 /// exactly this one superseded version rather than a generic "any lower version" sweep: each bump is
 /// a deliberate act whose predecessor is known, and a generic sweep would silently start covering
 /// versions nobody reasoned about.
-pub const CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION: i32 = 2;
+pub const CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION: i32 = 3;
 
 /// Bounded wait for the cutover fence. PostgreSQL's default `lock_timeout` is 0 — wait forever —
 /// which would let one abandoned or indefinitely stalled admission transaction hang v3 boot
@@ -78,16 +82,15 @@ const CI_PIPELINE_BACKLOG_PROBE_CALL: &str = "\
 SELECT myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs($1) \
 /* global registry fence: database-wide by construction */";
 
-/// **The v3→v4 activation-READINESS probe call, SCHEMA-QUALIFIED (CT-007 slice 5b.3-6e.1 — DORMANT).**
+/// **The v3→v4 activation-READINESS probe call, SCHEMA-QUALIFIED.**
 ///
 /// The companion to [`CI_PIPELINE_BACKLOG_PROBE_CALL`]. Where the backlog probe answers "is any run
 /// still pinned to the superseded version", THIS answers "does any non-terminal queue row still lack a
 /// claim window or carry a reservation marker other than 2" — the queue-safety half a v3→v4 activation
 /// must clear before it drains v3. It is schema-qualified for the SAME fail-closed reason: an
 /// unqualified name resolving through `search_path` to a shadowing `SELECT 0` would be a fail-OPEN
-/// activation. It takes NO parameter and returns a single `bigint` unsafe-row count. DORMANT: the
-/// production plan carries no readiness predicate ([`CutoverPlan::activation_readiness`] is `None`)
-/// until the activating slice (6e.2) selects it.
+/// activation. It takes NO parameter and returns a single `bigint` unsafe-row count. The production
+/// v3→v4 plan selects it during the atomic activation.
 const CI_V2_ACTIVATION_READINESS_PROBE_CALL: &str = "\
 SELECT myelin_ci_security.myelin_ci_v2_activation_readiness_unsafe_count() \
 /* global queue-safety fence: database-wide by construction */";
@@ -118,6 +121,9 @@ pub fn ci_manifest_pipeline_definition() -> CiWorkflowDefinitionPin {
         // this entry a future change to the topology formula would change what v3 dispatch persists
         // WITHOUT changing the v3 code hash — exactly the silent drift this pin exists to prevent.
         include_bytes!("ci_claim_window.rs").as_slice(),
+        // CT-007 6e.2 Stage B: bind the activated reservation/credential/accounting protocol choices
+        // into the v4 definition without hashing broad composition files.
+        include_bytes!("ci_pipeline_protocol.rs").as_slice(),
     ] {
         hasher.update(&(source.len() as u64).to_be_bytes());
         hasher.update(source);
@@ -188,7 +194,7 @@ pub enum CiSupersededDefinitionGuardError {
     /// The guard's own probe failed. Also fail-closed — an unanswered guard is not a passed guard.
     ProbeFailed(String),
     /// The backlog was clean but the registry transition itself would not verify (a divergent
-    /// hash, a non-active status, an unexpected drained state). Rolls back with v2 still active.
+    /// hash, a non-active status, an unexpected drained state). Rolls back with v3 still active.
     ActivationRefused(String),
     /// The superseded definition row is ABSENT. Fail-closed: with no row there is nothing to lock,
     /// so the fence would be vacuous and a concurrently-booting old binary could still register and
@@ -197,10 +203,10 @@ pub enum CiSupersededDefinitionGuardError {
     /// The fence could not be taken within its bounded timeout — an abandoned or stalled admission
     /// transaction still holds it. Fail-closed rather than hanging boot forever.
     FenceUnavailable(String),
-    /// **CT-007 slice 5b.3-6e.1 (DORMANT).** The activation-readiness predicate found the queue NOT
+    /// **CT-007 slice 5b.3-6e.2.** The activation-readiness predicate found the queue NOT
     /// safe for this activation: at least one non-terminal row still lacks a claim window or carries a
     /// reservation marker other than 2. Rolled back with the predecessor still active. Only a plan
-    /// that carries a readiness predicate can reach this (production v2→v3 carries none).
+    /// that carries a readiness predicate can reach this; the production v3→v4 plan does.
     ActivationNotReady {
         /// The count of unsafe non-terminal queue rows the database-wide probe found.
         unsafe_rows: i64,
@@ -229,7 +235,7 @@ impl std::fmt::Display for CiSupersededDefinitionGuardError {
                  concurrently-booting older binary could still register and admit under it. This is \
                  never 'nothing to fence'. REMEDIATION: apply the control-plane migrations \
                  (`{}` seeds this predecessor row on a fresh database), then reboot",
-                crate::migrations::CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID
+                crate::migrations::CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID
             ),
             Self::FenceUnavailable(detail) => write!(
                 f,
@@ -281,14 +287,13 @@ async fn local_superseded_runs(
     }
 }
 
-/// **An optional activation-READINESS predicate for a [`CutoverPlan`]** (CT-007 slice 5b.3-6e.1, DORMANT).
+/// **An optional activation-READINESS predicate for a [`CutoverPlan`].**
 ///
 /// The queue-safety half of a v3→v4 activation. It carries the schema-qualified call to the
 /// database-wide readiness probe (`ci_0022c`); the fence runs it AFTER locking the predecessor `FOR
 /// UPDATE` and AFTER the workflow-backlog probe, and BEFORE draining. A probe failure, a NULL result,
-/// or any unsafe row all roll the fence back with the predecessor still active. Production's v2→v3
-/// plan carries NO predicate; only the synthetic v3→v4 tests (and, in 6e.2, the production v3→v4 plan)
-/// select one.
+/// or any unsafe row all roll the fence back with the predecessor still active. The production
+/// v3→v4 plan selects this predicate; synthetic plans may select a schema-local substitute.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActivationReadinessProbe {
     /// The schema-qualified call returning the `bigint` unsafe-row count. Production default is
@@ -318,31 +323,28 @@ impl ActivationReadinessProbe {
 /// **A typed (predecessor, current) definition-cutover plan.**
 ///
 /// The cutover fence was originally hard-coded to the single v2→v3 transition. Generalizing it to a
-/// typed plan lets a future v3→v4 cutover (CT-007 slice 6e) reuse the EXACT same fence — the
+/// typed plan lets this v3→v4 cutover reuse the EXACT same fence — the
 /// `wf_definition FOR UPDATE` serialization, the database-wide backlog probe, and every fail-closed
 /// path (missing predecessor, divergent current hash, lock timeout, commit ambiguity) — without
 /// editing a single line of the heavily-reviewed fence body.
 ///
-/// **Production still constructs and runs ONLY the v2→v3 plan.**
+/// **Production constructs and runs ONLY the v3→v4 plan.**
 /// [`CiProductionRuntimeFactory::cutover_definition`] builds it through
 /// [`CiProductionRuntimeFactory::production_cutover_plan`] from this binary's own source-derived pin;
-/// nothing else runs a cutover. The v3→v4 plan exists exclusively in synthetic tests until slice 6e
-/// activates it (and ships the retired-v3 fresh-DB sentinel migration this slice deliberately does
-/// not).
+/// nothing else runs a cutover. Synthetic tests exercise the next v4→v5 pair through the test seam.
 ///
 /// The three fields are the complete set the fence parameterizes over:
 /// - `predecessor_version` — the version drained and fenced (`FOR UPDATE`d, then backlog-probed);
 /// - `current_version` / `current_code_hash` — the version activated and hash-verified.
 ///
-/// Plus, dormant from 5b.3-6e.1, an optional [`ActivationReadinessProbe`] the fence runs before drain.
+/// Plus an optional [`ActivationReadinessProbe`] the fence runs before drain.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CutoverPlan {
     predecessor_version: i32,
     current_version: i32,
     current_code_hash: String,
-    /// CT-007 slice 5b.3-6e.1 (DORMANT): the optional activation-readiness predicate. `None` for the
-    /// production v2→v3 plan (byte/behavior-identical to the frozen fence); `Some` only for the
-    /// synthetic v3→v4 tests until 6e.2 selects it in production.
+    /// The optional activation-readiness predicate. Production v3→v4 carries `Some`; synthetic
+    /// control tests may deliberately use `None`.
     activation_readiness: Option<ActivationReadinessProbe>,
 }
 
@@ -363,10 +365,10 @@ impl CutoverPlan {
     }
 
     /// **Construct an ARBITRARY (predecessor, current) plan — test-support only.** Production
-    /// constructs exactly the v2→v3 plan through
+    /// constructs exactly the v3→v4 plan through
     /// [`CiProductionRuntimeFactory::production_cutover_plan`] from its own source-derived pin; this
-    /// seam exists so the synthetic v3→v4 fence tests can drive the generalized cutover over
-    /// in-test-seeded `wf_definition` rows before slice 6e activates that transition in production.
+    /// seam exists so the synthetic v4→v5 fence tests can drive the generalized cutover over
+    /// in-test-seeded `wf_definition` rows.
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests(
         predecessor_version: i32,
@@ -381,11 +383,8 @@ impl CutoverPlan {
         }
     }
 
-    /// **Select an activation-readiness predicate on this plan (CT-007 slice 5b.3-6e.1 — DORMANT).**
-    /// Consumes and returns the plan with the predicate attached. No production root calls this in
-    /// 6e.1 (the occurrence pin holds it at zero); the activating slice (6e.2) attaches
-    /// [`ActivationReadinessProbe::production`] to the production v3→v4 plan here, and the synthetic
-    /// tests attach a schema-isolated one.
+    /// Select an activation-readiness predicate on a synthetic plan. Production constructs its
+    /// v3→v4 plan with the production probe directly; the v4→v5 suite attaches a schema-local one.
     pub fn with_activation_readiness(mut self, probe: ActivationReadinessProbe) -> Self {
         self.activation_readiness = Some(probe);
         self
@@ -408,6 +407,8 @@ pub struct CiProductionRuntimeFactory {
     /// The schema-qualified backlog-probe call. Only a schema-isolated test may substitute it; the
     /// production default is [`CI_PIPELINE_BACKLOG_PROBE_CALL`].
     backlog_probe_call: std::borrow::Cow<'static, str>,
+    /// The schema-qualified activation-readiness call. Test-only schema fixtures may substitute it.
+    activation_readiness_probe: ActivationReadinessProbe,
 }
 
 /// Result of one bounded active-run recovery/fan-out pass.
@@ -454,6 +455,7 @@ impl CiProductionRuntimeFactory {
             rt,
             definition: ci_manifest_pipeline_definition(),
             backlog_probe_call: std::borrow::Cow::Borrowed(CI_PIPELINE_BACKLOG_PROBE_CALL),
+            activation_readiness_probe: ActivationReadinessProbe::production(),
         })
     }
 
@@ -467,11 +469,11 @@ impl CiProductionRuntimeFactory {
         &self.definition
     }
 
-    /// **The definition CUTOVER FENCE — one transaction serialized with fresh v2 admission.**
+    /// **The definition CUTOVER FENCE — one transaction serialized with fresh v3 admission.**
     ///
     /// A preflight `SELECT` cannot close this race (CT-007 round-2 review): the v3 process could
     /// observe an empty backlog, an already-in-flight old-binary starter transaction could then
-    /// commit a fresh v2 `workflow_run`, and once the old binary retires that run is stranded
+    /// commit a fresh v3 `workflow_run`, and once the old binary retires that run is stranded
     /// forever. Nothing connected the two operations.
     ///
     /// The fix reuses the lock protocol the old binary ALREADY participates in.
@@ -485,19 +487,19 @@ impl CiProductionRuntimeFactory {
     /// - **Cutover wins the lock:** every later `FOR SHARE` blocks. The probe scans the complete
     ///   pre-fence backlog, the transition commits atomically, and the old transaction then wakes,
     ///   reads `status='draining'`, and refuses before writing a manifest, jobs, or workflow.
-    /// - **Cutover rolls back:** blocked admissions wake to v2 still `active`; the old fleet is
+    /// - **Cutover rolls back:** blocked admissions wake to v3 still `active`; the old fleet is
     ///   unaffected.
     ///
     /// Conflicting row locks plus a post-lock READ COMMITTED statement give the required
     /// happens-before; `SERIALIZABLE` is unnecessary.
     ///
     /// The backlog authority is the DATABASE-WIDE probe, not a regional scan, because
-    /// `wf_definition` has no region column: flipping v2 to `draining` fences every region this
-    /// database serves. Existing v2 runs keep draining — `validate_definition_pin` accepts
-    /// `active | draining` on replay — only fresh v2 admission is fenced.
+    /// `wf_definition` has no region column: flipping v3 to `draining` fences every region this
+    /// database serves. Existing v3 runs keep draining — `validate_definition_pin` accepts
+    /// `active | draining` on replay — only fresh v3 admission is fenced.
     ///
-    /// Idempotent: a retry that finds v2 already `draining` succeeds ONLY when v3 already exists,
-    /// `active`, with the exact expected hash. It never reactivates v2.
+    /// Idempotent: a retry that finds v3 already `draining` succeeds ONLY when v4 already exists,
+    /// `active`, with the exact expected hash. It never reactivates v3.
     /// `diagnostics` is the SCHEDULER-backed regional discovery (round-3 finding 4). It is used
     /// only to turn a refusal into concrete local `(tenant, run)` ids: the app pool this factory
     /// holds is RLS-blind cross-tenant, so a diagnostic built from it would report "0 runs" for a
@@ -506,36 +508,29 @@ impl CiProductionRuntimeFactory {
         &self,
         diagnostics: &CiRegionRunDiscovery,
     ) -> Result<(), CiSupersededDefinitionGuardError> {
-        // PRODUCTION runs EXACTLY ONE plan: the v2→v3 transition mechanically derived from this
-        // binary's source pin. The fence body below is fully generalized over an arbitrary
-        // (predecessor, current) plan so slice 6e can add v3→v4 without re-touching it, but there is
-        // no production code path that constructs any plan other than this one.
+        // PRODUCTION runs EXACTLY ONE plan: the v3→v4 transition mechanically derived from this
+        // binary's source pin. The fence body remains generalized for the synthetic v4→v5 suite.
         self.cutover_with_plan(&self.production_cutover_plan(), diagnostics)
             .await
     }
 
-    /// **The production v2→v3 cutover plan, mechanically derived from this binary's source pin.** The
+    /// **The production v3→v4 cutover plan, mechanically derived from this binary's source pin.** The
     /// predecessor is the compiled-in [`CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION`]; the current version
     /// and hash are the exact source-derived pin the starter and `worker_for` also register. This is
     /// the ONLY plan any production root runs — [`Self::cutover_definition`] constructs it and nothing
-    /// else can. For the v2→v3 pair its three fields are byte-identical to the values the fence
-    /// formerly hard-coded, so the generalized fence produces byte/behavior-identical SQL, binds, and
-    /// refusals to the frozen cutover.
+    /// else can. It also carries the database-wide activation-readiness predicate.
     fn production_cutover_plan(&self) -> CutoverPlan {
         CutoverPlan {
             predecessor_version: CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
             current_version: self.definition.version(),
             current_code_hash: self.definition.code_hash().to_string(),
-            // DORMANT: the production v2→v3 plan carries NO readiness predicate, so `cutover_with_plan`
-            // runs the frozen fence byte/behavior-identically. 6e.2 attaches the predicate here.
-            activation_readiness: None,
+            activation_readiness: Some(self.activation_readiness_probe.clone()),
         }
     }
 
     /// **Drive the generalized cutover fence over an arbitrary (predecessor, current) plan —
-    /// test-support only.** Production always runs [`Self::cutover_definition`]'s v2→v3 plan; this
-    /// seam lets the synthetic v3→v4 fence tests exercise the IDENTICAL fence body over
-    /// in-test-seeded rows before slice 6e activates that transition.
+    /// test-support only.** Production always runs [`Self::cutover_definition`]'s v3→v4 plan; this
+    /// seam lets the synthetic v4→v5 fence tests exercise the IDENTICAL fence body.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn cutover_definition_with_plan(
         &self,
@@ -545,7 +540,7 @@ impl CiProductionRuntimeFactory {
         self.cutover_with_plan(plan, diagnostics).await
     }
 
-    /// The generalized fence body shared by the production v2→v3 wrapper and the test-support seam.
+    /// The generalized fence body shared by the production v3→v4 wrapper and the test-support seam.
     /// Every version/hash the fence touches comes from `plan`; the queries, lock modes, ordering, and
     /// fail-closed paths are the frozen cutover's, unchanged.
     async fn cutover_with_plan(
@@ -647,12 +642,11 @@ impl CiProductionRuntimeFactory {
             ));
         }
 
-        // (2b) THE ACTIVATION-READINESS PREDICATE (CT-007 slice 5b.3-6e.1 — DORMANT). Runs INSIDE the
+        // (2b) THE ACTIVATION-READINESS PREDICATE. Runs INSIDE the
         // held fence, AFTER the backlog probe and BEFORE any drain/activate, so its READ COMMITTED
         // snapshot is strictly after any admission that beat us to the lock — the same happens-before
-        // the backlog probe relies on. Production's v2→v3 plan carries no predicate, so this whole
-        // block is skipped and the fence stays byte/behavior-identical to the frozen cutover. When a
-        // plan DOES carry a predicate, a probe error, a NULL result, or ANY unsafe row all roll the
+        // the backlog probe relies on. The production v3→v4 plan carries this predicate. A probe
+        // error, a NULL result, or ANY unsafe row rolls the
         // fence back with the predecessor still active — fail-closed, exactly like the backlog probe.
         if let Some(readiness) = plan.activation_readiness.as_ref() {
             // @tenant-cross-scope: `job_queue` is FORCE-RLS, but the readiness probe is a SECURITY
@@ -699,10 +693,19 @@ impl CiProductionRuntimeFactory {
         self
     }
 
+    /// Substitute the readiness probe for a schema-isolated live test. Production remains pinned to
+    /// the schema-qualified security-definer function.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn replace_activation_readiness_probe_call_for_tests(
+        mut self,
+        call: impl Into<String>,
+    ) -> Self {
+        self.activation_readiness_probe = ActivationReadinessProbe::with_call_for_tests(call);
+        self
+    }
+
     /// The transition half of [`Self::cutover_with_plan`], still inside the fenced transaction. Every
-    /// version and hash comes from `plan`; for the production v2→v3 plan these equal the values this
-    /// method formerly hard-coded, so the drained/activated queries, binds, and refusals are
-    /// byte-identical.
+    /// version and hash comes from `plan`.
     async fn commit_activation(
         &self,
         plan: &CutoverPlan,
@@ -870,7 +873,11 @@ impl CiProductionRuntimeFactory {
         let finalizer = Arc::new(DurableCiRunFinalizer::new(
             CiRunStore::with_pg(self.pool.clone()),
             self.ledger.clone(),
-            CiJobAccountingStore::with_pg(self.pool.clone(), self.region.clone()),
+            CiJobAccountingStore::with_pg_and_write_version(
+                self.pool.clone(),
+                self.region.clone(),
+                crate::ci_pipeline_protocol::PRODUCTION_ACCOUNTING_WRITE_VERSION,
+            ),
             manifest,
             scope,
             self.rt.clone(),
@@ -942,7 +949,11 @@ impl CiProductionRuntimeFactory {
                     manifest,
                     ledger.clone(),
                     CiCostEventStore::with_pg(pool.clone(), bound_region.clone()),
-                    CiJobAccountingStore::with_pg(pool.clone(), bound_region.clone()),
+                    CiJobAccountingStore::with_pg_and_write_version(
+                        pool.clone(),
+                        bound_region.clone(),
+                        crate::ci_pipeline_protocol::PRODUCTION_ACCOUNTING_WRITE_VERSION,
+                    ),
                     Arc::new(TierPOperationalCiJobPricer),
                 ),
             ))
@@ -1166,17 +1177,10 @@ mod tests {
         assert_eq!(first.code_hash().len(), "blake3:".len() + 64);
     }
 
-    /// **CT-007 slice 5b.3-6e.1 (DORMANT): the activation-readiness predicate is composition-root
-    /// ZERO.** A `for_tests` plan and the production plan both carry `None`, so the fence runs the
-    /// frozen byte/behavior-identical body; and no production COMPOSITION ROOT (`main.rs`,
-    /// `runner_bind.rs`, this module's own production paths) ever SELECTS the predicate — the
-    /// `.with_activation_readiness(` call and the `ActivationReadinessProbe::production` constructor
-    /// have zero occurrences in every production source file. Language-level, not merely counting:
-    /// the `for_tests`/production constructors return `has_activation_readiness() == false` by
-    /// construction, and the source-pin below proves nothing wires the predicate in.
+    /// Stage B selects the activation-readiness predicate exactly once in the production factory;
+    /// arbitrary test plans remain opt-in.
     #[test]
-    fn the_activation_readiness_predicate_has_no_production_selection() {
-        // Constructed plans carry no predicate by construction.
+    fn the_activation_readiness_predicate_has_one_production_selection() {
         assert!(!CutoverPlan::for_tests(3, 4, "blake3:x").has_activation_readiness());
 
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1196,37 +1200,26 @@ mod tests {
                 .map(|line| line.matches(marker).count())
                 .sum()
         }
-        // The predicate is never SELECTED by any production composition ROOT (Sol's 6e.1 major 2:
-        // include lib.rs; scan the BARE symbol so UFCS `CutoverPlan::with_activation_readiness(..)`
-        // cannot evade it). These roots do NOT define the selector, so a bare-symbol count of 0 is the
-        // full guarantee — any occurrence at all is a premature wiring.
+        // No outer composition root may construct a second readiness authority.
         for file in ["main.rs", "runner_bind.rs", "ci_runner_composition.rs", "lib.rs"] {
             let source = std::fs::read_to_string(src.join(file)).unwrap();
             assert_eq!(
                 code_occurrences(&source, "with_activation_readiness"),
                 0,
-                "{file} must not SELECT the activation-readiness predicate while it is dormant"
+                "{file} must not construct a parallel activation-readiness plan"
             );
             assert_eq!(
                 code_occurrences(&source, "ActivationReadinessProbe::production"),
                 0,
-                "{file} must not construct the production readiness probe while it is dormant"
+                "{file} must not construct a second production readiness probe"
             );
         }
-        // This module DEFINES `with_activation_readiness`, so the bare symbol legitimately occurs once;
-        // the composition-root zero here is that it is never CALLED (`.with_activation_readiness(` and
-        // the UFCS `CutoverPlan::with_activation_readiness(` are both absent) and the production probe
-        // constructor is never named.
         let this = std::fs::read_to_string(src.join("ci_runtime_composition.rs")).unwrap();
         assert_eq!(code_occurrences(&this, ".with_activation_readiness("), 0);
         assert_eq!(code_occurrences(&this, "CutoverPlan::with_activation_readiness("), 0);
-        assert_eq!(code_occurrences(&this, "ActivationReadinessProbe::production"), 0);
-        // And the production cutover plan pins `activation_readiness: None` at its one construction
-        // site (the frozen v2→v3 byte-equivalence), together with `for_tests`.
-        assert!(
-            code_occurrences(&this, "activation_readiness: None") >= 2,
-            "the production and for_tests plans both pin the predicate to None"
-        );
+        assert_eq!(code_occurrences(&this, "ActivationReadinessProbe::production"), 1);
+        assert_eq!(code_occurrences(&this, "activation_readiness: None"), 1);
+        assert_eq!(code_occurrences(&this, "activation_readiness: Some("), 1);
     }
 
     #[test]

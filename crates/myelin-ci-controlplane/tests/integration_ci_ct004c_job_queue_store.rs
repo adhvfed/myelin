@@ -44,8 +44,9 @@ use myelin_ci_controlplane::{
     CiJobLaunchClaim, CiJobQueueStore, DurableEnqueue, EnqueueOutcome, Lane,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
-    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
-    CREATE_JOB_QUEUE_INDEXES_DDL, INSERT_JOB_QUEUE_QUERY,
+    ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    INSERT_JOB_QUEUE_QUERY,
 };
 use myelin_ci_sandbox::TrustTier;
 use sqlx::types::Uuid;
@@ -147,6 +148,7 @@ fn job(
         idem_token: idem.into(),
         stage: "build".into(),
         claim_window_secs: CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
+        reservation_write_version: myelin_ci_controlplane::ReservationWriteVersionMarker::legacy(),
     }
 }
 
@@ -189,6 +191,10 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
         .await
         .expect("add the durable claim window");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL)
+        .await
+        .expect("add the reservation writer marker");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin
@@ -963,6 +969,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
             .bind("idem-ghost")
             .bind("build")
             .bind(CI_RUNNER_EXECUTION_LEASE_TTL_SECS)
+            .bind(Option::<i16>::None)
             .execute(&mut *tx)
             .await
             .expect("the in-tx enqueue writes (uncommitted)");

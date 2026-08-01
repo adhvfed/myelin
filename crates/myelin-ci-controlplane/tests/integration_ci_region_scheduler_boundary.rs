@@ -48,6 +48,7 @@ fn job(tenant: &str, region: &str, label: &str, ordinal: u16) -> DurableEnqueue 
         idem_token: format!("scheduler-boundary-{ordinal}"),
         stage: "build".into(),
         claim_window_secs: CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
+        reservation_write_version: myelin_ci_controlplane::ReservationWriteVersionMarker::legacy(),
     }
 }
 

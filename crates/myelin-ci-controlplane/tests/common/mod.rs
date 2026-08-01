@@ -25,6 +25,190 @@
 
 use futures::FutureExt;
 use sqlx::{Executor, PgPool};
+use std::sync::Arc;
+
+use myelin_ci_sandbox::gvisor::GvisorBackend;
+use myelin_ci_sandbox::{
+    CompletionSettlementOwner, RunnerHooks, SandboxBackend, SandboxCancellation, SandboxHandle,
+    SandboxLaunch, SandboxLaunchError, SandboxOutputSink,
+};
+
+/// Preserve legacy real-runsc integration fixtures whose scope is workload execution rather than
+/// the newly activated checkout transport. The adapter selects the trait's compatibility cycle and
+/// projects the manifest-derived checkout workspace out only for the gVisor workload call. Its
+/// companion hook adapter restores the exact workspace before every real durable/Identity fence.
+pub struct LegacyStreamingGvisor<'a>(pub &'a GvisorBackend);
+
+impl SandboxBackend for LegacyStreamingGvisor<'_> {
+    type Error = <GvisorBackend as SandboxBackend>::Error;
+
+    fn launch(
+        &self,
+        spec: &myelin_ci_sandbox::JobSpec,
+        hooks: &RunnerHooks,
+    ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+        let mut workload_only = spec.clone();
+        workload_only.workspace.repo_ref = None;
+        workload_only.workspace.commit = None;
+        self.0.launch(&workload_only, hooks)
+    }
+
+    fn launch_streaming(
+        &self,
+        spec: &myelin_ci_sandbox::JobSpec,
+        hooks: &RunnerHooks,
+        output: Arc<dyn SandboxOutputSink>,
+        cancellation: SandboxCancellation,
+    ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+        let mut workload_only = spec.clone();
+        workload_only.workspace.repo_ref = None;
+        workload_only.workspace.commit = None;
+        self.0
+            .launch_streaming(&workload_only, hooks, output, cancellation)
+    }
+
+    fn kill(&self, handle: &SandboxHandle) -> Result<(), Self::Error> {
+        self.0.kill(handle)
+    }
+}
+
+pub fn legacy_streaming_hooks(
+    real: RunnerHooks,
+    repo_ref: String,
+    commit: String,
+) -> RunnerHooks {
+    assert_eq!(
+        real.completion_settlement_owner(),
+        CompletionSettlementOwner::TerminalReporter
+    );
+    let real = Arc::new(real);
+    let restore = move |spec: &myelin_ci_sandbox::JobSpec| {
+        let mut restored = spec.clone();
+        restored.workspace.repo_ref = Some(repo_ref.clone());
+        restored.workspace.commit = Some(commit.clone());
+        restored
+    };
+    let restore = Arc::new(restore);
+
+    let reserve_real = real.clone();
+    let reserve_restore = restore.clone();
+    let release_real = real.clone();
+    let release_restore = restore.clone();
+    let launch_real = real.clone();
+    let launch_restore = restore.clone();
+    let isolation_real = real;
+    RunnerHooks::new_with_launch_fence(
+        CompletionSettlementOwner::TerminalReporter,
+        Box::new(move |spec| reserve_real.reserve(&reserve_restore(spec))),
+        Box::new(move |spec, handle, _usage| {
+            release_real.release_unused(&release_restore(spec), handle)
+        }),
+        Box::new(move |spec| launch_real.acquire_launch_permit(&launch_restore(spec))),
+        Box::new(move |spec| isolation_real.enforce_isolation_floor(&restore(spec))),
+    )
+}
+
+/// Stage-B compute admission for legacy real-runsc integration tests whose scope predates the
+/// manifest/V2 durable-authority layer. The typed cycle requires a parent-attempt admission, but a
+/// compute cycle discards the opaque authority before workload launch. The live-PG 6e.2 active-path
+/// suite separately proves the real durable admission/journal implementation.
+struct LegacyRunscComputeAttemptAuthority;
+
+impl myelin_ci_sandbox::checkout_orchestration::AttemptAuthority
+    for LegacyRunscComputeAttemptAuthority
+{
+    fn begin_phase(
+        &self,
+        _phase: myelin_ci_sandbox::PreparationPhase,
+    ) -> Result<(), myelin_ci_sandbox::checkout_orchestration::AttemptAuthorityError> {
+        panic!("compute must not open a checkout preparation phase")
+    }
+
+    fn complete_phase(
+        &self,
+        _phase: myelin_ci_sandbox::PreparationPhase,
+        _usage: myelin_ci_sandbox::ResourceUsage,
+    ) -> Result<(), myelin_ci_sandbox::checkout_orchestration::AttemptAuthorityError> {
+        panic!("compute must not complete a checkout preparation phase")
+    }
+
+    fn seal_phase(
+        &self,
+        _phase: myelin_ci_sandbox::PreparationPhase,
+    ) -> Result<(), myelin_ci_sandbox::checkout_orchestration::AttemptAuthorityError> {
+        panic!("compute must not seal a checkout preparation phase")
+    }
+
+    fn renew_preparation_lease(
+        &self,
+    ) -> Result<(), myelin_ci_sandbox::PreparationLeaseLost> {
+        panic!("compute must not renew a checkout preparation lease")
+    }
+
+    fn mint_phase_credential(
+        &self,
+        _phase: myelin_ci_sandbox::CheckoutPhase,
+    ) -> Result<
+        myelin_ci_sandbox::checkout_orchestration::PhaseCredentialCarrier,
+        myelin_ci_sandbox::checkout_orchestration::AttemptAuthorityError,
+    > {
+        panic!("compute must not mint a checkout phase credential")
+    }
+
+    fn mint_workload_credential(
+        &self,
+    ) -> Result<
+        myelin_ci_sandbox::checkout_orchestration::WorkloadCredentialCarrier,
+        myelin_ci_sandbox::checkout_orchestration::AttemptAuthorityError,
+    > {
+        panic!("compute discards the unused attempt authority before workload launch")
+    }
+
+    fn should_requeue(&self) -> bool {
+        false
+    }
+}
+
+pub fn stage_b_compute_hooks_for_legacy_runsc_test() -> myelin_ci_sandbox::RunnerHooks {
+    with_stage_b_compute_admission_for_legacy_runsc_test(myelin_ci_sandbox::RunnerHooks::new(
+        myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+        Box::new(|spec| {
+            Ok(myelin_ci_sandbox::ReserveHandle(
+                spec.meter_to.reserve_id.clone(),
+            ))
+        }),
+        Box::new(|_spec, _handle, _usage| Ok(())),
+        Box::new(|_token| Ok(())),
+        Box::new(|_spec| Ok(())),
+    ))
+}
+
+pub fn with_stage_b_compute_admission_for_legacy_runsc_test(
+    hooks: myelin_ci_sandbox::RunnerHooks,
+) -> myelin_ci_sandbox::RunnerHooks {
+    hooks.with_parent_attempt_reservation(Box::new(|spec| {
+        Ok(
+            myelin_ci_sandbox::checkout_orchestration::ParentAttemptAdmission::Admitted {
+                claim: myelin_ci_sandbox::PreparationReportClaim {
+                    tenant_id: "legacy-real-runsc".into(),
+                    region: "fr-par".into(),
+                    wf_run_id: "11111111-1111-1111-1111-111111111111".into(),
+                    ci_run_id: "22222222-2222-2222-2222-222222222222".into(),
+                    job_id: "33333333-3333-3333-3333-333333333333".into(),
+                    token_authority_handle: "legacy-real-runsc-compute".into(),
+                    idem_token: spec.idem_token.0.clone(),
+                    lease_owner: "legacy-real-runsc".into(),
+                    lease_epoch: 1,
+                    claim_nonce: "44444444-4444-4444-4444-444444444444".into(),
+                    claim_started_at_epoch_secs: 1,
+                    claim_expires_at_epoch_secs: i64::MAX,
+                },
+                reserve: myelin_ci_sandbox::ReserveHandle(spec.meter_to.reserve_id.clone()),
+                attempt_authority: Box::new(LegacyRunscComputeAttemptAuthority),
+            },
+        )
+    }))
+}
 
 /// Run `body`, then unconditionally `DROP SCHEMA IF EXISTS <schema> CASCADE` on `pool` afterward.
 ///

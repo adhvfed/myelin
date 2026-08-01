@@ -146,7 +146,8 @@ pub use runner::{
     LeaseStore, PreparationAttemptDisposition, PreparationLeaseCheckpoint, PreparationLeaseLost,
     PreparationOutcomeDispatch, PreparationPhase, PreparationReportClaim, PreparationRetryReport,
     PreparationTerminalDisposition, QueuedJob, RetryableAttemptCause, RetryableAttemptFailure,
-    RetryableAttemptOutcome, RunOutcome, RunnerAgent, RunnerError, TerminalReport, TerminalReporter,
+    RetryableAttemptOutcome, RunOutcome, RunnerAgent, RunnerCycleOutcome, RunnerError,
+    TerminalReport, TerminalReporter,
 };
 
 use serde::{Deserialize, Serialize};
@@ -1146,7 +1147,7 @@ pub trait SandboxBackend: Sync {
         Ok(launch)
     }
 
-    /// **The typed sandbox/runner CYCLE seam (CT-007 slice 5b.3-6e.1 — DORMANT).**
+    /// **The typed sandbox/runner CYCLE seam (activated by CT-007 slice 5b.3-6e.2).**
     ///
     /// [`SandboxLaunch`] can only ever describe a launched workload; it cannot represent a checkout
     /// PREPARATION that terminalized (`AttemptsExhausted`, a Hop-B failure), requeued, or demanded
@@ -1155,10 +1156,9 @@ pub trait SandboxBackend: Sync {
     ///
     /// **The default is a byte-faithful compatibility wrapper:** it performs the ordinary streaming
     /// launch and maps its `Ok` into [`SandboxCycleOutcome::WorkloadLaunched`], so EVERY existing
-    /// backend and test double satisfies the seam without changing a line. No production
-    /// [`RunnerAgent`](crate::runner::RunnerAgent) routes through this method yet — the activating
-    /// slice (5b.3-6e.2) is what makes production `RunnerAgent` call `run_cycle` and the gVisor
-    /// backend override it to produce the preparation variants for a checkout-bearing spec.
+    /// backend and test double satisfies the seam without changing a line. Production
+    /// [`RunnerAgent`](crate::runner::RunnerAgent) calls this method; gVisor overrides it to produce
+    /// preparation variants for checkout-bearing specs.
     fn run_cycle(
         &self,
         spec: &JobSpec,
@@ -1198,7 +1198,7 @@ pub trait SandboxBackend: Sync {
     }
 }
 
-/// **The typed outcome of ONE sandbox cycle (CT-007 slice 5b.3-6e.1 — DORMANT).**
+/// **The typed outcome of one activated sandbox cycle.**
 ///
 /// The strictly-wider return of [`SandboxBackend::run_cycle`]. A compute cycle and a
 /// checkout-preparation cycle both flow through the same runner lane, but only a WORKLOAD produces a
@@ -1388,14 +1388,13 @@ pub struct RunnerHooks {
     /// [`Self::with_checkout_authorization`] — [`Self::authorize_checkout`] refuses outright on
     /// `None` rather than silently treating a missing hook as authorization granted.
     checkout_authorization: Option<CheckoutAuthorizationHook>,
-    /// CT-007 phase-credential generations: the V2 per-phase authorization hook. `None` for every
-    /// caller that has not opted into phase-bound credentials (which is all of production today);
-    /// `RunnerHooks::authorize_checkout_phase` refuses outright on `None`, and never falls back to
-    /// the legacy claim-bound hook.
+    /// CT-007 phase-credential generations: the V2 per-phase authorization hook. Legacy callers
+    /// leave it `None`; the activated V2 runner wiring installs it. A missing hook refuses outright
+    /// and never falls back to the claim-bound hook.
     checkout_phase_authorization: Option<CheckoutPhaseAuthorizationHook>,
-    /// CT-007 slice 5b.3-6c: the V2 parent-attempt reservation mode. `None` for every caller today
-    /// (all production constructors keep it `None`, selecting the legacy [`ReserveHook`]);
-    /// [`Self::reserve_parent_attempt`] refuses outright on `None`. Installing it is 5b.3-6e's job.
+    /// CT-007 slice 5b.3-6c: the V2 parent-attempt reservation mode. Legacy callers leave it `None`;
+    /// the activated V2 runner wiring installs it. [`Self::reserve_parent_attempt`] refuses outright
+    /// on `None`.
     parent_attempt_reserve: Option<ParentAttemptReserveHook>,
 }
 
@@ -1418,9 +1417,8 @@ pub type ReserveHook = Box<dyn Fn(&JobSpec) -> Result<ReserveHandle, HookError> 
 /// claim/v2-reservation validation, transitions the reservation to inflight, and inserts/replays the
 /// exact parent-attempt row — all in one tenant transaction — returning a
 /// [`ParentAttemptAdmission`](crate::checkout_orchestration::ParentAttemptAdmission) that also carries
-/// the opaque per-attempt [`AttemptAuthority`](crate::checkout_orchestration::AttemptAuthority). `None`
-/// on every `RunnerHooks` today; the dormant checkout orchestrator refuses outright when it is not
-/// configured, so no production job can enter the V2 path until 5b.3-6e installs the real adapter.
+/// the opaque per-attempt [`AttemptAuthority`](crate::checkout_orchestration::AttemptAuthority). The
+/// activated V2 wiring installs this hook; the checkout orchestrator refuses outright when absent.
 pub type ParentAttemptReserveHook = Box<
     dyn Fn(&JobSpec) -> Result<crate::checkout_orchestration::ParentAttemptAdmission, HookError>
         + Send
