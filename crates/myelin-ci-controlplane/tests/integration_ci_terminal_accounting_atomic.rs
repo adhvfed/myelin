@@ -297,6 +297,7 @@ fn manifest(
             workflow_code_hash: workflow_code_hash.into(),
             policy_revision: "ci-policy:2026-07-21".into(),
             limits: executable.limits.clone(),
+            reserve_id: Some(executable.reserve_handle.clone()),
             checkout: derive_checkout_authorization_scope(
                 JobKind::Ci,
                 &WorkspaceSpec {

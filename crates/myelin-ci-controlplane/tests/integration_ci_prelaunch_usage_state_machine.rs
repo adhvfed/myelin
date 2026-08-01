@@ -114,7 +114,7 @@ async fn seed_fixture(
         pids_max: 128,
         timeout_secs: 120,
     };
-    let authority = CiJobRuntimeAuthorityRequest {
+    let mut authority = CiJobRuntimeAuthorityRequest {
         tenant_id: TENANT.into(),
         region: REGION.into(),
         ci_run_id: ci_run_id.clone(),
@@ -130,6 +130,7 @@ async fn seed_fixture(
         workflow_code_hash: digest('c'),
         policy_revision: "linux-small-v1:1".into(),
         limits: limits.clone(),
+        reserve_id: None,
         checkout: Some(checkout_scope()),
     };
     let provider = PgTierPCiJobBudgetReservation::new(
@@ -143,8 +144,8 @@ async fn seed_fixture(
     let original_handle = provider
         .reserve_batch(vec![authority.clone()])
         .await
-        .unwrap()
-        .remove(0);
+    .unwrap()
+    .remove(0);
     let reserve_handle = match mutation {
         FixtureMutation::ReservationDigest => {
             let mut tampered = original_handle.clone();
@@ -165,6 +166,7 @@ async fn seed_fixture(
         }
         _ => original_handle,
     };
+    authority.reserve_id = Some(reserve_handle.clone());
     match mutation {
         FixtureMutation::ReservationAmount => {
             sqlx::query(

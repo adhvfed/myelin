@@ -54,8 +54,9 @@ pub const CI_PHASE_CREDENTIAL_V1_DOMAIN: &[u8] = b"myelin.ci.phase-credential.v1
 /// The `run_id` prefix Identity signs for a V2 phase-bound credential.
 pub const CI_PHASE_CREDENTIAL_GENERATION_PREFIX: &str = "ci-credential:v1:";
 
-/// The only binding version this slice writes or accepts. Stored per row so a future expansion
-/// (task #91's reserve binding) adds a new version rather than reinterpreting a v1 row.
+/// The only generation-binding version this slice writes or accepts. Task #91 leaves this encoding
+/// intact: reserve identity is signed directly in the capability vector and transitively through
+/// the v3 `token_authority_handle` already hashed by the generation.
 pub const CI_PHASE_CREDENTIAL_BINDING_V1: i16 = 1;
 
 // =================================================================================================
@@ -141,7 +142,8 @@ pub enum CiJobCredentialWriteVersion {
 
 /// Every field the phase-credential digest binds. Deliberately EXCLUDES `lease_expires` (mutable
 /// liveness state a renewal rewrites), `claim_window_secs` (derivable from the two claim
-/// timestamps), any renewal result, and the reserve handle (task #91, a future binding version).
+/// timestamps), any renewal result, and a duplicate reserve field. The reserve is already bound by
+/// the v3 `token_authority_handle` input and by the credential's signed capability vector.
 #[derive(Clone, Copy, Debug)]
 pub struct CiPhaseGenerationInputs<'a> {
     pub tenant_id: &'a str,
@@ -322,6 +324,8 @@ fn map_sql_error(_error: sqlx::Error) -> CiCredentialGenerationError {
 #[derive(Clone, Debug)]
 pub struct CiPhaseCredentialMintRequest {
     pub claim: CiJobTokenRequest,
+    /// Exact durable reservation encoded into the signed capability vector.
+    pub reserve_id: String,
     pub checkout: Option<CheckoutAuthorizationScope>,
     pub purpose: CiCredentialPurpose,
     pub generation_id: String,
@@ -603,6 +607,10 @@ impl CiJobCredentialGenerationStore {
                 let credential = minter
                     .mint_phase(CiPhaseCredentialMintRequest {
                         claim: claim.clone(),
+                        reserve_id: authority
+                            .reserve_id
+                            .clone()
+                            .ok_or(CiCredentialGenerationError::DurableAuthorityUnavailable)?,
                         checkout: authority.checkout.clone(),
                         purpose,
                         generation_id: binding.generation_id.clone(),

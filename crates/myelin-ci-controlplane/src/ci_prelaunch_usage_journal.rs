@@ -1410,6 +1410,7 @@ mod tests {
                 pids_max: 1,
                 timeout_secs: 10,
             },
+            reserve_id: Some("ci-reserve:v2:fixture".into()),
             checkout,
         }
     }
