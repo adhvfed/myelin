@@ -176,15 +176,17 @@ impl TerminalReporter for CiPipelineReporterRouter {
         &self,
         claim: &PreparationReportClaim,
         disposition: PreparationTerminalDisposition,
+        diagnostic: Option<&str>,
     ) -> Result<SignalOutcome, ExecutorError> {
         // CT-007 5b.3-6d STEP 4: route to the exact-tenant reporter, then map the sandbox reporting
         // identity 1:1 onto the durable request and delegate to the inherent durable CAS. UFCS names
         // the inherent method, never the reporter's trait method.
         let reporter = self.preparation_reporter(&claim.tenant_id)?;
-        CiPipelineReporter::report_preparation_terminal(
+        CiPipelineReporter::report_preparation_terminal_with_diagnostic(
             &reporter,
             &token_request_from_preparation_report_claim(claim),
             disposition,
+            diagnostic,
         )
     }
 

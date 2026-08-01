@@ -935,7 +935,7 @@ async fn hop_b_terminal_reports_a_preparation_terminal_and_never_launches() {
 
         // A terminal preparation disposition, carrying the reporting claim — and NO workload launched.
         match result {
-            Ok(CheckoutContinuationOutcome::PreparationTerminal { claim, disposition }) => {
+            Ok(CheckoutContinuationOutcome::PreparationTerminal { claim, disposition, diagnostic: _ }) => {
                 assert!(
                     matches!(disposition, PreparationTerminalDisposition::Failed { .. }),
                     "the injected Hop-B failure is a terminal Failed disposition, got {disposition:?}"

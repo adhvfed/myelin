@@ -102,6 +102,9 @@ pub enum AssetRegistryError {
     },
     /// The registered rootfs path does not canonicalize to a real, non-root directory.
     InvalidRootfsPath { rootfs: PathBuf, reason: String },
+    /// A registered workload rootfs does not already contain the fixed, empty `/workspace` bind
+    /// target. The mountpoint is pinned content: launch code must never create it after hashing.
+    InvalidWorkspaceMountpoint { rootfs: PathBuf, reason: String },
     /// The recomputed canonical-tree digest of the registered directory does not match the digest
     /// embedded in the image reference.
     DigestMismatch {
@@ -136,6 +139,12 @@ impl std::fmt::Display for AssetRegistryError {
                 f,
                 "gvisor asset registry: registered rootfs {} does not resolve to a valid directory: \
                  {reason}",
+                rootfs.display()
+            ),
+            AssetRegistryError::InvalidWorkspaceMountpoint { rootfs, reason } => write!(
+                f,
+                "gvisor asset registry: registered rootfs {} has an invalid pinned /workspace \
+                 mountpoint: {reason}",
                 rootfs.display()
             ),
             AssetRegistryError::DigestMismatch {
@@ -216,6 +225,34 @@ impl GvisorAssetRegistry {
             });
         }
 
+        let workspace = canon.join("workspace");
+        let workspace_meta = std::fs::symlink_metadata(&workspace).map_err(|error| {
+            AssetRegistryError::InvalidWorkspaceMountpoint {
+                rootfs: canon.clone(),
+                reason: format!(
+                    "the empty directory must be precreated as part of the hashed asset: {error}"
+                ),
+            }
+        })?;
+        if workspace_meta.file_type().is_symlink() || !workspace_meta.is_dir() {
+            return Err(AssetRegistryError::InvalidWorkspaceMountpoint {
+                rootfs: canon.clone(),
+                reason: "must be a real directory, never a symlink or non-directory".to_string(),
+            });
+        }
+        let mut entries = std::fs::read_dir(&workspace).map_err(|error| {
+            AssetRegistryError::InvalidWorkspaceMountpoint {
+                rootfs: canon.clone(),
+                reason: format!("could not verify that it is empty: {error}"),
+            }
+        })?;
+        if entries.next().is_some() {
+            return Err(AssetRegistryError::InvalidWorkspaceMountpoint {
+                rootfs: canon.clone(),
+                reason: "must be empty before it is hidden by the per-job bind mount".to_string(),
+            });
+        }
+
         let actual_hex = canonical_tar::canonical_tree_sha256_hex(&canon).map_err(|e| {
             AssetRegistryError::Hashing {
                 rootfs: canon.clone(),
@@ -273,6 +310,7 @@ mod tests {
             ));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
+            fs::create_dir(dir.join("workspace")).unwrap();
             fs::write(dir.join("payload"), content).unwrap();
             let digest = canonical_tar::canonical_tree_sha256_hex(&dir).unwrap();
             let image =
@@ -307,6 +345,65 @@ mod tests {
             .resolve(&unknown)
             .expect_err("an unregistered image must never resolve");
         assert!(matches!(err, AssetRegistryError::UnknownImage { .. }));
+    }
+
+    #[test]
+    fn pinned_workspace_mountpoint_keeps_digest_stable_across_simulated_job() {
+        let fixture = Fixture::new("workspace-stability", b"immutable rootfs payload");
+        let workspace_mountpoint = fixture.dir.join("workspace");
+        assert!(workspace_mountpoint.is_dir());
+        assert_eq!(fs::read_dir(&workspace_mountpoint).unwrap().count(), 0);
+
+        let before = canonical_tar::canonical_tree_sha256_hex(&fixture.dir).unwrap();
+        let registry = GvisorAssetRegistry::from_bindings(vec![binding(
+            fixture.image.clone(),
+            fixture.dir.clone(),
+        )])
+        .expect("the pinned asset already carries the fixed mountpoint");
+
+        // Simulate the only host-side filesystem lifecycle a workspace job owns: the writable
+        // source is created and populated outside the rootfs, then discarded. gVisor binds that
+        // source over the already-pinned empty target; no target creation belongs to launch.
+        let job_workspace = fixture.dir.with_extension("simulated-job-workspace");
+        fs::create_dir(&job_workspace).unwrap();
+        fs::write(job_workspace.join("Cargo.lock"), b"job-owned bytes").unwrap();
+        registry.resolve(&fixture.image).unwrap();
+        fs::remove_dir_all(&job_workspace).unwrap();
+
+        let after = canonical_tar::canonical_tree_sha256_hex(&fixture.dir).unwrap();
+        assert_eq!(
+            before, after,
+            "a workspace job must not dirty the pinned rootfs"
+        );
+        GvisorAssetRegistry::from_bindings(vec![binding(
+            fixture.image.clone(),
+            fixture.dir.clone(),
+        )])
+        .expect("fresh registry construction still accepts the rootfs after the job");
+    }
+
+    #[test]
+    fn absent_workspace_mountpoint_refuses_construction_before_hash_trust() {
+        let dir = std::env::temp_dir().join(format!(
+            "myelin-asset-registry-no-workspace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let digest = canonical_tar::canonical_tree_sha256_hex(&dir).unwrap();
+        let image =
+            ImageRef::pinned(format!("test.local/no-workspace-rootfs@sha256:{digest}")).unwrap();
+
+        let error = GvisorAssetRegistry::from_bindings(vec![binding(image, dir.clone())])
+            .expect_err("launch must never create /workspace after the asset was hashed");
+        assert!(matches!(
+            error,
+            AssetRegistryError::InvalidWorkspaceMountpoint { .. }
+        ));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// (b) A binding whose actual directory content does NOT match the pinned digest refuses

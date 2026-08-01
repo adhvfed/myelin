@@ -19,17 +19,13 @@
 //!   4. **read-only enforced** — an in-guest WRITE to `/repo` (`git init --bare /repo`) FAILS (non-zero
 //!      exit, EROFS/permission), and the host repo is byte-unchanged. The RO mount is runsc-enforced.
 //!
-//! ## git-in-rootfs (the staging recipe)
-//! The escape-drill rootfs (`resolved_gvisor_rootfs`) is busybox-only — it has NO `git`. This test
-//! STAGES a git-bearing rootfs from it: copy the busybox rootfs, drop in the host `git` binary at
-//! `/usr/bin/git`, its two extra shared libs (`libpcre2-8`, `libz-ng` — both only need GLIBC ≤ the
-//! rootfs's), and the `git-core` helper symlinks (`git-upload-pack`/`git-receive-pack` → `git`). The
-//! rootfs's own glibc (2.41) is newer than the host `git` needs (2.38), so no glibc copy is required.
-//! It points `MYELIN_GVISOR_GIT_ROOTFS` at the staged rootfs. PRODUCTION staging would bake an OCI
-//! image with `git`; this self-test stages the minimum to run a real `git` in the sandbox.
+//! ## git-in-rootfs
+//! This test uses the same production-staged, content-addressed git rootfs as the runtime. Its pinned
+//! canonical-tree digest and immutable mountpoint contract are verified before any sandbox launch.
 //!
 //! ## Gating (CI without runsc still passes; THIS host must really run a container)
-//! SKIPPED GRACEFULLY when `runsc` is not on PATH or the busybox base rootfs is absent. With
+//! SKIPPED GRACEFULLY when `runsc` is not on PATH or the pinned production git rootfs is unavailable.
+//! With
 //! `MYELIN_REQUIRE_RUNSC=1` an absent capability is a HARD FAILURE (never a vacuous green). Run:
 //! `MYELIN_REQUIRE_RUNSC=1 cargo test -p myelin-ci-sandbox --features integration --test git_wire_prod_exec_test -- --nocapture`.
 
@@ -37,13 +33,11 @@
 
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    resolve_bare_repo_path, resolved_gvisor_rootfs, GitWireSpec, IdemToken, MeterTarget,
+    resolve_bare_repo_path, verified_gvisor_git_rootfs, GitWireSpec, IdemToken, MeterTarget,
     ReserveHandle, ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, WireError,
-    ENV_GVISOR_GIT_ROOTFS,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 
 // ───────────────────────────── runsc / rootfs preconditions ─────────────────────────────
 
@@ -61,108 +55,35 @@ fn runsc_bin() -> Option<String> {
     None
 }
 
-/// The base busybox rootfs + `runsc` must be present; otherwise skip.
-fn preconditions() -> Option<String> {
-    let bin = runsc_bin()?;
-    if !resolved_gvisor_rootfs().exists() {
-        return None;
-    }
-    Some(bin)
-}
-
 /// HARD-FAIL on an absent capability iff `MYELIN_REQUIRE_RUNSC=1`; otherwise GRACEFUL SKIP.
 fn require_or_skip(test: &str) -> Option<String> {
-    if let Some(bin) = preconditions() {
-        return Some(bin);
+    let bin = match runsc_bin() {
+        Some(bin) => bin,
+        None if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") => {
+            panic!(
+                "[{test}] MYELIN_REQUIRE_RUNSC=1 but `runsc` is not on PATH. CT-006a refuses a \
+                 VACUOUS green: a real `git` MUST run in a real `runsc` sandbox here."
+            );
+        }
+        None => {
+            eprintln!("[{test}] SKIPPED: `runsc` is not on PATH.");
+            return None;
+        }
+    };
+
+    match verified_gvisor_git_rootfs() {
+        Ok(_) => Some(bin),
+        Err(error) if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") => {
+            panic!(
+                "[{test}] MYELIN_REQUIRE_RUNSC=1 but the pinned production git rootfs is \
+                 unavailable: {error}. CT-006a refuses a VACUOUS green."
+            );
+        }
+        Err(error) => {
+            eprintln!("[{test}] SKIPPED: pinned production git rootfs unavailable: {error}");
+            None
+        }
     }
-    if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") {
-        panic!(
-            "[{test}] MYELIN_REQUIRE_RUNSC=1 but `runsc` is not on PATH or the busybox base rootfs \
-             ({}) is absent. CT-006a refuses a VACUOUS green: a real `git` MUST run in a real `runsc` \
-             sandbox here.",
-            resolved_gvisor_rootfs().display()
-        );
-    }
-    eprintln!(
-        "[{test}] SKIPPED: `runsc` or the base rootfs absent — cannot run a gVisor container."
-    );
-    None
-}
-
-// ───────────────────────────── stage a git-bearing rootfs (once) ─────────────────────────────
-
-/// Copy a file, creating parent dirs.
-fn copy_file(src: &Path, dst: &Path) {
-    if let Some(p) = dst.parent() {
-        std::fs::create_dir_all(p).expect("mkdir -p");
-    }
-    std::fs::copy(src, dst).unwrap_or_else(|e| panic!("copy {src:?} -> {dst:?}: {e}"));
-}
-
-/// Resolve a host lib (following symlinks) and copy the REAL file into the rootfs at both `/usr/lib`
-/// and `/lib`, recreating the `soname` symlink so the dynamic linker finds it.
-fn stage_lib(rootfs: &Path, soname: &str, host_path: &str) {
-    let real = std::fs::canonicalize(host_path).unwrap_or_else(|_| PathBuf::from(host_path));
-    let real_name = real.file_name().unwrap().to_string_lossy().to_string();
-    for libdir in ["usr/lib", "lib"] {
-        let dst_real = rootfs.join(libdir).join(&real_name);
-        copy_file(&real, &dst_real);
-        let link = rootfs.join(libdir).join(soname);
-        let _ = std::fs::remove_file(&link);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real_name, &link).expect("soname symlink");
-    }
-}
-
-/// Stage a git-bearing rootfs from the busybox base (copy base, add `git` + libs + git-core helpers).
-fn stage_git_rootfs(base: &Path) -> PathBuf {
-    let staged = std::env::temp_dir().join(format!("myelin-git-rootfs-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staged);
-    // Copy the whole base rootfs (busybox + its glibc — small, ~4 MiB) preserving symlinks/perms.
-    let st = Command::new("cp")
-        .arg("-a")
-        .arg(format!("{}/.", base.display()))
-        .arg(&staged)
-        .status()
-        .expect("cp -a base rootfs");
-    assert!(st.success(), "cp -a base rootfs failed");
-
-    // The host `git` (single multi-call binary; upload-pack/receive-pack dispatch off argv[0]).
-    copy_file(Path::new("/usr/bin/git"), &staged.join("usr/bin/git"));
-    // The two shared libs `git` needs beyond glibc (both need only GLIBC ≤ the rootfs's 2.41).
-    stage_lib(&staged, "libpcre2-8.so.0", "/usr/lib/libpcre2-8.so.0");
-    stage_lib(&staged, "libz-ng.so.2", "/usr/lib/libz-ng.so.2");
-    // The git-core exec dir: helpers are symlinks back to the single `git` binary (../../bin/git ⇒
-    // /usr/lib/git-core/../../bin/git = /usr/bin/git). GIT_EXEC_PATH points the sandboxed git here.
-    let core = staged.join("usr/lib/git-core");
-    std::fs::create_dir_all(&core).expect("mkdir git-core");
-    for helper in ["git-upload-pack", "git-receive-pack"] {
-        let link = core.join(helper);
-        let _ = std::fs::remove_file(&link);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("../../bin/git", &link).expect("git-core helper symlink");
-    }
-    // The bind-mount TARGET dirs must pre-exist in the READ-ONLY root (runsc cannot create a mount
-    // point inside a `readonly:true` rootfs — exactly as `/tmp` pre-exists for the tmpfs mount).
-    std::fs::create_dir_all(staged.join("repo")).expect("mkdir /repo mount point");
-    std::fs::create_dir_all(staged.join("quarantine")).expect("mkdir /quarantine mount point");
-    staged
-}
-
-/// Stage the git rootfs ONCE for the whole test binary + point the env var at it (idempotent).
-fn git_rootfs() -> Option<PathBuf> {
-    static STAGED: OnceLock<Option<PathBuf>> = OnceLock::new();
-    STAGED
-        .get_or_init(|| {
-            let base = resolved_gvisor_rootfs();
-            if !base.exists() {
-                return None;
-            }
-            let staged = stage_git_rootfs(&base);
-            std::env::set_var(ENV_GVISOR_GIT_ROOTFS, &staged);
-            Some(staged)
-        })
-        .clone()
 }
 
 // ───────────────────────────── a real bare repo with a commit ─────────────────────────────
@@ -290,9 +211,6 @@ fn sandboxed_upload_pack_advertise_refs_lists_the_real_repo() {
     let Some(_bin) = require_or_skip("git-wire advertise-refs") else {
         return;
     };
-    let Some(_rootfs) = git_rootfs() else {
-        return;
-    };
     let root = temp_root("adv");
     let oid = make_repo_with_commit(&root, "acme", "fr-par", "widgets");
 
@@ -363,9 +281,6 @@ fn sandboxed_upload_pack_advertise_refs_lists_the_real_repo() {
 #[test]
 fn sandboxed_upload_pack_v2_ls_refs_round_trip_with_bounded_stdin() {
     let Some(_bin) = require_or_skip("git-wire v2 ls-refs") else {
-        return;
-    };
-    let Some(_rootfs) = git_rootfs() else {
         return;
     };
     let root = temp_root("v2");
@@ -481,9 +396,6 @@ fn cross_tenant_and_traversal_locators_are_refused_before_any_mount() {
 #[test]
 fn read_only_repo_mount_rejects_an_in_guest_write() {
     let Some(_bin) = require_or_skip("git-wire ro-enforced") else {
-        return;
-    };
-    let Some(_rootfs) = git_rootfs() else {
         return;
     };
     let root = temp_root("ro");

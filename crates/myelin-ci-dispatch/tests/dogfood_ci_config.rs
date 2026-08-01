@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const MARKER: &str = "MYELIN-CI-a005e32fc1bb0c2b64e7d40ac1a01236";
-const ROOTFS_IMAGE: &str = "myelin.local/linux-small-v1-rootfs@sha256:f9bd3926a7b47e1dd4729e5788d40dc6daf4ce159a91db169ef5bb803e73ec1f";
+const ROOTFS_IMAGE: &str = "myelin.local/linux-small-v1-rootfs@sha256:65f0f6f242cd4412b4ad56250eadb0a459a59a71b49d21485e68da6a3d5cb975";
 const OID: &str = "dddddddddddddddddddddddddddddddddddddddd";
 const COMMAND: [&str; 3] = [
     "/bin/sh",

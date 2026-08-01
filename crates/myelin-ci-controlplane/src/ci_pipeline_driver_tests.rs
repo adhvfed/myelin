@@ -439,7 +439,11 @@ fn v4_receipt_and_result_summary_bind_the_closed_disposition() {
         result_refs: refs.to_vec(),
     };
     assert_eq!(
-        terminal_result_summary(&report, Some(CiJobTerminalDisposition::WorkloadFailed)),
+        terminal_result_summary(
+            &report,
+            Some(CiJobTerminalDisposition::WorkloadFailed),
+            None,
+        ),
         serde_json::json!({
             "passed": false,
             "timed_out": false,
@@ -448,7 +452,7 @@ fn v4_receipt_and_result_summary_bind_the_closed_disposition() {
         })
     );
     assert_eq!(
-        terminal_result_summary(&report, None),
+        terminal_result_summary(&report, None, None),
         serde_json::json!({"passed": false, "timed_out": false}),
         "a historical v3 replay retains the exact legacy summary shape"
     );
@@ -464,6 +468,27 @@ fn v4_receipt_and_result_summary_bind_the_closed_disposition() {
             "disposition": "checkout_transport_timed_out",
             "workload_started": false,
         })
+    );
+
+    let diagnostic = "host-side HEAD re-verification disagreed: workspace HEAD is absent";
+    assert_eq!(
+        terminal_result_summary(
+            &report,
+            Some(CiJobTerminalDisposition::Preparation(
+                PreparationTerminalDisposition::Failed {
+                    phase: myelin_ci_sandbox::PreparationPhase::CheckoutMaterialization,
+                },
+            )),
+            Some(diagnostic),
+        ),
+        serde_json::json!({
+            "passed": false,
+            "timed_out": false,
+            "disposition": "checkout_materialization_failed",
+            "workload_started": false,
+            "diagnostic": diagnostic,
+        }),
+        "a preparation-terminal result_summary must retain its underlying diagnostic"
     );
 }
 

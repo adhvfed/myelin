@@ -28,8 +28,21 @@ die() { echo "stage-git-rootfs: $*" >&2; exit 1; }
 [[ -d "${BASE_ROOTFS}" ]] || die "base rootfs absent at ${BASE_ROOTFS} — build/stage it first (MYELIN_GVISOR_ROOTFS overrides)"
 HOST_GIT="$(command -v git)" || die "no host \`git\` on PATH to bake into the guest"
 
-# Idempotent: a staged tree with a guest git already present is a no-op unless FORCE=1.
-if [[ "${FORCE:-0}" != "1" && -x "${STAGED}/usr/bin/git" ]]; then
+# Every OCI destination this shared tree can receive must exist before the tree is content-pinned.
+# `/tmp` is the tmpfs target on both paths; checkout binds `/workspace`; git-wire binds `/repo` and
+# optionally `/quarantine`. A pre-existing deployment missing any one of them is deliberately
+# re-staged below instead of taking the old `usr/bin/git`-only early return.
+REQUIRED_MOUNTPOINTS=(tmp workspace repo quarantine)
+mountpoints_ready=1
+for mountpoint in "${REQUIRED_MOUNTPOINTS[@]}"; do
+  if [[ ! -d "${STAGED}/${mountpoint}" || -L "${STAGED}/${mountpoint}" ]]; then
+    mountpoints_ready=0
+    break
+  fi
+done
+
+# Idempotent only when the executable AND the complete fixed OCI mountpoint set are already staged.
+if [[ "${FORCE:-0}" != "1" && -x "${STAGED}/usr/bin/git" && "${mountpoints_ready}" == "1" ]]; then
   echo "stage-git-rootfs: already staged at ${STAGED} (FORCE=1 to re-stage)" >&2
   echo "${STAGED}"
   exit 0
@@ -71,9 +84,13 @@ for helper in git-upload-pack git-receive-pack; do
   ln -sf "../../bin/git" "${STAGED}/usr/lib/git-core/${helper}"
 done
 
-# The bind-mount TARGET dirs must PRE-EXIST in the read-only root (runsc cannot create a mount point
-# inside a readonly:true rootfs — exactly as /tmp pre-exists for the tmpfs mount).
-mkdir -p "${STAGED}/repo" "${STAGED}/quarantine"
+# The complete fixed OCI mount destination set must PRE-EXIST in the read-only, digest-pinned root.
+# runsc must never create any of these paths in the shared tree.
+mkdir -p \
+  "${STAGED}/tmp" \
+  "${STAGED}/workspace" \
+  "${STAGED}/repo" \
+  "${STAGED}/quarantine"
 
 echo "stage-git-rootfs: done — set MYELIN_GVISOR_GIT_ROOTFS=${STAGED}" >&2
 echo "${STAGED}"

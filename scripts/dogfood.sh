@@ -122,7 +122,7 @@ EOF
 }
 
 verify_ci_rootfs() {
-  for tool in sed tar sha256sum awk; do
+  for tool in sed tar sha256sum awk find; do
     command -v "${tool}" >/dev/null 2>&1 || fail "CI rootfs verification requires ${tool}"
   done
   local config="${REPO_ROOT}/.myelin/ci.toml"
@@ -131,6 +131,10 @@ verify_ci_rootfs() {
     fail "checked-in founder pipeline is absent or linked: ${config}"
   [[ -d "${rootfs}" && ! -L "${rootfs}" ]] ||
     fail "staged CI rootfs is absent or linked: ${rootfs}"
+  [[ -d "${rootfs}/workspace" && ! -L "${rootfs}/workspace" ]] ||
+    fail "staged CI rootfs must contain a real, precreated /workspace mountpoint: ${rootfs}/workspace"
+  [[ -z "$(find "${rootfs}/workspace" -mindepth 1 -print -quit)" ]] ||
+    fail "staged CI rootfs /workspace mountpoint must be empty before it is pinned"
   local expected_digest actual_digest
   expected_digest="$(
     sed -nE \

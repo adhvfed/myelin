@@ -65,7 +65,7 @@ crash-recovery state). It:
 - Warns (does not fail) if `/usr/bin/newuidmap`/`newgidmap` are missing or not root-owned-setuid —
   install your distro's `uidmap` package if so.
 
-## Granting `CAP_SYS_ADMIN`/`CAP_CHOWN` without widening the host's trust surface
+## Granting workspace lifecycle and scoped host-verification capabilities
 
 `workspace_storage.rs` shells out to `/usr/bin/btrfs` (a hardcoded absolute path — there is
 deliberately no override, so the pin can never silently point at a different binary) for
@@ -73,24 +73,34 @@ deliberately no override, so the pin can never silently point at a different bin
 hand a fresh workspace to the job's own userns-mapped uid/gid (needs `CAP_CHOWN` — a distinct
 capability from `CAP_SYS_ADMIN`, easy to miss). **Do not** `setcap cap_sys_admin+ep /usr/bin/btrfs`
 — that grants the capability to every process on the host that can execute `btrfs`, not just the
-runner. Instead, `deploy/systemd/myelin-ci-controlplane.service` grants both ONLY to this service
+runner. Instead, `deploy/systemd/myelin-ci-controlplane.service` grants them ONLY to this service
 via:
 
 ```ini
-AmbientCapabilities=CAP_SYS_ADMIN CAP_CHOWN
+AmbientCapabilities=CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_READ_SEARCH
 NoNewPrivileges=false
 ```
 
 Ambient capabilities propagate from the granted process to everything it `exec`s (including its
 `btrfs`/`chown` child processes) without either process needing its own file capabilities — this is
-the mechanism, not a workaround. **Do NOT also restrict `CapabilityBoundingSet` to just these two
-capabilities** (an earlier draft of this unit did, and it was wrong): `runsc`'s explicit
+the mechanism for `CAP_SYS_ADMIN` and `CAP_CHOWN`, not a workaround. `CAP_DAC_READ_SEARCH` has a
+different, narrower lifecycle: the binary lowers it from ambient and clears it from effective on
+the initial thread **before constructing Tokio**, retaining it only in permitted. The dedicated
+runner thread temporarily makes it effective around the bounded `O_NOFOLLOW` reads of `.git/HEAD`
+and `Cargo.lock`, then clears it again. Thus `runsc` and workload processes never inherit it. This
+is a read/search-only DAC bypass; **never substitute `CAP_DAC_OVERRIDE`**, which also bypasses write
+permission checks. The unavoidable deployment tradeoff is that systemd's trusted `ExecStart` shell
+and the binary's few pre-runtime instructions briefly receive the ambient capability; avoiding that
+would require a privileged launcher or a file capability on a shared executable, both broader and
+harder to audit.
+
+**Do NOT also restrict `CapabilityBoundingSet` to just these capabilities** (an earlier draft of
+this unit did, and it was wrong): `runsc`'s explicit
 user-namespace mode execs `newuidmap`/`newgidmap` — setuid-root helpers — to write the uid/gid
 mapping. A setuid-root exec can never gain a capability outside the CALLING process's bounding set,
 so narrowing it breaks that escalation with an opaque `newuidmap failed: fork/exec ... operation not
 permitted` (hit and confirmed directly). Leave `CapabilityBoundingSet` at systemd's default (the
-full set); `AmbientCapabilities` alone already keeps what this process itself actively wields to
-exactly `CAP_SYS_ADMIN`/`CAP_CHOWN`. `NoNewPrivileges` MUST stay `false` for the same
+full set). `NoNewPrivileges` MUST stay `false` for the same
 setuid-helper reason — `NoNewPrivileges=true` (a common systemd hardening default — do not apply it
 here) makes the kernel ignore their setuid bit on exec entirely.
 
@@ -218,7 +228,7 @@ BIN=$(cargo test -p myelin-ci-sandbox --lib --features integration,test-support 
   | sed -n 's/^ *Executable unittests.*(\(.*\))$/\1/p')
 
 sudo systemd-run --uid="$(whoami)" --gid="$(id -gn)" --unit=myelin-userns-drill \
-  --property=AmbientCapabilities='CAP_SYS_ADMIN CAP_CHOWN' \
+  --property=AmbientCapabilities='CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_READ_SEARCH' \
   --property=NoNewPrivileges=false \
   --property=Delegate=memory \
   --property=DelegateSubgroup=supervisor \

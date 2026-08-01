@@ -347,6 +347,8 @@ pub enum CheckoutContinuationOutcome {
     PreparationTerminal {
         claim: PreparationReportClaim,
         disposition: PreparationTerminalDisposition,
+        /// Retained operator-safe detail from the checkout failure, if this terminal has one.
+        diagnostic: Option<String>,
     },
     /// A nonterminal preparation failure that is a RETRY REQUEST, not a completed requeue: it is
     /// produced after the ADVISORY `should_requeue()` check (budget not yet exhausted). The caller
@@ -382,6 +384,7 @@ pub(crate) fn route_preparation_disposition(
     claim: &PreparationReportClaim,
     disposition: PreparationAttemptDisposition,
     usage: ResourceUsage,
+    diagnostic: Option<String>,
 ) -> Result<CheckoutContinuationOutcome, AttemptAuthorityError> {
     match disposition {
         PreparationAttemptDisposition::Terminal(terminal) => {
@@ -391,6 +394,7 @@ pub(crate) fn route_preparation_disposition(
             Ok(CheckoutContinuationOutcome::PreparationTerminal {
                 claim: claim.clone(),
                 disposition: terminal,
+                diagnostic,
             })
         }
         PreparationAttemptDisposition::RefusedBeforeExecution { phase } => {
@@ -464,9 +468,11 @@ pub(crate) fn resolve_hop_b_failure(
     claim: &PreparationReportClaim,
     disposition: PreparationAttemptDisposition,
     usage: ResourceUsage,
+    diagnostic: Option<String>,
     disposal_diagnostics: Vec<String>,
 ) -> Result<CheckoutContinuationOutcome, AttemptAuthorityError> {
-    let routed = route_preparation_disposition(authority, claim, disposition, usage)?;
+    let routed =
+        route_preparation_disposition(authority, claim, disposition, usage, diagnostic)?;
     if disposal_diagnostics.is_empty() {
         Ok(routed)
     } else {
@@ -543,6 +549,7 @@ pub(crate) fn requeue_or_exhausted(
         CheckoutContinuationOutcome::PreparationTerminal {
             claim: claim.clone(),
             disposition: PreparationTerminalDisposition::AttemptsExhausted,
+            diagnostic: None,
         }
     }
 }
@@ -834,6 +841,7 @@ mod tests {
                 quarantine_required: true,
             },
             usage(2, 2),
+            None,
             vec!["slot quarantined; workspace manager poisoned".to_string()],
         )
         .expect("routes");
@@ -866,6 +874,7 @@ mod tests {
                 phase: PreparationPhase::CheckoutMaterialization,
             }),
             usage(4, 4),
+            Some("host-side HEAD re-verification disagreed: injected".to_string()),
             vec![],
         )
         .expect("routes");
@@ -950,7 +959,11 @@ mod tests {
             PreparationPhase::CheckoutTransport,
         );
         match exhausted {
-            CheckoutContinuationOutcome::PreparationTerminal { claim: carried, disposition } => {
+            CheckoutContinuationOutcome::PreparationTerminal {
+                claim: carried,
+                disposition,
+                ..
+            } => {
                 assert_eq!(carried, claim, "the exhausted terminal carries the exact claim");
                 assert_eq!(disposition, PreparationTerminalDisposition::AttemptsExhausted);
             }
@@ -968,6 +981,7 @@ mod tests {
                 phase: PreparationPhase::CheckoutTransport,
             }),
             usage(7, 9),
+            None,
         )
         .expect("routes");
         assert_eq!(authority.ops(), vec!["complete:CheckoutTransport:7:9"]);
@@ -992,6 +1006,7 @@ mod tests {
                 phase: PreparationPhase::CheckoutMaterialization,
             }),
             usage(3, 3),
+            None,
         )
         .expect("routes");
         assert_eq!(authority.ops(), vec!["complete:CheckoutMaterialization:3:3"]);
@@ -1014,6 +1029,7 @@ mod tests {
                 phase: PreparationPhase::CheckoutTransport,
             },
             usage(5, 5), // ignored — a refusal completes the phase with ZERO.
+            None,
         )
         .expect("routes");
         assert_eq!(authority.ops(), vec!["complete:CheckoutTransport:0:0"]);
@@ -1036,6 +1052,7 @@ mod tests {
                 phase: PreparationPhase::CheckoutTransport,
             },
             usage(0, 0),
+            None,
         )
         .expect("routes");
         assert_eq!(authority.ops(), vec!["complete:CheckoutTransport:0:0"]);
@@ -1058,6 +1075,7 @@ mod tests {
                 phase: PreparationPhase::CheckoutMaterialization,
             },
             usage(11, 13),
+            None,
         )
         .expect("routes");
         assert_eq!(authority.ops(), vec!["complete:CheckoutMaterialization:11:13"]);
@@ -1084,6 +1102,7 @@ mod tests {
                 quarantine_required: false,
             },
             usage(999, 999),
+            None,
         )
         .expect("routes");
         assert_eq!(authority.ops(), vec!["seal:CheckoutTransport"]);
@@ -1147,6 +1166,7 @@ mod tests {
                 quarantine_required: true,
             },
             usage(1, 1),
+            None,
         )
         .expect("routes");
         assert_eq!(authority.ops(), vec!["seal:CheckoutMaterialization"]);

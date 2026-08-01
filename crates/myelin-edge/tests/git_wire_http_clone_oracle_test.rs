@@ -15,11 +15,11 @@
 //! (`GvisorBackend::launch_git_wire`), streamed to the client through the production `RoutedGitCore`.
 //!
 //! ## Gating
-//! SKIPS gracefully when `runsc`/the busybox base rootfs/the host `git` are absent. With
+//! SKIPS gracefully when `runsc`/the pinned production git rootfs/the host `git` are absent. With
 //! `MYELIN_REQUIRE_RUNSC=1` an absent capability is a HARD failure (never a vacuous green). Run:
 //! `MYELIN_REQUIRE_RUNSC=1 cargo test -p myelin-edge --test git_wire_http_clone_oracle_test -- --nocapture`.
 
-use myelin_ci_sandbox::{resolved_gvisor_rootfs, ENV_GVISOR_GIT_ROOTFS};
+use myelin_ci_sandbox::verified_gvisor_git_rootfs;
 use myelin_edge::{
     register_git_durable, register_git_wire, serve_edge, AllowAll, CheckBackedRepoAuthorizer,
     DurableGitBackend, Gateway, Method, TupleRepoBootstrap, WhoamiHandler,
@@ -39,7 +39,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
@@ -71,83 +70,30 @@ fn host_git() -> bool {
 }
 
 fn require_or_skip(test: &str) -> bool {
-    if runsc_bin().is_some() && resolved_gvisor_rootfs().exists() && host_git() {
-        return true;
+    if runsc_bin().is_none() || !host_git() {
+        if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") {
+            panic!(
+                "[{test}] MYELIN_REQUIRE_RUNSC=1 but `runsc` or host git is absent — CT-006c \
+                 refuses a VACUOUS green."
+            );
+        }
+        eprintln!("[{test}] SKIPPED: `runsc` or host git is absent.");
+        return false;
     }
-    if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") {
-        panic!(
-            "[{test}] MYELIN_REQUIRE_RUNSC=1 but `runsc`/the busybox base rootfs ({})/host git is \
-             absent — CT-006c refuses a VACUOUS green.",
-            resolved_gvisor_rootfs().display()
-        );
+
+    match verified_gvisor_git_rootfs() {
+        Ok(_) => true,
+        Err(error) if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") => {
+            panic!(
+                "[{test}] MYELIN_REQUIRE_RUNSC=1 but the pinned production git rootfs is \
+                 unavailable: {error} — CT-006c refuses a VACUOUS green."
+            );
+        }
+        Err(error) => {
+            eprintln!("[{test}] SKIPPED: pinned production git rootfs unavailable: {error}");
+            false
+        }
     }
-    eprintln!("[{test}] SKIPPED: `runsc`/base rootfs/host git absent.");
-    false
-}
-
-// ───────────── stage a git-bearing rootfs (the CT-006a/b recipe, replicated) ─────────────
-
-fn copy_file(src: &Path, dst: &Path) {
-    if let Some(p) = dst.parent() {
-        std::fs::create_dir_all(p).expect("mkdir -p");
-    }
-    std::fs::copy(src, dst).unwrap_or_else(|e| panic!("copy {src:?} -> {dst:?}: {e}"));
-}
-
-fn stage_lib(rootfs: &Path, soname: &str, host_path: &str) {
-    let real = std::fs::canonicalize(host_path).unwrap_or_else(|_| PathBuf::from(host_path));
-    let real_name = real.file_name().unwrap().to_string_lossy().to_string();
-    for libdir in ["usr/lib", "lib"] {
-        let dst_real = rootfs.join(libdir).join(&real_name);
-        copy_file(&real, &dst_real);
-        let link = rootfs.join(libdir).join(soname);
-        let _ = std::fs::remove_file(&link);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real_name, &link).expect("soname symlink");
-    }
-}
-
-fn stage_git_rootfs(base: &Path) -> PathBuf {
-    let staged =
-        std::env::temp_dir().join(format!("myelin-ct006c-git-rootfs-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staged);
-    let st = Command::new("cp")
-        .arg("-a")
-        .arg(format!("{}/.", base.display()))
-        .arg(&staged)
-        .status()
-        .expect("cp -a base rootfs");
-    assert!(st.success(), "cp -a base rootfs failed");
-
-    copy_file(Path::new("/usr/bin/git"), &staged.join("usr/bin/git"));
-    stage_lib(&staged, "libpcre2-8.so.0", "/usr/lib/libpcre2-8.so.0");
-    stage_lib(&staged, "libz-ng.so.2", "/usr/lib/libz-ng.so.2");
-    let core = staged.join("usr/lib/git-core");
-    std::fs::create_dir_all(&core).expect("mkdir git-core");
-    for helper in ["git-upload-pack", "git-receive-pack"] {
-        let link = core.join(helper);
-        let _ = std::fs::remove_file(&link);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("../../bin/git", &link).expect("git-core helper symlink");
-    }
-    std::fs::create_dir_all(staged.join("repo")).expect("mkdir /repo mount point");
-    std::fs::create_dir_all(staged.join("quarantine")).expect("mkdir /quarantine mount point");
-    staged
-}
-
-fn git_rootfs() -> Option<PathBuf> {
-    static STAGED: OnceLock<Option<PathBuf>> = OnceLock::new();
-    STAGED
-        .get_or_init(|| {
-            let base = resolved_gvisor_rootfs();
-            if !base.exists() {
-                return None;
-            }
-            let staged = stage_git_rootfs(&base);
-            std::env::set_var(ENV_GVISOR_GIT_ROOTFS, &staged);
-            Some(staged)
-        })
-        .clone()
 }
 
 // ───────────────────────────── host-git helpers (the external oracle) ─────────────────────────────
@@ -380,7 +326,6 @@ async fn real_git_clone_fetch_over_smart_http_with_auth() {
     if !require_or_skip("ct006c clone/fetch oracle") {
         return;
     }
-    let Some(_rootfs) = git_rootfs() else { return };
 
     let root = temp_root("oracle");
     // ~2 MiB payload ⇒ a packfile WELL over the old 256 KiB SANDBOX_CAPTURE_BOUND (proves the fix).
@@ -526,7 +471,6 @@ async fn over_cap_upload_pack_response_errors_cleanly() {
     if !require_or_skip("ct006c over-cap fail-loud") {
         return;
     }
-    let Some(_rootfs) = git_rootfs() else { return };
 
     let root = temp_root("overcap");
     // ~16 MiB of incompressible content ⇒ a packfile ≫ the 8 MiB wire cap below.
@@ -737,7 +681,6 @@ async fn r2_1a_live_repo_authz_denies_ungranted_admits_creator_and_isolates_repo
     if !require_or_skip("r2.1a live repo-authz oracle") {
         return;
     }
-    let Some(_rootfs) = git_rootfs() else { return };
 
     let root = temp_root("r21a");
     let (gw, cell) = build_r21a(&root);

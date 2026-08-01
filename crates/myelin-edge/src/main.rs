@@ -479,6 +479,9 @@ fn validated_runsc(value: Result<String, VarError>) -> Result<PathBuf, String> {
     // sanctioned host-exec site, so edge asks it to verify the binary instead of spawning here.
     use myelin_ci_sandbox::gvisor::RunscProbeError;
     myelin_ci_sandbox::gvisor::probe_runsc_version(&path).map_err(|error| match error {
+        RunscProbeError::UnsafeBinary(reason) => {
+            format!("MYELIN_RUNSC_BIN failed executable metadata validation: {reason}")
+        }
         RunscProbeError::CouldNotExecute => {
             "MYELIN_RUNSC_BIN could not execute its version probe".to_string()
         }

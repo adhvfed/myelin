@@ -10,13 +10,11 @@
 
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    resolve_bare_repo_path, resolved_gvisor_rootfs, GitWireSpec, IdemToken, MeterTarget,
+    resolve_bare_repo_path, verified_gvisor_git_rootfs, GitWireSpec, IdemToken, MeterTarget,
     ReserveHandle, ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend,
-    ENV_GVISOR_GIT_ROOTFS,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::sync::OnceLock;
 
 fn runsc_bin() -> Option<String> {
     let bin = std::env::var("MYELIN_RUNSC_BIN").unwrap_or_else(|_| "runsc".to_string());
@@ -33,74 +31,32 @@ fn runsc_bin() -> Option<String> {
 }
 
 fn require_or_skip(test: &str) -> Option<String> {
-    if let Some(bin) = runsc_bin() {
-        if resolved_gvisor_rootfs().exists() {
-            return Some(bin);
+    let bin = match runsc_bin() {
+        Some(bin) => bin,
+        None if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") => {
+            panic!(
+                "[{test}] MYELIN_REQUIRE_RUNSC=1 but runsc is absent — refusing a vacuous green."
+            );
+        }
+        None => {
+            eprintln!("[{test}] SKIPPED: runsc is absent.");
+            return None;
+        }
+    };
+
+    match verified_gvisor_git_rootfs() {
+        Ok(_) => Some(bin),
+        Err(error) if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") => {
+            panic!(
+                "[{test}] MYELIN_REQUIRE_RUNSC=1 but the pinned production git rootfs is \
+                 unavailable: {error} — refusing a vacuous green."
+            );
+        }
+        Err(error) => {
+            eprintln!("[{test}] SKIPPED: pinned production git rootfs unavailable: {error}");
+            None
         }
     }
-    if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") {
-        panic!("[{test}] MYELIN_REQUIRE_RUNSC=1 but runsc/base rootfs absent — refusing a vacuous green.");
-    }
-    eprintln!("[{test}] SKIPPED: runsc/base rootfs absent.");
-    None
-}
-
-fn copy_file(src: &Path, dst: &Path) {
-    if let Some(p) = dst.parent() {
-        std::fs::create_dir_all(p).expect("mkdir -p");
-    }
-    std::fs::copy(src, dst).unwrap_or_else(|e| panic!("copy {src:?} -> {dst:?}: {e}"));
-}
-
-fn stage_lib(rootfs: &Path, soname: &str, host_path: &str) {
-    let real = std::fs::canonicalize(host_path).unwrap_or_else(|_| PathBuf::from(host_path));
-    let real_name = real.file_name().unwrap().to_string_lossy().to_string();
-    for libdir in ["usr/lib", "lib"] {
-        let dst_real = rootfs.join(libdir).join(&real_name);
-        copy_file(&real, &dst_real);
-        let link = rootfs.join(libdir).join(soname);
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&real_name, &link).expect("soname symlink");
-    }
-}
-
-fn stage_git_rootfs(base: &Path) -> PathBuf {
-    let staged = std::env::temp_dir().join(format!("myelin-ct006d-rootfs-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staged);
-    let st = Command::new("cp")
-        .arg("-a")
-        .arg(format!("{}/.", base.display()))
-        .arg(&staged)
-        .status()
-        .expect("cp -a base rootfs");
-    assert!(st.success(), "cp -a base rootfs failed");
-    copy_file(Path::new("/usr/bin/git"), &staged.join("usr/bin/git"));
-    stage_lib(&staged, "libpcre2-8.so.0", "/usr/lib/libpcre2-8.so.0");
-    stage_lib(&staged, "libz-ng.so.2", "/usr/lib/libz-ng.so.2");
-    let core = staged.join("usr/lib/git-core");
-    std::fs::create_dir_all(&core).expect("mkdir git-core");
-    for helper in ["git-upload-pack", "git-receive-pack"] {
-        let link = core.join(helper);
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink("../../bin/git", &link).expect("git-core helper symlink");
-    }
-    std::fs::create_dir_all(staged.join("repo")).expect("mkdir /repo mount point");
-    staged
-}
-
-fn git_rootfs() -> Option<PathBuf> {
-    static STAGED: OnceLock<Option<PathBuf>> = OnceLock::new();
-    STAGED
-        .get_or_init(|| {
-            let base = resolved_gvisor_rootfs();
-            if !base.exists() {
-                return None;
-            }
-            let staged = stage_git_rootfs(&base);
-            std::env::set_var(ENV_GVISOR_GIT_ROOTFS, &staged);
-            Some(staged)
-        })
-        .clone()
 }
 
 fn run_git(args: &[&str], cwd: Option<&Path>) -> std::process::Output {
@@ -158,7 +114,6 @@ fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
     let Some(_bin) = require_or_skip("ct006d receive-pack ingest") else {
         return;
     };
-    let Some(_rootfs) = git_rootfs() else { return };
 
     let root = std::env::temp_dir().join(format!("myelin-ct006d-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
