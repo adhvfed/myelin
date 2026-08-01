@@ -259,8 +259,8 @@ pub(crate) struct LockedJobClaim {
 pub const LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY: &str = "\
 SELECT state, idem_token, stage, trust_tier, lease_owner, lease_epoch,
        claim_nonce::text AS claim_nonce, claim_window_secs,
-       EXTRACT(EPOCH FROM claim_started_at)::bigint AS claim_started_at_epoch_secs,
-       EXTRACT(EPOCH FROM claim_expires_at)::bigint AS claim_expires_at_epoch_secs,
+       FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint AS claim_started_at_epoch_secs,
+       FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint AS claim_expires_at_epoch_secs,
        COALESCE(claim_expires_at > statement_timestamp(), false) AS claim_is_live
 FROM job_queue
 WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid AND run_id = $4::uuid

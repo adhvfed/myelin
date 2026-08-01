@@ -845,8 +845,8 @@ async fn the_renewal_is_capped_at_the_immutable_claim_expiry() {
         .await;
         assert!(queue.renew_preparation_lease(&claim).await.unwrap());
         let (lease_epoch_secs, claim_epoch_secs): (i64, i64) = sqlx::query_as(
-            "SELECT EXTRACT(EPOCH FROM lease_expires)::bigint,
-                    EXTRACT(EPOCH FROM claim_expires_at)::bigint
+            "SELECT FLOOR(EXTRACT(EPOCH FROM lease_expires))::bigint,
+                    FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint
              FROM job_queue WHERE tenant_id = $1 AND job_id = $2::uuid",
         )
         .bind(TENANT)

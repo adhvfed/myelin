@@ -1008,8 +1008,8 @@ async fn claim_job(admin: &PgPool, wf_run: &str, owner: &str, epoch: i64) -> Tes
              lease_expires = date_trunc('second', statement_timestamp()) + interval '5 minutes'
          WHERE run_id = $1
          RETURNING claim_nonce::text,
-                   EXTRACT(EPOCH FROM claim_started_at)::bigint,
-                   EXTRACT(EPOCH FROM claim_expires_at)::bigint",
+                   FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint,
+                   FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint",
     )
     .bind(Uuid::parse_str(wf_run).unwrap())
     .bind(owner)

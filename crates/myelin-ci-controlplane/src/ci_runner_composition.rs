@@ -719,8 +719,8 @@ async fn lock_exact_live_claim(
            AND idem_token = $5 AND stage = $6 AND trust_tier = $7
            AND state = 'leased' AND lease_owner = $8 AND lease_epoch = $9
            AND claim_nonce = $10::uuid
-           AND EXTRACT(EPOCH FROM claim_started_at)::bigint = $11
-           AND EXTRACT(EPOCH FROM claim_expires_at)::bigint = $12
+           AND FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint = $11
+           AND FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint = $12
            AND claim_expires_at > statement_timestamp()
            AND completion_receipt IS NULL
          FOR UPDATE",
@@ -755,8 +755,8 @@ async fn lock_release_disposition(
 ) -> Result<ReleaseDisposition, ReservationTransitionError> {
     let row = sqlx::query(
         "SELECT state, lease_owner, lease_epoch, claim_nonce::text AS claim_nonce,
-                EXTRACT(EPOCH FROM claim_started_at)::bigint AS claim_started_at_epoch_secs,
-                EXTRACT(EPOCH FROM claim_expires_at)::bigint AS claim_expires_at_epoch_secs,
+                FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint AS claim_started_at_epoch_secs,
+                FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint AS claim_expires_at_epoch_secs,
                 completion_receipt
          FROM job_queue
          WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid AND run_id = $4::uuid

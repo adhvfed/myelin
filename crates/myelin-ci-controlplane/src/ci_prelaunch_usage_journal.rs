@@ -1193,9 +1193,9 @@ async fn require_live_parent_attempt_on_conn(
            AND q.lease_owner = p.lease_owner
            AND q.lease_epoch = p.lease_epoch
            AND q.claim_nonce = p.claim_nonce
-           AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint =
+           AND FLOOR(EXTRACT(EPOCH FROM q.claim_started_at))::bigint =
                p.claim_started_at_epoch_secs
-           AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint =
+           AND FLOOR(EXTRACT(EPOCH FROM q.claim_expires_at))::bigint =
                p.claim_expires_at_epoch_secs
            AND q.claim_expires_at > statement_timestamp()
            AND q.completion_receipt IS NULL

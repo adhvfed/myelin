@@ -821,6 +821,138 @@ async fn migrated_schema(tag: &str) -> (String, PgPool, PgPool, PgPool) {
 // =================================================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fractional_claim_epoch_is_floored_and_the_real_credential_seam_issues() {
+    let (schema, bootstrap, admin, app) = migrated_schema("fractional_claim_epoch").await;
+    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+        let (minter, calls) = real_minter();
+        let store = store(&app, minter, CiJobCredentialWriteVersion::V2PhaseBound);
+        let mut fixture = seed_fixture(&app, &admin, 50, 5).await;
+
+        sqlx::query(
+            "INSERT INTO workflow_run (
+               tenant_id, region, run_id, wf_type, wf_version, input, state, correlation_id,
+               depth, partition
+             ) VALUES ($1, $2, $3, 'ci.pipeline', 1, '[]'::jsonb, 'running', $3, 0, 0)",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(&fixture.claim.wf_run_id)
+        .execute(&admin)
+        .await
+        .unwrap();
+
+        // Re-present the complete fixture to the REAL region scheduler so CLAIM_QUERY, rather than
+        // test-side epoch arithmetic, creates and extracts the claim generation. Start the claim in
+        // the latter half of a PostgreSQL second: a bare numeric -> bigint cast rounds this durable
+        // timestamp up, while the credential issuance clock below floors the same second.
+        sqlx::query(
+            "UPDATE job_queue
+             SET state = 'queued', lease_owner = NULL, lease_expires = NULL,
+                 claim_nonce = NULL, claim_started_at = NULL, claim_expires_at = NULL
+             WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(&fixture.claim.job_id)
+        .execute(&admin)
+        .await
+        .unwrap();
+
+        // Put CLAIM_QUERY safely inside [.50, .60), leaving nearly half a second for the real mint
+        // transaction. Verify the persisted timestamp rather than trusting client scheduling; retry
+        // the claim if a heavily loaded host misses the window.
+        let scheduler = ci_region_queue_store_test_support(admin.clone());
+        let (leased, exact_started_epoch) = loop {
+            let fraction: f64 = sqlx::query_scalar::<_, String>(
+                "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) % 1)::text",
+            )
+            .fetch_one(&admin)
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+            let wait = if fraction < 0.50 {
+                0.50 - fraction
+            } else if fraction >= 0.60 {
+                1.50 - fraction
+            } else {
+                0.0
+            };
+            if wait > 0.0 {
+                tokio::time::sleep(std::time::Duration::from_secs_f64(wait)).await;
+            }
+
+            let leased = scheduler
+                .claim(
+                    REGION,
+                    &["linux".into()],
+                    &[TrustTier::Trusted],
+                    "fractional-runner",
+                    900,
+                )
+                .await
+                .unwrap()
+                .expect("the real scheduler claims the fixture");
+            let exact_started_epoch: f64 = sqlx::query_scalar::<_, String>(
+                "SELECT EXTRACT(EPOCH FROM claim_started_at)::text
+                 FROM job_queue WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(&fixture.claim.job_id)
+            .fetch_one(&admin)
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+            if exact_started_epoch.fract() >= 0.5 && exact_started_epoch.fract() < 0.7 {
+                break (leased, exact_started_epoch);
+            }
+            sqlx::query(
+                "UPDATE job_queue
+                 SET state = 'queued', lease_owner = NULL, lease_expires = NULL,
+                     claim_nonce = NULL, claim_started_at = NULL, claim_expires_at = NULL
+                 WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+            )
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(&fixture.claim.job_id)
+            .execute(&admin)
+            .await
+            .unwrap();
+        };
+
+        fixture.claim.lease_owner = leased.lease_owner;
+        fixture.claim.lease_epoch = leased.lease_epoch;
+        fixture.claim.claim_nonce = leased.claim_nonce;
+        fixture.claim.claim_started_at_epoch_secs = leased.claim_started_at_epoch_secs;
+        fixture.claim.claim_expires_at_epoch_secs = leased.claim_expires_at_epoch_secs;
+
+        let minted = store
+            .mint_phase_credential(
+                &fixture.claim,
+                CiCredentialPurpose::CheckoutAdvertise,
+            )
+            .await
+            .expect("a fractional-second claim must issue at the credential-generation seam");
+
+        assert_eq!(
+            fixture.claim.claim_started_at_epoch_secs,
+            exact_started_epoch.floor() as i64,
+            "the scheduler persists the integer claim anchor by flooring"
+        );
+        assert!(
+            minted.binding.issued_at_epoch_secs >= fixture.claim.claim_started_at_epoch_secs,
+            "issued_at={} must not precede floored claim_started_at={} (exact={exact_started_epoch})",
+            minted.binding.issued_at_epoch_secs,
+            fixture.claim.claim_started_at_epoch_secs,
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "Identity issues exactly once");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generations() {
     let (schema, bootstrap, admin, app) = migrated_schema("sequence").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
@@ -2937,10 +3069,10 @@ struct LeaseFacts {
 
 async fn lease_facts(admin: &PgPool, fixture: &Fixture) -> LeaseFacts {
     let row = sqlx::query(
-        "SELECT EXTRACT(EPOCH FROM claim_started_at)::bigint AS cs,
-                EXTRACT(EPOCH FROM claim_expires_at)::bigint AS ce,
+        "SELECT FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint AS cs,
+                FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint AS ce,
                 claim_nonce::text AS nonce, lease_owner, lease_epoch,
-                EXTRACT(EPOCH FROM lease_expires)::bigint AS le
+                FLOOR(EXTRACT(EPOCH FROM lease_expires))::bigint AS le
          FROM job_queue WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
     )
     .bind(TENANT)

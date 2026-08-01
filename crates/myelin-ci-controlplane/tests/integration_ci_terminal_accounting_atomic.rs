@@ -435,8 +435,8 @@ async fn seed_prelaunch_usage_mix(pool: &PgPool, seed: JournalSeed<'_>) {
            budget_revision, max_parent_attempts
          )
          SELECT tenant_id, region, job_id, run_id, $5::uuid, $6, lease_owner, lease_epoch,
-                claim_nonce, EXTRACT(EPOCH FROM claim_started_at)::bigint,
-                EXTRACT(EPOCH FROM claim_expires_at)::bigint, 1, 5
+                claim_nonce, FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint,
+                FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint, 1, 5
          FROM job_queue
          WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid AND run_id = $4::uuid
          ON CONFLICT DO NOTHING",
@@ -1248,8 +1248,8 @@ async fn run_reporter_scenario(
                     .unwrap();
                     let exhausted_claim = sqlx::query(
                         "SELECT lease_owner, lease_epoch, claim_nonce::text AS claim_nonce,
-                        EXTRACT(EPOCH FROM claim_started_at)::bigint AS claim_started,
-                        EXTRACT(EPOCH FROM claim_expires_at)::bigint AS claim_expires
+                        FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint AS claim_started,
+                        FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint AS claim_expires
                  FROM job_queue WHERE job_id = $1::uuid",
                     )
                     .bind(job)
@@ -1366,8 +1366,8 @@ async fn run_reporter_scenario(
 
                     let exhausted_claim = sqlx::query(
                         "SELECT lease_owner, lease_epoch, claim_nonce::text AS claim_nonce,
-                        EXTRACT(EPOCH FROM claim_started_at)::bigint AS claim_started,
-                        EXTRACT(EPOCH FROM claim_expires_at)::bigint AS claim_expires
+                        FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint AS claim_started,
+                        FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint AS claim_expires
                  FROM job_queue WHERE job_id = $1::uuid",
                     )
                     .bind(job)
@@ -1697,8 +1697,8 @@ async fn run_reporter_scenario(
                     let q = sqlx::query(
                         "SELECT idem_token, stage, lease_owner, lease_epoch,
                                 claim_nonce::text AS claim_nonce,
-                                EXTRACT(EPOCH FROM claim_started_at)::bigint AS started,
-                                EXTRACT(EPOCH FROM claim_expires_at)::bigint AS expires
+                                FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint AS started,
+                                FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint AS expires
                          FROM job_queue WHERE job_id = $1::uuid",
                     )
                     .bind(job)
@@ -1927,8 +1927,8 @@ async fn run_reporter_scenario(
                     .unwrap();
                     let exhausted_claim = sqlx::query(
                         "SELECT lease_owner, lease_epoch, claim_nonce::text AS claim_nonce,
-                        EXTRACT(EPOCH FROM claim_started_at)::bigint AS claim_started,
-                        EXTRACT(EPOCH FROM claim_expires_at)::bigint AS claim_expires
+                        FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint AS claim_started,
+                        FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint AS claim_expires
                  FROM job_queue WHERE job_id = $1::uuid",
                     )
                     .bind(job)

@@ -551,8 +551,8 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
            $7, statement_timestamp() + interval '300 seconds', 'leased', $8, $9::uuid, 'build',
            statement_timestamp(), statement_timestamp() + interval '4800 seconds', 4800
          )
-         RETURNING EXTRACT(EPOCH FROM claim_started_at)::bigint,
-                   EXTRACT(EPOCH FROM claim_expires_at)::bigint",
+         RETURNING FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint,
+                   FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint",
     )
     .bind(&expected.tenant_id)
     .bind(&expected.region)
@@ -585,8 +585,8 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
            $7, statement_timestamp() + interval '300 seconds', 'leased', $8, $9::uuid, 'lint',
            statement_timestamp(), statement_timestamp() + interval '4800 seconds', 4800
          )
-         RETURNING EXTRACT(EPOCH FROM claim_started_at)::bigint,
-                   EXTRACT(EPOCH FROM claim_expires_at)::bigint",
+         RETURNING FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint,
+                   FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint",
     )
     .bind(&expected.tenant_id)
     .bind(&expected.region)
@@ -619,8 +619,8 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
            $7, statement_timestamp() + interval '300 seconds', 'leased', $8, $9::uuid, 'test',
            statement_timestamp(), statement_timestamp() + interval '4800 seconds', 4800
          )
-         RETURNING EXTRACT(EPOCH FROM claim_started_at)::bigint,
-                   EXTRACT(EPOCH FROM claim_expires_at)::bigint",
+         RETURNING FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint,
+                   FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint",
     )
     .bind(&expected.tenant_id)
     .bind(&expected.region)
@@ -1215,8 +1215,8 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
              claim_expires_at = statement_timestamp() + interval '4800 seconds',
              lease_expires = statement_timestamp() + interval '300 seconds'
          WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
-         RETURNING EXTRACT(EPOCH FROM claim_started_at)::bigint,
-                   EXTRACT(EPOCH FROM claim_expires_at)::bigint",
+         RETURNING FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint,
+                   FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint",
     )
     .bind(&expected.tenant_id)
     .bind(&expected.region)

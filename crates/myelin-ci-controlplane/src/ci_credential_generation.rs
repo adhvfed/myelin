@@ -1061,8 +1061,8 @@ WHERE q.tenant_id = $1
   AND q.lease_owner = $5
   AND q.lease_epoch = $6
   AND q.claim_nonce = $7::uuid
-  AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $8
-  AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $9
+  AND FLOOR(EXTRACT(EPOCH FROM q.claim_started_at))::bigint = $8
+  AND FLOOR(EXTRACT(EPOCH FROM q.claim_expires_at))::bigint = $9
   AND q.claim_expires_at > statement_timestamp()
   AND q.lease_expires > statement_timestamp()
   AND q.completion_receipt IS NULL
