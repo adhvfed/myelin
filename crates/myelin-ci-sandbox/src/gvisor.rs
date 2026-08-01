@@ -755,7 +755,18 @@ impl OciConfig {
     /// Build the OCI config from a job + its derived hardening profile (the same profile the
     /// Firecracker backend enforces — backend-independent).
     pub fn from_spec(spec: &JobSpec, profile: &HardeningProfile) -> OciConfig {
+        // CT-007 gate 2: propagate the job's declared (non-secret) environment into `process.env`.
+        // `EnvVar` carries only literal values — secrets are resolved in-boundary from `SecretRef`
+        // and never appear here — so a plain `NAME=VALUE` render is correct; `to_json` JSON-escapes
+        // each entry, so a value can carry no config-injection. The base PATH is emitted first, then
+        // these entries, so a job that re-declares PATH takes effect (last-wins).
+        let extra_env = spec
+            .env
+            .iter()
+            .map(|e| format!("{}={}", e.name, e.value))
+            .collect();
         Self::for_fixed_command(spec.command.clone(), spec.limits.mem_bytes, profile)
+            .with_extra_env(extra_env)
     }
 
     /// CT-007 slice 5b.2: the shared constructor beneath [`Self::from_spec`] for a caller with a
@@ -12842,6 +12853,39 @@ mod tests {
         assert!(!json.contains("\"destination\": \"/workspace\""));
         assert!(json.contains(WIRE_REPO_MOUNT));
         assert!(json.contains(WIRE_QUARANTINE_MOUNT));
+    }
+
+    /// CT-007 gate 2: a job's declared (non-secret) environment must reach `process.env`. Before
+    /// this, `from_spec` dropped `spec.env` entirely, so a real build job's `CARGO_*` / PATH
+    /// extensions never took effect in the sandbox. Secret values are NOT carried in `spec.env`
+    /// (resolved in-boundary from `SecretRef`), so a plain `NAME=VALUE` render is correct.
+    #[test]
+    fn oci_config_propagates_the_jobs_declared_env_into_process_env() {
+        let mut s = spec(vec![]);
+        s.env = vec![
+            crate::EnvVar {
+                name: "CARGO_NET_OFFLINE".into(),
+                value: "true".into(),
+            },
+            crate::EnvVar {
+                name: "CARGO_HOME".into(),
+                value: "/workspace/.cargo".into(),
+            },
+        ];
+        let json = GvisorBackend::oci_config(&s).unwrap().to_json();
+        assert!(
+            json.contains("CARGO_NET_OFFLINE=true"),
+            "declared env dropped: {json}"
+        );
+        assert!(
+            json.contains("CARGO_HOME=/workspace/.cargo"),
+            "declared env dropped: {json}"
+        );
+        // The base PATH is still emitted (declared env is APPENDED after it, not replaced).
+        assert!(
+            json.contains("PATH=/usr/local/sbin"),
+            "base PATH lost: {json}"
+        );
     }
 
     /// Empty host-mount collections are still valid (git-wire's OWN quarantine mount is genuinely
