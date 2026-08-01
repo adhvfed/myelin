@@ -502,13 +502,15 @@ RETURNING q.job_id";
 /// oldest-first tie-break). Bind: `$1 tenant_id`, `$2 region`, `$3 job_id` (uuid), `$4 run_id`
 /// (uuid), `$5 lane`, `$6 labels text[]`, `$7 trust_tier`, `$8 concurrency_group` (nullable),
 /// `$9 fair_key`, `$10 idem_token`, `$11 stage`, `$12 claim_window_secs` (the dispatch-derived
-/// immutable window; a new writer never supplies NULL — NULL is legacy-only). `RETURNING job_id` is
+/// immutable window; a new writer never supplies NULL — NULL is legacy-only), `$13
+/// reservation_write_version` (2 only for a parse-valid V2 reserve handle; NULL for historical V1).
+/// `RETURNING job_id` is
 /// present iff the row was inserted (absent on the idempotent conflict) — so the store reads
 /// INSERTED vs DUPLICATE from the returned-row count.
 pub const INSERT_JOB_QUEUE_QUERY: &str = "\
 INSERT INTO job_queue
-  (tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group, fair_key, idem_token, stage, claim_window_secs, state)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'queued')
+  (tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group, fair_key, idem_token, stage, claim_window_secs, reservation_write_version, state)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'queued')
 ON CONFLICT (tenant_id, idem_token) DO NOTHING
 RETURNING job_id";
 

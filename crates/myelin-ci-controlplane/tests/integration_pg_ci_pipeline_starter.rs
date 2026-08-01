@@ -14,22 +14,27 @@ use myelin_ci_controlplane::{
     ci_artifact_ref, ci_job_id_v2, ci_production_runtime_factory_test_support,
     ci_region_run_discovery_test_support, ci_run_ref, ci_run_starter_factory, CiDriveManifestStore,
     CiExecutionProfileV1, CiExecutionRequestV1, CiJobLaunchClaim, CiJobLaunchGrantV1,
-    CiJobQueueStore, CiJobSpecStore, CiLaunchAuthorityError, CiLaunchAuthorityMaterializer,
+    CiJobQueueStore, CiJobSpecStore, CiJobTokenRequest, CiLaunchAuthorityError,
+    CiLaunchAuthorityMaterializer,
     CiLaunchAuthorityV1, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
-    CiRunSupersessionError, CiWorkflowDefinitionPin, DurableCiJobLaunchTemplate, DurableEnqueue,
-    GrantedCiJobV1, Lane, PgCiPipelineStarter, PgCiRunStarterFactory, PgCiRunStarterPoller,
-    PgCiStarterError, PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
+    CiPrelaunchJournalOutcome, CiPrelaunchUsageJournal, CiRunSupersessionError,
+    CiWorkflowDefinitionPin, DurableCiJobLaunchTemplate, DurableEnqueue, GrantedCiJobV1, Lane,
+    PgCiPipelineStarter, PgCiRunStarterFactory, PgCiRunStarterPoller, PgCiStarterError,
+    PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
     ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL,
     ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL,
     ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
     ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
     ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL,
+    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
     BUMP_CHECK_ATTEMPT_SQL, CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
     CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_ACCOUNTING_DDL,
-    CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL,
-    CREATE_CI_RUN_CHECK_ATTEMPT_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_CI_JOB_DDL, CREATE_CI_JOB_PARENT_ATTEMPT_DDL, CREATE_CI_JOB_PRELAUNCH_USAGE_DDL,
+    CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_CHECK_ATTEMPT_DDL,
+    CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
+    ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL,
 };
 use myelin_ci_sandbox::{
     CompletionClaim, EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpecTemplate,
@@ -552,6 +557,9 @@ fn manifest_dispatch_for_test(
             idem_token,
             stage: job.name.clone(),
             claim_window_secs: claim_window_secs_for_template(&template.spec).unwrap(),
+            reservation_write_version: myelin_ci_controlplane::ReservationWriteVersionMarker::derive_from_reserve_handle(
+                &template.spec.meter_to.reserve_id,
+            ),
         },
         template,
     )
@@ -625,10 +633,11 @@ async fn seed_claimed_manifest_job(
         "INSERT INTO job_queue \
            (tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group, \
             fair_key, idem_token, stage, state, lease_owner, lease_expires, lease_epoch, \
-            claim_nonce, claim_started_at, claim_expires_at) \
+            claim_nonce, claim_started_at, claim_expires_at, reservation_write_version) \
          VALUES ($1, 'fr-par', $2::uuid, $3::uuid, 'interactive', ARRAY['linux'], 'trusted', \
                  $4, $1, $5, $6, $7, 'runner-race', statement_timestamp() + interval '10 minutes', \
-                 1, $2::uuid, statement_timestamp(), statement_timestamp() + interval '5 minutes')",
+                 1, $2::uuid, statement_timestamp(), statement_timestamp() + interval '5 minutes', \
+                 $8)",
     )
     .bind(tenant)
     .bind(&job.job_id)
@@ -637,6 +646,12 @@ async fn seed_claimed_manifest_job(
     .bind(&idem_token)
     .bind(&job.stage)
     .bind(queue_state)
+    .bind(
+        myelin_ci_controlplane::ReservationWriteVersionMarker::derive_from_reserve_handle(
+            &job.reserve_handle,
+        )
+        .value(),
+    )
     .execute(admin)
     .await
     .unwrap();
@@ -654,15 +669,6 @@ async fn seed_claimed_manifest_job(
     .execute(admin)
     .await
     .unwrap();
-    sqlx::query(
-        "UPDATE cost_reservation SET state='inflight' \
-         WHERE tenant_id=$1 AND region='fr-par' AND run_id=$2",
-    )
-    .bind(tenant)
-    .bind(&job.reserve_handle)
-    .execute(admin)
-    .await
-    .unwrap();
     let (started, expires): (i64, i64) = sqlx::query_as(
         "SELECT extract(epoch FROM claim_started_at)::bigint, \
                 extract(epoch FROM claim_expires_at)::bigint \
@@ -673,18 +679,56 @@ async fn seed_claimed_manifest_job(
     .fetch_one(admin)
     .await
     .unwrap();
+    let claim = CiJobLaunchClaim {
+        tenant_id: tenant.into(),
+        region: "fr-par".into(),
+        wf_run_id: wf_run_id.into(),
+        job_id: job.job_id.clone(),
+        lease_owner: "runner-race".into(),
+        lease_epoch: 1,
+        claim_nonce: job.job_id.clone(),
+        claim_started_at_epoch_secs: started,
+        claim_expires_at_epoch_secs: expires,
+    };
+    if myelin_ci_controlplane::ReservationWriteVersionMarker::derive_from_reserve_handle(
+        &job.reserve_handle,
+    )
+    .value()
+        == Some(2)
+    {
+        let journal = CiPrelaunchUsageJournal::new(admin.clone(), "fr-par").unwrap();
+        let token_request = CiJobTokenRequest {
+            tenant_id: claim.tenant_id.clone(),
+            region: claim.region.clone(),
+            wf_run_id: claim.wf_run_id.clone(),
+            ci_run_id: ci_run_id.into(),
+            job_id: claim.job_id.clone(),
+            token_authority_handle: job.token_authority_handle.clone(),
+            idem_token: idem_token.clone(),
+            lease_owner: claim.lease_owner.clone(),
+            lease_epoch: claim.lease_epoch,
+            claim_nonce: claim.claim_nonce.clone(),
+            claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
+            claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
+        };
+        let (_, outcome) = journal
+            .begin_parent_attempt(&token_request, &job.reserve_handle)
+            .await
+            .unwrap();
+        assert_eq!(outcome, CiPrelaunchJournalOutcome::Applied);
+    } else {
+        sqlx::query(
+            "UPDATE cost_reservation SET state='inflight' \
+             WHERE tenant_id=$1 AND region='fr-par' AND run_id=$2",
+        )
+        .bind(tenant)
+        .bind(&job.reserve_handle)
+        .execute(admin)
+        .await
+        .unwrap();
+    }
     SeededLaunch {
-        claim: CiJobLaunchClaim {
-            tenant_id: tenant.into(),
-            region: "fr-par".into(),
-            wf_run_id: wf_run_id.into(),
-            job_id: job.job_id.clone(),
-            lease_owner: "runner-race".into(),
-            lease_epoch: 1,
-            claim_nonce: job.job_id.clone(),
-            claim_started_at_epoch_secs: started,
-            claim_expires_at_epoch_secs: expires,
-        },
+        claim,
         idem_token,
         reserve_handle: job.reserve_handle.clone(),
     }
@@ -1161,6 +1205,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
         ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
         ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL,
+        ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL,
     ] {
         admin
             .execute(ddl)
@@ -1175,6 +1220,18 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .execute(ALTER_CI_JOB_SPEC_ADD_STAGE_DDL)
         .await
         .expect("ci_job_spec stage migration");
+    sqlx::raw_sql(CREATE_CI_JOB_PARENT_ATTEMPT_DDL)
+        .execute(&admin)
+        .await
+        .expect("ci_job_parent_attempt DDL");
+    sqlx::raw_sql(CREATE_CI_JOB_PRELAUNCH_USAGE_DDL)
+        .execute(&admin)
+        .await
+        .expect("ci_job_prelaunch_usage DDL");
+    admin
+        .execute(ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL)
+        .await
+        .expect("ci_job_prelaunch_usage seal-deadline migration");
     admin
         .execute(CREATE_CI_COST_EVENT_DDL)
         .await
@@ -1230,6 +1287,8 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     for table in [
         "job_queue",
         "ci_job_spec",
+        "ci_job_parent_attempt",
+        "ci_job_prelaunch_usage",
         "ci_cost_event",
         "ci_job_accounting",
     ] {
@@ -1250,6 +1309,10 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .execute("REVOKE UPDATE, DELETE ON ci_drive_manifest FROM myelin_app")
         .await
         .expect("manifest remains insert-only after broad test setup grant");
+    admin
+        .execute("REVOKE UPDATE, DELETE ON ci_job_parent_attempt FROM myelin_app")
+        .await
+        .expect("parent-attempt journal remains immutable after broad test setup grant");
     let app = pool_on(&app_url(), &schema).await;
     let blobs = Arc::new(FsBlobStore::new());
     let mut ledger_config = MyelinConfig::dev();
@@ -1505,6 +1568,45 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await
     .unwrap();
     assert_eq!(committed_reservations, 3);
+    let committed_handles: Vec<String> = sqlx::query_scalar(
+        "SELECT run_id FROM cost_reservation WHERE tenant_id=$1 ORDER BY run_id",
+    )
+    .bind(reservation_tenant)
+    .fetch_all(&admin)
+    .await
+    .unwrap();
+    assert!(
+        committed_handles.iter().all(|handle| {
+            myelin_ci_controlplane::ReservationWriteVersionMarker::derive_from_reserve_handle(
+                handle,
+            )
+            .value()
+                == Some(2)
+        }),
+        "every production reservation handle must parse as V2: {committed_handles:?}"
+    );
+    let manifest_store = CiDriveManifestStore::new(
+        admin.clone(),
+        TenantId(reservation_tenant.into()),
+        Region("fr-par".into()),
+    )
+    .unwrap();
+    let (manifest, _) = manifest_store
+        .load_by_identity(reservation_wf, reservation_run)
+        .await
+        .unwrap()
+        .expect("the production starter commits its immutable manifest");
+    let mut manifest_handles = manifest
+        .jobs
+        .iter()
+        .map(|job| job.reserve_handle.clone())
+        .collect::<Vec<_>>();
+    manifest_handles.sort();
+    assert_eq!(
+        manifest_handles, committed_handles,
+        "the production starter must carry every parse-valid V2 reservation into its manifest; \
+         marker=2 is asserted when those manifest jobs are actually dispatched"
+    );
 
     // Producer generations, not arrival time, own PR supersession. Starting generation 2
     // co-commits its own workflow/reservations with cancellation of the already-running generation
@@ -1587,7 +1689,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
            (SELECT count(*) FROM ci_cost_event \
              WHERE tenant_id=$1 AND run_id=$2::uuid), \
            (SELECT count(*) FROM cost_reservation \
-             WHERE tenant_id=$1 AND run_id LIKE ('ci-reserve:v1:' || $2 || ':%') \
+             WHERE tenant_id=$1 AND run_id LIKE ('ci-reserve:v2:' || $2 || ':%') \
                AND state='settled'), \
            (SELECT count(*) FROM workflow_run \
              WHERE tenant_id=$1 AND run_id=$3 AND state IN ('running','waiting'))",
@@ -2046,7 +2148,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         "SELECT old.state, w.state, new.state, \
            (SELECT count(*) FROM workflow_run WHERE run_id=$4), \
            (SELECT count(*) FROM cost_reservation \
-             WHERE run_id LIKE ('ci-reserve:v1:' || $3::text || ':%')) \
+             WHERE run_id LIKE ('ci-reserve:v2:' || $3::text || ':%')) \
          FROM ci_run old \
          JOIN workflow_run w ON w.tenant_id=old.tenant_id AND w.run_id=old.wf_run_id::text \
          JOIN ci_run new ON new.tenant_id=old.tenant_id \
@@ -2160,7 +2262,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
              WHERE c.tenant_id=r.tenant_id AND c.run_id=r.run_id), \
            (SELECT count(*) FROM cost_reservation c \
              WHERE c.tenant_id=r.tenant_id \
-               AND c.run_id LIKE ('ci-reserve:v1:' || r.run_id::text || ':%') \
+               AND c.run_id LIKE ('ci-reserve:v2:' || r.run_id::text || ':%') \
                AND c.state='settled') \
          FROM ci_run r JOIN job_queue q \
            ON q.tenant_id=r.tenant_id AND q.run_id=r.wf_run_id \
@@ -2308,7 +2410,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
            (SELECT count(*) FROM ci_drive_manifest WHERE ci_run_id=$3::uuid), \
            (SELECT count(*) FROM workflow_run WHERE run_id=$4), \
            (SELECT count(*) FROM cost_reservation \
-             WHERE run_id LIKE ('ci-reserve:v1:' || $3::text || ':%')) \
+             WHERE run_id LIKE ('ci-reserve:v2:' || $3::text || ':%')) \
          FROM ci_run old JOIN ci_run new ON new.tenant_id=old.tenant_id \
          WHERE old.tenant_id=$1 AND old.run_id=$2::uuid AND new.run_id=$3::uuid",
     )
@@ -2528,7 +2630,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
              WHERE a.tenant_id=r.tenant_id AND a.ci_run_id=r.run_id), \
            (SELECT count(*) FROM cost_reservation c \
              WHERE c.tenant_id=r.tenant_id \
-               AND c.run_id LIKE ('ci-reserve:v1:' || r.run_id::text || ':%') \
+               AND c.run_id LIKE ('ci-reserve:v2:' || r.run_id::text || ':%') \
                AND c.state='inflight') \
          FROM ci_run r JOIN job_queue q \
            ON q.tenant_id=r.tenant_id AND q.run_id=r.wf_run_id \
@@ -3703,6 +3805,7 @@ async fn a_v2_reservation_prevents_stale_queued_cancellation() {
             ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
             ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
             ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL,
+            ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL,
         ] {
             admin
                 .execute(ddl)

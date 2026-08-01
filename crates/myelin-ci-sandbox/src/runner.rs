@@ -925,6 +925,23 @@ pub struct RunOutcome {
     pub claim_nonce: String,
 }
 
+/// The result of one typed runner cycle. Workload completion retains the established terminal
+/// outcome; checkout preparation owns its own terminal/requeue reporting and never fabricates a
+/// workload result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunnerCycleOutcome {
+    Workload(RunOutcome),
+    PreparationTerminal {
+        job_id: String,
+        run_id: String,
+        signal_outcome: SignalOutcome,
+    },
+    PreparationRetryable {
+        job_id: String,
+        report: PreparationRetryReport,
+    },
+}
+
 /// **CT-007 slice 5b.3-6d STEP 4: what [`RunnerAgent::report_preparation_outcome`] delivered.** A
 /// checkout continuation surfaces a [`CheckoutContinuationOutcome`](crate::checkout_orchestration::CheckoutContinuationOutcome);
 /// only the two preparation variants are a preparation report. The non-preparation variants
@@ -983,6 +1000,11 @@ pub enum RunnerError {
         hooks: CompletionSettlementOwner,
         reporter: CompletionSettlementOwner,
     },
+    /// A preparation outcome could not be routed authoritatively. The lane must stop; reclaiming
+    /// more work could race a still-owned checkout attempt.
+    PreparationRoutingFailed { job_id: String, message: String },
+    /// The backend proved that durable/manual reconciliation is required. The lane must stop.
+    ReconciliationRequired { job_id: String, message: String },
 }
 
 impl std::fmt::Display for RunnerError {
@@ -1004,6 +1026,14 @@ impl std::fmt::Display for RunnerError {
             RunnerError::SettlementOwnerMismatch { hooks, reporter } => write!(
                 f,
                 "terminal settlement owner mismatch: hooks={hooks:?}, reporter={reporter:?}"
+            ),
+            RunnerError::PreparationRoutingFailed { job_id, message } => write!(
+                f,
+                "checkout preparation routing failed for job {job_id}: {message}"
+            ),
+            RunnerError::ReconciliationRequired { job_id, message } => write!(
+                f,
+                "checkout reconciliation required for job {job_id}: {message}"
             ),
         }
     }
@@ -1091,36 +1121,32 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
         &self.worker_id
     }
 
-    /// **CT-007 slice 5b.3-6d STEP 4: dispatch a checkout PREPARATION outcome to the terminal reporter
-    /// (DORMANT).** The dormant checkout continuation produces a
-    /// [`CheckoutContinuationOutcome`](crate::checkout_orchestration::CheckoutContinuationOutcome); its
+    /// **CT-007 slice 5b.3-6e.2: dispatch a checkout PREPARATION outcome to the terminal reporter.**
+    /// The typed sandbox cycle produces a [`SandboxCycleOutcome`](crate::SandboxCycleOutcome); its
     /// two preparation variants carry the [`PreparationReportClaim`] this echoes through the reporter's
     /// required preparation methods — a terminal or a requeue. The three non-preparation variants have
     /// other owners (the workload finalizer / the reaper-reconciliation path), so they deliver nothing
     /// here. The match is exhaustive: a future outcome variant will not compile until it is classified.
     ///
-    /// This has NO production caller until 5b.3-6e selects the checkout path; a compute cycle
-    /// ([`Self::run_one`]) never produces a checkout preparation outcome, so this method is never
-    /// reached in production.
     pub fn report_preparation_outcome(
         &self,
-        outcome: &crate::checkout_orchestration::CheckoutContinuationOutcome,
+        outcome: &crate::SandboxCycleOutcome,
     ) -> Result<PreparationOutcomeDispatch, ExecutorError> {
-        use crate::checkout_orchestration::CheckoutContinuationOutcome;
+        use crate::SandboxCycleOutcome;
         match outcome {
-            CheckoutContinuationOutcome::PreparationTerminal { claim, disposition } => Ok(
+            SandboxCycleOutcome::PreparationTerminal { claim, disposition } => Ok(
                 PreparationOutcomeDispatch::Terminalized(
                     self.reporter.report_preparation_terminal(claim, *disposition)?,
                 ),
             ),
-            CheckoutContinuationOutcome::PreparationRetryable { claim, .. } => Ok(
+            SandboxCycleOutcome::PreparationRetryable { claim, .. } => Ok(
                 PreparationOutcomeDispatch::Retried(
                     self.reporter.report_preparation_retry(claim)?,
                 ),
             ),
-            CheckoutContinuationOutcome::WorkloadLaunched(_)
-            | CheckoutContinuationOutcome::WorkloadRetryable { .. }
-            | CheckoutContinuationOutcome::ReconciliationRequired { .. } => {
+            SandboxCycleOutcome::WorkloadLaunched(_)
+            | SandboxCycleOutcome::WorkloadRetryable { .. }
+            | SandboxCycleOutcome::ReconciliationRequired { .. } => {
                 Ok(PreparationOutcomeDispatch::NotAPreparationReport)
             }
         }
@@ -1157,6 +1183,21 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
     /// (RESHAPE-001 / CT-001): the runner derives it from the [`SandboxResult`](crate::SandboxResult)
     /// the seam now carries back.
     pub fn run_one(&self, now: i64) -> Result<RunOutcome, RunnerError> {
+        match self.run_one_cycle(now)? {
+            RunnerCycleOutcome::Workload(outcome) => Ok(outcome),
+            RunnerCycleOutcome::PreparationTerminal { job_id, .. }
+            | RunnerCycleOutcome::PreparationRetryable { job_id, .. } => {
+                Err(RunnerError::PreparationRoutingFailed {
+                    job_id,
+                    message: "typed preparation outcome requires the runner-cycle caller".into(),
+                })
+            }
+        }
+    }
+
+    /// Stage-B typed claim cycle. This is the production runner edge: all backends flow through
+    /// `run_cycle`, and preparation outcomes are routed without entering workload completion.
+    pub fn run_one_cycle(&self, now: i64) -> Result<RunnerCycleOutcome, RunnerError> {
         let hook_owner = self.hooks.completion_settlement_owner();
         let reporter_owner = self.reporter.completion_settlement_owner();
         if hook_owner != reporter_owner {
@@ -1234,7 +1275,7 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
             let hooks = &self.hooks;
             let spec = &job.spec;
             let launch_thread = scope
-                .spawn(move || backend.launch_streaming(spec, hooks, output, backend_cancellation));
+                .spawn(move || backend.run_cycle(spec, hooks, output, backend_cancellation));
             let consumed = (|| -> Result<(), String> {
                 while let Ok(frame) = rx.recv() {
                     self.firehose.ship_frame(
@@ -1256,9 +1297,9 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                 RunnerError::LaunchFailed("sandbox launch thread panicked".to_string())
             })?;
             match (launch, consumed) {
-                (Ok(launch), Ok(())) => Ok((launch, None)),
-                (Ok(launch), Err(error)) => {
-                    Ok((launch, Some(format!("durable log stream failed: {error}"))))
+                (Ok(outcome), Ok(())) => Ok((outcome, None)),
+                (Ok(outcome), Err(error)) => {
+                    Ok((outcome, Some(format!("durable log stream failed: {error}"))))
                 }
                 // `launch_streaming` itself failed — no `SandboxLaunch`/handle was ever produced.
                 // Dispatch on the EXACT durable-claim phase the backend proved (Sol's design,
@@ -1302,7 +1343,72 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                 },
             }
         })?;
-        let (launch, stream_failure) = launch_result;
+        let (cycle_outcome, stream_failure) = launch_result;
+        let launch = match cycle_outcome {
+            crate::SandboxCycleOutcome::WorkloadRetryable {
+                cause,
+                usage,
+                message,
+            } => {
+                self.reporter
+                    .report_retryable_attempt(
+                        &claim,
+                        &RetryableAttemptFailure { cause, usage },
+                    )
+                    .map_err(RunnerError::ReportFailed)?;
+                return Err(RunnerError::RetryableAttemptRecorded {
+                    job_id: job.job_id,
+                    message,
+                });
+            }
+            outcome @ crate::SandboxCycleOutcome::PreparationTerminal { .. } => {
+                if let Some(error) = stream_failure {
+                    return self.retry_preparation_after_log_failure(&job, &outcome, error);
+                }
+                if let Err(error) =
+                    self.firehose
+                        .finish(&job.run_id, &job.job_id, &job.tenant, false)
+                {
+                    return self.retry_preparation_after_log_failure(
+                        &job,
+                        &outcome,
+                        format!("durable log finish failed: {error}"),
+                    );
+                }
+                return match self
+                    .report_preparation_outcome(&outcome)
+                    .map_err(RunnerError::ReportFailed)?
+                {
+                    PreparationOutcomeDispatch::Terminalized(signal_outcome) => {
+                        Ok(RunnerCycleOutcome::PreparationTerminal {
+                            job_id: job.job_id,
+                            run_id: job.run_id,
+                            signal_outcome,
+                        })
+                    }
+                    _ => unreachable!("a preparation-terminal outcome has one reporter route"),
+                };
+            }
+            outcome @ crate::SandboxCycleOutcome::PreparationRetryable { .. } => {
+                return self.finish_preparation_retry(&job, &outcome);
+            }
+            crate::SandboxCycleOutcome::ReconciliationRequired {
+                phase,
+                teardown_unproven,
+                usage_unrepresentable,
+                quarantine_required,
+            } => {
+                return Err(RunnerError::ReconciliationRequired {
+                    job_id: job.job_id,
+                    message: format!(
+                        "phase={phase:?}, teardown_unproven={teardown_unproven}, \
+                         usage_unrepresentable={usage_unrepresentable}, \
+                         quarantine_required={quarantine_required}"
+                    ),
+                });
+            }
+            crate::SandboxCycleOutcome::WorkloadLaunched(launch) => launch,
+        };
         let SandboxLaunch {
             handle,
             result,
@@ -1390,14 +1496,70 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
         // — is what makes the wake exactly-once, so a re-delivered report is still a harmless no-op.
         self.leases.settle(&job.tenant, &job.job_id);
 
-        Ok(RunOutcome {
+        Ok(RunnerCycleOutcome::Workload(RunOutcome {
             job_id: job.job_id,
             run_id: job.run_id,
             report,
             signal_outcome: outcome,
             lease_epoch: job.lease_epoch,
             claim_nonce: job.claim_nonce,
-        })
+        }))
+    }
+
+    fn retry_preparation_after_log_failure(
+        &self,
+        job: &QueuedJob,
+        terminal_outcome: &crate::SandboxCycleOutcome,
+        message: String,
+    ) -> Result<RunnerCycleOutcome, RunnerError> {
+        let claim = match terminal_outcome {
+            crate::SandboxCycleOutcome::PreparationTerminal { claim, .. } => claim,
+            _ => unreachable!("only a preparation terminal can fail its terminal log flush"),
+        };
+        match self.reporter.report_preparation_retry(claim) {
+            Ok(PreparationRetryReport::Requeued) => {
+                Ok(RunnerCycleOutcome::PreparationRetryable {
+                    job_id: job.job_id.clone(),
+                    report: PreparationRetryReport::Requeued,
+                })
+            }
+            Ok(PreparationRetryReport::NoOp) => Err(RunnerError::PreparationRoutingFailed {
+                job_id: job.job_id.clone(),
+                message: format!(
+                    "{message}; preparation retry CAS returned no-op and requires reconciliation"
+                ),
+            }),
+            Err(error) => Err(RunnerError::PreparationRoutingFailed {
+                    job_id: job.job_id.clone(),
+                    message: format!("{message}; retry report failed: {error}"),
+            }),
+        }
+    }
+
+    fn finish_preparation_retry(
+        &self,
+        job: &QueuedJob,
+        outcome: &crate::SandboxCycleOutcome,
+    ) -> Result<RunnerCycleOutcome, RunnerError> {
+        match self
+            .report_preparation_outcome(outcome)
+            .map_err(RunnerError::ReportFailed)?
+        {
+            PreparationOutcomeDispatch::Retried(PreparationRetryReport::Requeued) => {
+                Ok(RunnerCycleOutcome::PreparationRetryable {
+                    job_id: job.job_id.clone(),
+                    report: PreparationRetryReport::Requeued,
+                })
+            }
+            PreparationOutcomeDispatch::Retried(PreparationRetryReport::NoOp) => {
+                Err(RunnerError::PreparationRoutingFailed {
+                    job_id: job.job_id.clone(),
+                    message: "preparation retry CAS returned no-op; claim state requires reconciliation"
+                        .into(),
+                })
+            }
+            _ => unreachable!("a preparation-retry outcome has one reporter route"),
+        }
     }
 
     /// **Report the SAME terminal `job.done` AGAIN (the at-least-once re-delivery, §OQ-F).** A runner
@@ -1556,6 +1718,94 @@ mod tests {
             })()
             .map_err(SandboxLaunchError::Failed)
         }
+        fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CycleMode {
+        Workload,
+        PreparationTerminal,
+        PreparationRetryable,
+    }
+
+    /// Stage-B edge double: ordinary launch is a hard panic, so a green cycle proves the agent used
+    /// the typed `run_cycle` edge. The returned variants let the same edge prove reporter ownership.
+    struct CycleOnlyBackend {
+        mode: CycleMode,
+        cycle_calls: AtomicUsize,
+        kills: AtomicUsize,
+    }
+
+    impl CycleOnlyBackend {
+        fn new(mode: CycleMode) -> Self {
+            Self {
+                mode,
+                cycle_calls: AtomicUsize::new(0),
+                kills: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SandboxBackend for CycleOnlyBackend {
+        type Error = HookError;
+
+        fn launch(
+            &self,
+            _spec: &JobSpec,
+            _hooks: &RunnerHooks,
+        ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+            panic!("Stage-B RunnerAgent must never call launch; it must call run_cycle")
+        }
+
+        fn launch_streaming(
+            &self,
+            _spec: &JobSpec,
+            _hooks: &RunnerHooks,
+            _output: Arc<dyn SandboxOutputSink>,
+            _cancellation: SandboxCancellation,
+        ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+            panic!("Stage-B RunnerAgent must never call launch_streaming; it must call run_cycle")
+        }
+
+        fn run_cycle(
+            &self,
+            spec: &JobSpec,
+            _hooks: &RunnerHooks,
+            _output: Arc<dyn SandboxOutputSink>,
+            _cancellation: SandboxCancellation,
+        ) -> Result<crate::SandboxCycleOutcome, SandboxLaunchError<Self::Error>> {
+            self.cycle_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(match self.mode {
+                CycleMode::Workload => crate::SandboxCycleOutcome::WorkloadLaunched(SandboxLaunch {
+                    handle: SandboxHandle {
+                        guest_id: format!("cycle-{}", spec.idem_token.0),
+                    },
+                    result: SandboxResult::stub_ok(ResourceUsage {
+                        cpu_seconds: 2,
+                        mem_byte_seconds: 3,
+                    }),
+                    output_complete: true,
+                }),
+                CycleMode::PreparationTerminal => {
+                    crate::SandboxCycleOutcome::PreparationTerminal {
+                        claim: prep_report_claim(),
+                        disposition: PreparationTerminalDisposition::Failed {
+                            phase: PreparationPhase::CheckoutMaterialization,
+                        },
+                    }
+                }
+                CycleMode::PreparationRetryable => {
+                    crate::SandboxCycleOutcome::PreparationRetryable {
+                        claim: prep_report_claim(),
+                        phase: PreparationPhase::CheckoutMaterialization,
+                    }
+                }
+            })
+        }
+
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
             self.kills.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -1942,13 +2192,101 @@ mod tests {
         }
     }
 
+    fn cycle_agent<'a>(
+        leases: JobLeaseStore,
+        backend: &'a CycleOnlyBackend,
+        firehose: &'a CountingFirehose,
+        reporter: &'a RecordingTerminalReporter,
+    ) -> RunnerAgent<'a, CycleOnlyBackend, CountingFirehose, RecordingTerminalReporter> {
+        RunnerAgent::new(
+            "worker-1",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            leases,
+            backend,
+            firehose,
+            reporter,
+            hooks_with_owner(CompletionSettlementOwner::TerminalReporter, Arc::new(Mutex::new(Vec::new()))),
+        )
+    }
+
+    #[test]
+    fn stage_b_runner_edge_calls_run_cycle_and_never_launch_streaming() {
+        let leases = JobLeaseStore::new();
+        leases.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-1",
+            "job-1",
+            vec!["linux".into()],
+            ci_spec("cycle-edge"),
+        ));
+        let backend = CycleOnlyBackend::new(CycleMode::Workload);
+        let firehose = CountingFirehose::new();
+        let reporter = RecordingTerminalReporter::reporter_owned(
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+        );
+        let agent = cycle_agent(leases.clone(), &backend, &firehose, &reporter);
+
+        let outcome = agent.run_one_cycle(1_000).expect("typed workload cycle succeeds");
+        assert!(matches!(outcome, RunnerCycleOutcome::Workload(_)));
+        assert_eq!(backend.cycle_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.kills.load(Ordering::SeqCst), 1);
+        assert_eq!(reporter.reports.load(Ordering::SeqCst), 1);
+        assert!(leases.get(&tenant(), "job-1").is_none(), "workload completion settles the lease");
+    }
+
+    #[test]
+    fn stage_b_runner_routes_each_preparation_outcome_once_without_workload_completion() {
+        for (mode, terminal) in [
+            (CycleMode::PreparationTerminal, true),
+            (CycleMode::PreparationRetryable, false),
+        ] {
+            let leases = JobLeaseStore::new();
+            leases.enqueue(QueuedJob::new(
+                tenant(),
+                region(),
+                "run-1",
+                "job-1",
+                vec!["linux".into()],
+                ci_spec("prep-edge"),
+            ));
+            let backend = CycleOnlyBackend::new(mode);
+            let firehose = CountingFirehose::new();
+            let reporter = RecordingTerminalReporter::reporter_owned(
+                Arc::new(Mutex::new(Vec::new())),
+                false,
+            );
+            let agent = cycle_agent(leases.clone(), &backend, &firehose, &reporter);
+
+            let outcome = agent.run_one_cycle(1_000).expect("preparation route succeeds");
+            if terminal {
+                assert!(matches!(outcome, RunnerCycleOutcome::PreparationTerminal { .. }));
+                assert_eq!(reporter.prep_terminals.lock().unwrap().len(), 1);
+                assert_eq!(reporter.prep_retries.lock().unwrap().len(), 0);
+            } else {
+                assert!(matches!(outcome, RunnerCycleOutcome::PreparationRetryable { .. }));
+                assert_eq!(reporter.prep_terminals.lock().unwrap().len(), 0);
+                assert_eq!(reporter.prep_retries.lock().unwrap().len(), 1);
+            }
+            assert_eq!(backend.cycle_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.kills.load(Ordering::SeqCst), 0, "no workload handle existed");
+            assert_eq!(reporter.reports.load(Ordering::SeqCst), 0, "no job.done workload report");
+            assert_eq!(reporter.retry_reports.load(Ordering::SeqCst), 0, "no workload retry report");
+            assert!(leases.get(&tenant(), "job-1").is_some(), "preparation reporter owns queue settlement/requeue");
+        }
+    }
+
     /// **CT-007 5b.3-6d STEP 4 (DORMANT).** `report_preparation_outcome` dispatches the two preparation
     /// variants to the reporter's REQUIRED preparation methods — carrying the outcome's exact claim —
     /// and classifies every non-preparation variant as delivering nothing. Proven with the recording
     /// reporter directly (no claim/launch: this path is never reached by `run_one`).
     #[test]
     fn report_preparation_outcome_dispatches_terminal_retry_and_ignores_non_preparation() {
-        use crate::checkout_orchestration::CheckoutContinuationOutcome;
+        use crate::SandboxCycleOutcome;
         let backend = RecordingBackend::default();
         let firehose = CountingFirehose::new();
         let reporter =
@@ -1972,7 +2310,7 @@ mod tests {
             phase: PreparationPhase::CheckoutTransport,
         };
         let dispatched = agent
-            .report_preparation_outcome(&CheckoutContinuationOutcome::PreparationTerminal {
+            .report_preparation_outcome(&SandboxCycleOutcome::PreparationTerminal {
                 claim: claim.clone(),
                 disposition,
             })
@@ -1990,7 +2328,7 @@ mod tests {
 
         // PreparationRetryable → report_preparation_retry(claim).
         let dispatched = agent
-            .report_preparation_outcome(&CheckoutContinuationOutcome::PreparationRetryable {
+            .report_preparation_outcome(&SandboxCycleOutcome::PreparationRetryable {
                 claim: claim.clone(),
                 phase: PreparationPhase::CheckoutMaterialization,
             })
@@ -2003,7 +2341,7 @@ mod tests {
 
         // A non-preparation outcome delivers nothing and records nothing new.
         let dispatched = agent
-            .report_preparation_outcome(&CheckoutContinuationOutcome::WorkloadRetryable {
+            .report_preparation_outcome(&SandboxCycleOutcome::WorkloadRetryable {
                 cause: RetryableAttemptCause::SandboxInfrastructure,
                 usage: ResourceUsage {
                     cpu_seconds: 0,

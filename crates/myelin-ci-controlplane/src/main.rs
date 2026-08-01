@@ -309,6 +309,35 @@ fn prepare_runner_host() -> Result<myelin_ci_sandbox::gvisor::GvisorWorkspaceCon
     )
 }
 
+/// Stage-B Hop-A repository-root contract. There is deliberately no fallback: production runner
+/// activation requires an explicit absolute, existing, canonical directory.
+const ENV_CI_CHECKOUT_REPO_ROOT: &str = "MYELIN_CI_CHECKOUT_REPO_ROOT";
+
+fn prepare_checkout_config_given(
+    value: Result<String, std::env::VarError>,
+) -> Result<myelin_ci_sandbox::gvisor::GvisorCheckoutConfig, StartupRefusal> {
+    let value = match value {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) | Err(std::env::VarError::NotPresent) => {
+            return Err(StartupRefusal::RunnerHostPreflight(format!(
+                "{ENV_CI_CHECKOUT_REPO_ROOT} is required when MYELIN_CI_RUNNER=1; there is no default"
+            )))
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(StartupRefusal::RunnerHostPreflight(format!(
+                "{ENV_CI_CHECKOUT_REPO_ROOT} must be valid Unicode"
+            )))
+        }
+    };
+    myelin_ci_sandbox::gvisor::GvisorCheckoutConfig::enabled(value)
+        .map_err(|error| StartupRefusal::RunnerHostPreflight(error.to_string()))
+}
+
+fn prepare_checkout_config(
+) -> Result<myelin_ci_sandbox::gvisor::GvisorCheckoutConfig, StartupRefusal> {
+    prepare_checkout_config_given(std::env::var(ENV_CI_CHECKOUT_REPO_ROOT))
+}
+
 #[tokio::main]
 async fn main() {
     myelin_events::install_payload_free_panic_hook("ci-controlplane");
@@ -347,6 +376,17 @@ async fn main() {
     // second environment read (which could observe a different snapshot than what was preflighted).
     let gvisor_workspace_config = if runner_host_requested {
         match prepare_runner_host() {
+            Ok(config) => Some(config),
+            Err(error) => {
+                eprintln!("ci-controlplane: startup refused: {error}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let gvisor_checkout_config = if runner_host_requested {
+        match prepare_checkout_config() {
             Ok(config) => Some(config),
             Err(error) => {
                 eprintln!("ci-controlplane: startup refused: {error}");
@@ -624,17 +664,18 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        let runner_resolver = myelin_ci_controlplane::durable_spec_resolver(
-            myelin_ci_controlplane::ci_job_spec_store(provider.db_pool().clone()),
-            provider.config().region.clone(),
-            tokio::runtime::Handle::current(),
-            runner_identity.token_issuer().clone(),
-        );
-        let runner_hooks = myelin_ci_controlplane::ci_runner_hooks(
+        let runner_wiring = match myelin_ci_controlplane::ci_runner_v2_wiring(
             provider.clone(),
-            runner_identity.launch_authorizer(),
+            &runner_identity,
             tokio::runtime::Handle::current(),
-        );
+        ) {
+            Ok(wiring) => wiring,
+            Err(error) => {
+                eprintln!("ci-controlplane: V2 runner composition refused: {error}");
+                std::process::exit(1);
+            }
+        };
+        let (runner_resolver, runner_hooks) = runner_wiring.into_parts();
         let runner = myelin_ci_controlplane::CiRunnerLoop::new(
             format!("ci-runner-{}", std::process::id()),
             myelin_ci_controlplane::LINUX_SMALL_V1_RUNNER_LABELS
@@ -654,6 +695,8 @@ async fn main() {
             provider.config().s3.clone(),
             gvisor_workspace_config
                 .expect("gvisor_workspace_config is Some whenever runner_host_requested is true"),
+            gvisor_checkout_config
+                .expect("gvisor_checkout_config is Some whenever runner_host_requested is true"),
         );
         // THE DEFINITION CUTOVER FENCE (CT-007 lease/topology reconciliation) — the LAST boot gate,
         // deliberately after every fallible composition above. It is a single transaction that locks
@@ -811,7 +854,7 @@ impl ShutdownSignals {
 
 #[cfg(test)]
 mod tests {
-    use super::{verify_startup_activation, StartupRefusal};
+    use super::{prepare_checkout_config_given, verify_startup_activation, StartupRefusal};
     use std::env::VarError;
     use std::ffi::OsString;
 
@@ -849,6 +892,27 @@ mod tests {
             ),
             "an invalid setting neither requests the runner host nor boots"
         );
+    }
+
+    #[test]
+    fn checkout_repository_root_is_required_and_boot_validated_without_a_fallback() {
+        let missing = prepare_checkout_config_given(Err(VarError::NotPresent))
+            .expect_err("runner activation has no implicit checkout repository root");
+        assert!(missing.to_string().contains("there is no default"));
+
+        let root = std::env::temp_dir().join(format!(
+            "myelin-checkout-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let _config = prepare_checkout_config_given(Ok(root.to_string_lossy().into_owned()))
+            .expect("an explicit canonical directory is accepted");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

@@ -320,10 +320,14 @@ pub const CI_JOB_QUEUE_ACTIVATION_READINESS_INDEX_MIGRATION_ID: &str =
 /// EXACTLY (born fence-owned, `SECURITY DEFINER`, `row_security=off`, column-scoped to
 /// `job_queue(region, state, claim_window_secs, reservation_write_version)`, `REVOKE PUBLIC`, `GRANT
 /// EXECUTE` to `myelin_app`). Returns only an unsafe-row COUNT — never a row, tenant, or payload — so
-/// it cannot become a cross-region exfiltration path. DORMANT: no production cutover selects it until
-/// 6e.2.
+/// it cannot become a cross-region exfiltration path. The production v3→v4 cutover selects it.
 pub const CI_V2_ACTIVATION_READINESS_PROBE_MIGRATION_ID: &str =
     "ci_0022c_ci_v2_activation_readiness_probe";
+/// CT-007 6e.2 Stage B: seed the v3 predecessor row the production v3→v4 fence locks. On an existing
+/// database this is a no-op; on a fresh database the retired sentinel makes v3 permanently
+/// inadmissible while still providing the row-level serialization anchor.
+pub const CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
+    "ci_0022d_ci_pipeline_v3_cutover_fence_row";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -1475,6 +1479,19 @@ INSERT INTO wf_definition (wf_type, version, code_hash, status)
 VALUES ('ci.pipeline', 2, 'sentinel:ci-pipeline-v2-never-deployed-on-this-database', 'retired')
 ON CONFLICT (wf_type, version) DO NOTHING";
 
+/// The v3 predecessor sentinel for the atomic v3→v4 activation. This must land only with the v4
+/// binary: seeding it while v3 is still the current definition would make a fresh database refuse
+/// that binary's own registration.
+pub const SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL: &str = "\
+INSERT INTO wf_definition (wf_type, version, code_hash, status)
+VALUES (
+  'ci.pipeline',
+  3,
+  'sentinel:ci-pipeline-v3-never-deployed-on-this-database',
+  'retired'
+)
+ON CONFLICT (wf_type, version) DO NOTHING";
+
 /// **CT-007 slice 5b.3-6e.1 (DORMANT). The operational-reservation write-version marker.** Nullable
 /// so an already-populated hot queue takes no rewrite: legacy/V3 writers leave it `NULL`, the eventual
 /// V2 writer stores exactly `2`. The CHECK is added `NOT VALID` here and validated by `ci_0022a`, the
@@ -2304,6 +2321,10 @@ pub fn ci_controlplane_migrations() -> Migrations {
         CI_V2_ACTIVATION_READINESS_PROBE_MIGRATION_ID,
         CREATE_CI_V2_ACTIVATION_READINESS_PROBE_DDL,
     ));
+    migrations.push(Migration::plain(
+        CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID,
+        SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL,
+    ));
     Migrations::of(migrations)
 }
 
@@ -2955,17 +2976,17 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the claim-window validation is in the set");
         // The claim-window pair sits immediately before the wf_version grant, the backlog probe, the
         // cutover fence-row seed, and the CT-007 5b.3-6e.1 activation-chassis tail (4 migrations).
-        assert_eq!(expand, ids.len() - 9);
-        assert_eq!(validate, ids.len() - 8);
+        assert_eq!(expand, ids.len() - 10);
+        assert_eq!(validate, ids.len() - 9);
         // The activation chassis (ci_0022*) is appended AFTER the cutover fence-row seed, in order,
         // and the readiness probe is now the last of all.
         assert_eq!(
-            ids[ids.len() - 5],
+            ids[ids.len() - 6],
             CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID,
             "the cutover fence's predecessor-row seed precedes only the ci_0022* chassis"
         );
         assert_eq!(
-            &ids[ids.len() - 4..],
+            &ids[ids.len() - 5..ids.len() - 1],
             &[
                 CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID,
                 CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID,
@@ -2973,6 +2994,11 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 CI_V2_ACTIVATION_READINESS_PROBE_MIGRATION_ID,
             ],
             "the CT-007 5b.3-6e.1 activation chassis is appended last, in expand→validate→index→probe order"
+        );
+        assert_eq!(
+            ids[ids.len() - 1],
+            CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID,
+            "Stage B appends the retired-v3 sentinel after the activation chassis"
         );
         assert!(
             expand
@@ -2992,7 +3018,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            62,
+            63,
             "21 table/RLS (incl. the CT-007 credential-generation log) + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate) + 1 ci_job_spec-stage ALTER + 3 ci_job_accounting ALTERs + 1 scheduler-boundary + 3 scheduler claim grants + 4 scheduler ci_run/workflow discovery grants (incl. wf_version) + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand + 4 CT-007 5b.3-6e.1 activation-chassis (reservation-marker expand + validate + readiness index + readiness probe)"
         );
         for m in &migrations.0 {
@@ -3066,6 +3092,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL);
             } else if m.id == CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID {
                 assert_eq!(m.ddl, SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL);
+            } else if m.id == CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID {
+                assert_eq!(m.ddl, SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL);
             } else if m.id == CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL);
             } else if m.id == CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID {
@@ -3122,7 +3150,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            62,
+            63,
             "the runner applied all 21 table/RLS (incl. the CT-007 credential-generation log), 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate), 1 ci_job_spec-stage ALTER, 3 ci_job_accounting ALTERs, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, 1 prelaunch deadline expand, and the 4 CT-007 5b.3-6e.1 activation-chassis migrations (reservation-marker expand + validate + readiness index + readiness probe)"
         );
         assert_eq!(
@@ -3187,7 +3215,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             workflow_id_grant.ddl,
             GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL
         );
-        let ci_job_reap_reset_grant = migrations.0.iter().rev().nth(9).expect(
+        let ci_job_reap_reset_grant = migrations.0.iter().rev().nth(10).expect(
             "the ci_job reap-reset grant precedes only the claim-window pair, the wf_version grant, \
              the backlog probe, the cutover fence-row seed, and the 4-migration 5b.3-6e.1 chassis",
         );

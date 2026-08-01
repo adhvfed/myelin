@@ -40,7 +40,8 @@ use myelin_ci_controlplane::{
     DurableLogPersist, EnqueueOutcome, JobSpecResolver, Lane, LeasedJob, LogPipelineSink,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
-    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL,
+    ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL,
     CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL,
     CREATE_LOG_SEGMENT_DDL,
 };
@@ -48,8 +49,8 @@ use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, FirehoseSink, IdemToken, ImageRef, JobKind, JobSpec,
-    LeaseStore, MeterTarget, ReserveHandle, ResourceLimits, RunTokenCredential, RunnerAgent,
-    RunnerError, RunnerHooks, TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
+    LeaseStore, MeterTarget, ResourceLimits, RunTokenCredential, RunnerAgent, RunnerError,
+    RunnerHooks, TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::OUTBOX_MIGRATION;
@@ -128,6 +129,10 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
         .await
         .expect("add the durable claim window");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL)
+        .await
+        .expect("add the reservation writer marker");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin.execute(idx.as_str()).await.expect("index");
@@ -276,6 +281,7 @@ fn enq(
         idem_token: idem.into(),
         stage: "build".into(),
         claim_window_secs: CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
+        reservation_write_version: myelin_ci_controlplane::ReservationWriteVersionMarker::legacy(),
     }
 }
 
@@ -355,13 +361,7 @@ impl IdMinter for FixedMinter {
 }
 
 fn ok_hooks() -> RunnerHooks {
-    RunnerHooks::new(
-        myelin_ci_sandbox::CompletionSettlementOwner::Hook,
-        Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
-        Box::new(|_spec, _h, _u| Ok(())),
-        Box::new(|_t| Ok(())),
-        Box::new(|_s| Ok(())),
-    )
+    common::stage_b_compute_hooks_for_legacy_runsc_test()
 }
 
 /// The real, already-founder-pipeline-pinned `linux-small-v1` image (`.myelin/ci.toml`'s own pin).

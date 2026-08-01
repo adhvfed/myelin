@@ -365,6 +365,9 @@ pub struct CiRunnerLoop {
     /// (Sol's design review): this is security-sensitive composition state, so omitting it must be
     /// a compile error, not a silent default.
     gvisor_workspace_config: myelin_ci_sandbox::gvisor::GvisorWorkspaceConfig,
+    /// The independently boot-validated Hop-A bare-repository root. Stage B requires Enabled; the
+    /// opaque type makes an unchecked path unrepresentable here.
+    gvisor_checkout_config: myelin_ci_sandbox::gvisor::GvisorCheckoutConfig,
 }
 
 /// Terminal reason returned by the owned runner thread.
@@ -417,6 +420,7 @@ impl CiRunnerLoop {
         pool: sqlx::postgres::PgPool,
         s3: myelin_config::S3Config,
         gvisor_workspace_config: myelin_ci_sandbox::gvisor::GvisorWorkspaceConfig,
+        gvisor_checkout_config: myelin_ci_sandbox::gvisor::GvisorCheckoutConfig,
     ) -> CiRunnerLoop {
         CiRunnerLoop {
             worker_id: worker_id.into(),
@@ -433,6 +437,7 @@ impl CiRunnerLoop {
             pool,
             s3,
             gvisor_workspace_config,
+            gvisor_checkout_config,
             idle_backoff: Duration::from_millis(500),
             error_backoff: Duration::from_secs(2),
         }
@@ -516,6 +521,7 @@ impl CiRunnerLoop {
             pool,
             s3,
             gvisor_workspace_config,
+            gvisor_checkout_config,
             idle_backoff,
             error_backoff,
         } = self;
@@ -540,7 +546,7 @@ impl CiRunnerLoop {
             gvisor_workspace_config,
             incident_sink,
         ) {
-            Ok(backend) => backend,
+            Ok(backend) => backend.with_checkout_config(gvisor_checkout_config),
             Err(error) => {
                 eprintln!(
                     "ci-runner[{worker_id}]: sandbox backend initialization FAILED (fail-closed, \
@@ -582,11 +588,29 @@ impl CiRunnerLoop {
             if runner_shutdown_requested(&mut shutdown) {
                 return CiRunnerLoopExit::Shutdown;
             }
-            match agent.run_one(now_secs()) {
-                Ok(o) => {
+            match agent.run_one_cycle(now_secs()) {
+                Ok(myelin_ci_sandbox::RunnerCycleOutcome::Workload(o)) => {
                     eprintln!(
                         "ci-runner[{worker_id}]: ran job {} for run {} (passed={}, job.done={:?})",
                         o.job_id, o.run_id, o.report.passed, o.signal_outcome
+                    );
+                }
+                Ok(myelin_ci_sandbox::RunnerCycleOutcome::PreparationTerminal {
+                    job_id,
+                    run_id,
+                    signal_outcome,
+                }) => {
+                    eprintln!(
+                        "ci-runner[{worker_id}]: preparation terminalized job {job_id} for run \
+                         {run_id} (job.done={signal_outcome:?})"
+                    );
+                }
+                Ok(myelin_ci_sandbox::RunnerCycleOutcome::PreparationRetryable {
+                    job_id,
+                    report,
+                }) => {
+                    eprintln!(
+                        "ci-runner[{worker_id}]: preparation requeued job {job_id} ({report:?})"
                     );
                 }
                 Err(RunnerError::NoWork) => {
@@ -633,6 +657,15 @@ impl CiRunnerLoop {
                     // safe. Stop this runner lane fail-closed before it claims any work.
                     eprintln!("ci-runner[{worker_id}]: CONFIGURATION REFUSED: {e}");
                     return CiRunnerLoopExit::SettlementOwnerMismatch;
+                }
+                Err(
+                    e @ (RunnerError::PreparationRoutingFailed { .. }
+                    | RunnerError::ReconciliationRequired { .. }),
+                ) => {
+                    eprintln!(
+                        "ci-runner[{worker_id}]: checkout recovery REQUIRED; stopping host intake: {e}"
+                    );
+                    return CiRunnerLoopExit::TerminalReportFailed;
                 }
             }
         }
@@ -790,14 +823,14 @@ fn durable_spec_resolver_with_issuer(
     })
 }
 
-/// **CT-007 slice 5b.3-6e.2: the V2 spec resolver (DORMANT).** Identical claim reconstruction,
+/// **CT-007 slice 5b.3-6e.2: the activated V2 spec resolver.** Identical claim reconstruction,
 /// trust/null-window checks, and scope derivation as [`durable_spec_resolver`], but the resolved
 /// spec's INITIAL run-token authorization is minted through the V2 phase-credential path:
 /// [`V2CheckoutComposition::mint_initial_phase_credential`](crate::ci_checkout_composition::V2CheckoutComposition::mint_initial_phase_credential)
 /// mints a `CheckoutAdvertise` generation for a checkout-bearing job (or a `Workload` generation for a
 /// compute job) and returns the phase-authorization context — with the credential binding — that the
-/// parent-attempt reserve hook later reconstructs the exact durable claim from. No production
-/// composition root builds this until 5b.3-6e.2 Stage B selects `ci_runner_v2_wiring`.
+/// parent-attempt reserve hook later reconstructs the exact durable claim from. Stage B selects it
+/// only through `ci_runner_v2_wiring`.
 pub fn durable_v2_spec_resolver(
     store: CiJobSpecStore,
     region: impl Into<String>,

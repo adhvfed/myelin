@@ -1333,10 +1333,8 @@ pub struct GvisorBackend {
     /// piece). `new`/`git_wire_only` always construct `Disabled`; only the not-yet-public
     /// [`GvisorBackend::try_new`] can construct `Enabled`.
     workspace_integration: WorkspaceIntegration,
-    /// CT-007 slice 5b.3-6e.1 (DORMANT): the boot-validated checkout repository root selection. EVERY
-    /// existing constructor initializes this [`GvisorCheckoutConfig::disabled`]; only the dormant
-    /// [`GvisorBackend::with_checkout_config`] can set an enabled config, and no production root does so
-    /// until the activating slice (6e.2). Nothing reads it yet.
+    /// The boot-validated checkout repository root selection. Constructors initialize it disabled;
+    /// the activated runner composition replaces it with its boot-validated enabled config.
     checkout: GvisorCheckoutConfig,
 }
 
@@ -2014,7 +2012,7 @@ impl std::fmt::Display for GvisorCheckoutConfigError {
 impl std::error::Error for GvisorCheckoutConfigError {}
 
 impl GvisorCheckoutConfig {
-    /// The checkout-disabled selection — the state of every production backend until 6e.2.
+    /// The checkout-disabled selection for non-runner and legacy backends.
     pub fn disabled() -> Self {
         GvisorCheckoutConfig(CheckoutConfigState::Disabled)
     }
@@ -2243,11 +2241,8 @@ impl GvisorBackend {
         })
     }
 
-    /// **Select a validated checkout repository root (CT-007 slice 5b.3-6e.1 — DORMANT).** Returns the
-    /// backend with its [`checkout`](GvisorBackend::checkout) selection replaced. No production
-    /// composition root calls this — the occurrence pin holds it at zero — so every production backend
-    /// stays checkout-`Disabled`; the activating slice (6e.2) is the one reviewed edit that selects
-    /// [`GvisorCheckoutConfig::Enabled`] here and thereby routes a checkout-bearing spec through
+    /// Select a validated checkout repository root. The Stage-B runner composition calls this with
+    /// [`GvisorCheckoutConfig::Enabled`], routing checkout-bearing specs through
     /// [`Self::launch_checkout_orchestrated_with`].
     #[allow(dead_code)]
     pub fn with_checkout_config(mut self, checkout: GvisorCheckoutConfig) -> GvisorBackend {
@@ -2681,7 +2676,7 @@ impl GvisorBackend {
         })
     }
 
-    /// **The DORMANT compute-V2 orchestrated entry (CT-007 slice 5b.3-6e.1).**
+    /// **The compute-V2 orchestrated entry selected by the typed cycle's compute arm.**
     ///
     /// A compute job under V2 cannot merely use the legacy [`ReserveHook`](crate::ReserveHook): it
     /// must create a durable PARENT-ATTEMPT row (so exhaustion is expressible) before any workload
@@ -3340,17 +3335,16 @@ fn classify_bound_workload_failure(
     }
 }
 
-/// CT-007 slice 5b.3-6c: the DORMANT outer checkout orchestrator lives in its OWN impl block (kept
+/// CT-007 slice 5b.3-6c: the outer checkout orchestrator lives in its OWN impl block (kept
 /// out of the compute impl, exactly like the continuation seam) so the compute closed-world span stays
 /// capsule-free.
 impl GvisorBackend {
-    /// **The DORMANT outer checkout orchestrator (steps 1–14).** It owns preflight, parent-attempt
+    /// **The activated outer checkout orchestrator (steps 1–14).** It owns preflight, parent-attempt
     /// admission, Hop A (transport) with the shared renewal checkpoint, transport-phase completion, and
     /// — only AFTER Hop A succeeds — the ONE capsule acquisition, before transferring the capsule BY
     /// VALUE into [`Self::launch_checkout_continuation`] (steps 15–25). It RETAINS the parent-attempt
-    /// authority and LENDS it to the continuation. ZERO production callers until 5b.3-6e selects it;
-    /// production `RunnerHooks` never install a parent-attempt reservation, so
-    /// [`RunnerHooks::reserve_parent_attempt`](crate::RunnerHooks) refuses and nothing reaches here.
+    /// authority and LENDS it to the continuation. Stage B selects it through `run_cycle`; the V2
+    /// production hooks install the required parent-attempt reservation.
     #[allow(dead_code, clippy::too_many_arguments)]
     fn launch_checkout_orchestrated_with(
         &self,
@@ -3700,6 +3694,14 @@ impl SandboxBackend for GvisorBackend {
         spec: &JobSpec,
         hooks: &RunnerHooks,
     ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+        if !matches!(
+            crate::derive_checkout_authorization_scope(spec.kind, &spec.workspace),
+            Ok(None)
+        ) {
+            return Err(SandboxLaunchError::Failed(GvisorError::Runtime(
+                "checkout-bearing or malformed workspace specs require run_cycle".into(),
+            )));
+        }
         self.launch_with(
             spec,
             hooks,
@@ -3716,6 +3718,14 @@ impl SandboxBackend for GvisorBackend {
         output: Arc<dyn SandboxOutputSink>,
         cancellation: SandboxCancellation,
     ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
+        if !matches!(
+            crate::derive_checkout_authorization_scope(spec.kind, &spec.workspace),
+            Ok(None)
+        ) {
+            return Err(SandboxLaunchError::Failed(GvisorError::Runtime(
+                "checkout-bearing or malformed workspace specs require run_cycle".into(),
+            )));
+        }
         self.launch_with(
             spec,
             hooks,
@@ -3735,7 +3745,7 @@ impl SandboxBackend for GvisorBackend {
     }
 
     /// **CT-007 slice 5b.3-6e.2: the typed sandbox CYCLE — the shape selector (behind the cycle
-    /// method, DORMANT).** Overrides the trait default so a gVisor cycle routes on the job's workspace
+    /// method).** Overrides the trait default so a gVisor cycle routes on the job's workspace
     /// shape:
     ///
     /// - `(None, None)` — an ordinary compute job — runs the V2 parent-attempt-admitted orchestrated
@@ -3745,11 +3755,8 @@ impl SandboxBackend for GvisorBackend {
     ///   checkout config is `disabled()` FAILS CLOSED (it never silently runs as compute).
     /// - a partial/malformed workspace — refused before any reserve or spawn.
     ///
-    /// **DORMANT until 5b.3-6e.2 Stage B:** production [`RunnerAgent`](crate::runner::RunnerAgent) still
-    /// calls [`Self::launch_streaming`], never `run_cycle`, and production `RunnerHooks` install no
-    /// parent-attempt reservation — so the compute arm's `reserve_parent_attempt` would refuse and the
-    /// checkout arm's `repo_root()` is `None`. Stage B is the atomic flip that makes production
-    /// `RunnerAgent` drive `run_cycle` and installs the V2 hooks + enabled checkout root.
+    /// Stage B selects this from production [`RunnerAgent`](crate::runner::RunnerAgent), together
+    /// with V2 hooks and an enabled checkout root.
     fn run_cycle(
         &self,
         spec: &JobSpec,
@@ -10743,31 +10750,23 @@ mod tests {
         );
     }
 
-    /// **CT-007 slice 5b.3-6c: the checkout orchestrator + continuation are fully composed but DORMANT,
-    /// and the capsule's workload `OciConfig` is never detached.** 6c gives the continuation a real body
-    /// (Hop B through the capsule + the closed workload transition) and adds the outer orchestrator, so
-    /// the capsule IS now constructed/consumed — but ONLY through the single dormant entry
-    /// `launch_checkout_orchestrated_with`, which has ZERO production callers (the composition-root
-    /// zero). `launch_with` still never shape-diverts; 5b.3-6e is the slice that selects the dormant
-    /// path. Every capsule construction/consumption is reachable ONLY from that unreachable entry.
+    /// **CT-007 slice 5b.3-6e.2: the activated cycle has exactly one checkout orchestration path and
+    /// the capsule's workload `OciConfig` is never detached.** The typed `run_cycle` selector is the
+    /// single production caller; the continuation and capsule transition remain single-sourced.
     #[test]
-    fn the_checkout_runtime_capsule_has_no_production_caller() {
+    fn the_checkout_runtime_capsule_has_exactly_one_activated_cycle_caller() {
         let prod = production_source();
-        // The composition-root ZERO: the ONE dormant entry the whole checkout path hangs off has no
-        // production caller. `launch_with` never selects it; installing it is 5b.3-6e's job.
-        // CT-007 slice 5b.3-6e.2 Stage A: the dormant typed-cycle SELECTOR `run_cycle` now calls the
-        // outer orchestrator exactly once for a checkout-bearing spec. Dormancy no longer rests on a
-        // source-occurrence zero here but on production `RunnerAgent` NOT driving `run_cycle` yet (the
-        // atomic Stage B flip) — so the selector is present but unreached in production.
+        // The activated typed-cycle selector calls the outer orchestrator exactly once for a
+        // checkout-bearing spec.
         assert_eq!(
             prod.matches(".launch_checkout_orchestrated_with(").count(),
             1,
-            "the outer orchestrator has exactly ONE caller — the dormant `run_cycle` selector"
+            "the outer orchestrator has exactly ONE caller — the activated `run_cycle` selector"
         );
         assert_eq!(
             prod.matches("fn launch_checkout_orchestrated_with(").count(),
             1,
-            "the dormant outer orchestrator is defined exactly once"
+            "the activated outer orchestrator is defined exactly once"
         );
         assert_eq!(
             prod.matches("fn launch_checkout_orchestrated_with_given").count(),
@@ -10775,7 +10774,7 @@ mod tests {
             "its shared injectable body is defined exactly once"
         );
         // The fused V2 Hop B entry lives in the submodule (ONE definition); the continuation is its ONE
-        // production caller — reachable only through the (uncalled) orchestrator.
+        // production caller — reachable only through the typed-cycle orchestrator.
         assert_eq!(
             CHECKOUT_RUNTIME_SOURCE
                 .matches("run_checkout_preparation_v2(")
@@ -10788,11 +10787,11 @@ mod tests {
             1,
             "the continuation is the ONLY production caller of the fused Hop B entry"
         );
-        // The capsule constructor is called ONLY by the (uncalled) orchestrator.
+        // The capsule constructor is called ONLY by the activated orchestrator.
         assert_eq!(
             prod.matches("AcquiredCheckoutRuntime::acquire(").count(),
             1,
-            "the capsule is constructed only by the dormant orchestrator"
+            "the capsule is constructed only by the activated orchestrator"
         );
         assert_eq!(
             CHECKOUT_RUNTIME_SOURCE
@@ -10801,11 +10800,11 @@ mod tests {
             0,
             "the submodule only DEFINES `acquire`, never calls the qualified form"
         );
-        // The closed workload transition is invoked ONLY by the (uncalled) continuation.
+        // The closed workload transition is invoked ONLY by the activated continuation.
         assert_eq!(
             prod.matches(".run_retained_workload(").count(),
             1,
-            "the closed workload transition is invoked only by the dormant continuation"
+            "the closed workload transition is invoked only by the activated continuation"
         );
         // The old free-standing `into_prepared`/`bind_workload` seams are gone: the ONLY prepared
         // transition is the fused Hop B entry (production) plus the audited `#[cfg(test)]`
@@ -10849,8 +10848,8 @@ mod tests {
             launch_with.contains("self.launch_compute_with(spec, hooks, run)"),
             "launch_with is a plain delegating wrapper — it performs NO shape dispatch on spec.workspace"
         );
-        // 5b.3-6c: the continuation is DEFINED once and called ONLY by the (uncalled) orchestrator —
-        // never by any production dispatch. It consumes the 6a capsule BY VALUE.
+        // The continuation is DEFINED once and called ONLY by the activated orchestrator. It
+        // consumes the capsule BY VALUE.
         assert_eq!(
             prod.matches("fn launch_checkout_continuation(").count(),
             1,
@@ -10859,7 +10858,7 @@ mod tests {
         assert_eq!(
             prod.matches(".launch_checkout_continuation(").count(),
             1,
-            "the continuation's ONLY caller is the (uncalled) dormant orchestrator"
+            "the continuation's ONLY caller is the activated orchestrator"
         );
         let seam = source_of("fn launch_checkout_continuation(");
         assert!(
@@ -10884,27 +10883,21 @@ mod tests {
             "acquire must return the capsule alone — never the workload OciConfig detached"
         );
 
-        // ── CT-007 slice 5b.3-6e.1 (DORMANT): the compute-V2 orchestrated entry + checkout config ──
-        // The dormant orchestrated compute entry is DEFINED once and has ZERO production callers (the
-        // composition-root zero). Its ONLY caller anywhere is the `#[cfg(feature = "test-support")]`
-        // runsc-driver seam, which lives in the SEPARATE `gvisor/runsc_driver.rs` file this scan never
-        // reads — so production source sees exactly the definition and no call.
+        // ── CT-007 slice 5b.3-6e.2: the activated compute-V2 entry + checkout config ──
         assert_eq!(
             prod.matches("fn launch_compute_orchestrated_with").count(),
             1,
-            "the dormant compute-V2 orchestrated entry is defined exactly once"
+            "the activated compute-V2 orchestrated entry is defined exactly once"
         );
-        // CT-007 slice 5b.3-6e.2 Stage A: the dormant typed-cycle SELECTOR `run_cycle` now calls the
-        // compute-V2 orchestrated entry exactly once for a compute spec. As with the checkout arm,
-        // dormancy rests on production `RunnerAgent` not driving `run_cycle` until the atomic Stage B.
+        // The activated typed-cycle selector calls the compute-V2 orchestrated entry exactly once.
         assert_eq!(
             prod.matches(".launch_compute_orchestrated_with(").count(),
             1,
-            "the compute-V2 orchestrated entry has exactly ONE caller — the dormant `run_cycle` selector"
+            "the compute-V2 orchestrated entry has exactly ONE caller — the activated `run_cycle` selector"
         );
         // The shared post-reservation body is extracted ONCE and used by BOTH compute entries; the
         // preflight is extracted once and used by both. The legacy `launch_compute_with` remains the
-        // sole LIVE compute entry (called by the plain `launch_with` wrapper and streaming).
+        // compatibility compute entry (called by the plain `launch_with` wrapper and streaming).
         assert_eq!(
             prod.matches("fn launch_compute_common_body").count(),
             1,
@@ -10913,7 +10906,7 @@ mod tests {
         assert_eq!(
             prod.matches(".launch_compute_common_body(").count(),
             2,
-            "both compute entries (legacy + dormant orchestrated) run the ONE shared common body"
+            "both compute entries (legacy compatibility + activated orchestrated) run the ONE shared common body"
         );
         assert_eq!(
             prod.matches("fn compute_launch_preflight").count(),

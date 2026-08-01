@@ -170,6 +170,7 @@ print_env() {
 export MYELIN_CELL_ID="\${MYELIN_CELL_ID:-cell-dogfood}"  # a DEDICATED cell (the shared 'cell-dev' root may be sealed under a different key)
 export MYELIN_KMS_SEAL_KEY="${seal}"   # the operator seal key (unseals the KMS root AND the token cell root)
 export MYELIN_GIT_ROOT="${git_root}"   # on-disk bare-repo root
+export MYELIN_CI_CHECKOUT_REPO_ROOT="${git_root}"  # checkout runner's boot-validated bare-repo root
 export MYELIN_REGION="${region}"       # residency region
 export MYELIN_ISSUES_RECONCILE_TENANTS="\${MYELIN_ISSUES_RECONCILE_TENANTS:-acme}"  # explicit FORCE-RLS partitions; defaults to the runbook's canonical dogfood tenant
 export MYELIN_DOGFOOD_ISSUES_PROJECT="\${MYELIN_DOGFOOD_ISSUES_PROJECT:-${DOGFOOD_ISSUES_PROJECT}}"  # canonical founder project UUID (bootstrap reader grant)

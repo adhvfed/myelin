@@ -113,7 +113,8 @@ pub use ci_identity_adapter::{
 pub use ci_launch_authority::{
     CiAttemptBudgetPolicy, CiAttemptBudgetRevision, CiJobBudgetReservationProvider,
     CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority, ManifestBoundCiJobTokenAuthority,
-    OperationalReservationWriteVersion, PgTierPCiJobBudgetReservation, TierPOperationalCiJobPricer,
+    OperationalReservationWriteVersion, PgTierPCiJobBudgetReservation,
+    ReservationWriteVersionMarker, TierPOperationalCiJobPricer,
     LINUX_SMALL_V1_POLICY_REVISION, LINUX_SMALL_V1_RUNNER_LABELS,
     TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
 };
@@ -132,8 +133,8 @@ pub use ci_runner_composition::{
     ci_runner_cancellation_coordinator, CiRunnerCancellationCoordinator,
 };
 pub use ci_runner_composition::{
-    ci_runner_hooks, ci_runner_identity_authorities, CiRunnerIdentityAuthorities,
-    CiRunnerIdentityCompositionError,
+    ci_runner_hooks, ci_runner_identity_authorities, ci_runner_v2_wiring,
+    CiRunnerIdentityAuthorities, CiRunnerIdentityCompositionError, CiRunnerV2Wiring,
 };
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -700,8 +701,13 @@ pub use migrations::{
     ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL,
     ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, ARTIFACT_TABLE,
     CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DRIVE_MANIFEST_TABLE,
-    CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID, CI_PIPELINE_VERSION_BACKLOG_PROBE_MIGRATION_ID,
+    CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID,
+    CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID,
+    CI_PIPELINE_VERSION_BACKLOG_PROBE_MIGRATION_ID,
     CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL, SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL,
+    SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL,
+    ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL, CREATE_CI_JOB_PARENT_ATTEMPT_DDL,
+    CREATE_CI_JOB_PRELAUNCH_USAGE_DDL,
     CI_DURABLE_WRITER_IDS, CI_JOB_ACCOUNTING_DISPOSITION_V4_MIGRATION_ID,
     CI_JOB_ACCOUNTING_DISPOSITION_V4_VERDICT_MIGRATION_ID, CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID,
     CI_JOB_ACCOUNTING_TABLE, CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID,
@@ -893,7 +899,11 @@ pub fn ci_job_accounting_store(
     pool: sqlx::PgPool,
     region: myelin_tenancy::Region,
 ) -> CiJobAccountingStore {
-    CiJobAccountingStore::with_pg(pool, region)
+    CiJobAccountingStore::with_pg_and_write_version(
+        pool,
+        region,
+        ci_pipeline_protocol::PRODUCTION_ACCOUNTING_WRITE_VERSION,
+    )
 }
 
 /// **Construct the durable CI `job_queue` store at the composition root (CT-004c.1).** The service
@@ -988,17 +998,14 @@ pub fn ci_run_starter_factory(
     rt: tokio::runtime::Handle,
     supersession_ledger: myelin_storage::DurableCostLedger,
 ) -> Result<PgCiRunStarterFactory, CiLaunchAuthorityError> {
-    // CT-007 slice 5b.3-4a.1c: fresh writes stay pinned to `v1` here even though the `v2` writer
-    // is fully implemented and tested -- Sol's review: this is only safe to flip to `v2` once every
-    // reader in the fleet has already deployed 5b.3-4a.1b's compatibility reads. A prior commit
-    // landing is not the same guarantee as fleet convergence during a rolling deploy. Flip this
-    // deliberately, in its own commit, once that's confirmed.
+    // CT-007 6e.2 Stage B: the coordinated, non-mixed-runner cutover selects the descriptor's V2
+    // reservation writer in the same atomic delta as V2 parent-attempt admission and V4 accounting.
     let reservations = ci_launch_authority::PgTierPCiJobBudgetReservation::new(
         pool.clone(),
         region.0.clone(),
         ci_launch_authority::TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
         ci_launch_authority::CiAttemptBudgetPolicy::production(),
-        ci_launch_authority::OperationalReservationWriteVersion::V1,
+        ci_pipeline_protocol::PRODUCTION_RESERVATION_WRITE_VERSION,
     )?;
     Ok(PgCiRunStarterFactory::new_with_authority_and_supersession(
         pool,
@@ -1132,7 +1139,7 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            62,
+            63,
             "all 21 tables (incl. the CT-007 credential-generation log), three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 6 job_queue ALTERs (4 claim/completion + the claim-window expand and its validation), the ci_job_spec-stage and three accounting ALTERs, scheduler RLS boundary, 3 claim-column grants, 4 ci_run/workflow discovery grants (incl. the wf_version grant the cutover fence needs), 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, the prelaunch deadline expand, the cutover fence's database-wide backlog probe plus its predecessor-row seed, and the 4 CT-007 5b.3-6e.1 activation-chassis migrations (reservation-marker expand + validate + readiness index + readiness probe) are present"
         );
         assert!(

@@ -33,13 +33,14 @@ use myelin_ci_controlplane::ci_claim_token_issuer::runtime_authorities_from_dura
 use myelin_ci_controlplane::ci_runner_composition::ci_runner_v2_wiring;
 use myelin_ci_controlplane::runner_bind::JobSpecResolver;
 use myelin_ci_controlplane::{
-    ci_runner_identity_authorities, claim_window_secs_for_template, CiDriveManifestStore,
+    ci_production_runtime_factory, ci_runner_identity_authorities, claim_window_secs_for_template,
+    CiDriveManifestStore,
     CiDriveManifestV1, CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest,
     CiJobSpecStore, CiJobTokenRequest, CiManifestLaneV1, CiManifestLimitsV1,
     CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiRunRecord,
     DurableCiJobLaunchTemplate, DurableEnqueue, GrantedCiJobV1, Lane, LeasedJob,
     ManifestBoundCiJobTokenAuthority, OperationalReservationWriteVersion,
-    PgTierPCiJobBudgetReservation,
+    PgTierPCiJobBudgetReservation, CiPipelineReporterRouter,
 };
 use myelin_ci_sandbox::checkout_orchestration::CheckoutContinuationOutcome;
 use myelin_ci_sandbox::gvisor::checkout_transport_test_support::{
@@ -49,9 +50,9 @@ use myelin_ci_sandbox::gvisor::runsc_driver::InjectedHopBOutcome;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::runner::PreparationTerminalDisposition;
 use myelin_ci_sandbox::{
-    derive_checkout_authorization_scope, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec,
-    JobSpecTemplate, MeterTarget, ResourceLimits, ResourceUsage, RunnerHooks, TrustTier,
-    WorkspaceSpec,
+    derive_checkout_authorization_scope, CompletionClaim, EgressPolicy, IdemToken, ImageRef,
+    JobKind, JobSpec, JobSpecTemplate, MeterTarget, ResourceLimits, ResourceUsage, RunnerHooks,
+    TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec,
 };
 use myelin_config::MyelinConfig;
 use myelin_storage::{
@@ -300,6 +301,20 @@ async fn seed_fixture(
     .await
     .unwrap();
     sqlx::query(
+        "INSERT INTO workflow_run (
+           tenant_id, region, run_id, wf_type, wf_version, input, state, correlation_id,
+           depth, partition
+         ) VALUES ($1, $2, $3::uuid, 'ci.pipeline', $4, '[]'::jsonb, 'running', $5, 0, 0)",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(&wf_run_id)
+    .bind(authority.workflow_definition_version)
+    .bind(format!("corr-{seed}"))
+    .execute(admin)
+    .await
+    .unwrap();
+    sqlx::query(
         "INSERT INTO ci_job (
            tenant_id, region, job_id, run_id, stage, name, needs, spec_ref, state, attempt
          ) VALUES ($1, $2, $3::uuid, $4::uuid, 'build', 'build', '{}'::uuid[], $5, 'queued', 1)",
@@ -417,6 +432,9 @@ async fn seed_fixture(
                 idem_token: idem_token.clone(),
                 stage: "build".into(),
                 claim_window_secs: window,
+                reservation_write_version: myelin_ci_controlplane::ReservationWriteVersionMarker::derive_from_reserve_handle(
+                    &launch.spec.meter_to.reserve_id,
+                ),
             },
             &launch,
             "build",
@@ -475,7 +493,9 @@ async fn seed_fixture(
 /// composition mints the initial advertise credential (through the resolver) that the hooks'
 /// `reserve_parent_attempt` + per-phase authorizations later verify — a broken resolver, a wrong
 /// store/region, or a resolver/hooks mispairing can no longer pass unseen behind a hand-built parallel.
-async fn real_v2_wiring(schema: &str) -> (JobSpecResolver, RunnerHooks) {
+async fn real_v2_wiring(
+    schema: &str,
+) -> (JobSpecResolver, RunnerHooks, CiPipelineReporterRouter) {
     let mut config = MyelinConfig::dev();
     config.database_url = scoped_url(&app_url(), schema);
     config.region = REGION.into();
@@ -491,9 +511,14 @@ async fn real_v2_wiring(schema: &str) -> (JobSpecResolver, RunnerHooks) {
     )
     .await
     .expect("compose the production Identity authorities");
-    ci_runner_v2_wiring(provider, &identity, tokio::runtime::Handle::current())
+    let wiring = ci_runner_v2_wiring(provider.clone(), &identity, tokio::runtime::Handle::current())
         .expect("compose the dormant V2 runner wiring")
-        .into_parts()
+        .into_parts();
+    let reporter = ci_production_runtime_factory(provider, tokio::runtime::Handle::current())
+        .expect("compose production V4 runtime")
+        .reporter_router()
+        .expect("compose production V4 reporter router");
+    (wiring.0, wiring.1, reporter)
 }
 
 /// Resolve the seeded leased generation through the wiring's REAL resolver — reading the durable launch
@@ -630,6 +655,32 @@ async fn reservation_state(admin: &PgPool, reserve_handle: &str) -> String {
     .unwrap()
 }
 
+async fn reservation_marker(admin: &PgPool, fixture: &Fixture) -> Option<i16> {
+    sqlx::query_scalar(
+        "SELECT reservation_write_version FROM job_queue
+         WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(&fixture.claim.job_id)
+    .fetch_one(admin)
+    .await
+    .unwrap()
+}
+
+async fn v4_accounting_final(admin: &PgPool, fixture: &Fixture) -> Option<(String, String)> {
+    sqlx::query(
+        "SELECT terminal_disposition, completion_receipt_v4 FROM ci_job_accounting
+         WHERE tenant_id = $1 AND job_id = $2::uuid",
+    )
+    .bind(TENANT)
+    .bind(&fixture.claim.job_id)
+    .fetch_optional(admin)
+    .await
+    .unwrap()
+    .map(|row| (row.get("terminal_disposition"), row.get("completion_receipt_v4")))
+}
+
 async fn parent_row_count(admin: &PgPool, fixture: &Fixture) -> i64 {
     sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM ci_job_parent_attempt
@@ -705,7 +756,7 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
         );
 
         // The ONE production wiring: the resolver + hooks from a SINGLE Identity/composition (S3).
-        let (resolver, hooks) = real_v2_wiring(&schema).await;
+        let (resolver, hooks, reporter) = real_v2_wiring(&schema).await;
         // Resolving through the REAL wiring resolver mints the INITIAL advertise generation — after this
         // exactly ONE generation (advertise) exists; the drive adds fetch/materialization/workload.
         let spec = resolve_active_spec(&resolver, &fixture);
@@ -740,7 +791,7 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
         );
 
         // The active path settled to a clean workload launch carrying the exact substituted usage.
-        match result {
+        let workload_usage = match result {
             Ok(CheckoutContinuationOutcome::WorkloadLaunched(launch)) => {
                 assert!(
                     launch.output_complete,
@@ -754,9 +805,10 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
                     },
                     "the settled workload carries exactly the substituted workload usage"
                 );
+                launch.result.usage
             }
             other => panic!("expected a clean WorkloadLaunched, got {other:?}"),
-        }
+        };
 
         // Durable rows the active path wrote — present-and-shaped (deletion-sensitive):
         // FOUR credential generations, in phase order.
@@ -803,6 +855,43 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
             "inflight",
             "admission drove the reservation reserved → inflight"
         );
+        assert_eq!(
+            reservation_marker(&admin, &fixture).await,
+            Some(2),
+            "the V2 reserve handle persisted the exact Stage-B queue marker"
+        );
+
+        // Completion-side Stage-B proof: route the exact running claim through the production V4
+        // reporter. This atomically writes the V4 final receipt and settles the inflight reservation.
+        reporter
+            .report_done(
+                &CompletionClaim {
+                    tenant: TenantId(TENANT.into()),
+                    run: myelin_flow::RunId(fixture.claim.wf_run_id.clone()),
+                    job_id: fixture.claim.job_id.clone(),
+                    idem_token: fixture.claim.idem_token.clone(),
+                    lease_owner: fixture.claim.lease_owner.clone(),
+                    lease_epoch: fixture.claim.lease_epoch,
+                    claim_nonce: fixture.claim.claim_nonce.clone(),
+                },
+                &TerminalReport {
+                    passed: true,
+                    timed_out: false,
+                    usage: workload_usage,
+                    result_refs: Vec::new(),
+                },
+            )
+            .expect("the production V4 reporter finalizes the exact checkout claim");
+        let (disposition, receipt) = v4_accounting_final(&admin, &fixture)
+            .await
+            .expect("the V4 accounting-final row exists");
+        assert_eq!(disposition, "workload_passed");
+        assert!(receipt.starts_with("v4:"), "authoritative V4 receipt: {receipt}");
+        assert_eq!(
+            reservation_state(&admin, &fixture.reserve_handle).await,
+            "settled",
+            "completion settled the reservation inflight → settled"
+        );
         // The row-absent control query returns nothing — the assertions above are non-vacuous.
         assert_eq!(
             generation_rows_for_bogus_job(&admin).await,
@@ -830,7 +919,7 @@ async fn hop_b_terminal_reports_a_preparation_terminal_and_never_launches() {
         }, image)
         .await;
 
-        let (resolver, hooks) = real_v2_wiring(&schema).await;
+        let (resolver, hooks, _reporter) = real_v2_wiring(&schema).await;
         let spec = resolve_active_spec(&resolver, &fixture);
 
         let (result, recorded) = drive_checkout_off_runtime(
@@ -911,7 +1000,7 @@ async fn hop_b_retryable_reports_a_preparation_retry_and_never_launches() {
         }, image)
         .await;
 
-        let (resolver, hooks) = real_v2_wiring(&schema).await;
+        let (resolver, hooks, _reporter) = real_v2_wiring(&schema).await;
         let spec = resolve_active_spec(&resolver, &fixture);
 
         let (result, recorded) = drive_checkout_off_runtime(
@@ -1178,7 +1267,7 @@ async fn a_compute_spec_beneath_a_checkout_manifest_is_rejected_with_zero_mutati
         // the durable authority and refuses (compute spec ≠ checkout manifest) with
         // DurableAuthorityUnavailable — never signing a credential. Driving the PRODUCTION resolver (not a
         // hand-built composition) is the honesty line: a broken resolver/store/region pairing would fail here.
-        let (resolver, _hooks) = real_v2_wiring(&schema).await;
+        let (resolver, _hooks, _reporter) = real_v2_wiring(&schema).await;
         let leased = leased_job(&fixture);
         let err = std::thread::spawn(move || resolver(&leased))
             .join()
