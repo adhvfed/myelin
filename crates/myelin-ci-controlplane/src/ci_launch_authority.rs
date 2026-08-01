@@ -65,6 +65,11 @@ pub struct CiJobRuntimeAuthorityRequest {
     pub workflow_code_hash: String,
     pub policy_revision: String,
     pub limits: CiManifestLimitsV1,
+    /// The exact reservation the eventual `JobSpec.meter_to.reserve_id` must charge. It is absent
+    /// while the reservation provider is allocating the handle, then populated before the token
+    /// authority is minted. `None` is also the explicit compatibility shape for a persisted v1/v2
+    /// token-authority handle, whose frozen digest never attested this field.
+    pub reserve_id: Option<String>,
     /// CT-007 slice 5b.3-2b: the job's checkout target, when it has one. `None` for an ordinary
     /// compute job (never present in this workspace's CI jobs today, since `ci_run.repo_ref`/
     /// `.commit_oid` are always non-empty for a CI run — see `run_plan::parse_snapshot_ref`
@@ -798,28 +803,26 @@ fn pg_row(error: sqlx::Error) -> PgError {
 
 const CI_TOKEN_AUTHORITY_V1_HANDLE_PREFIX: &str = "ci-token-authority:v1:";
 const CI_TOKEN_AUTHORITY_V2_HANDLE_PREFIX: &str = "ci-token-authority:v2:";
+const CI_TOKEN_AUTHORITY_V3_HANDLE_PREFIX: &str = "ci-token-authority:v3:";
 
 /// Content-addressed token-authority reference. The immutable manifest persists this handle, and a
 /// later claim-bound issuer can reload the manifest and recompute it before minting. The hash binds
 /// every locked identity, source, workflow, policy, and limit field; it contains no secret and grants
 /// no authority by itself.
 ///
-/// CT-007 slice 5b.3-2b: every NEWLY minted handle is `v2` (`token_authority_digest_v2`), which
-/// additionally binds [`CiJobRuntimeAuthorityRequest::checkout`] — `v1` never hashed this field at
-/// all (it did not exist), so a `v1` handle can never be reinterpreted as proof of checkout
-/// authority. `v1` verification stays frozen (byte-identical to before this slice) and is accepted
-/// ONLY for a request with `checkout: None`, purely so runs whose manifest already persisted a `v1`
-/// handle before this slice landed keep resolving; any already-persisted `v1` handle on a
-/// checkout-bearing job is refused outright and must be regenerated/requeued under `v2` — a `v1`
-/// digest never bound a checkout target, so there is no way to "upgrade" one after the fact.
+/// New handles are `v3`, binding both checkout scope and the allocated reservation. The v1 and v2
+/// encoders remain byte-frozen. Rolling-fleet verification accepts either older version only when
+/// `reserve_id` is explicitly absent; v1 additionally requires `checkout: None`, because those
+/// facts did not exist in their respective digest generations and cannot be reinterpreted as
+/// attested after the fact.
 #[derive(Clone, Debug, Default)]
 pub struct ManifestBoundCiJobTokenAuthority;
 
 impl ManifestBoundCiJobTokenAuthority {
     pub fn handle_for(request: &CiJobRuntimeAuthorityRequest) -> String {
         format!(
-            "{CI_TOKEN_AUTHORITY_V2_HANDLE_PREFIX}{}",
-            token_authority_digest_v2(request)
+            "{CI_TOKEN_AUTHORITY_V3_HANDLE_PREFIX}{}",
+            token_authority_digest_v3(request)
         )
     }
 
@@ -829,11 +832,17 @@ impl ManifestBoundCiJobTokenAuthority {
     /// pre-existing `v1` manifest handle (minted before this slice) still verifies for a compute
     /// job.
     pub fn verifies(request: &CiJobRuntimeAuthorityRequest, handle: &str) -> bool {
+        if let Some(digest_hex) = handle.strip_prefix(CI_TOKEN_AUTHORITY_V3_HANDLE_PREFIX) {
+            return digest_hex == token_authority_digest_v3(request).to_string();
+        }
         if let Some(digest_hex) = handle.strip_prefix(CI_TOKEN_AUTHORITY_V2_HANDLE_PREFIX) {
+            if request.reserve_id.is_some() {
+                return false;
+            }
             return digest_hex == token_authority_digest_v2(request).to_string();
         }
         if let Some(digest_hex) = handle.strip_prefix(CI_TOKEN_AUTHORITY_V1_HANDLE_PREFIX) {
-            if request.checkout.is_some() {
+            if request.checkout.is_some() || request.reserve_id.is_some() {
                 return false;
             }
             return digest_hex == token_authority_digest(request).to_string();
@@ -933,6 +942,7 @@ fn prepare_linux_small_requests(
             workflow_code_hash: definition.code_hash().into(),
             policy_revision: LINUX_SMALL_V1_POLICY_REVISION.into(),
             limits: limits.clone(),
+            reserve_id: None,
             checkout: checkout.clone(),
         });
     }
@@ -967,7 +977,10 @@ fn finish_linux_small_authority(
                 "runtime authority reused one reservation across jobs",
             ));
         }
-        let token_authority_handle = ManifestBoundCiJobTokenAuthority::handle_for(request);
+        let mut token_authority_request = request.clone();
+        token_authority_request.reserve_id = Some(reserve_handle.clone());
+        let token_authority_handle =
+            ManifestBoundCiJobTokenAuthority::handle_for(&token_authority_request);
         validate_handle("token authority", &token_authority_handle)?;
         grants.push(CiJobLaunchGrantV1 {
             concrete_name: job.name.clone(),
@@ -1077,7 +1090,7 @@ const CI_TOKEN_AUTHORITY_V2_DOMAIN: &[u8] = b"myelin.ci.token-authority.v2\0";
 /// can never collide with a `v1` one even for a request with `checkout: None`), plus an explicit
 /// present/absent discriminator byte and — only when `Some` — the checkout scope's own canonical
 /// fields (tenant, repo ref, repo id, exact commit hex, object format).
-fn token_authority_digest_v2(request: &CiJobRuntimeAuthorityRequest) -> blake3::Hash {
+pub(crate) fn token_authority_digest_v2(request: &CiJobRuntimeAuthorityRequest) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(CI_TOKEN_AUTHORITY_V2_DOMAIN);
     for value in [
@@ -1118,6 +1131,66 @@ fn token_authority_digest_v2(request: &CiJobRuntimeAuthorityRequest) -> blake3::
                 myelin_ci_sandbox::GitObjectFormat::Sha256 => 2,
             };
             hasher.update(&[format_tag]);
+        }
+    }
+    hasher.finalize()
+}
+
+const CI_TOKEN_AUTHORITY_V3_DOMAIN: &[u8] = b"myelin.ci.token-authority.v3\0";
+
+/// Task #91: the reserve-attested token-authority digest. This is a wholly separate encoder so the
+/// frozen v1/v2 byte streams cannot drift. It repeats v2's complete canonical encoding under a new
+/// domain, then appends an explicit reserve-id presence discriminator and the length-prefixed id.
+fn token_authority_digest_v3(request: &CiJobRuntimeAuthorityRequest) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CI_TOKEN_AUTHORITY_V3_DOMAIN);
+    for value in [
+        request.tenant_id.as_str(),
+        request.region.as_str(),
+        request.ci_run_id.as_str(),
+        request.wf_run_id.as_str(),
+        request.project_id.as_str(),
+        request.job_id.as_str(),
+        request.stage.as_str(),
+        request.concrete_name.as_str(),
+        request.trigger_kind.as_str(),
+        request.trust_tier.as_str(),
+        request.source_snapshot_digest.as_str(),
+        request.workflow_code_hash.as_str(),
+        request.policy_revision.as_str(),
+    ] {
+        hash_length_prefixed(&mut hasher, value.as_bytes());
+    }
+    hasher.update(&request.workflow_definition_version.to_be_bytes());
+    hasher.update(&request.limits.cpu_millis.to_be_bytes());
+    hasher.update(&request.limits.mem_bytes.to_be_bytes());
+    hasher.update(&request.limits.disk_bytes.to_be_bytes());
+    hasher.update(&request.limits.pids_max.to_be_bytes());
+    hasher.update(&request.limits.timeout_secs.to_be_bytes());
+    match &request.checkout {
+        None => {
+            hasher.update(&[0u8]);
+        }
+        Some(scope) => {
+            hasher.update(&[1u8]);
+            hash_length_prefixed(&mut hasher, scope.tenant().0.as_bytes());
+            hash_length_prefixed(&mut hasher, scope.repo_ref().0.as_bytes());
+            hash_length_prefixed(&mut hasher, scope.repo_id().as_bytes());
+            hash_length_prefixed(&mut hasher, scope.commit_hex().as_bytes());
+            let format_tag: u8 = match scope.commit_format() {
+                myelin_ci_sandbox::GitObjectFormat::Sha1 => 1,
+                myelin_ci_sandbox::GitObjectFormat::Sha256 => 2,
+            };
+            hasher.update(&[format_tag]);
+        }
+    }
+    match &request.reserve_id {
+        None => {
+            hasher.update(&[0u8]);
+        }
+        Some(reserve_id) => {
+            hasher.update(&[1u8]);
+            hash_length_prefixed(&mut hasher, reserve_id.as_bytes());
         }
     }
     hasher.finalize()
@@ -1608,6 +1681,7 @@ mod tests {
                 workflow_code_hash: "code-hash-fixture".into(),
                 policy_revision: LINUX_SMALL_V1_POLICY_REVISION.into(),
                 limits: linux_small_limits(),
+                reserve_id: None,
                 checkout,
             }
         }
@@ -1863,6 +1937,7 @@ mod tests {
                 workflow_code_hash: "code-hash-fixture".into(),
                 policy_revision: LINUX_SMALL_V1_POLICY_REVISION.into(),
                 limits: linux_small_limits(),
+                reserve_id: None,
                 checkout: None,
             }
         }
@@ -2488,7 +2563,7 @@ mod tests {
             );
             assert!(grant
                 .token_authority_handle
-                .starts_with("ci-token-authority:v2:"));
+                .starts_with("ci-token-authority:v3:"));
         }
         assert_ne!(
             authority.jobs[0].token_authority_handle,
@@ -2596,13 +2671,15 @@ mod tests {
         let (record, prepared) = fixture();
         let budget = Arc::new(RecordingBudget::default());
         let pin = CiWorkflowDefinitionPin::new(1, "ci-body-v1").unwrap();
-        policy(budget.clone())
+        let granted = policy(budget.clone())
             .materialize(&record, &prepared, &pin)
             .await
             .unwrap();
-        let base = budget.batches.lock().unwrap()[0][0].clone();
+        let mut base = budget.batches.lock().unwrap()[0][0].clone();
+        base.reserve_id = Some(granted.jobs[0].reserve_handle.clone());
         let expected = token_handle(&base);
         assert_eq!(token_handle(&base), expected);
+        assert_eq!(granted.jobs[0].token_authority_handle, expected);
         assert!(ManifestBoundCiJobTokenAuthority::verifies(&base, &expected));
 
         let mut variants = Vec::new();
@@ -2627,6 +2704,7 @@ mod tests {
         changed!(workflow_definition_version, 2);
         changed!(workflow_code_hash, "ci-body-v2".into());
         changed!(policy_revision, "linux-small-v1:2".into());
+        changed!(reserve_id, Some("reserve:substituted".into()));
         let mut cpu_limits = base.limits.clone();
         cpu_limits.cpu_millis += 1;
         changed!(limits, cpu_limits);

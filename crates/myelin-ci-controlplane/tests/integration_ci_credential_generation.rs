@@ -282,7 +282,7 @@ async fn seed_fixture(app: &PgPool, admin: &PgPool, seed: u64, claim_age_secs: i
         pids_max: 128,
         timeout_secs: 120,
     };
-    let authority = CiJobRuntimeAuthorityRequest {
+    let mut authority = CiJobRuntimeAuthorityRequest {
         tenant_id: TENANT.into(),
         region: REGION.into(),
         ci_run_id: ci_run_id.clone(),
@@ -298,6 +298,7 @@ async fn seed_fixture(app: &PgPool, admin: &PgPool, seed: u64, claim_age_secs: i
         workflow_code_hash: digest('c'),
         policy_revision: "linux-small-v1:1".into(),
         limits: limits.clone(),
+        reserve_id: None,
         checkout: Some(checkout_scope()),
     };
     let reserve_handle = PgTierPCiJobBudgetReservation::new(
@@ -312,6 +313,7 @@ async fn seed_fixture(app: &PgPool, admin: &PgPool, seed: u64, claim_age_secs: i
     .await
     .unwrap()
     .remove(0);
+    authority.reserve_id = Some(reserve_handle.clone());
 
     sqlx::query(
         "INSERT INTO ci_run (
@@ -3000,7 +3002,7 @@ fn adapter_composition(pool: &PgPool, minter: Arc<CountingPhaseMinter>) -> V2Che
 fn resolved_checkout_spec(comp: &V2CheckoutComposition, fixture: &Fixture) -> JobSpec {
     let scope = checkout_scope();
     let (minted, context) = comp
-        .mint_initial_phase_credential(&fixture.claim, Some(&scope))
+        .mint_initial_phase_credential(&fixture.claim, &fixture.reserve_handle, Some(&scope))
         .expect("the resolver mints the initial advertise credential");
     let mut spec = JobSpec::new(
         JobKind::Ci,

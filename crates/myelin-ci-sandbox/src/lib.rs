@@ -484,6 +484,9 @@ pub struct CiJobAuthorizationContext {
     pub claim_nonce: String,
     pub claim_started_at_epoch_secs: i64,
     pub claim_expires_at_epoch_secs: i64,
+    /// Exact metering reservation attested by the signed capability vector. The launch boundary
+    /// re-derives it from the in-hand `JobSpec.meter_to.reserve_id` and requires exact equality.
+    pub reserve_id: String,
     pub required_capabilities: Vec<String>,
     /// CT-007 slice 5b.3-2c: the checkout target this job's durable claim was minted against, when
     /// it has one. `required_capabilities`' dynamic `repo:<ref>#pull` entry proves repo-READ
@@ -1969,6 +1972,7 @@ pub(crate) fn checkout_job_spec_for_tests() -> JobSpec {
             claim_nonce: "n".to_string(),
             claim_started_at_epoch_secs: 0,
             claim_expires_at_epoch_secs: 1,
+            reserve_id: "r".to_string(),
             required_capabilities: vec![],
             checkout_scope: None,
             credential_binding: None,
@@ -2585,6 +2589,7 @@ mod tests {
             claim_nonce: "44444444-4444-4444-8444-444444444444".into(),
             claim_started_at_epoch_secs: 1_785_000_000,
             claim_expires_at_epoch_secs: 1_785_000_030,
+            reserve_id: "reserve:job".into(),
             required_capabilities: vec!["job.launch".into()],
             checkout_scope: None,
             credential_binding: None,

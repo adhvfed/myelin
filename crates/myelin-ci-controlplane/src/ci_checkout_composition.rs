@@ -282,12 +282,14 @@ impl V2CheckoutComposition {
     pub fn mint_initial_phase_credential(
         &self,
         claim: &CiJobTokenRequest,
+        reserve_id: &str,
         checkout: Option<&CheckoutAuthorizationScope>,
     ) -> Result<(MintedPhaseCredential, RunTokenAuthorizationContext), AttemptAuthorityError> {
         let purpose = initial_phase_purpose(checkout);
         let minted = bridge(&self.rt, self.credential_store.mint_phase_credential(claim, purpose))
             .map_err(|error| AttemptAuthorityError(error.to_string()))?;
-        let context = ci_job_phase_authorization_context(claim, checkout, &minted.binding);
+        let context =
+            ci_job_phase_authorization_context(claim, reserve_id, checkout, &minted.binding);
         Ok((minted, context))
     }
 
@@ -386,7 +388,12 @@ impl DurableAttemptAuthority {
         )
         .map_err(|error| AttemptAuthorityError(error.to_string()))?;
         let context =
-            ci_job_phase_authorization_context(&self.claim, self.checkout.as_ref(), &minted.binding);
+            ci_job_phase_authorization_context(
+                &self.claim,
+                &self.reserve_handle,
+                self.checkout.as_ref(),
+                &minted.binding,
+            );
         Ok((minted.credential, context, minted.binding.generation_id))
     }
 }
@@ -524,6 +531,7 @@ mod tests {
             claim_nonce: "33333333-3333-3333-3333-333333333333".into(),
             claim_started_at_epoch_secs: 1_000,
             claim_expires_at_epoch_secs: 1_300,
+            reserve_id: "ci-reserve:v2:reserve-1".into(),
             required_capabilities: vec![],
             checkout_scope: Some(checkout_scope()),
             credential_binding: Some(CiJobCredentialBinding {

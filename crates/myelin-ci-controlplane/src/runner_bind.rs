@@ -836,7 +836,11 @@ fn durable_spec_resolver_with_issuer(
         // than what was actually authorized.
         let checkout = derive_checkout_authorization_scope(JobKind::Ci, &launch.spec.workspace)
             .map_err(|e| e.to_string())?;
-        let authorization = ci_job_authorization_context(&request, checkout.as_ref());
+        let authorization = ci_job_authorization_context(
+            &request,
+            &launch.spec.meter_to.reserve_id,
+            checkout.as_ref(),
+        );
         let run_token = bridge(&rt, token_issuer.mint(request)).map_err(|e| e.to_string())?;
         validate_run_token(&run_token, &launch.token_authority_handle).map_err(|e| e.0)?;
         Ok(launch
@@ -903,7 +907,11 @@ pub fn durable_v2_spec_resolver(
         // returned authorization context carries the credential binding the parent-attempt reserve
         // hook reconstructs the exact durable claim from.
         let (minted, authorization) = checkout_composition
-            .mint_initial_phase_credential(&request, checkout_scope.as_ref())
+            .mint_initial_phase_credential(
+                &request,
+                &launch.spec.meter_to.reserve_id,
+                checkout_scope.as_ref(),
+            )
             .map_err(|e| e.to_string())?;
         validate_run_token(&minted.credential, &launch.token_authority_handle).map_err(|e| e.0)?;
         Ok(launch

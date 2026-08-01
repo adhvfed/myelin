@@ -250,7 +250,7 @@ async fn seed_fixture(
         timeout_secs: 120,
     };
     let checkout = Some(checkout_scope());
-    let authority = CiJobRuntimeAuthorityRequest {
+    let mut authority = CiJobRuntimeAuthorityRequest {
         tenant_id: TENANT.into(),
         region: REGION.into(),
         ci_run_id: ci_run_id.clone(),
@@ -266,6 +266,7 @@ async fn seed_fixture(
         workflow_code_hash: digest('c'),
         policy_revision: "linux-small-v1:1".into(),
         limits: limits.clone(),
+        reserve_id: None,
         checkout,
     };
     let reserve_handle = PgTierPCiJobBudgetReservation::new(
@@ -280,6 +281,7 @@ async fn seed_fixture(
     .await
     .unwrap()
     .remove(0);
+    authority.reserve_id = Some(reserve_handle.clone());
 
     sqlx::query(
         "INSERT INTO ci_run (
@@ -1105,6 +1107,7 @@ fn multi_job_manifest_and_run(
                 workflow_code_hash: digest('c'),
                 policy_revision: "linux-small-v1:1".into(),
                 limits: limits.clone(),
+                reserve_id: Some(format!("ci-reserve:v2:invariant-{seed}-{i}")),
                 checkout: Some(checkout_scope()),
             };
             GrantedCiJobV1 {

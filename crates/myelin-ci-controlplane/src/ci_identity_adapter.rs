@@ -59,17 +59,25 @@ pub const CI_JOB_REQUIRED_CAPABILITIES: [&str; 2] = ["job.launch", "artifact.wri
 
 /// CT-007 slice 5b.3-2c: the ONE place the exact-repo capability grant is derived, shared by
 /// minting, context construction, and verification, so all three can never disagree about what a
-/// checkout-bearing job's capability vector should be. Compute jobs (`checkout: None`) get exactly
-/// the original two capabilities, unchanged. A checkout-bearing job additionally gets
+/// job's capability vector should be. Every job gets `reserve:<exact id>#consume`; a
+/// checkout-bearing job additionally gets
 /// `repo:<canonical ArtifactRef>#pull` (Sol's review: the full canonical ref, never a bare
 /// `repo_id`, so the grant is unambiguous without relying on capability evaluation to separately
 /// incorporate tenant). This capability proves repo-READ authority only -- NOT the exact commit;
-/// the exact commit is bound separately via `CiJobAuthorizationContext.checkout_scope`.
-fn required_ci_capabilities(checkout: Option<&CheckoutAuthorizationScope>) -> Vec<String> {
+/// checkout scope and reserve id are also exact-compared via [`CiJobAuthorizationContext`].
+fn reserve_capability(reserve_id: &str) -> String {
+    format!("reserve:{reserve_id}#consume")
+}
+
+fn required_ci_capabilities(
+    reserve_id: &str,
+    checkout: Option<&CheckoutAuthorizationScope>,
+) -> Vec<String> {
     let mut capabilities: Vec<String> = CI_JOB_REQUIRED_CAPABILITIES
         .iter()
         .map(|capability| (*capability).to_string())
         .collect();
+    capabilities.push(reserve_capability(reserve_id));
     if let Some(scope) = checkout {
         capabilities.push(format!("repo:{}#pull", scope.repo_ref().0));
     }
@@ -86,9 +94,10 @@ fn required_ci_capabilities(checkout: Option<&CheckoutAuthorizationScope>) -> Ve
 /// git wire. Only advertise/fetch (the two git-wire executions) get the repo grant.
 pub fn phase_ci_capabilities(
     purpose: CiCredentialPurpose,
+    reserve_id: &str,
     checkout: Option<&CheckoutAuthorizationScope>,
 ) -> Vec<String> {
-    match purpose {
+    let mut capabilities = match purpose {
         CiCredentialPurpose::CheckoutAdvertise | CiCredentialPurpose::CheckoutFetch => {
             let mut capabilities = vec!["job.launch".to_string()];
             if let Some(scope) = checkout {
@@ -100,7 +109,9 @@ pub fn phase_ci_capabilities(
         CiCredentialPurpose::Workload => {
             vec!["job.launch".to_string(), "artifact.write".to_string()]
         }
-    }
+    };
+    capabilities.push(reserve_capability(reserve_id));
+    capabilities
 }
 
 /// The deterministic JTI Identity will return for one exact generation. Identity derives it from
@@ -124,6 +135,7 @@ pub fn expected_phase_jti(
 /// against (CT-007 slice 5b.3-2c) -- see callers for how each derives it.
 pub fn ci_job_authorization_context(
     claim: &CiJobTokenRequest,
+    reserve_id: &str,
     checkout: Option<&CheckoutAuthorizationScope>,
 ) -> RunTokenAuthorizationContext {
     RunTokenAuthorizationContext::CiJob(CiJobAuthorizationContext {
@@ -137,7 +149,8 @@ pub fn ci_job_authorization_context(
         claim_nonce: claim.claim_nonce.clone(),
         claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
         claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
-        required_capabilities: required_ci_capabilities(checkout),
+        reserve_id: reserve_id.to_string(),
+        required_capabilities: required_ci_capabilities(reserve_id, checkout),
         checkout_scope: checkout.cloned(),
         credential_binding: None,
     })
@@ -147,6 +160,7 @@ pub fn ci_job_authorization_context(
 /// the exact durable generation so the launch boundary can recompute the signed generation id.
 pub fn ci_job_phase_authorization_context(
     claim: &CiJobTokenRequest,
+    reserve_id: &str,
     checkout: Option<&CheckoutAuthorizationScope>,
     binding: &CiPhaseCredentialBinding,
 ) -> RunTokenAuthorizationContext {
@@ -161,7 +175,8 @@ pub fn ci_job_phase_authorization_context(
         claim_nonce: claim.claim_nonce.clone(),
         claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
         claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
-        required_capabilities: phase_ci_capabilities(binding.purpose, checkout),
+        reserve_id: reserve_id.to_string(),
+        required_capabilities: phase_ci_capabilities(binding.purpose, reserve_id, checkout),
         checkout_scope: checkout.cloned(),
         credential_binding: Some(CiJobCredentialBinding {
             binding_version: binding.binding_version,
@@ -217,8 +232,11 @@ impl CiJobCredentialMinter for IdentityCiJobCredentialMinter {
             let minter = self.minter.clone();
             let mint_claim = claim.clone();
             let checkout = authority.checkout.clone();
+            let reserve_id = authority
+                .reserve_id
+                .ok_or_else(|| refused("durable CI authority lacks a reservation binding"))?;
             let task = tokio::task::spawn_blocking(move || {
-                mint_claim_credential(minter, mint_claim, checkout.as_ref())
+                mint_claim_credential(minter, mint_claim, &reserve_id, checkout.as_ref())
             });
             task.await
                 .map_err(|_| refused("Identity mint worker terminated"))?
@@ -269,6 +287,7 @@ fn validate_phase_mint_request(
         || request.issued_at_epoch_secs < claim.claim_started_at_epoch_secs
         || request.expires_at_epoch_secs <= request.issued_at_epoch_secs
         || request.expires_at_epoch_secs > claim.claim_expires_at_epoch_secs
+        || request.reserve_id.trim().is_empty()
     {
         return Err(refused("phase credential window is outside its claim"));
     }
@@ -325,7 +344,11 @@ fn sign_phase_credential(
     let minted_at = timestamp_from_epoch(request.issued_at_epoch_secs)?;
     let principal = ci_principal(&request.claim.tenant_id, &request.claim.region);
     let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
-    let required_capabilities = phase_ci_capabilities(request.purpose, request.checkout.as_ref());
+    let required_capabilities = phase_ci_capabilities(
+        request.purpose,
+        &request.reserve_id,
+        request.checkout.as_ref(),
+    );
     let authority = Authority::of(required_capabilities.clone());
     let input = DelegationInput {
         agent_policy: authority.clone(),
@@ -357,6 +380,7 @@ fn sign_phase_credential(
 fn mint_claim_credential(
     minter: RunTokenMinter,
     claim: CiJobTokenRequest,
+    reserve_id: &str,
     checkout: Option<&CheckoutAuthorizationScope>,
 ) -> Result<RunTokenCredential, CiJobTokenIssueError> {
     let token_expires_at = deterministic_token_expiry(&claim)?;
@@ -365,7 +389,7 @@ fn mint_claim_credential(
     let minted_at = timestamp_from_epoch(claim.claim_started_at_epoch_secs)?;
     let principal = ci_principal(&claim.tenant_id, &claim.region);
     let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
-    let required_capabilities = required_ci_capabilities(checkout);
+    let required_capabilities = required_ci_capabilities(reserve_id, checkout);
     let authority = Authority::of(required_capabilities.clone());
     let input = DelegationInput {
         agent_policy: authority.clone(),
@@ -693,13 +717,20 @@ impl IdentityCiJobLaunchAuthorizer {
         let (required, expected_run_id) =
             match (expected_purpose, context.credential_binding.as_ref()) {
                 (CiCredentialExpectation::LegacyClaimBound, None) => (
-                    required_ci_capabilities(rederived_checkout.as_ref()),
+                    required_ci_capabilities(
+                        &spec.meter_to.reserve_id,
+                        rederived_checkout.as_ref(),
+                    ),
                     context.job_id.clone(),
                 ),
                 (CiCredentialExpectation::Phase(purpose), Some(binding)) => {
                     let recomputed = self.verify_phase_binding(context, binding, purpose)?;
                     (
-                        phase_ci_capabilities(purpose, rederived_checkout.as_ref()),
+                        phase_ci_capabilities(
+                            purpose,
+                            &spec.meter_to.reserve_id,
+                            rederived_checkout.as_ref(),
+                        ),
                         recomputed,
                     )
                 }
@@ -717,6 +748,8 @@ impl IdentityCiJobLaunchAuthorizer {
         if context.principal_id != CI_JOB_PRINCIPAL_ID
             || context.required_capabilities != required
             || context.checkout_scope != rederived_checkout
+            || context.reserve_id != spec.meter_to.reserve_id
+            || context.reserve_id.trim().is_empty()
             || context.tenant_id.trim().is_empty()
             || context.region != self.region.0
             || context.wf_run_id.trim().is_empty()
@@ -986,6 +1019,10 @@ fn validate_claim_authority(
         || authority.ci_run_id != claim.ci_run_id
         || authority.wf_run_id != claim.wf_run_id
         || authority.job_id != claim.job_id
+        || authority
+            .reserve_id
+            .as_deref()
+            .is_none_or(|reserve_id| reserve_id.trim().is_empty())
     {
         return Err(refused(
             "durable CI authority does not match the scheduler claim",
@@ -1155,6 +1192,7 @@ mod tests {
                 pids_max: 128,
                 timeout_secs: 30,
             },
+            reserve_id: Some("reserve-1".into()),
             checkout: None,
         }
     }
@@ -1184,7 +1222,8 @@ mod tests {
             IdemToken("idem-job".into()),
         )
         .unwrap();
-        spec.run_token_authorization = Some(ci_job_authorization_context(claim, None));
+        spec.run_token_authorization =
+            Some(ci_job_authorization_context(claim, "reserve-1", None));
         spec
     }
 
@@ -1240,7 +1279,11 @@ mod tests {
             IdemToken("idem-job".into()),
         )
         .unwrap();
-        spec.run_token_authorization = Some(ci_job_authorization_context(claim, checkout));
+        spec.run_token_authorization = Some(ci_job_authorization_context(
+            claim,
+            "reserve-1",
+            checkout,
+        ));
         spec
     }
 
@@ -1330,21 +1373,26 @@ mod tests {
     }
 
     #[test]
-    fn compute_mint_capabilities_are_exactly_the_original_two() {
+    fn compute_mint_capabilities_add_exactly_the_reservation_binding() {
         assert_eq!(
-            required_ci_capabilities(None),
-            vec!["job.launch".to_string(), "artifact.write".to_string()]
+            required_ci_capabilities("reserve-1", None),
+            vec![
+                "job.launch".to_string(),
+                "artifact.write".to_string(),
+                "reserve:reserve-1#consume".to_string(),
+            ]
         );
     }
 
     #[test]
     fn checkout_mint_capabilities_add_exactly_one_repo_pull_capability() {
-        let caps = required_ci_capabilities(Some(&checkout_scope()));
+        let caps = required_ci_capabilities("reserve-1", Some(&checkout_scope()));
         assert_eq!(
             caps,
             vec![
                 "job.launch".to_string(),
                 "artifact.write".to_string(),
+                "reserve:reserve-1#consume".to_string(),
                 "repo:myelin://acme/git/repo/widgets#pull".to_string(),
             ]
         );
@@ -1362,8 +1410,8 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(
-            required_ci_capabilities(Some(&scope)),
-            required_ci_capabilities(Some(&checkout_scope())),
+            required_ci_capabilities("reserve-1", Some(&scope)),
+            required_ci_capabilities("reserve-1", Some(&checkout_scope())),
             "the repo capability names only the repo, never the commit"
         );
         assert_eq!(scope.commit_hex(), "b".repeat(64));
@@ -1462,6 +1510,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_mint_reserve_id_substitution_fails_at_the_context_comparison() {
+        let (credential, claim, cell, s7) = checkout_test_rig().await;
+        let boundary = checkout_boundary(&cell, s7, Arc::new(AllowClaimGate));
+        let scope = checkout_scope();
+        let mut spec = checkout_job(credential, &claim, checkout_workspace(), Some(&scope));
+        spec.meter_to.reserve_id = "reserve-substituted".into();
+        assert!(boundary.authorize_checkout(&spec, &scope).is_err());
+    }
+
+    #[tokio::test]
+    async fn reserve_id_substitution_fails_signed_token_verification() {
+        // Make spec, context, and expected vector consistently name a substituted reservation so
+        // every structural comparison passes. The real PASETO was minted for reserve-1 and must be
+        // the check that refuses this attack shape.
+        let (credential, claim, cell, s7) = checkout_test_rig().await;
+        let boundary = checkout_boundary(&cell, s7, Arc::new(AllowClaimGate));
+        let scope = checkout_scope();
+        let mut spec = checkout_job(credential, &claim, checkout_workspace(), Some(&scope));
+        let substituted = "reserve-substituted";
+        spec.meter_to.reserve_id = substituted.into();
+        let context = mut_context(&mut spec);
+        context.reserve_id = substituted.into();
+        context.required_capabilities = required_ci_capabilities(substituted, Some(&scope));
+        assert!(boundary.authorize_checkout(&spec, &scope).is_err());
+    }
+
+    #[tokio::test]
     async fn hook_scope_differing_from_the_in_hand_jobspec_scope_is_refused() {
         let (credential, claim, cell, s7) = checkout_test_rig().await;
         let boundary = checkout_boundary(&cell, s7, Arc::new(AllowClaimGate));
@@ -1525,6 +1600,12 @@ mod tests {
                 "wrong repo capability",
                 Box::new(|caps: &mut Vec<String>| {
                     *caps.last_mut().unwrap() = "repo:myelin://acme/git/repo/other#pull".into();
+                }),
+            ),
+            (
+                "wrong reserve capability",
+                Box::new(|caps: &mut Vec<String>| {
+                    caps[2] = "reserve:reserve-substituted#consume".into();
                 }),
             ),
             (
@@ -1884,26 +1965,46 @@ mod tests {
     fn phase_capability_vectors_are_attenuated_per_purpose() {
         let scope = checkout_scope();
         assert_eq!(
-            phase_ci_capabilities(CiCredentialPurpose::CheckoutAdvertise, Some(&scope)),
+            phase_ci_capabilities(
+                CiCredentialPurpose::CheckoutAdvertise,
+                "reserve-1",
+                Some(&scope),
+            ),
             vec![
                 "job.launch".to_string(),
-                "repo:myelin://acme/git/repo/widgets#pull".to_string()
+                "repo:myelin://acme/git/repo/widgets#pull".to_string(),
+                "reserve:reserve-1#consume".to_string(),
             ]
         );
         assert_eq!(
-            phase_ci_capabilities(CiCredentialPurpose::CheckoutFetch, Some(&scope)),
-            phase_ci_capabilities(CiCredentialPurpose::CheckoutAdvertise, Some(&scope))
+            phase_ci_capabilities(CiCredentialPurpose::CheckoutFetch, "reserve-1", Some(&scope)),
+            phase_ci_capabilities(
+                CiCredentialPurpose::CheckoutAdvertise,
+                "reserve-1",
+                Some(&scope),
+            )
         );
         assert_eq!(
-            phase_ci_capabilities(CiCredentialPurpose::CheckoutMaterialization, Some(&scope)),
-            vec!["job.launch".to_string()]
+            phase_ci_capabilities(
+                CiCredentialPurpose::CheckoutMaterialization,
+                "reserve-1",
+                Some(&scope),
+            ),
+            vec![
+                "job.launch".to_string(),
+                "reserve:reserve-1#consume".to_string(),
+            ]
         );
         assert_eq!(
-            phase_ci_capabilities(CiCredentialPurpose::Workload, Some(&scope)),
-            vec!["job.launch".to_string(), "artifact.write".to_string()]
+            phase_ci_capabilities(CiCredentialPurpose::Workload, "reserve-1", Some(&scope)),
+            vec![
+                "job.launch".to_string(),
+                "artifact.write".to_string(),
+                "reserve:reserve-1#consume".to_string(),
+            ]
         );
         for purpose in ALL_PURPOSES {
-            let caps = phase_ci_capabilities(purpose, Some(&scope));
+            let caps = phase_ci_capabilities(purpose, "reserve-1", Some(&scope));
             assert_eq!(
                 caps.contains(&"artifact.write".to_string()),
                 purpose == CiCredentialPurpose::Workload,
@@ -1983,6 +2084,7 @@ mod tests {
         let credential = adapter
             .mint_phase(CiPhaseCredentialMintRequest {
                 claim: claim.clone(),
+                reserve_id: "reserve-1".into(),
                 checkout: Some(checkout_scope()),
                 purpose,
                 generation_id: binding.generation_id.clone(),
@@ -2027,6 +2129,7 @@ mod tests {
         .unwrap();
         spec.run_token_authorization = Some(ci_job_phase_authorization_context(
             claim,
+            "reserve-1",
             Some(&scope),
             binding,
         ));
@@ -2253,6 +2356,7 @@ mod tests {
                        checkout: Option<CheckoutAuthorizationScope>| {
             CiPhaseCredentialMintRequest {
                 claim: claim.clone(),
+                reserve_id: "reserve-1".into(),
                 checkout,
                 purpose,
                 generation_id,
@@ -2330,6 +2434,7 @@ mod tests {
         assert!(late
             .mint_phase(CiPhaseCredentialMintRequest {
                 claim: claim.clone(),
+                reserve_id: "reserve-1".into(),
                 checkout: None,
                 purpose: CiCredentialPurpose::Workload,
                 generation_id: binding.generation_id,
@@ -2347,15 +2452,15 @@ mod tests {
         let claim = claim();
         let scope = checkout_scope();
         let RunTokenAuthorizationContext::CiJob(context) =
-            ci_job_authorization_context(&claim, Some(&scope));
+            ci_job_authorization_context(&claim, "reserve-1", Some(&scope));
         assert!(
             context.credential_binding.is_none(),
             "the V1 production resolver context is claim-bound, never phase-bound"
         );
         assert_eq!(
             context.required_capabilities,
-            required_ci_capabilities(Some(&scope)),
-            "the V1 capability vector is byte-unchanged by this slice"
+            required_ci_capabilities("reserve-1", Some(&scope)),
+            "the V1 capability vector includes the exact reserve binding"
         );
     }
 }

@@ -163,6 +163,7 @@ fn authority() -> CiJobRuntimeAuthorityRequest {
             pids_max: 128,
             timeout_secs: 600,
         },
+        reserve_id: Some(reserve_handle(PRIMARY_JOB_ID, '1')),
         checkout: Some(checkout_scope()),
     }
 }
@@ -778,7 +779,11 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .unwrap()
     .resolve_with_authorization(
         pre_cas_signed,
-        Some(ci_job_authorization_context(&exact_claim, Some(&checkout_scope()))),
+        Some(ci_job_authorization_context(
+            &exact_claim,
+            &expected.jobs[0].reserve_handle,
+            Some(&checkout_scope()),
+        )),
     );
     let launch_authorizer = second_identity.launch_authorizer();
     // CT-007 slice 5b.3-2c (Sol's review): prove `authorize_checkout` against a REAL durable claim
@@ -905,7 +910,11 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         .spec
         .resolve_with_authorization(
             signed.clone(),
-            Some(ci_job_authorization_context(&exact_claim, Some(&checkout_scope()))),
+            Some(ci_job_authorization_context(
+                &exact_claim,
+                &expected.jobs[0].reserve_handle,
+                Some(&checkout_scope()),
+            )),
         );
 
     let mut mutated_spec = spec.clone();
@@ -1039,7 +1048,11 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         .spec
         .resolve_with_authorization(
             spawn_signed,
-            Some(ci_job_authorization_context(&exact_claim, Some(&checkout_scope()))),
+            Some(ci_job_authorization_context(
+                &exact_claim,
+                &expected.jobs[0].reserve_handle,
+                Some(&checkout_scope()),
+            )),
         );
     launch_authorizer
         .authorize_checkout(&spawn_spec, &checkout_scope())
@@ -1129,16 +1142,30 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .unwrap()
     .resolve_with_authorization(
         signed.clone(),
-        Some(ci_job_authorization_context(&refused_claim, Some(&checkout_scope()))),
+        Some(ci_job_authorization_context(
+            &refused_claim,
+            &expected.jobs[1].reserve_handle,
+            Some(&checkout_scope()),
+        )),
     );
     let crash_spec = launch_template(&expected, 2, &crash_claim.idem_token)
         .spec
-        .resolve_with_authorization(signed, Some(ci_job_authorization_context(&crash_claim, Some(&checkout_scope()))));
+        .resolve_with_authorization(
+            signed,
+            Some(ci_job_authorization_context(
+                &crash_claim,
+                &expected.jobs[2].reserve_handle,
+                Some(&checkout_scope()),
+            )),
+        );
     let mut cross_tenant_claim = refused_claim.clone();
     cross_tenant_claim.tenant_id = "manifest-other".into();
     let mut cross_tenant_spec = refused_spec.clone();
-    cross_tenant_spec.run_token_authorization =
-        Some(ci_job_authorization_context(&cross_tenant_claim, Some(&checkout_scope())));
+    cross_tenant_spec.run_token_authorization = Some(ci_job_authorization_context(
+        &cross_tenant_claim,
+        &expected.jobs[1].reserve_handle,
+        Some(&checkout_scope()),
+    ));
     assert!(
         runner_hooks.reserve(&cross_tenant_spec).is_err(),
         "caller-supplied cross-tenant scope never begins another tenant's reservation"
@@ -1147,8 +1174,11 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     stale_generation_claim.lease_epoch += 1;
     stale_generation_claim.claim_nonce = "88888888-8888-8888-8888-888888888888".into();
     let mut stale_generation_spec = refused_spec.clone();
-    stale_generation_spec.run_token_authorization =
-        Some(ci_job_authorization_context(&stale_generation_claim, Some(&checkout_scope())));
+    stale_generation_spec.run_token_authorization = Some(ci_job_authorization_context(
+        &stale_generation_claim,
+        &expected.jobs[1].reserve_handle,
+        Some(&checkout_scope()),
+    ));
     assert!(
         runner_hooks.reserve(&stale_generation_spec).is_err(),
         "a copied context for a nonexistent claim generation cannot begin the reservation"

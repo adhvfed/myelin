@@ -392,9 +392,11 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
             "production run supersession must retain {production_supersession_dependency}"
         );
     }
-    assert!(
-        launch_authority_source.contains("ManifestBoundCiJobTokenAuthority::handle_for(request)")
-    );
+    assert!(launch_authority_source.contains(
+        "token_authority_request.reserve_id = Some(reserve_handle.clone())"
+    ));
+    assert!(launch_authority_source
+        .contains("ManifestBoundCiJobTokenAuthority::handle_for(&token_authority_request)"));
     assert!(launch_authority_source.contains("labels: LINUX_SMALL_V1_RUNNER_LABELS"));
     assert!(dispatch_consumer_source.contains("let group = format!(\"pr:{repo}:{number}\")"));
     assert!(dispatch_consumer_source.contains(".get(\"head_generation\")"));
@@ -449,10 +451,23 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let verify = claim_issuer_source
         .find("authority_from_durable_claim(&request, &run, &manifest, &launch_template)")
         .expect("claim-time issuer must reconstruct and verify durable authority");
+    let reserve_binding = claim_issuer_source
+        .find("launch_template.spec.meter_to.reserve_id != job.reserve_handle")
+        .expect("claim-time issuer must bind the dispatched reservation to the manifest");
+    let authority_function = claim_issuer_source
+        .find("pub(crate) fn authority_from_durable_claim(")
+        .expect("claim-time authority verifier must remain explicit");
+    let authority_handle_verification = claim_issuer_source
+        .find("ManifestBoundCiJobTokenAuthority::verifies(")
+        .expect("claim-time issuer must verify the versioned authority handle");
     let mint = claim_issuer_source
         .find(".mint_verified(request.clone(), authority)")
         .expect("raw Identity mint must be last");
     assert!(claim_lock < run_lock && run_lock < manifest && manifest < verify && verify < mint);
+    assert!(
+        authority_function < reserve_binding && reserve_binding < authority_handle_verification,
+        "reserve binding must happen inside durable-authority verification before handle acceptance"
+    );
     assert!(library_source.contains("PgCiRunStarterFactory::new_with_authority"));
     // It routes an AUTHORITATIVE tenant, never a synthetic one — no starter is constructed for a fixed
     // service tenant at the root (the factory mints per discovered ci_run.tenant_id).
