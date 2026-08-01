@@ -1415,8 +1415,8 @@ async fn verify_preparation_retry_permitted_on_conn(
          WHERE q.tenant_id = $1 AND q.region = $2 AND q.job_id = $3::uuid AND q.run_id = $4::uuid
            AND q.state = 'leased' AND q.lease_owner = $5 AND q.lease_epoch = $6
            AND q.claim_nonce = $7::uuid
-           AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $8
-           AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $9
+           AND FLOOR(EXTRACT(EPOCH FROM q.claim_started_at))::bigint = $8
+           AND FLOOR(EXTRACT(EPOCH FROM q.claim_expires_at))::bigint = $9
            AND q.claim_expires_at > statement_timestamp()
            AND q.completion_receipt IS NULL
          FOR UPDATE",

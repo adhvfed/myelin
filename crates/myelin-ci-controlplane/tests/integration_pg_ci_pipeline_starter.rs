@@ -670,8 +670,8 @@ async fn seed_claimed_manifest_job(
     .await
     .unwrap();
     let (started, expires): (i64, i64) = sqlx::query_as(
-        "SELECT extract(epoch FROM claim_started_at)::bigint, \
-                extract(epoch FROM claim_expires_at)::bigint \
+        "SELECT floor(extract(epoch FROM claim_started_at))::bigint, \
+                floor(extract(epoch FROM claim_expires_at))::bigint \
          FROM job_queue WHERE tenant_id=$1 AND job_id=$2::uuid",
     )
     .bind(tenant)

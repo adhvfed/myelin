@@ -155,8 +155,8 @@ FROM eligible e
 WHERE j.tenant_id = e.tenant_id AND j.job_id = e.job_id
 RETURNING j.tenant_id, j.job_id, j.run_id, j.lane, j.concurrency_group, j.fair_key, j.trust_tier,
           j.lease_epoch, j.claim_nonce::text AS claim_nonce, j.claim_window_secs,
-          EXTRACT(EPOCH FROM j.claim_started_at)::bigint AS claim_started_at_epoch_secs,
-          EXTRACT(EPOCH FROM j.claim_expires_at)::bigint AS claim_expires_at_epoch_secs";
+          FLOOR(EXTRACT(EPOCH FROM j.claim_started_at))::bigint AS claim_started_at_epoch_secs,
+          FLOOR(EXTRACT(EPOCH FROM j.claim_expires_at))::bigint AS claim_expires_at_epoch_secs";
 
 /// **Cancel-superseded (arch 02 §2.3) — a new push to a PR cancels the in-flight run for that group.**
 /// On a new enqueue for a `pr:%` concurrency group, the prior `queued`/`leased` rows for that group
@@ -269,8 +269,8 @@ WHERE tenant_id = $1
   AND lease_owner = $5
   AND lease_epoch = $6
   AND claim_nonce = $7::uuid
-  AND EXTRACT(EPOCH FROM claim_started_at)::bigint = $8
-  AND EXTRACT(EPOCH FROM claim_expires_at)::bigint = $9
+  AND FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint = $8
+  AND FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint = $9
   AND claim_expires_at > statement_timestamp()
   AND completion_receipt IS NULL
 RETURNING tenant_id, region, job_id
@@ -327,8 +327,8 @@ WHERE tenant_id = $1
   AND lease_owner = $5
   AND lease_epoch = $6
   AND claim_nonce = $7::uuid
-  AND EXTRACT(EPOCH FROM claim_started_at)::bigint = $8
-  AND EXTRACT(EPOCH FROM claim_expires_at)::bigint = $9
+  AND FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint = $8
+  AND FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint = $9
   AND claim_expires_at > statement_timestamp()
   AND lease_expires > statement_timestamp()
   AND completion_receipt IS NULL
@@ -422,8 +422,8 @@ WHERE tenant_id = $1
   AND lease_owner = $5
   AND lease_epoch = $6
   AND claim_nonce = $7::uuid
-  AND EXTRACT(EPOCH FROM claim_started_at)::bigint = $8
-  AND EXTRACT(EPOCH FROM claim_expires_at)::bigint = $9
+  AND FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint = $8
+  AND FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint = $9
   AND claim_expires_at > statement_timestamp()
   AND completion_receipt IS NULL
   AND EXISTS (
@@ -466,8 +466,8 @@ WHERE q.tenant_id = $1
   AND q.lease_owner = $5
   AND q.lease_epoch = $6
   AND q.claim_nonce = $7::uuid
-  AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $8
-  AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $9
+  AND FLOOR(EXTRACT(EPOCH FROM q.claim_started_at))::bigint = $8
+  AND FLOOR(EXTRACT(EPOCH FROM q.claim_expires_at))::bigint = $9
   AND q.claim_expires_at > statement_timestamp()
   AND q.completion_receipt IS NULL
   AND EXISTS (
@@ -587,8 +587,8 @@ WHERE q.tenant_id = $1
   AND q.lease_epoch = $7
   AND q.claim_nonce = $8::uuid
   AND q.stage = $9
-  AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $10
-  AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $11
+  AND FLOOR(EXTRACT(EPOCH FROM q.claim_started_at))::bigint = $10
+  AND FLOOR(EXTRACT(EPOCH FROM q.claim_expires_at))::bigint = $11
   AND q.claim_expires_at > statement_timestamp()
   AND q.state = 'leased'
   AND q.completion_receipt IS NULL
@@ -643,8 +643,8 @@ WHERE q.tenant_id = $1
   AND q.lease_epoch = $7
   AND q.claim_nonce = $8::uuid
   AND q.stage = $9
-  AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $10
-  AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $11
+  AND FLOOR(EXTRACT(EPOCH FROM q.claim_started_at))::bigint = $10
+  AND FLOOR(EXTRACT(EPOCH FROM q.claim_expires_at))::bigint = $11
   AND q.claim_expires_at > statement_timestamp()
   AND q.state = 'leased'
   AND q.completion_receipt IS NULL
@@ -695,8 +695,8 @@ WHERE q.tenant_id = $1
   AND q.lease_epoch = $7
   AND q.claim_nonce = $8::uuid
   AND q.stage = $9
-  AND EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $10
-  AND EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $11
+  AND FLOOR(EXTRACT(EPOCH FROM q.claim_started_at))::bigint = $10
+  AND FLOOR(EXTRACT(EPOCH FROM q.claim_expires_at))::bigint = $11
   AND q.claim_expires_at > statement_timestamp()
   AND q.state = 'leased'
   AND q.completion_receipt IS NULL
@@ -1737,8 +1737,8 @@ WHERE tenant_id = $1
   AND lease_owner = $5
   AND lease_epoch = $6
   AND claim_nonce = $7::uuid
-  AND EXTRACT(EPOCH FROM claim_started_at)::bigint = $8
-  AND EXTRACT(EPOCH FROM claim_expires_at)::bigint = $9
+  AND FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint = $8
+  AND FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint = $9
   AND claim_expires_at > statement_timestamp()
   AND completion_receipt IS NULL
 RETURNING tenant_id, region, job_id
@@ -1776,8 +1776,8 @@ RETURNING surface.job_id";
             "q.lease_owner = $5",
             "q.lease_epoch = $6",
             "q.claim_nonce = $7::uuid",
-            "EXTRACT(EPOCH FROM q.claim_started_at)::bigint = $8",
-            "EXTRACT(EPOCH FROM q.claim_expires_at)::bigint = $9",
+            "FLOOR(EXTRACT(EPOCH FROM q.claim_started_at))::bigint = $8",
+            "FLOOR(EXTRACT(EPOCH FROM q.claim_expires_at))::bigint = $9",
             "q.claim_expires_at > statement_timestamp()",
             "q.completion_receipt IS NULL",
             "FROM ci_job_parent_attempt AS parent",
@@ -1817,8 +1817,8 @@ RETURNING surface.job_id";
             "AND lease_owner = $5",
             "AND lease_epoch = $6",
             "AND claim_nonce = $7::uuid",
-            "AND EXTRACT(EPOCH FROM claim_started_at)::bigint = $8",
-            "AND EXTRACT(EPOCH FROM claim_expires_at)::bigint = $9",
+            "AND FLOOR(EXTRACT(EPOCH FROM claim_started_at))::bigint = $8",
+            "AND FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint = $9",
             "AND claim_expires_at > statement_timestamp()",
             "AND completion_receipt IS NULL",
             "UPDATE ci_job AS surface",
