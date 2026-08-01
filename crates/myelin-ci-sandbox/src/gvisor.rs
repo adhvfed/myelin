@@ -76,6 +76,212 @@ use std::time::{Duration, Instant};
 /// Env var naming the `runsc` binary; defaults to `runsc` on `PATH`.
 pub const ENV_RUNSC_BIN: &str = "MYELIN_RUNSC_BIN";
 
+// Linux capability ABI v3. Keep this tiny implementation local instead of adding a capability
+// crate to the sandbox's security-sensitive dependency surface. Capabilities are per-thread; the
+// host verifier uses that property to make CAP_DAC_READ_SEARCH effective only around its two
+// bounded, no-follow reads.
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const CAP_DAC_READ_SEARCH_NUMBER: u32 = 2;
+const PR_CAP_AMBIENT: libc::c_int = 47;
+const PR_CAP_AMBIENT_IS_SET: libc::c_ulong = 1;
+const PR_CAP_AMBIENT_LOWER: libc::c_ulong = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxCapabilityHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxCapabilityData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+fn current_thread_capabilities() -> io::Result<[LinuxCapabilityData; 2]> {
+    let mut header = LinuxCapabilityHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [LinuxCapabilityData::default(); 2];
+    // SAFETY: Linux capget ABI v3 consumes one valid header and exactly two data entries. pid=0
+    // names only the calling thread; both buffers live for the duration of the syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut header as *mut LinuxCapabilityHeader,
+            data.as_mut_ptr(),
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(data)
+    }
+}
+
+fn set_current_thread_capabilities(data: &[LinuxCapabilityData; 2]) -> io::Result<()> {
+    let mut header = LinuxCapabilityHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    // SAFETY: Linux capset ABI v3 consumes one valid header and exactly two data entries. pid=0
+    // changes only the calling thread; `data` remains live for the duration of the syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &mut header as *mut LinuxCapabilityHeader,
+            data.as_ptr(),
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn capability_mask(capability: u32) -> (usize, u32) {
+    ((capability / 32) as usize, 1u32 << (capability % 32))
+}
+
+fn capability_is_permitted(data: &[LinuxCapabilityData; 2], capability: u32) -> bool {
+    let (word, mask) = capability_mask(capability);
+    data[word].permitted & mask != 0
+}
+
+fn capability_is_effective(data: &[LinuxCapabilityData; 2], capability: u32) -> bool {
+    let (word, mask) = capability_mask(capability);
+    data[word].effective & mask != 0
+}
+
+fn capability_is_inheritable(data: &[LinuxCapabilityData; 2], capability: u32) -> bool {
+    let (word, mask) = capability_mask(capability);
+    data[word].inheritable & mask != 0
+}
+
+fn set_capability_effective(data: &mut [LinuxCapabilityData; 2], capability: u32, effective: bool) {
+    let (word, mask) = capability_mask(capability);
+    if effective {
+        data[word].effective |= mask;
+    } else {
+        data[word].effective &= !mask;
+    }
+}
+
+fn normalize_capability_sets(
+    data: &mut [LinuxCapabilityData; 2],
+    capability: u32,
+    retain_permitted: bool,
+) {
+    let (word, mask) = capability_mask(capability);
+    data[word].effective &= !mask;
+    data[word].inheritable &= !mask;
+    if retain_permitted {
+        data[word].permitted |= mask;
+    } else {
+        data[word].permitted &= !mask;
+    }
+}
+
+fn ambient_capability_is_set(capability: u32) -> io::Result<bool> {
+    // SAFETY: PR_CAP_AMBIENT/IS_SET is a read-only query for one numeric capability; unused prctl
+    // arguments are zero as required by the kernel API.
+    let result = unsafe {
+        libc::prctl(
+            PR_CAP_AMBIENT,
+            PR_CAP_AMBIENT_IS_SET,
+            capability as libc::c_ulong,
+            0,
+            0,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result == 1)
+    }
+}
+
+/// Normalize the host process's checkout-verification capability before any thread is created.
+///
+/// The service manager initially supplies `CAP_DAC_READ_SEARCH` in the ambient set because that is
+/// the only systemd mechanism that can place it in this unprivileged executable's permitted set
+/// without giving a shared binary a file capability. This function MUST run on the initial thread,
+/// before the Tokio runtime or any application thread is created. It immediately lowers the
+/// capability from the ambient set (so no later `exec`, including `runsc`, inherits it) and clears
+/// it from this thread's effective AND inheritable sets. When `retain_permitted` is true, it remains
+/// only as dormant permitted authority; threads created afterward inherit that permitted-only
+/// shape, and the host verifier temporarily enables it on its own runner thread solely around
+/// bounded `O_NOFOLLOW` reads. When false, it is removed from permitted too, so configurations that
+/// do not activate the checkout-workspace runner path retain no part of the capability at all.
+///
+/// `CAP_DAC_READ_SEARCH` bypasses DAC only for reads and directory traversal. This path never uses
+/// the broader `CAP_DAC_OVERRIDE`, never changes workspace ownership or modes, and never weakens
+/// the existing no-follow checks.
+pub fn prepare_checkout_host_verification_capability(retain_permitted: bool) -> Result<(), String> {
+    let mut capabilities = current_thread_capabilities()
+        .map_err(|error| format!("read initial thread capabilities: {error}"))?;
+    if retain_permitted && !capability_is_permitted(&capabilities, CAP_DAC_READ_SEARCH_NUMBER) {
+        return Err(
+            "CAP_DAC_READ_SEARCH is absent from the permitted set; the explicit-userns checkout \
+             host verifier requires this read-only DAC bypass"
+                .to_string(),
+        );
+    }
+    if ambient_capability_is_set(CAP_DAC_READ_SEARCH_NUMBER)
+        .map_err(|error| format!("query ambient CAP_DAC_READ_SEARCH: {error}"))?
+    {
+        // SAFETY: PR_CAP_AMBIENT/LOWER only removes the named capability from the calling thread's
+        // ambient set. Unused prctl arguments are zero as required by the kernel API.
+        let result = unsafe {
+            libc::prctl(
+                PR_CAP_AMBIENT,
+                PR_CAP_AMBIENT_LOWER,
+                CAP_DAC_READ_SEARCH_NUMBER as libc::c_ulong,
+                0,
+                0,
+            )
+        };
+        if result < 0 {
+            return Err(format!(
+                "lower ambient CAP_DAC_READ_SEARCH: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    normalize_capability_sets(
+        &mut capabilities,
+        CAP_DAC_READ_SEARCH_NUMBER,
+        retain_permitted,
+    );
+    set_current_thread_capabilities(&capabilities)
+        .map_err(|error| format!("normalize CAP_DAC_READ_SEARCH sets: {error}"))?;
+
+    let verified = current_thread_capabilities()
+        .map_err(|error| format!("re-read prepared thread capabilities: {error}"))?;
+    if capability_is_permitted(&verified, CAP_DAC_READ_SEARCH_NUMBER) != retain_permitted
+        || capability_is_effective(&verified, CAP_DAC_READ_SEARCH_NUMBER)
+        || capability_is_inheritable(&verified, CAP_DAC_READ_SEARCH_NUMBER)
+        || ambient_capability_is_set(CAP_DAC_READ_SEARCH_NUMBER)
+            .map_err(|error| format!("re-query ambient CAP_DAC_READ_SEARCH: {error}"))?
+    {
+        return Err(if retain_permitted {
+            "CAP_DAC_READ_SEARCH did not settle into permitted-only state (effective, \
+                 inheritable, and ambient must all be absent)"
+                .to_string()
+        } else {
+            "CAP_DAC_READ_SEARCH was not fully dropped (permitted, effective, inheritable, \
+                 and ambient must all be absent)"
+                .to_string()
+        });
+    }
+    Ok(())
+}
+
 /// The resolved, CANONICALIZED, ABSOLUTE `runsc` binary path — computed ONCE and cached (Sol's
 /// review, round 2: re-reading the env var on every launch means a boot preflight validating one
 /// binary and a later launch resolving a DIFFERENT one, if the environment changed mid-process,
@@ -125,6 +331,8 @@ fn runsc_bin() -> &'static Path {
 /// How a [`probe_runsc_version`] boot preflight failed; the caller owns the operator-facing wording.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunscProbeError {
+    /// The candidate carries metadata that would grant authority at `execve` time.
+    UnsafeBinary(String),
     /// The binary could not be spawned for its `--version` probe.
     CouldNotExecute,
     /// The binary ran but did not identify itself as `runsc`.
@@ -136,6 +344,17 @@ pub enum RunscProbeError {
 /// (no-host-exec, X-6/AG-2); serving binaries that require the sandbox at boot call this instead
 /// of spawning the probe themselves.
 pub fn probe_runsc_version(path: &Path) -> Result<(), RunscProbeError> {
+    probe_runsc_version_given(path, reject_security_capability_xattr)
+}
+
+fn probe_runsc_version_given(
+    path: &Path,
+    reject_file_capabilities: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), RunscProbeError> {
+    // File capabilities participate in execve's authority calculation but are not covered by the
+    // binary's content digest. This check belongs directly at the public probe/exec seam so the
+    // always-run rootless preflight cannot bypass the explicit-userns hardening helper.
+    reject_file_capabilities(path).map_err(RunscProbeError::UnsafeBinary)?;
     let output = Command::new(path)
         .arg("--version")
         .output()
@@ -161,6 +380,9 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         return Err("MYELIN_RUNSC_BIN must name an executable file".into());
     }
     probe_runsc_version(&runsc).map_err(|error| match error {
+        RunscProbeError::UnsafeBinary(reason) => format!(
+            "MYELIN_RUNSC_BIN failed executable metadata validation: {reason}"
+        ),
         RunscProbeError::CouldNotExecute => {
             "MYELIN_RUNSC_BIN could not execute its version probe".to_string()
         }
@@ -728,6 +950,16 @@ impl OciConfig {
                 absolute_rootfs, ..
             } => absolute_rootfs.as_path().to_string_lossy().to_string(),
         };
+        // Workspace-backed jobs execute from the checked-out tree. Keep every non-workspace
+        // layout at `/`: merely selecting an explicit user namespace must not imply that
+        // `/workspace` exists. Deriving cwd from the same closed layout enum that controls the
+        // mount prevents the two from drifting apart.
+        let process_cwd = match &self.layout {
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace { .. } => OCI_WORKSPACE_MOUNT,
+            OciExecutionLayout::Rootless
+            | OciExecutionLayout::RootlessWithHostMounts { .. }
+            | OciExecutionLayout::ExplicitUserNamespace { .. } => "/",
+        };
         // CT-007 slice 2/3: `Rootless`/`RootlessWithHostMounts` (the ONLY production behavior
         // before user namespaces existed) emit BYTE-IDENTICAL namespace/mapping JSON — no `user`
         // namespace, no `uidMappings`/`gidMappings`. Either explicit-userns layout adds a `user`
@@ -759,7 +991,7 @@ impl OciConfig {
         format!(
             "{{\n  \"ociVersion\": \"1.0.0\",\n  \"process\": {{\n    \
              \"user\": {{ \"uid\": {uid}, \"gid\": {gid} }},\n    \
-             \"args\": [{args}],\n    \"cwd\": \"/\",\n    \
+             \"args\": [{args}],\n    \"cwd\": {process_cwd:?},\n    \
              \"env\": [{env_json}],\n    \
              \"noNewPrivileges\": {nnp},\n    \
              \"rlimits\": [{{ \"type\": \"RLIMIT_NPROC\", \"hard\": {pids}, \"soft\": {pids} }}],\n    \
@@ -773,6 +1005,7 @@ impl OciConfig {
             uid = UNTRUSTED_UID,
             gid = UNTRUSTED_GID,
             args = args,
+            process_cwd = process_cwd,
             env_json = env_json,
             nnp = self.no_new_privileges,
             ro = self.root_readonly,
@@ -2747,6 +2980,7 @@ impl GvisorBackend {
                     claim,
                     disposition:
                         crate::runner::PreparationTerminalDisposition::AttemptsExhausted,
+                    diagnostic: None,
                 })
             }
         }
@@ -3095,12 +3329,14 @@ impl GvisorBackend {
                 // (Sol's finding 4) — but the phase is resolved either way.
                 let disposition = error.attempt_disposition();
                 let usage = checkout_preparation_error_usage(&error);
+                let diagnostic = checkout_preparation_error_diagnostic(&error).to_owned();
                 let diagnostics = runtime.dispose_checkout_runtime(workspace_manager);
                 return Ok(crate::checkout_orchestration::resolve_hop_b_failure(
                     authority,
                     report_claim,
                     disposition,
                     usage,
+                    Some(diagnostic),
                     diagnostics,
                 )?);
             }
@@ -3272,6 +3508,18 @@ fn checkout_preparation_error_usage(error: &CheckoutPreparationError) -> Resourc
         CheckoutPreparationError::Unreleasable { usage, .. } => usage.unwrap_or(zero),
         CheckoutPreparationError::TeardownUnproven { usage, .. } => *usage,
         CheckoutPreparationError::RejectedAfterQuiescence { usage, .. } => *usage,
+    }
+}
+
+/// Retain the checkout materialization diagnostic across the typed disposition seam. These messages
+/// are produced by bounded checkout/runtime or host-side verification code; credential carriers are
+/// never formatted into them.
+fn checkout_preparation_error_diagnostic(error: &CheckoutPreparationError) -> &str {
+    match error {
+        CheckoutPreparationError::Refused(message)
+        | CheckoutPreparationError::Unreleasable { message, .. }
+        | CheckoutPreparationError::TeardownUnproven { message, .. }
+        | CheckoutPreparationError::RejectedAfterQuiescence { message, .. } => message,
     }
 }
 
@@ -3526,6 +3774,7 @@ impl GvisorBackend {
                 return Ok(CheckoutContinuationOutcome::PreparationTerminal {
                     claim,
                     disposition: PreparationTerminalDisposition::AttemptsExhausted,
+                    diagnostic: None,
                 });
             }
         };
@@ -3605,6 +3854,7 @@ impl GvisorBackend {
                     report_claim,
                     disposition,
                     usage,
+                    None,
                 )?);
             }
         };
@@ -4369,6 +4619,19 @@ pub fn preflight_explicit_userns_helpers(helper_dir: &Path) -> Result<(), String
                 meta.mode() & 0o777
             ));
         }
+        // Some distributions ship these already-setuid helpers with the corresponding single file
+        // capability as defense in depth. Accept absence or that one exact v2 xattr; reject every
+        // extra bit/set/encoding so a helper cannot add unrelated authority at exec.
+        const NEWUIDMAP_CAP_SETUID_EP: &[u8] =
+            b"\x01\x00\x00\x02\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        const NEWGIDMAP_CAP_SETGID_EP: &[u8] =
+            b"\x01\x00\x00\x02\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        let expected_file_capability = match helper {
+            "newuidmap" => NEWUIDMAP_CAP_SETUID_EP,
+            "newgidmap" => NEWGIDMAP_CAP_SETGID_EP,
+            _ => unreachable!("the helper list above is closed"),
+        };
+        verify_helper_security_capability_xattr(&path, expected_file_capability)?;
         let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|e| format!("{path:?} contains an interior NUL: {e}"))?;
         // SAFETY: `path_c` is a valid, NUL-terminated path; `faccessat` only queries permission
@@ -4424,6 +4687,100 @@ fn sha256_hex_of_file(path: &Path) -> io::Result<String> {
         .collect())
 }
 
+/// Read a host executable's file capability under a tiny size bound. Content hashing does not cover
+/// xattrs, but a file capability participates in `execve`'s capability calculation.
+fn security_capability_xattr(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|error| format!("{path:?} contains an interior NUL: {error}"))?;
+    const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
+    // SAFETY: both pointers name live NUL-terminated byte strings. A null value pointer and zero
+    // size make lgetxattr a read-only size/absence query, and using lgetxattr avoids following a
+    // leaf symlink (which the surrounding hardening rejects independently).
+    let result = unsafe {
+        libc::lgetxattr(
+            path_c.as_ptr(),
+            SECURITY_CAPABILITY.as_ptr().cast(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result >= 0 {
+        let size = usize::try_from(result)
+            .map_err(|_| format!("{path:?} security.capability size is unrepresentable"))?;
+        if size > 64 {
+            return Err(format!(
+                "{path:?} security.capability xattr is unexpectedly large ({size} bytes)"
+            ));
+        }
+        let mut value = vec![0u8; size];
+        // SAFETY: the same live NUL-terminated strings are used, and `value` has exactly the size
+        // returned by the read-only probe. A concurrent size change fails closed below.
+        let read = unsafe {
+            libc::lgetxattr(
+                path_c.as_ptr(),
+                SECURITY_CAPABILITY.as_ptr().cast(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        if read < 0 {
+            return Err(format!(
+                "read {path:?} security.capability xattr: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let read = usize::try_from(read)
+            .map_err(|_| format!("{path:?} security.capability read size is unrepresentable"))?;
+        if read != size {
+            return Err(format!(
+                "{path:?} security.capability xattr changed size during validation"
+            ));
+        }
+        return Ok(Some(value));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENODATA) || error.raw_os_error() == Some(libc::ENOTSUP) {
+        Ok(None)
+    } else {
+        Err(format!("query {path:?} security.capability xattr: {error}"))
+    }
+}
+
+fn reject_security_capability_xattr(path: &Path) -> Result<(), String> {
+    reject_security_capability_xattr_given(path, security_capability_xattr)
+}
+
+/// Injectable decision core for the file-capability rejection. Keeping the policy separate from
+/// Linux's privileged xattr setup lets an ordinary unprivileged unit test prove that an unexpected
+/// value rejects before execution, while production always supplies the real no-follow reader.
+fn reject_security_capability_xattr_given(
+    path: &Path,
+    read_xattr: impl FnOnce(&Path) -> Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
+    if read_xattr(path)?.is_some() {
+        Err(format!(
+            "{path:?} carries an unexpected security.capability xattr; the pinned runsc binary \
+             must not acquire authority through file capabilities"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_helper_security_capability_xattr(
+    path: &Path,
+    expected: &[u8],
+) -> Result<(), String> {
+    match security_capability_xattr(path)? {
+        None => Ok(()),
+        Some(actual) if actual == expected => Ok(()),
+        Some(_) => Err(format!(
+            "{path:?} carries an unexpected security.capability xattr; only its exact \
+             distro-provided helper capability is accepted"
+        )),
+    }
+}
+
 /// Verify `bin` is EXACTLY the runsc release+build this slice's `ExplicitUserNamespace` contract
 /// was validated against — both the binary's own content digest AND the reported version string.
 /// Sol's review, round 6: HASH FIRST, EXECUTE ONLY AFTER the digest matches — the previous version
@@ -4443,6 +4800,9 @@ fn verify_pinned_explicit_userns_runsc(bin: &Path) -> Result<(), String> {
              hasn't already been proven byte-identical to the trusted build"
         ));
     }
+    // Keep this direct `--version` exec independently fail-closed even if a future caller forgets
+    // the surrounding explicit-userns hardening order.
+    reject_security_capability_xattr(bin)?;
     let output = Command::new(bin)
         .arg("--version")
         .output()
@@ -4574,6 +4934,7 @@ fn harden_explicit_userns_runsc_binary(bin: &Path) -> Result<(), String> {
             meta.mode() & 0o777
         ));
     }
+    reject_security_capability_xattr(bin)?;
     crate::dirlock::verify_ancestors_not_writable_by_us(bin)
         .map_err(|reason| format!("{bin:?}'s ancestor chain is not safely anchored: {reason}"))
 }
@@ -4711,9 +5072,30 @@ pub fn preflight_explicit_userns_policy(
 /// only lever we have is WHERE `runsc`'s own lookup can find them).
 fn apply_runsc_invocation_policy(
     cmd: &mut Command,
+    bin: &Path,
     mode: RunscInvocationMode,
 ) -> Result<(), String> {
-    apply_runsc_invocation_policy_given(cmd, mode, EXPLICIT_USERNS_POLICY.get())
+    apply_runsc_invocation_policy_checked_given(
+        cmd,
+        bin,
+        mode,
+        EXPLICIT_USERNS_POLICY.get(),
+        reject_security_capability_xattr,
+    )
+}
+
+fn apply_runsc_invocation_policy_checked_given(
+    cmd: &mut Command,
+    bin: &Path,
+    mode: RunscInvocationMode,
+    policy: Option<&ResolvedExplicitUsernsPolicy>,
+    reject_file_capabilities: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    // This wrapper is the common pre-exec gate for production run/kill/delete invocations. Check
+    // the actual runtime path separately from `cmd.get_program()`: fenced launches execute
+    // `/bin/sh` as the durable gate and pass `bin` as its eventual `exec "$@"` target.
+    reject_file_capabilities(bin)?;
+    apply_runsc_invocation_policy_given(cmd, mode, policy)
 }
 
 /// The actual decision logic behind [`apply_runsc_invocation_policy`], taking the installed policy
@@ -4769,7 +5151,7 @@ fn apply_explicit_userns_env(cmd: &mut Command, policy: &ResolvedExplicitUsernsP
 /// lifecycle.
 fn delete_container(bin: &Path, container_id: &str, mode: RunscInvocationMode) {
     let mut cmd = Command::new(bin);
-    if apply_runsc_invocation_policy(&mut cmd, mode).is_err() {
+    if apply_runsc_invocation_policy(&mut cmd, bin, mode).is_err() {
         return;
     }
     let _ = cmd.arg("delete").arg("-force").arg(container_id).output();
@@ -4943,7 +5325,7 @@ fn retire_container(
     mode: RunscInvocationMode,
 ) -> Result<(), String> {
     let mut cmd = Command::new(bin);
-    apply_runsc_invocation_policy(&mut cmd, mode)
+    apply_runsc_invocation_policy(&mut cmd, bin, mode)
         .map_err(|e| format!("apply runsc invocation policy for delete: {e}"))?;
     let output = cmd
         .arg("delete")
@@ -5464,7 +5846,7 @@ fn run_and_capture_impl(
     }
     {
         let cmd = sandbox_command.command_mut();
-        apply_runsc_invocation_policy(cmd, mode).map_err(RunFailure::uncommitted)?;
+        apply_runsc_invocation_policy(cmd, bin, mode).map_err(RunFailure::uncommitted)?;
         cmd.arg("--network=none")
             .arg("run")
             .arg("-bundle")
@@ -5639,7 +6021,7 @@ fn run_and_capture_impl(
             // reachable in practice. Best-effort regardless: if it somehow did fail, skip the
             // `runsc kill` (nothing safe to send it with) but still reap the host-side child below.
             let mut kill_cmd = Command::new(bin);
-            if apply_runsc_invocation_policy(&mut kill_cmd, mode).is_ok() {
+            if apply_runsc_invocation_policy(&mut kill_cmd, bin, mode).is_ok() {
                 let _ = kill_cmd.arg("kill").arg(container_id).arg("KILL").output();
             }
             *child_retirement = child.kill_and_wait();
@@ -6026,12 +6408,17 @@ pub fn resolved_gvisor_rootfs() -> std::path::PathBuf {
 /// roots/tests that need to build a real [`crate::asset_registry::GvisorAssetRegistry`] entry for
 /// it, rather than re-typing the hex string at every call site).
 pub const LINUX_SMALL_V1_ROOTFS_SHA256: &str =
-    "f9bd3926a7b47e1dd4729e5788d40dc6daf4ce159a91db169ef5bb803e73ec1f";
+    "65f0f6f242cd4412b4ad56250eadb0a459a59a71b49d21485e68da6a3d5cb975";
 
 /// The canonical-tree sha256 of the STAGED `linux-rust-v1` rootfs [`resolved_gvisor_rust_rootfs`]
 /// resolves by default — the SAME digest committed in `runner-assets.toml`'s `linux-rust-v1` row.
 pub const LINUX_RUST_V1_ROOTFS_SHA256: &str =
-    "6feada1e0ef7b739d71c7f198b03dcaab494f35ea86182dd887d23f5df0c6083";
+    "7cff5227e39276b02a2f501fd7dd29299a8341a28f02c09f83726b10f052bffa";
+
+/// Canonical-tree digest of the staged git-bearing rootfs. Unlike the former env-path-only
+/// checkout authority, this pin covers the complete tree including every fixed OCI mount target.
+pub const GVISOR_GIT_ROOTFS_SHA256: &str =
+    "0ac70764ba20a043d19933213d60070c7f8712947a86753bab518569df302646";
 
 /// Env var naming the staged Rust-capable gVisor rootfs (mirrors `runner-assets.toml`'s
 /// `linux-rust-v1` row: `env_var = "MYELIN_GVISOR_RUST_ROOTFS"`).
@@ -6310,6 +6697,69 @@ pub fn resolved_gvisor_git_rootfs() -> PathBuf {
         .join("share")
         .join("gvisor-assets")
         .join("git-rootfs")
+}
+
+/// Resolve and enforce the git rootfs's content-addressed integrity before it can be used. This is
+/// intentionally the same canonical-tree SHA-256 mechanism as [`GvisorAssetRegistry`], plus the
+/// git layouts' complete fixed mountpoint contract. Production also registers this exact path and
+/// pin at runner construction; the per-exec verification here additionally covers git-wire-only
+/// users and detects drift between startup and a later checkout.
+pub fn verified_gvisor_git_rootfs() -> Result<PathBuf, String> {
+    verify_gvisor_git_rootfs_given(&resolved_gvisor_git_rootfs(), GVISOR_GIT_ROOTFS_SHA256)
+}
+
+fn verify_gvisor_git_rootfs_given(
+    configured: &Path,
+    expected_digest: &str,
+) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(configured).map_err(|error| {
+        format!(
+            "staged gVisor git rootfs {} is absent or invalid: {error}",
+            configured.display()
+        )
+    })?;
+    if canonical == Path::new("/") || !canonical.is_dir() {
+        return Err(format!(
+            "staged gVisor git rootfs {} must resolve to a real, non-root directory",
+            canonical.display()
+        ));
+    }
+
+    // Complete destination enumeration across both layouts using this tree:
+    //   checkout: /tmp (tmpfs), /workspace (rw bind)
+    //   git wire: /tmp (tmpfs), /repo (ro bind), /quarantine (optional rw bind)
+    for destination in ["tmp", "workspace", "repo", "quarantine"] {
+        let path = canonical.join(destination);
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "git rootfs OCI mount target /{destination} must be precreated in the pinned tree: \
+                 {error}"
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "git rootfs OCI mount target /{destination} must be a real directory"
+            ));
+        }
+        let mut entries = std::fs::read_dir(&path).map_err(|error| {
+            format!("read git rootfs OCI mount target /{destination}: {error}")
+        })?;
+        if entries.next().is_some() {
+            return Err(format!(
+                "git rootfs OCI mount target /{destination} must be empty before hashing and use"
+            ));
+        }
+    }
+
+    let actual = crate::canonical_tar::canonical_tree_sha256_hex(&canonical)
+        .map_err(|error| format!("hash staged gVisor git rootfs: {error}"))?;
+    if actual != expected_digest {
+        return Err(format!(
+            "staged gVisor git rootfs has DRIFTED — expected canonical-tree \
+             sha256:{expected_digest}, computed sha256:{actual}"
+        ));
+    }
+    Ok(canonical)
 }
 
 /// A git-wire backend error.
@@ -6861,14 +7311,13 @@ fn build_git_wire_oci_config(
     profile.assert_enforced().map_err(WireError::Hardening)?;
 
     // The staged rootfs is referenced by an ABSOLUTE `root.path` (no symlink — required alongside
-    // the host bind mounts). Canonicalize so the path is absolute; an absent rootfs is caught
-    // (fail-closed) in `run_git_wire_container`.
-    let rootfs = resolved_gvisor_git_rootfs();
-    let root_abs = std::fs::canonicalize(&rootfs).unwrap_or_else(|_| rootfs.clone());
+    // the host bind mounts). Verify its complete mountpoint set and canonical-tree pin before the
+    // config can reach any spawn path; no env-path-only fallback remains.
+    let rootfs = verified_gvisor_git_rootfs().map_err(WireError::Runtime)?;
     let cfg = OciConfig::from_spec(job, &profile)
         .with_extra_env(spec.env.clone())
         .with_rootless_host_mounts(
-            root_abs,
+            rootfs.clone(),
             spec.repo_host_path.clone(),
             spec.quarantine_host_path.clone(),
         )
@@ -9402,6 +9851,107 @@ fn hash_workspace_cargo_lock_no_follow(workspace_host_path: &Path) -> Result<Str
     Ok(hex)
 }
 
+/// A per-thread, effective-only `CAP_DAC_READ_SEARCH` scope. The capability must already be dormant
+/// in the permitted set (the shape [`prepare_checkout_host_verification_capability`] establishes
+/// before application threads exist). A pre-existing effective capability is refused: silently
+/// accepting that state would turn a process-wide deployment mistake into an apparently-scoped
+/// verification.
+struct ScopedDacReadSearch {
+    active: bool,
+}
+
+impl ScopedDacReadSearch {
+    fn enter() -> Result<Self, String> {
+        let mut capabilities = current_thread_capabilities()
+            .map_err(|error| format!("read verifier-thread capabilities: {error}"))?;
+        if !capability_is_permitted(&capabilities, CAP_DAC_READ_SEARCH_NUMBER) {
+            return Err("CAP_DAC_READ_SEARCH is absent from the verifier thread's permitted set"
+                .to_string());
+        }
+        if capability_is_effective(&capabilities, CAP_DAC_READ_SEARCH_NUMBER) {
+            return Err(
+                "CAP_DAC_READ_SEARCH was already effective before the bounded host-verification \
+                 scope; startup must leave it permitted-only"
+                    .to_string(),
+            );
+        }
+        set_capability_effective(
+            &mut capabilities,
+            CAP_DAC_READ_SEARCH_NUMBER,
+            true,
+        );
+        set_current_thread_capabilities(&capabilities)
+            .map_err(|error| format!("enable scoped CAP_DAC_READ_SEARCH: {error}"))?;
+        Ok(Self { active: true })
+    }
+
+    fn clear_current_thread() -> Result<(), String> {
+        let mut capabilities = current_thread_capabilities()
+            .map_err(|error| format!("read verifier-thread capabilities for restore: {error}"))?;
+        set_capability_effective(
+            &mut capabilities,
+            CAP_DAC_READ_SEARCH_NUMBER,
+            false,
+        );
+        set_current_thread_capabilities(&capabilities)
+            .map_err(|error| format!("clear scoped CAP_DAC_READ_SEARCH: {error}"))?;
+        let verified = current_thread_capabilities()
+            .map_err(|error| format!("re-read restored verifier-thread capabilities: {error}"))?;
+        if capability_is_effective(&verified, CAP_DAC_READ_SEARCH_NUMBER) {
+            return Err("CAP_DAC_READ_SEARCH remained effective after the verifier scope".to_string());
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        Self::clear_current_thread()?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for ScopedDacReadSearch {
+    fn drop(&mut self) {
+        if self.active && Self::clear_current_thread().is_err() {
+            // Continuing the runner after failing to withdraw a host-wide read bypass would make
+            // the advertised scope false. Abort fail-closed; systemd's restart policy rebuilds the
+            // process from the prepared initial capability state.
+            std::process::abort();
+        }
+    }
+}
+
+/// Perform BOTH authoritative host reads inside one narrowly bounded capability scope. In ordinary
+/// unprivileged unit tests (where the fixture is runner-owned and the capability is wholly absent),
+/// perform the same no-follow reads under normal DAC. Production explicit-userns activation calls
+/// [`prepare_checkout_host_verification_capability`] before constructing its runtime, so a real
+/// subuid-owned checkout always takes the scoped branch and startup fails before claims if the
+/// capability was not supplied.
+fn verify_materialized_checkout_no_follow(
+    workspace_host_path: &Path,
+    expected: &ExpectedGitCommitId,
+) -> Result<String, String> {
+    let capabilities = current_thread_capabilities()
+        .map_err(|error| format!("read host-verifier capability state: {error}"))?;
+    let guard = if capability_is_permitted(&capabilities, CAP_DAC_READ_SEARCH_NUMBER) {
+        Some(ScopedDacReadSearch::enter()?)
+    } else {
+        None
+    };
+
+    let result = verify_workspace_head_no_follow(workspace_host_path, expected)
+        .map_err(|reason| format!("host-side HEAD re-verification disagreed: {reason}"))
+        .and_then(|()| {
+            hash_workspace_cargo_lock_no_follow(workspace_host_path)
+                .map_err(|reason| format!("could not hash the materialized Cargo.lock: {reason}"))
+        });
+
+    if let Some(guard) = guard {
+        guard.finish()?;
+    }
+    result
+}
+
 /// The measured [`ResourceUsage`] of one `RunscOutcome` — the SAME derivation [`build_result`] uses,
 /// extracted so the checkout-preparation path (which has no real `JobSpec` to hand `build_result`,
 /// by design — see [`run_checkout_preparation`]'s doc) can compute it from a bare `mem_bytes` value.
@@ -9748,15 +10298,7 @@ fn run_checkout_preparation_inner(
     output: Option<Arc<dyn SandboxOutputSink>>,
 ) -> Result<PreparedCheckoutEvidence, CheckoutPreparationError> {
     let bin = runsc_bin();
-    let rootfs = resolved_gvisor_git_rootfs();
-    if !rootfs.exists() {
-        return Err(CheckoutPreparationError::Refused(format!(
-            "staged gVisor git rootfs absent: {} (the checkout runtime REQUIRES a real `git` in \
-             the guest, same as the git wire)",
-            rootfs.display()
-        )));
-    }
-    let root_abs = std::fs::canonicalize(&rootfs).unwrap_or_else(|_| rootfs.clone());
+    let root_abs = verified_gvisor_git_rootfs().map_err(CheckoutPreparationError::Refused)?;
     let userns = lease.config();
     let workspace_mount = OciWorkspaceMount::from_managed_workspace(workspace);
 
@@ -10016,19 +10558,13 @@ fn evaluate_checkout_finalization(
             return Err(checkout_materialization_terminal_failed(reason, usage))
         }
     };
-    if let Err(reason) = verify_workspace_head_no_follow(workspace_host_path, expected_commit) {
-        return Err(checkout_materialization_terminal_failed(
-            format!("host-side HEAD re-verification disagreed: {reason}"),
-            usage,
-        ));
-    }
-    let cargo_lock_sha256_hex = match hash_workspace_cargo_lock_no_follow(workspace_host_path) {
+    let cargo_lock_sha256_hex = match verify_materialized_checkout_no_follow(
+        workspace_host_path,
+        expected_commit,
+    ) {
         Ok(hex) => hex,
         Err(reason) => {
-            return Err(checkout_materialization_terminal_failed(
-                format!("could not hash the materialized Cargo.lock: {reason}"),
-                usage,
-            ))
+            return Err(checkout_materialization_terminal_failed(reason, usage))
         }
     };
 
@@ -10066,6 +10602,62 @@ mod tests {
     // hardware-independent runsc-driver seam + §4 tests can reach them. Re-imported here so the
     // existing `#[cfg(test)]` callers keep compiling.
     use crate::gvisor::checkout_transport_test_support::FakeRunsc;
+
+    #[test]
+    fn enabled_startup_normalization_keeps_only_permitted_dac_read_search() {
+        let mut capabilities = [LinuxCapabilityData::default(); 2];
+        let (word, mask) = capability_mask(CAP_DAC_READ_SEARCH_NUMBER);
+        capabilities[word].permitted |= mask;
+        capabilities[word].effective |= mask;
+        capabilities[word].inheritable |= mask;
+
+        normalize_capability_sets(
+            &mut capabilities,
+            CAP_DAC_READ_SEARCH_NUMBER,
+            true,
+        );
+
+        assert!(capability_is_permitted(
+            &capabilities,
+            CAP_DAC_READ_SEARCH_NUMBER
+        ));
+        assert!(!capability_is_effective(
+            &capabilities,
+            CAP_DAC_READ_SEARCH_NUMBER
+        ));
+        assert!(!capability_is_inheritable(
+            &capabilities,
+            CAP_DAC_READ_SEARCH_NUMBER
+        ));
+    }
+
+    #[test]
+    fn non_enabled_startup_normalization_drops_dac_read_search_entirely() {
+        let mut capabilities = [LinuxCapabilityData::default(); 2];
+        let (word, mask) = capability_mask(CAP_DAC_READ_SEARCH_NUMBER);
+        capabilities[word].permitted |= mask;
+        capabilities[word].effective |= mask;
+        capabilities[word].inheritable |= mask;
+
+        normalize_capability_sets(
+            &mut capabilities,
+            CAP_DAC_READ_SEARCH_NUMBER,
+            false,
+        );
+
+        assert!(!capability_is_permitted(
+            &capabilities,
+            CAP_DAC_READ_SEARCH_NUMBER
+        ));
+        assert!(!capability_is_effective(
+            &capabilities,
+            CAP_DAC_READ_SEARCH_NUMBER
+        ));
+        assert!(!capability_is_inheritable(
+            &capabilities,
+            CAP_DAC_READ_SEARCH_NUMBER
+        ));
+    }
 
     // =============================================================================================
     // CT-007 phase-credential generations: SOURCE PINS.
@@ -11414,6 +12006,86 @@ mod tests {
         assert!(error.contains("MYELIN_RUNSC_BIN must be an absolute path"));
     }
 
+    #[test]
+    fn rootless_version_probe_rejects_an_unexpected_file_capability_before_exec() {
+        let result = probe_runsc_version_given(Path::new("/definitely/not/executable"), |_| {
+            Err("unexpected security.capability xattr".to_string())
+        });
+        assert_eq!(
+            result,
+            Err(RunscProbeError::UnsafeBinary(
+                "unexpected security.capability xattr".to_string()
+            )),
+            "the rootless startup probe must reject metadata before attempting --version"
+        );
+    }
+
+    #[test]
+    fn every_rootless_runtime_invocation_rejects_an_unexpected_file_capability() {
+        let bin = Path::new("/vetted/runsc");
+        let mut cmd = Command::new(bin);
+        let result = apply_runsc_invocation_policy_checked_given(
+            &mut cmd,
+            bin,
+            RunscInvocationMode::Rootless,
+            None,
+            |path| Err(format!("{path:?} carries an unexpected security.capability xattr")),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("unexpected security.capability xattr")
+        );
+        assert_eq!(
+            cmd.get_args().count(),
+            0,
+            "rejection must happen before even the rootless invocation policy is assembled"
+        );
+    }
+
+    #[test]
+    fn git_rootfs_requires_every_fixed_mountpoint_and_verifies_a_stable_digest() {
+        let rootfs = std::env::temp_dir().join(format!(
+            "myelin-git-rootfs-integrity-{}",
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&rootfs).unwrap();
+        for destination in ["tmp", "workspace", "repo", "quarantine"] {
+            std::fs::create_dir(rootfs.join(destination)).unwrap();
+        }
+        std::fs::write(rootfs.join("git-payload"), b"pinned git rootfs bytes").unwrap();
+        let digest = crate::canonical_tar::canonical_tree_sha256_hex(&rootfs).unwrap();
+
+        let first = verify_gvisor_git_rootfs_given(&rootfs, &digest).unwrap();
+        let second = verify_gvisor_git_rootfs_given(&rootfs, &digest).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            crate::canonical_tar::canonical_tree_sha256_hex(&rootfs).unwrap(),
+            digest,
+            "verification itself must not mutate the shared git rootfs"
+        );
+
+        for destination in ["tmp", "workspace", "repo", "quarantine"] {
+            std::fs::remove_dir(rootfs.join(destination)).unwrap();
+            let error = verify_gvisor_git_rootfs_given(&rootfs, &digest)
+                .expect_err("every OCI destination must pre-exist before hashing/use");
+            assert!(
+                error.contains(&format!("/{destination}")),
+                "missing destination must be named: {error}"
+            );
+            std::fs::create_dir(rootfs.join(destination)).unwrap();
+        }
+
+        std::fs::write(rootfs.join("unapproved-drift"), b"drift").unwrap();
+        assert!(
+            verify_gvisor_git_rootfs_given(&rootfs, &digest)
+                .unwrap_err()
+                .contains("DRIFTED"),
+            "content added outside the mountpoints must fail the pin"
+        );
+        let _ = std::fs::remove_dir_all(rootfs);
+    }
+
     /// A real, on-disk, empty fixture rootfs — hashed with the SAME pure-Rust
     /// [`crate::canonical_tar::canonical_tree_sha256_hex`] the registry itself uses — so [`spec`]'s
     /// image is a GENUINELY verifiable pin, not a fabricated placeholder digest a real registry
@@ -11426,6 +12098,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::create_dir(dir.join("workspace"));
         dir
     }
 
@@ -12025,6 +12698,10 @@ mod tests {
                 && json.contains("\"rw\""),
             "exactly one fixed writable workspace bind mount must be present: {json}"
         );
+        assert!(
+            json.contains("\"cwd\": \"/workspace\""),
+            "workspace-backed workloads must start in the checked-out tree: {json}"
+        );
         // Never readonly, never a caller-selectable destination — only ONE workspace mount entry.
         assert_eq!(
             json.matches("\"destination\": \"/workspace\"").count(),
@@ -12241,8 +12918,10 @@ mod tests {
     /// `apply_runsc_invocation_policy_refuses_explicit_userns_without_a_validated_policy`).
     #[test]
     fn apply_runsc_invocation_policy_matches_the_mode_exactly() {
-        let mut rootless_cmd = Command::new("runsc");
-        apply_runsc_invocation_policy(&mut rootless_cmd, RunscInvocationMode::Rootless).unwrap();
+        let bin = Path::new("/bin/true");
+        let mut rootless_cmd = Command::new(bin);
+        apply_runsc_invocation_policy(&mut rootless_cmd, bin, RunscInvocationMode::Rootless)
+            .unwrap();
         assert_eq!(
             rootless_cmd
                 .get_args()
@@ -13775,10 +14454,12 @@ mod tests {
                     disposition: PreparationTerminalDisposition::Failed {
                         phase: PreparationPhase::CheckoutMaterialization
                     },
+                    diagnostic: Some(ref diagnostic),
                     ..
                 }
+                if diagnostic == "injected terminal checkout rejection"
             ),
-            "a terminal Hop B failure becomes a preparation-terminal outcome, got {outcome:?}"
+            "a terminal Hop B failure retains its diagnostic in the preparation-terminal outcome, got {outcome:?}"
         );
         let ops = authority.ops.lock().unwrap().clone();
         assert!(
@@ -17976,6 +18657,146 @@ mod tests {
             let _ = std::fs::remove_dir_all(&real);
         }
 
+        /// Exact regression for the production failure: checkout runs as OCI uid 65534, mapped to
+        /// the leased subordinate host uid, and `umask 077` leaves its `.git` directory mode 0700.
+        /// Normal runner DAC must get EACCES; the combined host verifier must succeed through only
+        /// scoped CAP_DAC_READ_SEARCH, then withdraw it without changing any owner or mode.
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn host_verifier_reads_subuid_owned_umask_077_checkout_without_normalizing_ownership() {
+            let initial = current_thread_capabilities().unwrap();
+            if !capability_is_permitted(&initial, CAP_DAC_READ_SEARCH_NUMBER) {
+                if std::env::var("MYELIN_REQUIRE_DAC_READ_SEARCH_TEST").as_deref() == Ok("1") {
+                    panic!(
+                        "MYELIN_REQUIRE_DAC_READ_SEARCH_TEST=1 but CAP_DAC_READ_SEARCH is absent \
+                         from the test process's permitted set"
+                    );
+                }
+                eprintln!(
+                    "host_verifier_reads_subuid_owned_umask_077_checkout_without_normalizing_ownership: \
+                     SKIPPED — rerun under the production-shaped ambient capability grant with \
+                     MYELIN_REQUIRE_DAC_READ_SEARCH_TEST=1 to hard-require this privileged drill"
+                );
+                return;
+            }
+            prepare_checkout_host_verification_capability(true)
+                .expect("the privileged regression unit must supply CAP_DAC_READ_SEARCH");
+            let Some((allocator, leases_dir)) =
+                real_userns_allocator_for_tests("host-verifier-subuid")
+            else {
+                panic!("the privileged regression unit requires a usable subordinate uid/gid");
+            };
+            let lease = allocator.lease().expect("lease a real subordinate uid/gid");
+            let subuid = lease.host_uid();
+            let subgid = lease.host_gid();
+            assert_ne!(subuid, unsafe { libc::geteuid() });
+
+            let ws = temp_dir_for("subuid-0700");
+            std::fs::create_dir(ws.join(".git")).unwrap();
+            let oid = sha1_oid(0xce);
+            std::fs::write(ws.join(".git/HEAD"), format!("{oid}\n")).unwrap();
+            let lock_bytes = b"# subuid regression lockfile\n";
+            std::fs::write(ws.join("Cargo.lock"), lock_bytes).unwrap();
+
+            // Retain FDs so cleanup never depends on traversing the deliberately inaccessible
+            // pathname. This also lets the test restore ownership after all assertions are sampled.
+            let ws_fd = std::fs::File::open(&ws).unwrap();
+            let git_fd = std::fs::File::open(ws.join(".git")).unwrap();
+            let head_fd = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(ws.join(".git/HEAD"))
+                .unwrap();
+            let lock_fd = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(ws.join("Cargo.lock"))
+                .unwrap();
+            let transfer_to_subuid = |file: &std::fs::File, mode: u32| {
+                // Match WorkspaceStorage's load-bearing order: chmod while still the owner, then
+                // transfer ownership last. CAP_CHOWN does not itself authorize a later chmod.
+                // SAFETY: every FD is live and still owned by this test process here.
+                assert_eq!(unsafe { libc::fchmod(file.as_raw_fd(), mode) }, 0);
+                // SAFETY: every FD is live for the closure call. The test is launched with
+                // CAP_CHOWN and changes only its fresh fixture to the allocator-minted subids.
+                assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), subuid, subgid) }, 0);
+            };
+            let restore_to_runner = |file: &std::fs::File, mode: u32| {
+                // Restore ownership first through CAP_CHOWN; once owner again, chmod is ordinary.
+                // SAFETY: every FD remains live and names only the fresh fixture.
+                assert_eq!(unsafe {
+                    libc::fchown(file.as_raw_fd(), libc::geteuid(), libc::getegid())
+                }, 0);
+                // SAFETY: the successful fchown above made the current euid the owner.
+                assert_eq!(unsafe { libc::fchmod(file.as_raw_fd(), mode) }, 0);
+            };
+            transfer_to_subuid(&head_fd, 0o600);
+            transfer_to_subuid(&lock_fd, 0o600);
+            transfer_to_subuid(&git_fd, 0o700);
+            transfer_to_subuid(&ws_fd, 0o755);
+
+            let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
+            let ordinary_dac_error = verify_workspace_head_no_follow(&ws, &expected).unwrap_err();
+            let verified_digest = verify_materialized_checkout_no_follow(&ws, &expected);
+            let ws_meta = ws_fd.metadata().unwrap();
+            let git_meta = git_fd.metadata().unwrap();
+            let head_meta = head_fd.metadata().unwrap();
+            let lock_meta = lock_fd.metadata().unwrap();
+            let post_scope_caps = current_thread_capabilities().unwrap();
+            let post_scope_ambient =
+                ambient_capability_is_set(CAP_DAC_READ_SEARCH_NUMBER).unwrap();
+
+            restore_to_runner(&head_fd, 0o600);
+            restore_to_runner(&lock_fd, 0o600);
+            restore_to_runner(&git_fd, 0o700);
+            restore_to_runner(&ws_fd, 0o755);
+            drop((head_fd, lock_fd, git_fd, ws_fd));
+            lease.release_unused().expect("release unused subuid lease");
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&leases_dir);
+
+            assert!(
+                ordinary_dac_error.contains("Permission denied"),
+                "ordinary host DAC must reproduce the exact .git traversal failure: \
+                 {ordinary_dac_error}"
+            );
+            let mut hasher = Sha256::new();
+            hasher.update(lock_bytes);
+            let expected_digest = hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(verified_digest.unwrap(), expected_digest);
+            for (label, metadata, mode) in [
+                ("workspace", ws_meta, 0o755),
+                (".git", git_meta, 0o700),
+                (".git/HEAD", head_meta, 0o600),
+                ("Cargo.lock", lock_meta, 0o600),
+            ] {
+                assert_eq!(metadata.uid(), subuid, "{label} owner must remain the subuid");
+                assert_eq!(
+                    metadata.gid(),
+                    subgid,
+                    "{label} group must remain the subgid"
+                );
+                assert_eq!(
+                    metadata.mode() & 0o777,
+                    mode,
+                    "{label} mode must not be widened"
+                );
+            }
+            assert!(
+                !capability_is_effective(&post_scope_caps, CAP_DAC_READ_SEARCH_NUMBER),
+                "CAP_DAC_READ_SEARCH must be withdrawn after verification"
+            );
+            assert!(
+                !capability_is_inheritable(&post_scope_caps, CAP_DAC_READ_SEARCH_NUMBER),
+                "CAP_DAC_READ_SEARCH must never remain inheritable"
+            );
+            assert!(!post_scope_ambient, "runsc/child execs must never inherit the cap");
+        }
+
         // ---- CT-007 slice 5b.2 live drill (Sol's review, round 3): real git-wire (Hop A) + real
         // runsc/OCI/userns/workspace (Hop B), end to end. Mirrors
         // `explicit_user_namespace_boots_through_the_real_enabled_backend_and_launch`'s exact
@@ -18049,8 +18870,11 @@ mod tests {
                 std::os::unix::fs::symlink("../../bin/git", &link)
                     .expect("git-core helper symlink");
             }
-            std::fs::create_dir_all(staged.join("repo")).expect("mkdir /repo mount point");
-            std::fs::create_dir_all(staged.join("quarantine")).expect("mkdir /quarantine mount point");
+            for destination in ["tmp", "workspace", "repo", "quarantine"] {
+                std::fs::create_dir_all(staged.join(destination)).unwrap_or_else(|error| {
+                    panic!("mkdir /{destination} mount point: {error}")
+                });
+            }
             staged
         }
 
@@ -22664,6 +23488,8 @@ pub mod checkout_transport_test_support {
     pub fn deterministic_enabled_backend_for_tests(root: &Path) -> (GvisorBackend, ImageRef) {
         let rootfs = root.join("rootfs");
         std::fs::create_dir_all(&rootfs).expect("stage the workload rootfs dir");
+        std::fs::create_dir(rootfs.join("workspace"))
+            .expect("precreate the pinned workspace mountpoint");
         let digest = crate::canonical_tar::canonical_tree_sha256_hex(&rootfs)
             .expect("hash the staged rootfs");
         let image =

@@ -14,7 +14,7 @@
 //! one-tx ref-CAS + outbox. Gated like CT-006c: `MYELIN_REQUIRE_RUNSC=1` ⇒ an absent capability is a
 //! HARD failure. Run: `MYELIN_REQUIRE_RUNSC=1 cargo test -p myelin-edge --test git_wire_http_push_oracle_test -- --nocapture`.
 
-use myelin_ci_sandbox::{resolved_gvisor_rootfs, ENV_GVISOR_GIT_ROOTFS};
+use myelin_ci_sandbox::verified_gvisor_git_rootfs;
 use myelin_edge::{
     register_git_wire, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
@@ -31,7 +31,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
@@ -61,73 +60,27 @@ fn host_git() -> bool {
 }
 
 fn require_or_skip(test: &str) -> bool {
-    if runsc_bin().is_some() && resolved_gvisor_rootfs().exists() && host_git() {
-        return true;
+    if runsc_bin().is_none() || !host_git() {
+        if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") {
+            panic!("[{test}] MYELIN_REQUIRE_RUNSC=1 but runsc/host git absent — refusing a vacuous green.");
+        }
+        eprintln!("[{test}] SKIPPED: runsc/host git absent.");
+        return false;
     }
-    if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") {
-        panic!("[{test}] MYELIN_REQUIRE_RUNSC=1 but runsc/base rootfs/host git absent — refusing a vacuous green.");
-    }
-    eprintln!("[{test}] SKIPPED: runsc/base rootfs/host git absent.");
-    false
-}
 
-fn copy_file(src: &Path, dst: &Path) {
-    if let Some(p) = dst.parent() {
-        std::fs::create_dir_all(p).expect("mkdir -p");
+    match verified_gvisor_git_rootfs() {
+        Ok(_) => true,
+        Err(error) if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") => {
+            panic!(
+                "[{test}] MYELIN_REQUIRE_RUNSC=1 but the pinned production git rootfs is \
+                 unavailable: {error} — refusing a vacuous green."
+            );
+        }
+        Err(error) => {
+            eprintln!("[{test}] SKIPPED: pinned production git rootfs unavailable: {error}");
+            false
+        }
     }
-    std::fs::copy(src, dst).unwrap_or_else(|e| panic!("copy {src:?} -> {dst:?}: {e}"));
-}
-
-fn stage_lib(rootfs: &Path, soname: &str, host_path: &str) {
-    let real = std::fs::canonicalize(host_path).unwrap_or_else(|_| PathBuf::from(host_path));
-    let real_name = real.file_name().unwrap().to_string_lossy().to_string();
-    for libdir in ["usr/lib", "lib"] {
-        let dst_real = rootfs.join(libdir).join(&real_name);
-        copy_file(&real, &dst_real);
-        let link = rootfs.join(libdir).join(soname);
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&real_name, &link).expect("soname symlink");
-    }
-}
-
-fn stage_git_rootfs(base: &Path) -> PathBuf {
-    let staged =
-        std::env::temp_dir().join(format!("myelin-ct006d-push-rootfs-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staged);
-    let st = Command::new("cp")
-        .arg("-a")
-        .arg(format!("{}/.", base.display()))
-        .arg(&staged)
-        .status()
-        .expect("cp -a");
-    assert!(st.success(), "cp -a base rootfs failed");
-    copy_file(Path::new("/usr/bin/git"), &staged.join("usr/bin/git"));
-    stage_lib(&staged, "libpcre2-8.so.0", "/usr/lib/libpcre2-8.so.0");
-    stage_lib(&staged, "libz-ng.so.2", "/usr/lib/libz-ng.so.2");
-    let core = staged.join("usr/lib/git-core");
-    std::fs::create_dir_all(&core).expect("mkdir git-core");
-    for helper in ["git-upload-pack", "git-receive-pack"] {
-        let link = core.join(helper);
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink("../../bin/git", &link).expect("helper symlink");
-    }
-    std::fs::create_dir_all(staged.join("repo")).expect("mkdir /repo");
-    staged
-}
-
-fn git_rootfs() -> Option<PathBuf> {
-    static STAGED: OnceLock<Option<PathBuf>> = OnceLock::new();
-    STAGED
-        .get_or_init(|| {
-            let base = resolved_gvisor_rootfs();
-            if !base.exists() {
-                return None;
-            }
-            let staged = stage_git_rootfs(&base);
-            std::env::set_var(ENV_GVISOR_GIT_ROOTFS, &staged);
-            Some(staged)
-        })
-        .clone()
 }
 
 fn now() -> i64 {
@@ -314,7 +267,6 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
     if !require_or_skip("ct006d push oracle") {
         return;
     }
-    let Some(_rootfs) = git_rootfs() else { return };
 
     let root = temp_root("push");
     // The server repo must exist (push to a non-existent repo is a 404). Create it durably.
@@ -572,7 +524,6 @@ async fn r0_2_branch_protection_rejects_force_push_through_the_live_wire() {
     if !require_or_skip("r2.1a R0.2 protected-ref oracle") {
         return;
     }
-    let Some(_rootfs) = git_rootfs() else { return };
 
     let root = temp_root("r21a-r02");
     let (gw, cell) = build_r21a(&root);
@@ -662,7 +613,6 @@ async fn writer_direct_push_to_protected_ref_is_refused_over_the_wire() {
     if !require_or_skip("r2-exit writer→protected-push oracle") {
         return;
     }
-    let Some(_rootfs) = git_rootfs() else { return };
 
     let root = temp_root("r2exit-writer");
     // A backend whose per-repo authorizer grants the pushing principal (svc:agent) WRITE only — NOT
@@ -803,7 +753,6 @@ async fn real_git_clone_and_push_over_http_basic_auth() {
     if !require_or_skip("r4.0 basic-auth wire oracle") {
         return;
     }
-    let Some(_rootfs) = git_rootfs() else { return };
 
     let root = temp_root("basic");
     let backend_for_create = DurableGitBackend::rooted_inmem_for_test(root.clone());
@@ -949,7 +898,6 @@ async fn f1_real_git_over_credential_helper_needs_the_basic_challenge() {
     if !require_or_skip("f1 credential-helper wire oracle") {
         return;
     }
-    let Some(_rootfs) = git_rootfs() else { return };
 
     let root = temp_root("f1-helper");
     let backend_for_create = DurableGitBackend::rooted_inmem_for_test(root.clone());
@@ -999,7 +947,6 @@ async fn f9_fresh_clone_checks_out_main_and_server_head_symref_is_main() {
     if !require_or_skip("f9 head-symref clone oracle") {
         return;
     }
-    let Some(_rootfs) = git_rootfs() else { return };
 
     let root = temp_root("f9-head");
     let backend_for_create = DurableGitBackend::rooted_inmem_for_test(root.clone());

@@ -604,9 +604,10 @@ impl PreparationPhase {
 /// Closed terminal vocabulary for a job whose workload never launched.
 ///
 /// There is intentionally no usage, caller-supplied `passed`, arbitrary message, or result payload
-/// here. Prelaunch usage is authoritative in `ci_job_prelaunch_usage`; every variant resumes the
-/// DAG as failed; diagnostics remain in the bounded durable log stream. The exact-owner/CAS method
-/// that consumes this report lands in CT-007 slice 5b.3-5b.
+/// in the disposition. Prelaunch usage is authoritative in `ci_job_prelaunch_usage`; every variant
+/// resumes the DAG as failed. The reporting seam carries separately-derived, operator-safe checkout
+/// diagnostics without making them receipt authority. The exact-owner/CAS method that consumes this
+/// report lands in CT-007 slice 5b.3-5b.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreparationTerminalDisposition {
     Failed { phase: PreparationPhase },
@@ -791,8 +792,9 @@ pub trait TerminalReporter {
     /// full [`PreparationReportClaim`] (the twelve claim-bound identity fields) because a preparation
     /// terminal re-verifies the parent attempt under the durable CAS — the seven-field
     /// [`CompletionClaim`] a workload `job.done` carries is insufficient. A CI-pipeline reporter maps
-    /// the claim onto its durable request and settles/terminalizes; a generic engine reporter (which is
-    /// NOT on the CI pipeline path) EXPLICITLY refuses.
+    /// the claim onto its durable request and settles/terminalizes. `diagnostic` is separately-derived
+    /// operator detail, never credential material or accounting authority. A generic engine reporter
+    /// (which is NOT on the CI pipeline path) EXPLICITLY refuses.
     ///
     /// This is a REQUIRED method with no default: every implementor makes a conscious refuse-or-delegate
     /// choice, so an incomplete production reporter fails to compile rather than silently refusing.
@@ -800,6 +802,7 @@ pub trait TerminalReporter {
         &self,
         claim: &PreparationReportClaim,
         disposition: PreparationTerminalDisposition,
+        diagnostic: Option<&str>,
     ) -> Result<SignalOutcome, ExecutorError>;
 
     /// **CT-007 slice 5b.3-6d STEP 4: report a checkout PREPARATION retry — requeue the exact leased
@@ -878,6 +881,7 @@ impl<E: DurableExecutor> TerminalReporter for EngineTerminalReporter<E> {
         &self,
         _claim: &PreparationReportClaim,
         _disposition: PreparationTerminalDisposition,
+        _diagnostic: Option<&str>,
     ) -> Result<SignalOutcome, ExecutorError> {
         // The generic engine reporter is NOT the CI pipeline path: it has no parent-attempt journal,
         // no preparation CAS, and no claim-bound token request to re-verify. Preparation reporting
@@ -935,6 +939,8 @@ pub enum RunnerCycleOutcome {
         job_id: String,
         run_id: String,
         signal_outcome: SignalOutcome,
+        /// The retained, operator-safe checkout diagnostic reported and persisted with the terminal.
+        diagnostic: Option<String>,
     },
     PreparationRetryable {
         job_id: String,
@@ -1134,11 +1140,17 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
     ) -> Result<PreparationOutcomeDispatch, ExecutorError> {
         use crate::SandboxCycleOutcome;
         match outcome {
-            SandboxCycleOutcome::PreparationTerminal { claim, disposition } => Ok(
-                PreparationOutcomeDispatch::Terminalized(
-                    self.reporter.report_preparation_terminal(claim, *disposition)?,
-                ),
-            ),
+            SandboxCycleOutcome::PreparationTerminal {
+                claim,
+                disposition,
+                diagnostic,
+            } => Ok(PreparationOutcomeDispatch::Terminalized(
+                self.reporter.report_preparation_terminal(
+                    claim,
+                    *disposition,
+                    diagnostic.as_deref(),
+                )?,
+            )),
             SandboxCycleOutcome::PreparationRetryable { claim, .. } => Ok(
                 PreparationOutcomeDispatch::Retried(
                     self.reporter.report_preparation_retry(claim)?,
@@ -1380,10 +1392,17 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                     .map_err(RunnerError::ReportFailed)?
                 {
                     PreparationOutcomeDispatch::Terminalized(signal_outcome) => {
+                        let diagnostic = match outcome {
+                            crate::SandboxCycleOutcome::PreparationTerminal {
+                                diagnostic, ..
+                            } => diagnostic,
+                            _ => unreachable!("the matched outcome is preparation-terminal"),
+                        };
                         Ok(RunnerCycleOutcome::PreparationTerminal {
                             job_id: job.job_id,
                             run_id: job.run_id,
                             signal_outcome,
+                            diagnostic,
                         })
                     }
                     _ => unreachable!("a preparation-terminal outcome has one reporter route"),
@@ -1795,6 +1814,7 @@ mod tests {
                         disposition: PreparationTerminalDisposition::Failed {
                             phase: PreparationPhase::CheckoutMaterialization,
                         },
+                        diagnostic: Some("injected materialization diagnostic".into()),
                     }
                 }
                 CycleMode::PreparationRetryable => {
@@ -1812,6 +1832,12 @@ mod tests {
         }
     }
 
+    type RecordedPreparationTerminal = (
+        PreparationReportClaim,
+        PreparationTerminalDisposition,
+        Option<String>,
+    );
+
     struct RecordingTerminalReporter {
         owner: CompletionSettlementOwner,
         reports: AtomicUsize,
@@ -1823,7 +1849,7 @@ mod tests {
         retry_causes: Arc<Mutex<Vec<RetryableAttemptCause>>>,
         /// CT-007 5b.3-6d STEP 4: every `report_preparation_terminal` call's exact claim + disposition,
         /// so the dormant dispatch test can assert the reporter received the outcome's own claim.
-        prep_terminals: Arc<Mutex<Vec<(PreparationReportClaim, PreparationTerminalDisposition)>>>,
+        prep_terminals: Arc<Mutex<Vec<RecordedPreparationTerminal>>>,
         /// CT-007 5b.3-6d STEP 4: every `report_preparation_retry` call's exact claim.
         prep_retries: Arc<Mutex<Vec<PreparationReportClaim>>>,
         fail: bool,
@@ -1884,6 +1910,7 @@ mod tests {
             &self,
             claim: &PreparationReportClaim,
             disposition: PreparationTerminalDisposition,
+            diagnostic: Option<&str>,
         ) -> Result<SignalOutcome, ExecutorError> {
             if self.fail {
                 return Err(ExecutorError::Storage(
@@ -1893,7 +1920,7 @@ mod tests {
             self.prep_terminals
                 .lock()
                 .unwrap()
-                .push((claim.clone(), disposition));
+                .push((claim.clone(), disposition, diagnostic.map(str::to_owned)));
             Ok(SignalOutcome::Buffered)
         }
 
@@ -2309,10 +2336,12 @@ mod tests {
         let disposition = PreparationTerminalDisposition::Failed {
             phase: PreparationPhase::CheckoutTransport,
         };
+        let diagnostic = "host-side HEAD re-verification disagreed: injected mismatch";
         let dispatched = agent
             .report_preparation_outcome(&SandboxCycleOutcome::PreparationTerminal {
                 claim: claim.clone(),
                 disposition,
+                diagnostic: Some(diagnostic.to_string()),
             })
             .expect("dispatches the terminal");
         assert_eq!(
@@ -2324,6 +2353,7 @@ mod tests {
             assert_eq!(recorded.len(), 1);
             assert_eq!(recorded[0].0, claim, "the reporter got the outcome's exact claim");
             assert_eq!(recorded[0].1, disposition);
+            assert_eq!(recorded[0].2.as_deref(), Some(diagnostic));
         }
 
         // PreparationRetryable → report_preparation_retry(claim).
@@ -2368,6 +2398,7 @@ mod tests {
                 .report_preparation_terminal(
                     &claim,
                     PreparationTerminalDisposition::AttemptsExhausted,
+                    None,
                 )
                 .is_err(),
             "the engine reporter must refuse a preparation terminal"

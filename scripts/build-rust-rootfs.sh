@@ -231,6 +231,11 @@ docker export "${CONTAINER_ID}" | tar -x -C "${TMP}"
 docker rm "${CONTAINER_ID}" >/dev/null 2>&1 || true
 CONTAINER_ID=""
 
+# The enabled checkout runner binds each job's external workspace over this fixed destination.
+# It is part of the content-addressed asset (and therefore the digest below), never something
+# runsc may create in the shared verified tree after registry construction.
+mkdir -p "${TMP}/workspace"
+
 # --- PATH-reachability fixup (pure filesystem content — no OciConfig/hardening code touched) ------
 TOOLCHAIN_DIR="$(find "${TMP}/usr/local/rustup/toolchains" -mindepth 1 -maxdepth 1 -type d | head -1)"
 [[ -n "${TOOLCHAIN_DIR}" ]] || die "no rustup toolchain directory found under ${TMP}/usr/local/rustup/toolchains — unexpected image layout"

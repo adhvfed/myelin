@@ -24,9 +24,11 @@
 //! (the in-memory
 //! `OutboxStore::new()` is `test-support`-gated and does not even compile here).
 //!
-//! The runtime is the multi-thread `#[tokio::main]` flavor (required): the sync
-//! `DurableOutboxBacking` verbs bridge to async sqlx via `block_in_place` + `block_on`, which
-//! panics on a current-thread runtime.
+//! The runtime is multi-threaded (required): the sync `DurableOutboxBacking` verbs bridge to async
+//! sqlx via `block_in_place` + `block_on`, which panics on a current-thread runtime. It is built
+//! explicitly only AFTER the initial thread has normalized checkout verification's
+//! `CAP_DAC_READ_SEARCH`: ambient/effective/inheritable are always cleared, permitted is retained
+//! only for the enabled checkout-workspace runner, and every other configuration drops it entirely.
 //!
 //! The substrate AppSpec config still uses its validated default, while every production endpoint
 //! and all three PostgreSQL roles are explicit through `Mode::RequireEnv`. The per-table behaviour
@@ -112,6 +114,16 @@ fn verify_startup_activation(
             Err(StartupRefusal::NonUnicodeRunnerSetting(value))
         }
     }
+}
+
+fn checkout_workspace_capability_requested(
+    runner_setting: &Result<String, std::env::VarError>,
+    workspace_mode: &Result<String, std::env::VarError>,
+) -> bool {
+    matches!(
+        (runner_setting, workspace_mode),
+        (Ok(runner), Ok(workspace)) if runner == "1" && workspace == "enabled"
+    )
 }
 
 /// CT-007 slice 4: the `runsc --root=`/helper-dir pair a caller must feed
@@ -338,13 +350,30 @@ fn prepare_checkout_config(
     prepare_checkout_config_given(std::env::var(ENV_CI_CHECKOUT_REPO_ROOT))
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     myelin_events::install_payload_free_panic_hook("ci-controlplane");
     // Runner execution is explicit opt-in. Unset / `0` keeps the runner host dormant; `1` composes
     // the proven production claim, Identity, reservation, fenced launch, recovery, and reporter root.
     // Every other value is refused before PostgreSQL bootstrap.
     let runner_setting = std::env::var("MYELIN_CI_RUNNER");
+    let workspace_mode = std::env::var("MYELIN_CI_WORKSPACE_MODE");
+    let checkout_workspace_runner_requested =
+        checkout_workspace_capability_requested(&runner_setting, &workspace_mode);
+    // systemd delivers CAP_DAC_READ_SEARCH through AmbientCapabilities so the unprivileged binary
+    // can receive it in permitted. Normalize it on the initial thread for EVERY configuration,
+    // before validation can exit and before Tokio can create any worker: ambient, effective, and
+    // inheritable are always cleared. Only the exact enabled checkout-workspace runner path keeps
+    // dormant permitted authority for ScopedDacReadSearch; every other (including invalid or
+    // non-Unicode) configuration drops permitted too.
+    if let Err(error) = myelin_ci_sandbox::gvisor::prepare_checkout_host_verification_capability(
+        checkout_workspace_runner_requested,
+    ) {
+        eprintln!(
+            "ci-controlplane: startup refused: checkout host-verification privilege \
+             normalization failed: {error}"
+        );
+        std::process::exit(1);
+    }
     // Read by borrow before validation consumes the setting so the complete host stays behind the
     // same single activation decision.
     let runner_host_requested = matches!(&runner_setting, Ok(value) if value == "1");
@@ -352,6 +381,20 @@ async fn main() {
         eprintln!("ci-controlplane: startup refused: {e}");
         std::process::exit(1);
     }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ci-controlplane: failed to construct the async runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+    runtime.block_on(run(runner_host_requested));
+}
+
+async fn run(runner_host_requested: bool) {
     // Install OS signal handlers before database bootstrap or runner-host construction. A deploy
     // signal that lands after intake starts must always enter the coordinated drain path.
     let shutdown_signals = match ShutdownSignals::install() {
@@ -854,7 +897,10 @@ impl ShutdownSignals {
 
 #[cfg(test)]
 mod tests {
-    use super::{prepare_checkout_config_given, verify_startup_activation, StartupRefusal};
+    use super::{
+        checkout_workspace_capability_requested, prepare_checkout_config_given,
+        verify_startup_activation, StartupRefusal,
+    };
     use std::env::VarError;
     use std::ffi::OsString;
 
@@ -895,6 +941,27 @@ mod tests {
     }
 
     #[test]
+    fn dac_read_search_is_retained_only_for_the_exact_enabled_runner_path() {
+        let absent = Err(VarError::NotPresent);
+        assert!(checkout_workspace_capability_requested(
+            &Ok("1".to_owned()),
+            &Ok("enabled".to_owned())
+        ));
+        for (runner, workspace) in [
+            (Ok("0".to_owned()), Ok("enabled".to_owned())),
+            (absent, Ok("enabled".to_owned())),
+            (Ok("1".to_owned()), Ok("disabled".to_owned())),
+            (Ok("1".to_owned()), Ok("invalid".to_owned())),
+            (Ok("1".to_owned()), Err(VarError::NotPresent)),
+        ] {
+            assert!(
+                !checkout_workspace_capability_requested(&runner, &workspace),
+                "non-enabled configuration must drop CAP_DAC_READ_SEARCH entirely"
+            );
+        }
+    }
+
+    #[test]
     fn checkout_repository_root_is_required_and_boot_validated_without_a_fallback() {
         let missing = prepare_checkout_config_given(Err(VarError::NotPresent))
             .expect_err("runner activation has no implicit checkout repository root");
@@ -921,6 +988,13 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let invalid = OsString::from_vec(vec![b'1', 0xff]);
+        assert!(
+            !checkout_workspace_capability_requested(
+                &Err(VarError::NotUnicode(invalid.clone())),
+                &Ok("enabled".to_owned())
+            ),
+            "a non-Unicode runner configuration must drop CAP_DAC_READ_SEARCH entirely"
+        );
         let refusal = verify_startup_activation(Err(VarError::NotUnicode(invalid.clone())))
             .expect_err("non-UTF-8 runner setting must be refused");
 

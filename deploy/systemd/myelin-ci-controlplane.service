@@ -13,9 +13,8 @@
 #
 # Every directive below (capabilities, cgroup delegation) was validated end-to-end against
 # `crates/myelin-ci-sandbox/src/gvisor.rs`'s real `explicit_user_namespace_boots_through_the_real_
-# enabled_backend_and_launch` drill — see docs/ci-runner-deployment.md's "Granting CAP_SYS_ADMIN/
-# CAP_CHOWN" and "Cgroup v2 delegation" sections for exactly how, and why each of the less-obvious
-# lines is there.
+# enabled_backend_and_launch` drill — see docs/ci-runner-deployment.md's capability and cgroup-v2
+# delegation sections for exactly how, and why each of the less-obvious lines is there.
 
 [Unit]
 Description=Myelin CI control plane (runner lane)
@@ -69,23 +68,29 @@ Environment=MYELIN_CI_WORKSPACE_CAPACITY_BYTES=21474836480
 
 EnvironmentFile=/etc/myelin/ci-controlplane.env
 
-# --- CAP_SYS_ADMIN + CAP_CHOWN for the workspace lifecycle (needed only once EphemeralDisk is
-# enabled above): `workspace_storage.rs` shells out to `/usr/bin/btrfs` for `qgroup limit`,
+# --- CAP_SYS_ADMIN + CAP_CHOWN for the workspace lifecycle, plus scoped CAP_DAC_READ_SEARCH for
+# host verification (needed only once EphemeralDisk is enabled above): `workspace_storage.rs`
+# shells out to `/usr/bin/btrfs` for `qgroup limit`,
 # `subvolume delete`, and `sync` (CAP_SYS_ADMIN), and to `/usr/bin/chown` to hand a fresh workspace
 # to the job's own userns-mapped uid/gid (CAP_CHOWN — a distinct capability, easy to miss since
-# CAP_SYS_ADMIN does NOT imply it). Delivered via AmbientCapabilities so both propagate to this
-# service's `btrfs`/`chown` child processes WITHOUT modifying the shared system binaries (the
+# CAP_SYS_ADMIN does NOT imply it). CAP_DAC_READ_SEARCH lets the host independently re-read HEAD
+# and Cargo.lock after `umask 077` creates a subuid-owned `.git`; it is the read/search-only bypass,
+# never CAP_DAC_OVERRIDE. The binary immediately lowers CAP_DAC_READ_SEARCH from ambient/effective
+# BEFORE constructing Tokio, retaining it permitted-only; the runner thread enables it only around
+# bounded O_NOFOLLOW verifier reads, then clears it. CAP_SYS_ADMIN and CAP_CHOWN remain ambient so
+# they propagate to this service's `btrfs`/`chown` child processes WITHOUT modifying the shared
+# system binaries (the
 # alternative, `setcap cap_sys_admin+ep /usr/bin/btrfs`, would grant that capability to EVERY
 # process on the host able to execute it).
 #
-# Do NOT also restrict CapabilityBoundingSet to just these two capabilities. `runsc`'s explicit
+# Do NOT also restrict CapabilityBoundingSet to just these capabilities. `runsc`'s explicit
 # user-namespace mode execs `newuidmap`/`newgidmap` (setuid-root helpers) to write the uid/gid
 # mapping; a setuid-root exec can never gain a capability outside the CALLING process's bounding
 # set, so narrowing it here breaks that escalation with an opaque `newuidmap failed: fork/exec
 # ... operation not permitted` — this was hit and confirmed directly. Leave CapabilityBoundingSet
 # at systemd's default (the full set); AmbientCapabilities alone already keeps what this process
-# itself actively wields to exactly CAP_SYS_ADMIN/CAP_CHOWN.
-AmbientCapabilities=CAP_SYS_ADMIN CAP_CHOWN
+# itself normally wields to CAP_SYS_ADMIN/CAP_CHOWN, with CAP_DAC_READ_SEARCH scoped as above.
+AmbientCapabilities=CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_READ_SEARCH
 # MUST stay false: same newuidmap/newgidmap concern as above — `NoNewPrivileges=true` (a common
 # systemd hardening default) makes the kernel ignore their setuid bit on exec entirely, silently
 # breaking every ExplicitUserNamespace launch regardless of the bounding set. Do not "harden" this

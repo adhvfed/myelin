@@ -61,9 +61,10 @@ default_path = "~/.local/share/gvisor-assets/rust-rootfs"
 # changes the rootfs content and therefore this row's digest.
 source_image = "rust:1.82-slim-bookworm"
 source_image_digest = "sha256:1111c28d995d06a7863ba6cea3b3dcb87bebe65af8ec5517caaf2c8c26f38010"
-# The canonical-tree content digest of the STAGED rootfs (docker-exported filesystem +
-# usr/local/bin/{rustc,cargo,...} PATH-reachability symlinks — see the script's own header for why
-# the symlinks target the real toolchain binaries, not the rustup proxy hardlinks). Computed
+# The canonical-tree content digest of the STAGED rootfs (docker-exported filesystem + the empty
+# pinned /workspace bind target + usr/local/bin/{rustc,cargo,...} PATH-reachability symlinks — see
+# the script's own header for why the symlinks target the real toolchain binaries, not the rustup
+# proxy hardlinks). Computed
 # 2026-07-25 on the founder dogfood host; reconfirmed unchanged 2026-07-25 after the staging-safety
 # rewrite of build-rust-rootfs.sh (atomic build-then-promote instead of rm-rf-then-build). That
 # rewrite briefly produced a DIFFERENT digest (2493dd29...) because `mktemp -d`'s default 0700 mode
@@ -73,7 +74,7 @@ source_image_digest = "sha256:1111c28d995d06a7863ba6cea3b3dcb87bebe65af8ec5517ca
 # finding /bin/sh — caught by actually re-running the prod-exec test, not assumed green). Fixed by
 # chmod 0755 on the temp dir before populating it; the raw `docker export` step itself was
 # independently confirmed byte-for-byte reproducible across separate container creates.
-canonical_tree_sha256 = "6feada1e0ef7b739d71c7f198b03dcaab494f35ea86182dd887d23f5df0c6083"
+canonical_tree_sha256 = "7cff5227e39276b02a2f501fd7dd29299a8341a28f02c09f83726b10f052bffa"
 # CT-007 gate 2/4 (registry slice, 2026-07-25): the digest-pinned `ImageRef` reference
 # `GvisorAssetRegistry` (crates/myelin-ci-sandbox/src/asset_registry.rs) resolves against this row's
 # staged directory. The digest embedded after `@sha256:` MUST equal `canonical_tree_sha256` above —
@@ -81,5 +82,22 @@ canonical_tree_sha256 = "6feada1e0ef7b739d71c7f198b03dcaab494f35ea86182dd887d23f
 # consistency unconditionally (no staged directory required). This is the row that closes the
 # "JobSpec.image is not yet bound to this asset at launch" gap the STATUS note above used to name —
 # nothing dispatches this image yet, but the registry now carries the binding honestly.
-image = "myelin.local/linux-rust-v1-rootfs@sha256:6feada1e0ef7b739d71c7f198b03dcaab494f35ea86182dd887d23f5df0c6083"
+image = "myelin.local/linux-rust-v1-rootfs@sha256:7cff5227e39276b02a2f501fd7dd29299a8341a28f02c09f83726b10f052bffa"
 note = "Docker-pull + docker-export of an official Debian-slim rust image, NOT a hand-chased host-lib copy (unlike scripts/stage-git-rootfs.sh's git precedent) — the host cargo/rustc pull in dozens of transitive shared libs (libgit2, libssl, libcurl, icu, ...) that would make a hand-staged tree fragile and not a real immutable release artifact. Proven end to end by crates/myelin-ci-sandbox/tests/rust_capable_rootfs_prod_exec_test.rs: a real `runsc` sandbox on the SAME GvisorBackend::launch path every other job uses runs `rustc --version && cargo --version` and asserts non-root uid + no network egress, unchanged hardening. As of CT-007 gate 2/4's registry slice, this is a REAL registry entry (myelin-ci-controlplane's production_gvisor_registry()), not just a manifest row — though no dispatched job names this image yet."
+
+[[asset]]
+id = "git-v1"
+capability = "checkout"
+covers_job = "build-test-clippy"
+stage_script = "scripts/stage-git-rootfs.sh"
+env_var = "MYELIN_GVISOR_GIT_ROOTFS"
+default_path = "~/.local/share/gvisor-assets/git-rootfs"
+source_image = "host-git:2.54.0"
+source_image_digest = "sha256:bb6007e89e15dad35cf623a203db26dde9e042cb2df844320055cad3cd2eb5d0"
+# Honest canonical-tree digest of the founder host's staged git tree after re-staging through the
+# corrected recipe. The pin includes every fixed OCI destination: /tmp, /workspace, /repo, and
+# /quarantine. Both checkout and git-wire verify this same digest immediately before use, and the
+# control-plane registers the same image/path in GvisorAssetRegistry at runner construction.
+canonical_tree_sha256 = "0ac70764ba20a043d19933213d60070c7f8712947a86753bab518569df302646"
+image = "myelin.local/git-v1-rootfs@sha256:0ac70764ba20a043d19933213d60070c7f8712947a86753bab518569df302646"
+note = "Founder-dogfood git-bearing rootfs used for exact-commit checkout and git wire. The shared tree is read-only to OCI workloads, all mount targets are precreated and empty, registry construction pins the complete content, and each git execution re-verifies the same canonical digest before spawning."

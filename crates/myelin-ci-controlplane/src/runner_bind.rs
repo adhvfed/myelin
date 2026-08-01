@@ -55,8 +55,9 @@ use myelin_ci_sandbox::asset_registry::{GvisorAssetRegistry, RootfsAssetBinding}
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     derive_checkout_authorization_scope, resolved_gvisor_rootfs, resolved_gvisor_rust_rootfs,
-    ImageRef, JobKind, JobSpec, LeaseStore, QueuedJob, RunnerError, RunnerHooks, TrustTier,
-    LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
+    verified_gvisor_git_rootfs, ImageRef, JobKind, JobSpec, LeaseStore, QueuedJob, RunnerError,
+    RunnerHooks, TrustTier, GVISOR_GIT_ROOTFS_SHA256, LINUX_RUST_V1_ROOTFS_SHA256,
+    LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_storage::s3blob::S3BlobStore;
 use myelin_tenancy::{Region, TenantId};
@@ -65,9 +66,9 @@ use myelin_tenancy::{Region, TenantId};
 /// single most safety-critical construction in this slice: it is what turns `spec.image` into the
 /// rootfs the REAL production runner loop ([`CiRunnerLoop::run_until_shutdown`]) actually launches
 /// against. Every entry here reuses an EXISTING resolver ([`resolved_gvisor_rootfs`] /
-/// [`resolved_gvisor_rust_rootfs`]) rather than hardcoding a path, so an operator's env-var override
-/// (`MYELIN_GVISOR_ROOTFS` / `MYELIN_GVISOR_RUST_ROOTFS`) still works exactly as it did before this
-/// slice.
+/// [`resolved_gvisor_rust_rootfs`] / [`verified_gvisor_git_rootfs`]) rather than hardcoding a path,
+/// so the corresponding operator env-var overrides remain the path-selection mechanism while the
+/// registry pin remains the authority.
 ///
 /// **Registered today:**
 /// - `myelin.local/linux-small-v1-rootfs@sha256:<LINUX_SMALL_V1_ROOTFS_SHA256>` → the base rootfs —
@@ -82,6 +83,9 @@ use myelin_tenancy::{Region, TenantId};
 ///   rootfs (`runner-assets.toml`'s `linux-rust-v1` row) — registered for HONESTY (every ordinary,
 ///   non-git-wire job rootfs this runner currently launches is covered) even though no dispatched
 ///   job names it yet.
+/// - `myelin.local/git-v1-rootfs@sha256:<GVISOR_GIT_ROOTFS_SHA256>` → the git-bearing checkout and
+///   git-wire rootfs. Its resolver also validates the complete `/tmp`, `/workspace`, `/repo`, and
+///   `/quarantine` destination set before registry construction hashes it.
 ///
 /// **Composition-root placement, not `myelin-ci-sandbox`:** this function lives here (the CI
 /// control-plane's composition root), not in `myelin-ci-sandbox`, because the SPECIFIC bindings
@@ -112,6 +116,17 @@ pub fn production_gvisor_registry() -> Arc<GvisorAssetRegistry> {
                 ))
                 .expect("the linux-rust-v1 image reference is a well-formed digest pin"),
                 rootfs: resolved_gvisor_rust_rootfs(),
+            },
+            RootfsAssetBinding {
+                image: ImageRef::pinned(format!(
+                    "myelin.local/git-v1-rootfs@sha256:{GVISOR_GIT_ROOTFS_SHA256}"
+                ))
+                .expect("the git rootfs image reference is a well-formed digest pin"),
+                // This resolver verifies all four fixed OCI destinations and the same canonical
+                // digest first; `from_bindings` then independently verifies the registry pin.
+                rootfs: verified_gvisor_git_rootfs().expect(
+                    "the git rootfs and every fixed OCI mountpoint must verify before runner startup",
+                ),
             },
         ])
         .expect(
@@ -599,11 +614,18 @@ impl CiRunnerLoop {
                     job_id,
                     run_id,
                     signal_outcome,
+                    diagnostic,
                 }) => {
-                    eprintln!(
-                        "ci-runner[{worker_id}]: preparation terminalized job {job_id} for run \
-                         {run_id} (job.done={signal_outcome:?})"
-                    );
+                    match diagnostic {
+                        Some(diagnostic) => eprintln!(
+                            "ci-runner[{worker_id}]: preparation terminalized job {job_id} for run \
+                             {run_id} (job.done={signal_outcome:?}, diagnostic={diagnostic})"
+                        ),
+                        None => eprintln!(
+                            "ci-runner[{worker_id}]: preparation terminalized job {job_id} for run \
+                             {run_id} (job.done={signal_outcome:?})"
+                        ),
+                    }
                 }
                 Ok(myelin_ci_sandbox::RunnerCycleOutcome::PreparationRetryable {
                     job_id,
@@ -957,7 +979,8 @@ mod shutdown_tests {
 }
 
 /// A direct test for [`production_gvisor_registry`] itself — before this, nothing called it; every
-/// test built its own ad-hoc registry. Both real staged assets (`linux-small-v1`, `linux-rust-v1`)
+/// test built its own ad-hoc registry. All three real staged assets (`linux-small-v1`,
+/// `linux-rust-v1`, `git-v1`)
 /// are present on the founder-dogfood host this was written on, so this is a REAL, non-skipped
 /// assertion here (matching this repo's existing runsc/KVM graceful-skip convention, this test would
 /// need to skip on a host without the assets staged — but per the CT-007 gate 2/4 brief, this host
@@ -967,15 +990,17 @@ mod production_gvisor_registry_tests {
     use super::*;
 
     #[test]
-    fn constructs_and_resolves_both_real_images_to_their_expected_paths() {
+    fn constructs_and_resolves_all_real_images_to_their_expected_paths() {
         let base_dir = resolved_gvisor_rootfs();
         let rust_dir = resolved_gvisor_rust_rootfs();
-        if !base_dir.is_dir() || !rust_dir.is_dir() {
+        let git_dir = myelin_ci_sandbox::resolved_gvisor_git_rootfs();
+        if !base_dir.is_dir() || !rust_dir.is_dir() || !git_dir.is_dir() {
             eprintln!(
-                "constructs_and_resolves_both_real_images_to_their_expected_paths: SKIPPED — the \
-                 staged base rootfs ({}) and/or rust rootfs ({}) are absent on this machine",
+                "constructs_and_resolves_all_real_images_to_their_expected_paths: SKIPPED — a \
+                 staged base ({}) / rust ({}) / git ({}) rootfs is absent on this machine",
                 base_dir.display(),
-                rust_dir.display()
+                rust_dir.display(),
+                git_dir.display()
             );
             return;
         }
@@ -990,6 +1015,10 @@ mod production_gvisor_registry_tests {
             "myelin.local/linux-rust-v1-rootfs@sha256:{LINUX_RUST_V1_ROOTFS_SHA256}"
         ))
         .unwrap();
+        let git_image = ImageRef::pinned(format!(
+            "myelin.local/git-v1-rootfs@sha256:{GVISOR_GIT_ROOTFS_SHA256}"
+        ))
+        .unwrap();
 
         let verified_small = registry
             .resolve(&small_image)
@@ -997,6 +1026,9 @@ mod production_gvisor_registry_tests {
         let verified_rust = registry
             .resolve(&rust_image)
             .expect("the production registry must resolve linux-rust-v1");
+        let verified_git = registry
+            .resolve(&git_image)
+            .expect("the production registry must resolve git-v1");
 
         assert_eq!(
             verified_small.path(),
@@ -1007,6 +1039,11 @@ mod production_gvisor_registry_tests {
             verified_rust.path(),
             std::fs::canonicalize(&rust_dir).unwrap(),
             "linux-rust-v1 must resolve to the SAME canonicalized path resolved_gvisor_rust_rootfs() names"
+        );
+        assert_eq!(
+            verified_git.path(),
+            std::fs::canonicalize(&git_dir).unwrap(),
+            "git-v1 must resolve to the same verified canonical path used by checkout"
         );
     }
 }

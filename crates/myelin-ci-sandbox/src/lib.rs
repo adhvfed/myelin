@@ -126,8 +126,8 @@ pub use asset_registry::{
 };
 pub use canonical_tar::canonical_tree_sha256_hex;
 pub use gvisor::{
-    resolved_gvisor_rust_rootfs, ENV_GVISOR_RUST_ROOTFS, LINUX_RUST_V1_ROOTFS_SHA256,
-    LINUX_SMALL_V1_ROOTFS_SHA256,
+    resolved_gvisor_rust_rootfs, ENV_GVISOR_RUST_ROOTFS, GVISOR_GIT_ROOTFS_SHA256,
+    LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 
 // CT-006a (GT-006 / SI-013): the SANDBOXED GIT-WIRE capability — canonical `git upload-pack`/
@@ -137,8 +137,9 @@ pub use gvisor::{
 // before any mount. Exercised by tests/git_wire_prod_exec_test.rs against a real `runsc` sandbox.
 pub use gvisor::{
     assert_repo_under_root, resolve_bare_repo_path, resolved_gvisor_git_rootfs,
-    validate_wire_repo_slug, validate_wire_segment, GitWireSpec, MemoryCgroup, WireError,
-    ENV_GVISOR_GIT_ROOTFS, ENV_RUNSC_BIN, WIRE_QUARANTINE_MOUNT, WIRE_REPO_MOUNT, WIRE_STDIN_BOUND,
+    validate_wire_repo_slug, validate_wire_segment, verified_gvisor_git_rootfs, GitWireSpec,
+    MemoryCgroup, WireError, ENV_GVISOR_GIT_ROOTFS, ENV_RUNSC_BIN, WIRE_QUARANTINE_MOUNT,
+    WIRE_REPO_MOUNT, WIRE_STDIN_BOUND,
 };
 
 pub use runner::{
@@ -1235,6 +1236,8 @@ pub enum SandboxCycleOutcome {
         claim: crate::runner::PreparationReportClaim,
         /// The terminal disposition (its own accounting/signal semantics).
         disposition: crate::runner::PreparationTerminalDisposition,
+        /// Retained operator-safe detail explaining the preparation failure, when one exists.
+        diagnostic: Option<String>,
     },
     /// Preparation failed retryably — the preparation requeue reporter re-queues the exact claim and
     /// emits no `job.done`.
@@ -1275,9 +1278,15 @@ impl From<crate::checkout_orchestration::CheckoutContinuationOutcome> for Sandbo
                 usage,
                 message,
             },
-            Cco::PreparationTerminal { claim, disposition } => {
-                Self::PreparationTerminal { claim, disposition }
-            }
+            Cco::PreparationTerminal {
+                claim,
+                disposition,
+                diagnostic,
+            } => Self::PreparationTerminal {
+                claim,
+                disposition,
+                diagnostic,
+            },
             Cco::PreparationRetryable { claim, phase } => {
                 Self::PreparationRetryable { claim, phase }
             }
@@ -2512,6 +2521,7 @@ mod tests {
             SandboxCycleOutcome::from(Cco::PreparationTerminal {
                 claim: claim(),
                 disposition: PreparationTerminalDisposition::AttemptsExhausted,
+                diagnostic: None,
             }),
             SandboxCycleOutcome::PreparationTerminal {
                 disposition: PreparationTerminalDisposition::AttemptsExhausted,

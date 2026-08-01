@@ -2275,7 +2275,11 @@ async fn run_reporter_scenario(
                         let terminal_claim = report_claim.clone();
                         let terminal_router = router.clone();
                         let signal = tokio::task::spawn_blocking(move || {
-                            terminal_router.report_preparation_terminal(&terminal_claim, disposition)
+                            terminal_router.report_preparation_terminal(
+                                &terminal_claim,
+                                disposition,
+                                None,
+                            )
                         })
                         .await
                         .unwrap()

@@ -36,7 +36,9 @@
 //! could silently drift from it.
 
 use myelin_ci_sandbox::canonical_tree_sha256_hex;
-use myelin_ci_sandbox::{LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256};
+use myelin_ci_sandbox::{
+    GVISOR_GIT_ROOTFS_SHA256, LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
+};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -242,13 +244,15 @@ fn staged_runner_assets_match_their_committed_digest_pin() {
 }
 
 /// **UNCONDITIONAL (no staged directory required) — the source-file sync check.** Before this test,
-/// `LINUX_RUST_V1_ROOTFS_SHA256`/`LINUX_SMALL_V1_ROOTFS_SHA256` (`gvisor.rs`) duplicated
+/// `GVISOR_GIT_ROOTFS_SHA256`/`LINUX_RUST_V1_ROOTFS_SHA256`/
+/// `LINUX_SMALL_V1_ROOTFS_SHA256` (`gvisor.rs`) duplicated
 /// `runner-assets.toml`'s `canonical_tree_sha256`/`image` fields and `.myelin/ci.toml`'s `image`
 /// field as separate hardcoded literals with NO mechanical link between any of them — a source-file
 /// edit to one could leave every existing test green while production silently refused (or accepted
 /// a wrong) newly-authored image. This asserts:
 ///   - `LINUX_RUST_V1_ROOTFS_SHA256` == `runner-assets.toml`'s `linux-rust-v1` row's
 ///     `canonical_tree_sha256` == that row's own `image` field's embedded `@sha256:` digest.
+///   - `GVISOR_GIT_ROOTFS_SHA256` == the equivalent `git-v1` row values.
 ///   - `LINUX_SMALL_V1_ROOTFS_SHA256` == `.myelin/ci.toml`'s (single) job's `image` field's embedded
 ///     `@sha256:` digest.
 #[test]
@@ -274,6 +278,22 @@ fn rust_and_small_rootfs_constants_are_mechanically_synced_to_their_toml_sources
         LINUX_RUST_V1_ROOTFS_SHA256, rust_embedded,
         "gvisor.rs's LINUX_RUST_V1_ROOTFS_SHA256 constant has drifted from the digest embedded in \
          runner-assets.toml's `linux-rust-v1` row's own `image` field"
+    );
+
+    let git_row = manifest
+        .asset
+        .iter()
+        .find(|row| row.id == "git-v1")
+        .expect("runner-assets.toml must have a `git-v1` row");
+    assert_eq!(
+        GVISOR_GIT_ROOTFS_SHA256, git_row.canonical_tree_sha256,
+        "gvisor.rs's GVISOR_GIT_ROOTFS_SHA256 constant has drifted from runner-assets.toml's \
+         `git-v1` row"
+    );
+    assert_eq!(
+        Some(GVISOR_GIT_ROOTFS_SHA256),
+        parse_sha256_digest(&git_row.image),
+        "runner-assets.toml's `git-v1` image must carry the same git rootfs pin"
     );
 
     let ci = load_real_ci_toml();

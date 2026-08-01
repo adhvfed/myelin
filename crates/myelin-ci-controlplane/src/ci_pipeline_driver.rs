@@ -902,7 +902,14 @@ struct TerminalAccountingInput<'a> {
     report: &'a TerminalReport,
     receipts: &'a CompletionReceipts,
     disposition: CiJobTerminalDisposition,
+    diagnostic: Option<&'a str>,
     replay: bool,
+}
+
+struct TerminalSurfaceInput<'a> {
+    report: &'a TerminalReport,
+    disposition: Option<CiJobTerminalDisposition>,
+    diagnostic: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -1188,8 +1195,11 @@ async fn co_commit_terminal_accounting(
         accounting.scope.region(),
         input.ci_run_id,
         input.job_id,
-        input.report,
-        surface_disposition,
+        TerminalSurfaceInput {
+            report: input.report,
+            disposition: surface_disposition,
+            diagnostic: input.diagnostic,
+        },
     )
     .await?;
     Ok(())
@@ -1531,16 +1541,22 @@ async fn settle_ci_job_surface_on_conn(
     region: &Region,
     ci_run_id: &str,
     job_id: &str,
-    report: &TerminalReport,
-    disposition: Option<CiJobTerminalDisposition>,
+    surface: TerminalSurfaceInput<'_>,
 ) -> Result<(), CompletionTxError> {
-    let preparation = matches!(disposition, Some(CiJobTerminalDisposition::Preparation(_)));
-    let state = if !preparation && report.passed && !report.timed_out {
+    let preparation = matches!(
+        surface.disposition,
+        Some(CiJobTerminalDisposition::Preparation(_))
+    );
+    let state = if !preparation && surface.report.passed && !surface.report.timed_out {
         "succeeded"
     } else {
         "failed"
     };
-    let summary = terminal_result_summary(report, disposition);
+    let summary = terminal_result_summary(
+        surface.report,
+        surface.disposition,
+        surface.diagnostic,
+    );
     let state_predicate = if preparation {
         "state IN ('queued','leased') OR (state=$5 AND result_summary=$6)"
     } else {
@@ -1575,14 +1591,21 @@ async fn settle_ci_job_surface_on_conn(
 fn terminal_result_summary(
     report: &TerminalReport,
     disposition: Option<CiJobTerminalDisposition>,
+    diagnostic: Option<&str>,
 ) -> serde_json::Value {
     match disposition {
-        Some(disposition) => serde_json::json!({
-            "passed": report.passed,
-            "timed_out": report.timed_out,
-            "disposition": disposition.as_storage_token(),
-            "workload_started": disposition.workload_started(),
-        }),
+        Some(disposition) => {
+            let mut summary = serde_json::json!({
+                "passed": report.passed,
+                "timed_out": report.timed_out,
+                "disposition": disposition.as_storage_token(),
+                "workload_started": disposition.workload_started(),
+            });
+            if let Some(diagnostic) = diagnostic {
+                summary["diagnostic"] = serde_json::Value::String(diagnostic.to_owned());
+            }
+            summary
+        }
         None => serde_json::json!({
             "passed": report.passed,
             "timed_out": report.timed_out,
@@ -1795,6 +1818,17 @@ impl CiPipelineReporter {
         claim: &CiJobTokenRequest,
         disposition: PreparationTerminalDisposition,
     ) -> Result<SignalOutcome, ExecutorError> {
+        self.report_preparation_terminal_with_diagnostic(claim, disposition, None)
+    }
+
+    /// The production preparation-terminal path, retaining an operator-safe checkout diagnostic in
+    /// the job surface while the immutable accounting receipt remains disposition-bound.
+    pub fn report_preparation_terminal_with_diagnostic(
+        &self,
+        claim: &CiJobTokenRequest,
+        disposition: PreparationTerminalDisposition,
+        diagnostic: Option<&str>,
+    ) -> Result<SignalOutcome, ExecutorError> {
         claim.validate().map_err(|error| {
             ExecutorError::InvalidInput(format!(
                 "ci.pipeline preparation completion refused: {}",
@@ -1836,6 +1870,7 @@ impl CiPipelineReporter {
         let nonce_uuid = Uuid::parse_str(&claim.claim_nonce)
             .map_err(|_| ExecutorError::InvalidInput("invalid claim nonce UUID".into()))?;
         let claim = claim.clone();
+        let diagnostic = diagnostic.map(str::to_owned);
         let refusal_job = claim.job_id.clone();
         let refusal_owner = claim.lease_owner.clone();
         let refusal_epoch = claim.lease_epoch;
@@ -2021,6 +2056,7 @@ impl CiPipelineReporter {
                                 report: &report,
                                 receipts: &receipts,
                                 disposition: CiJobTerminalDisposition::Preparation(disposition),
+                                diagnostic: diagnostic.as_deref(),
                                 replay: claim_outcome == ClaimConsumeOutcome::AlreadyConsumed,
                             },
                         )
@@ -2472,6 +2508,7 @@ impl TerminalReporter for CiPipelineReporter {
                                         report: &accounted_report,
                                         receipts: &receipts,
                                         disposition,
+                                        diagnostic: None,
                                         replay: claim == ClaimConsumeOutcome::AlreadyConsumed,
                                     },
                                 )
@@ -2732,6 +2769,7 @@ impl TerminalReporter for CiPipelineReporter {
                                             report: &report,
                                             receipts: &receipts,
                                             disposition,
+                                            diagnostic: None,
                                             replay: outcome == RetryableAttemptOutcome::ExactReplay,
                                         },
                                     )
@@ -2789,15 +2827,17 @@ impl TerminalReporter for CiPipelineReporter {
         &self,
         claim: &PreparationReportClaim,
         disposition: PreparationTerminalDisposition,
+        diagnostic: Option<&str>,
     ) -> Result<SignalOutcome, ExecutorError> {
         // CT-007 5b.3-6d STEP 4: map the sandbox reporting identity 1:1 onto the durable claim-bound
         // request and delegate to the INHERENT durable method (which re-verifies scope, v4-accounting
         // activation, and the parent attempt under the CAS). Explicit UFCS names the inherent method,
         // never this trait method.
-        CiPipelineReporter::report_preparation_terminal(
+        CiPipelineReporter::report_preparation_terminal_with_diagnostic(
             self,
             &token_request_from_preparation_report_claim(claim),
             disposition,
+            diagnostic,
         )
     }
 

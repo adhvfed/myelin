@@ -150,7 +150,7 @@ fn empty_directory_matches_shell_recipe() {
 /// staged `linux-rust-v1` asset (resolved the SAME way `runner-assets.toml`'s row resolves it: env
 /// var `MYELIN_GVISOR_RUST_ROOTFS`, else the documented default path
 /// `~/.local/share/gvisor-assets/rust-rootfs`) and assert it equals the digest ALREADY committed in
-/// `runner-assets.toml` (`6feada1e0ef7b739d71c7f198b03dcaab494f35ea86182dd887d23f5df0c6083`).
+/// `runner-assets.toml` (`7cff5227e39276b02a2f501fd7dd29299a8341a28f02c09f83726b10f052bffa`).
 /// Genuinely, honestly SKIPPED if the asset isn't staged on this machine (this repo's existing
 /// runsc/KVM graceful-skip convention) — never a vacuous pass. `MYELIN_REQUIRE_RUST_ROOTFS_PIN=1`
 /// hard-requires it (this is exercised for REAL on the founder dogfood host this was written on).
@@ -192,7 +192,7 @@ fn pure_rust_digest_matches_the_committed_linux_rust_v1_pin() {
 }
 
 /// Same proof for the base `linux-small-v1` asset that ALREADY powers the real founder-dogfood
-/// pipeline (`.myelin/ci.toml`'s pinned `myelin.local/linux-small-v1-rootfs@sha256:f9bd3926...`) —
+/// pipeline (`.myelin/ci.toml`'s pinned `myelin.local/linux-small-v1-rootfs@sha256:65f0f6f2...`) —
 /// the asset the production registry (`myelin-ci-controlplane`'s `runner_bind.rs`) binds first.
 #[test]
 fn pure_rust_digest_matches_the_committed_linux_small_v1_pin() {
