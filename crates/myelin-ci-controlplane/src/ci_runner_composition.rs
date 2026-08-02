@@ -16,12 +16,12 @@ use myelin_ci_sandbox::{
 use myelin_identity_service::mint::RunTokenAuthorizer;
 use myelin_identity_service::{
     CellTokenAuthority, PasetoCapabilitySigner, PasetoCapabilityVerifier, RevocationStore,
-    RunTokenMinter,
+    RunTokenMinter, StoreBackedCheck,
 };
 use myelin_storage::reserve_settle::{MeteredUnit, RunId as CostRunId};
 use myelin_storage::{
-    with_tenant_tx_error, DurableCellRootBacking, DurableCostLedger, DurableRevocationBacking,
-    PgError, SealKey, SubstrateProvider,
+    with_tenant_tx_error, DurableCellRootBacking, DurableCostLedger, DurableKmsBacking,
+    DurableRevocationBacking, KmsEngine, PgError, SealKey, SubstrateProvider,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
@@ -39,6 +39,8 @@ pub enum CiRunnerIdentityCompositionError {
     InvalidCellId,
     DurableCellRootUnavailable,
     InvalidCellRoot,
+    DurableKmsUnavailable,
+    CiRebacFragmentUnavailable,
 }
 
 impl std::fmt::Display for CiRunnerIdentityCompositionError {
@@ -50,6 +52,12 @@ impl std::fmt::Display for CiRunnerIdentityCompositionError {
             }
             Self::InvalidCellRoot => {
                 f.write_str("CI runner durable cell token authority is invalid")
+            }
+            Self::DurableKmsUnavailable => {
+                f.write_str("CI runner durable tenant key hierarchy is unavailable")
+            }
+            Self::CiRebacFragmentUnavailable => {
+                f.write_str("CI runner secret ReBAC fragment is unavailable")
             }
         }
     }
@@ -67,6 +75,8 @@ pub struct CiRunnerIdentityAuthorities {
     /// to [`V2CheckoutComposition`](crate::ci_checkout_composition::V2CheckoutComposition) so the V2
     /// per-phase credential path mints through one Identity.
     phase_credential_minter: Arc<IdentityCiJobCredentialMinter>,
+    secret_identity: Arc<StoreBackedCheck>,
+    kms: Arc<KmsEngine>,
 }
 
 impl CiRunnerIdentityAuthorities {
@@ -85,6 +95,14 @@ impl CiRunnerIdentityAuthorities {
         &self,
     ) -> Arc<dyn crate::ci_credential_generation::CiPhaseCredentialMinter> {
         self.phase_credential_minter.clone()
+    }
+
+    fn secret_identity(&self) -> Arc<StoreBackedCheck> {
+        self.secret_identity.clone()
+    }
+
+    fn kms(&self) -> Arc<KmsEngine> {
+        self.kms.clone()
     }
 }
 
@@ -176,18 +194,32 @@ pub fn ci_runner_v2_wiring(
     rt: tokio::runtime::Handle,
     secret_terminal_reporter: crate::CiPipelineReporterRouter,
 ) -> Result<CiRunnerV2Wiring, HookError> {
+    let store = Arc::new(crate::DurableCiSecretStore::with_pg(
+        provider.db_pool().clone(),
+        identity.kms(),
+        myelin_tenancy::Region(provider.config().region.clone()),
+        rt.clone(),
+    ));
+    let secrets = crate::durable_ci_job_secret_resolver(
+        store,
+        identity.secret_identity(),
+        myelin_identity::Consistency {
+            at_least: myelin_identity::Zookie(String::new()),
+            mode: myelin_identity::ConsistencyMode::Strong,
+        },
+    );
     ci_runner_v2_wiring_with_secret_resolver(
         provider,
         identity,
         rt,
-        crate::ci_manifest_job_runner::unavailable_ci_job_secret_resolver(),
+        secrets,
         secret_terminal_reporter,
     )
 }
 
 /// Compose the same production runner path with the cell's concrete in-boundary secret resolver.
-/// This is the injection seam for the shared secret-store capability; the default composition above
-/// remains fail-closed and reports withholds when that capability is unavailable.
+/// This remains the explicit injection seam for focused tests and alternate deployments; the default
+/// composition above now supplies the durable tenant-DEK-backed resolver.
 pub fn ci_runner_v2_wiring_with_secret_resolver(
     provider: SubstrateProvider,
     identity: &CiRunnerIdentityAuthorities,
@@ -870,13 +902,19 @@ pub async fn ci_runner_identity_authorities(
         return Err(CiRunnerIdentityCompositionError::InvalidCellId);
     }
 
-    let material = DurableCellRootBacking::new(provider.db_pool().clone(), cell_id)
+    let material = DurableCellRootBacking::new(provider.db_pool().clone(), cell_id.clone())
         .load_or_generate(seal_key)
         .await
         .map_err(|_| CiRunnerIdentityCompositionError::DurableCellRootUnavailable)?;
     let cell = Arc::new(
         CellTokenAuthority::from_material(&material)
             .map_err(|_| CiRunnerIdentityCompositionError::InvalidCellRoot)?,
+    );
+    let kms = Arc::new(
+        DurableKmsBacking::new(provider.db_pool().clone(), cell_id.clone())
+            .load_or_generate(seal_key)
+            .await
+            .map_err(|_| CiRunnerIdentityCompositionError::DurableKmsUnavailable)?,
     );
     let revocations =
         RevocationStore::with_pg(DurableRevocationBacking::new(provider.clone()), rt.clone());
@@ -897,13 +935,28 @@ pub async fn ci_runner_identity_authorities(
         RunTokenAuthorizer::new(verifier, revocations),
         CiJobQueueStore::with_pg(provider.db_pool().clone()),
         myelin_tenancy::Region(region),
+        rt.clone(),
+    ));
+    let secret_identity = Arc::new(StoreBackedCheck::with_pg(
+        provider,
+        kms.clone(),
+        cell,
         rt,
     ));
+    if secret_identity
+        .admit_ci_fragment()
+        .into_iter()
+        .any(|result| matches!(result, myelin_identity::FragmentAdmit::Rejected { .. }))
+    {
+        return Err(CiRunnerIdentityCompositionError::CiRebacFragmentUnavailable);
+    }
 
     Ok(CiRunnerIdentityAuthorities {
         token_issuer,
         launch_authorizer,
         phase_credential_minter,
+        secret_identity,
+        kms,
     })
 }
 

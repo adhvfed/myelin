@@ -285,7 +285,7 @@ pub(crate) fn parse_canonical_secret_handle(handle: &str) -> Option<CanonicalSec
     Some(CanonicalSecretHandle { tenant, id })
 }
 
-fn strict_secret_segment(segment: &str) -> bool {
+pub(crate) fn strict_secret_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment.len() <= MAX_SECRET_HANDLE_SEGMENT_BYTES
         && segment
