@@ -98,6 +98,21 @@ pub const SECRET_BINDING_TABLE: &str = "secret_binding";
 pub const CI_SECRET_TABLE: &str = "ci_secret";
 /// Additive migration for the encrypted store, appended after every migration present at #34's base.
 pub const CI_SECRET_MIGRATION_ID: &str = "ci_0023_ci_secret";
+/// Forward-only project ownership metadata required by the authenticated secret-admin surface.
+pub const CI_SECRET_ADMIN_SCOPE_MIGRATION_ID: &str = "ci_0024a_secret_admin_scope";
+/// Online uniqueness enforcement for managed `(tenant, project, name)` rows.
+pub const CI_SECRET_ADMIN_UNIQUE_MIGRATION_ID: &str = "ci_0024b_secret_admin_unique";
+/// Forward-only binding backfill + referential-integrity constraint. The applied binding and secret
+/// table migrations remain byte-frozen; this is the first migration allowed to connect them.
+pub const CI_SECRET_BINDING_INTEGRITY_MIGRATION_ID: &str = "ci_0024c_secret_binding_integrity";
+/// Durable high-water marks keep managed-secret versions monotonic across physical deletion and
+/// recreation without weakening the binding FK's `ON DELETE CASCADE` semantics.
+pub const CI_SECRET_TOMBSTONE_MIGRATION_ID: &str = "ci_0024d_secret_version_tombstone";
+pub const CI_SECRET_TOMBSTONE_TABLE: &str = "ci_secret_tombstone";
+/// Universal atomic allocator for every `ci_secret` writer. This is deliberately a new migration
+/// after the managed-only tombstone migration so all earlier migration bodies remain immutable.
+pub const CI_SECRET_VERSION_HIGH_WATER_MIGRATION_ID: &str = "ci_0024e_secret_version_high_water";
+pub const CI_SECRET_VERSION_HIGH_WATER_TABLE: &str = "ci_secret_version_high_water";
 /// CI's metering-projection table. **CT-004m rename:** NAMED `ci_cost_event` (not `cost_event`) so it
 /// does NOT collide with Storage's money-ledger `cost_event` (myelin-storage migration `0050`,
 /// `reserve_settle_durable::COST_LEDGER_MIGRATION`) in the ONE shared `myelin` database every service
@@ -712,6 +727,75 @@ CREATE TABLE IF NOT EXISTS ci_secret (
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, secret_id)
 )";
+
+/// Add project ownership without rewriting #34's already-landed migration. Legacy rows remain
+/// readable by their existing handles but are deliberately absent from the management surface until
+/// explicitly reprovisioned; every newly managed row carries a project and is name-unique there.
+pub const ALTER_CI_SECRET_ADD_ADMIN_SCOPE_DDL: &str =
+    "ALTER TABLE ci_secret ADD COLUMN IF NOT EXISTS project_id uuid";
+pub const CREATE_CI_SECRET_ADMIN_UNIQUE_INDEX_DDL: &str = "\
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ux_ci_secret_tenant_project_name
+  ON ci_secret (tenant_id, project_id, name) WHERE project_id IS NOT NULL";
+
+/// Backfill canonical binding handles, discard irreconcilable pre-existing orphans fail-closed, and
+/// make the database own the lifetime edge. The tenant-qualified FK uses `ci_secret`'s immutable
+/// primary key and cascades every matching binding, including rows whose non-key metadata was
+/// malformed before this constraint existed.
+pub const ALTER_SECRET_BINDING_ADD_INTEGRITY_DDL: &str = "\
+ALTER TABLE secret_binding ADD COLUMN IF NOT EXISTS secret_id text;
+UPDATE secret_binding AS binding
+   SET secret_id = secret.secret_id
+  FROM ci_secret AS secret
+ WHERE binding.secret_id IS NULL
+   AND binding.tenant_id = secret.tenant_id
+   AND binding.region = secret.region
+   AND binding.value_ref = 'myelin://' || secret.tenant_id || '/ci/secret/' || secret.secret_id;
+DELETE FROM secret_binding WHERE secret_id IS NULL;
+ALTER TABLE secret_binding ALTER COLUMN secret_id SET NOT NULL;
+ALTER TABLE secret_binding
+  ADD CONSTRAINT fk_secret_binding_ci_secret
+  FOREIGN KEY (tenant_id, secret_id)
+  REFERENCES ci_secret (tenant_id, secret_id)
+  ON DELETE CASCADE";
+
+pub const CREATE_CI_SECRET_TOMBSTONE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS ci_secret_tombstone (
+  tenant_id  text   NOT NULL,
+  region     text   NOT NULL,
+  project_id uuid   NOT NULL,
+  secret_id  text   NOT NULL CHECK (secret_id ~ '^[A-Za-z0-9_-]{1,128}$'),
+  max_version bigint NOT NULL CHECK (max_version > 0),
+  deleted_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, project_id, secret_id)
+)";
+
+/// Backfill the greatest extant or deleted version before any writer can allocate through this
+/// table. Thereafter `INSERT .. ON CONFLICT .. max_version + 1 RETURNING` is the single authority,
+/// whose row lock serializes concurrent create/update/seal operations for one logical secret.
+pub const CREATE_CI_SECRET_VERSION_HIGH_WATER_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS ci_secret_version_high_water (
+  tenant_id   text        NOT NULL,
+  region      text        NOT NULL,
+  secret_id   text        NOT NULL CHECK (secret_id ~ '^[A-Za-z0-9_-]{1,128}$'),
+  max_version bigint      NOT NULL CHECK (max_version > 0),
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, secret_id)
+);
+INSERT INTO ci_secret_version_high_water (tenant_id, region, secret_id, max_version)
+SELECT tenant_id,
+       (array_agg(region ORDER BY version DESC, region))[1],
+       secret_id,
+       max(version)
+  FROM (
+    SELECT tenant_id, region, secret_id, version FROM ci_secret
+    UNION ALL
+    SELECT tenant_id, region, secret_id, max_version AS version FROM ci_secret_tombstone
+  ) AS history
+ GROUP BY tenant_id, secret_id
+ON CONFLICT (tenant_id, secret_id) DO UPDATE SET
+  region = EXCLUDED.region,
+  max_version = GREATEST(ci_secret_version_high_water.max_version, EXCLUDED.max_version),
+  updated_at = now()";
 
 /// `ci_cost_event` (arch 01 §3.7 — D8) — one row per metered unit; wholesale & markup separate
 /// columns, integer quantities (NEVER a float). HOT (per-metered-unit). The reserve/settle metering is
@@ -2367,6 +2451,31 @@ pub fn ci_controlplane_migrations() -> Migrations {
         CI_SECRET_TABLE,
         CREATE_CI_SECRET_DDL.to_owned(),
     ));
+    migrations.push(Migration::plain_on(
+        CI_SECRET_ADMIN_SCOPE_MIGRATION_ID,
+        ALTER_CI_SECRET_ADD_ADMIN_SCOPE_DDL,
+        CI_SECRET_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_SECRET_ADMIN_UNIQUE_MIGRATION_ID,
+        CREATE_CI_SECRET_ADMIN_UNIQUE_INDEX_DDL,
+        CI_SECRET_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_SECRET_BINDING_INTEGRITY_MIGRATION_ID,
+        ALTER_SECRET_BINDING_ADD_INTEGRITY_DDL,
+        SECRET_BINDING_TABLE,
+    ));
+    migrations.push(assemble_ci_migration(
+        CI_SECRET_TOMBSTONE_MIGRATION_ID,
+        CI_SECRET_TOMBSTONE_TABLE,
+        CREATE_CI_SECRET_TOMBSTONE_DDL.to_owned(),
+    ));
+    migrations.push(assemble_ci_migration(
+        CI_SECRET_VERSION_HIGH_WATER_MIGRATION_ID,
+        CI_SECRET_VERSION_HIGH_WATER_TABLE,
+        CREATE_CI_SECRET_VERSION_HIGH_WATER_DDL.to_owned(),
+    ));
     Migrations::of(migrations)
 }
 
@@ -2452,13 +2561,13 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
 mod tests {
     use super::*;
 
-    /// **All twenty-two CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
+    /// **All twenty-three CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
     /// The complete arch 01 §3 control-plane schema (+ CT-004d.1's `ci_job_spec` + CT-007 slice
     /// 5b.3-4a.2's prelaunch-usage journal pair + CT-007's phase-credential generation log) lands
     /// here; `ci_run` precedes `ci_job` (the FK dependency). This is the prompt's "the complete
     /// forward-only data-model migrations" gate.
     #[test]
-    fn all_twenty_two_controlplane_tables_are_present_fk_ordered() {
+    fn all_twenty_three_controlplane_tables_are_present_fk_ordered() {
         let migrations = ci_controlplane_migrations();
         let tables: Vec<&str> = migrations
             .0
@@ -2491,8 +2600,10 @@ mod tests {
                 CI_JOB_PRELAUNCH_USAGE_TABLE,
                 CI_JOB_CREDENTIAL_GENERATION_TABLE,
                 CI_SECRET_TABLE,
+                CI_SECRET_TOMBSTONE_TABLE,
+                CI_SECRET_VERSION_HIGH_WATER_TABLE,
             ],
-            "all 22 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
+            "all 24 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
         );
         // ci_run precedes ci_job (the FK target before the FK source).
         let run_pos = tables.iter().position(|t| *t == CI_RUN_TABLE).unwrap();
@@ -2519,6 +2630,83 @@ mod tests {
                 "ci_secret must have no plaintext-at-rest column: {forbidden}"
             );
         }
+        assert_eq!(
+            ALTER_CI_SECRET_ADD_ADMIN_SCOPE_DDL,
+            "ALTER TABLE ci_secret ADD COLUMN IF NOT EXISTS project_id uuid"
+        );
+        assert!(
+            CREATE_CI_SECRET_ADMIN_UNIQUE_INDEX_DDL.starts_with("CREATE UNIQUE INDEX CONCURRENTLY")
+        );
+        assert!(CREATE_CI_SECRET_ADMIN_UNIQUE_INDEX_DDL
+            .contains("(tenant_id, project_id, name) WHERE project_id IS NOT NULL"));
+    }
+
+    #[test]
+    fn secret_binding_integrity_is_forward_only_fk_cascade() {
+        assert!(
+            !CREATE_SECRET_BINDING_DDL.contains("secret_id"),
+            "the applied ci_0013 migration remains checksum-immutable"
+        );
+        assert!(
+            !CREATE_CI_SECRET_DDL.contains("secret_binding"),
+            "the applied ci_0023 migration remains checksum-immutable"
+        );
+        assert!(
+            ALTER_SECRET_BINDING_ADD_INTEGRITY_DDL.contains("FOREIGN KEY (tenant_id, secret_id)")
+        );
+        assert!(ALTER_SECRET_BINDING_ADD_INTEGRITY_DDL
+            .contains("REFERENCES ci_secret (tenant_id, secret_id)"));
+        assert!(ALTER_SECRET_BINDING_ADD_INTEGRITY_DDL.contains("ON DELETE CASCADE"));
+        assert!(ALTER_SECRET_BINDING_ADD_INTEGRITY_DDL
+            .contains("DELETE FROM secret_binding WHERE secret_id IS NULL"));
+
+        let migrations = ci_controlplane_migrations();
+        let integrity = migrations
+            .0
+            .iter()
+            .find(|migration| migration.id == CI_SECRET_BINDING_INTEGRITY_MIGRATION_ID)
+            .expect("the binding-integrity migration is registered");
+        assert_eq!(integrity.ddl, ALTER_SECRET_BINDING_ADD_INTEGRITY_DDL);
+        let tombstone = migrations
+            .0
+            .iter()
+            .find(|migration| migration.id == CI_SECRET_TOMBSTONE_MIGRATION_ID)
+            .expect("the version-tombstone migration is registered");
+        assert!(tombstone.ddl.contains("myelin_make_tenant_scoped"));
+    }
+
+    #[test]
+    fn secret_version_high_water_migration_is_forward_only_and_backfills_history() {
+        assert!(CREATE_CI_SECRET_VERSION_HIGH_WATER_DDL
+            .starts_with("CREATE TABLE IF NOT EXISTS ci_secret_version_high_water"));
+        assert!(
+            CREATE_CI_SECRET_VERSION_HIGH_WATER_DDL.contains("PRIMARY KEY (tenant_id, secret_id)")
+        );
+        assert!(CREATE_CI_SECRET_VERSION_HIGH_WATER_DDL
+            .contains("SELECT tenant_id, region, secret_id, version FROM ci_secret"));
+        assert!(CREATE_CI_SECRET_VERSION_HIGH_WATER_DDL.contains(
+            "SELECT tenant_id, region, secret_id, max_version AS version FROM ci_secret_tombstone"
+        ));
+        assert!(CREATE_CI_SECRET_VERSION_HIGH_WATER_DDL.contains("max(version)"));
+        assert!(!myelin_substrate::is_destructive(
+            CREATE_CI_SECRET_VERSION_HIGH_WATER_DDL
+        ));
+
+        let migrations = ci_controlplane_migrations();
+        let tombstone_pos = migrations
+            .0
+            .iter()
+            .position(|migration| migration.id == CI_SECRET_TOMBSTONE_MIGRATION_ID)
+            .expect("managed tombstone migration");
+        let high_water_pos = migrations
+            .0
+            .iter()
+            .position(|migration| migration.id == CI_SECRET_VERSION_HIGH_WATER_MIGRATION_ID)
+            .expect("universal high-water migration");
+        assert_eq!(high_water_pos, tombstone_pos + 1);
+        assert!(migrations.0[high_water_pos]
+            .ddl
+            .contains("myelin_make_tenant_scoped('ci_secret_version_high_water')"));
     }
 
     /// **Every CI table is `(tenant_id, region)`-first with a tenant-first primary key (contract
@@ -2793,7 +2981,11 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             !ddl.contains("CREATE OR REPLACE FUNCTION"),
             "a blind replace would overwrite a divergent function instead of raising"
         );
-        for forbidden in ["CREATE ROLE", "ALTER ROLE", "GRANT myelin_ci_definition_fence TO"] {
+        for forbidden in [
+            "CREATE ROLE",
+            "ALTER ROLE",
+            "GRANT myelin_ci_definition_fence TO",
+        ] {
             assert!(
                 !ddl.contains(forbidden),
                 "a migration must never provision cluster authority (`{forbidden}`) — it verifies \
@@ -2851,7 +3043,11 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             !ddl.contains("ALTER FUNCTION") && !ddl.contains("CREATE OR REPLACE FUNCTION"),
             "the function is BORN fence-owned and never blind-replaced"
         );
-        for forbidden in ["CREATE ROLE", "ALTER ROLE", "GRANT myelin_ci_definition_fence TO"] {
+        for forbidden in [
+            "CREATE ROLE",
+            "ALTER ROLE",
+            "GRANT myelin_ci_definition_fence TO",
+        ] {
             assert!(
                 !ddl.contains(forbidden),
                 "a migration must never provision cluster authority (`{forbidden}`)"
@@ -2863,7 +3059,13 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
              cross-region authority"
         );
         // The probe reads ONLY the four scoped columns — never a payload/identity column.
-        for forbidden_column in ["tenant_id", "idem_token", "lease_owner", "job_id", "meter_to"] {
+        for forbidden_column in [
+            "tenant_id",
+            "idem_token",
+            "lease_owner",
+            "job_id",
+            "meter_to",
+        ] {
             assert!(
                 !ddl.contains(&format!(
                     "GRANT SELECT (region, state, claim_window_secs, reservation_write_version, {forbidden_column}"
@@ -2906,7 +3108,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
     #[test]
     fn the_activation_readiness_index_is_concurrent_and_covers_unsafe_rows() {
         let index = CREATE_JOB_QUEUE_ACTIVATION_READINESS_INDEX_DDL;
-        assert!(index.starts_with("CREATE INDEX CONCURRENTLY IF NOT EXISTS job_queue_activation_readiness"));
+        assert!(index
+            .starts_with("CREATE INDEX CONCURRENTLY IF NOT EXISTS job_queue_activation_readiness"));
         assert_eq!(
             index.matches(';').count(),
             0,
@@ -2917,7 +3120,10 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             "WHERE state <> 'terminal'",
             "claim_window_secs IS NULL OR reservation_write_version IS DISTINCT FROM 2",
         ] {
-            assert!(index.contains(required), "the readiness index pins `{required}`");
+            assert!(
+                index.contains(required),
+                "the readiness index pins `{required}`"
+            );
         }
     }
 
@@ -2966,7 +3172,10 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             ddl.contains("sentinel:"),
             "the seeded hash must be unmistakable for a real source-derived pin"
         );
-        assert!(!ddl.contains("DO UPDATE"), "the seed never rewrites an existing row");
+        assert!(
+            !ddl.contains("DO UPDATE"),
+            "the seed never rewrites an existing row"
+        );
     }
 
     #[test]
@@ -3033,17 +3242,18 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the claim-window validation is in the set");
         // The claim-window pair sits immediately before the wf_version grant, the backlog probe, the
         // cutover fence-row seed, and the CT-007 5b.3-6e.1 activation-chassis tail (4 migrations).
-        assert_eq!(expand, ids.len() - 11);
-        assert_eq!(validate, ids.len() - 10);
+        assert_eq!(expand, ids.len() - 16);
+        assert_eq!(validate, ids.len() - 15);
         // The activation chassis (ci_0022*) is appended AFTER the cutover fence-row seed, in order,
-        // followed by the Stage-B sentinel; #34's new secret-store migration is the absolute tail.
+        // followed by the Stage-B sentinel, #34's secret store, then SecretAdmin's online scope,
+        // uniqueness, binding-integrity, version-tombstone, and universal-high-water migrations.
         assert_eq!(
-            ids[ids.len() - 7],
+            ids[ids.len() - 12],
             CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID,
             "the cutover fence's predecessor-row seed precedes only the ci_0022* chassis"
         );
         assert_eq!(
-            &ids[ids.len() - 6..ids.len() - 2],
+            &ids[ids.len() - 11..ids.len() - 7],
             &[
                 CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID,
                 CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID,
@@ -3053,14 +3263,25 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             "the CT-007 5b.3-6e.1 activation chassis retains expand→validate→index→probe order"
         );
         assert_eq!(
-            ids[ids.len() - 2],
+            ids[ids.len() - 7],
             CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID,
             "Stage B appends the retired-v3 sentinel after the activation chassis"
         );
         assert_eq!(
-            ids[ids.len() - 1],
+            ids[ids.len() - 6],
             CI_SECRET_MIGRATION_ID,
             "the new encrypted secret store is appended after every migration shipped at the base"
+        );
+        assert_eq!(
+            &ids[ids.len() - 5..],
+            &[
+                CI_SECRET_ADMIN_SCOPE_MIGRATION_ID,
+                CI_SECRET_ADMIN_UNIQUE_MIGRATION_ID,
+                CI_SECRET_BINDING_INTEGRITY_MIGRATION_ID,
+                CI_SECRET_TOMBSTONE_MIGRATION_ID,
+                CI_SECRET_VERSION_HIGH_WATER_MIGRATION_ID,
+            ],
+            "SecretAdmin appends ownership, uniqueness, binding integrity, tombstones, then the universal version high-water"
         );
         assert!(
             expand
@@ -3080,8 +3301,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            64,
-            "22 table/RLS (incl. the encrypted ci_secret store) + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate) + 1 ci_job_spec-stage ALTER + 3 ci_job_accounting ALTERs + 1 scheduler-boundary + 3 scheduler claim grants + 4 scheduler ci_run/workflow discovery grants (incl. wf_version) + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand + 4 CT-007 5b.3-6e.1 activation-chassis (reservation-marker expand + validate + readiness index + readiness probe)"
+            69,
+            "24 table/RLS (including encrypted secrets, tombstones, and universal high-water) + 3 secret-admin scope/index/integrity migrations + the previously shipped CI follow-ons"
         );
         for m in &migrations.0 {
             assert!(
@@ -3180,6 +3401,10 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, GRANT_SCHEDULER_CI_JOB_PRELAUNCH_USAGE_REAP_DDL);
             } else if m.id == CI_JOB_PRELAUNCH_USAGE_SEAL_DEADLINE_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL);
+            } else if m.id == CI_SECRET_ADMIN_SCOPE_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_CI_SECRET_ADD_ADMIN_SCOPE_DDL);
+            } else if m.id == CI_SECRET_BINDING_INTEGRITY_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_SECRET_BINDING_ADD_INTEGRITY_DDL);
             } else if m.id == CI_REGION_SCHEDULER_RLS_MIGRATION_ID {
                 assert_eq!(m.ddl, CREATE_CI_REGION_SCHEDULER_RLS_DDL);
             } else {
@@ -3212,8 +3437,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            64,
-            "the runner applied all 22 table/RLS (incl. the encrypted ci_secret store), 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate), 1 ci_job_spec-stage ALTER, 3 ci_job_accounting ALTERs, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, 1 prelaunch deadline expand, and the 4 CT-007 5b.3-6e.1 activation-chassis migrations (reservation-marker expand + validate + readiness index + readiness probe)"
+            69,
+            "the runner applied the complete 24-table schema plus every additive follow-on"
         );
         assert_eq!(
             runner.applied()[0],

@@ -7,10 +7,9 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use myelin_gdpr::ErasureMethod;
-use myelin_identity::{
-    AuthzError, Consistency, Decision, IdentityService, Permission, Principal,
-};
+use myelin_identity::{AuthzError, Consistency, Decision, IdentityService, Permission, Principal};
 use myelin_storage::{
     with_tenant_tx, ColumnCryptor, EncryptedColumn, KekId, KeyClass, KmsEngine, PiiKeyRef,
     NONCE_LEN,
@@ -24,20 +23,113 @@ use crate::{
     CiJobSecretResolver, SecretBroker, SecretCapability, SecretLaunchError, SECRET_READ_PERMISSION,
 };
 
-const INSERT_SECRET: &str = "INSERT INTO ci_secret \
+const INSERT_SECRET: &str = "WITH next_version AS ( \
+      INSERT INTO ci_secret_version_high_water (tenant_id, region, secret_id, max_version) \
+      VALUES ($1, $2, $3, 1) \
+      ON CONFLICT (tenant_id, secret_id) DO UPDATE SET \
+        region = EXCLUDED.region, \
+        max_version = ci_secret_version_high_water.max_version + 1, \
+        updated_at = now() \
+      RETURNING max_version \
+    ) \
+    INSERT INTO ci_secret \
     (tenant_id, region, secret_id, name, pii_key_ref, nonce, ciphertext, version) \
-    VALUES ($1, $2, $3, $4, $5, $6, $7, 1) \
+    SELECT $1, $2, $3, $4, $5, $6, $7, max_version FROM next_version \
     ON CONFLICT (tenant_id, secret_id) DO UPDATE SET \
       name = EXCLUDED.name, pii_key_ref = EXCLUDED.pii_key_ref, nonce = EXCLUDED.nonce, \
-      ciphertext = EXCLUDED.ciphertext, version = ci_secret.version + 1, updated_at = now()";
+      ciphertext = EXCLUDED.ciphertext, version = EXCLUDED.version, updated_at = now()";
 
-const SELECT_SECRET: &str = "SELECT pii_key_ref, nonce, ciphertext \
+const CREATE_MANAGED_SECRET: &str = "WITH next_version AS ( \
+      INSERT INTO ci_secret_version_high_water (tenant_id, region, secret_id, max_version) \
+      VALUES ($1, $2, $3, 1) \
+      ON CONFLICT (tenant_id, secret_id) DO UPDATE SET \
+        region = EXCLUDED.region, \
+        max_version = ci_secret_version_high_water.max_version + 1, \
+        updated_at = now() \
+      RETURNING max_version \
+    ) \
+    INSERT INTO ci_secret \
+    (tenant_id, region, secret_id, project_id, name, pii_key_ref, nonce, ciphertext, version) \
+    SELECT $1, $2, $3, $4::uuid, $5, $6, $7, $8, max_version FROM next_version \
+    ON CONFLICT DO NOTHING \
+    RETURNING created_at, version";
+
+const UPDATE_MANAGED_SECRET: &str = "WITH next_version AS ( \
+      INSERT INTO ci_secret_version_high_water (tenant_id, region, secret_id, max_version) \
+      VALUES ($1, $2, $3, 1) \
+      ON CONFLICT (tenant_id, secret_id) DO UPDATE SET \
+        region = EXCLUDED.region, \
+        max_version = ci_secret_version_high_water.max_version + 1, \
+        updated_at = now() \
+      RETURNING max_version \
+    ) \
+    UPDATE ci_secret SET \
+      pii_key_ref = $6, nonce = $7, ciphertext = $8, \
+      version = next_version.max_version, updated_at = now() \
+    FROM next_version \
+    WHERE tenant_id = $1 AND region = $2 AND secret_id = $3 \
+      AND project_id = $4::uuid AND name = $5 \
+    RETURNING created_at, version";
+
+const DELETE_MANAGED_SECRET: &str = "WITH deleted AS ( \
+      DELETE FROM ci_secret \
+      WHERE tenant_id = $1 AND region = $2 AND project_id = $3::uuid AND name = $4 \
+      RETURNING tenant_id, region, project_id, secret_id, version \
+    ) \
+    INSERT INTO ci_secret_tombstone \
+      (tenant_id, region, project_id, secret_id, max_version, deleted_at) \
+    SELECT tenant_id, region, project_id, secret_id, version, now() FROM deleted \
+    ON CONFLICT (tenant_id, project_id, secret_id) DO UPDATE SET \
+      region = EXCLUDED.region, \
+      max_version = GREATEST(ci_secret_tombstone.max_version, EXCLUDED.max_version), \
+      deleted_at = EXCLUDED.deleted_at \
+    RETURNING secret_id";
+
+const LIST_MANAGED_SECRETS: &str = "SELECT secret_id, project_id::text AS project_id, name, \
+      created_at, version FROM ci_secret \
+    WHERE tenant_id = $1 AND region = $2 AND project_id IS NOT NULL \
+    ORDER BY project_id, name";
+
+const LIST_PROJECT_MANAGED_SECRETS: &str =
+    "SELECT secret_id, project_id::text AS project_id, name, \
+      created_at, version FROM ci_secret \
+    WHERE tenant_id = $1 AND region = $2 AND project_id = $3::uuid \
+    ORDER BY name";
+
+const SELECT_MANAGED_SECRET_BY_NAME: &str =
+    "SELECT secret_id, project_id::text AS project_id, name, \
+      created_at, version FROM ci_secret \
+    WHERE tenant_id = $1 AND region = $2 AND project_id = $3::uuid AND name = $4";
+
+const GRANT_SECRET_BINDING: &str = "INSERT INTO secret_binding \
+    (tenant_id, region, project_id, name, scope, value_ref, secret_id) \
+    SELECT tenant_id, region, project_id, name, $5, \
+           'myelin://' || tenant_id || '/ci/secret/' || secret_id, secret_id \
+      FROM ci_secret \
+     WHERE tenant_id = $1 AND region = $2 AND project_id = $3::uuid AND name = $4 \
+    ON CONFLICT (tenant_id, project_id, name, scope) DO UPDATE SET \
+      region = EXCLUDED.region, value_ref = EXCLUDED.value_ref, secret_id = EXCLUDED.secret_id";
+
+const REVOKE_SECRET_BINDING: &str = "DELETE FROM secret_binding \
+    WHERE tenant_id = $1 AND region = $2 AND project_id = $3::uuid \
+      AND name = $4 AND scope = $5 AND value_ref = $6";
+
+#[cfg(test)]
+const SELECT_SECRET: &str = "SELECT pii_key_ref, nonce, ciphertext, version \
     FROM ci_secret \
     WHERE tenant_id = $1 AND region = $2 AND secret_id = $3";
 
-const SELECT_SECRET_BINDING: &str = "SELECT EXISTS (SELECT 1 FROM secret_binding \
-    WHERE tenant_id = $1 AND region = $2 AND project_id = $3::uuid AND name = $4 \
-      AND value_ref = $5 AND scope IN ('project', $6)) AS bound";
+const SELECT_BOUND_SECRET: &str = "SELECT secret.pii_key_ref, secret.nonce, secret.ciphertext, \
+      secret.version \
+    FROM ci_secret AS secret \
+    JOIN secret_binding AS binding \
+      ON binding.tenant_id = secret.tenant_id \
+     AND binding.region = secret.region \
+     AND binding.secret_id = secret.secret_id \
+    WHERE secret.tenant_id = $1 AND secret.region = $2 AND secret.secret_id = $3 \
+      AND binding.project_id = $4::uuid AND binding.name = $5 \
+      AND binding.value_ref = $6 AND binding.scope IN ('project', $7) \
+    LIMIT 1";
 
 const SECRET_AAD_DOMAIN: &[u8] = b"myelin-ci-secret-row:v1";
 
@@ -46,10 +138,18 @@ const SECRET_AAD_DOMAIN: &[u8] = b"myelin-ci-secret-row:v1";
 /// dimension fails authentication.
 fn secret_row_aad(tenant: &TenantId, region: &Region, secret_id: &str) -> Vec<u8> {
     let mut aad = Vec::with_capacity(
-        SECRET_AAD_DOMAIN.len() + tenant.as_str().len() + region.as_str().len() + secret_id.len() + 12,
+        SECRET_AAD_DOMAIN.len()
+            + tenant.as_str().len()
+            + region.as_str().len()
+            + secret_id.len()
+            + 12,
     );
     aad.extend_from_slice(SECRET_AAD_DOMAIN);
-    for component in [tenant.as_str().as_bytes(), region.as_str().as_bytes(), secret_id.as_bytes()] {
+    for component in [
+        tenant.as_str().as_bytes(),
+        region.as_str().as_bytes(),
+        secret_id.as_bytes(),
+    ] {
         aad.extend_from_slice(&(component.len() as u32).to_be_bytes());
         aad.extend_from_slice(component);
     }
@@ -61,13 +161,26 @@ struct StoredSecret {
     key_ref: PiiKeyRef,
     nonce: [u8; NONCE_LEN],
     ciphertext: Vec<u8>,
+    version: i64,
+}
+
+#[derive(Clone)]
+pub(crate) struct ManagedSecretRow {
+    pub(crate) secret_id: String,
+    pub(crate) project_id: String,
+    pub(crate) name: String,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) version: i64,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 struct MemorySecretStore {
     rows: std::collections::BTreeMap<(String, String), StoredSecret>,
-    bindings: std::collections::BTreeSet<(String, String, String, String, String)>,
+    managed_rows: std::collections::BTreeMap<(String, String), ManagedSecretRow>,
+    bindings: std::collections::BTreeSet<(String, String, String, String, String, String)>,
+    tombstones: std::collections::BTreeMap<(String, String, String), i64>,
+    high_water: std::collections::BTreeMap<(String, String), i64>,
 }
 
 #[derive(Clone)]
@@ -84,6 +197,8 @@ enum SecretStoreBackend {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiSecretStoreError {
     InvalidScope,
+    AlreadyExists,
+    NotFound,
     Encrypt,
     Database,
     CorruptCiphertext,
@@ -93,6 +208,8 @@ impl std::fmt::Display for CiSecretStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::InvalidScope => "CI secret scope is invalid",
+            Self::AlreadyExists => "CI secret already exists",
+            Self::NotFound => "CI secret does not exist",
             Self::Encrypt => "CI secret sealing failed",
             Self::Database => "CI secret durable store is unavailable",
             Self::CorruptCiphertext => "CI secret ciphertext could not be authenticated",
@@ -144,6 +261,10 @@ impl DurableCiSecretStore {
         name: &str,
         handle: &str,
     ) {
+        let secret_id = parse_canonical_secret_handle(handle)
+            .expect("test bindings use canonical handles")
+            .id
+            .to_owned();
         let SecretStoreBackend::Memory(state) = &self.backend else {
             panic!("test binding helper requires the in-memory backend")
         };
@@ -157,6 +278,7 @@ impl DurableCiSecretStore {
                 name.to_owned(),
                 "project".to_owned(),
                 handle.to_owned(),
+                secret_id,
             ));
     }
 
@@ -179,24 +301,628 @@ impl DurableCiSecretStore {
             return Err(CiSecretStoreError::InvalidScope);
         }
 
+        let encrypted = self.encrypt_secret(tenant, secret_id, material.as_bytes())?;
+
+        self.store_encrypted(tenant, secret_id, name, encrypted)
+    }
+
+    fn encrypt_secret(
+        &self,
+        tenant: &TenantId,
+        secret_id: &str,
+        material: &[u8],
+    ) -> Result<EncryptedColumn, CiSecretStoreError> {
         self.kms
             .ensure_kek(&KekId::new(tenant.clone(), self.region.clone()));
-        let encrypted = ColumnCryptor::new(&self.kms, self.region.clone())
+        ColumnCryptor::new(&self.kms, self.region.clone())
             .encrypt_with_aad(
                 tenant,
                 None,
                 &ErasureMethod::CryptoShred("tenant_dek".into()),
-                material.as_bytes(),
+                material,
                 &secret_row_aad(tenant, &self.region, secret_id),
             )
-            .map_err(|_| CiSecretStoreError::Encrypt)?;
+            .map_err(|_| CiSecretStoreError::Encrypt)
+    }
 
-        self.store_encrypted(tenant, secret_id, name, encrypted)
+    pub(crate) fn create_managed_secret(
+        &self,
+        tenant: &TenantId,
+        project_id: &str,
+        secret_id: &str,
+        name: &str,
+        material: &[u8],
+    ) -> Result<ManagedSecretRow, CiSecretStoreError> {
+        if !strict_secret_segment(tenant.as_str()) || !strict_secret_segment(secret_id) {
+            return Err(CiSecretStoreError::InvalidScope);
+        }
+        let encrypted = self.encrypt_secret(tenant, secret_id, material)?;
+        let stored = StoredSecret {
+            key_ref: encrypted.key_ref,
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext,
+            version: 0,
+        };
+        match &self.backend {
+            SecretStoreBackend::Pg { pool, runtime } => {
+                let pool = pool.clone();
+                let tenant_id = tenant.as_str().to_owned();
+                let region = self.region.as_str().to_owned();
+                let row_tenant = tenant_id.clone();
+                let row_region = region.clone();
+                let secret_id = secret_id.to_owned();
+                let project_id = project_id.to_owned();
+                let name = name.to_owned();
+                let key_ref = stored.key_ref.to_uri();
+                let nonce = stored.nonce.to_vec();
+                let ciphertext = stored.ciphertext;
+                bridge(runtime, async move {
+                    with_tenant_tx(&pool, &tenant_id, &region, |connection| {
+                        Box::pin(async move {
+                            sqlx::query(CREATE_MANAGED_SECRET)
+                                .bind(&row_tenant)
+                                .bind(&row_region)
+                                .bind(&secret_id)
+                                .bind(&project_id)
+                                .bind(&name)
+                                .bind(key_ref)
+                                .bind(nonce)
+                                .bind(ciphertext)
+                                .fetch_optional(&mut *connection)
+                                .await
+                                .map(|row| {
+                                    row.map(|row| ManagedSecretRow {
+                                        secret_id,
+                                        project_id,
+                                        name,
+                                        created_at: row.get("created_at"),
+                                        version: row.get("version"),
+                                    })
+                                })
+                                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+                        })
+                    })
+                    .await
+                })
+                .map_err(|_| CiSecretStoreError::Database)?
+                .ok_or(CiSecretStoreError::AlreadyExists)
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            SecretStoreBackend::Memory(state) => {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.managed_rows.iter().any(|((row_tenant, _), row)| {
+                    row_tenant == tenant.as_str()
+                        && row.project_id == project_id
+                        && row.name == name
+                        && row.secret_id != secret_id
+                }) || state
+                    .managed_rows
+                    .contains_key(&(tenant.as_str().to_owned(), secret_id.to_owned()))
+                {
+                    return Err(CiSecretStoreError::AlreadyExists);
+                }
+                let high_water_key = (tenant.as_str().to_owned(), secret_id.to_owned());
+                let version = state
+                    .high_water
+                    .entry(high_water_key)
+                    .and_modify(|version| *version += 1)
+                    .or_insert(1)
+                    .to_owned();
+                let stored = StoredSecret { version, ..stored };
+                let row = ManagedSecretRow {
+                    secret_id: secret_id.to_owned(),
+                    project_id: project_id.to_owned(),
+                    name: name.to_owned(),
+                    created_at: DateTime::<Utc>::from(std::time::SystemTime::now()),
+                    version,
+                };
+                let key = (tenant.as_str().to_owned(), secret_id.to_owned());
+                state.rows.insert(key.clone(), stored);
+                state.managed_rows.insert(key, row.clone());
+                Ok(row)
+            }
+        }
+    }
+
+    pub(crate) fn replace_managed_secret(
+        &self,
+        tenant: &TenantId,
+        project_id: &str,
+        secret_id: &str,
+        name: &str,
+        material: &[u8],
+    ) -> Result<ManagedSecretRow, CiSecretStoreError> {
+        let encrypted = self.encrypt_secret(tenant, secret_id, material)?;
+        let stored = StoredSecret {
+            key_ref: encrypted.key_ref,
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext,
+            version: 0,
+        };
+        match &self.backend {
+            SecretStoreBackend::Pg { pool, runtime } => {
+                let pool = pool.clone();
+                let tenant_id = tenant.as_str().to_owned();
+                let region = self.region.as_str().to_owned();
+                let row_tenant = tenant_id.clone();
+                let row_region = region.clone();
+                let secret_id = secret_id.to_owned();
+                let project_id = project_id.to_owned();
+                let name = name.to_owned();
+                let key_ref = stored.key_ref.to_uri();
+                let nonce = stored.nonce.to_vec();
+                let ciphertext = stored.ciphertext;
+                bridge(runtime, async move {
+                    with_tenant_tx(&pool, &tenant_id, &region, |connection| {
+                        Box::pin(async move {
+                            sqlx::query(UPDATE_MANAGED_SECRET)
+                                .bind(&row_tenant)
+                                .bind(&row_region)
+                                .bind(&secret_id)
+                                .bind(&project_id)
+                                .bind(&name)
+                                .bind(key_ref)
+                                .bind(nonce)
+                                .bind(ciphertext)
+                                .fetch_optional(&mut *connection)
+                                .await
+                                .map(|row| {
+                                    row.map(|row| ManagedSecretRow {
+                                        secret_id,
+                                        project_id,
+                                        name,
+                                        created_at: row.get("created_at"),
+                                        version: row.get("version"),
+                                    })
+                                })
+                                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+                        })
+                    })
+                    .await
+                })
+                .map_err(|_| CiSecretStoreError::Database)?
+                .ok_or(CiSecretStoreError::NotFound)
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            SecretStoreBackend::Memory(state) => {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let key = (tenant.as_str().to_owned(), secret_id.to_owned());
+                if state
+                    .managed_rows
+                    .get(&key)
+                    .filter(|row| row.project_id == project_id && row.name == name)
+                    .is_none()
+                {
+                    return Err(CiSecretStoreError::NotFound);
+                }
+                let version = state
+                    .high_water
+                    .entry(key.clone())
+                    .and_modify(|version| *version += 1)
+                    .or_insert(1)
+                    .to_owned();
+                let stored = StoredSecret { version, ..stored };
+                let row = state
+                    .managed_rows
+                    .get_mut(&key)
+                    .expect("the validated managed row remains present under the store lock");
+                row.version = version;
+                let row = row.clone();
+                state.rows.insert(key, stored);
+                Ok(row)
+            }
+        }
+    }
+
+    pub(crate) fn delete_managed_secret(
+        &self,
+        tenant: &TenantId,
+        project_id: &str,
+        name: &str,
+    ) -> Result<(), CiSecretStoreError> {
+        match &self.backend {
+            SecretStoreBackend::Pg { pool, runtime } => {
+                let pool = pool.clone();
+                let tenant_id = tenant.as_str().to_owned();
+                let region = self.region.as_str().to_owned();
+                let row_tenant = tenant_id.clone();
+                let row_region = region.clone();
+                let project_id = project_id.to_owned();
+                let name = name.to_owned();
+                let deleted = bridge(runtime, async move {
+                    with_tenant_tx(&pool, &tenant_id, &region, |connection| {
+                        Box::pin(async move {
+                            let row = sqlx::query(DELETE_MANAGED_SECRET)
+                                .bind(&row_tenant)
+                                .bind(&row_region)
+                                .bind(&project_id)
+                                .bind(&name)
+                                .fetch_optional(&mut *connection)
+                                .await
+                                .map_err(|error| {
+                                    myelin_storage::PgError::Query(error.to_string())
+                                })?;
+                            Ok(row.is_some())
+                        })
+                    })
+                    .await
+                })
+                .map_err(|_| CiSecretStoreError::Database)?;
+                if deleted {
+                    Ok(())
+                } else {
+                    Err(CiSecretStoreError::NotFound)
+                }
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            SecretStoreBackend::Memory(state) => {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let key = state
+                    .managed_rows
+                    .iter()
+                    .find(|((row_tenant, _), row)| {
+                        row_tenant == tenant.as_str()
+                            && row.project_id == project_id
+                            && row.name == name
+                    })
+                    .map(|(key, _)| key.clone())
+                    .ok_or(CiSecretStoreError::NotFound)?;
+                let row = state
+                    .managed_rows
+                    .remove(&key)
+                    .expect("the selected managed row remains present under the store lock");
+                state.rows.remove(&key);
+                state.tombstones.insert(
+                    (
+                        tenant.as_str().to_owned(),
+                        project_id.to_owned(),
+                        key.1.clone(),
+                    ),
+                    row.version,
+                );
+                state
+                    .bindings
+                    .retain(|binding| !(binding.0 == tenant.as_str() && binding.5 == key.1));
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn list_managed_secrets(
+        &self,
+        tenant: &TenantId,
+        project_id: Option<&str>,
+    ) -> Result<Vec<ManagedSecretRow>, CiSecretStoreError> {
+        match &self.backend {
+            SecretStoreBackend::Pg { pool, runtime } => {
+                let pool = pool.clone();
+                let tenant_id = tenant.as_str().to_owned();
+                let region = self.region.as_str().to_owned();
+                let row_tenant = tenant_id.clone();
+                let row_region = region.clone();
+                let project_id = project_id.map(str::to_owned);
+                bridge(runtime, async move {
+                    with_tenant_tx(&pool, &tenant_id, &region, |connection| {
+                        Box::pin(async move {
+                            let query = if let Some(project_id) = project_id.as_ref() {
+                                sqlx::query(LIST_PROJECT_MANAGED_SECRETS)
+                                    .bind(row_tenant)
+                                    .bind(row_region)
+                                    .bind(project_id)
+                            } else {
+                                sqlx::query(LIST_MANAGED_SECRETS)
+                                    .bind(row_tenant)
+                                    .bind(row_region)
+                            };
+                            query
+                                .fetch_all(&mut *connection)
+                                .await
+                                .map(|rows| rows.into_iter().map(managed_row_from_pg).collect())
+                                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+                        })
+                    })
+                    .await
+                })
+                .map_err(|_| CiSecretStoreError::Database)
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            SecretStoreBackend::Memory(state) => Ok(state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .managed_rows
+                .iter()
+                .filter(|((row_tenant, _), row)| {
+                    row_tenant == tenant.as_str()
+                        && project_id.is_none_or(|project_id| row.project_id == project_id)
+                })
+                .map(|(_, row)| row.clone())
+                .collect()),
+        }
+    }
+
+    fn managed_secret_by_name(
+        &self,
+        tenant: &TenantId,
+        project_id: &str,
+        name: &str,
+    ) -> Result<ManagedSecretRow, CiSecretStoreError> {
+        match &self.backend {
+            SecretStoreBackend::Pg { pool, runtime } => {
+                let pool = pool.clone();
+                let tenant_id = tenant.as_str().to_owned();
+                let region = self.region.as_str().to_owned();
+                let row_tenant = tenant_id.clone();
+                let row_region = region.clone();
+                let project_id = project_id.to_owned();
+                let name = name.to_owned();
+                bridge(runtime, async move {
+                    with_tenant_tx(&pool, &tenant_id, &region, |connection| {
+                        Box::pin(async move {
+                            sqlx::query(SELECT_MANAGED_SECRET_BY_NAME)
+                                .bind(row_tenant)
+                                .bind(row_region)
+                                .bind(project_id)
+                                .bind(name)
+                                .fetch_optional(&mut *connection)
+                                .await
+                                .map(|row| row.map(managed_row_from_pg))
+                                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+                        })
+                    })
+                    .await
+                })
+                .map_err(|_| CiSecretStoreError::Database)?
+                .ok_or(CiSecretStoreError::NotFound)
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            SecretStoreBackend::Memory(state) => state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .managed_rows
+                .iter()
+                .find(|((row_tenant, _), row)| {
+                    row_tenant == tenant.as_str()
+                        && row.project_id == project_id
+                        && row.name == name
+                })
+                .map(|(_, row)| row.clone())
+                .ok_or(CiSecretStoreError::NotFound),
+        }
+    }
+
+    pub(crate) fn grant_managed_binding(
+        &self,
+        tenant: &TenantId,
+        project_id: &str,
+        name: &str,
+        scope: &str,
+    ) -> Result<(), CiSecretStoreError> {
+        match &self.backend {
+            SecretStoreBackend::Pg { pool, runtime } => {
+                let pool = pool.clone();
+                let tenant_id = tenant.as_str().to_owned();
+                let region = self.region.as_str().to_owned();
+                let row_tenant = tenant_id.clone();
+                let row_region = region.clone();
+                let project_id = project_id.to_owned();
+                let name = name.to_owned();
+                let scope = scope.to_owned();
+                bridge(runtime, async move {
+                    with_tenant_tx(&pool, &tenant_id, &region, |connection| {
+                        Box::pin(async move {
+                            let result = sqlx::query(GRANT_SECRET_BINDING)
+                                .bind(row_tenant)
+                                .bind(row_region)
+                                .bind(project_id)
+                                .bind(name)
+                                .bind(scope)
+                                .execute(&mut *connection)
+                                .await
+                                .map_err(|error| {
+                                    myelin_storage::PgError::Query(error.to_string())
+                                })?;
+                            Ok(result.rows_affected() == 1)
+                        })
+                    })
+                    .await
+                })
+                .map_err(|_| CiSecretStoreError::Database)?
+                .then_some(())
+                .ok_or(CiSecretStoreError::NotFound)
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            SecretStoreBackend::Memory(state) => {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let secret_id = state
+                    .managed_rows
+                    .iter()
+                    .find(|((row_tenant, _), row)| {
+                        row_tenant == tenant.as_str()
+                            && row.project_id == project_id
+                            && row.name == name
+                    })
+                    .map(|(_, row)| row.secret_id.clone())
+                    .ok_or(CiSecretStoreError::NotFound)?;
+                let handle = format!("myelin://{}/ci/secret/{secret_id}", tenant.as_str());
+                state.bindings.retain(|binding| {
+                    !(binding.0 == tenant.as_str()
+                        && binding.1 == project_id
+                        && binding.2 == name
+                        && binding.3 == scope)
+                });
+                state.bindings.insert((
+                    tenant.as_str().to_owned(),
+                    project_id.to_owned(),
+                    name.to_owned(),
+                    scope.to_owned(),
+                    handle,
+                    secret_id,
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn revoke_managed_binding(
+        &self,
+        tenant: &TenantId,
+        project_id: &str,
+        name: &str,
+        scope: &str,
+    ) -> Result<(), CiSecretStoreError> {
+        let row = self.managed_secret_by_name(tenant, project_id, name)?;
+        let handle = format!("myelin://{}/ci/secret/{}", tenant.as_str(), row.secret_id);
+        match &self.backend {
+            SecretStoreBackend::Pg { pool, runtime } => {
+                let pool = pool.clone();
+                let tenant_id = tenant.as_str().to_owned();
+                let region = self.region.as_str().to_owned();
+                let row_tenant = tenant_id.clone();
+                let row_region = region.clone();
+                let project_id = project_id.to_owned();
+                let name = name.to_owned();
+                let scope = scope.to_owned();
+                bridge(runtime, async move {
+                    with_tenant_tx(&pool, &tenant_id, &region, |connection| {
+                        Box::pin(async move {
+                            sqlx::query(REVOKE_SECRET_BINDING)
+                                .bind(row_tenant)
+                                .bind(row_region)
+                                .bind(project_id)
+                                .bind(name)
+                                .bind(scope)
+                                .bind(handle)
+                                .execute(&mut *connection)
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+                        })
+                    })
+                    .await
+                })
+                .map_err(|_| CiSecretStoreError::Database)
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            SecretStoreBackend::Memory(state) => {
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .bindings
+                    .remove(&(
+                        tenant.as_str().to_owned(),
+                        project_id.to_owned(),
+                        name.to_owned(),
+                        scope.to_owned(),
+                        handle,
+                        row.secret_id,
+                    ));
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_envelope_for_test(
+        &self,
+        tenant: &TenantId,
+        secret_id: &str,
+    ) -> Option<([u8; NONCE_LEN], Vec<u8>)> {
+        let SecretStoreBackend::Memory(state) = &self.backend else {
+            return None;
+        };
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .rows
+            .get(&(tenant.as_str().to_owned(), secret_id.to_owned()))
+            .map(|row| (row.nonce, row.ciphertext.clone()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn binding_count_for_secret_for_test(
+        &self,
+        tenant: &TenantId,
+        secret_id: &str,
+    ) -> usize {
+        let SecretStoreBackend::Memory(state) = &self.backend else {
+            return 0;
+        };
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .bindings
+            .iter()
+            .filter(|binding| binding.0 == tenant.as_str() && binding.5 == secret_id)
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_malformed_binding_for_secret_for_test(
+        &self,
+        tenant: &TenantId,
+        project_id: &str,
+        secret_id: &str,
+    ) {
+        let SecretStoreBackend::Memory(state) = &self.backend else {
+            panic!("test binding helper requires the in-memory backend")
+        };
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .bindings
+            .insert((
+                tenant.as_str().to_owned(),
+                project_id.to_owned(),
+                "malformed-name".to_owned(),
+                "malformed-scope".to_owned(),
+                "malformed-value-ref".to_owned(),
+                secret_id.to_owned(),
+            ));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_binding_for_secret_id_for_test(
+        &self,
+        tenant: &TenantId,
+        project_id: &str,
+        name: &str,
+        secret_id: &str,
+    ) -> Result<(), CiSecretStoreError> {
+        let SecretStoreBackend::Memory(state) = &self.backend else {
+            panic!("test binding helper requires the in-memory backend")
+        };
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state
+            .managed_rows
+            .contains_key(&(tenant.as_str().to_owned(), secret_id.to_owned()))
+        {
+            return Err(CiSecretStoreError::NotFound);
+        }
+        state.bindings.insert((
+            tenant.as_str().to_owned(),
+            project_id.to_owned(),
+            name.to_owned(),
+            "project".to_owned(),
+            format!("myelin://{}/ci/secret/{secret_id}", tenant.as_str()),
+            secret_id.to_owned(),
+        ));
+        Ok(())
     }
 
     /// Open one exact `(tenant, secret_id)` row. Any absence, malformed envelope, wrong tenant key,
     /// AEAD authentication failure, or invalid UTF-8 is a material-free error/absence for the
     /// capability to convert into a terminal withhold.
+    #[cfg(test)]
     fn resolve_secret(
         &self,
         tenant: &TenantId,
@@ -208,7 +934,20 @@ impl DurableCiSecretStore {
         let Some(stored) = self.load_encrypted(tenant, secret_id)? else {
             return Ok(None);
         };
-        if stored.key_ref.tenant != *tenant || stored.key_ref.class != KeyClass::Tenant {
+        self.decrypt_stored_secret(tenant, secret_id, stored)
+            .map(Some)
+    }
+
+    fn decrypt_stored_secret(
+        &self,
+        tenant: &TenantId,
+        secret_id: &str,
+        stored: StoredSecret,
+    ) -> Result<Zeroizing<String>, CiSecretStoreError> {
+        if stored.version <= 0
+            || stored.key_ref.tenant != *tenant
+            || stored.key_ref.class != KeyClass::Tenant
+        {
             return Err(CiSecretStoreError::CorruptCiphertext);
         }
         let column = EncryptedColumn {
@@ -218,10 +957,7 @@ impl DurableCiSecretStore {
         };
         let plaintext = Zeroizing::new(
             ColumnCryptor::new(&self.kms, self.region.clone())
-                .decrypt_with_aad(
-                    &column,
-                    &secret_row_aad(tenant, &self.region, secret_id),
-                )
+                .decrypt_with_aad(&column, &secret_row_aad(tenant, &self.region, secret_id))
                 .map_err(|_| CiSecretStoreError::CorruptCiphertext)?,
         );
         let material = Zeroizing::new(
@@ -229,7 +965,7 @@ impl DurableCiSecretStore {
                 .map_err(|_| CiSecretStoreError::CorruptCiphertext)?
                 .to_owned(),
         );
-        Ok(Some(material))
+        Ok(material)
     }
 
     fn store_encrypted(
@@ -243,6 +979,7 @@ impl DurableCiSecretStore {
             key_ref: encrypted.key_ref,
             nonce: encrypted.nonce,
             ciphertext: encrypted.ciphertext,
+            version: 0,
         };
         match &self.backend {
             SecretStoreBackend::Pg { pool, runtime } => {
@@ -281,16 +1018,27 @@ impl DurableCiSecretStore {
             }
             #[cfg(any(test, feature = "test-support"))]
             SecretStoreBackend::Memory(state) => {
-                state
+                let mut state = state
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .rows
-                    .insert((tenant.as_str().to_owned(), secret_id.to_owned()), stored);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let key = (tenant.as_str().to_owned(), secret_id.to_owned());
+                let version = state
+                    .high_water
+                    .entry(key.clone())
+                    .and_modify(|version| *version += 1)
+                    .or_insert(1)
+                    .to_owned();
+                let stored = StoredSecret { version, ..stored };
+                if let Some(row) = state.managed_rows.get_mut(&key) {
+                    row.version = version;
+                }
+                state.rows.insert(key, stored);
                 Ok(())
             }
         }
     }
 
+    #[cfg(test)]
     fn load_encrypted(
         &self,
         tenant: &TenantId,
@@ -321,6 +1069,7 @@ impl DurableCiSecretStore {
                                     row.get::<String, _>("pii_key_ref"),
                                     row.get::<Vec<u8>, _>("nonce"),
                                     row.get::<Vec<u8>, _>("ciphertext"),
+                                    row.get::<i64, _>("version"),
                                 )
                             }))
                         })
@@ -341,16 +1090,24 @@ impl DurableCiSecretStore {
         }
     }
 
-    fn is_bound_to_request(
+    /// Load the ciphertext and its exact binding in one PostgreSQL statement/MVCC snapshot. A
+    /// delete/recreate can therefore expose either the old joined generation or the new joined
+    /// generation, never old ciphertext paired with a newly-created binding. A revoke committed
+    /// before this statement is observed; an overlapping revoke linearizes immediately afterward.
+    fn resolve_bound_secret(
         &self,
         tenant: &TenantId,
         project_id: &str,
         job_id: &str,
         name: &str,
         handle: &str,
-    ) -> Result<bool, CiSecretStoreError> {
+        secret_id: &str,
+    ) -> Result<Option<Zeroizing<String>>, CiSecretStoreError> {
+        if !strict_secret_segment(tenant.as_str()) || !strict_secret_segment(secret_id) {
+            return Err(CiSecretStoreError::InvalidScope);
+        }
         let job_scope = format!("job:{job_id}");
-        match &self.backend {
+        let stored = match &self.backend {
             SecretStoreBackend::Pg { pool, runtime } => {
                 let pool = pool.clone();
                 let tenant_id = tenant.as_str().to_owned();
@@ -358,51 +1115,74 @@ impl DurableCiSecretStore {
                 let project_id = project_id.to_owned();
                 let name = name.to_owned();
                 let handle = handle.to_owned();
+                let secret_id = secret_id.to_owned();
                 let row_tenant = tenant_id.clone();
                 let row_region = region.clone();
                 bridge(runtime, async move {
                     with_tenant_tx(&pool, &tenant_id, &region, |connection| {
                         Box::pin(async move {
-                            sqlx::query(SELECT_SECRET_BINDING)
-                                .bind(row_tenant)
-                                .bind(row_region)
+                            sqlx::query(SELECT_BOUND_SECRET)
+                                .bind(&row_tenant)
+                                .bind(&row_region)
+                                .bind(&secret_id)
                                 .bind(project_id)
                                 .bind(name)
                                 .bind(handle)
                                 .bind(job_scope)
-                                .fetch_one(&mut *connection)
+                                .fetch_optional(&mut *connection)
                                 .await
-                                .map(|row| row.get::<bool, _>("bound"))
-                                .map_err(|error| {
-                                    myelin_storage::PgError::Query(error.to_string())
+                                .map(|row| {
+                                    row.map(|row| {
+                                        (
+                                            row.get::<String, _>("pii_key_ref"),
+                                            row.get::<Vec<u8>, _>("nonce"),
+                                            row.get::<Vec<u8>, _>("ciphertext"),
+                                            row.get::<i64, _>("version"),
+                                        )
+                                    })
                                 })
+                                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
                         })
                     })
                     .await
                 })
-                .map_err(|_| CiSecretStoreError::Database)
+                .map_err(|_| CiSecretStoreError::Database)?
+                .map(parse_stored_secret)
+                .transpose()?
             }
             #[cfg(any(test, feature = "test-support"))]
             SecretStoreBackend::Memory(state) => {
                 let state = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                Ok(["project", job_scope.as_str()].iter().any(|scope| {
+                let bound = ["project", job_scope.as_str()].iter().any(|scope| {
                     state.bindings.contains(&(
                         tenant.as_str().to_owned(),
                         project_id.to_owned(),
                         name.to_owned(),
                         (*scope).to_owned(),
                         handle.to_owned(),
+                        secret_id.to_owned(),
                     ))
-                }))
+                });
+                if !bound {
+                    None
+                } else {
+                    state
+                        .rows
+                        .get(&(tenant.as_str().to_owned(), secret_id.to_owned()))
+                        .cloned()
+                }
             }
-        }
+        };
+        stored
+            .map(|stored| self.decrypt_stored_secret(tenant, secret_id, stored))
+            .transpose()
     }
 }
 
 fn parse_stored_secret(
-    (key_ref, nonce, ciphertext): (String, Vec<u8>, Vec<u8>),
+    (key_ref, nonce, ciphertext, version): (String, Vec<u8>, Vec<u8>, i64),
 ) -> Result<StoredSecret, CiSecretStoreError> {
     let key_ref = PiiKeyRef::parse(&key_ref).ok_or(CiSecretStoreError::CorruptCiphertext)?;
     let nonce: [u8; NONCE_LEN] = nonce
@@ -415,7 +1195,18 @@ fn parse_stored_secret(
         key_ref,
         nonce,
         ciphertext,
+        version,
     })
+}
+
+fn managed_row_from_pg(row: sqlx::postgres::PgRow) -> ManagedSecretRow {
+    ManagedSecretRow {
+        secret_id: row.get("secret_id"),
+        project_id: row.get("project_id"),
+        name: row.get("name"),
+        created_at: row.get("created_at"),
+        version: row.get("version"),
+    }
 }
 
 fn bridge<F: std::future::Future>(runtime: &tokio::runtime::Handle, future: F) -> F::Output {
@@ -488,20 +1279,17 @@ impl<I: IdentityService> SecretCapability for DurableSecretCapability<I> {
         if decision != Decision::Allow {
             return None;
         }
-        if !self
-            .store
-            .is_bound_to_request(
+        self.store
+            .resolve_bound_secret(
                 tenant,
                 &self.project_id,
                 &self.job_id,
                 binding_name,
                 handle,
+                parsed.id,
             )
-            .ok()?
-        {
-            return None;
-        }
-        self.store.resolve_secret(tenant, parsed.id).ok().flatten()
+            .ok()
+            .flatten()
     }
 }
 
@@ -707,6 +1495,163 @@ mod tests {
 
     fn handle(tenant: &str, id: &str) -> String {
         format!("myelin://{tenant}/ci/secret/{id}")
+    }
+
+    #[test]
+    fn bound_secret_resolution_is_one_mvcc_statement() {
+        assert!(SELECT_BOUND_SECRET.contains("FROM ci_secret AS secret"));
+        assert!(SELECT_BOUND_SECRET.contains("JOIN secret_binding AS binding"));
+        assert!(SELECT_BOUND_SECRET.contains("binding.secret_id = secret.secret_id"));
+        assert_eq!(
+            SELECT_BOUND_SECRET.matches(';').count(),
+            0,
+            "ciphertext and the exact live binding must be read by one PostgreSQL statement"
+        );
+    }
+
+    #[test]
+    fn every_ci_secret_writer_uses_the_atomic_version_high_water() {
+        for (writer, query) in [
+            ("seal_secret", INSERT_SECRET),
+            ("managed create", CREATE_MANAGED_SECRET),
+            ("managed update/rotate", UPDATE_MANAGED_SECRET),
+        ] {
+            assert!(
+                query.contains("INSERT INTO ci_secret_version_high_water"),
+                "{writer} must allocate from the universal high-water"
+            );
+            assert!(
+                query.contains("max_version = ci_secret_version_high_water.max_version + 1"),
+                "{writer} must increment the high-water atomically"
+            );
+            assert!(query.contains("RETURNING max_version"));
+        }
+    }
+
+    #[test]
+    fn concurrent_seal_writers_allocate_distinct_monotonic_versions() {
+        let store = fixture_store();
+        let tenant = tenant("tenant-a");
+        let writers: Vec<_> = (0..8)
+            .map(|writer| {
+                let store = store.clone();
+                let tenant = tenant.clone();
+                std::thread::spawn(move || {
+                    store
+                        .seal_secret(
+                            &tenant,
+                            "deploy",
+                            "DEPLOY_KEY",
+                            &format!("material-{writer}"),
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let SecretStoreBackend::Memory(state) = &store.backend else {
+            unreachable!("unit fixture is memory-backed")
+        };
+        let state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (tenant.as_str().to_owned(), "deploy".to_owned());
+        assert_eq!(state.high_water.get(&key), Some(&8));
+        assert_eq!(state.rows.get(&key).map(|row| row.version), Some(8));
+    }
+
+    #[test]
+    fn seal_secret_and_managed_writes_share_one_version_high_water() {
+        let store = fixture_store();
+        let tenant = tenant("tenant-a");
+        let created = store
+            .create_managed_secret(&tenant, PROJECT_A, "deploy", "DEPLOY_KEY", b"managed-v1")
+            .unwrap();
+        store
+            .seal_secret(&tenant, "deploy", "DEPLOY_KEY", "legacy-v2")
+            .unwrap();
+        let updated = store
+            .replace_managed_secret(&tenant, PROJECT_A, "deploy", "DEPLOY_KEY", b"managed-v3")
+            .unwrap();
+
+        assert_eq!((created.version, updated.version), (1, 3));
+        assert_eq!(
+            store
+                .resolve_secret(&tenant, "deploy")
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("managed-v3")
+        );
+    }
+
+    #[test]
+    fn delete_recreate_resolution_returns_only_the_joined_current_generation() {
+        let store = fixture_store();
+        let tenant = tenant("tenant-a");
+        store
+            .create_managed_secret(
+                &tenant,
+                PROJECT_A,
+                "deploy",
+                "DEPLOY_KEY",
+                b"old-generation",
+            )
+            .unwrap();
+        store
+            .grant_managed_binding(&tenant, PROJECT_A, "DEPLOY_KEY", "project")
+            .unwrap();
+        let old_envelope = {
+            let SecretStoreBackend::Memory(state) = &store.backend else {
+                unreachable!("unit fixture is memory-backed")
+            };
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .rows
+                .get(&(tenant.as_str().to_owned(), "deploy".to_owned()))
+                .cloned()
+                .unwrap()
+        };
+
+        store
+            .delete_managed_secret(&tenant, PROJECT_A, "DEPLOY_KEY")
+            .unwrap();
+        let recreated = store
+            .create_managed_secret(
+                &tenant,
+                PROJECT_A,
+                "deploy",
+                "DEPLOY_KEY",
+                b"new-generation",
+            )
+            .unwrap();
+        store
+            .grant_managed_binding(&tenant, PROJECT_A, "DEPLOY_KEY", "project")
+            .unwrap();
+
+        assert_eq!(recreated.version, 2);
+        assert_eq!(
+            store
+                .decrypt_stored_secret(&tenant, "deploy", old_envelope)
+                .unwrap()
+                .as_str(),
+            "old-generation",
+            "the regression fixture proves the stale envelope remains independently decryptable"
+        );
+        let handle = handle(tenant.as_str(), "deploy");
+        assert_eq!(
+            store
+                .resolve_bound_secret(&tenant, PROJECT_A, JOB_A, "DEPLOY_KEY", &handle, "deploy",)
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("new-generation"),
+            "the joined read must not pair the old envelope with the recreated binding"
+        );
     }
 
     fn one_secret_spec(tenant: &str, id: &str) -> JobSpec {
@@ -973,9 +1918,7 @@ mod tests {
 
         let dev_object = handle("tenant-a", "dev");
         store.bind_secret_for_project(&tenant, PROJECT_A, "DEPLOY_KEY", &dev_object);
-        let identity = Arc::new(
-            ScopedIdentity::default().grant("tenant-a", "ci-job", &dev_object),
-        );
+        let identity = Arc::new(ScopedIdentity::default().grant("tenant-a", "ci-job", &dev_object));
         let capability = DurableSecretCapability::new(
             store,
             identity.clone(),
@@ -1007,9 +1950,8 @@ mod tests {
         store.bind_secret_for_project(&tenant, PROJECT_B, "DEPLOY_KEY", &object);
         let job_principal = format!("svc:ci:project:{PROJECT_A}:job:{JOB_A}");
         let job_subject = subject("tenant-a", &job_principal);
-        let identity = Arc::new(
-            ScopedIdentity::default().grant("tenant-a", &job_principal, &object),
-        );
+        let identity =
+            Arc::new(ScopedIdentity::default().grant("tenant-a", &job_principal, &object));
         let capability = DurableSecretCapability::new(
             store.clone(),
             identity.clone(),
@@ -1061,13 +2003,12 @@ mod tests {
             JOB_A.into(),
             consistency(),
         );
-        let material = capability.resolve_handle(
-            &tenant,
-            &ArtifactRef(object.clone()),
-            "DEPLOY_KEY",
-            &object,
-        );
+        let material =
+            capability.resolve_handle(&tenant, &ArtifactRef(object.clone()), "DEPLOY_KEY", &object);
         assert_zeroizing(&material);
-        assert_eq!(material.as_deref().map(String::as_str), Some("ephemeral-material"));
+        assert_eq!(
+            material.as_deref().map(String::as_str),
+            Some("ephemeral-material")
+        );
     }
 }
