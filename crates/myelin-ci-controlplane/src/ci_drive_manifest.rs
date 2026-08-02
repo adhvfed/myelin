@@ -168,6 +168,8 @@ pub struct CiDriveManifestV1 {
     pub schema_version: u32,
     pub tenant_id: String,
     pub region: String,
+    /// Server-owned project scope for every job and secret binding in this immutable manifest.
+    pub project_id: String,
     pub wf_run_id: String,
     pub ci_run_id: String,
     pub source_snapshot_ref: String,
@@ -194,6 +196,7 @@ impl CiDriveManifestV1 {
         }
         validate_scope("tenant", &self.tenant_id)?;
         validate_scope("region", &self.region)?;
+        validate_uuid("project_id", &self.project_id)?;
         validate_uuid("wf_run_id", &self.wf_run_id)?;
         validate_uuid("ci_run_id", &self.ci_run_id)?;
         validate_canonical_ref(
@@ -953,6 +956,7 @@ mod tests {
             schema_version: 1,
             tenant_id: "acme".into(),
             region: "fr-par".into(),
+            project_id: "55555555-5555-4555-8555-555555555555".into(),
             wf_run_id: "33333333-3333-8333-8333-333333333333".into(),
             ci_run_id: "44444444-4444-8444-8444-444444444444".into(),
             source_snapshot_ref: format!("myelin://acme/ci/artifact/snapshot-{}", digest('a')),
@@ -1049,6 +1053,22 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("manifest tenant"));
+    }
+
+    #[test]
+    fn secret_handles_require_a_canonical_manifest_project_binding_identity() {
+        let mut manifest = manifest();
+        manifest.jobs[0]
+            .secret_handles
+            .insert("DEPLOY_KEY".into(), "myelin://acme/ci/secret/deploy".into());
+        manifest.validate().unwrap();
+
+        manifest.project_id = "project-b-alias".into();
+        assert!(manifest
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("project_id"));
     }
 
     #[test]

@@ -914,17 +914,18 @@ fn secret_withhold_result_summary_persists_the_machine_reason() {
     );
 }
 
-/// **CT-007 slice 5b.3-6d STEP 4: the twelve-field `CiJobTokenRequest` ↔ `PreparationReportClaim`
+/// **CT-007 slice 5b.3-6d STEP 4: the thirteen-field `CiJobTokenRequest` ↔ `PreparationReportClaim`
 /// mapping is EXACT (no drop, no reorder).** A canonical request with a DISTINCT value in every field
 /// round-trips through the admission-side projection (`preparation_report_claim`) and the reporter-side
 /// projection (`token_request_from_preparation_report_claim`) byte-identically — so a claim minted at
 /// admission reaches the durable preparation CAS unchanged. Distinct per-field values mean a swapped or
 /// dropped field would break equality.
 #[test]
-fn preparation_report_claim_round_trips_all_twelve_token_request_fields() {
+fn preparation_report_claim_round_trips_all_thirteen_token_request_fields() {
     let request = CiJobTokenRequest {
         tenant_id: "tenant-distinct".into(),
         region: "region-distinct".into(),
+        project_id: "55555555-5555-4555-8555-555555555555".into(),
         wf_run_id: "11111111-1111-1111-1111-111111111111".into(),
         ci_run_id: "22222222-2222-2222-2222-222222222222".into(),
         job_id: "33333333-3333-3333-3333-333333333333".into(),
@@ -936,7 +937,7 @@ fn preparation_report_claim_round_trips_all_twelve_token_request_fields() {
         claim_started_at_epoch_secs: 101,
         claim_expires_at_epoch_secs: 404,
     };
-    // Admission-side projection carries each of the twelve fields UNCHANGED.
+    // Admission-side projection carries each of the thirteen fields UNCHANGED.
     let report_claim = crate::ci_checkout_composition::preparation_report_claim(&request);
     assert_eq!(report_claim.tenant_id, request.tenant_id);
     assert_eq!(report_claim.region, request.region);
@@ -952,5 +953,5 @@ fn preparation_report_claim_round_trips_all_twelve_token_request_fields() {
     assert_eq!(report_claim.claim_expires_at_epoch_secs, request.claim_expires_at_epoch_secs);
     // Reporter-side projection reconstructs the byte-identical request (round-trip).
     let back = token_request_from_preparation_report_claim(&report_claim);
-    assert_eq!(back, request, "the twelve-field mapping is an exact round-trip");
+    assert_eq!(back, request, "the thirteen-field mapping is an exact round-trip");
 }

@@ -380,6 +380,7 @@ fn compute_spec(command: Vec<String>, trust: TrustTier, idem: &str) -> DurableCi
     let (spec, _token) = resolved.into_template();
     DurableCiJobLaunchTemplate {
         spec,
+        project_id: "55555555-5555-4555-8555-555555555555".into(),
         ci_run_id: uid(&format!("ci-run:{idem}")).to_string(),
         token_authority_handle: format!("identity-authority:{idem}"),
     }

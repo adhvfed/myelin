@@ -190,6 +190,7 @@ fn manifest(
         schema_version: 1,
         tenant_id: tenant.into(),
         region: region.into(),
+        project_id: "55555555-5555-8555-8555-555555555555".into(),
         wf_run_id: wf_run.into(),
         ci_run_id: ci_run.into(),
         source_snapshot_ref: format!("myelin://{tenant}/ci/artifact/snapshot-{}", digest('a')),
@@ -927,6 +928,7 @@ async fn run_reporter_scenario(
                 let preparation_claim = CiJobTokenRequest {
                     tenant_id: tenant.0.clone(),
                     region: region.0.clone(),
+                    project_id: "55555555-5555-8555-8555-555555555555".into(),
                     wf_run_id: wf_run.into(),
                     ci_run_id: ci_run.into(),
                     job_id: job.into(),
@@ -2227,6 +2229,7 @@ async fn run_reporter_scenario(
                     let report_claim = PreparationReportClaim {
                         tenant_id: preparation_claim.tenant_id.clone(),
                         region: preparation_claim.region.clone(),
+                        project_id: preparation_claim.project_id.clone(),
                         wf_run_id: preparation_claim.wf_run_id.clone(),
                         ci_run_id: preparation_claim.ci_run_id.clone(),
                         job_id: preparation_claim.job_id.clone(),

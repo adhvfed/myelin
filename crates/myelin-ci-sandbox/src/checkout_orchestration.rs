@@ -647,6 +647,7 @@ mod tests {
             tenant_id: "acme".to_string(),
             region: "fr-par".to_string(),
             principal_id: "p".to_string(),
+            project_id: "00000000-0000-0000-0000-000000000001".to_string(),
             wf_run_id: "wf".to_string(),
             job_id: "j".to_string(),
             lease_owner: "o".to_string(),
@@ -669,6 +670,7 @@ mod tests {
             tenant_id: "acme".to_string(),
             region: "us-west-2".to_string(),
             principal_id: format!("principal-{generation}"),
+            project_id: "00000000-0000-0000-0000-000000000001".to_string(),
             wf_run_id: "wf-rotated".to_string(),
             job_id: format!("job-{generation}"),
             lease_owner: "rotated-owner".to_string(),
@@ -696,6 +698,7 @@ mod tests {
         PreparationReportClaim {
             tenant_id: "acme".into(),
             region: "fr-par".into(),
+            project_id: "00000000-0000-0000-0000-000000000001".into(),
             wf_run_id: "11111111-1111-1111-1111-111111111111".into(),
             ci_run_id: "44444444-4444-4444-4444-444444444444".into(),
             job_id: "22222222-2222-2222-2222-222222222222".into(),

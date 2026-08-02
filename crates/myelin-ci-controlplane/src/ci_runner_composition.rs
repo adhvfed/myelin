@@ -21,7 +21,7 @@ use myelin_identity_service::{
 use myelin_storage::reserve_settle::{MeteredUnit, RunId as CostRunId};
 use myelin_storage::{
     with_tenant_tx_error, DurableCellRootBacking, DurableCostLedger, DurableKmsBacking,
-    DurableRevocationBacking, KmsEngine, PgError, SealKey, SubstrateProvider,
+    DurableRevocationBacking, PgError, SealKey, SubstrateProvider,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
@@ -39,8 +39,6 @@ pub enum CiRunnerIdentityCompositionError {
     InvalidCellId,
     DurableCellRootUnavailable,
     InvalidCellRoot,
-    DurableKmsUnavailable,
-    CiRebacFragmentUnavailable,
 }
 
 impl std::fmt::Display for CiRunnerIdentityCompositionError {
@@ -52,12 +50,6 @@ impl std::fmt::Display for CiRunnerIdentityCompositionError {
             }
             Self::InvalidCellRoot => {
                 f.write_str("CI runner durable cell token authority is invalid")
-            }
-            Self::DurableKmsUnavailable => {
-                f.write_str("CI runner durable tenant key hierarchy is unavailable")
-            }
-            Self::CiRebacFragmentUnavailable => {
-                f.write_str("CI runner secret ReBAC fragment is unavailable")
             }
         }
     }
@@ -75,8 +67,7 @@ pub struct CiRunnerIdentityAuthorities {
     /// to [`V2CheckoutComposition`](crate::ci_checkout_composition::V2CheckoutComposition) so the V2
     /// per-phase credential path mints through one Identity.
     phase_credential_minter: Arc<IdentityCiJobCredentialMinter>,
-    secret_identity: Arc<StoreBackedCheck>,
-    kms: Arc<KmsEngine>,
+    secrets: crate::CiJobSecretResolver,
 }
 
 impl CiRunnerIdentityAuthorities {
@@ -97,12 +88,8 @@ impl CiRunnerIdentityAuthorities {
         self.phase_credential_minter.clone()
     }
 
-    fn secret_identity(&self) -> Arc<StoreBackedCheck> {
-        self.secret_identity.clone()
-    }
-
-    fn kms(&self) -> Arc<KmsEngine> {
-        self.kms.clone()
+    fn secret_resolver(&self) -> crate::CiJobSecretResolver {
+        self.secrets.clone()
     }
 }
 
@@ -152,6 +139,15 @@ pub struct CiRunnerV2Wiring {
     hooks: RunnerHooks,
 }
 
+/// Collapse optional secret infrastructure into the runner's stable resolver port. This is the
+/// fail-closed boundary that keeps non-secret work available while making a missing secret stack a
+/// terminal capability withhold only for jobs that actually declare secret references.
+pub(crate) fn optional_secret_resolver(
+    resolver: Option<crate::CiJobSecretResolver>,
+) -> crate::CiJobSecretResolver {
+    resolver.unwrap_or_else(crate::unavailable_ci_job_secret_resolver)
+}
+
 impl CiRunnerV2Wiring {
     /// The V2 spec resolver (checkout → initial `CheckoutAdvertise`, compute → initial `Workload`).
     pub fn resolver(&self) -> crate::runner_bind::JobSpecResolver {
@@ -194,25 +190,11 @@ pub fn ci_runner_v2_wiring(
     rt: tokio::runtime::Handle,
     secret_terminal_reporter: crate::CiPipelineReporterRouter,
 ) -> Result<CiRunnerV2Wiring, HookError> {
-    let store = Arc::new(crate::DurableCiSecretStore::with_pg(
-        provider.db_pool().clone(),
-        identity.kms(),
-        myelin_tenancy::Region(provider.config().region.clone()),
-        rt.clone(),
-    ));
-    let secrets = crate::durable_ci_job_secret_resolver(
-        store,
-        identity.secret_identity(),
-        myelin_identity::Consistency {
-            at_least: myelin_identity::Zookie(String::new()),
-            mode: myelin_identity::ConsistencyMode::Strong,
-        },
-    );
     ci_runner_v2_wiring_with_secret_resolver(
         provider,
         identity,
         rt,
-        secrets,
+        identity.secret_resolver(),
         secret_terminal_reporter,
     )
 }
@@ -910,12 +892,6 @@ pub async fn ci_runner_identity_authorities(
         CellTokenAuthority::from_material(&material)
             .map_err(|_| CiRunnerIdentityCompositionError::InvalidCellRoot)?,
     );
-    let kms = Arc::new(
-        DurableKmsBacking::new(provider.db_pool().clone(), cell_id.clone())
-            .load_or_generate(seal_key)
-            .await
-            .map_err(|_| CiRunnerIdentityCompositionError::DurableKmsUnavailable)?,
-    );
     let revocations =
         RevocationStore::with_pg(DurableRevocationBacking::new(provider.clone()), rt.clone());
     let signer = Arc::new(PasetoCapabilitySigner::new(cell.clone()));
@@ -937,26 +913,51 @@ pub async fn ci_runner_identity_authorities(
         myelin_tenancy::Region(region),
         rt.clone(),
     ));
-    let secret_identity = Arc::new(StoreBackedCheck::with_pg(
-        provider,
-        kms.clone(),
-        cell,
-        rt,
-    ));
-    if secret_identity
-        .admit_ci_fragment()
-        .into_iter()
-        .any(|result| matches!(result, myelin_identity::FragmentAdmit::Rejected { .. }))
+    // Secret infrastructure is an optional launch capability: a missing/corrupt durable KMS or a
+    // rejected ReBAC fragment must not prevent the runner from serving jobs that declare no secrets.
+    // The unavailable resolver remains fail-closed and terminal for secret-bearing jobs.
+    let secrets = optional_secret_resolver(if let Ok(kms) =
+        DurableKmsBacking::new(provider.db_pool().clone(), cell_id)
+        .load_or_generate(seal_key)
+        .await
     {
-        return Err(CiRunnerIdentityCompositionError::CiRebacFragmentUnavailable);
-    }
+        let kms = Arc::new(kms);
+        let secret_identity = Arc::new(StoreBackedCheck::with_pg(
+            provider.clone(),
+            kms.clone(),
+            cell,
+            rt.clone(),
+        ));
+        let fragment_available = secret_identity
+            .admit_ci_fragment()
+            .into_iter()
+            .all(|result| !matches!(result, myelin_identity::FragmentAdmit::Rejected { .. }));
+        if fragment_available {
+            Some(crate::durable_ci_job_secret_resolver(
+                Arc::new(crate::DurableCiSecretStore::with_pg(
+                    provider.db_pool().clone(),
+                    kms,
+                    myelin_tenancy::Region(provider.config().region.clone()),
+                    rt,
+                )),
+                secret_identity,
+                myelin_identity::Consistency {
+                    at_least: myelin_identity::Zookie(String::new()),
+                    mode: myelin_identity::ConsistencyMode::Strong,
+                },
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    });
 
     Ok(CiRunnerIdentityAuthorities {
         token_issuer,
         launch_authorizer,
         phase_credential_minter,
-        secret_identity,
-        kms,
+        secrets,
     })
 }
 

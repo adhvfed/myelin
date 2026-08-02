@@ -495,6 +495,7 @@ fn manifest_dispatch_for_test(
 ) -> (DurableEnqueue, DurableCiJobLaunchTemplate) {
     let idem_token = format!("{wf_run_id}:fenced:{suffix}");
     let template = DurableCiJobLaunchTemplate {
+        project_id: "55555555-5555-4555-8555-555555555555".into(),
         spec: JobSpecTemplate {
             kind: JobKind::Ci,
             image: ImageRef::pinned(job.image.clone()).unwrap(),
@@ -585,6 +586,7 @@ async fn seed_claimed_manifest_job(
     let job = manifest.jobs.first().expect("test plan has jobs");
     let idem_token = format!("{wf_run_id}:race:{}", job.stage);
     let template = DurableCiJobLaunchTemplate {
+        project_id: manifest.project_id.clone(),
         spec: JobSpecTemplate {
             kind: JobKind::Ci,
             image: ImageRef::pinned(job.image.clone()).unwrap(),
@@ -700,6 +702,7 @@ async fn seed_claimed_manifest_job(
         let token_request = CiJobTokenRequest {
             tenant_id: claim.tenant_id.clone(),
             region: claim.region.clone(),
+            project_id: "55555555-5555-4555-8555-555555555555".into(),
             wf_run_id: claim.wf_run_id.clone(),
             ci_run_id: ci_run_id.into(),
             job_id: claim.job_id.clone(),

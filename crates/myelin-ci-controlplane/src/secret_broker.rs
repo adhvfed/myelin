@@ -51,7 +51,7 @@ use myelin_identity::{
 };
 use myelin_tenancy::{ArtifactRef, TenantId};
 use std::fmt;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 /// **The READ permission on a `ci_secret` (the FROZEN `secret.read` gate, contract 4.9).** The ONLY
 /// path to a secret is a DIRECT `secret#direct_reader@subject` grant resolving `read` (CI-1 §1 — NOT
@@ -68,7 +68,7 @@ pub struct ResolvedSecret {
     pub name: String,
     /// The resolved secret material (the clear value). NEVER leaves the boundary — not onto a spec,
     /// an event, or a log. The broker scopes it to THIS job only.
-    pub value: String,
+    pub value: Zeroizing<String>,
 }
 
 impl fmt::Debug for ResolvedSecret {
@@ -78,12 +78,6 @@ impl fmt::Debug for ResolvedSecret {
             .field("name", &self.name)
             .field("value", &"[REDACTED]")
             .finish()
-    }
-}
-
-impl Drop for ResolvedSecret {
-    fn drop(&mut self) {
-        self.value.zeroize();
     }
 }
 
@@ -234,8 +228,9 @@ pub trait SecretCapability {
         &self,
         tenant: &TenantId,
         object: &ArtifactRef,
+        binding_name: &str,
         handle: &str,
-    ) -> Option<String>;
+    ) -> Option<Zeroizing<String>>;
 }
 
 const MAX_SECRET_HANDLE_SEGMENT_BYTES: usize = 128;
@@ -417,7 +412,7 @@ impl<'a, C: SecretCapability, I: IdentityService> SecretBroker<'a, C, I> {
             if decision == Decision::Allow {
                 match self
                     .cap
-                    .resolve_handle(&subject.tenant, &object, &sref.handle)
+                    .resolve_handle(&subject.tenant, &object, &sref.name, &sref.handle)
                 {
                     Some(value) => outcomes.push(SecretOutcome::Resolved(ResolvedSecret {
                         name: sref.name.clone(),
@@ -480,8 +475,15 @@ impl<'a, C: SecretCapability, I: IdentityService> SecretBroker<'a, C, I> {
         }
 
         let bindings = resolution
-            .resolved()
-            .map(|secret| ResolvedSecretEnv::new(secret.name.clone(), secret.value.clone()))
+            .outcomes
+            .into_iter()
+            .filter_map(|outcome| match outcome {
+                SecretOutcome::Resolved(secret) => Some(ResolvedSecretEnv::from_zeroizing(
+                    secret.name,
+                    secret.value,
+                )),
+                SecretOutcome::Withheld { .. } => None,
+            })
             .collect();
         spec.with_resolved_secrets(bindings)
             .map_err(SecretLaunchError::Injection)

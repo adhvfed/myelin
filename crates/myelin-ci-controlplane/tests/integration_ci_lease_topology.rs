@@ -142,6 +142,7 @@ fn uuid(prefix: u8, seed: u64) -> String {
 
 fn launch_template(seed: u64, timeout_secs: u32, checkout: bool) -> DurableCiJobLaunchTemplate {
     DurableCiJobLaunchTemplate {
+        project_id: "55555555-5555-4555-8555-555555555555".into(),
         spec: JobSpecTemplate {
             kind: JobKind::Ci,
             image: ImageRef::pinned(format!("registry.example/ci@sha256:{}", "b".repeat(64)))

@@ -86,6 +86,38 @@ pub fn unavailable_ci_job_secret_resolver() -> CiJobSecretResolver {
     })
 }
 
+/// Derive the ReBAC subject for one exact server-authorized CI job. The tenant-global signed
+/// `svc:ci` principal remains the credential issuer identity; secret authorization is deliberately
+/// narrowed to this immutable `(project_id, job_id)` pair.
+pub(crate) fn claim_secret_subject(
+    tenant: &TenantId,
+    context: &myelin_ci_sandbox::CiJobAuthorizationContext,
+) -> Result<Principal, SecretLaunchError> {
+    if context.tenant_id != tenant.as_str() {
+        return Err(SecretLaunchError::Authorization(AuthzError::FailClosed(
+            "CI secret resolution tenant does not match the authorized claim".into(),
+        )));
+    }
+    if sqlx::types::Uuid::parse_str(&context.project_id).is_err()
+        || sqlx::types::Uuid::parse_str(&context.job_id).is_err()
+    {
+        return Err(SecretLaunchError::Authorization(AuthzError::FailClosed(
+            "CI secret resolution requires canonical project and job identities".into(),
+        )));
+    }
+    Ok(Principal::new(
+        tenant.clone(),
+        Region::new(context.region.clone()),
+        PrincipalId(format!(
+            "svc:ci:project:{}:job:{}",
+            context.project_id, context.job_id
+        )),
+        PrincipalKind::Service,
+        DataRole::Processor,
+        PrincipalStatus::Active,
+    ))
+}
+
 /// Adapt the real in-boundary broker to the durable CI launch port. The subject is rebuilt only from
 /// the server-resolved, non-persistable claim authorization context; a missing or cross-tenant
 /// context fails closed before the capability or Identity service is called.
@@ -107,19 +139,7 @@ where
                 )));
             }
         };
-        if context.tenant_id != tenant.0 {
-            return Err(SecretLaunchError::Authorization(AuthzError::FailClosed(
-                "CI secret resolution tenant does not match the authorized claim".into(),
-            )));
-        }
-        let subject = Principal::new(
-            tenant.clone(),
-            Region::new(context.region),
-            PrincipalId(context.principal_id),
-            PrincipalKind::Service,
-            DataRole::Processor,
-            PrincipalStatus::Active,
-        );
+        let subject = claim_secret_subject(tenant, &context)?;
         SecretBroker::new(capability.as_ref(), identity.as_ref()).resolve_for_launch(
             spec,
             &subject,
@@ -151,6 +171,7 @@ pub(crate) fn resolve_claim_launch_secrets(
 pub struct CiJobTokenRequest {
     pub tenant_id: String,
     pub region: String,
+    pub project_id: String,
     pub wf_run_id: String,
     pub ci_run_id: String,
     pub job_id: String,
@@ -174,6 +195,7 @@ pub const MAX_CI_JOB_TOKEN_TTL_SECS: u64 = 300;
 impl CiJobTokenRequest {
     pub fn validate(&self) -> Result<(), CiJobTokenIssueError> {
         for (name, value) in [
+            ("project", self.project_id.as_str()),
             ("workflow run", self.wf_run_id.as_str()),
             ("CI run", self.ci_run_id.as_str()),
             ("job", self.job_id.as_str()),
@@ -419,6 +441,7 @@ fn manifest_dispatch_parts(
         enqueue,
         DurableCiJobLaunchTemplate {
             spec,
+            project_id: manifest.project_id.clone(),
             ci_run_id: manifest.ci_run_id.clone(),
             token_authority_handle: job.token_authority_handle.clone(),
         },
@@ -492,6 +515,7 @@ mod tests {
             tenant_id: "acme".into(),
             region: "fr-par".into(),
             principal_id: "ci-job".into(),
+            project_id: "11111111-1111-4111-8111-111111111111".into(),
             wf_run_id: "wf".into(),
             job_id: "job".into(),
             lease_owner: "runner".into(),
@@ -548,6 +572,7 @@ mod tests {
         let request = CiJobTokenRequest {
             tenant_id: "acme".into(),
             region: "fr-par".into(),
+            project_id: "55555555-5555-4555-8555-555555555555".into(),
             wf_run_id: "10000000-0000-0000-0000-000000000001".into(),
             ci_run_id: "20000000-0000-0000-0000-000000000001".into(),
             job_id: "30000000-0000-0000-0000-000000000001".into(),
@@ -595,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn production_claim_launch_path_resolves_or_withholds_before_sandbox() {
+    fn unavailable_secret_stack_admits_non_secret_and_terminally_withholds_secret_job() {
         let resolver: CiJobSecretResolver = Arc::new(|tenant, spec| {
             assert_eq!(tenant.0, "acme");
             spec.with_resolved_secrets(vec![myelin_ci_sandbox::ResolvedSecretEnv::new(
@@ -615,12 +640,25 @@ mod tests {
         assert_eq!(injected.resolved_secret_count(), 1);
         assert!(injected.validate_secret_coverage().is_ok());
 
+        let mut non_secret_template = secret_template();
+        non_secret_template.secret_refs.clear();
+        let non_secret = resolve_claim_launch_secrets(
+            &TenantId::from_token("acme"),
+            non_secret_template,
+            RunTokenCredential::new("bearer", "jti", 60).unwrap(),
+            authorization(),
+            &crate::ci_runner_composition::optional_secret_resolver(None),
+        )
+        .expect("an unavailable secret stack must not block a non-secret job");
+        assert_eq!(non_secret.resolved_secret_count(), 0);
+        assert!(non_secret.validate_secret_coverage().is_ok());
+
         let withheld = resolve_claim_launch_secrets(
             &TenantId::from_token("acme"),
             secret_template(),
             RunTokenCredential::new("bearer", "jti", 60).unwrap(),
             authorization(),
-            &unavailable_ci_job_secret_resolver(),
+            &crate::ci_runner_composition::optional_secret_resolver(None),
         )
         .unwrap_err();
         assert_eq!(
