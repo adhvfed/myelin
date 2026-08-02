@@ -575,6 +575,79 @@ const RUNTIME_QUIESCE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The fixed guest mount point a workspace is ALWAYS bound at — never caller-selectable (matching
 /// [`WorkspaceStorageMode::Disabled`]'s own doc: "`/workspace` is never mounted" when disabled).
 const OCI_WORKSPACE_MOUNT: &str = "/workspace";
+/// Fixed read-only destination for the dependency directories inside a verified Cargo vendor
+/// asset. Slice #32 precreated this empty mountpoint in the digest-pinned Rust rootfs.
+pub const OCI_CARGO_VENDOR_MOUNT: &str = "/opt/myelin/cargo-vendor";
+/// Server-only selector carried by the structured Cargo launch translation. Its value is an exact
+/// digest-pinned [`VerifiedCargoVendor`] registry reference, never a tenant path.
+pub const ENV_CARGO_VENDOR_ASSET: &str = "MYELIN_CARGO_VENDOR_ASSET";
+/// Cargo needs a writable home for its package-cache lock. This directory lives inside the job's
+/// already size-bounded writable `/tmp` tmpfs; its `config.toml` is over-mounted read-only.
+pub const STRUCTURED_CARGO_HOME: &str = "/tmp/cargo-home";
+pub const CARGO_SOURCE_REPLACE_ENV: &str = "CARGO_SOURCE_CRATES_IO_REPLACE_WITH";
+pub const CARGO_VENDOR_DIRECTORY_ENV: &str = "CARGO_SOURCE_VENDORED_DIRECTORY";
+const OCI_CARGO_CONFIG_MOUNT: &str = "/tmp/cargo-home/config.toml";
+const TEST_SERVER_CARGO_CONFIG_SOURCE: &str = "/server-owned/cargo/config.toml";
+const CARGO_VENDOR_SOURCE_NAME: &str = "vendored";
+
+/// Canonical server policy artifact mounted read-only at `$CARGO_HOME/config.toml`. The two
+/// corresponding Cargo configuration environment variables are also server-set because Cargo's
+/// documented precedence makes a workspace `.cargo/config.toml` higher priority than the home
+/// file, while configuration environment variables outrank every discovered TOML file.
+pub const SERVER_CARGO_CONFIG_TOML: &str = "[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = \"/opt/myelin/cargo-vendor\"\n";
+
+fn selected_cargo_vendor(
+    spec: &JobSpec,
+    registry: &crate::asset_registry::GvisorAssetRegistry,
+) -> Result<Option<crate::asset_registry::VerifiedCargoVendor>, String> {
+    let values = |name: &str| {
+        spec.env
+            .iter()
+            .filter(|entry| entry.name == name)
+            .map(|entry| entry.value.as_str())
+            .collect::<Vec<_>>()
+    };
+    let selectors = values(ENV_CARGO_VENDOR_ASSET);
+    if selectors.is_empty() {
+        return Ok(None);
+    }
+    if spec.kind != JobKind::Ci || spec.command != ["cargo", "build", "--locked"] {
+        return Err(
+            "a Cargo vendor asset may be selected only for the platform-owned structured CI Cargo build"
+                .to_string(),
+        );
+    }
+    if selectors.len() != 1 {
+        return Err(format!(
+            "{ENV_CARGO_VENDOR_ASSET} must appear exactly once when selecting a Cargo vendor asset"
+        ));
+    }
+    for (name, expected) in [
+        ("CARGO_HOME", STRUCTURED_CARGO_HOME),
+        ("CARGO_NET_OFFLINE", "true"),
+        (CARGO_SOURCE_REPLACE_ENV, CARGO_VENDOR_SOURCE_NAME),
+        (CARGO_VENDOR_DIRECTORY_ENV, OCI_CARGO_VENDOR_MOUNT),
+    ] {
+        if values(name) != [expected] {
+            return Err(format!(
+                "a structured Cargo vendor build requires exactly {name}={expected} in the job environment"
+            ));
+        }
+        if spec.secret_refs.iter().any(|secret| secret.name == name) {
+            return Err(format!(
+                "structured Cargo boundary variable {name} cannot be supplied through a secret"
+            ));
+        }
+    }
+    let reference = ImageRef::pinned(selectors[0].to_string()).map_err(|error| {
+        format!("{ENV_CARGO_VENDOR_ASSET} is not a digest-pinned asset reference: {error}")
+    })?;
+    registry
+        .resolve_cargo_vendor(&reference)
+        .cloned()
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
 
 /// A path proven absolute AT CONSTRUCTION — every OCI `root.path` override this crate ever uses is
 /// meant to be absolute (a symlinked/relative `root.path` COMBINED with a host bind mount makes the
@@ -640,6 +713,15 @@ struct GitWireMounts {
     quarantine_source: Option<PathBuf>,
 }
 
+/// The structured Cargo build's server-owned dependency boundary. The verified asset is selected
+/// before workspace acquisition; the independently host-computed materialized lock digest is bound
+/// only after Hop B succeeds and before the workload can reach its launch permit/spawn path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CargoVendorBoundary {
+    asset: crate::asset_registry::VerifiedCargoVendor,
+    materialized_cargo_lock_sha256: Option<String>,
+}
+
 impl GitWireMounts {
     fn new(repo_source: PathBuf, quarantine_source: Option<PathBuf>) -> Self {
         GitWireMounts {
@@ -692,6 +774,7 @@ enum OciExecutionLayout {
         config: UserNamespaceConfig,
         workspace: OciWorkspaceMount,
         absolute_rootfs: AbsoluteRootfs,
+        cargo_vendor: Option<CargoVendorBoundary>,
     },
 }
 
@@ -916,8 +999,123 @@ impl OciConfig {
             config,
             workspace,
             absolute_rootfs: AbsoluteRootfs::new(absolute_rootfs)?,
+            cargo_vendor: None,
         };
         Ok(self)
+    }
+
+    /// Attach a registry-verified Cargo vendor asset to the workspace layout. Both destinations are
+    /// fixed by the platform. The rootfs mountpoint must already be a real empty directory in the
+    /// digest-pinned rootfs; launch code never creates or mutates it after rootfs verification.
+    pub(crate) fn with_cargo_vendor(
+        mut self,
+        asset: crate::asset_registry::VerifiedCargoVendor,
+    ) -> Result<OciConfig, String> {
+        let (absolute_rootfs, slot) = match &mut self.layout {
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+                absolute_rootfs,
+                cargo_vendor,
+                ..
+            } => (absolute_rootfs, cargo_vendor),
+            _ => {
+                return Err(
+                    "a Cargo vendor asset requires the explicit-user-namespace workspace layout"
+                        .to_string(),
+                )
+            }
+        };
+        if slot.is_some() {
+            return Err("a Cargo vendor asset was already selected for this OCI config".to_string());
+        }
+        let destination = absolute_rootfs
+            .as_path()
+            .join(OCI_CARGO_VENDOR_MOUNT.trim_start_matches('/'));
+        let metadata = std::fs::symlink_metadata(&destination).map_err(|error| {
+            format!(
+                "pinned rootfs is missing the precreated {} mount destination: {error}",
+                OCI_CARGO_VENDOR_MOUNT
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "pinned rootfs {} mount destination must be a real directory",
+                OCI_CARGO_VENDOR_MOUNT
+            ));
+        }
+        if std::fs::read_dir(&destination)
+            .map_err(|error| format!("read Cargo vendor mount destination: {error}"))?
+            .next()
+            .is_some()
+        {
+            return Err(format!(
+                "pinned rootfs {} mount destination must be empty",
+                OCI_CARGO_VENDOR_MOUNT
+            ));
+        }
+        *slot = Some(CargoVendorBoundary {
+            asset,
+            materialized_cargo_lock_sha256: None,
+        });
+        Ok(self)
+    }
+
+    /// Bind Hop B's independently host-computed materialized lock digest into the retained launch
+    /// config. A non-structured/free-form job has no Cargo boundary and remains a no-op.
+    fn bind_materialized_cargo_lock(&mut self, digest: &str) -> Result<(), String> {
+        match &mut self.layout {
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+                cargo_vendor: Some(boundary),
+                ..
+            } => {
+                if boundary.materialized_cargo_lock_sha256.is_some() {
+                    return Err(
+                        "the materialized Cargo.lock digest was already bound to this launch"
+                            .to_string(),
+                    );
+                }
+                if digest != boundary.asset.cargo_lock_sha256() {
+                    return Err(format!(
+                        "cargo vendor asset lock mismatch: checked-out Cargo.lock is sha256:{digest}, but the selected asset is keyed to sha256:{}",
+                        boundary.asset.cargo_lock_sha256()
+                    ));
+                }
+                boundary.materialized_cargo_lock_sha256 = Some(digest.to_string());
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Final verify-to-use check, called by the production bundle/spawn path. It re-walks the
+    /// ownership/mode-hardened canonical asset tree and rechecks both the embedded and materialized
+    /// Cargo.lock identities. Free-form jobs have no boundary and remain a no-op.
+    fn verify_cargo_vendor_before_spawn(&self) -> Result<(), String> {
+        match &self.layout {
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+                cargo_vendor: Some(boundary),
+                ..
+            } => {
+                let materialized = boundary
+                    .materialized_cargo_lock_sha256
+                    .as_deref()
+                    .ok_or_else(|| {
+                        "structured Cargo launch reached verify-to-use without a materialized Cargo.lock digest"
+                            .to_string()
+                    })?;
+                boundary.asset.verify_before_spawn(materialized)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn has_cargo_vendor(&self) -> bool {
+        matches!(
+            self.layout,
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+                cargo_vendor: Some(_),
+                ..
+            }
+        )
     }
 
     /// The [`RunscInvocationMode`] this config implies — the ONE place that decision is made,
@@ -951,6 +1149,19 @@ impl OciConfig {
     /// Production serializer for config files that may contain injected secret environment values.
     /// Every secret-bearing buffer created here is zeroized when it leaves scope.
     fn to_json_zeroizing(&self) -> zeroize::Zeroizing<String> {
+        let cargo_config_source = self
+            .has_cargo_vendor()
+            .then(|| Path::new(TEST_SERVER_CARGO_CONFIG_SOURCE));
+        self.to_json_zeroizing_with_cargo_config_source(cargo_config_source)
+    }
+
+    /// Production bundle staging supplies the just-created server-owned config path here. Keeping
+    /// that host path out of [`OciConfig`] avoids turning a mutable external pathname into part of
+    /// the long-lived verified asset capability.
+    fn to_json_zeroizing_with_cargo_config_source(
+        &self,
+        cargo_config_host_source: Option<&Path>,
+    ) -> zeroize::Zeroizing<String> {
         use std::fmt::Write as _;
 
         let args = self
@@ -996,13 +1207,34 @@ impl OciConfig {
             } => {
                 mounts.extend(wire_mounts.bind_mounts_json());
             }
-            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace { workspace, .. } => {
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+                workspace,
+                cargo_vendor,
+                ..
+            } => {
                 // Always exactly one fixed writable mount — never caller-selectable readonly/dest.
                 mounts.push(bind_mount_json(
                     OCI_WORKSPACE_MOUNT,
                     &workspace.host_source,
                     false,
                 ));
+                if let Some(boundary) = cargo_vendor {
+                    // The verified asset root also carries its lock/config metadata. Only the actual
+                    // `cargo vendor` directory is projected at Cargo's fixed directory-source path.
+                    mounts.push(bind_mount_json(
+                        OCI_CARGO_VENDOR_MOUNT,
+                        &boundary.asset.path().join("vendor"),
+                        true,
+                    ));
+                    let config_source = cargo_config_host_source.expect(
+                        "a Cargo vendor OCI config must be rendered with a server config source",
+                    );
+                    mounts.push(bind_mount_json(
+                        OCI_CARGO_CONFIG_MOUNT,
+                        config_source,
+                        true,
+                    ));
+                }
             }
         }
         let mounts_json = mounts.join(", ");
@@ -3830,6 +4062,8 @@ impl GvisorBackend {
         let verified_rootfs = registry
             .resolve(&spec.image)
             .map_err(|e| CheckoutOrchestrationError::Hook(HookError(e.to_string())))?;
+        let cargo_vendor = selected_cargo_vendor(spec, registry)
+            .map_err(|e| CheckoutOrchestrationError::Hook(HookError(e)))?;
         let (workspace_manager, userns_allocator) = match &self.workspace_integration {
             WorkspaceIntegration::Enabled {
                 workspace_manager,
@@ -4008,6 +4242,7 @@ impl GvisorBackend {
             verified_rootfs.path().to_path_buf(),
             workspace_manager,
             userns_allocator,
+            cargo_vendor,
         ) {
             Ok(runtime) => runtime,
             Err(failure) => {
@@ -4429,7 +4664,10 @@ fn run_production_container_streaming(
     // downstream use below shares.
     let mode = prep.mode;
 
-    let mut bundle = stage_production_bundle(cfg, rootfs).map_err(RunFailure::uncommitted)?;
+    let mut bundle = verify_cargo_vendor_then_continue(cfg, || {
+        stage_production_bundle(cfg, rootfs)
+    })
+    .map_err(RunFailure::uncommitted)?;
 
     // CT-003b (SI-017): establish the OUT-OF-BAND memory cgroup BEFORE spawning runsc and FAIL
     // CLOSED if it cannot be established (rootless runsc would otherwise run the workload's
@@ -4670,7 +4908,7 @@ fn stage_production_bundle(
     cfg: &OciConfig,
     rootfs: &Path,
 ) -> Result<StagedProductionBundle, String> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
     let bundle = std::env::temp_dir().join(format!(
         "myelin-gvisor-prod-{}-{}",
@@ -4693,6 +4931,44 @@ fn stage_production_bundle(
             Err(cleanup) => format!("symlink rootfs into bundle: {error}; {cleanup}"),
         });
     }
+    let cargo_config_path = if cfg.has_cargo_vendor() {
+        let path = bundle.join("cargo-config.toml");
+        let mut cargo_config = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let cleanup = staged.cleanup();
+                return Err(match cleanup {
+                    Ok(()) => format!("create server Cargo config: {error}"),
+                    Err(cleanup) => {
+                        format!("create server Cargo config: {error}; {cleanup}")
+                    }
+                });
+            }
+        };
+        if let Err(error) = cargo_config
+            .write_all(SERVER_CARGO_CONFIG_TOML.as_bytes())
+            .and_then(|()| cargo_config.sync_all())
+            .and_then(|()| {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+            })
+        {
+            drop(cargo_config);
+            let cleanup = staged.cleanup();
+            return Err(match cleanup {
+                Ok(()) => format!("write server Cargo config: {error}"),
+                Err(cleanup) => format!("write server Cargo config: {error}; {cleanup}"),
+            });
+        }
+        drop(cargo_config);
+        Some(path)
+    } else {
+        None
+    };
     let config_path = bundle.join("config.json");
     let mut file = match std::fs::OpenOptions::new()
         .write(true)
@@ -4709,7 +4985,7 @@ fn stage_production_bundle(
             });
         }
     };
-    let json = cfg.to_json_zeroizing();
+    let json = cfg.to_json_zeroizing_with_cargo_config_source(cargo_config_path.as_deref());
     if let Err(error) = file.write_all(json.as_bytes()).and_then(|()| file.sync_all()) {
         drop(file);
         let cleanup = staged.cleanup();
@@ -4720,6 +4996,17 @@ fn stage_production_bundle(
     }
     drop(file);
     Ok(staged)
+}
+
+/// The verify-to-use ordering fence. The continuation stands for bundle construction and the later
+/// spawn path in production, and for a counting fake in unit tests. Asset drift can never fall
+/// through to that continuation.
+fn verify_cargo_vendor_then_continue<T>(
+    cfg: &OciConfig,
+    continuation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    cfg.verify_cargo_vendor_before_spawn()?;
+    continuation()
 }
 
 /// The `runsc` GLOBAL flags (BEFORE the subcommand) `mode` implies — the ONE place any of
@@ -10970,7 +11257,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::RunTokenCredential;
+    use crate::{EnvVar, RunTokenCredential};
     // CT-007 slice 5b.3-6e.2 Stage A: the git-wire fakes were lifted to a
     // `#[cfg(any(test, feature = "test-support"))]` module (below the top-level test module) so the
     // hardware-independent runsc-driver seam + §4 tests can reach them. Re-imported here so the
@@ -12716,6 +13003,258 @@ mod tests {
             IdemToken("idem-runsc-1".into()),
         )
         .unwrap()
+    }
+
+    struct CargoBoundaryFixture {
+        root: PathBuf,
+        rootfs: PathBuf,
+        reference: ImageRef,
+        lock_sha256: String,
+        registry: crate::asset_registry::GvisorAssetRegistry,
+    }
+
+    impl Drop for CargoBoundaryFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn cargo_boundary_fixture(tag: &str) -> CargoBoundaryFixture {
+        let root = std::env::temp_dir().join(format!(
+            "myelin-cargo-boundary-{tag}-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let vendor_asset = root.join("asset");
+        let rootfs = root.join("rootfs");
+        std::fs::create_dir_all(vendor_asset.join("vendor/itoa-1.0.15")).unwrap();
+        std::fs::create_dir_all(vendor_asset.join(".cargo")).unwrap();
+        std::fs::create_dir_all(rootfs.join("opt/myelin/cargo-vendor")).unwrap();
+        std::fs::write(
+            vendor_asset.join("vendor/itoa-1.0.15/.cargo-checksum.json"),
+            b"{}",
+        )
+        .unwrap();
+        std::fs::write(
+            vendor_asset.join("vendor/itoa-1.0.15/lib.rs"),
+            b"pub fn fixture() {}",
+        )
+        .unwrap();
+        std::fs::write(
+            vendor_asset.join(".cargo/config.toml"),
+            SERVER_CARGO_CONFIG_TOML,
+        )
+        .unwrap();
+        std::fs::write(vendor_asset.join("Cargo.lock"), b"fixture lock\n").unwrap();
+        let lock_sha256 = crate::asset_registry::file_sha256_hex(&vendor_asset.join("Cargo.lock"))
+            .unwrap();
+        let digest = crate::canonical_tar::canonical_tree_sha256_hex(&vendor_asset).unwrap();
+        let reference =
+            ImageRef::pinned(format!("test.local/cargo-vendor-{tag}@sha256:{digest}")).unwrap();
+        let registry =
+            crate::asset_registry::GvisorAssetRegistry::from_bindings_with_cargo_vendor(
+                Vec::new(),
+                vec![crate::asset_registry::CargoVendorAssetBinding {
+                    reference: reference.clone(),
+                    root: vendor_asset,
+                    cargo_lock_sha256: lock_sha256.clone(),
+                }],
+            )
+            .unwrap();
+        CargoBoundaryFixture {
+            root,
+            rootfs,
+            reference,
+            lock_sha256,
+            registry,
+        }
+    }
+
+    fn structured_cargo_spec(reference: &ImageRef) -> JobSpec {
+        JobSpec::new(
+            JobKind::Ci,
+            fixture_image(),
+            vec!["cargo".into(), "build".into(), "--locked".into()],
+            vec![
+                EnvVar {
+                    name: "CARGO_HOME".into(),
+                    value: STRUCTURED_CARGO_HOME.into(),
+                },
+                EnvVar {
+                    name: "CARGO_NET_OFFLINE".into(),
+                    value: "true".into(),
+                },
+                EnvVar {
+                    name: CARGO_SOURCE_REPLACE_ENV.into(),
+                    value: CARGO_VENDOR_SOURCE_NAME.into(),
+                },
+                EnvVar {
+                    name: CARGO_VENDOR_DIRECTORY_ENV.into(),
+                    value: OCI_CARGO_VENDOR_MOUNT.into(),
+                },
+                EnvVar {
+                    name: ENV_CARGO_VENDOR_ASSET.into(),
+                    value: reference.reference.clone(),
+                },
+            ],
+            vec![],
+            EgressPolicy::deny_all(),
+            ResourceLimits {
+                cpu_millis: 1000,
+                mem_bytes: 256 << 20,
+                disk_bytes: 1 << 30,
+                tmpfs_bytes: 64 << 20,
+                pids_max: 64,
+                timeout_secs: 120,
+            },
+            WorkspaceSpec::default(),
+            TrustTier::UntrustedFork,
+            RunTokenCredential::new("test-bearer", "cargo-boundary", 300).unwrap(),
+            MeterTarget {
+                reserve_id: "r".into(),
+            },
+            IdemToken("idem-cargo-boundary".into()),
+        )
+        .unwrap()
+    }
+
+    fn wired_cargo_config(fixture: &CargoBoundaryFixture) -> OciConfig {
+        let job = structured_cargo_spec(&fixture.reference);
+        let profile = HardeningProfile::derive(&job);
+        let vendor = selected_cargo_vendor(&job, &fixture.registry)
+            .unwrap()
+            .expect("structured Cargo selector resolves the registered asset");
+        let mut cfg = OciConfig::from_spec(&job, &profile)
+            .with_explicit_user_namespace_and_workspace(
+                UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005),
+                OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace")),
+                fixture.rootfs.clone(),
+            )
+            .unwrap()
+            .with_cargo_vendor(vendor)
+            .unwrap();
+        cfg.bind_materialized_cargo_lock(&fixture.lock_sha256)
+            .unwrap();
+        cfg
+    }
+
+    #[test]
+    fn structured_cargo_launch_spec_has_verified_ro_vendor_server_config_and_bounded_writable_home() {
+        let fixture = cargo_boundary_fixture("structured-launch");
+        let cfg = wired_cargo_config(&fixture);
+        let json = cfg.to_json();
+        assert!(json.contains("CARGO_HOME=/tmp/cargo-home"), "{json}");
+        assert!(json.contains("CARGO_NET_OFFLINE=true"), "{json}");
+        assert!(json.contains(
+            "CARGO_SOURCE_CRATES_IO_REPLACE_WITH=vendored"
+        ));
+        assert!(json.contains(
+            "CARGO_SOURCE_VENDORED_DIRECTORY=/opt/myelin/cargo-vendor"
+        ));
+        assert!(json.contains("\"destination\": \"/tmp\""), "{json}");
+        assert!(json.contains("\"size=67108864\""), "{json}");
+        assert!(json.contains("\"destination\": \"/opt/myelin/cargo-vendor\""));
+        assert!(json.contains("\"destination\": \"/tmp/cargo-home/config.toml\""));
+        assert_eq!(json.matches("\"ro\"").count(), 2, "{json}");
+
+        let continued = std::cell::Cell::new(false);
+        let staged = verify_cargo_vendor_then_continue(&cfg, || {
+            continued.set(true);
+            stage_production_bundle(&cfg, &fixture.rootfs)
+        })
+        .unwrap();
+        assert!(continued.get(), "the unchanged verified asset reaches the spawn continuation");
+        let staged_config = std::fs::read_to_string(staged.path.join("cargo-config.toml")).unwrap();
+        assert_eq!(staged_config, SERVER_CARGO_CONFIG_TOML);
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(staged.path.join("cargo-config.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+        let staged_json = std::fs::read_to_string(staged.path.join("config.json")).unwrap();
+        assert!(staged_json.contains(&format!(
+            "\"source\": {:?}",
+            staged.path.join("cargo-config.toml").to_string_lossy()
+        )));
+        assert!(staged_json.contains("\"destination\": \"/tmp/cargo-home/config.toml\""));
+    }
+
+    #[test]
+    fn free_form_command_launch_spec_gets_no_cargo_vendor_boundary() {
+        let fixture = cargo_boundary_fixture("free-form");
+        let mut free_form = structured_cargo_spec(&fixture.reference);
+        free_form.command = vec!["/bin/test".into()];
+        free_form.env.clear();
+        assert!(selected_cargo_vendor(&free_form, &fixture.registry)
+            .unwrap()
+            .is_none());
+        let profile = HardeningProfile::derive(&free_form);
+        let json = OciConfig::from_spec(&free_form, &profile)
+            .with_explicit_user_namespace_and_workspace(
+                UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005),
+                OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace")),
+                PathBuf::from("/abs/staged-rootfs"),
+            )
+            .unwrap()
+            .to_json();
+        assert!(!json.contains(OCI_CARGO_VENDOR_MOUNT), "{json}");
+        assert!(!json.contains(OCI_CARGO_CONFIG_MOUNT), "{json}");
+        assert!(!json.contains("CARGO_HOME="), "{json}");
+        assert!(!json.contains("CARGO_NET_OFFLINE="), "{json}");
+    }
+
+    #[test]
+    fn server_cargo_config_replaces_crates_io_with_the_verified_vendor_directory() {
+        assert_eq!(
+            SERVER_CARGO_CONFIG_TOML,
+            "[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = \"/opt/myelin/cargo-vendor\"\n"
+        );
+    }
+
+    #[test]
+    fn cargo_vendor_digest_drift_fails_closed_before_spawn_continuation() {
+        let fixture = cargo_boundary_fixture("drift");
+        let cfg = wired_cargo_config(&fixture);
+        std::fs::write(
+            fixture.root.join("asset/vendor/itoa-1.0.15/tampered"),
+            b"drift",
+        )
+        .unwrap();
+        let continued = std::cell::Cell::new(false);
+        let error = verify_cargo_vendor_then_continue(&cfg, || {
+            continued.set(true);
+            Ok(())
+        })
+        .expect_err("post-registration asset drift must refuse");
+        assert!(error.contains("drifted before spawn"), "{error}");
+        assert!(!continued.get(), "asset drift must never reach the spawn continuation");
+    }
+
+    #[test]
+    fn workspace_cargo_config_cannot_shadow_structured_source_boundary() {
+        let fixture = cargo_boundary_fixture("precedence");
+        let workspace = fixture.root.join("workspace");
+        std::fs::create_dir_all(workspace.join(".cargo")).unwrap();
+        std::fs::write(
+            workspace.join(".cargo/config.toml"),
+            b"[source.crates-io]\nreplace-with='tenant'\n[source.tenant]\ndirectory='/workspace/tenant'\n",
+        )
+        .unwrap();
+        let cfg = wired_cargo_config(&fixture);
+        let json = cfg.to_json();
+        assert!(json.contains(
+            "CARGO_SOURCE_CRATES_IO_REPLACE_WITH=vendored"
+        ));
+        assert!(json.contains(
+            "CARGO_SOURCE_VENDORED_DIRECTORY=/opt/myelin/cargo-vendor"
+        ));
+        assert!(json.contains("\"destination\": \"/tmp/cargo-home/config.toml\""));
+        assert!(json.contains("\"ro\""));
+        assert!(!json.contains("/workspace/tenant"));
     }
 
     // ───────── CT-007 slice 3, piece 4: WorkspaceIntegration / GvisorWorkspaceConfig ─────────
@@ -14985,6 +15524,7 @@ mod tests {
             PathBuf::from("/abs/staged-rootfs"),
             &workspace_manager,
             &userns_allocator,
+            None,
         )
         .expect("acquisition must succeed against a healthy real manager/allocator");
         // Sanity: the acquisition already exhausted the size-1 pool.
@@ -23738,6 +24278,7 @@ pub(crate) fn acquire_deterministic_checkout_capsule(
         std::path::PathBuf::from("/abs/staged-rootfs"),
         &workspace_manager,
         &userns_allocator,
+        None,
     )
     .expect("acquisition must succeed against a healthy deterministic manager/allocator");
     (

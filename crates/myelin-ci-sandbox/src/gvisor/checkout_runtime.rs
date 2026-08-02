@@ -99,6 +99,7 @@ impl AcquiredCheckoutRuntime {
         absolute_rootfs: PathBuf,
         workspace_manager: &WorkspaceManager,
         userns_allocator: &UserNamespaceAllocator,
+        cargo_vendor: Option<crate::asset_registry::VerifiedCargoVendor>,
     ) -> Result<AcquiredCheckoutRuntime, AcquisitionFailure> {
         // Blocker 1: the capsule's scope is DERIVED from the same `spec` Hop B will run against — it is
         // not an independent argument that a caller could set to scope A while handing a scope-B spec.
@@ -123,7 +124,7 @@ impl AcquiredCheckoutRuntime {
         // `job_key`, so the two can never diverge.
         let workload_container_id =
             format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
-        let (workload_cfg, enabled_context) = acquire_enabled_workspace(
+        let (mut workload_cfg, enabled_context) = acquire_enabled_workspace(
             spec,
             profile,
             &workload_container_id,
@@ -131,6 +132,21 @@ impl AcquiredCheckoutRuntime {
             workspace_manager,
             userns_allocator,
         )?;
+        if let Some(asset) = cargo_vendor {
+            workload_cfg = match workload_cfg.with_cargo_vendor(asset) {
+                Ok(cfg) => cfg,
+                Err(reason) => {
+                    let diagnostics = super::cleanup_pre_bind_failure(
+                        enabled_context,
+                        workspace_manager,
+                    );
+                    return Err(AcquisitionFailure::from_rollback_diagnostics(
+                        format!("attaching the structured Cargo boundary failed: {reason}"),
+                        diagnostics,
+                    ));
+                }
+            };
+        }
         let runtime = AcquiredCheckoutRuntime {
             workload_container_id,
             checkout_scope,
@@ -277,6 +293,15 @@ impl PreparedCheckoutRuntime {
             BoundWorkloadRefusal,
         >,
     {
+        if let Err(message) = self.acquired.workload_cfg.bind_materialized_cargo_lock(
+            self.prepared_checkout_evidence.cargo_lock_sha256_hex(),
+        ) {
+            let disposal_diagnostics = self.dispose_checkout_runtime(workspace_manager);
+            return RetainedWorkloadOutcome::RunFailed {
+                failure: RunFailure::uncommitted(message),
+                disposal_diagnostics,
+            };
+        }
         // Step 19: complete the materialization phase with the RETAINED Hop B usage (borrow only).
         let materialization_usage = self.prepared_checkout_evidence.preparation_usage();
         if let Err(error) = authority.complete_phase(
