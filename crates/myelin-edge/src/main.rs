@@ -338,7 +338,8 @@ impl EdgeRuntimeConfig {
     fn from_env(serving: bool) -> Result<Self, String> {
         let config = Self::from_reader(serving, std::env::var)?;
         if serving {
-            validate_git_wire_host()?;
+            let limits = myelin_edge::GitWireExecutor::default_limits();
+            validate_git_wire_host(&limits)?;
         }
         Ok(config)
     }
@@ -426,8 +427,9 @@ fn validated_public_base_url(value: Result<String, VarError>) -> Result<String, 
     Ok(raw.trim_end_matches('/').to_string())
 }
 
-fn validate_git_wire_host() -> Result<(), String> {
-    let cgroup = myelin_ci_sandbox::MemoryCgroup::create(1024 * 1024)
+fn validate_git_wire_host(limits: &myelin_ci_sandbox::ResourceLimits) -> Result<(), String> {
+    let cgroup =
+        myelin_ci_sandbox::MemoryCgroup::create(1024 * 1024, limits.cpu_millis)
         .map_err(|error| format!("Git wire sandbox host preflight failed: {error}"))?;
     drop(cgroup);
     Ok(())

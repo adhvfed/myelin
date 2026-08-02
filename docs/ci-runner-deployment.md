@@ -104,27 +104,28 @@ full set). `NoNewPrivileges` MUST stay `false` for the same
 setuid-helper reason — `NoNewPrivileges=true` (a common systemd hardening default — do not apply it
 here) makes the kernel ignore their setuid bit on exec entirely.
 
-## Cgroup v2 delegation for per-job memory bounding
+## Cgroup v2 delegation for per-job memory and CPU bounding
 
-`MemoryCgroup::create` (`gvisor.rs`) creates each job's memory-bounding cgroup as a SIBLING of the
+`MemoryCgroup::create` (`gvisor.rs`) creates each job's memory/CPU-bounding cgroup as a SIBLING of the
 runner process's own cgroup — it needs write access to its own cgroup's PARENT directory, with
-`memory` already enabled in that parent's `cgroup.subtree_control`. The unit achieves this with:
+`memory` and `cpu` already enabled in that parent's `cgroup.subtree_control`. The unit achieves this
+with:
 
 ```ini
-Delegate=memory
+Delegate=memory cpu
 DelegateSubgroup=supervisor
-ExecStart=/bin/sh -c 'CG="/sys/fs/cgroup$(sed -n "s#^0::##p" /proc/self/cgroup)"; echo +memory > "$CG/../cgroup.subtree_control"; exec /opt/myelin/bin/ci-controlplane'
+ExecStart=/bin/sh -c 'CG="/sys/fs/cgroup$(sed -n "s#^0::##p" /proc/self/cgroup)"; echo +memory +cpu > "$CG/../cgroup.subtree_control"; exec /opt/myelin/bin/ci-controlplane'
 ```
 
 `DelegateSubgroup=supervisor` places the actual service process one level below the delegated
 boundary (in a `supervisor/` subgroup), so the boundary itself — this process's cgroup's parent —
-is what's delegated, leaving room for sibling cgroups beside `supervisor/`. `Delegate=memory` chowns
-that boundary to the service account but does **not** itself populate its `cgroup.subtree_control`
+is what's delegated, leaving room for sibling cgroups beside `supervisor/`. `Delegate=memory cpu`
+chowns that boundary to the service account but does **not** itself populate its `cgroup.subtree_control`
 (confirmed directly: without the explicit write, the boundary is owned by `myelin-runner` yet has an
-EMPTY `cgroup.subtree_control`, so `supervisor/cgroup.controllers` shows no `memory` and
+EMPTY `cgroup.subtree_control`, so `supervisor/cgroup.controllers` lacks `memory` and `cpu` and
 `MemoryCgroup::create` fails closed with `Permission denied`).
 
-**The `+memory` write MUST happen from `ExecStart`, never `ExecStartPre`.** This was confirmed
+**The `+memory +cpu` write MUST happen from `ExecStart`, never `ExecStartPre`.** This was confirmed
 directly and is not obvious: an `ExecStartPre` doing the exact same write deterministically fails
 the ENTIRE unit start with `Failed to spawn executor: Device or resource busy` — a systemd/kernel
 cgroup-v2 ordering interaction specific to a freshly delegated unit's own startup sequence (the
@@ -230,7 +231,7 @@ BIN=$(cargo test -p myelin-ci-sandbox --lib --features integration,test-support 
 sudo systemd-run --uid="$(whoami)" --gid="$(id -gn)" --unit=myelin-userns-drill \
   --property=AmbientCapabilities='CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_READ_SEARCH' \
   --property=NoNewPrivileges=false \
-  --property=Delegate=memory \
+  --property='Delegate=memory cpu' \
   --property=DelegateSubgroup=supervisor \
   --property=WorkingDirectory="$(pwd)" \
   --setenv=MYELIN_RUNSC_BIN=/opt/myelin/bin/runsc \
@@ -238,12 +239,12 @@ sudo systemd-run --uid="$(whoami)" --gid="$(id -gn)" --unit=myelin-userns-drill 
   --setenv=MYELIN_USERNS_DRILL_LEASES_DIR=/var/lib/myelin/userns-leases-drill \
   --setenv=HOME="$HOME" \
   --collect \
-  -- /bin/sh -c 'CG="/sys/fs/cgroup$(sed -n "s#^0::##p" /proc/self/cgroup)"; echo +memory > "$CG/../cgroup.subtree_control"; exec '"$BIN"' --test-threads=1 --nocapture explicit_user_namespace_boots_through_the_real_enabled_backend_and_launch'
+  -- /bin/sh -c 'CG="/sys/fs/cgroup$(sed -n "s#^0::##p" /proc/self/cgroup)"; echo +memory +cpu > "$CG/../cgroup.subtree_control"; exec '"$BIN"' --test-threads=1 --nocapture explicit_user_namespace_boots_through_the_real_enabled_backend_and_launch'
 
 sudo journalctl -u myelin-userns-drill --no-pager -o cat
 ```
 
-(The `+memory` write is inline in the drill's own `ExecStart`-equivalent for the same reason the real
+(The `+memory +cpu` write is inline in the drill's own `ExecStart`-equivalent for the same reason the real
 unit's is — see the cgroup-delegation section above; a separate `ExecStartPre`/pre-step
 deterministically fails unit startup here too.) A passing run leaves no leaked Btrfs subvolume,
 qgroup, or userns lease marker behind — verify with `sudo btrfs qgroup show /`, `runsc list`, and

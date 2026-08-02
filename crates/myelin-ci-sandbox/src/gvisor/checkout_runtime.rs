@@ -458,6 +458,7 @@ pub(crate) fn run_checkout_preparation_v2(
 /// 19–25 (including the real `Prepared → Bound` session bind against synthetic identities) with a FAKE
 /// spawn — no `runsc` — while still proving the per-phase workload credential/context threading.
 #[cfg(test)]
+#[allow(dead_code)]
 impl PreparedCheckoutRuntime {
     // The `#[cfg(test)]` execution seam's `F` bound names gvisor-module-private RuntimePreparation /
     // RuntimeFinalization — legitimate for a test-only injection point (production `run_retained_workload`
@@ -511,6 +512,7 @@ impl PreparedCheckoutRuntime {
 /// freshly-acquired capsule's session to the requested disposition using the session's OWN real
 /// transitions (no `runsc` needed), so the sibling matrix can then observe disposal's durable effect.
 #[cfg(test)]
+#[allow(dead_code)]
 impl AcquiredCheckoutRuntime {
     pub(crate) fn drive_session_for_tests(
         &mut self,
