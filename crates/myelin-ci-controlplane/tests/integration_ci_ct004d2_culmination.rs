@@ -711,6 +711,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         region,
         tokio::runtime::Handle::current(),
         Arc::new(ClaimTokenIssuer),
+        myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
     );
     let adapter = DurableLeaseAdapter::new(
         ci_region_queue_store_test_support(admin.clone()),

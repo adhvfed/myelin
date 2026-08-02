@@ -38,10 +38,6 @@ use crate::JobSpec;
 use std::fmt;
 use zeroize::Zeroize;
 
-/// The marker a masked needle is replaced by in captured output (references-not-payloads: the fact a
-/// secret was present is preserved; its value is not).
-pub const REDACTION_MARKER: &[u8] = b"***";
-
 /// A set of exact-value needles to mask from a job's captured output at the sandbox boundary. See the
 /// module docs for the (precise, do-not-overclaim) security model and the choke-point rationale.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -50,6 +46,9 @@ pub struct RedactionPlan {
     /// [`RedactionPlan::for_job`]. Needles are held as bytes (a secret is not necessarily UTF-8) and
     /// never logged/serialized.
     needles: Vec<Vec<u8>>,
+    /// A per-plan marker made solely from a byte absent from every needle. That delimiter makes the
+    /// marker non-collidable and prevents adjacent markers or marker boundaries reconstructing one.
+    marker: Vec<u8>,
 }
 
 impl fmt::Debug for RedactionPlan {
@@ -67,6 +66,7 @@ impl RedactionPlan {
     pub fn none() -> RedactionPlan {
         RedactionPlan {
             needles: Vec::new(),
+            marker: Vec::new(),
         }
     }
 
@@ -86,13 +86,9 @@ impl RedactionPlan {
     /// helper; the filtering keeps direct masker callers safe too.
     pub fn for_needles(needles: impl IntoIterator<Item = Vec<u8>>) -> RedactionPlan {
         let mut needles: Vec<Vec<u8>> = needles.into_iter().filter(|n| !n.is_empty()).collect();
-        needles.sort_by(|left, right| {
-            right
-                .len()
-                .cmp(&left.len())
-                .then_with(|| left.cmp(right))
-        });
-        RedactionPlan { needles }
+        needles.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        let marker = collision_free_marker(&needles);
+        RedactionPlan { needles, marker }
     }
 
     /// `true` iff there is nothing to mask.
@@ -105,12 +101,7 @@ impl RedactionPlan {
             .iter()
             .map(|binding| binding.value.as_bytes())
             .collect();
-        expected.sort_by(|left, right| {
-            right
-                .len()
-                .cmp(&left.len())
-                .then_with(|| left.cmp(right))
-        });
+        expected.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
         self.needles.len() == expected.len()
             && self
                 .needles
@@ -119,7 +110,7 @@ impl RedactionPlan {
                 .all(|(needle, expected)| needle.as_slice() == expected)
     }
 
-    /// Mask every needle occurrence in `bytes`, replacing each with [`REDACTION_MARKER`]. The empty
+    /// Mask every needle occurrence in `bytes`, replacing each with the plan's collision-free marker. The empty
     /// plan returns the bytes unchanged. This is an exact-substring replacement; see the module's
     /// deliberately narrow security model.
     pub fn redact(&self, bytes: &[u8]) -> Vec<u8> {
@@ -128,7 +119,7 @@ impl RedactionPlan {
         }
         let mut out = bytes.to_vec();
         for needle in &self.needles {
-            out = replace_all(&out, needle, REDACTION_MARKER);
+            out = replace_all(&out, needle, &self.marker);
         }
         out
     }
@@ -187,7 +178,7 @@ impl StreamingRedactor<'_> {
                 .filter(|needle| self.pending[consumed..].starts_with(needle))
                 .max_by_key(|needle| needle.len())
             {
-                output.extend_from_slice(REDACTION_MARKER);
+                output.extend_from_slice(&self.plan.marker);
                 consumed += needle.len();
             } else {
                 output.push(self.pending[consumed]);
@@ -268,9 +259,8 @@ impl fmt::Display for SecretInjectionError {
                 formatter,
                 "resolved secret `{name}` collides with a literal environment entry"
             ),
-            Self::CoverageMismatch => formatter.write_str(
-                "injected secret environment and redaction-plan coverage disagree",
-            ),
+            Self::CoverageMismatch => formatter
+                .write_str("injected secret environment and redaction-plan coverage disagree"),
         }
     }
 }
@@ -286,6 +276,8 @@ impl std::error::Error for SecretInjectionError {}
 pub struct ResolvedJobSecrets {
     bindings: Vec<ResolvedSecretEnv>,
     redaction: RedactionPlan,
+    authorized_trust_tier: Option<crate::TrustTier>,
+    authorized_refs: Vec<crate::SecretRef>,
 }
 
 impl fmt::Debug for ResolvedJobSecrets {
@@ -303,6 +295,8 @@ impl Default for ResolvedJobSecrets {
         Self {
             bindings: Vec::new(),
             redaction: RedactionPlan::none(),
+            authorized_trust_tier: None,
+            authorized_refs: Vec::new(),
         }
     }
 }
@@ -327,11 +321,10 @@ impl ResolvedJobSecrets {
                 name: binding.name.clone(),
             });
         }
-        if let Some(binding) = bindings.iter().find(|binding| {
-            spec.env
-                .iter()
-                .any(|literal| literal.name == binding.name)
-        }) {
+        if let Some(binding) = bindings
+            .iter()
+            .find(|binding| spec.env.iter().any(|literal| literal.name == binding.name))
+        {
             return Err(SecretInjectionError::EnvNameCollision {
                 name: binding.name.clone(),
             });
@@ -340,6 +333,8 @@ impl ResolvedJobSecrets {
         let resolved = Self {
             bindings,
             redaction,
+            authorized_trust_tier: Some(spec.trust_tier),
+            authorized_refs: spec.secret_refs.clone(),
         };
         resolved.validate_coverage()?;
         Ok(resolved)
@@ -355,6 +350,18 @@ impl ResolvedJobSecrets {
     }
 
     pub(crate) fn validate_for_job(&self, spec: &JobSpec) -> Result<(), SecretInjectionError> {
+        if spec.secret_refs.is_empty()
+            && self.bindings.is_empty()
+            && self.authorized_trust_tier.is_none()
+            && self.authorized_refs.is_empty()
+        {
+            return self.validate_coverage();
+        }
+        if self.authorized_trust_tier != Some(spec.trust_tier)
+            || self.authorized_refs != spec.secret_refs
+        {
+            return Err(SecretInjectionError::BindingSetMismatch);
+        }
         if self.bindings.len() != spec.secret_refs.len()
             || self
                 .bindings
@@ -388,13 +395,12 @@ impl ResolvedJobSecrets {
     }
 
     #[cfg(test)]
-    fn with_plan_for_test(
-        bindings: Vec<ResolvedSecretEnv>,
-        redaction: RedactionPlan,
-    ) -> Self {
+    fn with_plan_for_test(bindings: Vec<ResolvedSecretEnv>, redaction: RedactionPlan) -> Self {
         Self {
             bindings,
             redaction,
+            authorized_trust_tier: None,
+            authorized_refs: Vec::new(),
         }
     }
 }
@@ -416,6 +422,21 @@ fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Choose one delimiter byte absent from every needle and repeat it into a bounded marker. Because no
+/// needle contains the delimiter at all, no needle can occur inside a marker, across two adjacent
+/// markers, or across a marker/plaintext boundary. Production secret values are UTF-8 strings, so at
+/// least one byte in 0x80..=0xff is always absent; the empty fallback keeps direct arbitrary-byte test
+/// callers safe even if their combined needle alphabet covers all 256 byte values.
+fn collision_free_marker(needles: &[Vec<u8>]) -> Vec<u8> {
+    const PREFERRED: &[u8] = b"#~^|!%+?@";
+    let delimiter = PREFERRED
+        .iter()
+        .copied()
+        .chain((0u8..=u8::MAX).filter(|byte| !PREFERRED.contains(byte)))
+        .find(|candidate| needles.iter().all(|needle| !needle.contains(candidate)));
+    delimiter.map_or_else(Vec::new, |byte| vec![byte; 3])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,6 +447,7 @@ mod tests {
             name: "DEPLOY_TOKEN".into(),
             handle: "opaque:deploy".into(),
         }];
+        spec.trust_tier = crate::TrustTier::Trusted;
         spec
     }
 
@@ -443,7 +465,8 @@ mod tests {
     fn masks_every_occurrence_of_each_needle() {
         let plan = RedactionPlan::for_needles([b"s3cr3t".to_vec(), b"hunter2".to_vec()]);
         let got = plan.redact(b"token=s3cr3t and again s3cr3t; pw=hunter2");
-        assert_eq!(got, b"token=*** and again ***; pw=***".to_vec());
+        assert!(!contains_bytes(&got, b"s3cr3t"));
+        assert!(!contains_bytes(&got, b"hunter2"));
     }
 
     #[test]
@@ -452,26 +475,27 @@ mod tests {
         let mut input = b"before".to_vec();
         input.extend_from_slice(&[0xff, 0x00, 0xfe]);
         input.extend_from_slice(b"after");
-        assert_eq!(plan.redact(&input), b"before***after".to_vec());
+        let output = plan.redact(&input);
+        assert!(!contains_bytes(&output, &[0xff, 0x00, 0xfe]));
     }
 
     #[test]
     fn empty_needles_are_dropped_not_masked_between_every_byte() {
         let plan = RedactionPlan::for_needles([Vec::new(), b"keep".to_vec()]);
-        assert_eq!(plan.redact(b"keep this"), b"*** this".to_vec());
+        assert!(!contains_bytes(&plan.redact(b"keep this"), b"keep"));
     }
 
     #[test]
     fn adjacent_and_boundary_occurrences() {
         let plan = RedactionPlan::for_needles([b"ab".to_vec()]);
-        assert_eq!(plan.redact(b"abab"), b"******".to_vec());
-        assert_eq!(plan.redact(b"xabx"), b"x***x".to_vec());
+        assert!(!contains_bytes(&plan.redact(b"abab"), b"ab"));
+        assert!(!contains_bytes(&plan.redact(b"xabx"), b"ab"));
     }
 
     #[test]
     fn overlapping_needles_mask_the_longest_injected_value_first() {
         let plan = RedactionPlan::for_needles([b"prefix".to_vec(), b"prefix-and-rest".to_vec()]);
-        assert_eq!(plan.redact(b"prefix-and-rest"), b"***");
+        assert!(!contains_bytes(&plan.redact(b"prefix-and-rest"), b"prefix"));
     }
 
     #[test]
@@ -481,7 +505,35 @@ mod tests {
         let mut output = stream.push(b"before split-");
         output.extend(stream.push(b"secret after"));
         output.extend(stream.finish());
-        assert_eq!(output, b"before *** after");
+        assert!(!contains_bytes(&output, b"split-secret"));
+    }
+
+    #[test]
+    fn marker_like_and_one_byte_secrets_are_non_colliding() {
+        let needles = [
+            b"*".to_vec(),
+            b"**".to_vec(),
+            b"***".to_vec(),
+            b"[redacted]".to_vec(),
+            b"x".to_vec(),
+        ];
+        let plan = RedactionPlan::for_needles(needles.clone());
+        let output = plan.redact(b"***[redacted]x** *");
+        for needle in needles {
+            assert!(
+                !contains_bytes(&output, &needle),
+                "redacted output retained an adversarial needle"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_markers_cannot_synthesize_another_secret() {
+        let synthesized = b"######".to_vec();
+        let plan =
+            RedactionPlan::for_needles([b"left".to_vec(), b"right".to_vec(), synthesized.clone()]);
+        let output = plan.redact(b"leftright");
+        assert!(!contains_bytes(&output, &synthesized));
     }
 
     #[test]
@@ -491,6 +543,8 @@ mod tests {
             vec![ResolvedSecretEnv::new("DEPLOY_TOKEN", "injected-material")],
             RedactionPlan::none(),
         );
+        spec.resolved_secrets.authorized_trust_tier = Some(spec.trust_tier);
+        spec.resolved_secrets.authorized_refs = spec.secret_refs.clone();
 
         assert_eq!(
             spec.validate_secret_coverage(),
@@ -499,5 +553,41 @@ mod tests {
         let error = crate::gvisor::GvisorBackend::oci_config(&spec)
             .expect_err("coverage mismatch must reject before OCI composition");
         assert!(error.to_string().contains("coverage disagree"));
+    }
+
+    #[test]
+    fn launch_rejects_trust_tier_or_handle_changed_after_resolution() {
+        let resolved = one_secret_job()
+            .with_resolved_secrets(vec![ResolvedSecretEnv::new(
+                "DEPLOY_TOKEN",
+                "injected-material",
+            )])
+            .unwrap();
+
+        let mut tier_flipped = resolved.clone();
+        tier_flipped.trust_tier = crate::TrustTier::UntrustedFork;
+        assert_eq!(
+            tier_flipped.resolved_secrets.authorized_trust_tier,
+            Some(crate::TrustTier::Trusted)
+        );
+        assert_eq!(
+            tier_flipped.validate_secret_coverage(),
+            Err(SecretInjectionError::BindingSetMismatch)
+        );
+        assert!(crate::gvisor::GvisorBackend::oci_config(&tier_flipped).is_err());
+
+        let mut handle_flipped = resolved;
+        handle_flipped.secret_refs[0].handle = "myelin://victim/ci/secret/deploy".into();
+        assert_eq!(
+            handle_flipped.validate_secret_coverage(),
+            Err(SecretInjectionError::BindingSetMismatch)
+        );
+        assert!(crate::gvisor::GvisorBackend::oci_config(&handle_flipped).is_err());
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 }

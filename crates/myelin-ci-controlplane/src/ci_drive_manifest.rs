@@ -313,7 +313,7 @@ impl CiDriveManifestV1 {
             validate_collection_len("environment", job.env.len())?;
             for (name, handle) in &job.secret_handles {
                 validate_machine_token("secret environment name", name)?;
-                validate_bounded("secret handle", handle)?;
+                validate_tenant_secret_handle(handle, &self.tenant_id)?;
                 if job.env.contains_key(name) {
                     return invalid("a secret name cannot also carry a literal environment value");
                 }
@@ -878,6 +878,18 @@ fn validate_canonical_ref(
     Ok(())
 }
 
+fn validate_tenant_secret_handle(handle: &str, tenant: &str) -> Result<(), CiDriveManifestError> {
+    validate_bounded("secret handle", handle)?;
+    let expected_prefix = format!("myelin://{tenant}/ci/secret/");
+    let Some(secret_id) = handle.strip_prefix(&expected_prefix) else {
+        return invalid("secret handle is not bound to the manifest tenant");
+    };
+    if secret_id.is_empty() || secret_id.contains(['/', '#']) {
+        return invalid("secret handle is not a canonical tenant-scoped secret identity");
+    }
+    Ok(())
+}
+
 fn invalid<T>(detail: impl Into<String>) -> Result<T, CiDriveManifestError> {
     Err(CiDriveManifestError::Invalid(detail.into()))
 }
@@ -1019,6 +1031,25 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("reserve handles must be unique"));
+    }
+
+    #[test]
+    fn secret_handles_are_bound_to_the_manifest_tenant() {
+        let mut valid = manifest();
+        valid.jobs[0]
+            .secret_handles
+            .insert("DEPLOY_KEY".into(), "myelin://acme/ci/secret/deploy".into());
+        valid.validate().unwrap();
+
+        valid.jobs[0].secret_handles.insert(
+            "DEPLOY_KEY".into(),
+            "myelin://victim/ci/secret/deploy".into(),
+        );
+        assert!(valid
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("manifest tenant"));
     }
 
     #[test]

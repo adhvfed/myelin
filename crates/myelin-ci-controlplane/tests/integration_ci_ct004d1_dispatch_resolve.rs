@@ -512,6 +512,7 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
         region,
         tokio::runtime::Handle::current(),
         claim_token_issuer(),
+        myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
     );
     let adapter = DurableLeaseAdapter::new(
         ci_region_queue_store_test_support(admin.clone()),
@@ -824,6 +825,7 @@ async fn trusted_runner_never_executes_a_dispatched_untrusted_fork() {
         region,
         tokio::runtime::Handle::current(),
         claim_token_issuer(),
+        myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
     );
     let adapter = DurableLeaseAdapter::new(
         ci_region_queue_store_test_support(admin.clone()),
@@ -905,6 +907,7 @@ async fn a_leased_row_without_a_spec_resolves_fail_closed() {
         region,
         tokio::runtime::Handle::current(),
         claim_token_issuer(),
+        myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
     );
     let adapter = DurableLeaseAdapter::new(
         ci_region_queue_store_test_support(admin.clone()),

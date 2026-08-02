@@ -176,13 +176,18 @@ fn cdc_4_4_consumer_resolves_approvers_via_list_subjects_environment_approve() {
 
 struct ResolvingCap;
 impl SecretCapability for ResolvingCap {
-    fn resolve_handle(&self, handle: &str) -> Option<String> {
-        Some(format!("material:{handle}"))
+    fn resolve_handle(
+        &self,
+        tenant: &TenantId,
+        object: &ArtifactRef,
+        handle: &str,
+    ) -> Option<String> {
+        (tenant.0 == "acme" && object.0 == handle).then(|| format!("material:{handle}"))
     }
 }
 
 fn secret_object_of(r: &SecretRef) -> ArtifactRef {
-    ArtifactRef(format!("myelin://acme/ci/secret/{}", r.handle))
+    ArtifactRef(r.handle.clone())
 }
 
 fn subject(id: &str) -> Principal {
@@ -205,11 +210,11 @@ fn cdc_4_9_broker_gates_secret_read_and_fork_short_circuits() {
     let refs = vec![
         SecretRef {
             name: "GRANTED".into(),
-            handle: "h:granted".into(),
+            handle: "myelin://acme/ci/secret/granted".into(),
         },
         SecretRef {
             name: "DENIED".into(),
-            handle: "h:denied".into(),
+            handle: "myelin://acme/ci/secret/denied".into(),
         },
     ];
 

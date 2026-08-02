@@ -31,8 +31,13 @@ use std::cell::RefCell;
 /// A capability that WOULD resolve every secret (the adversary's advantage maximised).
 struct AlwaysResolves;
 impl SecretCapability for AlwaysResolves {
-    fn resolve_handle(&self, handle: &str) -> Option<String> {
-        Some(format!("PROD-SECRET-MATERIAL:{handle}"))
+    fn resolve_handle(
+        &self,
+        tenant: &TenantId,
+        object: &ArtifactRef,
+        handle: &str,
+    ) -> Option<String> {
+        (tenant.0 == "acme" && object.0 == handle).then(|| format!("PROD-SECRET-MATERIAL:{handle}"))
     }
 }
 
@@ -114,7 +119,7 @@ impl IdentityService for MisconfiguredGrantAll {
 }
 
 fn secret_object_of(r: &SecretRef) -> ArtifactRef {
-    ArtifactRef(format!("myelin://acme/ci/secret/{}", r.handle))
+    ArtifactRef(r.handle.clone())
 }
 
 /// **CI-D7: 0 fork secret reads.** An adversarial fork references every protected secret; the authz
@@ -133,19 +138,19 @@ fn ci_d7_fork_gets_no_secrets() {
     let protected_secrets = vec![
         SecretRef {
             name: "PROD_DB_PASSWORD".into(),
-            handle: "h:db".into(),
+            handle: "myelin://acme/ci/secret/db".into(),
         },
         SecretRef {
             name: "REGISTRY_PUSH_TOKEN".into(),
-            handle: "h:registry".into(),
+            handle: "myelin://acme/ci/secret/registry".into(),
         },
         SecretRef {
             name: "CLOUD_DEPLOY_KEY".into(),
-            handle: "h:cloud".into(),
+            handle: "myelin://acme/ci/secret/cloud".into(),
         },
         SecretRef {
             name: "SIGNING_PRIVATE_KEY".into(),
-            handle: "h:signing".into(),
+            handle: "myelin://acme/ci/secret/signing".into(),
         },
     ];
 

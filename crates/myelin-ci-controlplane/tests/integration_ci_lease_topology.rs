@@ -389,6 +389,7 @@ async fn a_legacy_null_window_row_claims_flat_and_refuses_checkout_before_any_mi
             REGION,
             tokio::runtime::Handle::current(),
             Arc::new(NeverMintIssuer(mints.clone())),
+            myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
         );
 
         // The non-checkout legacy row is claimed under the flat fallback and resolves normally.

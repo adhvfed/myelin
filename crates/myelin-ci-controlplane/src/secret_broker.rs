@@ -45,13 +45,11 @@
 //! `Decision::Allow` check, or resolving an un-referenced name all flip a pinned assertion. A `< 90%`
 //! survivor count is a regression — the floor is never weakened to pass.
 
-use myelin_ci_sandbox::{
-    JobSpec, ResolvedSecretEnv, SecretInjectionError, SecretRef, TrustTier,
-};
+use myelin_ci_sandbox::{JobSpec, ResolvedSecretEnv, SecretInjectionError, SecretRef, TrustTier};
 use myelin_identity::{
     Consistency, Decision, IdentityService, Permission, Principal, Result as IdResult,
 };
-use myelin_tenancy::ArtifactRef;
+use myelin_tenancy::{ArtifactRef, TenantId};
 use std::fmt;
 use zeroize::Zeroize;
 
@@ -171,9 +169,7 @@ pub enum SecretLaunchError {
 impl fmt::Display for SecretLaunchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Authorization(_) => {
-                formatter.write_str("secret launch authorization failed")
-            }
+            Self::Authorization(_) => formatter.write_str("secret launch authorization failed"),
             Self::Withheld(withheld) => {
                 formatter.write_str("secret launch withheld: ")?;
                 for (index, item) in withheld.iter().enumerate() {
@@ -225,11 +221,30 @@ impl SecretResolution {
 /// does NOT depend on the concrete secret store in production (the real store is the shared Id/GDPR
 /// secret capability; the DAG stays acyclic — the broker owns only the scope+gate logic).
 pub trait SecretCapability {
-    /// Resolve ONE opaque handle to its material (scoped to this job). Returns `None` if the handle
-    /// does not resolve (a stale/absent binding — withheld, never an error). The implementation mints
-    /// the material from the EU-sovereign secret store; OIDC short-lived credentials are minted by
-    /// [`SecretBroker::mint_oidc`] over the resolved binding, NOT here.
-    fn resolve_handle(&self, handle: &str) -> Option<String>;
+    /// Resolve ONE tenant-scoped handle to its material, bound to the exact object Identity authorized.
+    /// Implementations MUST refuse unless `handle` belongs to `tenant` and identifies `object`; the
+    /// redundant inputs deliberately prevent a global handle lookup from becoming a confused deputy.
+    /// Returns `None` for a stale, absent, or scope-mismatched binding.
+    fn resolve_handle(
+        &self,
+        tenant: &TenantId,
+        object: &ArtifactRef,
+        handle: &str,
+    ) -> Option<String>;
+}
+
+fn tenant_bound_secret_object(
+    tenant: &TenantId,
+    sref: &SecretRef,
+    secret_object_of: &impl Fn(&SecretRef) -> ArtifactRef,
+) -> Option<ArtifactRef> {
+    let expected_prefix = format!("myelin://{}/ci/secret/", tenant.0);
+    let secret_id = sref.handle.strip_prefix(&expected_prefix)?;
+    if secret_id.is_empty() || secret_id.contains(['/', '#']) {
+        return None;
+    }
+    let object = secret_object_of(sref);
+    (object.0 == sref.handle).then_some(object)
 }
 
 /// **An OIDC short-lived audience-scoped federated credential (contract 4.7, arch §7.3).** CI mints
@@ -322,7 +337,14 @@ impl<'a, C: SecretCapability, I: IdentityService> SecretBroker<'a, C, I> {
         // The scope is EXACTLY `secret_refs` (the per-job filter — never the project's full set).
         let mut outcomes = Vec::with_capacity(secret_refs.len());
         for sref in secret_refs {
-            let object = secret_object_of(sref);
+            let Some(object) = tenant_bound_secret_object(&subject.tenant, sref, &secret_object_of)
+            else {
+                outcomes.push(SecretOutcome::Withheld {
+                    name: sref.name.clone(),
+                    reason: WithholdReason::NotGranted,
+                });
+                continue;
+            };
             let decision = self.identity.check(
                 subject,
                 &Permission(SECRET_READ_PERMISSION.to_string()),
@@ -333,7 +355,10 @@ impl<'a, C: SecretCapability, I: IdentityService> SecretBroker<'a, C, I> {
             // Only an explicit Allow (the DIRECT `secret#direct_reader` grant) resolves the material;
             // a Deny / Conditional WITHHOLDS (never a leak) — fail-closed (ADR-03).
             if decision == Decision::Allow {
-                match self.cap.resolve_handle(&sref.handle) {
+                match self
+                    .cap
+                    .resolve_handle(&subject.tenant, &object, &sref.handle)
+                {
                     Some(value) => outcomes.push(SecretOutcome::Resolved(ResolvedSecret {
                         name: sref.name.clone(),
                         value,
