@@ -35,9 +35,10 @@
 //! path the production asset registry uses rather than a parallel shell-based reimplementation that
 //! could silently drift from it.
 
-use myelin_ci_sandbox::canonical_tree_sha256_hex;
+use myelin_ci_sandbox::{canonical_tree_sha256_hex, file_sha256_hex};
 use myelin_ci_sandbox::{
-    GVISOR_GIT_ROOTFS_SHA256, LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
+    CARGO_VENDOR_SMOKE_LOCK_SHA256, CARGO_VENDOR_SMOKE_TREE_SHA256, GVISOR_GIT_ROOTFS_SHA256,
+    LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use serde::Deserialize;
 use std::fs;
@@ -51,19 +52,19 @@ struct Manifest {
 #[derive(Debug, Deserialize)]
 struct AssetRow {
     id: String,
-    #[allow(dead_code)]
     capability: String,
-    #[allow(dead_code)]
     covers_job: String,
     stage_script: String,
     env_var: String,
     default_path: String,
-    #[allow(dead_code)]
     source_image: String,
-    #[allow(dead_code)]
     source_image_digest: String,
     canonical_tree_sha256: String,
     image: String,
+    #[serde(default)]
+    lockfile_sha256: Option<String>,
+    #[serde(default)]
+    mount_destination: Option<String>,
     #[allow(dead_code)]
     note: String,
 }
@@ -311,5 +312,60 @@ fn rust_and_small_rootfs_constants_are_mechanically_synced_to_their_toml_sources
         LINUX_SMALL_V1_ROOTFS_SHA256, small_embedded,
         "gvisor.rs's LINUX_SMALL_V1_ROOTFS_SHA256 constant has drifted from the digest embedded in \
          .myelin/ci.toml's job `image` field"
+    );
+}
+
+#[test]
+fn cargo_vendor_manifest_row_is_mechanically_synced_to_code_and_fixture() {
+    let manifest = load_real_manifest();
+    let row = manifest
+        .asset
+        .iter()
+        .find(|row| row.id == "cargo-vendor-smoke-v1")
+        .expect("runner-assets.toml must have a `cargo-vendor-smoke-v1` row");
+
+    assert_eq!(row.capability, "cargo-vendor");
+    assert_eq!(row.covers_job, "build-test-clippy");
+    assert_eq!(row.stage_script, "scripts/build-cargo-vendor-asset.sh");
+    assert_eq!(row.env_var, "MYELIN_GVISOR_CARGO_VENDOR");
+    assert_eq!(
+        row.default_path,
+        "~/.local/share/gvisor-assets/cargo-vendor-smoke-v1"
+    );
+    assert_eq!(
+        row.source_image,
+        "testing/fixtures/cargo-vendor-smoke/Cargo.lock"
+    );
+    assert_eq!(
+        row.mount_destination.as_deref(),
+        Some("/opt/myelin/cargo-vendor")
+    );
+
+    assert_eq!(
+        row.canonical_tree_sha256, CARGO_VENDOR_SMOKE_TREE_SHA256,
+        "the registry's Cargo vendor tree constant must match runner-assets.toml"
+    );
+    assert_eq!(
+        parse_sha256_digest(&row.image),
+        Some(CARGO_VENDOR_SMOKE_TREE_SHA256),
+        "the Cargo vendor reference must carry the same complete-tree pin"
+    );
+    assert_eq!(
+        row.lockfile_sha256.as_deref(),
+        Some(CARGO_VENDOR_SMOKE_LOCK_SHA256),
+        "the registered asset's lock key must match runner-assets.toml"
+    );
+    assert_eq!(
+        row.source_image_digest,
+        format!("sha256:{CARGO_VENDOR_SMOKE_LOCK_SHA256}"),
+        "the source-image digest must name the same exact lockfile key"
+    );
+
+    let fixture_lock = workspace_root().join(&row.source_image);
+    let actual_fixture_lock_sha256 = file_sha256_hex(&fixture_lock)
+        .unwrap_or_else(|error| panic!("hash fixture lock {}: {error}", fixture_lock.display()));
+    assert_eq!(
+        actual_fixture_lock_sha256, CARGO_VENDOR_SMOKE_LOCK_SHA256,
+        "the checked-in fixture Cargo.lock moved without an intentional asset rebuild/repin"
     );
 }
