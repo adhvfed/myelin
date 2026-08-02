@@ -174,12 +174,14 @@ pub fn ci_runner_v2_wiring(
     provider: SubstrateProvider,
     identity: &CiRunnerIdentityAuthorities,
     rt: tokio::runtime::Handle,
+    secret_terminal_reporter: crate::CiPipelineReporterRouter,
 ) -> Result<CiRunnerV2Wiring, HookError> {
     ci_runner_v2_wiring_with_secret_resolver(
         provider,
         identity,
         rt,
         crate::ci_manifest_job_runner::unavailable_ci_job_secret_resolver(),
+        secret_terminal_reporter,
     )
 }
 
@@ -191,6 +193,7 @@ pub fn ci_runner_v2_wiring_with_secret_resolver(
     identity: &CiRunnerIdentityAuthorities,
     rt: tokio::runtime::Handle,
     secrets: crate::ci_manifest_job_runner::CiJobSecretResolver,
+    secret_terminal_reporter: crate::CiPipelineReporterRouter,
 ) -> Result<CiRunnerV2Wiring, HookError> {
     let pool = provider.db_pool().clone();
     let region = provider.config().region.clone();
@@ -207,6 +210,7 @@ pub fn ci_runner_v2_wiring_with_secret_resolver(
         rt.clone(),
         composition.clone(),
         secrets,
+        secret_terminal_reporter,
     );
     let hooks = ci_runner_v2_hooks(provider, identity.launch_authorizer(), composition, rt);
     Ok(CiRunnerV2Wiring { resolver, hooks })

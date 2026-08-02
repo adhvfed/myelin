@@ -711,6 +711,7 @@ async fn run(runner_host_requested: bool) {
             provider.clone(),
             &runner_identity,
             tokio::runtime::Handle::current(),
+            runner_reporter.clone(),
         ) {
             Ok(wiring) => wiring,
             Err(error) => {

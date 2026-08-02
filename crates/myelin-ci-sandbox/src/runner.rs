@@ -586,6 +586,7 @@ pub struct TerminalReport {
 /// an ordinary workload result continues to use [`TerminalReport`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreparationPhase {
+    SecretResolution,
     CheckoutTransport,
     CheckoutMaterialization,
 }
@@ -595,6 +596,7 @@ impl PreparationPhase {
     /// accounting cannot encode the same phase through separate hand-written strings.
     pub fn as_storage_token(self) -> &'static str {
         match self {
+            Self::SecretResolution => "secret_resolution",
             Self::CheckoutTransport => "checkout_transport",
             Self::CheckoutMaterialization => "checkout_materialization",
         }

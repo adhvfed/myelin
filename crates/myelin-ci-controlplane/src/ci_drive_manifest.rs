@@ -14,7 +14,7 @@ use myelin_tenancy::{Region, TenantId};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool, Row};
 
-use crate::CI_PIPELINE_WF_TYPE;
+use crate::{secret_broker::parse_canonical_secret_handle, CI_PIPELINE_WF_TYPE};
 
 pub const CI_DRIVE_MANIFEST_SCHEMA_V1: u32 = 1;
 pub const CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN: &str = "myelin.ci.drive-manifest.v1";
@@ -880,12 +880,11 @@ fn validate_canonical_ref(
 
 fn validate_tenant_secret_handle(handle: &str, tenant: &str) -> Result<(), CiDriveManifestError> {
     validate_bounded("secret handle", handle)?;
-    let expected_prefix = format!("myelin://{tenant}/ci/secret/");
-    let Some(secret_id) = handle.strip_prefix(&expected_prefix) else {
-        return invalid("secret handle is not bound to the manifest tenant");
+    let Some(parsed) = parse_canonical_secret_handle(handle) else {
+        return invalid("secret handle is not a strict canonical tenant-scoped secret identity");
     };
-    if secret_id.is_empty() || secret_id.contains(['/', '#']) {
-        return invalid("secret handle is not a canonical tenant-scoped secret identity");
+    if parsed.tenant != tenant {
+        return invalid("secret handle is not bound to the manifest tenant");
     }
     Ok(())
 }
@@ -1050,6 +1049,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("manifest tenant"));
+    }
+
+    #[test]
+    fn secret_handles_reject_every_noncanonical_alias_vector() {
+        for handle in [
+            "myelin://acme/ci/secret/secret:deploy",
+            "myelin://acme/ci/secret/..",
+            "myelin://acme/ci/secret/%2f",
+            "myelin://acme/ci/secret/deploy\0",
+            "junkmyelin://acme/ci/secret/deploy",
+            "myelin://acme/ci/secret/deploy/",
+            "myelin:///ci/secret/deploy",
+            "myelin://acme/ci/secret/",
+        ] {
+            let mut invalid = manifest();
+            invalid.jobs[0]
+                .secret_handles
+                .insert("DEPLOY_KEY".into(), handle.into());
+            assert!(
+                invalid.validate().is_err(),
+                "manifest admitted noncanonical secret handle {handle:?}"
+            );
+        }
     }
 
     #[test]

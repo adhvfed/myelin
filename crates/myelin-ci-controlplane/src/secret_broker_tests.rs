@@ -71,11 +71,44 @@ impl SecretCapability for FakeCapability {
         object: &ArtifactRef,
         handle: &str,
     ) -> Option<String> {
-        if tenant.0 == "acme" && object.0 == handle && self.known.contains(handle) {
+        let parsed = parse_canonical_secret_handle(handle)?;
+        if parsed.tenant == tenant.0 && object.0 == handle && self.known.contains(handle) {
             Some(format!("material:{handle}"))
         } else {
             None
         }
+    }
+}
+
+#[test]
+fn strict_secret_handles_round_trip_to_one_tenant_object_key() {
+    let clean = "myelin://acme/ci/secret/deploy";
+    let parsed = parse_canonical_secret_handle(clean).expect("clean handle must be accepted");
+    assert_eq!(parsed.tenant, "acme");
+    assert_eq!(parsed.id, "deploy");
+    let key = myelin_refs::object_key(&ArtifactRef(clean.into())).unwrap();
+    assert_eq!(key.tenant.as_deref(), Some("acme"));
+    assert_eq!(key.tuple_key(), "secret:deploy");
+
+    for refused in [
+        "myelin://acme/ci/secret/secret:deploy",
+        "myelin://acme/ci/secret/..",
+        "myelin://acme/ci/secret/%2f",
+        "myelin://acme/ci/secret/deploy\0",
+        "junkmyelin://acme/ci/secret/deploy",
+        "myelin://acme/ci/secret/deployjunk/",
+        "myelin:///ci/secret/deploy",
+        "myelin://acme/ci/secret/",
+        "myelin://ac.me/ci/secret/deploy",
+        "myelin://acme/ci/secret/de.ploy",
+        "myelin://acme/ci/secret/deploy#anchor",
+        "myelin://acme/ci/secret/deploy/extra",
+        "myelin://acme/ci/secret/deploy\n",
+    ] {
+        assert!(
+            parse_canonical_secret_handle(refused).is_none(),
+            "noncanonical handle must be refused: {refused:?}"
+        );
     }
 }
 
@@ -420,6 +453,21 @@ fn cross_tenant_handle_cannot_use_an_authorized_local_object() {
 }
 
 #[test]
+fn capability_resolution_refuses_foreign_handle_for_authorized_local_object() {
+    let foreign = "myelin://victim/ci/secret/deploy";
+    let cap = FakeCapability::with(&[foreign]);
+    assert_eq!(
+        cap.resolve_handle(
+            &TenantId("acme".into()),
+            &ArtifactRef("myelin://acme/ci/secret/deploy".into()),
+            foreign,
+        ),
+        None,
+        "the capability interface must tenant-bind the requested handle to the authorized object"
+    );
+}
+
+#[test]
 fn self_hosted_is_trusted_for_secret_resolution() {
     // A self-hosted member run is trusted CODE — it resolves its granted secrets (it is NOT a fork).
     let cap = FakeCapability::with(&[
@@ -756,6 +804,10 @@ fn fork_is_refused_an_oidc_credential() {
 fn withhold_reason_tokens_are_stable() {
     assert_eq!(WithholdReason::UntrustedFork.as_token(), "untrusted_fork");
     assert_eq!(WithholdReason::NotGranted.as_token(), "not_granted");
+    assert_eq!(
+        WithholdReason::CapabilityUnavailable.as_token(),
+        "capability_unavailable"
+    );
 }
 
 #[test]

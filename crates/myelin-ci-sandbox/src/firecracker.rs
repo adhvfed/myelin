@@ -1309,18 +1309,20 @@ fn build_result_from_console(
                 .flatten(),
         ),
         None => (
-            redaction.redact(&capture_stream(
+            capture_stream_redacted(
                 &o.console,
                 MARK_STDOUT_BEGIN,
                 MARK_STDOUT_END,
                 nonce,
-            )),
-            redaction.redact(&capture_stream(
+                redaction,
+            ),
+            capture_stream_redacted(
                 &o.console,
                 MARK_STDERR_BEGIN,
                 MARK_STDERR_END,
                 nonce,
-            )),
+                redaction,
+            ),
             parse_exit(&o.console, nonce),
         ),
     };
@@ -1367,7 +1369,32 @@ fn parse_exit(console: &str, nonce: &str) -> Option<i32> {
 /// Extract one captured stream: the base64 blob between the LAST nonce-framed `begin:<nonce>` line and
 /// the following `end:<nonce>` line, decoded and HEAD-bounded to [`SANDBOX_CAPTURE_BOUND`]. Serial
 /// consoles may CRLF-translate, so lines are trimmed and the decoder ignores non-alphabet bytes.
+#[cfg(test)]
 fn capture_stream(console: &str, begin: &str, end: &str, nonce: &str) -> Vec<u8> {
+    let mut data = decode_captured_stream(console, begin, end, nonce);
+    if data.len() > SANDBOX_CAPTURE_BOUND {
+        data.truncate(SANDBOX_CAPTURE_BOUND); // HEAD capture (documented; full stream → firehose)
+    }
+    data
+}
+
+/// The legacy whole-console result path must mask the complete decoded stream before taking its
+/// diagnostic head. Truncating first could cut a secret occurrence at the bound and leak its prefix.
+fn capture_stream_redacted(
+    console: &str,
+    begin: &str,
+    end: &str,
+    nonce: &str,
+    redaction: &RedactionPlan,
+) -> Vec<u8> {
+    let mut data = redaction.redact(&decode_captured_stream(console, begin, end, nonce));
+    if data.len() > SANDBOX_CAPTURE_BOUND {
+        data.truncate(SANDBOX_CAPTURE_BOUND);
+    }
+    data
+}
+
+fn decode_captured_stream(console: &str, begin: &str, end: &str, nonce: &str) -> Vec<u8> {
     let begin_marker = format!("{begin}:{nonce}");
     let end_marker = format!("{end}:{nonce}");
     let lines: Vec<&str> = console.lines().collect();
@@ -1381,11 +1408,7 @@ fn capture_stream(console: &str, begin: &str, end: &str, nonce: &str) -> Vec<u8>
         }
         b64.push_str(l);
     }
-    let mut data = b64_decode(&b64);
-    if data.len() > SANDBOX_CAPTURE_BOUND {
-        data.truncate(SANDBOX_CAPTURE_BOUND); // HEAD capture (documented; full stream → firehose)
-    }
-    data
+    b64_decode(&b64)
 }
 
 /// A small dependency-free standard-base64 decoder (the streams the in-guest runner emits are
@@ -2230,5 +2253,28 @@ mod tests {
         let out = capture_stream(&console, MARK_STDOUT_BEGIN, MARK_STDOUT_END, "n");
         assert_eq!(out.len(), SANDBOX_CAPTURE_BOUND);
         assert!(out.iter().all(|b| *b == b'x'));
+    }
+
+    #[test]
+    fn legacy_console_redacts_before_taking_the_bounded_head() {
+        let secret = b"SECRETVALUE";
+        let mut bytes = vec![b'x'; SANDBOX_CAPTURE_BOUND - 4];
+        bytes.extend_from_slice(secret);
+        bytes.extend_from_slice(b"tail");
+        let console = framed_console("n", &bytes, b"", 0);
+        let plan = crate::redaction::RedactionPlan::for_needles([secret.to_vec()]).unwrap();
+
+        let out = capture_stream_redacted(
+            &console,
+            MARK_STDOUT_BEGIN,
+            MARK_STDOUT_END,
+            "n",
+            &plan,
+        );
+        assert!(!out.windows(secret.len()).any(|window| window == secret));
+        assert!(
+            !out.windows(4).any(|window| window == &secret[..4]),
+            "truncate-before-redact would leak this secret prefix"
+        );
     }
 }
