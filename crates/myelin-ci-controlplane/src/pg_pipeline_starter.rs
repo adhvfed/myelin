@@ -40,7 +40,8 @@ use crate::ci_drive_manifest::{
 use crate::ci_run_store::CiRunRecord;
 use crate::ci_run_supersession::{HeadDecision, PgCiRunSupersession};
 use crate::run_plan::{
-    load_launch_run_plan_v2, PreparedRunPlanV2, RunPlanError, RUN_PLAN_SCHEMA_V2,
+    load_launch_run_plan_v2, PreparedRunPlanV2, ResolvedJobV2, RunPlanError, PLATFORM_CARGO_HOME,
+    RUN_PLAN_SCHEMA_V2,
 };
 use crate::surfacing::{ci_artifact_ref, ci_run_ref};
 
@@ -1573,6 +1574,7 @@ fn granted_jobs_v2(
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
             needs.sort();
+            let (command, env) = platform_owned_execution(job, &grant.env);
             Ok(GrantedCiJobV1 {
                 job_id: expected.job_id.to_string(),
                 stage: job.stage.clone(),
@@ -1581,8 +1583,8 @@ fn granted_jobs_v2(
                 needs,
                 matrix_key: job.matrix_key.clone(),
                 image: job.image.clone(),
-                command: job.command.clone(),
-                env: grant.env.clone(),
+                command,
+                env,
                 secret_handles: grant.secret_handles.clone(),
                 egress_allow: grant.egress_allow.clone(),
                 limits: grant.limits.clone(),
@@ -1599,6 +1601,25 @@ fn granted_jobs_v2(
             })
         })
         .collect()
+}
+
+/// Lower one validated authored job into the exact executable manifest fields. Free-form jobs retain
+/// their historical argv/env byte-for-byte. Structured Cargo jobs receive an argv constructed by the
+/// platform and fixed Cargo environment values that overwrite any conflicting grant value.
+///
+/// There is deliberately no shell in this translation. Full attested hermeticity remains contingent
+/// on the later read-only vendored dependency/config boundary and Cargo.lock attestation check.
+fn platform_owned_execution(
+    job: &ResolvedJobV2,
+    granted_env: &BTreeMap<String, String>,
+) -> (Vec<String>, BTreeMap<String, String>) {
+    let Some(build) = &job.build else {
+        return (job.command.clone(), granted_env.clone());
+    };
+    let mut env = granted_env.clone();
+    env.insert("CARGO_HOME".into(), PLATFORM_CARGO_HOME.into());
+    env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+    (build.platform_argv(), env)
 }
 
 fn build_drive_manifest_v1(
@@ -2188,6 +2209,12 @@ mod tests {
     }
 
     fn prepared_plan_v2() -> (CiRunRecord, PreparedRunPlanV2) {
+        prepared_plan_v2_with_structured_build(false)
+    }
+
+    fn prepared_plan_v2_with_structured_build(
+        structured_build: bool,
+    ) -> (CiRunRecord, PreparedRunPlanV2) {
         let tenant = tenant();
         let plan = ResolvedRunPlanV2 {
             schema_version: RUN_PLAN_SCHEMA_V2,
@@ -2200,7 +2227,15 @@ mod tests {
                     stage: "build".into(),
                     name: "build".into(),
                     image: PINNED_IMAGE.into(),
-                    command: vec!["/bin/build".into()],
+                    command: if structured_build {
+                        Vec::new()
+                    } else {
+                        vec!["/bin/build".into()]
+                    },
+                    build: structured_build.then_some(crate::StructuredBuildV1 {
+                        tool: crate::StructuredBuildToolV1::Cargo,
+                        args: vec!["build".into(), "--locked".into()],
+                    }),
                     needs: Vec::new(),
                     is_generator: false,
                     matrix_key: BTreeMap::new(),
@@ -2210,6 +2245,7 @@ mod tests {
                     name: "test".into(),
                     image: PINNED_IMAGE.into(),
                     command: vec!["/bin/test".into()],
+                    build: None,
                     needs: vec!["build".into()],
                     is_generator: false,
                     matrix_key: BTreeMap::new(),
@@ -2469,6 +2505,38 @@ mod tests {
             .expect_err("reordered authority jobs must fail closed")
             .to_string()
             .contains("strictly plan-ordered"));
+    }
+
+    #[test]
+    fn structured_cargo_job_lowers_to_platform_argv_and_env_without_a_shell() {
+        let (record, prepared) = prepared_plan_v2_with_structured_build(true);
+        let expected = expected_ci_jobs_v2(&record, &prepared).unwrap();
+        let mut build_grant = launch_grant("build");
+        build_grant
+            .env
+            .insert("CARGO_HOME".into(), "/tenant".into());
+        build_grant
+            .env
+            .insert("CARGO_NET_OFFLINE".into(), "false".into());
+        let authority = CiLaunchAuthorityV1 {
+            policy_revision: "policy-v1".into(),
+            jobs: vec![build_grant, launch_grant("test")],
+            merge_waiter: None,
+        };
+
+        let jobs = granted_jobs_v2(&record, &prepared, &expected, &authority).unwrap();
+        let build = &jobs[0];
+        assert_eq!(build.command, ["cargo", "build", "--locked"]);
+        assert!(!build
+            .command
+            .iter()
+            .any(|arg| arg == "/bin/sh" || arg == "-c"));
+        assert_eq!(build.env.get("CARGO_HOME").unwrap(), PLATFORM_CARGO_HOME);
+        assert_eq!(build.env.get("CARGO_NET_OFFLINE").unwrap(), "true");
+
+        let free_form = &jobs[1];
+        assert_eq!(free_form.command, ["/bin/test"]);
+        assert_eq!(free_form.env, authority.jobs[1].env);
     }
 
     #[test]

@@ -111,6 +111,7 @@ fn valid_plan_v2() -> ResolvedRunPlanV2 {
         name: job.name,
         image: job.image,
         command: job.command,
+        build: None,
         needs: job.needs,
         is_generator: job.is_generator,
         matrix_key: job.matrix_key,
@@ -129,6 +130,16 @@ fn valid_plan_v2() -> ResolvedRunPlanV2 {
         },
         jobs: vec![build, test],
     }
+}
+
+fn structured_cargo_plan_v2() -> ResolvedRunPlanV2 {
+    let mut plan = valid_plan_v2();
+    plan.jobs[0].command.clear();
+    plan.jobs[0].build = Some(StructuredBuildV1 {
+        tool: StructuredBuildToolV1::Cargo,
+        args: vec!["build".into(), "--locked".into()],
+    });
+    plan
 }
 
 fn run_for(hash: &ContentHash) -> CiRunRecord {
@@ -242,6 +253,66 @@ fn version_two_canonical_wire_and_launch_request_digest_are_pinned() {
         plan.launch_request_digest_v1().expect("request digest"),
         "blake3:e41fa8f911b554840fd4b3abe85833295869529566da294839c52bd21171610e"
     );
+}
+
+#[test]
+fn structured_cargo_recipe_is_canonical_and_constructs_direct_argv() {
+    let plan = structured_cargo_plan_v2();
+    let bytes = plan
+        .canonical_bytes()
+        .expect("valid structured Cargo recipe");
+    let decoded = decode_resolved_run_plan(&bytes).expect("decode structured recipe");
+    assert_eq!(decoded, VersionedResolvedRunPlan::V2(plan.clone()));
+
+    let build = plan.jobs[0].build.as_ref().unwrap();
+    assert_eq!(build.platform_argv(), ["cargo", "build", "--locked"]);
+    assert!(!build
+        .platform_argv()
+        .iter()
+        .any(|arg| arg == "/bin/sh" || arg == "-c"));
+}
+
+#[test]
+fn structured_build_validation_rejects_shell_unknown_tool_and_oversized_args() {
+    let mut shell = structured_cargo_plan_v2();
+    shell.jobs[0].build.as_mut().unwrap().args =
+        vec!["build".into(), "--locked;touch-pwned".into()];
+    assert!(matches!(
+        shell.canonical_bytes(),
+        Err(RunPlanError::InvalidPlan { detail }) if detail.contains("shell metacharacters")
+    ));
+
+    let mut oversized = structured_cargo_plan_v2();
+    oversized.jobs[0].build.as_mut().unwrap().args = vec!["x".repeat(257)];
+    assert!(matches!(
+        oversized.canonical_bytes(),
+        Err(RunPlanError::InvalidPlan { detail }) if detail.contains("exceeds 256 bytes")
+    ));
+
+    let valid = structured_cargo_plan_v2().canonical_bytes().unwrap();
+    let mut unknown: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+    unknown["jobs"][0]["build"]["tool"] = serde_json::json!("make");
+    assert!(matches!(
+        decode_resolved_run_plan(&serde_json::to_vec(&unknown).unwrap()),
+        Err(RunPlanError::WireMalformed { detail }) if detail.contains("unknown variant `make`")
+    ));
+}
+
+#[test]
+fn version_two_job_execution_is_exactly_one_of_command_or_build() {
+    let mut both = structured_cargo_plan_v2();
+    both.jobs[0].command = vec!["/bin/sh".into(), "-c".into(), "cargo build".into()];
+    assert!(matches!(
+        both.canonical_bytes(),
+        Err(RunPlanError::InvalidPlan { detail }) if detail.contains("never both")
+    ));
+
+    let mut neither = valid_plan_v2();
+    neither.jobs[0].command.clear();
+    assert!(matches!(
+        neither.canonical_bytes(),
+        Err(RunPlanError::InvalidPlan { detail }) if detail.contains("either command or build")
+    ));
 }
 
 #[test]

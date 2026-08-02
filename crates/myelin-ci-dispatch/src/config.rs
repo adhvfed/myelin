@@ -66,7 +66,9 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::dispatch::OnTrigger;
-use crate::resolve::{CiDefinition, CiPlanContract, JobDef, JobKind, VersionedCiDefinition};
+use crate::resolve::{
+    CiDefinition, CiPlanContract, JobDef, JobKind, StructuredBuildV1, VersionedCiDefinition,
+};
 
 pub const MAX_CI_CONFIG_BYTES: usize = 1024 * 1024;
 pub const MAX_AUTHORED_JOBS: usize = 256;
@@ -205,6 +207,10 @@ pub enum CiConfigError {
         job: String,
         detail: String,
     },
+    InvalidBuild {
+        job: String,
+        detail: String,
+    },
     TooManyMatrixAxes {
         job: String,
         actual: usize,
@@ -279,6 +285,9 @@ impl std::fmt::Display for CiConfigError {
             }
             CiConfigError::InvalidCommand { job, detail } => {
                 write!(f, "job `{job}` command is invalid: {detail}")
+            }
+            CiConfigError::InvalidBuild { job, detail } => {
+                write!(f, "job `{job}` structured build is invalid: {detail}")
             }
             CiConfigError::TooManyMatrixAxes {
                 job,
@@ -379,7 +388,8 @@ struct AuthoredExecution {
 
 /// One authored job. `image` is the RAW reference as authored — it MAY be a floating tag at parse
 /// time; the digest-pin-or-fail-closed control is the RESOLVER's (`resolve_snapshot`), not the
-/// parser's. `command` is required; `needs`/`matrix`/`kind` default to empty/normal.
+/// parser's. Exactly one of `command` or `build` is required; `needs`/`matrix`/`kind` default to
+/// empty/normal. Structured builds require the version-2 authored execution contract.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthoredJob {
@@ -387,7 +397,10 @@ struct AuthoredJob {
     name: String,
     /// The RAW image reference as authored (may be a floating tag — resolved fail-closed later).
     image: String,
-    command: Vec<String>,
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    #[serde(default)]
+    build: Option<StructuredBuildV1>,
     /// The names this job depends on (the DAG edges — each must reference a declared job).
     #[serde(default)]
     needs: Vec<String>,
@@ -435,7 +448,7 @@ impl AuthoredCi {
     /// (non-empty jobs, non-empty + unique names, declared `needs`, well-formed matrix axes,
     /// well-formed `on:`/`kind`). The SEMANTIC checks (acyclicity, digest-pin, matrix expansion)
     /// are the resolver's — NOT duplicated here.
-    fn into_definition(self) -> Result<CiDefinition, CiConfigError> {
+    fn into_definition(self, allow_structured_build: bool) -> Result<CiDefinition, CiConfigError> {
         let on = parse_trigger(&self.on)?;
 
         if self.jobs.is_empty() {
@@ -479,7 +492,36 @@ impl AuthoredCi {
                     job: j.name.clone(),
                 });
             }
-            validate_command(&j.name, &j.command)?;
+            match (j.command.as_deref(), &j.build) {
+                (Some(command), None) => validate_command(&j.name, command)?,
+                (None, Some(build)) if allow_structured_build => build
+                    .validate_for_job(&j.name)
+                    .map_err(|error| CiConfigError::InvalidBuild {
+                        job: j.name.clone(),
+                        detail: error.to_string(),
+                    })?,
+                (None, Some(_)) => {
+                    return Err(CiConfigError::InvalidBuild {
+                        job: j.name.clone(),
+                        detail: "requires `schema_version = 2` and an execution profile".into(),
+                    })
+                }
+                (Some(_), Some(_)) => {
+                    return Err(CiConfigError::InvalidBuild {
+                        job: j.name.clone(),
+                        detail: "declare either `command` or `build`, never both".into(),
+                    })
+                }
+                (None, None) => {
+                    return Err(CiConfigError::Syntax {
+                        format: "schema",
+                        message: format!(
+                            "job `{}` must declare either `command` or a structured `build`",
+                            j.name
+                        ),
+                    })
+                }
+            }
             if j.matrix.len() > myelin_ci_controlplane::run_plan::MAX_MATRIX_AXES {
                 return Err(CiConfigError::TooManyMatrixAxes {
                     job: j.name.clone(),
@@ -527,7 +569,8 @@ impl AuthoredCi {
             jobs.push(JobDef {
                 name: j.name.clone(),
                 image: j.image.clone(),
-                command: j.command.clone(),
+                command: j.command.clone().unwrap_or_default(),
+                build: j.build.clone(),
                 needs: j.needs.clone(),
                 kind,
                 matrix: j.matrix.clone(),
@@ -564,11 +607,12 @@ impl VersionedAuthoredCi {
             }
             _ => return Err(VersionedCiConfigError::PartialExecutionContract),
         };
+        let allow_structured_build = matches!(contract, CiPlanContract::V2(_));
         let definition = AuthoredCi {
             on: self.on,
             jobs: self.jobs,
         }
-        .into_definition()
+        .into_definition(allow_structured_build)
         .map_err(VersionedCiConfigError::Legacy)?;
         Ok(VersionedCiDefinition {
             contract,
@@ -664,7 +708,7 @@ pub fn parse_ci_config(
     filename_or_format: &str,
 ) -> Result<CiDefinition, CiConfigError> {
     let authored: AuthoredCi = deserialize_ci_config(bytes, filename_or_format)?;
-    authored.into_definition()
+    authored.into_definition(false)
 }
 
 /// Parse either the legacy V1 document or the exact authored V2 execution-request contract.
@@ -713,7 +757,7 @@ mod tests {
     use super::*;
     use crate::resolve::{
         resolve_snapshot, resolve_versioned_snapshot, CiPlanContract, ResolveError,
-        ResolvedSnapshot, ResolvedSnapshotExt, VersionedCiDefinition,
+        ResolvedSnapshot, ResolvedSnapshotExt, VersionedCiDefinition, VersionedResolvedSnapshot,
     };
     use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
     use myelin_tenancy::TenantId;
@@ -850,6 +894,98 @@ command = ["build"]
                 parse_ci_config(VALID_TOML.as_bytes(), "toml").unwrap().jobs,
             )
         );
+    }
+
+    #[test]
+    fn structured_cargo_build_parses_and_resolves_only_on_v2() {
+        let toml = format!(
+            r#"schema_version = 2
+on = "push"
+
+[execution]
+profile = "linux-small-v1"
+
+[[jobs]]
+name = "build"
+image = "{PINNED_BUILD}"
+build = {{ tool = "cargo", args = ["build", "--locked"] }}
+"#
+        );
+        let definition = parse_versioned_ci_config(toml.as_bytes(), "toml").unwrap();
+        assert!(definition.jobs[0].command.is_empty());
+        assert_eq!(
+            definition.jobs[0].build.as_ref().unwrap().platform_argv(),
+            ["cargo", "build", "--locked"]
+        );
+
+        let store = FsBlobStore::new();
+        let (snapshot, _) =
+            resolve_versioned_snapshot(&definition, &store, &TenantId("acme".into())).unwrap();
+        let VersionedResolvedSnapshot::V2(plan) = snapshot else {
+            panic!("structured builds require and retain the V2 wire")
+        };
+        assert!(plan.jobs[0].command.is_empty());
+        assert!(plan.jobs[0].build.is_some());
+
+        let legacy = format!(
+            r#"on = "push"
+[[jobs]]
+name = "build"
+image = "{PINNED_BUILD}"
+build = {{ tool = "cargo", args = ["build", "--locked"] }}
+"#
+        );
+        assert!(matches!(
+            parse_ci_config(legacy.as_bytes(), "toml"),
+            Err(CiConfigError::InvalidBuild { detail, .. }) if detail.contains("schema_version = 2")
+        ));
+    }
+
+    #[test]
+    fn structured_build_authored_fields_fail_closed() {
+        let config = |build: &str| {
+            format!(
+                r#"schema_version = 2
+on = "push"
+[execution]
+profile = "linux-small-v1"
+[[jobs]]
+name = "build"
+image = "{PINNED_BUILD}"
+{build}
+"#
+            )
+        };
+        for invalid in [
+            "build = { tool = \"cargo\", args = [\"build\", \"--locked;touch-pwned\"] }"
+                .to_string(),
+            format!(
+                "build = {{ tool = \"cargo\", args = [\"{}\"] }}",
+                "x".repeat(257)
+            ),
+        ] {
+            assert!(matches!(
+                parse_versioned_ci_config(config(&invalid).as_bytes(), "toml"),
+                Err(VersionedCiConfigError::Legacy(
+                    CiConfigError::InvalidBuild { .. }
+                ))
+            ));
+        }
+
+        let unknown = config("build = { tool = \"make\", args = [\"build\"] }");
+        assert!(matches!(
+            parse_versioned_ci_config(unknown.as_bytes(), "toml"),
+            Err(VersionedCiConfigError::Legacy(CiConfigError::Syntax { .. }))
+        ));
+
+        let both = config(
+            "command = [\"/bin/sh\", \"-c\", \"cargo build\"]\nbuild = { tool = \"cargo\", args = [\"build\", \"--locked\"] }",
+        );
+        assert!(matches!(
+            parse_versioned_ci_config(both.as_bytes(), "toml"),
+            Err(VersionedCiConfigError::Legacy(CiConfigError::InvalidBuild { detail, .. }))
+                if detail.contains("never both")
+        ));
     }
 
     #[test]

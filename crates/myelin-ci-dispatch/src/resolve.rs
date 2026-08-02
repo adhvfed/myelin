@@ -80,6 +80,7 @@ use myelin_tenancy::TenantId;
 
 pub use myelin_ci_controlplane::{
     CiExecutionRequestV1, ResolvedJobV1, ResolvedJobV2, ResolvedRunPlanV1, ResolvedRunPlanV2,
+    StructuredBuildToolV1, StructuredBuildV1,
     VersionedResolvedRunPlan as VersionedResolvedSnapshot,
 };
 /// Legacy V1 job alias retained for source compatibility.
@@ -144,6 +145,9 @@ pub struct JobDef {
     pub image: String,
     /// Exact executable argv. Dispatch never infers a shell or fallback command.
     pub command: Vec<String>,
+    /// Optional structured build recipe. It is valid only on the V2 authored contract and is
+    /// lowered by the control-plane into a platform-owned direct invocation.
+    pub build: Option<StructuredBuildV1>,
     /// The names this job depends on (the DAG edges — every name must exist in the definition).
     pub needs: Vec<String>,
     /// The job kind — [`JobKind::Generate`] marks the sandboxed dynamic-generation escape hatch.
@@ -164,10 +168,18 @@ impl JobDef {
             name: name.into(),
             image: image.into(),
             command: command.into_iter().map(Into::into).collect(),
+            build: None,
             needs: Vec::new(),
             kind: JobKind::Normal,
             matrix: BTreeMap::new(),
         }
+    }
+
+    /// Replace the free-form command with a platform-invoked structured build recipe.
+    pub fn with_structured_build(mut self, build: StructuredBuildV1) -> JobDef {
+        self.command.clear();
+        self.build = Some(build);
+        self
     }
 
     /// Mark this job's `needs` (the DAG edges).
@@ -491,6 +503,12 @@ pub fn resolve_versioned_snapshot(
     if def.jobs.is_empty() {
         return Err(ResolveError::EmptyDefinition);
     }
+    if matches!(def.contract, CiPlanContract::V1) && def.jobs.iter().any(|job| job.build.is_some())
+    {
+        return Err(ResolveError::InvalidPlan(
+            "structured build jobs require the authored V2 execution contract".into(),
+        ));
+    }
     validate_authored_tokens(&def.jobs)?;
     // Unique job names (DAG node ids).
     let mut seen = BTreeSet::new();
@@ -542,6 +560,7 @@ pub fn resolve_versioned_snapshot(
                 name: instance_name(&j.name, &assignment),
                 image: j.image.clone(),
                 command: j.command.clone(),
+                build: j.build.clone(),
                 needs: Vec::new(),
                 is_generator: j.kind == JobKind::Generate,
                 matrix_key: assignment,
