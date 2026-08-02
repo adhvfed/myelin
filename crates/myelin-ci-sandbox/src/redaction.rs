@@ -36,7 +36,7 @@
 //!
 use crate::JobSpec;
 use std::fmt;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// A set of exact-value needles to mask from a job's captured output at the sandbox boundary. See the
 /// module docs for the (precise, do-not-overclaim) security model and the choke-point rationale.
@@ -227,7 +227,7 @@ impl Drop for StreamingRedactor<'_> {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedSecretEnv {
     name: String,
-    value: String,
+    value: Zeroizing<String>,
 }
 
 impl ResolvedSecretEnv {
@@ -235,7 +235,16 @@ impl ResolvedSecretEnv {
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            value: value.into(),
+            value: Zeroizing::new(value.into()),
+        }
+    }
+
+    /// Move already-zeroizing broker material into the sandbox binding without ever creating a
+    /// non-zeroizing plaintext `String` on the production resolution path.
+    pub fn from_zeroizing(name: impl Into<String>, value: Zeroizing<String>) -> Self {
+        Self {
+            name: name.into(),
+            value,
         }
     }
 }
@@ -247,12 +256,6 @@ impl fmt::Debug for ResolvedSecretEnv {
             .field("name", &self.name)
             .field("value", &"[REDACTED]")
             .finish()
-    }
-}
-
-impl Drop for ResolvedSecretEnv {
-    fn drop(&mut self) {
-        self.value.zeroize();
     }
 }
 
@@ -406,7 +409,7 @@ impl ResolvedJobSecrets {
     pub(crate) fn process_env(&self) -> impl Iterator<Item = String> + '_ {
         self.bindings
             .iter()
-            .map(|binding| format!("{}={}", binding.name, binding.value))
+            .map(|binding| format!("{}={}", binding.name, binding.value.as_str()))
     }
 
     pub(crate) fn redaction_plan(&self) -> &RedactionPlan {

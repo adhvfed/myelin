@@ -483,6 +483,8 @@ pub struct CiJobAuthorizationContext {
     pub tenant_id: String,
     pub region: String,
     pub principal_id: String,
+    /// Server-verified project scope used to derive the job-specific secret principal and binding.
+    pub project_id: String,
     pub wf_run_id: String,
     pub job_id: String,
     pub lease_owner: String,
@@ -1997,6 +1999,7 @@ pub(crate) fn checkout_job_spec_for_tests() -> JobSpec {
             tenant_id: "acme".to_string(),
             region: "fr-par".to_string(),
             principal_id: "p".to_string(),
+            project_id: "00000000-0000-0000-0000-000000000001".to_string(),
             wf_run_id: "wf".to_string(),
             job_id: "j".to_string(),
             lease_owner: "o".to_string(),
@@ -2533,6 +2536,7 @@ mod tests {
         let claim = || PreparationReportClaim {
             tenant_id: "t".into(),
             region: "fr-par".into(),
+            project_id: "00000000-0000-0000-0000-000000000001".into(),
             wf_run_id: "wf".into(),
             ci_run_id: "ci".into(),
             job_id: "job".into(),
@@ -2614,6 +2618,7 @@ mod tests {
             tenant_id: "acme".into(),
             region: "eu-west".into(),
             principal_id: "svc:ci".into(),
+            project_id: "00000000-0000-0000-0000-000000000001".into(),
             wf_run_id: "11111111-1111-4111-8111-111111111111".into(),
             job_id: "job-1".into(),
             lease_owner: "runner-1".into(),

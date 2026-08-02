@@ -338,6 +338,7 @@ async fn seed_fixture(
         schema_version: 1,
         tenant_id: TENANT.into(),
         region: REGION.into(),
+        project_id: project_id.clone(),
         wf_run_id: wf_run_id.clone(),
         ci_run_id: ci_run_id.clone(),
         source_snapshot_ref: format!("myelin://{TENANT}/ci/artifact/snapshot-{}", digest('a')),
@@ -393,6 +394,7 @@ async fn seed_fixture(
     let idem_token = format!("6e2-active-{seed}");
     let workspace = spec_workspace;
     let launch = DurableCiJobLaunchTemplate {
+        project_id: project_id.clone(),
         spec: JobSpecTemplate {
             kind: JobKind::Ci,
             image,
@@ -469,6 +471,7 @@ async fn seed_fixture(
         claim: CiJobTokenRequest {
             tenant_id: TENANT.into(),
             region: REGION.into(),
+            project_id: project_id.clone(),
             wf_run_id,
             ci_run_id,
             job_id,
@@ -1151,6 +1154,7 @@ fn multi_job_manifest_and_run(
         schema_version: 1,
         tenant_id: TENANT.into(),
         region: REGION.into(),
+        project_id: project_id.clone(),
         wf_run_id: wf_run_id.clone(),
         ci_run_id: ci_run_id.clone(),
         source_snapshot_ref: format!("myelin://{TENANT}/ci/artifact/snapshot-{}", digest('a')),
@@ -1173,7 +1177,7 @@ fn multi_job_manifest_and_run(
         tenant_id: TENANT.into(),
         run_id: ci_run_id.clone(),
         region: REGION.into(),
-        project_id,
+        project_id: project_id.clone(),
         pipeline_id,
         wf_run_id: wf_run_id.clone(),
         repo_ref: Some(REPO_REF.into()),
@@ -1192,6 +1196,7 @@ fn multi_job_manifest_and_run(
     let claim = CiJobTokenRequest {
         tenant_id: TENANT.into(),
         region: REGION.into(),
+        project_id: project_id.clone(),
         wf_run_id,
         ci_run_id,
         job_id: uuid(0x40, seed),

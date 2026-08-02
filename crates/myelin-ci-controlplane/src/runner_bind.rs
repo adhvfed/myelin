@@ -199,6 +199,7 @@ impl SecretWithholdTerminalizer for CiPipelineReporterRouter {
         let report_claim = PreparationReportClaim {
             tenant_id: claim.tenant_id.clone(),
             region: claim.region.clone(),
+            project_id: claim.project_id.clone(),
             wf_run_id: claim.wf_run_id.clone(),
             ci_run_id: claim.ci_run_id.clone(),
             job_id: claim.job_id.clone(),
@@ -913,6 +914,7 @@ fn durable_spec_resolver_with_issuer(
         let request = CiJobTokenRequest {
             tenant_id: leased.tenant_id.clone(),
             region: region.clone(),
+            project_id: launch.project_id.clone(),
             wf_run_id: leased.run_id.to_string(),
             ci_run_id: launch.ci_run_id,
             job_id: leased.job_id.to_string(),
@@ -990,6 +992,7 @@ pub fn durable_v2_spec_resolver(
         let request = CiJobTokenRequest {
             tenant_id: leased.tenant_id.clone(),
             region: region.clone(),
+            project_id: launch.project_id.clone(),
             wf_run_id: leased.run_id.to_string(),
             ci_run_id: launch.ci_run_id,
             job_id: leased.job_id.to_string(),
@@ -1142,6 +1145,7 @@ mod secret_withhold_terminal_tests {
         CiJobTokenRequest {
             tenant_id: "acme".into(),
             region: "fr-par".into(),
+            project_id: "55555555-5555-4555-8555-555555555555".into(),
             wf_run_id: "10000000-0000-0000-0000-000000000001".into(),
             ci_run_id: "20000000-0000-0000-0000-000000000001".into(),
             job_id: "30000000-0000-0000-0000-000000000001".into(),
@@ -1216,6 +1220,7 @@ mod secret_withhold_terminal_tests {
             tenant_id: claim.tenant_id.clone(),
             region: claim.region.clone(),
             principal_id: "ci-job".into(),
+            project_id: claim.project_id.clone(),
             wf_run_id: claim.wf_run_id.clone(),
             job_id: claim.job_id.clone(),
             lease_owner: claim.lease_owner.clone(),

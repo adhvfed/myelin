@@ -142,6 +142,7 @@ pub fn ci_job_authorization_context(
         tenant_id: claim.tenant_id.clone(),
         region: claim.region.clone(),
         principal_id: CI_JOB_PRINCIPAL_ID.into(),
+        project_id: claim.project_id.clone(),
         wf_run_id: claim.wf_run_id.clone(),
         job_id: claim.job_id.clone(),
         lease_owner: claim.lease_owner.clone(),
@@ -168,6 +169,7 @@ pub fn ci_job_phase_authorization_context(
         tenant_id: claim.tenant_id.clone(),
         region: claim.region.clone(),
         principal_id: CI_JOB_PRINCIPAL_ID.into(),
+        project_id: claim.project_id.clone(),
         wf_run_id: claim.wf_run_id.clone(),
         job_id: claim.job_id.clone(),
         lease_owner: claim.lease_owner.clone(),
@@ -1156,6 +1158,7 @@ mod tests {
         CiJobTokenRequest {
             tenant_id: "acme".into(),
             region: "eu-west".into(),
+            project_id: "55555555-5555-4555-8555-555555555555".into(),
             wf_run_id: WF_RUN_ID.into(),
             ci_run_id: CI_RUN_ID.into(),
             job_id: JOB_ID.into(),

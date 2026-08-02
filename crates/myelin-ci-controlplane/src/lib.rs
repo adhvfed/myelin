@@ -308,6 +308,7 @@ pub mod schedule_and_run_job;
 pub mod scheduler;
 pub mod schema;
 pub mod secret_broker;
+pub mod ci_secret_store;
 pub mod supply_chain;
 pub mod surfacing;
 pub mod surfacing_index;
@@ -382,6 +383,10 @@ pub use supply_chain::{
 pub use secret_broker::{
     OidcCredential, ResolvedSecret, SecretBroker, SecretCapability, SecretOutcome,
     SecretLaunchError, SecretResolution, WithheldSecret, WithholdReason, SECRET_READ_PERMISSION,
+};
+pub use ci_secret_store::{
+    durable_ci_job_secret_resolver, CiSecretStoreError, DurableCiSecretStore,
+    DurableSecretCapability,
 };
 
 // CI-P24 (P-367, M4): DEPLOYMENTS & the protected-env HITL gate (arch 03 §1.2). The deploy state
@@ -733,11 +738,12 @@ pub use migrations::{
     CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL, CREATE_CI_RUN_SURFACE_REPO_CREATED_INDEX_DDL,
     CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
     CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL,
-    CREATE_SECRET_BINDING_DDL, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE,
+    CREATE_CI_SECRET_DDL, CREATE_SECRET_BINDING_DDL, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE,
+    FAIR_DEFICIT_TABLE,
     GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL, GRANT_SCHEDULER_CLAIM_NONCE_DDL,
     GRANT_SCHEDULER_CLAIM_TIME_DDL, GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE,
     JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE,
-    RUNNER_TABLE, SECRET_BINDING_TABLE, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+    RUNNER_TABLE, CI_SECRET_TABLE, SECRET_BINDING_TABLE, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
     VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL,
 };
 
@@ -1141,8 +1147,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            63,
-            "all 21 tables (incl. the CT-007 credential-generation log), three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 6 job_queue ALTERs (4 claim/completion + the claim-window expand and its validation), the ci_job_spec-stage and three accounting ALTERs, scheduler RLS boundary, 3 claim-column grants, 4 ci_run/workflow discovery grants (incl. the wf_version grant the cutover fence needs), 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, the prelaunch deadline expand, the cutover fence's database-wide backlog probe plus its predecessor-row seed, and the 4 CT-007 5b.3-6e.1 activation-chassis migrations (reservation-marker expand + validate + readiness index + readiness probe) are present"
+            64,
+            "all 22 tables (incl. the encrypted ci_secret store), three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 6 job_queue ALTERs (4 claim/completion + the claim-window expand and its validation), the ci_job_spec-stage and three accounting ALTERs, scheduler RLS boundary, 3 claim-column grants, 4 ci_run/workflow discovery grants (incl. the wf_version grant the cutover fence needs), 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, the prelaunch deadline expand, the cutover fence's database-wide backlog probe plus its predecessor-row seed, and the 4 CT-007 5b.3-6e.1 activation-chassis migrations (reservation-marker expand + validate + readiness index + readiness probe) are present"
         );
         assert!(
             spec.consumers.is_empty(),

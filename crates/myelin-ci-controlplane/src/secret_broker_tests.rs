@@ -69,11 +69,12 @@ impl SecretCapability for FakeCapability {
         &self,
         tenant: &TenantId,
         object: &ArtifactRef,
+        _binding_name: &str,
         handle: &str,
-    ) -> Option<String> {
+    ) -> Option<zeroize::Zeroizing<String>> {
         let parsed = parse_canonical_secret_handle(handle)?;
         if parsed.tenant == tenant.0 && object.0 == handle && self.known.contains(handle) {
-            Some(format!("material:{handle}"))
+            Some(zeroize::Zeroizing::new(format!("material:{handle}")))
         } else {
             None
         }
@@ -119,16 +120,22 @@ fn strict_secret_handles_round_trip_to_one_tenant_object_key() {
 struct FakeIdentity {
     granted: HashSet<String>,
     checks: std::sync::Mutex<Vec<String>>,
+    subjects: std::sync::Mutex<Vec<String>>,
 }
 impl FakeIdentity {
     fn granting(objects: &[&str]) -> Self {
         FakeIdentity {
             granted: objects.iter().map(|o| o.to_string()).collect(),
             checks: std::sync::Mutex::new(Vec::new()),
+            subjects: std::sync::Mutex::new(Vec::new()),
         }
     }
     fn check_count(&self) -> usize {
         self.checks.lock().unwrap().len()
+    }
+
+    fn checked_subjects(&self) -> Vec<String> {
+        self.subjects.lock().unwrap().clone()
     }
 }
 impl IdentityService for FakeIdentity {
@@ -137,13 +144,17 @@ impl IdentityService for FakeIdentity {
     }
     fn check(
         &self,
-        _s: &Principal,
+        s: &Principal,
         p: &Permission,
         o: &ArtifactRef,
         _at: &Consistency,
         _cav: Option<&CaveatContext>,
     ) -> IdResult<Decision> {
         self.checks.lock().unwrap().push(o.0.clone());
+        self.subjects
+            .lock()
+            .unwrap()
+            .push(s.principal_id.0.clone());
         // The broker only ever asks for `read` on a secret object.
         assert_eq!(
             p.0, SECRET_READ_PERMISSION,
@@ -334,7 +345,7 @@ fn trusted_resolves_only_referenced_granted_names() {
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].name, "REGISTRY_TOKEN");
     assert_eq!(
-        resolved[0].value,
+        resolved[0].value.as_str(),
         "material:myelin://acme/ci/secret/registry"
     );
 
@@ -460,6 +471,7 @@ fn capability_resolution_refuses_foreign_handle_for_authorized_local_object() {
         cap.resolve_handle(
             &TenantId("acme".into()),
             &ArtifactRef("myelin://acme/ci/secret/deploy".into()),
+            "DEPLOY_KEY",
             foreign,
         ),
         None,
@@ -568,8 +580,9 @@ fn production_secret_resolver_calls_broker_with_claim_bound_subject() {
             tenant_id: "acme".into(),
             region: "fr-par".into(),
             principal_id: "ci-job".into(),
+            project_id: "11111111-1111-4111-8111-111111111111".into(),
             wf_run_id: "wf".into(),
-            job_id: "job".into(),
+            job_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
             lease_owner: "runner".into(),
             lease_epoch: 1,
             claim_nonce: "nonce".into(),
@@ -586,6 +599,14 @@ fn production_secret_resolver_calls_broker_with_claim_bound_subject() {
     assert_eq!(resolved.resolved_secret_count(), 2);
     assert!(resolved.validate_secret_coverage().is_ok());
     assert_eq!(id.check_count(), 2);
+    assert_eq!(
+        id.checked_subjects(),
+        vec![
+            "svc:ci:project:11111111-1111-4111-8111-111111111111:job:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            2
+        ],
+        "the resolver must never authorize secrets as tenant-global svc:ci"
+    );
 }
 
 #[test]
@@ -620,6 +641,7 @@ fn injected_material_is_absent_from_durable_ci_records_and_result_records() {
     let (template, _credential) = injected.into_template();
     let durable_spec = DurableCiJobLaunchTemplate {
         spec: template,
+        project_id: "55555555-5555-4555-8555-555555555555".into(),
         ci_run_id: "44444444-4444-8444-8444-444444444444".into(),
         token_authority_handle: "mint:job".into(),
     };
@@ -629,6 +651,7 @@ fn injected_material_is_absent_from_durable_ci_records_and_result_records() {
         schema_version: 1,
         tenant_id: "acme".into(),
         region: "fr-par".into(),
+        project_id: "55555555-5555-4555-8555-555555555555".into(),
         wf_run_id: "33333333-3333-8333-8333-333333333333".into(),
         ci_run_id: "44444444-4444-8444-8444-444444444444".into(),
         source_snapshot_ref: format!(
@@ -816,7 +839,7 @@ fn debug_output_redacts_secret_and_oidc_material_recursively() {
     let token = "unique-short-lived-oidc-token";
     let resolved = ResolvedSecret {
         name: "DEPLOY_KEY".into(),
-        value: material.into(),
+        value: zeroize::Zeroizing::new(material.to_owned()),
     };
     let resolution = SecretResolution {
         outcomes: vec![SecretOutcome::Resolved(resolved.clone())],

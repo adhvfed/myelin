@@ -1631,6 +1631,7 @@ fn build_drive_manifest_v1(
         schema_version: 1,
         tenant_id: record.tenant_id.clone(),
         region: record.region.clone(),
+        project_id: record.project_id.clone(),
         wf_run_id: record.wf_run_id.clone(),
         ci_run_id: record.run_id.clone(),
         source_snapshot_ref: ci_artifact_ref(
