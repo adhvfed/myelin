@@ -221,6 +221,7 @@ async fn seed_fixture(
         schema_version: 1,
         tenant_id: TENANT.into(),
         region: REGION.into(),
+        project_id: project_id.clone(),
         wf_run_id: wf_run_id.clone(),
         ci_run_id: ci_run_id.clone(),
         source_snapshot_ref: format!("myelin://{TENANT}/ci/artifact/snapshot-{}", digest('a')),
@@ -280,6 +281,7 @@ async fn seed_fixture(
     };
     let idem_token = format!("prelaunch-{seed}");
     let launch = DurableCiJobLaunchTemplate {
+        project_id: project_id.clone(),
         spec: JobSpecTemplate {
             kind: JobKind::Ci,
             image,
@@ -356,6 +358,7 @@ async fn seed_fixture(
         claim: CiJobTokenRequest {
             tenant_id: TENANT.into(),
             region: REGION.into(),
+            project_id: project_id.clone(),
             wf_run_id,
             ci_run_id,
             job_id,

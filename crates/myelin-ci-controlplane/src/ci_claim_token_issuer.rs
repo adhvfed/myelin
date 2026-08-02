@@ -321,10 +321,12 @@ pub fn runtime_authorities_from_durable_claim(
     }
     if run.tenant_id != claim.tenant_id
         || run.region != claim.region
+        || run.project_id != claim.project_id
         || run.run_id != claim.ci_run_id
         || run.wf_run_id != claim.wf_run_id
         || manifest.tenant_id != run.tenant_id
         || manifest.region != run.region
+        || manifest.project_id != run.project_id
         || manifest.ci_run_id != run.run_id
         || manifest.wf_run_id != run.wf_run_id
         || manifest.repo_ref != run.repo_ref.as_deref().unwrap_or_default()
@@ -499,6 +501,7 @@ mod tests {
     ) -> DurableCiJobLaunchTemplate {
         DurableCiJobLaunchTemplate {
             spec: dispatched_spec_for(granted_workspace),
+            project_id: claim.project_id.clone(),
             ci_run_id: claim.ci_run_id.clone(),
             token_authority_handle: claim.token_authority_handle.clone(),
         }
@@ -610,6 +613,7 @@ mod tests {
             schema_version: CI_DRIVE_MANIFEST_SCHEMA_V1,
             tenant_id: run.tenant_id.clone(),
             region: run.region.clone(),
+            project_id: run.project_id.clone(),
             wf_run_id: run.wf_run_id.clone(),
             ci_run_id: run.run_id.clone(),
             source_snapshot_ref: ci_artifact_ref(
@@ -663,6 +667,7 @@ mod tests {
         let claim = CiJobTokenRequest {
             tenant_id: run.tenant_id,
             region: run.region,
+            project_id: run.project_id,
             wf_run_id: run.wf_run_id,
             ci_run_id: run.run_id,
             job_id: JOB_ID.into(),

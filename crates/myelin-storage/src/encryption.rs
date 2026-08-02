@@ -255,6 +255,20 @@ impl<'a> ColumnCryptor<'a> {
         erasure: &ErasureMethod,
         plaintext: &[u8],
     ) -> Result<EncryptedColumn, KeyChoiceError> {
+        self.encrypt_with_aad(tenant, subject, erasure, plaintext, &[])
+    }
+
+    /// Encrypt a personal-data column while binding non-secret row identity as AES-GCM associated
+    /// data. Callers derive a stable, domain-separated AAD encoding and supply the same bytes to
+    /// [`Self::decrypt_with_aad`].
+    pub fn encrypt_with_aad(
+        &self,
+        tenant: &TenantId,
+        subject: Option<&SubjectId>,
+        erasure: &ErasureMethod,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<EncryptedColumn, KeyChoiceError> {
         // (1) GD-4: the erasure tag drives the key class (per-subject vs per-tenant).
         let class = key_class_for(erasure, subject)?;
         // (2) Ensure the chosen DEK exists, get its pii_key_ref (the epoch travels with the value).
@@ -267,7 +281,7 @@ impl<'a> ColumnCryptor<'a> {
             .engine
             .resolve_dek(&key_ref, &self.region)
             .map_err(KeyChoiceError::Kms)?;
-        let (nonce, ciphertext) = dek.seal(plaintext);
+        let (nonce, ciphertext) = dek.seal_with_aad(plaintext, aad);
         Ok(EncryptedColumn {
             key_ref,
             nonce,
@@ -280,11 +294,21 @@ impl<'a> ColumnCryptor<'a> {
     /// ([`KeyChoiceError::Kms`]) — the column is unrecoverable (the GD-4 erase lever working), NEVER
     /// a plaintext-without-key fall-through.
     pub fn decrypt(&self, column: &EncryptedColumn) -> Result<Vec<u8>, KeyChoiceError> {
+        self.decrypt_with_aad(column, &[])
+    }
+
+    /// Decrypt an encrypted column while authenticating its caller-defined row identity. Supplying
+    /// AAD different from the encryption-time bytes fails exactly like ciphertext tampering.
+    pub fn decrypt_with_aad(
+        &self,
+        column: &EncryptedColumn,
+        aad: &[u8],
+    ) -> Result<Vec<u8>, KeyChoiceError> {
         let dek: DekHandle = self
             .engine
             .resolve_dek(&column.key_ref, &self.region)
             .map_err(KeyChoiceError::Kms)?;
-        dek.open(&column.nonce, &column.ciphertext)
+        dek.open_with_aad(&column.nonce, &column.ciphertext, aad)
             .ok_or(KeyChoiceError::Kms(KmsError::UnwrapFailed(
                 crate::kms::DekId::new(column.key_ref.tenant.clone(), column.key_ref.class.clone()),
             )))

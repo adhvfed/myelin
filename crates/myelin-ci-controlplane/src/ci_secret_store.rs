@@ -9,8 +9,7 @@ use std::sync::Arc;
 
 use myelin_gdpr::ErasureMethod;
 use myelin_identity::{
-    AuthzError, Consistency, DataRole, Decision, IdentityService, Permission, Principal,
-    PrincipalId, PrincipalKind, PrincipalStatus,
+    AuthzError, Consistency, Decision, IdentityService, Permission, Principal,
 };
 use myelin_storage::{
     with_tenant_tx, ColumnCryptor, EncryptedColumn, KekId, KeyClass, KmsEngine, PiiKeyRef,
@@ -36,11 +35,39 @@ const SELECT_SECRET: &str = "SELECT pii_key_ref, nonce, ciphertext \
     FROM ci_secret \
     WHERE tenant_id = $1 AND region = $2 AND secret_id = $3";
 
+const SELECT_SECRET_BINDING: &str = "SELECT EXISTS (SELECT 1 FROM secret_binding \
+    WHERE tenant_id = $1 AND region = $2 AND project_id = $3::uuid AND name = $4 \
+      AND value_ref = $5 AND scope IN ('project', $6)) AS bound";
+
+const SECRET_AAD_DOMAIN: &[u8] = b"myelin-ci-secret-row:v1";
+
+/// Unambiguous, domain-separated AES-GCM AAD for one durable secret row. Length prefixes prevent
+/// tuple-boundary ambiguity; region is included so moving an envelope across any row-scope
+/// dimension fails authentication.
+fn secret_row_aad(tenant: &TenantId, region: &Region, secret_id: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(
+        SECRET_AAD_DOMAIN.len() + tenant.as_str().len() + region.as_str().len() + secret_id.len() + 12,
+    );
+    aad.extend_from_slice(SECRET_AAD_DOMAIN);
+    for component in [tenant.as_str().as_bytes(), region.as_str().as_bytes(), secret_id.as_bytes()] {
+        aad.extend_from_slice(&(component.len() as u32).to_be_bytes());
+        aad.extend_from_slice(component);
+    }
+    aad
+}
+
 #[derive(Clone)]
 struct StoredSecret {
     key_ref: PiiKeyRef,
     nonce: [u8; NONCE_LEN],
     ciphertext: Vec<u8>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+struct MemorySecretStore {
+    rows: std::collections::BTreeMap<(String, String), StoredSecret>,
+    bindings: std::collections::BTreeSet<(String, String, String, String, String)>,
 }
 
 #[derive(Clone)]
@@ -50,7 +77,7 @@ enum SecretStoreBackend {
         runtime: tokio::runtime::Handle,
     },
     #[cfg(any(test, feature = "test-support"))]
-    Memory(Arc<std::sync::Mutex<std::collections::BTreeMap<(String, String), StoredSecret>>>),
+    Memory(Arc<std::sync::Mutex<MemorySecretStore>>),
 }
 
 /// A material-free secret-store failure. No variant carries plaintext, ciphertext, or key material.
@@ -102,11 +129,35 @@ impl DurableCiSecretStore {
     pub fn in_memory(kms: Arc<KmsEngine>, region: Region) -> Self {
         Self {
             backend: SecretStoreBackend::Memory(Arc::new(std::sync::Mutex::new(
-                std::collections::BTreeMap::new(),
+                MemorySecretStore::default(),
             ))),
             kms,
             region,
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn bind_secret_for_project(
+        &self,
+        tenant: &TenantId,
+        project_id: &str,
+        name: &str,
+        handle: &str,
+    ) {
+        let SecretStoreBackend::Memory(state) = &self.backend else {
+            panic!("test binding helper requires the in-memory backend")
+        };
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .bindings
+            .insert((
+                tenant.as_str().to_owned(),
+                project_id.to_owned(),
+                name.to_owned(),
+                "project".to_owned(),
+                handle.to_owned(),
+            ));
     }
 
     /// Minimal write/seal primitive: provision the tenant hierarchy, encrypt with the existing
@@ -131,11 +182,12 @@ impl DurableCiSecretStore {
         self.kms
             .ensure_kek(&KekId::new(tenant.clone(), self.region.clone()));
         let encrypted = ColumnCryptor::new(&self.kms, self.region.clone())
-            .encrypt(
+            .encrypt_with_aad(
                 tenant,
                 None,
                 &ErasureMethod::CryptoShred("tenant_dek".into()),
                 material.as_bytes(),
+                &secret_row_aad(tenant, &self.region, secret_id),
             )
             .map_err(|_| CiSecretStoreError::Encrypt)?;
 
@@ -149,7 +201,7 @@ impl DurableCiSecretStore {
         &self,
         tenant: &TenantId,
         secret_id: &str,
-    ) -> Result<Option<String>, CiSecretStoreError> {
+    ) -> Result<Option<Zeroizing<String>>, CiSecretStoreError> {
         if !strict_secret_segment(tenant.as_str()) || !strict_secret_segment(secret_id) {
             return Err(CiSecretStoreError::InvalidScope);
         }
@@ -166,12 +218,17 @@ impl DurableCiSecretStore {
         };
         let plaintext = Zeroizing::new(
             ColumnCryptor::new(&self.kms, self.region.clone())
-                .decrypt(&column)
+                .decrypt_with_aad(
+                    &column,
+                    &secret_row_aad(tenant, &self.region, secret_id),
+                )
                 .map_err(|_| CiSecretStoreError::CorruptCiphertext)?,
         );
-        let material = std::str::from_utf8(plaintext.as_slice())
-            .map_err(|_| CiSecretStoreError::CorruptCiphertext)?
-            .to_owned();
+        let material = Zeroizing::new(
+            std::str::from_utf8(plaintext.as_slice())
+                .map_err(|_| CiSecretStoreError::CorruptCiphertext)?
+                .to_owned(),
+        );
         Ok(Some(material))
     }
 
@@ -223,9 +280,11 @@ impl DurableCiSecretStore {
                 .map_err(|_| CiSecretStoreError::Database)
             }
             #[cfg(any(test, feature = "test-support"))]
-            SecretStoreBackend::Memory(rows) => {
-                rows.lock()
+            SecretStoreBackend::Memory(state) => {
+                state
+                    .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .rows
                     .insert((tenant.as_str().to_owned(), secret_id.to_owned()), stored);
                 Ok(())
             }
@@ -273,11 +332,71 @@ impl DurableCiSecretStore {
                 .transpose()
             }
             #[cfg(any(test, feature = "test-support"))]
-            SecretStoreBackend::Memory(rows) => Ok(rows
+            SecretStoreBackend::Memory(state) => Ok(state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .rows
                 .get(&(tenant.as_str().to_owned(), secret_id.to_owned()))
                 .cloned()),
+        }
+    }
+
+    fn is_bound_to_request(
+        &self,
+        tenant: &TenantId,
+        project_id: &str,
+        job_id: &str,
+        name: &str,
+        handle: &str,
+    ) -> Result<bool, CiSecretStoreError> {
+        let job_scope = format!("job:{job_id}");
+        match &self.backend {
+            SecretStoreBackend::Pg { pool, runtime } => {
+                let pool = pool.clone();
+                let tenant_id = tenant.as_str().to_owned();
+                let region = self.region.as_str().to_owned();
+                let project_id = project_id.to_owned();
+                let name = name.to_owned();
+                let handle = handle.to_owned();
+                let row_tenant = tenant_id.clone();
+                let row_region = region.clone();
+                bridge(runtime, async move {
+                    with_tenant_tx(&pool, &tenant_id, &region, |connection| {
+                        Box::pin(async move {
+                            sqlx::query(SELECT_SECRET_BINDING)
+                                .bind(row_tenant)
+                                .bind(row_region)
+                                .bind(project_id)
+                                .bind(name)
+                                .bind(handle)
+                                .bind(job_scope)
+                                .fetch_one(&mut *connection)
+                                .await
+                                .map(|row| row.get::<bool, _>("bound"))
+                                .map_err(|error| {
+                                    myelin_storage::PgError::Query(error.to_string())
+                                })
+                        })
+                    })
+                    .await
+                })
+                .map_err(|_| CiSecretStoreError::Database)
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            SecretStoreBackend::Memory(state) => {
+                let state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                Ok(["project", job_scope.as_str()].iter().any(|scope| {
+                    state.bindings.contains(&(
+                        tenant.as_str().to_owned(),
+                        project_id.to_owned(),
+                        name.to_owned(),
+                        (*scope).to_owned(),
+                        handle.to_owned(),
+                    ))
+                }))
+            }
         }
     }
 }
@@ -313,6 +432,8 @@ pub struct DurableSecretCapability<I: IdentityService> {
     store: Arc<DurableCiSecretStore>,
     identity: Arc<I>,
     subject: Principal,
+    project_id: String,
+    job_id: String,
     consistency: Consistency,
 }
 
@@ -321,12 +442,16 @@ impl<I: IdentityService> DurableSecretCapability<I> {
         store: Arc<DurableCiSecretStore>,
         identity: Arc<I>,
         subject: Principal,
+        project_id: String,
+        job_id: String,
         consistency: Consistency,
     ) -> Self {
         Self {
             store,
             identity,
             subject,
+            project_id,
+            job_id,
             consistency,
         }
     }
@@ -337,8 +462,9 @@ impl<I: IdentityService> SecretCapability for DurableSecretCapability<I> {
         &self,
         tenant: &TenantId,
         authorized_object: &ArtifactRef,
+        binding_name: &str,
         handle: &str,
-    ) -> Option<String> {
+    ) -> Option<Zeroizing<String>> {
         let parsed = parse_canonical_secret_handle(handle)?;
         let authorized = parse_canonical_secret_handle(&authorized_object.0)?;
         if self.subject.tenant != *tenant
@@ -360,6 +486,19 @@ impl<I: IdentityService> SecretCapability for DurableSecretCapability<I> {
             )
             .ok()?;
         if decision != Decision::Allow {
+            return None;
+        }
+        if !self
+            .store
+            .is_bound_to_request(
+                tenant,
+                &self.project_id,
+                &self.job_id,
+                binding_name,
+                handle,
+            )
+            .ok()?
+        {
             return None;
         }
         self.store.resolve_secret(tenant, parsed.id).ok().flatten()
@@ -388,23 +527,15 @@ where
                 )));
             }
         };
-        if context.tenant_id != tenant.as_str() {
-            return Err(SecretLaunchError::Authorization(AuthzError::FailClosed(
-                "CI secret resolution tenant does not match the authorized claim".into(),
-            )));
-        }
-        let subject = Principal::new(
-            tenant.clone(),
-            Region::new(context.region),
-            PrincipalId(context.principal_id),
-            PrincipalKind::Service,
-            DataRole::Processor,
-            PrincipalStatus::Active,
-        );
+        let project_id = context.project_id.clone();
+        let job_id = context.job_id.clone();
+        let subject = crate::ci_manifest_job_runner::claim_secret_subject(tenant, &context)?;
         let capability = DurableSecretCapability::new(
             store.clone(),
             identity.clone(),
             subject.clone(),
+            project_id,
+            job_id,
             consistency.clone(),
         );
         SecretBroker::new(&capability, identity.as_ref()).resolve_for_launch(
@@ -431,6 +562,10 @@ mod tests {
         RunId, RunToken, SubjectTree, TupleDelta, Zookie,
     };
     use std::collections::BTreeSet;
+
+    const PROJECT_A: &str = "11111111-1111-4111-8111-111111111111";
+    const PROJECT_B: &str = "22222222-2222-4222-8222-222222222222";
+    const JOB_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
     #[derive(Default)]
     struct ScopedIdentity {
@@ -613,17 +748,23 @@ mod tests {
         store
             .seal_secret(&tenant, "deploy", "DEPLOY_KEY", material)
             .unwrap();
+        store.bind_secret_for_project(&tenant, PROJECT_A, "DEPLOY_KEY", &object);
         let identity = Arc::new(ScopedIdentity::default().grant("tenant-a", "ci-job", &object));
         let capability = DurableSecretCapability::new(
             store,
             identity.clone(),
             subject("tenant-a", "ci-job"),
+            PROJECT_A.into(),
+            JOB_A.into(),
             consistency(),
         );
 
         assert_eq!(
-            capability.resolve_handle(&tenant, &ArtifactRef(object.clone()), &object),
-            Some(material.to_owned())
+            capability
+                .resolve_handle(&tenant, &ArtifactRef(object.clone()), "DEPLOY_KEY", &object)
+                .as_deref()
+                .map(String::as_str),
+            Some(material)
         );
         let launched = SecretBroker::new(&capability, identity.as_ref())
             .resolve_for_launch(
@@ -652,6 +793,8 @@ mod tests {
             store,
             identity.clone(),
             subject("tenant-b", "ci-job"),
+            PROJECT_A.into(),
+            JOB_A.into(),
             consistency(),
         );
 
@@ -659,6 +802,7 @@ mod tests {
             capability.resolve_handle(
                 &requesting_tenant,
                 &ArtifactRef(requesting_object.clone()),
+                "DEPLOY_KEY",
                 &requesting_object,
             ),
             None
@@ -685,11 +829,18 @@ mod tests {
             store,
             identity,
             subject("tenant-a", "ci-job"),
+            PROJECT_A.into(),
+            JOB_A.into(),
             consistency(),
         );
 
         assert_eq!(
-            capability.resolve_handle(&tenant("tenant-a"), &ArtifactRef(local_object), &foreign,),
+            capability.resolve_handle(
+                &tenant("tenant-a"),
+                &ArtifactRef(local_object),
+                "DEPLOY_KEY",
+                &foreign,
+            ),
             None
         );
     }
@@ -718,10 +869,13 @@ mod tests {
         let store = fixture_store();
         let object = handle("tenant-a", "missing");
         let identity = Arc::new(ScopedIdentity::default().grant("tenant-a", "ci-job", &object));
+        store.bind_secret_for_project(&tenant("tenant-a"), PROJECT_A, "DEPLOY_KEY", &object);
         let capability = DurableSecretCapability::new(
             store,
             identity.clone(),
             subject("tenant-a", "ci-job"),
+            PROJECT_A.into(),
+            JOB_A.into(),
             consistency(),
         );
 
@@ -753,11 +907,14 @@ mod tests {
         store
             .seal_secret(&tenant, "deploy", "DEPLOY_KEY", material)
             .unwrap();
-        let SecretStoreBackend::Memory(rows) = &store.backend else {
+        store.bind_secret_for_project(&tenant, PROJECT_A, "DEPLOY_KEY", &object);
+        let SecretStoreBackend::Memory(state) = &store.backend else {
             unreachable!("unit fixture is memory-backed")
         };
-        rows.lock()
+        state
+            .lock()
             .unwrap()
+            .rows
             .get_mut(&("tenant-a".into(), "deploy".into()))
             .unwrap()
             .ciphertext[0] ^= 0xff;
@@ -766,6 +923,8 @@ mod tests {
             store,
             identity.clone(),
             subject("tenant-a", "ci-job"),
+            PROJECT_A.into(),
+            JOB_A.into(),
             consistency(),
         );
 
@@ -780,5 +939,135 @@ mod tests {
         let rendered = format!("{error:?} {error}");
         assert!(matches!(error, SecretLaunchError::Withheld(_)));
         assert!(!rendered.contains(material));
+    }
+
+    #[test]
+    fn ciphertext_copied_to_a_different_secret_row_fails_aad_authentication() {
+        let store = fixture_store();
+        let tenant = tenant("tenant-a");
+        store
+            .seal_secret(&tenant, "prod", "PROD_KEY", "prod-material")
+            .unwrap();
+        store
+            .seal_secret(&tenant, "dev", "DEV_KEY", "dev-material")
+            .unwrap();
+        let SecretStoreBackend::Memory(state) = &store.backend else {
+            unreachable!("unit fixture is memory-backed")
+        };
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prod = state
+            .rows
+            .get(&("tenant-a".into(), "prod".into()))
+            .cloned()
+            .unwrap();
+        state.rows.insert(("tenant-a".into(), "dev".into()), prod);
+        drop(state);
+
+        assert_eq!(
+            store.resolve_secret(&tenant, "dev"),
+            Err(CiSecretStoreError::CorruptCiphertext),
+            "prod's valid envelope must not authenticate as dev's row"
+        );
+
+        let dev_object = handle("tenant-a", "dev");
+        store.bind_secret_for_project(&tenant, PROJECT_A, "DEPLOY_KEY", &dev_object);
+        let identity = Arc::new(
+            ScopedIdentity::default().grant("tenant-a", "ci-job", &dev_object),
+        );
+        let capability = DurableSecretCapability::new(
+            store,
+            identity.clone(),
+            subject("tenant-a", "ci-job"),
+            PROJECT_A.into(),
+            JOB_A.into(),
+            consistency(),
+        );
+        let error = SecretBroker::new(&capability, identity.as_ref())
+            .resolve_for_launch(
+                one_secret_spec("tenant-a", "dev"),
+                &subject("tenant-a", "ci-job"),
+                |secret| ArtifactRef(secret.handle.clone()),
+                &consistency(),
+            )
+            .expect_err("AAD substitution must withhold the launch");
+        assert!(matches!(error, SecretLaunchError::Withheld(_)));
+        assert!(!format!("{error:?} {error}").contains("prod-material"));
+    }
+
+    #[test]
+    fn project_a_job_cannot_resolve_project_b_secret_binding() {
+        let store = fixture_store();
+        let tenant = tenant("tenant-a");
+        let object = handle("tenant-a", "deploy");
+        store
+            .seal_secret(&tenant, "deploy", "DEPLOY_KEY", "bound-material")
+            .unwrap();
+        store.bind_secret_for_project(&tenant, PROJECT_B, "DEPLOY_KEY", &object);
+        let job_principal = format!("svc:ci:project:{PROJECT_A}:job:{JOB_A}");
+        let job_subject = subject("tenant-a", &job_principal);
+        let identity = Arc::new(
+            ScopedIdentity::default().grant("tenant-a", &job_principal, &object),
+        );
+        let capability = DurableSecretCapability::new(
+            store.clone(),
+            identity.clone(),
+            job_subject.clone(),
+            PROJECT_A.into(),
+            JOB_A.into(),
+            consistency(),
+        );
+
+        let error = SecretBroker::new(&capability, identity.as_ref())
+            .resolve_for_launch(
+                one_secret_spec("tenant-a", "deploy"),
+                &job_subject,
+                |secret| ArtifactRef(secret.handle.clone()),
+                &consistency(),
+            )
+            .expect_err("project-A must not consume project-B's binding");
+        assert!(matches!(error, SecretLaunchError::Withheld(_)));
+
+        store.bind_secret_for_project(&tenant, PROJECT_A, "DEPLOY_KEY", &object);
+        let launched = SecretBroker::new(&capability, identity.as_ref())
+            .resolve_for_launch(
+                one_secret_spec("tenant-a", "deploy"),
+                &job_subject,
+                |secret| ArtifactRef(secret.handle.clone()),
+                &consistency(),
+            )
+            .expect("the same job may consume its own project's binding");
+        assert_eq!(launched.resolved_secret_count(), 1);
+    }
+
+    #[test]
+    fn capability_plaintext_type_is_zeroizing_end_to_end() {
+        fn assert_zeroizing(_: &Option<Zeroizing<String>>) {}
+
+        let store = fixture_store();
+        let tenant = tenant("tenant-a");
+        let object = handle("tenant-a", "deploy");
+        store
+            .seal_secret(&tenant, "deploy", "DEPLOY_KEY", "ephemeral-material")
+            .unwrap();
+        store.bind_secret_for_project(&tenant, PROJECT_A, "DEPLOY_KEY", &object);
+        let identity = Arc::new(ScopedIdentity::default().grant("tenant-a", "ci-job", &object));
+        let capability = DurableSecretCapability::new(
+            store,
+            identity,
+            subject("tenant-a", "ci-job"),
+            PROJECT_A.into(),
+            JOB_A.into(),
+            consistency(),
+        );
+        let material = capability.resolve_handle(
+            &tenant,
+            &ArtifactRef(object.clone()),
+            "DEPLOY_KEY",
+            &object,
+        );
+        assert_zeroizing(&material);
+        assert_eq!(material.as_deref().map(String::as_str), Some("ephemeral-material"));
     }
 }

@@ -180,8 +180,9 @@ impl SecretCapability for ResolvingCap {
         &self,
         tenant: &TenantId,
         object: &ArtifactRef,
+        _binding_name: &str,
         handle: &str,
-    ) -> Option<String> {
+    ) -> Option<zeroize::Zeroizing<String>> {
         let expected_prefix = format!("myelin://{}/ci/secret/", tenant.0);
         let id = handle.strip_prefix(&expected_prefix)?;
         (!id.is_empty()
@@ -190,7 +191,7 @@ impl SecretCapability for ResolvingCap {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
             && object.0 == handle)
-            .then(|| format!("material:{handle}"))
+            .then(|| zeroize::Zeroizing::new(format!("material:{handle}")))
     }
 }
 

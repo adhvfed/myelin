@@ -184,6 +184,7 @@ fn reconstruct_claim(
     let claim = CiJobTokenRequest {
         tenant_id: context.tenant_id.clone(),
         region: context.region.clone(),
+        project_id: context.project_id.clone(),
         wf_run_id: context.wf_run_id.clone(),
         ci_run_id: binding.ci_run_id.clone(),
         job_id: context.job_id.clone(),
@@ -209,12 +210,13 @@ fn reconstruct_claim(
 /// continuation; the CI pipeline reporter router maps it 1:1 back onto a `CiJobTokenRequest` to reach
 /// the durable preparation CAS. It is built from the SAME validated claim
 /// [`DurableAttemptAuthority`] is constructed with — never re-derived from a different source — so the
-/// twelve fields are identical to the ones the durable admission verified. The mapping is field-for-
+/// thirteen fields are identical to the ones the durable admission verified. The mapping is field-for-
 /// field with no drop or reorder; the round-trip is proven in `ci_pipeline_driver` tests.
 pub(crate) fn preparation_report_claim(claim: &CiJobTokenRequest) -> PreparationReportClaim {
     PreparationReportClaim {
         tenant_id: claim.tenant_id.clone(),
         region: claim.region.clone(),
+        project_id: claim.project_id.clone(),
         wf_run_id: claim.wf_run_id.clone(),
         ci_run_id: claim.ci_run_id.clone(),
         job_id: claim.job_id.clone(),
@@ -527,6 +529,7 @@ mod tests {
             tenant_id: "acme".into(),
             region: "fr-par".into(),
             principal_id: "ci-job".into(),
+            project_id: "11111111-1111-4111-8111-111111111111".into(),
             wf_run_id: "11111111-1111-1111-1111-111111111111".into(),
             job_id: "22222222-2222-2222-2222-222222222222".into(),
             lease_owner: "worker-1".into(),

@@ -72,7 +72,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Mutex;
 
-use aes_gcm::aead::{Aead, OsRng};
+use aes_gcm::aead::{Aead, OsRng, Payload};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
 
 use myelin_tenancy::{Region, TenantId};
@@ -537,11 +537,28 @@ impl DekHandle {
 
     /// Encrypt `plaintext` under this DEK (AES-256-GCM), returning `(nonce, ciphertext)`.
     pub fn seal(&self, plaintext: &[u8]) -> ([u8; NONCE_LEN], Vec<u8>) {
+        self.seal_with_aad(plaintext, &[])
+    }
+
+    /// Encrypt under this DEK while authenticating caller-supplied row identity as AEAD associated
+    /// data. The AAD is authenticated but not stored in the ciphertext and must be supplied
+    /// byte-identically to [`Self::open_with_aad`].
+    pub fn seal_with_aad(
+        &self,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> ([u8; NONCE_LEN], Vec<u8>) {
         let nonce = Aes256Gcm::generate_nonce(OsRng);
         let ct = self
             .key
             .cipher()
-            .encrypt(&nonce, plaintext)
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .expect("AES-256-GCM seal");
         let mut n = [0u8; NONCE_LEN];
         n.copy_from_slice(nonce.as_slice());
@@ -552,9 +569,26 @@ impl DekHandle {
     /// does not authenticate under this DEK (a wrong key / tampered ciphertext is a loud failure,
     /// never silently wrong plaintext).
     pub fn open(&self, nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Option<Vec<u8>> {
+        self.open_with_aad(nonce, ciphertext, &[])
+    }
+
+    /// Open ciphertext sealed by [`Self::seal_with_aad`]. A wrong key, modified ciphertext, or any
+    /// AAD mismatch is the same fail-closed authentication failure.
+    pub fn open_with_aad(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> Option<Vec<u8>> {
         self.key
             .cipher()
-            .decrypt(Nonce::from_slice(nonce), ciphertext)
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
             .ok()
     }
 }

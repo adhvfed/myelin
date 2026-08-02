@@ -150,6 +150,7 @@ WHERE q.region = $1 AND q.state <> 'terminal' AND q.claim_window_secs IS NULL";
 #[serde(deny_unknown_fields)]
 pub struct DurableCiJobLaunchTemplate {
     pub spec: JobSpecTemplate,
+    pub project_id: String,
     pub ci_run_id: String,
     pub token_authority_handle: String,
 }

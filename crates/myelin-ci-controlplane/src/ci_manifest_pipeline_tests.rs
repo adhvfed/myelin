@@ -89,6 +89,7 @@ fn manifest() -> CiDriveManifestV1 {
         schema_version: 1,
         tenant_id: tenant().0,
         region: region().0,
+        project_id: "55555555-5555-4555-8555-555555555555".into(),
         wf_run_id: RUN_ID.into(),
         ci_run_id: "44444444-4444-8444-8444-444444444444".into(),
         source_snapshot_ref: format!(

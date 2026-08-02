@@ -192,6 +192,7 @@ pub fn with_stage_b_compute_admission_for_legacy_runsc_test(
                 claim: myelin_ci_sandbox::PreparationReportClaim {
                     tenant_id: "legacy-real-runsc".into(),
                     region: "fr-par".into(),
+                    project_id: "55555555-5555-4555-8555-555555555555".into(),
                     wf_run_id: "11111111-1111-1111-1111-111111111111".into(),
                     ci_run_id: "22222222-2222-2222-2222-222222222222".into(),
                     job_id: "33333333-3333-3333-3333-333333333333".into(),
