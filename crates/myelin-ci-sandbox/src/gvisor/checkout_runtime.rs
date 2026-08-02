@@ -124,29 +124,15 @@ impl AcquiredCheckoutRuntime {
         // `job_key`, so the two can never diverge.
         let workload_container_id =
             format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
-        let (mut workload_cfg, enabled_context) = acquire_enabled_workspace(
+        let (workload_cfg, enabled_context) = acquire_enabled_workspace(
             spec,
             profile,
             &workload_container_id,
             absolute_rootfs,
             workspace_manager,
             userns_allocator,
+            cargo_vendor,
         )?;
-        if let Some(asset) = cargo_vendor {
-            workload_cfg = match workload_cfg.with_cargo_vendor(asset) {
-                Ok(cfg) => cfg,
-                Err(reason) => {
-                    let diagnostics = super::cleanup_pre_bind_failure(
-                        enabled_context,
-                        workspace_manager,
-                    );
-                    return Err(AcquisitionFailure::from_rollback_diagnostics(
-                        format!("attaching the structured Cargo boundary failed: {reason}"),
-                        diagnostics,
-                    ));
-                }
-            };
-        }
         let runtime = AcquiredCheckoutRuntime {
             workload_container_id,
             checkout_scope,
