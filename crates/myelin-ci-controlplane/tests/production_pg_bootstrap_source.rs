@@ -28,6 +28,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let migrations_source = include_str!("../src/migrations.rs");
     let claim_issuer_source = include_str!("../src/ci_claim_token_issuer.rs");
     let identity_adapter_source = include_str!("../src/ci_identity_adapter.rs");
+    let credential_generation_source = include_str!("../src/ci_credential_generation.rs");
+    let checkout_composition_source = include_str!("../src/ci_checkout_composition.rs");
     let runtime_composition_source = include_str!("../src/ci_runtime_composition.rs");
     let manifest_runner_source = include_str!("../src/ci_manifest_job_runner.rs");
     let job_spec_store_source = include_str!("../src/job_spec_store.rs");
@@ -395,8 +397,24 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(launch_authority_source.contains(
         "token_authority_request.reserve_id = Some(reserve_handle.clone())"
     ));
+    assert!(launch_authority_source.contains("CI_TOKEN_AUTHORITY_V4_HANDLE_PREFIX"));
+    assert!(launch_authority_source.contains(
+        ".map(|scope| scope.commit_hex().to_owned())"
+    ));
     assert!(launch_authority_source
         .contains("ManifestBoundCiJobTokenAuthority::handle_for(&token_authority_request)"));
+    assert_eq!(
+        checkout_composition_source
+            .matches("minted.checkout.as_ref()")
+            .count(),
+        2,
+        "initial and rotated phase contexts must both use the durable minted checkout"
+    );
+    assert!(checkout_composition_source.contains("mint_phase_credential_for_checkout_scope"));
+    assert!(credential_generation_source.contains(
+        "(launch.spec #>> '{spec,workspace,commit}') IS NOT DISTINCT FROM $21::text"
+    ));
+    assert!(identity_adapter_source.contains("checkout-commit:{format}:{}#attest"));
     assert!(launch_authority_source.contains("labels: LINUX_SMALL_V1_RUNNER_LABELS"));
     assert!(dispatch_consumer_source.contains("let group = format!(\"pr:{repo}:{number}\")"));
     assert!(dispatch_consumer_source.contains(".get(\"head_generation\")"));
@@ -454,6 +472,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let reserve_binding = claim_issuer_source
         .find("launch_template.spec.meter_to.reserve_id != job.reserve_handle")
         .expect("claim-time issuer must bind the dispatched reservation to the manifest");
+    let checkout_commit_binding = claim_issuer_source
+        .find("launch_template.spec.workspace.commit.as_deref()")
+        .expect("claim-time issuer must bind the dispatched checkout commit to durable authority");
     let authority_function = claim_issuer_source
         .find("pub(crate) fn authority_from_durable_claim(")
         .expect("claim-time authority verifier must remain explicit");
@@ -465,8 +486,11 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         .expect("raw Identity mint must be last");
     assert!(claim_lock < run_lock && run_lock < manifest && manifest < verify && verify < mint);
     assert!(
-        authority_function < reserve_binding && reserve_binding < authority_handle_verification,
-        "reserve binding must happen inside durable-authority verification before handle acceptance"
+        authority_function < reserve_binding
+            && reserve_binding < checkout_commit_binding
+            && checkout_commit_binding < authority_handle_verification,
+        "reserve and checkout-commit bindings must happen inside durable-authority verification \
+         before handle acceptance"
     );
     assert!(library_source.contains("PgCiRunStarterFactory::new_with_authority"));
     // It routes an AUTHORITATIVE tenant, never a synthetic one — no starter is constructed for a fixed

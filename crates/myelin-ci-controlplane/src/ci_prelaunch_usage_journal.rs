@@ -1411,6 +1411,9 @@ mod tests {
                 timeout_secs: 10,
             },
             reserve_id: Some("ci-reserve:v2:fixture".into()),
+            checkout_commit: checkout
+                .as_ref()
+                .map(|scope| scope.commit_hex().to_owned()),
             checkout,
         }
     }

@@ -267,6 +267,9 @@ async fn seed_fixture(
         policy_revision: "linux-small-v1:1".into(),
         limits: limits.clone(),
         reserve_id: None,
+        checkout_commit: checkout
+            .as_ref()
+            .map(|scope| scope.commit_hex().to_owned()),
         checkout,
     };
     let reserve_handle = PgTierPCiJobBudgetReservation::new(
@@ -1116,6 +1119,7 @@ fn multi_job_manifest_and_run(
                 policy_revision: "linux-small-v1:1".into(),
                 limits: limits.clone(),
                 reserve_id: Some(format!("ci-reserve:v2:invariant-{seed}-{i}")),
+                checkout_commit: Some(checkout_scope().commit_hex().to_owned()),
                 checkout: Some(checkout_scope()),
             };
             GrantedCiJobV1 {

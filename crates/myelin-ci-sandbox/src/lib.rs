@@ -499,11 +499,11 @@ pub struct CiJobAuthorizationContext {
     pub reserve_id: String,
     pub required_capabilities: Vec<String>,
     /// CT-007 slice 5b.3-2c: the checkout target this job's durable claim was minted against, when
-    /// it has one. `required_capabilities`' dynamic `repo:<ref>#pull` entry proves repo-READ
-    /// authority but not the exact COMMIT — a substituted commit from the same repo would still
-    /// carry that same capability, so a launch hook must separately re-derive the checkout scope
-    /// from the in-hand `JobSpec.workspace` and require it to equal this field exactly (Sol's
-    /// review).
+    /// it has one. `required_capabilities` carries both the dynamic `repo:<ref>#pull` grant and a
+    /// non-operational `checkout-commit:<format>:<hex>#attest` fact. A launch hook must still
+    /// re-derive the checkout scope from the in-hand `JobSpec.workspace`, require exact equality
+    /// here, and require Identity's signed capability vector to match; neither the ephemeral
+    /// context nor the signed bearer is sufficient alone.
     pub checkout_scope: Option<CheckoutAuthorizationScope>,
     /// **CT-007 phase-credential generations.** The exact durable credential generation this
     /// ephemeral context was resolved under, or `None` for the legacy V1 claim-bound shape whose

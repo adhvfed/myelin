@@ -299,6 +299,7 @@ async fn seed_fixture(app: &PgPool, admin: &PgPool, seed: u64, claim_age_secs: i
         policy_revision: "linux-small-v1:1".into(),
         limits: limits.clone(),
         reserve_id: None,
+        checkout_commit: Some(checkout_scope().commit_hex().to_owned()),
         checkout: Some(checkout_scope()),
     };
     let reserve_handle = PgTierPCiJobBudgetReservation::new(
@@ -750,6 +751,10 @@ fn gate_for(
         job_id: claim.job_id.clone(),
         token_authority_handle: claim.token_authority_handle.clone(),
         idem_token: claim.idem_token.clone(),
+        checkout_commit: minted
+            .checkout
+            .as_ref()
+            .map(|scope| scope.commit_hex().to_owned()),
         lease_owner: claim.lease_owner.clone(),
         lease_epoch: claim.lease_epoch,
         claim_nonce: claim.claim_nonce.clone(),
@@ -1774,6 +1779,7 @@ async fn an_identity_success_with_a_rolled_back_transaction_leaves_an_unusable_o
                 job_id: fixture.claim.job_id.clone(),
                 token_authority_handle: fixture.claim.token_authority_handle.clone(),
                 idem_token: fixture.claim.idem_token.clone(),
+                checkout_commit: Some(COMMIT_OID.into()),
                 lease_owner: fixture.claim.lease_owner.clone(),
                 lease_epoch: fixture.claim.lease_epoch,
                 claim_nonce: fixture.claim.claim_nonce.clone(),

@@ -410,6 +410,29 @@ impl CiJobCredentialGenerationStore {
         claim: &CiJobTokenRequest,
         purpose: CiCredentialPurpose,
     ) -> Result<MintedPhaseCredential, CiCredentialGenerationError> {
+        self.mint_phase_credential_inner(claim, purpose, None).await
+    }
+
+    /// Mint while exact-comparing the caller's checkout scope with the durable manifest authority
+    /// inside the same locked transaction. The outer `Option` in the private seam distinguishes
+    /// "no comparison requested" (legacy direct callers) from an explicitly expected compute
+    /// scope (`None`). Production checkout composition always uses this strict path.
+    pub async fn mint_phase_credential_for_checkout_scope(
+        &self,
+        claim: &CiJobTokenRequest,
+        purpose: CiCredentialPurpose,
+        expected_checkout: Option<&CheckoutAuthorizationScope>,
+    ) -> Result<MintedPhaseCredential, CiCredentialGenerationError> {
+        self.mint_phase_credential_inner(claim, purpose, Some(expected_checkout.cloned()))
+            .await
+    }
+
+    async fn mint_phase_credential_inner(
+        &self,
+        claim: &CiJobTokenRequest,
+        purpose: CiCredentialPurpose,
+        expected_checkout: Option<Option<CheckoutAuthorizationScope>>,
+    ) -> Result<MintedPhaseCredential, CiCredentialGenerationError> {
         if self.write_version != CiJobCredentialWriteVersion::V2PhaseBound {
             return Err(CiCredentialGenerationError::WriteVersionPinned);
         }
@@ -476,6 +499,10 @@ impl CiJobCredentialGenerationStore {
                     .map_err(|_| CiCredentialGenerationError::DurableAuthorityUnavailable)?;
                 let authority = authority_from_durable_claim(&claim, &run, &manifest, &launch)
                     .map_err(|_| CiCredentialGenerationError::DurableAuthorityUnavailable)?;
+                verify_supplied_checkout_matches_durable(
+                    expected_checkout.as_ref(),
+                    &authority.checkout,
+                )?;
                 if locked.stage.as_deref() != Some(authority.stage.as_str())
                     || locked.trust_tier != authority.trust_tier
                 {
@@ -630,6 +657,17 @@ impl CiJobCredentialGenerationStore {
             })
         })
         .await
+    }
+}
+
+fn verify_supplied_checkout_matches_durable(
+    expected_checkout: Option<&Option<CheckoutAuthorizationScope>>,
+    durable_checkout: &Option<CheckoutAuthorizationScope>,
+) -> Result<(), CiCredentialGenerationError> {
+    if expected_checkout.is_some_and(|expected| expected != durable_checkout) {
+        Err(CiCredentialGenerationError::DurableAuthorityUnavailable)
+    } else {
+        Ok(())
     }
 }
 
@@ -1020,6 +1058,9 @@ pub struct CiPhaseGenerationGate {
     pub job_id: String,
     pub token_authority_handle: String,
     pub idem_token: String,
+    /// Exact commit re-derived at signed-context verification and compared to the immutable
+    /// dispatched `ci_job_spec` by every retained generation predicate.
+    pub checkout_commit: Option<String>,
     pub lease_owner: String,
     pub lease_epoch: i64,
     pub claim_nonce: String,
@@ -1061,6 +1102,9 @@ FROM job_queue AS q
 JOIN ci_job_credential_generation AS g
   ON g.tenant_id = q.tenant_id AND g.region = q.region AND g.job_id = q.job_id
  AND g.lease_epoch = q.lease_epoch AND g.claim_nonce = q.claim_nonce
+JOIN ci_job_spec AS launch
+  ON launch.tenant_id = q.tenant_id AND launch.region = q.region
+ AND launch.job_id = q.job_id AND launch.run_id = q.run_id
 WHERE q.tenant_id = $1
   AND q.region = $2
   AND q.job_id = $3::uuid
@@ -1084,6 +1128,7 @@ WHERE q.tenant_id = $1
   AND g.ci_run_id = $16::uuid
   AND g.token_authority_handle = $17
   AND g.idem_token = $18
+  AND (launch.spec #>> '{spec,workspace,commit}') IS NOT DISTINCT FROM $21::text
   AND g.lease_owner = q.lease_owner
   AND g.claim_started_at_epoch_secs = $8
   AND g.claim_expires_at_epoch_secs = $9
@@ -1188,6 +1233,7 @@ pub async fn verify_phase_generation_live(
                     .bind(&gate.idem_token)
                     .bind(transport)
                     .bind(materialization)
+                    .bind(&gate.checkout_commit)
                     .fetch_optional(&mut *connection)
                     .await
                     .map_err(|error| PgError::Query(error.to_string()))?;
@@ -1314,6 +1360,7 @@ async fn phase_generation_predicate_holds(
         .bind(&gate.idem_token)
         .bind(transport)
         .bind(materialization)
+        .bind(&gate.checkout_commit)
         .fetch_optional(&mut *connection)
         .await
         .map_err(map_sql_error)?;
@@ -1479,6 +1526,49 @@ mod tests {
         CiCredentialPurpose::CheckoutMaterialization,
         CiCredentialPurpose::Workload,
     ];
+
+    #[test]
+    fn mint_time_checkout_commit_divergence_is_refused_against_durable_authority() {
+        let durable = myelin_ci_sandbox::derive_checkout_authorization_scope(
+            myelin_ci_sandbox::JobKind::Ci,
+            &myelin_ci_sandbox::WorkspaceSpec {
+                repo_ref: Some("myelin://acme/git/repo/core".into()),
+                commit: Some("a".repeat(40)),
+            },
+        )
+        .unwrap();
+        let supplied = myelin_ci_sandbox::derive_checkout_authorization_scope(
+            myelin_ci_sandbox::JobKind::Ci,
+            &myelin_ci_sandbox::WorkspaceSpec {
+                repo_ref: Some("myelin://acme/git/repo/core".into()),
+                commit: Some("b".repeat(40)),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            verify_supplied_checkout_matches_durable(Some(&supplied), &durable),
+            Err(CiCredentialGenerationError::DurableAuthorityUnavailable)
+        );
+        assert!(verify_supplied_checkout_matches_durable(Some(&durable), &durable).is_ok());
+    }
+
+    #[test]
+    fn retained_phase_predicate_exact_compares_checkout_commit_to_durable_spec() {
+        for predicate in [
+            "JOIN ci_job_spec AS launch",
+            "launch.job_id = q.job_id AND launch.run_id = q.run_id",
+            "(launch.spec #>> '{spec,workspace,commit}') IS NOT DISTINCT FROM $21::text",
+        ] {
+            assert!(
+                VERIFY_PHASE_GENERATION_QUERY.contains(predicate),
+                "retained phase predicate must bind `{predicate}`"
+            );
+            assert!(
+                lock_phase_generation_query().contains(predicate),
+                "locking retained phase predicate must bind `{predicate}`"
+            );
+        }
+    }
 
     #[test]
     fn purpose_tokens_and_ordinals_are_the_schema_vocabulary() {

@@ -310,7 +310,7 @@ RETURNING surface.job_id";
 ///
 /// Bind: `$1..$10` exactly as the legacy query, then `$11 binding version`, `$12 generation id`,
 /// `$13 jti`, `$14 issued at`, `$15 expires at`, `$16 CI run`, `$17 authority handle`,
-/// `$18 idem token`.
+/// `$18 idem token`, `$19 exact checkout commit`.
 pub const AUTHORIZE_JOB_LAUNCH_V2_QUERY: &str = "\
 WITH launched AS (
 UPDATE job_queue
@@ -365,6 +365,15 @@ WHERE tenant_id = $1
           AND successor.claim_nonce = generation.claim_nonce
           AND successor.phase_ordinal > generation.phase_ordinal
       )
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM ci_job_spec AS launch
+    WHERE launch.tenant_id = job_queue.tenant_id
+      AND launch.region = job_queue.region
+      AND launch.job_id = job_queue.job_id
+      AND launch.run_id = job_queue.run_id
+      AND (launch.spec #>> '{spec,workspace,commit}') IS NOT DISTINCT FROM $19::text
   )
   AND EXISTS (
     SELECT 1
@@ -1897,6 +1906,8 @@ RETURNING surface.job_id";
             "generation.ci_run_id = $16::uuid",
             "generation.token_authority_handle = $17",
             "generation.idem_token = $18",
+            "FROM ci_job_spec AS launch",
+            "(launch.spec #>> '{spec,workspace,commit}') IS NOT DISTINCT FROM $19::text",
             "generation.claim_started_at_epoch_secs = $8",
             "generation.claim_expires_at_epoch_secs = $9",
             "successor.phase_ordinal > generation.phase_ordinal",

@@ -64,9 +64,19 @@ pub const CI_JOB_REQUIRED_CAPABILITIES: [&str; 2] = ["job.launch", "artifact.wri
 /// `repo:<canonical ArtifactRef>#pull` (Sol's review: the full canonical ref, never a bare
 /// `repo_id`, so the grant is unambiguous without relying on capability evaluation to separately
 /// incorporate tenant). This capability proves repo-READ authority only -- NOT the exact commit;
-/// checkout scope and reserve id are also exact-compared via [`CiJobAuthorizationContext`].
+/// checkout scope and reserve id are also exact-compared via [`CiJobAuthorizationContext`]. The
+/// commit attestation capability is deliberately non-operational: it grants no Git verb, but makes
+/// the exact commit part of Identity's signed capability vector for every checkout-bearing phase.
 fn reserve_capability(reserve_id: &str) -> String {
     format!("reserve:{reserve_id}#consume")
+}
+
+fn checkout_commit_capability(scope: &CheckoutAuthorizationScope) -> String {
+    let format = match scope.commit_format() {
+        myelin_ci_sandbox::GitObjectFormat::Sha1 => "sha1",
+        myelin_ci_sandbox::GitObjectFormat::Sha256 => "sha256",
+    };
+    format!("checkout-commit:{format}:{}#attest", scope.commit_hex())
 }
 
 fn required_ci_capabilities(
@@ -80,6 +90,7 @@ fn required_ci_capabilities(
     capabilities.push(reserve_capability(reserve_id));
     if let Some(scope) = checkout {
         capabilities.push(format!("repo:{}#pull", scope.repo_ref().0));
+        capabilities.push(checkout_commit_capability(scope));
     }
     capabilities
 }
@@ -110,6 +121,9 @@ pub fn phase_ci_capabilities(
             vec!["job.launch".to_string(), "artifact.write".to_string()]
         }
     };
+    if let Some(scope) = checkout {
+        capabilities.push(checkout_commit_capability(scope));
+    }
     capabilities.push(reserve_capability(reserve_id));
     capabilities
 }
@@ -461,6 +475,10 @@ fn phase_gate_from_context(
         job_id: context.job_id.clone(),
         token_authority_handle: binding.token_authority_handle.clone(),
         idem_token: binding.idem_token.clone(),
+        checkout_commit: context
+            .checkout_scope
+            .as_ref()
+            .map(|scope| scope.commit_hex().to_owned()),
         lease_owner: context.lease_owner.clone(),
         lease_epoch: context.lease_epoch,
         claim_nonce: context.claim_nonce.clone(),
@@ -681,14 +699,16 @@ impl IdentityCiJobLaunchAuthorizer {
     /// CT-007 slice 5b.3-2c: the shared, READ-ONLY verification core both `authorize_retained` (the
     /// real workload launch boundary) and `authorize_checkout` (the pre-Hop-A checkout-authorization
     /// hook) call — a genuine re-verification each time, never a cached prior success (Sol's
-    /// review). Checks: CI job kind + context shape, the EXACT capability vector (the fixed two
-    /// PLUS, only if the job is checkout-bearing, the one matching `repo:<ref>#pull`), that the
-    /// checkout scope re-derived from the in-hand `spec.workspace` agrees EXACTLY with what the
-    /// server-resolved authorization context claims (catching a commit substituted after mint even
-    /// though the repo-read capability alone would not), the cryptographic bearer (JTI/tenant/
-    /// region/principal/job/capabilities all bound into Identity's own verification), and that the
-    /// signed credential's expiry never outlives the durable claim. Does NOT check durable claim
-    /// liveness or perform any
+    /// review). Checks: CI job kind + context shape, the EXACT capability vector (including the
+    /// reservation and, for checkout-bearing jobs, canonical repo + exact commit attestation), that
+    /// the SIGNED authority is exactly that set (never merely a superset), that the checkout scope
+    /// re-derived from the in-hand `spec.workspace` agrees EXACTLY with what the server-resolved
+    /// authorization context claims, the cryptographic bearer (JTI/tenant/region/principal/job/
+    /// capabilities all bound into Identity's own verification), and that the signed credential's
+    /// expiry never outlives the durable claim. Exact signed-authority equality is what prevents a
+    /// checkout credential from being shape-downgraded into a compute/None request whose smaller
+    /// vector would otherwise pass Identity's contains-every-required-capability check. Does NOT
+    /// check durable claim liveness or perform any
     /// state transition -- callers do that themselves (`permit`'s CAS, or `verify_live`'s read-only
     /// check).
     fn verify_ci_job_signed<'a>(
@@ -783,6 +803,16 @@ impl IdentityCiJobLaunchAuthorizer {
                 &required,
             )
             .map_err(|error| HookError(format!("Identity refused CI launch: {error}")))?;
+        // `RunTokenAuthorizer` intentionally implements general capability authorization (the
+        // signed authority may be a superset of `required`). A CI launch credential is narrower:
+        // its complete authority shape is itself signed context. Requiring set equality here makes
+        // checkout presence/absence and exact commit fail closed independently of the V2 workload
+        // CAS backstop.
+        if verified.authority != Authority::of(required.iter().cloned()) {
+            return Err(HookError(
+                "signed CI credential authority differs from the exact launch authority".into(),
+            ));
+        }
         if verified.exp_unix > context.claim_expires_at_epoch_secs {
             return Err(HookError(
                 "signed CI credential outlives its durable scheduler claim".into(),
@@ -888,8 +918,10 @@ impl IdentityCiJobLaunchAuthorizer {
         Ok(recomputed)
     }
 
-    /// Reauthorize signed facts and return a lazy durable permit. The exact CAS runs only after the
-    /// sandbox launch guard is spawned and armed.
+    /// Reauthorize signed facts and return a lazy durable permit. The shared verifier's exact
+    /// signed-authority equality is the legacy path's checkout shape/commit predicate; a mutated
+    /// compute/None request cannot discard a checkout commit carried by the signed credential. The
+    /// exact durable CAS runs only after the sandbox launch guard is spawned and armed.
     pub fn authorize_retained(&self, spec: &JobSpec) -> Result<LaunchPermit, HookError> {
         let context = self.verify_ci_job_signed(spec, CiCredentialExpectation::LegacyClaimBound)?;
         self.claim_gate
@@ -1196,6 +1228,7 @@ mod tests {
                 timeout_secs: 30,
             },
             reserve_id: Some("reserve-1".into()),
+            checkout_commit: None,
             checkout: None,
         }
     }
@@ -1225,8 +1258,7 @@ mod tests {
             IdemToken("idem-job".into()),
         )
         .unwrap();
-        spec.run_token_authorization =
-            Some(ci_job_authorization_context(claim, "reserve-1", None));
+        spec.run_token_authorization = Some(ci_job_authorization_context(claim, "reserve-1", None));
         spec
     }
 
@@ -1245,6 +1277,7 @@ mod tests {
 
     fn checkout_authority() -> CiJobRuntimeAuthorityRequest {
         CiJobRuntimeAuthorityRequest {
+            checkout_commit: Some("a".repeat(40)),
             checkout: Some(checkout_scope()),
             ..authority()
         }
@@ -1282,11 +1315,8 @@ mod tests {
             IdemToken("idem-job".into()),
         )
         .unwrap();
-        spec.run_token_authorization = Some(ci_job_authorization_context(
-            claim,
-            "reserve-1",
-            checkout,
-        ));
+        spec.run_token_authorization =
+            Some(ci_job_authorization_context(claim, "reserve-1", checkout));
         spec
     }
 
@@ -1388,7 +1418,7 @@ mod tests {
     }
 
     #[test]
-    fn checkout_mint_capabilities_add_exactly_one_repo_pull_capability() {
+    fn checkout_mint_capabilities_bind_repo_and_exact_commit() {
         let caps = required_ci_capabilities("reserve-1", Some(&checkout_scope()));
         assert_eq!(
             caps,
@@ -1397,6 +1427,7 @@ mod tests {
                 "artifact.write".to_string(),
                 "reserve:reserve-1#consume".to_string(),
                 "repo:myelin://acme/git/repo/widgets#pull".to_string(),
+                format!("checkout-commit:sha1:{}#attest", "a".repeat(40)),
             ]
         );
     }
@@ -1412,10 +1443,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let sha256 = required_ci_capabilities("reserve-1", Some(&scope));
+        let sha1 = required_ci_capabilities("reserve-1", Some(&checkout_scope()));
+        assert_eq!(sha256[3], sha1[3], "the repo grant remains canonical");
+        assert_ne!(sha256[4], sha1[4], "the exact commit attestation is signed");
         assert_eq!(
-            required_ci_capabilities("reserve-1", Some(&scope)),
-            required_ci_capabilities("reserve-1", Some(&checkout_scope())),
-            "the repo capability names only the repo, never the commit"
+            sha256[4],
+            format!("checkout-commit:sha256:{}#attest", "b".repeat(64))
         );
         assert_eq!(scope.commit_hex(), "b".repeat(64));
     }
@@ -1456,6 +1490,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkout_a_credential_is_refused_for_compute_absent_launch() {
+        // Shape-downgrade mutation: every unsigned carrier field consistently says compute/None,
+        // while the signed checkout-A credential still carries repo + exact-commit authority.
+        // The standalone verifier must reject that unused signed superset before the durable gate.
+        let (credential, claim, cell, s7) = checkout_test_rig().await;
+        let boundary = checkout_boundary(&cell, s7, Arc::new(AllowClaimGate));
+        let compute_spec = job(credential, &claim);
+
+        assert!(
+            boundary.authorize_retained(&compute_spec).is_err(),
+            "a checkout-bearing signed authority must not authorize a compute/None launch"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_credential_is_refused_for_checkout_launch() {
+        let s7 = RevocationStore::new();
+        let cell = Arc::new(CellTokenAuthority::from_seed(&[11_u8; 32], &[12_u8; 32]).unwrap());
+        let signer = Arc::new(PasetoCapabilitySigner::new(cell.clone()).with_clock(|| NOW));
+        let minter = RunTokenMinter::with_signer_and_tuples(s7.clone(), None, signer);
+        let adapter = IdentityCiJobCredentialMinter::new(minter).with_clock(|| NOW);
+        let claim = claim();
+        let credential = adapter
+            .mint_verified(claim.clone(), authority())
+            .await
+            .expect("compute claim mints");
+        let boundary = checkout_boundary(&cell, s7, Arc::new(AllowClaimGate));
+        let scope = checkout_scope();
+        let checkout_spec = checkout_job(credential, &claim, checkout_workspace(), Some(&scope));
+
+        assert!(
+            boundary.authorize_retained(&checkout_spec).is_err(),
+            "a compute signed authority must not authorize a checkout-bearing launch"
+        );
+    }
+
+    #[tokio::test]
     async fn commit_substitution_after_mint_fails_at_the_context_scope_comparison() {
         // The exact production attack shape (Sol's review): mint for `widgets@A`, keep the
         // server-resolved authorization context's own scope as `widgets@A` (the claim-time-
@@ -1488,6 +1559,32 @@ mod tests {
         );
         assert!(boundary
             .authorize_checkout(&spec, &rederived_from_substituted_workspace)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn post_mint_signed_context_checkout_commit_substitution_is_refused() {
+        // Make workspace, context, hook scope, and expected vector consistently name commit B.
+        // Structural equality therefore passes; only Identity's signature over the exact commit
+        // attestation can distinguish this from the credential minted for commit A.
+        let (credential, claim, cell, s7) = checkout_test_rig().await;
+        let boundary = checkout_boundary(&cell, s7, Arc::new(AllowClaimGate));
+        let substituted_workspace = WorkspaceSpec {
+            repo_ref: checkout_workspace().repo_ref,
+            commit: Some("c".repeat(40)),
+        };
+        let substituted_scope =
+            derive_checkout_authorization_scope(JobKind::Ci, &substituted_workspace)
+                .unwrap()
+                .unwrap();
+        let spec = checkout_job(
+            credential,
+            &claim,
+            substituted_workspace,
+            Some(&substituted_scope),
+        );
+        assert!(boundary
+            .authorize_checkout(&spec, &substituted_scope)
             .is_err());
     }
 
@@ -1596,13 +1693,19 @@ mod tests {
             (
                 "missing the repo capability",
                 Box::new(|caps: &mut Vec<String>| {
-                    caps.pop();
+                    caps.remove(3);
                 }),
             ),
             (
                 "wrong repo capability",
                 Box::new(|caps: &mut Vec<String>| {
-                    *caps.last_mut().unwrap() = "repo:myelin://acme/git/repo/other#pull".into();
+                    caps[3] = "repo:myelin://acme/git/repo/other#pull".into();
+                }),
+            ),
+            (
+                "wrong checkout commit capability",
+                Box::new(|caps: &mut Vec<String>| {
+                    caps[4] = format!("checkout-commit:sha1:{}#attest", "f".repeat(40));
                 }),
             ),
             (
@@ -1614,8 +1717,7 @@ mod tests {
             (
                 "duplicate repo capability",
                 Box::new(|caps: &mut Vec<String>| {
-                    let last = caps.last().unwrap().clone();
-                    caps.push(last);
+                    caps.push(caps[3].clone());
                 }),
             ),
             (
@@ -1976,11 +2078,16 @@ mod tests {
             vec![
                 "job.launch".to_string(),
                 "repo:myelin://acme/git/repo/widgets#pull".to_string(),
+                format!("checkout-commit:sha1:{}#attest", "a".repeat(40)),
                 "reserve:reserve-1#consume".to_string(),
             ]
         );
         assert_eq!(
-            phase_ci_capabilities(CiCredentialPurpose::CheckoutFetch, "reserve-1", Some(&scope)),
+            phase_ci_capabilities(
+                CiCredentialPurpose::CheckoutFetch,
+                "reserve-1",
+                Some(&scope)
+            ),
             phase_ci_capabilities(
                 CiCredentialPurpose::CheckoutAdvertise,
                 "reserve-1",
@@ -1995,6 +2102,7 @@ mod tests {
             ),
             vec![
                 "job.launch".to_string(),
+                format!("checkout-commit:sha1:{}#attest", "a".repeat(40)),
                 "reserve:reserve-1#consume".to_string(),
             ]
         );
@@ -2003,6 +2111,7 @@ mod tests {
             vec![
                 "job.launch".to_string(),
                 "artifact.write".to_string(),
+                format!("checkout-commit:sha1:{}#attest", "a".repeat(40)),
                 "reserve:reserve-1#consume".to_string(),
             ]
         );

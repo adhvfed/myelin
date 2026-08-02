@@ -67,6 +67,7 @@ fn request(tenant: &str, run_suffix: u8, job_suffix: u8) -> CiJobRuntimeAuthorit
             timeout_secs: 600,
         },
         reserve_id: None,
+        checkout_commit: Some("deadbeef00deadbeef00deadbeef00deadbeef00".into()),
         checkout: derive_checkout_authorization_scope(
             JobKind::Ci,
             &WorkspaceSpec {
