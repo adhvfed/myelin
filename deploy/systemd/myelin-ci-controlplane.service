@@ -26,14 +26,14 @@ Type=simple
 User=myelin-runner
 Group=myelin-runner
 # See the `Delegate=`/`DelegateSubgroup=` block below for why this wraps the real binary instead of
-# invoking it directly — TL;DR: the `+memory` `cgroup.subtree_control` write MUST happen from
+# invoking it directly — TL;DR: the `+memory +cpu` `cgroup.subtree_control` write MUST happen from
 # `ExecStart`, never `ExecStartPre` (confirmed directly: identical `ExecStartPre` content
 # deterministically fails unit startup with "Failed to spawn executor: Device or resource busy",
 # while the exact same write from `ExecStart` succeeds every time — a systemd/kernel cgroup-v2
 # ordering interaction during a delegated unit's OWN startup, not a permissions issue). `exec` (not
 # a plain subshell) replaces this shell with the real binary so systemd's MainPID/signal tracking is
 # unaffected.
-ExecStart=/bin/sh -c 'CG="/sys/fs/cgroup$(sed -n "s#^0::##p" /proc/self/cgroup)"; echo +memory > "$CG/../cgroup.subtree_control"; exec /opt/myelin/bin/ci-controlplane'
+ExecStart=/bin/sh -c 'CG="/sys/fs/cgroup$(sed -n "s#^0::##p" /proc/self/cgroup)"; echo +memory +cpu > "$CG/../cgroup.subtree_control"; exec /opt/myelin/bin/ci-controlplane'
 
 # --- Rootless gVisor base (already wired, works today) ---
 Environment=MYELIN_CI_RUNNER=1
@@ -98,19 +98,19 @@ AmbientCapabilities=CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_READ_SEARCH
 NoNewPrivileges=false
 
 # --- Cgroup v2 delegation for MemoryCgroup::create's per-job sandbox cgroups ---
-# `MemoryCgroup::create` (gvisor.rs) creates each job's memory-bounding cgroup as a SIBLING of this
+# `MemoryCgroup::create` (gvisor.rs) creates each job's memory/CPU-bounding cgroup as a SIBLING of this
 # process's own cgroup, requiring this process to have write access to its OWN cgroup's PARENT
-# directory with `memory` already enabled in that parent's `cgroup.subtree_control`.
+# directory with `memory` and `cpu` already enabled in that parent's `cgroup.subtree_control`.
 # `DelegateSubgroup=supervisor` places the actual service process one level below the delegated
 # boundary (in a `supervisor/` subgroup) specifically so that boundary itself — this process's
 # cgroup's parent — is the thing delegated to `myelin-runner`, leaving room for sibling cgroups
-# beside `supervisor/`. `Delegate=memory` chowns that boundary to this unit but does NOT itself
+# beside `supervisor/`. `Delegate=memory cpu` chowns that boundary to this unit but does NOT itself
 # populate its `cgroup.subtree_control` (confirmed directly: without the `ExecStart` write above,
 # the delegated boundary reports as owned by `myelin-runner` yet an EMPTY `cgroup.subtree_control`,
-# so `supervisor/cgroup.controllers` shows no `memory` and `MemoryCgroup::create` fails closed with
-# `Permission denied`) — this is a genuinely separate step, not automatic, hence the explicit write
+# so `supervisor/cgroup.controllers` lacks the required controllers and `MemoryCgroup::create` fails
+# closed with `Permission denied`) — this is a genuinely separate step, hence the explicit write
 # in `ExecStart` above (see that line's own comment for why it CANNOT live in `ExecStartPre`).
-Delegate=memory
+Delegate=memory cpu
 DelegateSubgroup=supervisor
 
 Restart=on-failure

@@ -458,7 +458,7 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
     // CT-007 slice 3, piece 7b: same cgroup hoist as the production run paths — this preflight is
     // real production code (it gates host activation), so it gets the same checked teardown rather
     // than a best-effort `delete_container`/`Drop`-only cleanup.
-    let cgroup = match MemoryCgroup::create(config.mem_bytes) {
+    let cgroup = match MemoryCgroup::create(config.mem_bytes, 1000) {
         Ok(cgroup) => cgroup,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&bundle);
@@ -1125,8 +1125,58 @@ pub struct MemoryCgroup {
 /// Classify every memory-cgroup setup failure with the security consequence. These errors reach the
 /// production runner/operator, so a host permission error must say that execution was refused rather
 /// than looking like an ambiguous best-effort warning.
-fn memory_cgroup_refusal(reason: impl core::fmt::Display) -> String {
-    format!("{reason} — refusing to run the gVisor workload unbounded (SI-017 fail-closed)")
+fn resource_cgroup_refusal(reason: impl core::fmt::Display) -> String {
+    format!(
+        "{reason} — refusing to run the gVisor workload without its hard resource bounds \
+         (SI-017 fail-closed)"
+    )
+}
+
+/// cgroup v2 CPU bandwidth period. `cpu_millis` is a thousandth of one core, so this period makes
+/// the quota conversion exact above the kernel minimum: `quota = cpu_millis * 100` microseconds
+/// (2000 millicpu becomes `200000 100000`, i.e. two cores of bandwidth per period). Linux rejects
+/// quotas below 1000 microseconds, so 1..=9 millicpu must use that smallest expressible bandwidth.
+const CPU_MAX_PERIOD_US: u64 = 100_000;
+const CPU_MAX_MIN_QUOTA_US: u64 = 1_000;
+
+fn cpu_max_value(cpu_millis: u32) -> Result<String, String> {
+    if cpu_millis == 0 {
+        return Err("cpu_millis is zero; cannot establish a nonzero cpu.max quota".to_string());
+    }
+    let quota_us = u64::from(cpu_millis)
+        .checked_mul(CPU_MAX_PERIOD_US)
+        .and_then(|value| value.checked_div(1000))
+        .ok_or_else(|| format!("cpu.max quota overflow for cpu_millis={cpu_millis}"))?
+        .max(CPU_MAX_MIN_QUOTA_US);
+    Ok(format!("{quota_us} {CPU_MAX_PERIOD_US}"))
+}
+
+/// Write every hard per-job cgroup limit through an injectable writer. Keeping the writes in one
+/// helper makes their shared-cgroup placement and fail-closed error propagation deterministic to
+/// unit-test without touching `/sys/fs/cgroup`.
+fn write_job_cgroup_limits_given<F>(
+    dir: &Path,
+    mem_bytes: u64,
+    cpu_millis: u32,
+    mut write: F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, &[u8]) -> io::Result<()>,
+{
+    let memory_max = mem_bytes.to_string();
+    write(dir.join("memory.max").as_path(), memory_max.as_bytes()).map_err(|e| {
+        format!("write memory.max={mem_bytes} to {dir:?}: {e}")
+    })?;
+
+    // Swap is structurally fixed at zero by ResourceLimits. Failure is fatal: ignoring it would let
+    // a tenant spill beyond memory.max into shared host swap.
+    write(dir.join("memory.swap.max").as_path(), b"0")
+        .map_err(|e| format!("write memory.swap.max=0 to {dir:?}: {e}"))?;
+
+    let cpu_max = cpu_max_value(cpu_millis)?;
+    write(dir.join("cpu.max").as_path(), cpu_max.as_bytes())
+        .map_err(|e| format!("write cpu.max={cpu_max} to {dir:?}: {e}"))?;
+    Ok(())
 }
 
 /// `(device, inode)` of `dir` via a plain path-based `stat`. This is a STALE-HANDLE consistency
@@ -1318,72 +1368,75 @@ fn wait_for_unpopulated(
 }
 
 impl MemoryCgroup {
-    /// Establish a memory cgroup capped at `mem_bytes` (swap disabled). FAIL-CLOSED: returns `Err`
-    /// when cgroup v2 is absent or the `memory` controller is not delegated to this process — the
-    /// caller MUST then refuse to run the workload (never unbounded). The sandbox cgroup is created
-    /// as a SIBLING of this process's own cgroup (whose parent already delegates the `memory`
-    /// controller into its `subtree_control`, since our own cgroup carries it as a controller); this
-    /// respects cgroup v2's no-internal-process rule without relocating this supervisor process.
-    pub fn create(mem_bytes: u64) -> Result<MemoryCgroup, String> {
+    /// Establish a job cgroup capped at `mem_bytes`, `cpu_millis`, and zero swap. FAIL-CLOSED:
+    /// returns `Err` when cgroup v2 is absent, either required controller is not delegated, or any
+    /// limit write fails. The sandbox cgroup is created as a SIBLING of this process's own cgroup;
+    /// this respects cgroup v2's no-internal-process rule without relocating the supervisor.
+    pub fn create(mem_bytes: u64, cpu_millis: u32) -> Result<MemoryCgroup, String> {
         const ROOT: &str = "/sys/fs/cgroup";
         // cgroup v2 unified hierarchy ⇒ /proc/self/cgroup has exactly one `0::<path>` line.
         let content = std::fs::read_to_string("/proc/self/cgroup")
-            .map_err(|e| memory_cgroup_refusal(format!("read /proc/self/cgroup: {e}")))?;
+            .map_err(|e| resource_cgroup_refusal(format!("read /proc/self/cgroup: {e}")))?;
         let rel = content
             .lines()
             .find_map(|l| l.strip_prefix("0::"))
             .map(str::trim)
             .ok_or_else(|| {
-                memory_cgroup_refusal(
-                    "no cgroup v2 unified hierarchy (`0::` line absent); cannot establish a memory cgroup",
+                resource_cgroup_refusal(
+                    "no cgroup v2 unified hierarchy (`0::` line absent); cannot establish a job cgroup",
                 )
             })?;
         let our_dir = PathBuf::from(ROOT).join(rel.trim_start_matches('/'));
-        // The `memory` controller must be delegated to our own cgroup (⇒ available to siblings).
+        // Both controllers must be delegated to our own cgroup (⇒ available to siblings).
         let controllers =
             std::fs::read_to_string(our_dir.join("cgroup.controllers")).unwrap_or_default();
-        if !controllers.split_whitespace().any(|c| c == "memory") {
-            return Err(memory_cgroup_refusal(format!(
-                "the `memory` cgroup controller is NOT delegated to {our_dir:?} \
-                 (controllers: {controllers:?}); cannot bound gVisor memory"
-            )));
+        for required in ["memory", "cpu"] {
+            if !controllers.split_whitespace().any(|c| c == required) {
+                return Err(resource_cgroup_refusal(format!(
+                    "the `{required}` cgroup controller is NOT delegated to {our_dir:?} \
+                     (controllers: {controllers:?}); cannot bound gVisor resources"
+                )));
+            }
         }
         let parent = our_dir.parent().ok_or_else(|| {
-            memory_cgroup_refusal(
-                "this process's cgroup has no parent; cannot create a sibling memory cgroup",
+            resource_cgroup_refusal(
+                "this process's cgroup has no parent; cannot create a sibling job cgroup",
             )
         })?;
         let dir = parent.join(format!(
-            "myelin-mem-{}-{}",
+            "myelin-job-{}-{}",
             std::process::id(),
             unique_suffix()
         ));
         let _ = std::fs::remove_dir(&dir);
         std::fs::create_dir(&dir)
-            .map_err(|e| memory_cgroup_refusal(format!("create memory cgroup {dir:?}: {e}")))?;
-        // The sibling must actually have the `memory` controller (the parent delegated it). If not,
-        // tear down and fail closed rather than run a workload an empty cgroup would not bound.
+            .map_err(|e| resource_cgroup_refusal(format!("create job cgroup {dir:?}: {e}")))?;
+        // The sibling must actually have both controllers. If not, tear down and fail closed rather
+        // than run a workload whose cgroup cannot enforce the full resource policy.
         let cg_controllers =
             std::fs::read_to_string(dir.join("cgroup.controllers")).unwrap_or_default();
-        if !cg_controllers.split_whitespace().any(|c| c == "memory") {
-            let _ = std::fs::remove_dir(&dir);
-            return Err(memory_cgroup_refusal(format!(
-                "the created cgroup {dir:?} has no `memory` controller (parent did not delegate it)"
-            )));
+        for required in ["memory", "cpu"] {
+            if !cg_controllers.split_whitespace().any(|c| c == required) {
+                let _ = std::fs::remove_dir(&dir);
+                return Err(resource_cgroup_refusal(format!(
+                    "the created cgroup {dir:?} has no `{required}` controller \
+                     (parent did not delegate it)"
+                )));
+            }
         }
-        // The HARD host-RAM bound + close the swap escape hatch (so a hog OOMs rather than swaps).
-        if let Err(e) = std::fs::write(dir.join("memory.max"), mem_bytes.to_string()) {
+        // All hard limits are installed before this handle can reach the runsc spawn path. Any
+        // failure removes the empty cgroup and refuses launch; none is best-effort.
+        if let Err(e) =
+            write_job_cgroup_limits_given(&dir, mem_bytes, cpu_millis, |path, value| {
+                std::fs::write(path, value)
+            })
+        {
             let _ = std::fs::remove_dir(&dir);
-            return Err(memory_cgroup_refusal(format!(
-                "write memory.max={mem_bytes} to {dir:?}: {e}"
-            )));
+            return Err(resource_cgroup_refusal(e));
         }
-        // Best-effort: a host without a swap controller has nothing to cap (swap.max absent ⇒ no
-        // swap to escape into). Where present, 0 forces an OOM-kill instead of swapping the hog out.
-        let _ = std::fs::write(dir.join("memory.swap.max"), b"0");
         let identity = cgroup_identity(&dir).map_err(|e| {
             let _ = std::fs::remove_dir(&dir);
-            memory_cgroup_refusal(format!("stat freshly-created memory cgroup {dir:?}: {e}"))
+            resource_cgroup_refusal(format!("stat freshly-created job cgroup {dir:?}: {e}"))
         })?;
         Ok(MemoryCgroup {
             dir,
@@ -3987,6 +4040,7 @@ impl SandboxBackend for GvisorBackend {
                 "checkout-bearing or malformed workspace specs require run_cycle".into(),
             )));
         }
+        let output = cap_total_job_output(output);
         self.launch_with(
             spec,
             hooks,
@@ -4025,6 +4079,7 @@ impl SandboxBackend for GvisorBackend {
         output: Arc<dyn SandboxOutputSink>,
         cancellation: SandboxCancellation,
     ) -> Result<SandboxCycleOutcome, SandboxLaunchError<Self::Error>> {
+        let output = cap_total_job_output(output);
         match crate::derive_checkout_authorization_scope(spec.kind, &spec.workspace) {
             // (None, None): compute — the V2 orchestrated entry (parent-attempt admission), streaming.
             //
@@ -4306,7 +4361,7 @@ fn run_production_container_streaming(
     // — not `run_and_capture` — owns the checked teardown via `finalize_runtime`. A creation
     // failure here happens AFTER the bundle was staged, so it must clean the bundle up itself
     // (nothing else will).
-    let cgroup = match MemoryCgroup::create(spec.limits.mem_bytes) {
+    let cgroup = match MemoryCgroup::create(spec.limits.mem_bytes, spec.limits.cpu_millis) {
         Ok(cgroup) => cgroup,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&bundle_dir);
@@ -6137,8 +6192,93 @@ struct StreamingOutput {
     redaction: RedactionPlan,
 }
 
+/// One marker is stored inside (not in addition to) the total per-job log ceiling. Reserving its
+/// fixed size means an adversarial stream can never make durable capture exceed the exact bound.
+const TOTAL_LOG_TRUNCATION_MARKER: &[u8] =
+    b"\n[myelin: total job log byte limit reached; output truncated]\n";
+const SANDBOX_TOTAL_LOG_CAPTURE_BOUND: usize = 2 * SANDBOX_CAPTURE_BOUND;
+
+#[derive(Debug)]
+struct TotalLogCaptureState {
+    payload_bytes: usize,
+    captured_bytes: usize,
+    stopped: bool,
+}
+
+/// Per-job choke point in front of the durable output sink. Every stdout/stderr frame and every
+/// checkout/workload phase for one job shares this single state, so a tenant cannot multiply the
+/// ceiling by alternating streams or phases.
+struct TotalLogCappedOutput {
+    sink: Arc<dyn SandboxOutputSink>,
+    total_limit: usize,
+    state: Mutex<TotalLogCaptureState>,
+}
+
+impl TotalLogCappedOutput {
+    fn new(sink: Arc<dyn SandboxOutputSink>) -> Self {
+        Self::with_limit(sink, SANDBOX_TOTAL_LOG_CAPTURE_BOUND)
+    }
+
+    fn with_limit(sink: Arc<dyn SandboxOutputSink>, total_limit: usize) -> Self {
+        assert!(
+            total_limit >= TOTAL_LOG_TRUNCATION_MARKER.len(),
+            "the total log limit must have room for its truncation marker"
+        );
+        Self {
+            sink,
+            total_limit,
+            state: Mutex::new(TotalLogCaptureState {
+                payload_bytes: 0,
+                captured_bytes: 0,
+                stopped: false,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn captured_bytes(&self) -> usize {
+        self.state.lock().unwrap().captured_bytes
+    }
+}
+
+impl SandboxOutputSink for TotalLogCappedOutput {
+    fn emit(&self, stream: SandboxOutputStream, frame: &[u8]) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|_| {
+            "total job log capture state poisoned; refusing further output".to_string()
+        })?;
+        if state.stopped || frame.is_empty() {
+            return Ok(());
+        }
+
+        let payload_limit = self.total_limit - TOTAL_LOG_TRUNCATION_MARKER.len();
+        let remaining = payload_limit.saturating_sub(state.payload_bytes);
+        let take = remaining.min(frame.len());
+        if take > 0 {
+            if let Err(error) = self.sink.emit(stream, &frame[..take]) {
+                state.stopped = true;
+                return Err(error);
+            }
+            state.payload_bytes += take;
+            state.captured_bytes += take;
+        }
+
+        if take < frame.len() {
+            // Mark stopped before invoking the external sink: even a marker-write failure cannot
+            // reopen capture or let later frames grow storage without bound.
+            state.stopped = true;
+            self.sink.emit(stream, TOTAL_LOG_TRUNCATION_MARKER)?;
+            state.captured_bytes += TOTAL_LOG_TRUNCATION_MARKER.len();
+        }
+        Ok(())
+    }
+}
+
+fn cap_total_job_output(output: Arc<dyn SandboxOutputSink>) -> Arc<dyn SandboxOutputSink> {
+    Arc::new(TotalLogCappedOutput::new(output))
+}
+
 /// Drain a complete guest stream while retaining only its bounded diagnostic head and forwarding
-/// every bounded chunk to the durable-output callback.
+/// chunks to the job-wide, total-byte-capped durable-output callback.
 ///
 /// A callback failure is remembered, but the pipe is still drained to EOF so the guest cannot
 /// deadlock behind a full pipe and defeat timeout/teardown. Redaction is applied before the callback.
@@ -7509,7 +7649,7 @@ fn run_git_wire_container_raw(
     // CT-007 slice 3, piece 7b: cgroup ownership hoisted up here (see
     // `run_production_container_streaming`'s identical treatment) — `run_and_capture` only
     // borrows it now, and this function owns the checked teardown via `finalize_runtime`.
-    let cgroup = match MemoryCgroup::create(job.limits.mem_bytes) {
+    let cgroup = match MemoryCgroup::create(job.limits.mem_bytes, job.limits.cpu_millis) {
         Ok(cgroup) => cgroup,
         Err(e) => {
             let cleanup_proof = std::fs::remove_dir_all(&bundle_dir)
@@ -7951,6 +8091,7 @@ pub(crate) struct PrefetchedCheckoutPack {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl PrefetchedCheckoutPack {
     /// CT-007 slice 5b.3-6c: a test-only pack so a 6c continuation test can build a
     /// [`CheckoutPreparationSpec`] without a real Hop A. `#[cfg(test)]` only — `fetch_checkout_pack`
@@ -10354,7 +10495,7 @@ fn run_checkout_preparation_inner(
         .map_err(|e| CheckoutPreparationError::Refused(e.message))?;
 
     // CT-003b (SI-017): the out-of-band memory cgroup, established BEFORE anything durably commits.
-    let cgroup = match MemoryCgroup::create(spec.limits.mem_bytes) {
+    let cgroup = match MemoryCgroup::create(spec.limits.mem_bytes, spec.limits.cpu_millis) {
         Ok(cgroup) => cgroup,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&bundle_dir);
@@ -11983,13 +12124,15 @@ mod tests {
     }
 
     #[test]
-    fn streaming_drain_keeps_only_the_head_but_delivers_the_complete_byte_stream() {
+    fn streaming_drain_keeps_only_the_head_but_forwards_chunks_to_the_job_budget() {
         let input: Vec<u8> = (0..(3 * 64 * 1024 + 17))
             .map(|offset| (offset % 251) as u8)
             .collect();
         let sink = Arc::new(RecordingOutput::default());
+        let capped: Arc<dyn SandboxOutputSink> =
+            Arc::new(TotalLogCappedOutput::new(sink.clone()));
         let output = StreamingOutput {
-            sink: sink.clone(),
+            sink: capped,
             redaction: RedactionPlan::none(),
         };
 
@@ -12006,7 +12149,96 @@ mod tests {
         assert_eq!(
             *sink.bytes.lock().unwrap(),
             input,
-            "bytes beyond the diagnostic capture cap still reach durable output"
+            "bytes beyond the diagnostic head still reach the shared job budget when under it"
+        );
+    }
+
+    #[test]
+    fn streaming_capture_total_log_cap_truncates_with_marker_and_stops_growth() {
+        let payload_limit = 1024;
+        let total_limit = payload_limit + TOTAL_LOG_TRUNCATION_MARKER.len();
+        let sink = Arc::new(RecordingOutput::default());
+        let capped = Arc::new(TotalLogCappedOutput::with_limit(
+            sink.clone(),
+            total_limit,
+        ));
+        let output = StreamingOutput {
+            sink: capped.clone(),
+            redaction: RedactionPlan::none(),
+        };
+        let input = vec![b'x'; 256 * 1024];
+
+        let (_head, truncated, error) = drain_capped_streaming(
+            std::io::Cursor::new(&input),
+            128,
+            SandboxOutputStream::Stdout,
+            &output,
+        );
+        assert_eq!(error, None);
+        assert!(truncated, "the diagnostic head is also truncated");
+
+        let captured_before_late_frame = sink.bytes.lock().unwrap().clone();
+        capped
+            .emit(SandboxOutputStream::Stderr, b"late bytes must be discarded")
+            .unwrap();
+        let captured = sink.bytes.lock().unwrap().clone();
+        assert_eq!(captured, captured_before_late_frame);
+        assert_eq!(captured.len(), total_limit);
+        assert_eq!(&captured[..payload_limit], &input[..payload_limit]);
+        assert!(captured.ends_with(TOTAL_LOG_TRUNCATION_MARKER));
+        assert_eq!(capped.captured_bytes(), total_limit);
+    }
+
+    #[test]
+    fn total_log_cap_is_shared_across_streams_and_under_ceiling_is_unchanged() {
+        let sink = Arc::new(RecordingOutput::default());
+        let total_limit = TOTAL_LOG_TRUNCATION_MARKER.len() + 64;
+        let capped = TotalLogCappedOutput::with_limit(sink.clone(), total_limit);
+        capped
+            .emit(SandboxOutputStream::Stdout, b"ordinary stdout\n")
+            .unwrap();
+        capped
+            .emit(SandboxOutputStream::Stderr, b"ordinary stderr\n")
+            .unwrap();
+        assert_eq!(
+            *sink.bytes.lock().unwrap(),
+            b"ordinary stdout\nordinary stderr\n",
+            "combined output below the payload ceiling must be byte-identical"
+        );
+
+        let sink = Arc::new(RecordingOutput::default());
+        let capped = TotalLogCappedOutput::with_limit(
+            sink.clone(),
+            TOTAL_LOG_TRUNCATION_MARKER.len() + 8,
+        );
+        capped.emit(SandboxOutputStream::Stdout, b"123456").unwrap();
+        capped.emit(SandboxOutputStream::Stderr, b"abcdef").unwrap();
+        let captured = sink.bytes.lock().unwrap().clone();
+        assert_eq!(&captured[..8], b"123456ab");
+        assert!(captured.ends_with(TOTAL_LOG_TRUNCATION_MARKER));
+        assert_eq!(
+            captured.len(),
+            TOTAL_LOG_TRUNCATION_MARKER.len() + 8,
+            "stdout and stderr must consume one exact shared total-byte budget"
+        );
+    }
+
+    #[test]
+    fn production_streaming_entries_install_one_job_wide_total_log_cap() {
+        let streaming = source_of("fn launch_streaming(");
+        assert!(
+            streaming.find("cap_total_job_output(output)").unwrap()
+                < streaming.find("self.launch_with(").unwrap(),
+            "ordinary streaming launch must install the cap before any production run path"
+        );
+
+        let cycle = source_of("fn run_cycle(");
+        assert!(
+            cycle.find("cap_total_job_output(output)").unwrap()
+                < cycle
+                    .find("match crate::derive_checkout_authorization_scope")
+                    .unwrap(),
+            "the cap must wrap the sink once before checkout routing so every phase shares it"
         );
     }
 
@@ -14007,6 +14239,7 @@ mod tests {
         fail_begin_phase: bool,
         fail_mint_phase: bool,
     }
+    #[allow(dead_code)]
     impl FakeAttemptAuthority {
         fn new(should_requeue: bool) -> Self {
             Self {
@@ -15493,7 +15726,10 @@ mod tests {
         // SAME identity `finalize_runtime` will re-confirm at teardown below.
         let runsc_root_identity = revalidated_explicit_userns_root_identity()
             .expect("the policy this drill just installed via preflight must revalidate cleanly");
-        let cgroup = MemoryCgroup::create(command_spec.limits.mem_bytes)
+        let cgroup = MemoryCgroup::create(
+            command_spec.limits.mem_bytes,
+            command_spec.limits.cpu_millis,
+        )
             .expect("establish a real memory cgroup for this drill");
         let cgroup_identity = cgroup.identity();
         lease
@@ -15969,12 +16205,106 @@ mod tests {
     }
 
     #[test]
+    fn job_cgroup_limits_write_cpu_from_policy_to_same_cgroup_before_exec() {
+        let dir = PathBuf::from("/deterministic/job-cgroup");
+        let mut writes = Vec::<(PathBuf, Vec<u8>)>::new();
+        write_job_cgroup_limits_given(&dir, 64 << 20, 2000, |path, value| {
+            writes.push((path.to_path_buf(), value.to_vec()));
+            Ok(())
+        })
+        .expect("all resource controls should be installed");
+
+        assert_eq!(
+            writes,
+            vec![
+                (dir.join("memory.max"), (64u64 << 20).to_string().into_bytes()),
+                (dir.join("memory.swap.max"), b"0".to_vec()),
+                (dir.join("cpu.max"), b"200000 100000".to_vec()),
+            ],
+            "2000 millicpu must become a two-core cpu.max quota in the same job cgroup"
+        );
+
+        let create = source_of("pub fn create(mem_bytes: u64, cpu_millis: u32)");
+        assert!(
+            create.find("write_job_cgroup_limits_given").unwrap()
+                < create.find("Ok(MemoryCgroup").unwrap(),
+            "MemoryCgroup::create must not return a launchable handle before every limit write succeeds"
+        );
+        let run = source_of("fn run_production_container_streaming(");
+        assert!(
+            run.find("MemoryCgroup::create(spec.limits.mem_bytes, spec.limits.cpu_millis)")
+                .unwrap()
+                < run.find("let capture = ||").unwrap(),
+            "the policy-derived cgroup must be complete before the runsc capture/exec continuation exists"
+        );
+    }
+
+    #[test]
+    fn cpu_max_quota_floors_sub_ten_millicpu_at_kernel_minimum() {
+        for cpu_millis in 1..=9 {
+            assert_eq!(
+                cpu_max_value(cpu_millis).expect("positive millicpu must produce cpu.max"),
+                "1000 100000",
+                "{cpu_millis} millicpu must use the kernel's minimum accepted quota"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_max_write_failure_aborts_cgroup_setup_fail_closed() {
+        let dir = PathBuf::from("/deterministic/job-cgroup");
+        let mut attempted = Vec::<PathBuf>::new();
+        let error = write_job_cgroup_limits_given(&dir, 64 << 20, 2000, |path, _| {
+            attempted.push(path.to_path_buf());
+            if path == dir.join("cpu.max") {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected cpu.max denial",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("a cpu.max write failure must abort cgroup setup");
+
+        assert_eq!(attempted.last(), Some(&dir.join("cpu.max")));
+        assert!(error.contains("write cpu.max=200000 100000"));
+        assert!(error.contains("injected cpu.max denial"));
+    }
+
+    #[test]
+    fn swap_max_write_failure_aborts_cgroup_setup_fail_closed() {
+        let dir = PathBuf::from("/deterministic/job-cgroup");
+        let mut attempted = Vec::<PathBuf>::new();
+        let error = write_job_cgroup_limits_given(&dir, 64 << 20, 2000, |path, _| {
+            attempted.push(path.to_path_buf());
+            if path == dir.join("memory.swap.max") {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected swap.max denial",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("a memory.swap.max write failure must abort cgroup setup");
+
+        assert_eq!(
+            attempted,
+            vec![dir.join("memory.max"), dir.join("memory.swap.max")],
+            "fail immediately at swap.max; cpu.max and launch must never be reached"
+        );
+        assert!(error.contains("write memory.swap.max=0"));
+        assert!(error.contains("injected swap.max denial"));
+    }
+
+    #[test]
     fn memory_cgroup_round_trips_or_fails_closed() {
         // On a host with cgroup v2 + a delegated `memory` controller, create() establishes a real
         // child cgroup with memory.max set, places nothing (we only assert the knobs), and cleans up
         // (no leaked cgroup dir). On a host WITHOUT it, create() MUST fail closed (Err) — never a
         // silently-unbounded cgroup. Either branch is a valid host posture; both are asserted honest.
-        match MemoryCgroup::create(64 << 20) {
+        match MemoryCgroup::create(64 << 20, 1000) {
             Ok(cg) => {
                 let dir = cg.dir.clone();
                 let max = std::fs::read_to_string(dir.join("memory.max")).unwrap_or_default();
@@ -16109,7 +16439,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn quiesce_succeeds_on_an_empty_real_cgroup_and_removes_it() {
-        let cg = MemoryCgroup::create(64 << 20)
+        let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
         let dir = cg.dir.clone();
         let identity = cg.identity();
@@ -16128,7 +16458,7 @@ mod tests {
         // descendant that has `setsid`'d itself away, exactly the shape a sentry/gofer escape
         // would take. Reuses the exact detached-descendant spawning pattern the existing watchdog
         // test uses, but calls `quiesce()` directly instead of the watchdog's own cgroup.kill.
-        let cg = MemoryCgroup::create(64 << 20)
+        let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
         let dir = cg.dir.clone();
         let armed = std::env::temp_dir().join(format!(
@@ -16188,7 +16518,7 @@ mod tests {
     fn quiesce_succeeds_without_the_caller_ever_reaping_a_killed_direct_child() {
         // `populated` tracks LIVENESS, not reap status — quiesce() must not depend on the caller
         // having `wait()`-ed its child first, only on `cgroup.kill` having actually killed it.
-        let cg = MemoryCgroup::create(64 << 20)
+        let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
         let dir = cg.dir.clone();
         let mut command = Command::new("/bin/sh");
@@ -16216,7 +16546,7 @@ mod tests {
         // `populated=0` can be true (this cgroup itself holds no processes) while `rmdir` still
         // refuses because a child cgroup exists underneath it — quiescence must not be treated as
         // stable (the hierarchy could still be re-populated) until removal itself succeeds.
-        let cg = MemoryCgroup::create(64 << 20)
+        let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
         let dir = cg.dir.clone();
         let nested = dir.join("myelin-unexpected-child");
@@ -16241,7 +16571,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn drop_retries_removal_after_an_earlier_failed_cleanup_call() {
-        let cg = MemoryCgroup::create(64 << 20)
+        let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
         let dir = cg.dir.clone();
         let nested = dir.join("myelin-unexpected-child");
@@ -16308,7 +16638,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn quiesce_detects_an_identity_change_and_refuses_to_mint_evidence() {
-        let cg = MemoryCgroup::create(64 << 20)
+        let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
         let dir = cg.dir.clone();
         let original_identity = cg.identity();
@@ -16370,7 +16700,7 @@ mod tests {
     #[test]
     fn launch_watchdog_cgroup_kills_a_descendant_outside_the_runtime_process_group() {
         use std::time::Instant;
-        let cgroup = MemoryCgroup::create(64 << 20)
+        let cgroup = MemoryCgroup::create(64 << 20, 1000)
             .expect("the all-feature gVisor cgroup watchdog gate requires a real delegated cgroup");
         let armed = std::env::temp_dir().join(format!(
             "myelin-gvisor-cgroup-watchdog-armed-{}-{}",
@@ -17550,7 +17880,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn finalize_runtime_mints_evidence_on_a_clean_rootless_teardown() {
-        let cg = MemoryCgroup::create(64 << 20)
+        let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
         let dir = cg.dir.clone();
         let cgroup_identity = cg.identity();
@@ -17578,7 +17908,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn finalize_runtime_refuses_when_the_direct_child_was_not_confirmed_reaped() {
-        let cg = MemoryCgroup::create(64 << 20)
+        let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
         let dir = cg.dir.clone();
         let result = finalize_runtime(
@@ -17606,7 +17936,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn finalize_runtime_refuses_when_the_container_delete_is_not_confirmed() {
-        let cg = MemoryCgroup::create(64 << 20)
+        let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
         let dir = cg.dir.clone();
         // `/bin/false` ignores every argument and always exits 1 — a deterministic stand-in for a
@@ -17638,7 +17968,7 @@ mod tests {
         // invoked here, since the (injected) namespace-identity revalidation reports a drift first.
         // If `retire_container` ran anyway, `ContainerNotConfirmedDeleted` would ALSO appear in
         // `issues`, which the assertion below rules out.
-        let cg = MemoryCgroup::create(64 << 20)
+        let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
         let dir = cg.dir.clone();
         let expected_root_identity = (11, 22);
@@ -17679,7 +18009,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn finalize_runtime_mints_explicit_userns_evidence_when_the_identity_still_matches() {
-        let cg = MemoryCgroup::create(64 << 20)
+        let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
         let cgroup_identity = cg.identity();
         let identity = (33, 44);

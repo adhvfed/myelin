@@ -174,9 +174,10 @@ fn ag_d4_ci_t1_escape_gate_re_runs_green_on_the_gvisor_backend() {
     //    place the runsc process tree into an OUT-OF-BAND host memory cgroup (the SAME
     //    `MemoryCgroup` helper the production path uses; no forked enforcer). Without it the hog
     //    would HELD an oversized anonymous allocation ⇒ ESCAPED ⇒ the drill would (correctly) go RED.
-    let cgroup = MemoryCgroup::create(spec.limits.mem_bytes).expect(
-        "[AG-D4 gVisor] the memory cgroup MUST be establishable to contain the anon-memory hog \
-         (cgroup v2 + a delegated `memory` controller) — fail-closed otherwise (SI-017)",
+    let cgroup = MemoryCgroup::create(spec.limits.mem_bytes, spec.limits.cpu_millis).expect(
+        "[AG-D4 gVisor] the resource cgroup MUST be establishable to contain the anon-memory hog \
+         and bound CPU (cgroup v2 + delegated `memory` and `cpu` controllers) — fail-closed \
+         otherwise (SI-017)",
     );
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("--rootless")
