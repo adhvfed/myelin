@@ -39,7 +39,8 @@ use myelin_ci_controlplane::{
     ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support,
     ci_run_store_factory, durable_spec_resolver_test_support, fixed_command_spec_builder,
     CheckFacts, CiJobLaunchClaim, CiJobQueueStore, CiJobTokenIssueError, CiJobTokenIssuer,
-    CiJobTokenRequest, CiPipelineDriver, CiPipelineReporter, CiRunInsert, DurableJobRunner,
+    CiJobTokenRequest, CiPipelineDriver, CiPipelineReporter, CiPipelineReporterFactory,
+    CiPipelineReporterFactoryError, CiPipelineReporterRouter, CiRunInsert, DurableJobRunner,
     DurableLeaseAdapter, JobScheduleTerms, Lane, PipelineRun, PipelineStage,
     ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
     ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
@@ -72,6 +73,12 @@ use sqlx::{Executor, PgPool};
 use tokio::sync::Mutex as AsyncMutex;
 
 static TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+fn unused_secret_terminal_reporter(region: &str) -> CiPipelineReporterRouter {
+    let factory: CiPipelineReporterFactory =
+        Arc::new(|_, _| Err(CiPipelineReporterFactoryError));
+    CiPipelineReporterRouter::new(Region(region.into()), factory).unwrap()
+}
 
 struct ClaimTokenIssuer;
 
@@ -712,6 +719,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         tokio::runtime::Handle::current(),
         Arc::new(ClaimTokenIssuer),
         myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
+        unused_secret_terminal_reporter(region),
     );
     let adapter = DurableLeaseAdapter::new(
         ci_region_queue_store_test_support(admin.clone()),
