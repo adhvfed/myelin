@@ -99,6 +99,7 @@ impl AcquiredCheckoutRuntime {
         absolute_rootfs: PathBuf,
         workspace_manager: &WorkspaceManager,
         userns_allocator: &UserNamespaceAllocator,
+        cargo_vendor: Option<crate::asset_registry::VerifiedCargoVendor>,
     ) -> Result<AcquiredCheckoutRuntime, AcquisitionFailure> {
         // Blocker 1: the capsule's scope is DERIVED from the same `spec` Hop B will run against — it is
         // not an independent argument that a caller could set to scope A while handing a scope-B spec.
@@ -130,6 +131,7 @@ impl AcquiredCheckoutRuntime {
             absolute_rootfs,
             workspace_manager,
             userns_allocator,
+            cargo_vendor,
         )?;
         let runtime = AcquiredCheckoutRuntime {
             workload_container_id,
@@ -277,6 +279,15 @@ impl PreparedCheckoutRuntime {
             BoundWorkloadRefusal,
         >,
     {
+        if let Err(message) = self.acquired.workload_cfg.bind_materialized_cargo_lock(
+            self.prepared_checkout_evidence.cargo_lock_sha256_hex(),
+        ) {
+            let disposal_diagnostics = self.dispose_checkout_runtime(workspace_manager);
+            return RetainedWorkloadOutcome::RunFailed {
+                failure: RunFailure::uncommitted(message),
+                disposal_diagnostics,
+            };
+        }
         // Step 19: complete the materialization phase with the RETAINED Hop B usage (borrow only).
         let materialization_usage = self.prepared_checkout_evidence.preparation_usage();
         if let Err(error) = authority.complete_phase(

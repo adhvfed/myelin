@@ -42,8 +42,9 @@ use crate::runner::{
 };
 use crate::user_namespace::{
     CheckoutPreparationSession, CheckoutSessionCleanup, PreparationQuiescenceProof,
-    RunscInvocationMode, UserNamespaceAllocator, UserNamespaceAllocatorError, UserNamespaceBindError,
-    UserNamespaceConfig, UserNamespaceLease, UserNamespaceQuiescenceProof, UserNamespaceRefusal,
+    RunscInvocationMode, UserNamespaceAllocator, UserNamespaceAllocatorError,
+    UserNamespaceBindError, UserNamespaceConfig, UserNamespaceLease, UserNamespaceQuiescenceProof,
+    UserNamespaceRefusal,
 };
 use crate::workspace_manager::{
     CapacityLease, CapacityRefusal, DeleteWorkspaceError, ManagedWorkspace, WorkspaceManager,
@@ -51,14 +52,12 @@ use crate::workspace_manager::{
 };
 use crate::workspace_storage::WorkspaceStorageError;
 use crate::{
-    drain_capped, CheckoutAuthorizationProof, CheckoutAuthorizationScope, CompletionSettlementOwner,
-    EgressPolicy, HookError,
-    IdemToken, ImageRef, JobKind, JobSpec, LaunchPermit, MeterTarget, PhaseAuthorization,
-    ReserveHandle,
-    ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend,
-    SandboxCancellation, SandboxCycleOutcome, SandboxHandle, SandboxLaunch, SandboxLaunchError,
-    SandboxOutputSink,
-    SandboxOutputStream, SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
+    drain_capped, CheckoutAuthorizationProof, CheckoutAuthorizationScope,
+    CompletionSettlementOwner, EgressPolicy, HookError, IdemToken, ImageRef, JobKind, JobSpec,
+    LaunchPermit, MeterTarget, PhaseAuthorization, ReserveHandle, ResourceLimits, ResourceUsage,
+    RunTokenCredential, RunnerHooks, SandboxBackend, SandboxCancellation, SandboxCycleOutcome,
+    SandboxHandle, SandboxLaunch, SandboxLaunchError, SandboxOutputSink, SandboxOutputStream,
+    SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
@@ -380,9 +379,9 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         return Err("MYELIN_RUNSC_BIN must name an executable file".into());
     }
     probe_runsc_version(&runsc).map_err(|error| match error {
-        RunscProbeError::UnsafeBinary(reason) => format!(
-            "MYELIN_RUNSC_BIN failed executable metadata validation: {reason}"
-        ),
+        RunscProbeError::UnsafeBinary(reason) => {
+            format!("MYELIN_RUNSC_BIN failed executable metadata validation: {reason}")
+        }
         RunscProbeError::CouldNotExecute => {
             "MYELIN_RUNSC_BIN could not execute its version probe".to_string()
         }
@@ -504,7 +503,9 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         (Ok(outcome), Ok(())) => outcome,
         (Err(error), Ok(())) => return Err(error),
         (Ok(_), Err(cleanup)) => {
-            return Err(format!("CI runner sandbox host preflight failed: {cleanup}"));
+            return Err(format!(
+                "CI runner sandbox host preflight failed: {cleanup}"
+            ));
         }
         (Err(error), Err(cleanup)) => return Err(format!("{error}; {cleanup}")),
     };
@@ -575,6 +576,110 @@ const RUNTIME_QUIESCE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The fixed guest mount point a workspace is ALWAYS bound at — never caller-selectable (matching
 /// [`WorkspaceStorageMode::Disabled`]'s own doc: "`/workspace` is never mounted" when disabled).
 const OCI_WORKSPACE_MOUNT: &str = "/workspace";
+/// Fixed read-only destination for the dependency directories inside a verified Cargo vendor
+/// asset. Slice #32 precreated this empty mountpoint in the digest-pinned Rust rootfs.
+pub const OCI_CARGO_VENDOR_MOUNT: &str = "/opt/myelin/cargo-vendor";
+/// Server-only selector carried by the structured Cargo launch translation. Its value is an exact
+/// digest-pinned [`VerifiedCargoVendor`] registry reference, never a tenant path.
+pub const ENV_CARGO_VENDOR_ASSET: &str = "MYELIN_CARGO_VENDOR_ASSET";
+/// Cargo needs a writable home for its package-cache lock. This directory lives inside the job's
+/// already size-bounded writable `/tmp` tmpfs; its `config.toml` is over-mounted read-only.
+pub const STRUCTURED_CARGO_HOME: &str = "/tmp/cargo-home";
+pub const CARGO_SOURCE_REPLACE_ENV: &str = "CARGO_SOURCE_CRATES_IO_REPLACE_WITH";
+pub const CARGO_VENDOR_DIRECTORY_ENV: &str = "CARGO_SOURCE_VENDORED_DIRECTORY";
+/// Cargo CLI `KEY=VALUE` TOML snippets installed only by the platform-owned structured argv.
+/// Command-line config has Cargo's highest precedence, above environment and every discovered
+/// `.cargo/config{,.toml}` file.
+pub const CARGO_SOURCE_REPLACE_CONFIG: &str = "source.crates-io.replace-with=\"vendored\"";
+pub const CARGO_VENDOR_DIRECTORY_CONFIG: &str =
+    "source.vendored.directory=\"/opt/myelin/cargo-vendor\"";
+const OCI_CARGO_CONFIG_MOUNT: &str = "/tmp/cargo-home/config.toml";
+const TEST_SERVER_CARGO_CONFIG_SOURCE: &str = "/server-owned/cargo/config.toml";
+const TEST_FD_BOUND_CARGO_VENDOR_SOURCE: &str = "/proc/123/fd/456/vendor";
+const CARGO_VENDOR_SOURCE_NAME: &str = "vendored";
+
+/// Canonical server policy artifact mounted read-only at `$CARGO_HOME/config.toml`. This and the
+/// corresponding environment variables are defense in depth; the platform-owned Cargo `--config`
+/// argv is authoritative because Cargo gives CLI config precedence over environment and every
+/// discovered config file (including workspace config and legacy `$CARGO_HOME/config`).
+pub const SERVER_CARGO_CONFIG_TOML: &str = "[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = \"/opt/myelin/cargo-vendor\"\n";
+
+fn validated_cargo_vendor_reference(spec: &JobSpec) -> Result<Option<ImageRef>, String> {
+    let values = |name: &str| {
+        spec.env
+            .iter()
+            .filter(|entry| entry.name == name)
+            .map(|entry| entry.value.as_str())
+            .collect::<Vec<_>>()
+    };
+    let selectors = values(ENV_CARGO_VENDOR_ASSET);
+    if selectors.is_empty() {
+        return Ok(None);
+    }
+    if spec.kind != JobKind::Ci
+        || spec.command
+            != [
+                "cargo",
+                "build",
+                "--locked",
+                "--config",
+                CARGO_SOURCE_REPLACE_CONFIG,
+                "--config",
+                CARGO_VENDOR_DIRECTORY_CONFIG,
+            ]
+    {
+        return Err(
+            "a Cargo vendor asset may be selected only for the platform-owned structured CI Cargo build"
+                .to_string(),
+        );
+    }
+    if selectors.len() != 1 {
+        return Err(format!(
+            "{ENV_CARGO_VENDOR_ASSET} must appear exactly once when selecting a Cargo vendor asset"
+        ));
+    }
+    if !spec.egress.allow.is_empty() {
+        return Err(
+            "a structured Cargo vendor build requires empty egress (network=none)".to_string(),
+        );
+    }
+    for (name, expected) in [
+        ("CARGO_HOME", STRUCTURED_CARGO_HOME),
+        ("CARGO_NET_OFFLINE", "true"),
+        (CARGO_SOURCE_REPLACE_ENV, CARGO_VENDOR_SOURCE_NAME),
+        (CARGO_VENDOR_DIRECTORY_ENV, OCI_CARGO_VENDOR_MOUNT),
+    ] {
+        if values(name) != [expected] {
+            return Err(format!(
+                "a structured Cargo vendor build requires exactly {name}={expected} in the job environment"
+            ));
+        }
+        if spec.secret_refs.iter().any(|secret| secret.name == name) {
+            return Err(format!(
+                "structured Cargo boundary variable {name} cannot be supplied through a secret"
+            ));
+        }
+    }
+    ImageRef::pinned(selectors[0].to_string())
+        .map(Some)
+        .map_err(|error| {
+            format!("{ENV_CARGO_VENDOR_ASSET} is not a digest-pinned asset reference: {error}")
+        })
+}
+
+fn selected_cargo_vendor(
+    spec: &JobSpec,
+    registry: &crate::asset_registry::GvisorAssetRegistry,
+) -> Result<Option<crate::asset_registry::VerifiedCargoVendor>, String> {
+    let Some(reference) = validated_cargo_vendor_reference(spec)? else {
+        return Ok(None);
+    };
+    registry
+        .resolve_cargo_vendor(&reference)
+        .cloned()
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
 
 /// A path proven absolute AT CONSTRUCTION — every OCI `root.path` override this crate ever uses is
 /// meant to be absolute (a symlinked/relative `root.path` COMBINED with a host bind mount makes the
@@ -640,6 +745,40 @@ struct GitWireMounts {
     quarantine_source: Option<PathBuf>,
 }
 
+/// The structured Cargo build's server-owned dependency boundary. The verified asset is selected
+/// before workspace acquisition; the independently host-computed materialized lock digest is bound
+/// only after Hop B succeeds and before the workload can reach its launch permit/spawn path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CargoVendorBoundary {
+    asset: crate::asset_registry::VerifiedCargoVendor,
+    materialized_cargo_lock_sha256: Option<String>,
+}
+
+/// A per-launch capability for the exact vendor-tree inode verified immediately before bundle
+/// staging. The OCI source is derived from this held descriptor, so renaming/replacing the registry
+/// pathname after verification cannot redirect the runtime's mount open to another tree.
+///
+/// Residual scope: a host actor running as the trusted asset-store uid could still mutate children
+/// inside this exact directory inode between the re-walk and runsc's descendant opens. Tenant and
+/// workload ids cannot do so because registry verification enforces owner plus mode invariants;
+/// this is the same defense-in-depth, same-uid host-compromise class already scoped for the CoW and
+/// workspace fd-binding work, not a tenant fetch or cross-tenant escape.
+struct FdBoundCargoVendor {
+    _root_fd: OwnedFd,
+    root_identity: (u64, u64),
+    vendor_mount_source: PathBuf,
+}
+
+impl std::fmt::Debug for FdBoundCargoVendor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FdBoundCargoVendor")
+            .field("root_identity", &self.root_identity)
+            .field("vendor_mount_source", &self.vendor_mount_source)
+            .finish_non_exhaustive()
+    }
+}
+
 impl GitWireMounts {
     fn new(repo_source: PathBuf, quarantine_source: Option<PathBuf>) -> Self {
         GitWireMounts {
@@ -692,6 +831,7 @@ enum OciExecutionLayout {
         config: UserNamespaceConfig,
         workspace: OciWorkspaceMount,
         absolute_rootfs: AbsoluteRootfs,
+        cargo_vendor: Option<CargoVendorBoundary>,
     },
 }
 
@@ -719,9 +859,11 @@ pub struct OciConfig {
     /// production run path places the `runsc` process tree into — that is what OOM-kills a memory hog
     /// within the limit and keeps it from consuming host RAM beyond `mem_bytes`.
     mem_bytes: u64,
-    /// The RAM-backed `/tmp` tmpfs ceiling (bytes) (CT-003a). gVisor would otherwise auto-mount an
-    /// UNBOUNDED host-RAM-backed tmpfs at `/tmp`; sizing it caps a disk fill at ENOSPC (the SI-017
-    /// host-DoS escape D2 surfaced through the production `launch()`). Sourced from
+    /// The aggregate RAM-backed writable-tmpfs ceiling (bytes) (CT-003a). Ordinarily all of it is
+    /// assigned to `/tmp`; a structured Cargo launch partitions it between `/tmp` and the nested
+    /// owned Cargo-home tmpfs. gVisor would otherwise auto-mount an UNBOUNDED host-RAM-backed tmpfs
+    /// at `/tmp`; sizing it caps a disk fill at ENOSPC (the SI-017 host-DoS escape D2 surfaced
+    /// through the production `launch()`). Sourced from
     /// [`ResourceLimits::tmpfs_bytes`](crate::ResourceLimits::tmpfs_bytes), NOT
     /// `disk_bytes` (that field is the disk-backed ephemeral-workspace quota — unrelated to this
     /// RAM-backed tmpfs).
@@ -743,7 +885,11 @@ impl std::fmt::Debug for OciConfig {
         let env_names: Vec<&str> = self
             .extra_env
             .iter()
-            .map(|entry| entry.split_once('=').map_or(entry.as_str(), |(name, _)| name))
+            .map(|entry| {
+                entry
+                    .split_once('=')
+                    .map_or(entry.as_str(), |(name, _)| name)
+            })
             .collect();
         formatter
             .debug_struct("OciConfig")
@@ -916,8 +1062,206 @@ impl OciConfig {
             config,
             workspace,
             absolute_rootfs: AbsoluteRootfs::new(absolute_rootfs)?,
+            cargo_vendor: None,
         };
         Ok(self)
+    }
+
+    /// Attach a registry-verified Cargo vendor asset to the workspace layout. Both destinations are
+    /// fixed by the platform. The rootfs mountpoint must already be a real empty directory in the
+    /// digest-pinned rootfs; launch code never creates or mutates it after rootfs verification.
+    pub(crate) fn with_cargo_vendor(
+        mut self,
+        asset: crate::asset_registry::VerifiedCargoVendor,
+    ) -> Result<OciConfig, String> {
+        let (absolute_rootfs, slot) =
+            match &mut self.layout {
+                OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+                    absolute_rootfs,
+                    cargo_vendor,
+                    ..
+                } => (absolute_rootfs, cargo_vendor),
+                _ => return Err(
+                    "a Cargo vendor asset requires the explicit-user-namespace workspace layout"
+                        .to_string(),
+                ),
+            };
+        if slot.is_some() {
+            return Err(
+                "a Cargo vendor asset was already selected for this OCI config".to_string(),
+            );
+        }
+        let destination = absolute_rootfs
+            .as_path()
+            .join(OCI_CARGO_VENDOR_MOUNT.trim_start_matches('/'));
+        let metadata = std::fs::symlink_metadata(&destination).map_err(|error| {
+            format!(
+                "pinned rootfs is missing the precreated {} mount destination: {error}",
+                OCI_CARGO_VENDOR_MOUNT
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "pinned rootfs {} mount destination must be a real directory",
+                OCI_CARGO_VENDOR_MOUNT
+            ));
+        }
+        if std::fs::read_dir(&destination)
+            .map_err(|error| format!("read Cargo vendor mount destination: {error}"))?
+            .next()
+            .is_some()
+        {
+            return Err(format!(
+                "pinned rootfs {} mount destination must be empty",
+                OCI_CARGO_VENDOR_MOUNT
+            ));
+        }
+        *slot = Some(CargoVendorBoundary {
+            asset,
+            materialized_cargo_lock_sha256: None,
+        });
+        Ok(self)
+    }
+
+    /// Bind Hop B's independently host-computed materialized lock digest into the retained launch
+    /// config. A non-structured/free-form job has no Cargo boundary and remains a no-op.
+    fn bind_materialized_cargo_lock(&mut self, digest: &str) -> Result<(), String> {
+        match &mut self.layout {
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+                cargo_vendor: Some(boundary),
+                ..
+            } => {
+                if boundary.materialized_cargo_lock_sha256.is_some() {
+                    return Err(
+                        "the materialized Cargo.lock digest was already bound to this launch"
+                            .to_string(),
+                    );
+                }
+                if digest != boundary.asset.cargo_lock_sha256() {
+                    return Err(format!(
+                        "cargo vendor asset lock mismatch: checked-out Cargo.lock is sha256:{digest}, but the selected asset is keyed to sha256:{}",
+                        boundary.asset.cargo_lock_sha256()
+                    ));
+                }
+                boundary.materialized_cargo_lock_sha256 = Some(digest.to_string());
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Open the registered canonical tree with `O_PATH|O_NOFOLLOW`, bind it to the identity captured
+    /// at registry verification, re-verify through that held descriptor, and return the exact
+    /// descriptor-derived source the OCI runtime must mount. The descriptor remains owned by the
+    /// staged bundle until after runtime teardown.
+    fn fd_bind_cargo_vendor_before_spawn(&self) -> Result<Option<FdBoundCargoVendor>, String> {
+        match &self.layout {
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+                cargo_vendor: Some(boundary),
+                ..
+            } => {
+                let materialized = boundary
+                    .materialized_cargo_lock_sha256
+                    .as_deref()
+                    .ok_or_else(|| {
+                        "structured Cargo launch reached verify-to-use without a materialized Cargo.lock digest"
+                            .to_string()
+                    })?;
+                let path_c = CString::new(boundary.asset.path().as_os_str().as_encoded_bytes())
+                    .map_err(|error| {
+                        format!(
+                            "Cargo vendor asset path {} contains an interior NUL: {error}",
+                            boundary.asset.path().display()
+                        )
+                    })?;
+                // SAFETY: `path_c` is a live NUL-terminated pathname. `O_NOFOLLOW` atomically
+                // refuses a symlink at the verified canonical leaf, and the successful fd is
+                // transferred immediately into one `OwnedFd` below.
+                let raw_fd = unsafe {
+                    libc::open(
+                        path_c.as_ptr(),
+                        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if raw_fd < 0 {
+                    return Err(format!(
+                        "open verified Cargo vendor tree {} with O_PATH|O_NOFOLLOW: {}",
+                        boundary.asset.path().display(),
+                        io::Error::last_os_error()
+                    ));
+                }
+                // SAFETY: `raw_fd` was returned by the successful `open` above and has no other
+                // owner. `O_CLOEXEC` prevents accidental inheritance; runsc opens the explicit
+                // parent-process fd path while this descriptor remains held by the bundle.
+                let root_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+                let opened_identity = crate::dirlock::fd_identity(&root_fd)
+                    .map_err(|error| format!("fstat fd-bound Cargo vendor tree: {error}"))?;
+                if opened_identity != boundary.asset.identity() {
+                    return Err(format!(
+                        "Cargo vendor asset pathname no longer names its registry-verified inode: \
+                         expected {:?}, opened {opened_identity:?}",
+                        boundary.asset.identity()
+                    ));
+                }
+
+                let fd_bound_root = PathBuf::from(format!(
+                    "/proc/{}/fd/{}",
+                    std::process::id(),
+                    root_fd.as_raw_fd()
+                ));
+                let fd_path_metadata = std::fs::metadata(&fd_bound_root).map_err(|error| {
+                    format!(
+                        "resolve held Cargo vendor descriptor {}: {error}",
+                        fd_bound_root.display()
+                    )
+                })?;
+                if (fd_path_metadata.dev(), fd_path_metadata.ino()) != opened_identity {
+                    return Err(
+                        "Cargo vendor /proc fd source did not resolve to the held inode"
+                            .to_string(),
+                    );
+                }
+
+                boundary
+                    .asset
+                    .verify_before_spawn_at(&fd_bound_root, materialized)?;
+
+                let current_path_metadata =
+                    std::fs::metadata(boundary.asset.path()).map_err(|error| {
+                        format!(
+                            "Cargo vendor pathname changed during fd-bound verification: {error}"
+                        )
+                    })?;
+                let current_path_identity =
+                    (current_path_metadata.dev(), current_path_metadata.ino());
+                let after_identity = crate::dirlock::fd_identity(&root_fd)
+                    .map_err(|error| format!("re-fstat fd-bound Cargo vendor tree: {error}"))?;
+                if current_path_identity != opened_identity || after_identity != opened_identity {
+                    return Err(format!(
+                        "Cargo vendor tree identity changed during verification: opened \
+                         {opened_identity:?}, pathname {current_path_identity:?}, fd after \
+                         verification {after_identity:?}"
+                    ));
+                }
+
+                Ok(Some(FdBoundCargoVendor {
+                    vendor_mount_source: fd_bound_root.join("vendor"),
+                    _root_fd: root_fd,
+                    root_identity: opened_identity,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn has_cargo_vendor(&self) -> bool {
+        matches!(
+            self.layout,
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+                cargo_vendor: Some(_),
+                ..
+            }
+        )
     }
 
     /// The [`RunscInvocationMode`] this config implies — the ONE place that decision is made,
@@ -944,13 +1288,30 @@ impl OciConfig {
 
     /// Serialize to a minimal OCI `config.json` (`runsc run --bundle <dir>` consumes it). The
     /// posture flags reflect the real enforced state, so a test over this JSON asserts the posture.
-    pub fn to_json(&self) -> String {
-        self.to_json_zeroizing().to_string()
+    pub fn to_json(&self) -> Result<String, String> {
+        self.to_json_zeroizing().map(|json| json.to_string())
     }
 
     /// Production serializer for config files that may contain injected secret environment values.
     /// Every secret-bearing buffer created here is zeroized when it leaves scope.
-    fn to_json_zeroizing(&self) -> zeroize::Zeroizing<String> {
+    fn to_json_zeroizing(&self) -> Result<zeroize::Zeroizing<String>, String> {
+        let cargo_config_source = self
+            .has_cargo_vendor()
+            .then(|| Path::new(TEST_SERVER_CARGO_CONFIG_SOURCE));
+        let cargo_vendor_source = self
+            .has_cargo_vendor()
+            .then(|| Path::new(TEST_FD_BOUND_CARGO_VENDOR_SOURCE));
+        self.to_json_zeroizing_with_cargo_sources(cargo_config_source, cargo_vendor_source)
+    }
+
+    /// Production bundle staging supplies the just-created server-owned config path here. Keeping
+    /// that host path out of [`OciConfig`] avoids turning a mutable external pathname into part of
+    /// the long-lived verified asset capability.
+    fn to_json_zeroizing_with_cargo_sources(
+        &self,
+        cargo_config_host_source: Option<&Path>,
+        cargo_vendor_host_source: Option<&Path>,
+    ) -> Result<zeroize::Zeroizing<String>, String> {
         use std::fmt::Write as _;
 
         let args = self
@@ -975,18 +1336,30 @@ impl OciConfig {
         .expect("writing JSON into a String cannot fail");
         for e in &self.extra_env {
             env_json.push_str(", ");
-            write!(&mut *env_json, "{e:?}")
-                .expect("writing JSON into a String cannot fail");
+            write!(&mut *env_json, "{e:?}").expect("writing JSON into a String cannot fail");
         }
-        // `mounts`: the size-bounded writable `/tmp` tmpfs first (byte-unchanged), then whatever
+        // `mounts`: the size-bounded writable `/tmp` tmpfs first, then whatever
         // host mounts this config's layout implies (CT-006a's git-wire repo/quarantine binds, or
         // CT-007 slice 3's fixed workspace bind) — `OciExecutionLayout` only ever produces one
         // shape or the other, never both. Source/dest are JSON-escaped via `{:?}` so a path can
         // carry no JSON-injection.
+        let has_cargo_vendor = self.has_cargo_vendor();
+        let cargo_home_tmpfs_bytes = if has_cargo_vendor {
+            if self.tmpfs_bytes < 2 {
+                return Err(
+                    "a structured Cargo build requires at least two bytes of writable tmpfs quota"
+                        .to_string(),
+                );
+            }
+            self.tmpfs_bytes / 2
+        } else {
+            0
+        };
+        let general_tmpfs_bytes = self.tmpfs_bytes - cargo_home_tmpfs_bytes;
         let mut mounts = vec![format!(
             "{{ \"destination\": \"/tmp\", \"type\": \"tmpfs\", \"source\": \"tmpfs\", \
              \"options\": [\"nosuid\", \"nodev\", \"mode=1777\", \"size={}\"] }}",
-            self.tmpfs_bytes
+            general_tmpfs_bytes
         )];
         match &self.layout {
             OciExecutionLayout::Rootless | OciExecutionLayout::ExplicitUserNamespace { .. } => {}
@@ -996,13 +1369,45 @@ impl OciConfig {
             } => {
                 mounts.extend(wire_mounts.bind_mounts_json());
             }
-            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace { workspace, .. } => {
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+                workspace,
+                cargo_vendor,
+                ..
+            } => {
                 // Always exactly one fixed writable mount — never caller-selectable readonly/dest.
                 mounts.push(bind_mount_json(
                     OCI_WORKSPACE_MOUNT,
                     &workspace.host_source,
                     false,
                 ));
+                if cargo_vendor.is_some() {
+                    // The nested config bind needs its parent mount to exist before process start,
+                    // so Cargo home remains a distinct tmpfs for deterministic ownership. Its quota
+                    // is SUBTRACTED from `/tmp` above: the two writable tmpfs mounts partition, and
+                    // can never double, the job's one declared scratch-tmpfs bound.
+                    mounts.push(format!(
+                        "{{ \"destination\": {destination:?}, \"type\": \"tmpfs\", \
+                         \"source\": \"tmpfs\", \"options\": [\"rw\", \"nosuid\", \
+                         \"nodev\", \"mode=0700\", \"uid={uid}\", \"gid={gid}\", \
+                         \"size={size}\"] }}",
+                        destination = STRUCTURED_CARGO_HOME,
+                        uid = UNTRUSTED_UID,
+                        gid = UNTRUSTED_GID,
+                        size = cargo_home_tmpfs_bytes,
+                    ));
+                    // The verified asset root also carries its lock/config metadata. Only the actual
+                    // `cargo vendor` directory is projected at Cargo's fixed directory-source path.
+                    let vendor_source = cargo_vendor_host_source.ok_or_else(|| {
+                        "refusing Cargo vendor OCI config without an fd-bound vendor source"
+                            .to_string()
+                    })?;
+                    mounts.push(bind_mount_json(OCI_CARGO_VENDOR_MOUNT, vendor_source, true));
+                    let config_source = cargo_config_host_source.ok_or_else(|| {
+                        "refusing Cargo vendor OCI config without a server config source"
+                            .to_string()
+                    })?;
+                    mounts.push(bind_mount_json(OCI_CARGO_CONFIG_MOUNT, config_source, true));
+                }
             }
         }
         let mounts_json = mounts.join(", ");
@@ -1057,7 +1462,7 @@ impl OciConfig {
                 ),
             ),
         };
-        zeroize::Zeroizing::new(format!(
+        Ok(zeroize::Zeroizing::new(format!(
             "{{\n  \"ociVersion\": \"1.0.0\",\n  \"process\": {{\n    \
              \"user\": {{ \"uid\": {uid}, \"gid\": {gid} }},\n    \
              \"args\": [{args}],\n    \"cwd\": {process_cwd:?},\n    \
@@ -1083,7 +1488,7 @@ impl OciConfig {
             pids = self.pids_max,
             namespaces_json = namespaces_json,
             id_mappings_json = id_mappings_json,
-        ))
+        )))
     }
 
     /// True iff the OCI root is read-only.
@@ -1222,9 +1627,8 @@ where
     F: FnMut(&Path, &[u8]) -> io::Result<()>,
 {
     let memory_max = mem_bytes.to_string();
-    write(dir.join("memory.max").as_path(), memory_max.as_bytes()).map_err(|e| {
-        format!("write memory.max={mem_bytes} to {dir:?}: {e}")
-    })?;
+    write(dir.join("memory.max").as_path(), memory_max.as_bytes())
+        .map_err(|e| format!("write memory.max={mem_bytes} to {dir:?}: {e}"))?;
 
     // Swap is structurally fixed at zero by ResourceLimits. Failure is fatal: ignoring it would let
     // a tenant spill beyond memory.max into shared host swap.
@@ -1484,11 +1888,9 @@ impl MemoryCgroup {
         }
         // All hard limits are installed before this handle can reach the runsc spawn path. Any
         // failure removes the empty cgroup and refuses launch; none is best-effort.
-        if let Err(e) =
-            write_job_cgroup_limits_given(&dir, mem_bytes, cpu_millis, |path, value| {
-                std::fs::write(path, value)
-            })
-        {
+        if let Err(e) = write_job_cgroup_limits_given(&dir, mem_bytes, cpu_millis, |path, value| {
+            std::fs::write(path, value)
+        }) {
             let _ = std::fs::remove_dir(&dir);
             return Err(resource_cgroup_refusal(e));
         }
@@ -1949,8 +2351,9 @@ fn acquire_enabled_workspace(
     absolute_rootfs: PathBuf,
     workspace_manager: &WorkspaceManager,
     userns_allocator: &UserNamespaceAllocator,
+    cargo_vendor: Option<crate::asset_registry::VerifiedCargoVendor>,
 ) -> Result<(OciConfig, EnabledLaunchContext), AcquisitionFailure> {
-    acquire_enabled_workspace_given(
+    let (cfg, context) = acquire_enabled_workspace_given(
         spec,
         profile,
         container_id,
@@ -1961,7 +2364,20 @@ fn acquire_enabled_workspace(
             workspace_manager.create_workspace(job_key, quota, uid, gid, capacity)
         },
         |workspace| workspace_manager.delete_workspace(workspace),
-    )
+    )?;
+    let Some(cargo_vendor) = cargo_vendor else {
+        return Ok((cfg, context));
+    };
+    match cfg.with_cargo_vendor(cargo_vendor) {
+        Ok(cfg) => Ok((cfg, context)),
+        Err(reason) => {
+            let diagnostics = cleanup_pre_bind_failure(context, workspace_manager);
+            Err(AcquisitionFailure::from_rollback_diagnostics(
+                format!("attaching the structured Cargo vendor boundary failed: {reason}"),
+                diagnostics,
+            ))
+        }
+    }
 }
 
 /// The actual decision logic behind [`acquire_enabled_workspace`], taking the four external
@@ -2235,7 +2651,8 @@ fn settle_enabled_finalization(
             let workspace_manager = workspace_manager.expect(
                 "an enabled context is only ever present alongside its workspace manager (Enabled)",
             );
-            settle_enabled_workspace_and_lease(context, workspace_manager, &finalized.evidence).err()
+            settle_enabled_workspace_and_lease(context, workspace_manager, &finalized.evidence)
+                .err()
         }
         (Some(context), RuntimeFinalization::Failed { .. }) => {
             // Runtime finalization itself failed (no full quiescence evidence exists) — never delete
@@ -2406,7 +2823,9 @@ impl GvisorCheckoutConfig {
                 canonical,
             });
         }
-        Ok(GvisorCheckoutConfig(CheckoutConfigState::Enabled { repo_root }))
+        Ok(GvisorCheckoutConfig(CheckoutConfigState::Enabled {
+            repo_root,
+        }))
     }
 
     /// The boot-validated checkout root, if this config is enabled. `pub(crate)` — the sandbox's own
@@ -2698,7 +3117,8 @@ impl GvisorBackend {
         // common body. The three operations happen in the exact prior order with the exact prior side
         // effects; only the surrounding boilerplate moved into named helpers so the dormant
         // `launch_compute_orchestrated_with` reuses this identical preflight and body.
-        let (profile, verified_rootfs) = self.compute_launch_preflight(spec, hooks)?;
+        let (profile, verified_rootfs, cargo_vendor) =
+            self.compute_launch_preflight(spec, hooks)?;
         let reserve = hooks
             .reserve(spec)
             .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
@@ -2713,6 +3133,7 @@ impl GvisorBackend {
             run,
             profile,
             verified_rootfs,
+            cargo_vendor,
             reserve,
             container_id,
         )
@@ -2728,7 +3149,11 @@ impl GvisorBackend {
         spec: &JobSpec,
         hooks: &RunnerHooks,
     ) -> Result<
-        (HardeningProfile, &crate::asset_registry::VerifiedRootfs),
+        (
+            HardeningProfile,
+            &crate::asset_registry::VerifiedRootfs,
+            Option<crate::asset_registry::VerifiedCargoVendor>,
+        ),
         SandboxLaunchError<GvisorError>,
     > {
         // #4 isolation floor FIRST — the hardening profile must hold before any code (including the
@@ -2742,6 +3167,11 @@ impl GvisorBackend {
                 "secret injection refused: {error}"
             )))
         })?;
+        // Validate the structured-build selector before generic hardening can reject a networked
+        // spec for a different reason. This keeps the compute routes' Cargo-specific empty-egress
+        // refusal explicit, while registry resolution remains after the hardening assertion.
+        let cargo_vendor_reference = validated_cargo_vendor_reference(spec)
+            .map_err(|error| SandboxLaunchError::Failed(GvisorError::Runtime(error)))?;
         let profile = HardeningProfile::derive(spec);
         profile
             .assert_enforced()
@@ -2763,6 +3193,20 @@ impl GvisorBackend {
         let verified_rootfs = registry
             .resolve(&spec.image)
             .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
+        let cargo_vendor = cargo_vendor_reference
+            .as_ref()
+            .map(|reference| registry.resolve_cargo_vendor(reference).cloned())
+            .transpose()
+            .map_err(|error| SandboxLaunchError::Failed(GvisorError::Runtime(error.to_string())))?;
+        if cargo_vendor.is_some()
+            && matches!(&self.workspace_integration, WorkspaceIntegration::Disabled)
+        {
+            return Err(SandboxLaunchError::Failed(GvisorError::Runtime(
+                "a structured Cargo vendor build requires the Enabled workspace integration; \
+                 refusing the compute route rather than launching without its vendor mounts"
+                    .to_string(),
+            )));
+        }
 
         // CT-007 slice 3, piece 7c: for `Enabled`, both managers must be independently healthy
         // BEFORE `reserve` — no reservation or other resource exists yet, so either refusal is an
@@ -2784,7 +3228,7 @@ impl GvisorBackend {
             })?;
         }
 
-        Ok((profile, verified_rootfs))
+        Ok((profile, verified_rootfs, cargo_vendor))
     }
 
     /// **The SHARED, source-identical post-reservation compute body (CT-007 slice 5b.3-6e.1).** Runs
@@ -2802,6 +3246,7 @@ impl GvisorBackend {
         run: F,
         profile: HardeningProfile,
         verified_rootfs: &crate::asset_registry::VerifiedRootfs,
+        cargo_vendor: Option<crate::asset_registry::VerifiedCargoVendor>,
         reserve: ReserveHandle,
         container_id: String,
     ) -> Result<SandboxLaunch, SandboxLaunchError<GvisorError>>
@@ -2834,6 +3279,7 @@ impl GvisorBackend {
                 verified_rootfs.path().to_path_buf(),
                 workspace_manager,
                 userns_allocator,
+                cargo_vendor,
             ) {
                 Ok((cfg, context)) => {
                     enabled_context = Some(context);
@@ -3082,7 +3528,8 @@ impl GvisorBackend {
             -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure>,
     {
         use crate::checkout_orchestration::ParentAttemptAdmission;
-        let (profile, verified_rootfs) = self.compute_launch_preflight(spec, hooks)?;
+        let (profile, verified_rootfs, cargo_vendor) =
+            self.compute_launch_preflight(spec, hooks)?;
         // Same generated container id as the legacy path — a safe, unique path component.
         let container_id = format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
         match hooks
@@ -3100,6 +3547,7 @@ impl GvisorBackend {
                     run,
                     profile,
                     verified_rootfs,
+                    cargo_vendor,
                     reserve,
                     container_id,
                 )
@@ -3107,8 +3555,7 @@ impl GvisorBackend {
             ParentAttemptAdmission::AttemptsExhausted { claim, reserve: _ } => {
                 Ok(SandboxCycleOutcome::PreparationTerminal {
                     claim,
-                    disposition:
-                        crate::runner::PreparationTerminalDisposition::AttemptsExhausted,
+                    disposition: crate::runner::PreparationTerminalDisposition::AttemptsExhausted,
                     diagnostic: None,
                 })
             }
@@ -3491,17 +3938,23 @@ impl GvisorBackend {
                     .lock()
                     .unwrap()
                     .insert(guest_id.clone(), RunscProc { child, bundle_dir });
-                Ok(CheckoutContinuationOutcome::WorkloadLaunched(SandboxLaunch {
-                    handle: SandboxHandle { guest_id },
-                    result,
-                    output_complete: run_error.is_none(),
-                }))
+                Ok(CheckoutContinuationOutcome::WorkloadLaunched(
+                    SandboxLaunch {
+                        handle: SandboxHandle { guest_id },
+                        result,
+                        output_complete: run_error.is_none(),
+                    },
+                ))
             }
             RetainedWorkloadOutcome::Ran(Err(run_failure)) => {
                 // The workload bound + ran, then a post-settle failure surfaced. Classify by whether the
                 // launch CAS committed (finding 5): pre-CAS `Uncommitted` → preparation requeue; a
                 // committed running claim → the reporter-owned workload retry path.
-                Ok(classify_bound_workload_failure(authority, report_claim, run_failure))
+                Ok(classify_bound_workload_failure(
+                    authority,
+                    report_claim,
+                    run_failure,
+                ))
             }
             RetainedWorkloadOutcome::RunFailed {
                 failure,
@@ -3685,9 +4138,11 @@ fn classify_bound_workload_failure(
     match failure {
         // Pre-CAS: the workload CAS never committed, so the row is still leased — this is a PREPARATION
         // requeue/exhaustion, never a running-claim workload attempt.
-        RunFailure::Uncommitted { .. } => {
-            requeue_or_exhausted(authority, report_claim, PreparationPhase::CheckoutMaterialization)
-        }
+        RunFailure::Uncommitted { .. } => requeue_or_exhausted(
+            authority,
+            report_claim,
+            PreparationPhase::CheckoutMaterialization,
+        ),
         RunFailure::CommitOutcomeUnknown { .. } => {
             CheckoutContinuationOutcome::ReconciliationRequired {
                 phase: PreparationPhase::CheckoutMaterialization,
@@ -3745,7 +4200,13 @@ impl GvisorBackend {
             // Production step 15: the REAL continuation, byte-identical to the prior inline call —
             // same live `authority`/`report_claim`/`runtime`, threading this backend's `cancellation`
             // + `output`. `move` so the `output` sink is owned by the one-shot continuation.
-            move |authority, report_claim, scope, runtime, preparation_spec, workspace_manager, rootfs| {
+            move |authority,
+                  report_claim,
+                  scope,
+                  runtime,
+                  preparation_spec,
+                  workspace_manager,
+                  rootfs| {
                 self.launch_checkout_continuation(
                     spec,
                     hooks,
@@ -3824,12 +4285,15 @@ impl GvisorBackend {
             .map_err(|e| CheckoutOrchestrationError::Hook(HookError(e.to_string())))?;
         let registry = self.registry.as_ref().ok_or_else(|| {
             CheckoutOrchestrationError::Hook(HookError(
-                "checkout orchestration requires an asset registry for the workload image".to_string(),
+                "checkout orchestration requires an asset registry for the workload image"
+                    .to_string(),
             ))
         })?;
         let verified_rootfs = registry
             .resolve(&spec.image)
             .map_err(|e| CheckoutOrchestrationError::Hook(HookError(e.to_string())))?;
+        let cargo_vendor = selected_cargo_vendor(spec, registry)
+            .map_err(|e| CheckoutOrchestrationError::Hook(HookError(e)))?;
         let (workspace_manager, userns_allocator) = match &self.workspace_integration {
             WorkspaceIntegration::Enabled {
                 workspace_manager,
@@ -3869,16 +4333,15 @@ impl GvisorBackend {
                 ))))
             }
         };
-        let region = match &spec.run_token_authorization {
-            Some(crate::RunTokenAuthorizationContext::CiJob(ctx)) => ctx.region.clone(),
-            None => {
-                return Err(CheckoutOrchestrationError::Hook(HookError(
+        let region =
+            match &spec.run_token_authorization {
+                Some(crate::RunTokenAuthorizationContext::CiJob(ctx)) => ctx.region.clone(),
+                None => return Err(CheckoutOrchestrationError::Hook(HookError(
                     "checkout orchestration requires a resolved run-token authorization context \
                      (for the region)"
                         .to_string(),
-                )))
-            }
-        };
+                ))),
+            };
         let tenant = scope.tenant().0.clone();
         let repo = scope.repo_id().to_string();
         let expected = crate::workspace_intent::ExpectedGitCommitId::new(
@@ -3892,8 +4355,9 @@ impl GvisorBackend {
         // an exhausted attempt has no authority but still needs the claim to report its terminal.
         let (report_claim, _reserve, attempt_authority) = match hooks
             .reserve_parent_attempt(spec)
-            .map_err(CheckoutOrchestrationError::Hook)?
-        {
+            .map_err(
+            CheckoutOrchestrationError::Hook,
+        )? {
             ParentAttemptAdmission::Admitted {
                 claim,
                 reserve,
@@ -3949,13 +4413,12 @@ impl GvisorBackend {
         // Step 10: the fetch leg mints + authorizes its OWN generation mid-transport (only after the
         // advertisement retires and the lease renews — the transport drives that ordering internally),
         // against the fetch generation's OWN phase-local spec (finding 1).
-        let mut fetch_leg =
-            || -> Result<(RunTokenCredential, PhaseAuthorization), HookError> {
-                let carrier = authority
-                    .mint_phase_credential(CheckoutPhase::Fetch)
-                    .map_err(|e| HookError(e.to_string()))?;
-                authorize_phase_generation(hooks, spec, &scope, CheckoutPhase::Fetch, carrier)
-            };
+        let mut fetch_leg = || -> Result<(RunTokenCredential, PhaseAuthorization), HookError> {
+            let carrier = authority
+                .mint_phase_credential(CheckoutPhase::Fetch)
+                .map_err(|e| HookError(e.to_string()))?;
+            authorize_phase_generation(hooks, spec, &scope, CheckoutPhase::Fetch, carrier)
+        };
 
         // Step 9/13: the ONE renewal checkpoint composed from the attempt authority (replaces the
         // Hop A transport's historical `None`).
@@ -4008,6 +4471,7 @@ impl GvisorBackend {
             verified_rootfs.path().to_path_buf(),
             workspace_manager,
             userns_allocator,
+            cargo_vendor,
         ) {
             Ok(runtime) => runtime,
             Err(failure) => {
@@ -4169,7 +4633,14 @@ impl SandboxBackend for GvisorBackend {
                 hooks,
                 move |spec, cfg, permit, rootfs, container_id, prep| {
                     run_production_container_streaming(
-                        spec, cfg, permit, rootfs, container_id, Some(output), cancellation, prep,
+                        spec,
+                        cfg,
+                        permit,
+                        rootfs,
+                        container_id,
+                        Some(output),
+                        cancellation,
+                        prep,
                     )
                 },
             ),
@@ -4183,23 +4654,31 @@ impl SandboxBackend for GvisorBackend {
                             .to_string(),
                     )))
                 })?;
-                self.launch_checkout_orchestrated_with(spec, hooks, repo_root, &cancellation, Some(output))
-                    .map(SandboxCycleOutcome::from)
-                    .map_err(|error| {
-                        SandboxLaunchError::Failed(match error {
-                            crate::checkout_orchestration::CheckoutOrchestrationError::Hook(h) => {
-                                GvisorError::Hook(h)
-                            }
-                            other => GvisorError::Runtime(other.to_string()),
-                        })
+                self.launch_checkout_orchestrated_with(
+                    spec,
+                    hooks,
+                    repo_root,
+                    &cancellation,
+                    Some(output),
+                )
+                .map(SandboxCycleOutcome::from)
+                .map_err(|error| {
+                    SandboxLaunchError::Failed(match error {
+                        crate::checkout_orchestration::CheckoutOrchestrationError::Hook(h) => {
+                            GvisorError::Hook(h)
+                        }
+                        other => GvisorError::Runtime(other.to_string()),
                     })
+                })
             }
             // A malformed workspace (mixed Some/None, unparseable ref/commit) — refuse before reserve
             // or spawn; it is dispatched as neither compute nor checkout.
-            Err(reason) => Err(SandboxLaunchError::Failed(GvisorError::Hook(HookError(format!(
+            Err(reason) => Err(SandboxLaunchError::Failed(GvisorError::Hook(HookError(
+                format!(
                 "run_cycle refused a malformed workspace spec (neither a clean compute nor a valid \
                  checkout job): {reason}"
-            ))))),
+            ),
+            )))),
         }
     }
 
@@ -4525,7 +5004,13 @@ fn run_production_container_streaming(
                     unreachable!("EnabledPrepared is handled in the arm above")
                 }
             };
-            bind_then_continue(enabled, container_id, cgroup.identity(), revalidate, capture)
+            bind_then_continue(
+                enabled,
+                container_id,
+                cgroup.identity(),
+                revalidate,
+                capture,
+            )
         }
     };
     let (result, child_retirement) = match bind_and_capture_result {
@@ -4646,6 +5131,9 @@ impl Drop for BundleCleanupGuard {
 struct StagedProductionBundle {
     path: PathBuf,
     cleanup: BundleCleanupGuard,
+    // Held across staging, spawn, execution, and teardown so the descriptor-derived mount source
+    // can never be recycled to another inode while runsc may still open it.
+    _cargo_vendor: Option<FdBoundCargoVendor>,
 }
 
 impl StagedProductionBundle {
@@ -4670,7 +5158,11 @@ fn stage_production_bundle(
     cfg: &OciConfig,
     rootfs: &Path,
 ) -> Result<StagedProductionBundle, String> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+    // Verify and fd-bind before producing any bundle bytes. For a structured build this capability
+    // is moved into `StagedProductionBundle` and kept alive through the entire runtime lifecycle.
+    let cargo_vendor = cfg.fd_bind_cargo_vendor_before_spawn()?;
 
     let bundle = std::env::temp_dir().join(format!(
         "myelin-gvisor-prod-{}-{}",
@@ -4684,6 +5176,7 @@ fn stage_production_bundle(
     let mut staged = StagedProductionBundle {
         path: bundle.clone(),
         cleanup: BundleCleanupGuard::new(bundle.clone()),
+        _cargo_vendor: cargo_vendor,
     };
     #[cfg(unix)]
     if let Err(error) = std::os::unix::fs::symlink(rootfs, bundle.join("rootfs")) {
@@ -4693,6 +5186,42 @@ fn stage_production_bundle(
             Err(cleanup) => format!("symlink rootfs into bundle: {error}; {cleanup}"),
         });
     }
+    let cargo_config_path = if cfg.has_cargo_vendor() {
+        let path = bundle.join("cargo-config.toml");
+        let mut cargo_config = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let cleanup = staged.cleanup();
+                return Err(match cleanup {
+                    Ok(()) => format!("create server Cargo config: {error}"),
+                    Err(cleanup) => {
+                        format!("create server Cargo config: {error}; {cleanup}")
+                    }
+                });
+            }
+        };
+        if let Err(error) = cargo_config
+            .write_all(SERVER_CARGO_CONFIG_TOML.as_bytes())
+            .and_then(|()| cargo_config.sync_all())
+            .and_then(|()| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)))
+        {
+            drop(cargo_config);
+            let cleanup = staged.cleanup();
+            return Err(match cleanup {
+                Ok(()) => format!("write server Cargo config: {error}"),
+                Err(cleanup) => format!("write server Cargo config: {error}; {cleanup}"),
+            });
+        }
+        drop(cargo_config);
+        Some(path)
+    } else {
+        None
+    };
     let config_path = bundle.join("config.json");
     let mut file = match std::fs::OpenOptions::new()
         .write(true)
@@ -4709,8 +5238,27 @@ fn stage_production_bundle(
             });
         }
     };
-    let json = cfg.to_json_zeroizing();
-    if let Err(error) = file.write_all(json.as_bytes()).and_then(|()| file.sync_all()) {
+    let cargo_vendor_source = staged
+        ._cargo_vendor
+        .as_ref()
+        .map(|bound| bound.vendor_mount_source.as_path());
+    let json = match cfg
+        .to_json_zeroizing_with_cargo_sources(cargo_config_path.as_deref(), cargo_vendor_source)
+    {
+        Ok(json) => json,
+        Err(error) => {
+            drop(file);
+            let cleanup = staged.cleanup();
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => format!("{error}; {cleanup}"),
+            });
+        }
+    };
+    if let Err(error) = file
+        .write_all(json.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
         drop(file);
         let cleanup = staged.cleanup();
         return Err(match cleanup {
@@ -5015,10 +5563,7 @@ fn reject_security_capability_xattr_given(
     }
 }
 
-fn verify_helper_security_capability_xattr(
-    path: &Path,
-    expected: &[u8],
-) -> Result<(), String> {
+fn verify_helper_security_capability_xattr(path: &Path, expected: &[u8]) -> Result<(), String> {
     match security_capability_xattr(path)? {
         None => Ok(()),
         Some(actual) if actual == expected => Ok(()),
@@ -6621,13 +7166,11 @@ fn drain_to_temp_file<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
     // second, independent access to what may be sensitive wire content) by seeking to the start. A
     // read-back failure is treated as truncated (fail-closed: the wire seam refuses rather than
     // serving a short/empty pack).
-    let head = match file
-        .seek(std::io::SeekFrom::Start(0))
-        .and_then(|_| {
-            let mut buf = Vec::new();
-            file.read_to_end(&mut buf)?;
-            Ok(buf)
-        }) {
+    let head = match file.seek(std::io::SeekFrom::Start(0)).and_then(|_| {
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        Ok(buf)
+    }) {
         Ok(bytes) => bytes,
         Err(_) => {
             truncated = true;
@@ -7104,9 +7647,8 @@ fn verify_gvisor_git_rootfs_given(
                 "git rootfs OCI mount target /{destination} must be a real directory"
             ));
         }
-        let mut entries = std::fs::read_dir(&path).map_err(|error| {
-            format!("read git rootfs OCI mount target /{destination}: {error}")
-        })?;
+        let mut entries = std::fs::read_dir(&path)
+            .map_err(|error| format!("read git rootfs OCI mount target /{destination}: {error}"))?;
         if entries.next().is_some() {
             return Err(format!(
                 "git rootfs OCI mount target /{destination} must be empty before hashing and use"
@@ -7981,13 +8523,28 @@ fn stage_config_only_bundle(cfg: &OciConfig, label: &str) -> Result<PathBuf, Sta
             message: format!("create bundle dir {bundle:?}: {e}"),
             leaked: false,
         })?;
-    let json = cfg.to_json_zeroizing();
+    let json = cfg.to_json_zeroizing().map_err(|message| {
+        let (message, leaked) = match std::fs::remove_dir_all(&bundle) {
+            Ok(()) => (message, false),
+            Err(cleanup) => (
+                format!(
+                    "{message} AND cleaning up the partially-staged bundle dir also failed: \
+                     {cleanup}"
+                ),
+                true,
+            ),
+        };
+        StageBundleError { message, leaked }
+    })?;
     let write_result = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(bundle.join("config.json"))
-        .and_then(|mut file| file.write_all(json.as_bytes()).and_then(|()| file.sync_all()));
+        .and_then(|mut file| {
+            file.write_all(json.as_bytes())
+                .and_then(|()| file.sync_all())
+        });
     if let Err(e) = write_result {
         return Err(match std::fs::remove_dir_all(&bundle) {
             Ok(()) => StageBundleError {
@@ -8118,20 +8675,19 @@ fn parse_upload_pack_advertisement(
         match read_pkt_line(response, &mut pos)? {
             PktLine::Flush => break,
             PktLine::Data(data) => {
-                let (line, caps) = if first_line {
-                    match data.iter().position(|&b| b == 0) {
-                        Some(nul) => (&data[..nul], &data[nul + 1..]),
-                        None => {
-                            return Err(
+                let (line, caps) =
+                    if first_line {
+                        match data.iter().position(|&b| b == 0) {
+                            Some(nul) => (&data[..nul], &data[nul + 1..]),
+                            None => return Err(
                                 "advertisement's first ref line is missing a capability section \
                                  (malformed or spoofed response)"
                                     .to_string(),
-                            )
+                            ),
                         }
-                    }
-                } else {
-                    (data, &[][..])
-                };
+                    } else {
+                        (data, &[][..])
+                    };
                 first_line = false;
                 let line = std::str::from_utf8(line)
                     .map_err(|_| "ref-advertisement line is not UTF-8".to_string())?;
@@ -8486,7 +9042,12 @@ pub(crate) fn fetch_checkout_pack(
             String::from_utf8_lossy(&fetched.result.stderr)
         ))
     } else {
-        parse_checkout_fetch_response(&fetched.result.stdout, expected, &mut pack_file, limits.disk_bytes)
+        parse_checkout_fetch_response(
+            &fetched.result.stdout,
+            expected,
+            &mut pack_file,
+            limits.disk_bytes,
+        )
     };
     let kill_result = backend.kill(&fetched.handle);
     // Same combine-don't-lose-either-error fix as the advertisement block above.
@@ -8605,8 +9166,7 @@ impl CheckoutTransportError {
                 }
             }
             Self::UsageUnrepresentable {
-                teardown_unproven,
-                ..
+                teardown_unproven, ..
             } => PreparationAttemptDisposition::ReconciliationRequired {
                 phase: PreparationPhase::CheckoutTransport,
                 teardown_unproven: *teardown_unproven,
@@ -8632,10 +9192,7 @@ fn checkout_transport_terminal_failed(
     }
 }
 
-fn checkout_transport_timed_out(
-    message: String,
-    usage: ResourceUsage,
-) -> CheckoutTransportError {
+fn checkout_transport_timed_out(message: String, usage: ResourceUsage) -> CheckoutTransportError {
     CheckoutTransportError::Failed {
         message,
         usage,
@@ -8647,10 +9204,7 @@ fn checkout_transport_timed_out(
     }
 }
 
-fn checkout_transport_retryable(
-    message: String,
-    usage: ResourceUsage,
-) -> CheckoutTransportError {
+fn checkout_transport_retryable(message: String, usage: ResourceUsage) -> CheckoutTransportError {
     CheckoutTransportError::Failed {
         message,
         usage,
@@ -9492,10 +10046,7 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
     // a staging failure here must still carry the advertisement's already-measured usage, never
     // silently drop it.
     let mut pack_file = tempfile_for_checkout_pack().map_err(|e| {
-        checkout_transport_retryable(
-            format!("stage pack artifact: {e}"),
-            usage_after_advertise,
-        )
+        checkout_transport_retryable(format!("stage pack artifact: {e}"), usage_after_advertise)
     })?;
 
     // CT-007 lease/topology reconciliation: Hop A contains TWO independently full-timeout
@@ -9543,9 +10094,7 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
             // permit from another.
             let permit = authorization
                 .into_transport_permit(crate::CheckoutPhase::Fetch, &credential, tenant, repo, expected)
-                .map_err(|error| {
-                    checkout_transport_retryable(error.0, usage_after_advertise)
-                })?;
+                .map_err(|error| checkout_transport_retryable(error.0, usage_after_advertise))?;
             (credential, permit)
         }
     };
@@ -9567,10 +10116,7 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
         synthetic_parent_attempt_idem_token("checkout-fetch"),
     )
     .map_err(|e| {
-        checkout_transport_retryable(
-            format!("build fetch spec: {e}"),
-            usage_after_advertise,
-        )
+        checkout_transport_retryable(format!("build fetch spec: {e}"), usage_after_advertise)
     })?;
     let mut fetch_command = Vec::with_capacity(fetch_spec.git_argv.len() + 2);
     fetch_command.push("git".to_string());
@@ -9594,36 +10140,18 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
         limits.disk_bytes,
     )
     .map_err(|e| {
-        checkout_transport_terminal_failed(
-            format!("parse fetch response: {e}"),
-            usage_after_fetch,
-        )
+        checkout_transport_terminal_failed(format!("parse fetch response: {e}"), usage_after_fetch)
     })?;
 
-    pack_file
-        .flush()
-        .map_err(|e| {
-            checkout_transport_retryable(
-                format!("flush pack artifact: {e}"),
-                usage_after_fetch,
-            )
-        })?;
-    let mut pack_file = pack_file
-        .into_inner()
-        .map_err(|e| {
-            checkout_transport_retryable(
-                format!("finish pack artifact: {e}"),
-                usage_after_fetch,
-            )
-        })?;
-    pack_file
-        .seek(std::io::SeekFrom::Start(0))
-        .map_err(|e| {
-            checkout_transport_retryable(
-                format!("rewind pack artifact: {e}"),
-                usage_after_fetch,
-            )
-        })?;
+    pack_file.flush().map_err(|e| {
+        checkout_transport_retryable(format!("flush pack artifact: {e}"), usage_after_fetch)
+    })?;
+    let mut pack_file = pack_file.into_inner().map_err(|e| {
+        checkout_transport_retryable(format!("finish pack artifact: {e}"), usage_after_fetch)
+    })?;
+    pack_file.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
+        checkout_transport_retryable(format!("rewind pack artifact: {e}"), usage_after_fetch)
+    })?;
 
     Ok(ParentAttemptCheckoutTransportOutcome {
         pack: PrefetchedCheckoutPack {
@@ -9806,14 +10334,12 @@ impl CheckoutPreparationError {
             Self::Refused(_) => PreparationAttemptDisposition::RefusedBeforeExecution {
                 phase: PreparationPhase::CheckoutMaterialization,
             },
-            Self::Unreleasable { .. } => {
-                PreparationAttemptDisposition::ReconciliationRequired {
-                    phase: PreparationPhase::CheckoutMaterialization,
-                    teardown_unproven: false,
-                    usage_unrepresentable: false,
-                    quarantine_required: true,
-                }
-            }
+            Self::Unreleasable { .. } => PreparationAttemptDisposition::ReconciliationRequired {
+                phase: PreparationPhase::CheckoutMaterialization,
+                teardown_unproven: false,
+                usage_unrepresentable: false,
+                quarantine_required: true,
+            },
             Self::TeardownUnproven { .. } => {
                 PreparationAttemptDisposition::ReconciliationRequired {
                     phase: PreparationPhase::CheckoutMaterialization,
@@ -9874,9 +10400,7 @@ fn checkout_materialization_retryable(
 /// preparation session reached `Prepared`. The immediate launch permit makes
 /// `CommitOutcomeUnknown` unreachable in today's production path, but matching every variant here
 /// keeps a future invariant violation fail-closed exactly like Hop A's [`map_hop_run_failure`].
-fn map_checkout_materialization_run_failure(
-    failure: RunFailure,
-) -> CheckoutPreparationError {
+fn map_checkout_materialization_run_failure(failure: RunFailure) -> CheckoutPreparationError {
     match failure {
         failure @ RunFailure::CommitOutcomeUnknown { .. } => {
             CheckoutPreparationError::RejectedAfterQuiescence {
@@ -9896,14 +10420,15 @@ fn map_checkout_materialization_run_failure(
                 },
             }
         }
-        failure @ (RunFailure::Uncommitted { .. }
-        | RunFailure::CommittedButNotExecuted { .. }) => checkout_materialization_retryable(
-            format!("the run itself failed: {failure}"),
-            ResourceUsage {
-                cpu_seconds: 0,
-                mem_byte_seconds: 0,
-            },
-        ),
+        failure @ (RunFailure::Uncommitted { .. } | RunFailure::CommittedButNotExecuted { .. }) => {
+            checkout_materialization_retryable(
+                format!("the run itself failed: {failure}"),
+                ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0,
+                },
+            )
+        }
         failure @ RunFailure::Executed { usage, .. } => {
             checkout_materialization_retryable(format!("the run itself failed: {failure}"), usage)
         }
@@ -10241,8 +10766,10 @@ impl ScopedDacReadSearch {
         let mut capabilities = current_thread_capabilities()
             .map_err(|error| format!("read verifier-thread capabilities: {error}"))?;
         if !capability_is_permitted(&capabilities, CAP_DAC_READ_SEARCH_NUMBER) {
-            return Err("CAP_DAC_READ_SEARCH is absent from the verifier thread's permitted set"
-                .to_string());
+            return Err(
+                "CAP_DAC_READ_SEARCH is absent from the verifier thread's permitted set"
+                    .to_string(),
+            );
         }
         if capability_is_effective(&capabilities, CAP_DAC_READ_SEARCH_NUMBER) {
             return Err(
@@ -10251,11 +10778,7 @@ impl ScopedDacReadSearch {
                     .to_string(),
             );
         }
-        set_capability_effective(
-            &mut capabilities,
-            CAP_DAC_READ_SEARCH_NUMBER,
-            true,
-        );
+        set_capability_effective(&mut capabilities, CAP_DAC_READ_SEARCH_NUMBER, true);
         set_current_thread_capabilities(&capabilities)
             .map_err(|error| format!("enable scoped CAP_DAC_READ_SEARCH: {error}"))?;
         Ok(Self { active: true })
@@ -10264,17 +10787,15 @@ impl ScopedDacReadSearch {
     fn clear_current_thread() -> Result<(), String> {
         let mut capabilities = current_thread_capabilities()
             .map_err(|error| format!("read verifier-thread capabilities for restore: {error}"))?;
-        set_capability_effective(
-            &mut capabilities,
-            CAP_DAC_READ_SEARCH_NUMBER,
-            false,
-        );
+        set_capability_effective(&mut capabilities, CAP_DAC_READ_SEARCH_NUMBER, false);
         set_current_thread_capabilities(&capabilities)
             .map_err(|error| format!("clear scoped CAP_DAC_READ_SEARCH: {error}"))?;
         let verified = current_thread_capabilities()
             .map_err(|error| format!("re-read restored verifier-thread capabilities: {error}"))?;
         if capability_is_effective(&verified, CAP_DAC_READ_SEARCH_NUMBER) {
-            return Err("CAP_DAC_READ_SEARCH remained effective after the verifier scope".to_string());
+            return Err(
+                "CAP_DAC_READ_SEARCH remained effective after the verifier scope".to_string(),
+            );
         }
         Ok(())
     }
@@ -10413,9 +10934,7 @@ enum CheckoutCleanupPlan {
 fn checkout_cleanup_plan(disposition: CheckoutSessionCleanup) -> CheckoutCleanupPlan {
     match disposition {
         CheckoutSessionCleanup::NeverBound => CheckoutCleanupPlan::DeleteWorkspaceThenReleaseUnused,
-        CheckoutSessionCleanup::Prepared => {
-            CheckoutCleanupPlan::DeleteWorkspaceThenReleasePrepared
-        }
+        CheckoutSessionCleanup::Prepared => CheckoutCleanupPlan::DeleteWorkspaceThenReleasePrepared,
         CheckoutSessionCleanup::TeardownUnproven | CheckoutSessionCleanup::Unreleasable => {
             CheckoutCleanupPlan::QuarantineBoth
         }
@@ -10702,12 +11221,11 @@ fn run_checkout_preparation_inner(
     // Revalidate the runsc-root identity live, immediately before it is baked into
     // `PreparedRuntimeMode` — same pattern as the ordinary workload path's `RuntimeBinding::Enabled`
     // construction (`launch_with`), re-revalidated again below, right at the actual bind boundary.
-    let expected_root_identity = revalidated_explicit_userns_root_identity()
-        .map_err(|reason| {
-            CheckoutPreparationError::Refused(format!(
-                "runsc-root identity revalidation failed: {reason}"
-            ))
-        })?;
+    let expected_root_identity = revalidated_explicit_userns_root_identity().map_err(|reason| {
+        CheckoutPreparationError::Refused(format!(
+            "runsc-root identity revalidation failed: {reason}"
+        ))
+    })?;
     let prepared_mode = PreparedRuntimeMode::ExplicitUserNamespace {
         config: userns,
         expected_root_identity,
@@ -10726,11 +11244,7 @@ fn run_checkout_preparation_inner(
             return Err(CheckoutPreparationError::Refused(e));
         }
     };
-    let container_id = format!(
-        "myelin-checkout-{}-{}",
-        std::process::id(),
-        unique_suffix()
-    );
+    let container_id = format!("myelin-checkout-{}-{}", std::process::id(), unique_suffix());
 
     // Durably bind `session`/`lease` to the preparation runtime BEFORE ever calling
     // `run_and_capture` -- immediately after the cgroup exists (so `cgroup.identity()` is
@@ -10928,19 +11442,13 @@ fn evaluate_checkout_finalization(
     }
     let tree_oid = match parse_checkout_confirmation_line(&outcome.stdout, expected_commit) {
         Ok(tree) => tree,
-        Err(reason) => {
-            return Err(checkout_materialization_terminal_failed(reason, usage))
-        }
+        Err(reason) => return Err(checkout_materialization_terminal_failed(reason, usage)),
     };
-    let cargo_lock_sha256_hex = match verify_materialized_checkout_no_follow(
-        workspace_host_path,
-        expected_commit,
-    ) {
-        Ok(hex) => hex,
-        Err(reason) => {
-            return Err(checkout_materialization_terminal_failed(reason, usage))
-        }
-    };
+    let cargo_lock_sha256_hex =
+        match verify_materialized_checkout_no_follow(workspace_host_path, expected_commit) {
+            Ok(hex) => hex,
+            Err(reason) => return Err(checkout_materialization_terminal_failed(reason, usage)),
+        };
 
     Ok(PreparedCheckoutEvidence {
         commit_hex: expected_commit.as_str().to_string(),
@@ -10970,7 +11478,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::RunTokenCredential;
+    use crate::{EnvVar, RunTokenCredential};
     // CT-007 slice 5b.3-6e.2 Stage A: the git-wire fakes were lifted to a
     // `#[cfg(any(test, feature = "test-support"))]` module (below the top-level test module) so the
     // hardware-independent runsc-driver seam + §4 tests can reach them. Re-imported here so the
@@ -10985,11 +11493,7 @@ mod tests {
         capabilities[word].effective |= mask;
         capabilities[word].inheritable |= mask;
 
-        normalize_capability_sets(
-            &mut capabilities,
-            CAP_DAC_READ_SEARCH_NUMBER,
-            true,
-        );
+        normalize_capability_sets(&mut capabilities, CAP_DAC_READ_SEARCH_NUMBER, true);
 
         assert!(capability_is_permitted(
             &capabilities,
@@ -11013,11 +11517,7 @@ mod tests {
         capabilities[word].effective |= mask;
         capabilities[word].inheritable |= mask;
 
-        normalize_capability_sets(
-            &mut capabilities,
-            CAP_DAC_READ_SEARCH_NUMBER,
-            false,
-        );
+        normalize_capability_sets(&mut capabilities, CAP_DAC_READ_SEARCH_NUMBER, false);
 
         assert!(!capability_is_permitted(
             &capabilities,
@@ -11114,7 +11614,9 @@ mod tests {
         );
         let legacy_preparation = source_of("pub(crate) fn run_checkout_preparation(");
         assert_eq!(
-            legacy_preparation.matches("LaunchPermit::immediate()").count(),
+            legacy_preparation
+                .matches("LaunchPermit::immediate()")
+                .count(),
             1,
             "the LEGACY Hop B entry point is the one place an immediate preparation permit exists"
         );
@@ -11159,7 +11661,8 @@ mod tests {
         );
         assert!(
             v2_transport.contains("advertise: PhaseAuthorization")
-                && v2_transport.contains("Result<(RunTokenCredential, PhaseAuthorization), HookError>"),
+                && v2_transport
+                    .contains("Result<(RunTokenCredential, PhaseAuthorization), HookError>"),
             "the V2 Hop A entry point takes the fused authorization for both legs"
         );
         let inner_transport = source_of("fn fetch_checkout_pack_within_parent_attempt_inner(");
@@ -11730,12 +12233,14 @@ mod tests {
             "the outer orchestrator has exactly ONE caller — the activated `run_cycle` selector"
         );
         assert_eq!(
-            prod.matches("fn launch_checkout_orchestrated_with(").count(),
+            prod.matches("fn launch_checkout_orchestrated_with(")
+                .count(),
             1,
             "the activated outer orchestrator is defined exactly once"
         );
         assert_eq!(
-            prod.matches("fn launch_checkout_orchestrated_with_given").count(),
+            prod.matches("fn launch_checkout_orchestrated_with_given")
+                .count(),
             1,
             "its shared injectable body is defined exactly once"
         );
@@ -11889,7 +12394,8 @@ mod tests {
         // the `with_checkout_config` selector (which a controlplane root could call) is enforced by the
         // recursive both-crates dormancy scan `the_v2_phase_credential_surface_has_exactly_its_known_occurrences`.
         assert_eq!(
-            prod.matches("checkout: GvisorCheckoutConfig::disabled()").count(),
+            prod.matches("checkout: GvisorCheckoutConfig::disabled()")
+                .count(),
             3,
             "every production GvisorBackend constructor leaves checkout disabled()"
         );
@@ -11945,8 +12451,8 @@ mod tests {
             });
         std::fs::create_dir_all(&base).unwrap();
         let base = std::fs::canonicalize(&base).unwrap();
-        let accepted = GvisorCheckoutConfig::enabled(&base)
-            .expect("a canonical directory must be accepted");
+        let accepted =
+            GvisorCheckoutConfig::enabled(&base).expect("a canonical directory must be accepted");
         assert_eq!(
             accepted.repo_root(),
             Some(base.as_path()),
@@ -12128,7 +12634,8 @@ mod tests {
                                 }
                             }
                             _ => violations.push(
-                                "non-fn associated item in the WorkloadRotatedSpec impl".to_string(),
+                                "non-fn associated item in the WorkloadRotatedSpec impl"
+                                    .to_string(),
                             ),
                         }
                     }
@@ -12143,7 +12650,10 @@ mod tests {
             violations.is_empty(),
             "workload_spec module shape violated: {violations:#?}"
         );
-        assert!(struct_seen && enum_seen, "the two sanctioned types must be present");
+        assert!(
+            struct_seen && enum_seen,
+            "the two sanctioned types must be present"
+        );
         let sorted = |mut v: Vec<String>| {
             v.sort();
             v
@@ -12327,7 +12837,9 @@ mod tests {
             .find("true, // the advertisement hop above already completed.")
             .expect("the fetch hop runs");
         assert!(
-            advertise_hop < checkpoint && checkpoint < provider && provider < fetch_spec
+            advertise_hop < checkpoint
+                && checkpoint < provider
+                && provider < fetch_spec
                 && fetch_spec < fetch_hop,
             "ordering must be advertise -> renew -> mint fetch credential -> build -> spawn"
         );
@@ -12351,8 +12863,7 @@ mod tests {
             .map(|offset| (offset % 251) as u8)
             .collect();
         let sink = Arc::new(RecordingOutput::default());
-        let capped: Arc<dyn SandboxOutputSink> =
-            Arc::new(TotalLogCappedOutput::new(sink.clone()));
+        let capped: Arc<dyn SandboxOutputSink> = Arc::new(TotalLogCappedOutput::new(sink.clone()));
         let output = StreamingOutput { sink: capped };
         let redaction = RedactionPlan::none();
 
@@ -12470,7 +12981,10 @@ mod tests {
                 Err("simulated post-stage launch failure"),
             )
         };
-        assert_eq!(post_stage.unwrap_err(), "simulated post-stage launch failure");
+        assert_eq!(
+            post_stage.unwrap_err(),
+            "simulated post-stage launch failure"
+        );
         assert!(!bundle_path.exists());
         std::fs::remove_dir_all(rootfs).unwrap();
     }
@@ -12480,10 +12994,7 @@ mod tests {
         let payload_limit = 1024;
         let total_limit = payload_limit + TOTAL_LOG_TRUNCATION_MARKER.len();
         let sink = Arc::new(RecordingOutput::default());
-        let capped = Arc::new(TotalLogCappedOutput::with_limit(
-            sink.clone(),
-            total_limit,
-        ));
+        let capped = Arc::new(TotalLogCappedOutput::with_limit(sink.clone(), total_limit));
         let output = StreamingOutput {
             sink: capped.clone(),
         };
@@ -12530,10 +13041,8 @@ mod tests {
         );
 
         let sink = Arc::new(RecordingOutput::default());
-        let capped = TotalLogCappedOutput::with_limit(
-            sink.clone(),
-            TOTAL_LOG_TRUNCATION_MARKER.len() + 8,
-        );
+        let capped =
+            TotalLogCappedOutput::with_limit(sink.clone(), TOTAL_LOG_TRUNCATION_MARKER.len() + 8);
         capped.emit(SandboxOutputStream::Stdout, b"123456").unwrap();
         capped.emit(SandboxOutputStream::Stderr, b"abcdef").unwrap();
         let captured = sink.bytes.lock().unwrap().clone();
@@ -12595,13 +13104,15 @@ mod tests {
             bin,
             RunscInvocationMode::Rootless,
             None,
-            |path| Err(format!("{path:?} carries an unexpected security.capability xattr")),
+            |path| {
+                Err(format!(
+                    "{path:?} carries an unexpected security.capability xattr"
+                ))
+            },
         );
-        assert!(
-            result
-                .unwrap_err()
-                .contains("unexpected security.capability xattr")
-        );
+        assert!(result
+            .unwrap_err()
+            .contains("unexpected security.capability xattr"));
         assert_eq!(
             cmd.get_args().count(),
             0,
@@ -12611,10 +13122,8 @@ mod tests {
 
     #[test]
     fn git_rootfs_requires_every_fixed_mountpoint_and_verifies_a_stable_digest() {
-        let rootfs = std::env::temp_dir().join(format!(
-            "myelin-git-rootfs-integrity-{}",
-            unique_suffix()
-        ));
+        let rootfs =
+            std::env::temp_dir().join(format!("myelin-git-rootfs-integrity-{}", unique_suffix()));
         std::fs::create_dir_all(&rootfs).unwrap();
         for destination in ["tmp", "workspace", "repo", "quarantine"] {
             std::fs::create_dir(rootfs.join(destination)).unwrap();
@@ -12716,6 +13225,418 @@ mod tests {
             IdemToken("idem-runsc-1".into()),
         )
         .unwrap()
+    }
+
+    struct CargoBoundaryFixture {
+        root: PathBuf,
+        rootfs: PathBuf,
+        reference: ImageRef,
+        lock_sha256: String,
+        registry: crate::asset_registry::GvisorAssetRegistry,
+    }
+
+    impl Drop for CargoBoundaryFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn cargo_boundary_fixture(tag: &str) -> CargoBoundaryFixture {
+        let root = std::env::temp_dir().join(format!(
+            "myelin-cargo-boundary-{tag}-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let vendor_asset = root.join("asset");
+        let rootfs = root.join("rootfs");
+        std::fs::create_dir_all(vendor_asset.join("vendor/itoa-1.0.15")).unwrap();
+        std::fs::create_dir_all(vendor_asset.join(".cargo")).unwrap();
+        std::fs::create_dir_all(rootfs.join("opt/myelin/cargo-vendor")).unwrap();
+        std::fs::write(
+            vendor_asset.join("vendor/itoa-1.0.15/.cargo-checksum.json"),
+            b"{}",
+        )
+        .unwrap();
+        std::fs::write(
+            vendor_asset.join("vendor/itoa-1.0.15/lib.rs"),
+            b"pub fn fixture() {}",
+        )
+        .unwrap();
+        std::fs::write(
+            vendor_asset.join(".cargo/config.toml"),
+            SERVER_CARGO_CONFIG_TOML,
+        )
+        .unwrap();
+        std::fs::write(vendor_asset.join("Cargo.lock"), b"fixture lock\n").unwrap();
+        let lock_sha256 =
+            crate::asset_registry::file_sha256_hex(&vendor_asset.join("Cargo.lock")).unwrap();
+        let digest = crate::canonical_tar::canonical_tree_sha256_hex(&vendor_asset).unwrap();
+        let reference =
+            ImageRef::pinned(format!("test.local/cargo-vendor-{tag}@sha256:{digest}")).unwrap();
+        let registry = crate::asset_registry::GvisorAssetRegistry::from_bindings_with_cargo_vendor(
+            Vec::new(),
+            vec![crate::asset_registry::CargoVendorAssetBinding {
+                reference: reference.clone(),
+                root: vendor_asset,
+                cargo_lock_sha256: lock_sha256.clone(),
+            }],
+        )
+        .unwrap();
+        CargoBoundaryFixture {
+            root,
+            rootfs,
+            reference,
+            lock_sha256,
+            registry,
+        }
+    }
+
+    fn structured_cargo_spec(reference: &ImageRef) -> JobSpec {
+        JobSpec::new(
+            JobKind::Ci,
+            fixture_image(),
+            vec![
+                "cargo".into(),
+                "build".into(),
+                "--locked".into(),
+                "--config".into(),
+                CARGO_SOURCE_REPLACE_CONFIG.into(),
+                "--config".into(),
+                CARGO_VENDOR_DIRECTORY_CONFIG.into(),
+            ],
+            vec![
+                EnvVar {
+                    name: "CARGO_HOME".into(),
+                    value: STRUCTURED_CARGO_HOME.into(),
+                },
+                EnvVar {
+                    name: "CARGO_NET_OFFLINE".into(),
+                    value: "true".into(),
+                },
+                EnvVar {
+                    name: CARGO_SOURCE_REPLACE_ENV.into(),
+                    value: CARGO_VENDOR_SOURCE_NAME.into(),
+                },
+                EnvVar {
+                    name: CARGO_VENDOR_DIRECTORY_ENV.into(),
+                    value: OCI_CARGO_VENDOR_MOUNT.into(),
+                },
+                EnvVar {
+                    name: ENV_CARGO_VENDOR_ASSET.into(),
+                    value: reference.reference.clone(),
+                },
+            ],
+            vec![],
+            EgressPolicy::deny_all(),
+            ResourceLimits {
+                cpu_millis: 1000,
+                mem_bytes: 256 << 20,
+                disk_bytes: 1 << 30,
+                tmpfs_bytes: 64 << 20,
+                pids_max: 64,
+                timeout_secs: 120,
+            },
+            WorkspaceSpec::default(),
+            TrustTier::UntrustedFork,
+            RunTokenCredential::new("test-bearer", "cargo-boundary", 300).unwrap(),
+            MeterTarget {
+                reserve_id: "r".into(),
+            },
+            IdemToken("idem-cargo-boundary".into()),
+        )
+        .unwrap()
+    }
+
+    fn wired_cargo_config(fixture: &CargoBoundaryFixture) -> OciConfig {
+        let job = structured_cargo_spec(&fixture.reference);
+        let profile = HardeningProfile::derive(&job);
+        let vendor = selected_cargo_vendor(&job, &fixture.registry)
+            .unwrap()
+            .expect("structured Cargo selector resolves the registered asset");
+        let mut cfg = OciConfig::from_spec(&job, &profile)
+            .with_explicit_user_namespace_and_workspace(
+                UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005),
+                OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace")),
+                fixture.rootfs.clone(),
+            )
+            .unwrap()
+            .with_cargo_vendor(vendor)
+            .unwrap();
+        cfg.bind_materialized_cargo_lock(&fixture.lock_sha256)
+            .unwrap();
+        cfg
+    }
+
+    fn cargo_compute_registry(
+        fixture: &CargoBoundaryFixture,
+    ) -> Arc<crate::asset_registry::GvisorAssetRegistry> {
+        Arc::new(
+            crate::asset_registry::GvisorAssetRegistry::from_bindings_with_cargo_vendor(
+                vec![crate::asset_registry::RootfsAssetBinding {
+                    image: fixture_image(),
+                    rootfs: fixture_rootfs_dir(),
+                }],
+                vec![crate::asset_registry::CargoVendorAssetBinding {
+                    reference: fixture.reference.clone(),
+                    root: fixture.root.join("asset"),
+                    cargo_lock_sha256: fixture.lock_sha256.clone(),
+                }],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn structured_cargo_launch_spec_has_verified_ro_vendor_server_config_and_bounded_writable_home()
+    {
+        let fixture = cargo_boundary_fixture("structured-launch");
+        let cfg = wired_cargo_config(&fixture);
+        let json = cfg.to_json().unwrap();
+        assert!(json.contains("CARGO_HOME=/tmp/cargo-home"), "{json}");
+        assert!(json.contains("CARGO_NET_OFFLINE=true"), "{json}");
+        assert!(json.contains("CARGO_SOURCE_CRATES_IO_REPLACE_WITH=vendored"));
+        assert!(json.contains("CARGO_SOURCE_VENDORED_DIRECTORY=/opt/myelin/cargo-vendor"));
+        assert!(json.contains("\"destination\": \"/tmp\""), "{json}");
+        assert_eq!(
+            json.matches("\"type\": \"tmpfs\"").count(),
+            2,
+            "the structured launch has exactly /tmp plus its nested Cargo-home tmpfs: {json}"
+        );
+        assert_eq!(
+            json.matches("\"size=33554432\"").count(),
+            2,
+            "the two tmpfs quotas partition 64 MiB into 32 MiB + 32 MiB, totaling exactly the one declared bound: {json}"
+        );
+        assert!(
+            json.contains("\"destination\": \"/tmp/cargo-home\"")
+                && json.contains("\"uid=65534\"")
+                && json.contains("\"gid=65534\"")
+                && json.contains("\"mode=0700\"")
+                && json.contains("\"rw\""),
+            "the structured Cargo home must be an explicit writable mount owned by the workload: {json}"
+        );
+        assert!(json.contains("\"destination\": \"/opt/myelin/cargo-vendor\""));
+        assert!(json.contains("\"destination\": \"/tmp/cargo-home/config.toml\""));
+        assert_eq!(json.matches("\"ro\"").count(), 2, "{json}");
+
+        let staged = stage_production_bundle(&cfg, &fixture.rootfs).unwrap();
+        let staged_config = std::fs::read_to_string(staged.path.join("cargo-config.toml")).unwrap();
+        assert_eq!(staged_config, SERVER_CARGO_CONFIG_TOML);
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(staged.path.join("cargo-config.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+        let staged_json = std::fs::read_to_string(staged.path.join("config.json")).unwrap();
+        assert!(staged_json.contains(&format!(
+            "\"source\": {:?}",
+            staged.path.join("cargo-config.toml").to_string_lossy()
+        )));
+        assert!(staged_json.contains("\"destination\": \"/tmp/cargo-home/config.toml\""));
+    }
+
+    #[test]
+    fn cargo_vendor_serialization_missing_sources_returns_typed_refusal_without_panicking() {
+        let fixture = cargo_boundary_fixture("typed-source-refusal");
+        let cfg = wired_cargo_config(&fixture);
+        let config_source = Path::new(TEST_SERVER_CARGO_CONFIG_SOURCE);
+        let vendor_source = Path::new(TEST_FD_BOUND_CARGO_VENDOR_SOURCE);
+
+        let missing_vendor = cfg
+            .to_json_zeroizing_with_cargo_sources(Some(config_source), None)
+            .expect_err("a missing fd-bound vendor source must be a typed refusal");
+        assert!(missing_vendor.contains("without an fd-bound vendor source"));
+
+        let missing_config = cfg
+            .to_json_zeroizing_with_cargo_sources(None, Some(vendor_source))
+            .expect_err("a missing server config source must be a typed refusal");
+        assert!(missing_config.contains("without a server config source"));
+    }
+
+    #[test]
+    fn structured_cargo_compute_route_refuses_instead_of_skipping_vendor_boundary() {
+        let fixture = cargo_boundary_fixture("compute-route");
+        let backend = GvisorBackend::new(cargo_compute_registry(&fixture));
+        let job = structured_cargo_spec(&fixture.reference);
+        let error = backend
+            .launch_with(
+                &job,
+                &ok_hooks(),
+                |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                    panic!(
+                        "a structured compute job without Enabled workspace support must not run"
+                    )
+                },
+            )
+            .expect_err("the compute route must refuse rather than omit the vendor mounts");
+        assert!(
+            error
+                .to_string()
+                .contains("requires the Enabled workspace integration"),
+            "{error}"
+        );
+
+        let mut networked_job = structured_cargo_spec(&fixture.reference);
+        networked_job.egress.allow = vec!["registry.example:443".into()];
+        let error = backend
+            .launch_with(
+                &networked_job,
+                &ok_hooks(),
+                |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                    panic!("a networked structured compute job must not run")
+                },
+            )
+            .expect_err("the compute route must apply empty-egress validation");
+        assert!(
+            error.to_string().contains("empty egress (network=none)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn free_form_command_launch_spec_gets_no_cargo_vendor_boundary() {
+        let fixture = cargo_boundary_fixture("free-form");
+        let mut free_form = structured_cargo_spec(&fixture.reference);
+        free_form.command = vec!["/bin/test".into()];
+        free_form.env.clear();
+        assert!(selected_cargo_vendor(&free_form, &fixture.registry)
+            .unwrap()
+            .is_none());
+        let profile = HardeningProfile::derive(&free_form);
+        let json = OciConfig::from_spec(&free_form, &profile)
+            .with_explicit_user_namespace_and_workspace(
+                UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005),
+                OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace")),
+                PathBuf::from("/abs/staged-rootfs"),
+            )
+            .unwrap()
+            .to_json()
+            .unwrap();
+        assert!(!json.contains(OCI_CARGO_VENDOR_MOUNT), "{json}");
+        assert!(!json.contains(OCI_CARGO_CONFIG_MOUNT), "{json}");
+        assert!(!json.contains("CARGO_HOME="), "{json}");
+        assert!(!json.contains("CARGO_NET_OFFLINE="), "{json}");
+    }
+
+    #[test]
+    fn structured_cargo_vendor_selection_refuses_nonempty_egress_defense_in_depth() {
+        let fixture = cargo_boundary_fixture("egress-refusal");
+        let mut job = structured_cargo_spec(&fixture.reference);
+        job.egress.allow = vec!["registry.example:443".into()];
+        let error = selected_cargo_vendor(&job, &fixture.registry)
+            .expect_err("the sandbox boundary must independently require network=none");
+        assert!(error.contains("empty egress (network=none)"), "{error}");
+    }
+
+    #[test]
+    fn server_cargo_config_replaces_crates_io_with_the_verified_vendor_directory() {
+        assert_eq!(
+            SERVER_CARGO_CONFIG_TOML,
+            "[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = \"/opt/myelin/cargo-vendor\"\n"
+        );
+    }
+
+    #[test]
+    fn cargo_vendor_digest_drift_fails_closed_before_spawn_continuation() {
+        let fixture = cargo_boundary_fixture("drift");
+        let cfg = wired_cargo_config(&fixture);
+        std::fs::write(
+            fixture.root.join("asset/vendor/itoa-1.0.15/tampered"),
+            b"drift",
+        )
+        .unwrap();
+        let error = match stage_production_bundle(&cfg, &fixture.rootfs) {
+            Ok(_) => panic!("post-registration asset drift must refuse"),
+            Err(error) => error,
+        };
+        assert!(error.contains("drifted before spawn"), "{error}");
+    }
+
+    #[test]
+    fn verified_cargo_vendor_mount_is_fd_bound_across_pathname_rename() {
+        let fixture = cargo_boundary_fixture("fd-bound-rename");
+        let cfg = wired_cargo_config(&fixture);
+        let staged = stage_production_bundle(&cfg, &fixture.rootfs)
+            .expect("the unchanged tree must verify and stage");
+        let fd_source = staged
+            ._cargo_vendor
+            .as_ref()
+            .expect("structured staging holds the vendor fd")
+            .vendor_mount_source
+            .clone();
+        let original = std::fs::read_to_string(fd_source.join("itoa-1.0.15/lib.rs")).unwrap();
+
+        let asset_path = fixture.root.join("asset");
+        let moved_path = fixture.root.join("asset-moved-after-verify");
+        std::fs::rename(&asset_path, &moved_path).unwrap();
+        std::fs::create_dir_all(asset_path.join("vendor/itoa-1.0.15")).unwrap();
+        std::fs::write(
+            asset_path.join("vendor/itoa-1.0.15/lib.rs"),
+            b"pub fn replacement() {}",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(fd_source.join("itoa-1.0.15/lib.rs")).unwrap(),
+            original,
+            "the staged mount source must continue to resolve through the held original inode"
+        );
+        let staged_json = std::fs::read_to_string(staged.path.join("config.json")).unwrap();
+        assert!(
+            staged_json.contains(&format!("\"source\": {:?}", fd_source.to_string_lossy())),
+            "the OCI mount must consume the fd-derived source: {staged_json}"
+        );
+        let error = match stage_production_bundle(&cfg, &fixture.rootfs) {
+            Ok(_) => panic!("a later launch must refuse the replacement pathname inode"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("no longer names its registry-verified inode"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn workspace_cargo_config_cannot_shadow_structured_source_boundary() {
+        let fixture = cargo_boundary_fixture("precedence");
+        let workspace = fixture.root.join("workspace");
+        std::fs::create_dir_all(workspace.join(".cargo")).unwrap();
+        std::fs::write(
+            workspace.join(".cargo/config.toml"),
+            b"[source.crates-io]\nreplace-with='tenant'\n[source.tenant]\ndirectory='/workspace/tenant'\n",
+        )
+        .unwrap();
+        let legacy_cargo_home = fixture.root.join("legacy-cargo-home");
+        std::fs::create_dir(&legacy_cargo_home).unwrap();
+        std::fs::write(
+            legacy_cargo_home.join("config"),
+            b"[source.crates-io]\nreplace-with='legacy'\n[source.legacy]\ndirectory='/tmp/legacy'\n",
+        )
+        .unwrap();
+        let cfg = wired_cargo_config(&fixture);
+        let json = cfg.to_json().unwrap();
+        assert_eq!(
+            cfg.args,
+            [
+                "cargo",
+                "build",
+                "--locked",
+                "--config",
+                "source.crates-io.replace-with=\"vendored\"",
+                "--config",
+                "source.vendored.directory=\"/opt/myelin/cargo-vendor\"",
+            ],
+            "platform CLI config must outrank both workspace and legacy Cargo-home config files"
+        );
+        assert!(json.contains("CARGO_SOURCE_CRATES_IO_REPLACE_WITH=vendored"));
+        assert!(json.contains("CARGO_SOURCE_VENDORED_DIRECTORY=/opt/myelin/cargo-vendor"));
+        assert!(json.contains("\"destination\": \"/tmp/cargo-home/config.toml\""));
+        assert!(json.contains("\"ro\""));
+        assert!(!json.contains("/workspace/tenant"));
     }
 
     // ───────── CT-007 slice 3, piece 4: WorkspaceIntegration / GvisorWorkspaceConfig ─────────
@@ -13012,8 +13933,14 @@ mod tests {
         assert!(res.stdout.ends_with(b" now"));
         assert!(res.stderr.starts_with(b"error: "));
         assert!(res.stderr.ends_with(b" invalid"));
-        assert!(!res.stdout.windows(needle.len()).any(|window| window == needle));
-        assert!(!res.stderr.windows(needle.len()).any(|window| window == needle));
+        assert!(!res
+            .stdout
+            .windows(needle.len())
+            .any(|window| window == needle));
+        assert!(!res
+            .stderr
+            .windows(needle.len())
+            .any(|window| window == needle));
     }
 
     #[test]
@@ -13034,11 +13961,7 @@ mod tests {
         let stderr = format!("stderr:{material}");
         let outcome = outcome(stdout.as_bytes(), stderr.as_bytes());
 
-        let result = build_result(
-            &s,
-            &outcome,
-            s.resolved_secrets().redaction_plan(),
-        );
+        let result = build_result(&s, &outcome, s.resolved_secrets().redaction_plan());
 
         assert!(result.stdout.starts_with(b"stdout:"));
         assert!(result.stderr.starts_with(b"stderr:"));
@@ -13153,7 +14076,7 @@ mod tests {
         let cfg = GvisorBackend::oci_config(&spec(vec![])).unwrap();
         assert!(cfg.root_readonly());
         assert!(!cfg.has_network(), "no allowlist ⇒ no network interface");
-        let json = cfg.to_json();
+        let json = cfg.to_json().unwrap();
         assert!(json.contains("\"readonly\": true"));
         assert!(json.contains("\"noNewPrivileges\": true"));
         assert!(
@@ -13232,7 +14155,7 @@ mod tests {
             RunscInvocationMode::Rootless,
             "host mounts alone must not imply a user namespace"
         );
-        let json = cfg.to_json();
+        let json = cfg.to_json().unwrap();
         assert!(
             json.contains("\"path\": \"/abs/staged-rootfs\""),
             "the absolute rootfs override must be emitted verbatim: {json}"
@@ -13285,7 +14208,7 @@ mod tests {
             cfg.invocation_mode(),
             RunscInvocationMode::ExplicitUserNamespace(config)
         );
-        let json = cfg.to_json();
+        let json = cfg.to_json().unwrap();
         assert!(
             json.contains("\"path\": \"/abs/staged-rootfs\""),
             "the workspace layout must use an absolute rootfs override: {json}"
@@ -13444,7 +14367,7 @@ mod tests {
                 Some(PathBuf::from("/host/quarantine")),
             )
             .unwrap();
-        let json = cfg.to_json();
+        let json = cfg.to_json().unwrap();
         assert!(!json.contains("\"destination\": \"/workspace\""));
         assert!(json.contains(WIRE_REPO_MOUNT));
         assert!(json.contains(WIRE_QUARANTINE_MOUNT));
@@ -13467,7 +14390,7 @@ mod tests {
                 value: "/workspace/.cargo".into(),
             },
         ];
-        let json = GvisorBackend::oci_config(&s).unwrap().to_json();
+        let json = GvisorBackend::oci_config(&s).unwrap().to_json().unwrap();
         assert!(
             json.contains("CARGO_NET_OFFLINE=true"),
             "declared env dropped: {json}"
@@ -13499,7 +14422,7 @@ mod tests {
             .expect("the exact declared binding set must couple to redaction");
 
         let cfg = GvisorBackend::oci_config(&s).expect("covered injection is launchable");
-        let json = cfg.to_json();
+        let json = cfg.to_json().unwrap();
         assert!(json.contains(&format!("DEPLOY_TOKEN={material}")));
         assert!(!format!("{s:?}").contains(&material));
         assert!(!format!("{:?}", s.resolved_secrets().redaction_plan()).contains(&material));
@@ -13520,7 +14443,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let json = cfg.to_json();
+        let json = cfg.to_json().unwrap();
         assert!(json.contains(WIRE_REPO_MOUNT));
         assert!(!json.contains(WIRE_QUARANTINE_MOUNT));
     }
@@ -13539,7 +14462,7 @@ mod tests {
             cfg.invocation_mode(),
             RunscInvocationMode::ExplicitUserNamespace(config)
         );
-        let json = cfg.to_json();
+        let json = cfg.to_json().unwrap();
         assert!(
             json.contains("\"type\": \"user\""),
             "a user namespace must be declared: {json}"
@@ -14576,6 +15499,7 @@ mod tests {
             PathBuf::from("/abs/staged-rootfs"),
             &workspace_manager,
             &userns_allocator,
+            None,
         )
         .expect("acquisition must succeed against a healthy real manager/allocator");
         assert_eq!(
@@ -14709,11 +15633,13 @@ mod tests {
             crate::checkout_orchestration::AttemptAuthorityError,
         > {
             self.ops.lock().unwrap().push("mint:Workload".to_string());
-            Ok(crate::checkout_orchestration::WorkloadCredentialCarrier::new(
-                RunTokenCredential::new("bearer", "jti-Workload", 300).unwrap(),
-                fake_authorization_context(),
-                "gen-Workload",
-            ))
+            Ok(
+                crate::checkout_orchestration::WorkloadCredentialCarrier::new(
+                    RunTokenCredential::new("bearer", "jti-Workload", 300).unwrap(),
+                    fake_authorization_context(),
+                    "gen-Workload",
+                ),
+            )
         }
         fn should_requeue(&self) -> bool {
             self.should_requeue
@@ -14819,7 +15745,11 @@ mod tests {
         let authority = FakeAttemptAuthority::new(true);
 
         // Uncommitted (pre-CAS, row still leased) → preparation requeue.
-        let out = classify_bound_workload_failure(&authority, &report_claim(), RunFailure::uncommitted("gate failed"));
+        let out = classify_bound_workload_failure(
+            &authority,
+            &report_claim(),
+            RunFailure::uncommitted("gate failed"),
+        );
         assert!(
             matches!(
                 out,
@@ -14851,7 +15781,10 @@ mod tests {
         assert!(matches!(
             out,
             CheckoutContinuationOutcome::WorkloadRetryable {
-                usage: ResourceUsage { cpu_seconds: 0, mem_byte_seconds: 0 },
+                usage: ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0
+                },
                 ..
             }
         ));
@@ -14871,7 +15804,10 @@ mod tests {
         assert!(matches!(
             out,
             CheckoutContinuationOutcome::WorkloadRetryable {
-                usage: ResourceUsage { cpu_seconds: 5, mem_byte_seconds: 6 },
+                usage: ResourceUsage {
+                    cpu_seconds: 5,
+                    mem_byte_seconds: 6
+                },
                 ..
             }
         ));
@@ -14883,7 +15819,11 @@ mod tests {
     fn classify_uncommitted_terminalizes_when_attempts_are_exhausted() {
         use crate::checkout_orchestration::CheckoutContinuationOutcome;
         let authority = FakeAttemptAuthority::new(false);
-        let out = classify_bound_workload_failure(&authority, &report_claim(), RunFailure::uncommitted("gate failed"));
+        let out = classify_bound_workload_failure(
+            &authority,
+            &report_claim(),
+            RunFailure::uncommitted("gate failed"),
+        );
         assert!(matches!(
             out,
             CheckoutContinuationOutcome::PreparationTerminal {
@@ -14985,6 +15925,7 @@ mod tests {
             PathBuf::from("/abs/staged-rootfs"),
             &workspace_manager,
             &userns_allocator,
+            None,
         )
         .expect("acquisition must succeed against a healthy real manager/allocator");
         // Sanity: the acquisition already exhausted the size-1 pool.
@@ -15019,12 +15960,11 @@ mod tests {
         else {
             return;
         };
-        let prepared = runtime.into_prepared_for_tests(PreparedCheckoutEvidence::for_tests(
-            ResourceUsage {
+        let prepared =
+            runtime.into_prepared_for_tests(PreparedCheckoutEvidence::for_tests(ResourceUsage {
                 cpu_seconds: 2,
                 mem_byte_seconds: 3,
-            },
-        ));
+            }));
         let diagnostics = prepared.dispose_checkout_runtime(&workspace_manager);
         assert!(
             diagnostics.is_empty(),
@@ -15191,7 +16131,10 @@ mod tests {
         let runtime = NotStartedCapsuleGuard::new(runtime, &workspace_manager).disarm();
         // The disarmed guard dropped harmlessly; the capsule is intact — dispose it exactly once.
         let diagnostics = runtime.dispose_checkout_runtime(&workspace_manager);
-        assert!(diagnostics.is_empty(), "a clean NotStarted disposal, got {diagnostics:?}");
+        assert!(
+            diagnostics.is_empty(),
+            "a clean NotStarted disposal, got {diagnostics:?}"
+        );
         assert!(workspace_manager.is_healthy());
         assert!(userns_allocator.lease().is_ok());
         let _ = std::fs::remove_dir_all(&workspace_base);
@@ -15358,10 +16301,14 @@ mod tests {
                     preparation_spec,
                     &workspace_manager,
                     std::path::Path::new("/abs/staged-rootfs"),
-                    |_runtime, _spec, _rt, _auth| panic!("Hop B must not run after an authority failure"),
+                    |_runtime, _spec, _rt, _auth| {
+                        panic!("Hop B must not run after an authority failure")
+                    },
                     |_prepared, _a, _h, _s, _wm, _r| panic!("the workload must not run"),
                 )
-                .unwrap_or_else(|e| panic!("{label}: authority failure must be a typed outcome, not {e:?}"));
+                .unwrap_or_else(|e| {
+                    panic!("{label}: authority failure must be a typed outcome, not {e:?}")
+                });
 
             // The capsule was disposed cleanly (NotStarted → delete + release_unused) — NOT poisoned.
             assert!(
@@ -15400,12 +16347,11 @@ mod tests {
         else {
             return;
         };
-        let prepared = runtime.into_prepared_for_tests(PreparedCheckoutEvidence::for_tests(
-            ResourceUsage {
+        let prepared =
+            runtime.into_prepared_for_tests(PreparedCheckoutEvidence::for_tests(ResourceUsage {
                 cpu_seconds: 1,
                 mem_byte_seconds: 1,
-            },
-        ));
+            }));
         let spec = checkout_spec();
         let hooks = RunnerHooks::new(
             CompletionSettlementOwner::TerminalReporter,
@@ -15429,7 +16375,9 @@ mod tests {
                 *seen.lock().unwrap() = Some(workload_spec.run_token.jti.clone());
                 drop(permit);
                 // Assert-only executor: a synthetic pre-CAS Uncommitted so the capsule disposes cleanly.
-                Err(RunFailure::uncommitted("synthetic assert-only workload executor"))
+                Err(RunFailure::uncommitted(
+                    "synthetic assert-only workload executor",
+                ))
             },
         );
 
@@ -15585,6 +16533,7 @@ mod tests {
             PathBuf::from("/abs/staged-rootfs"),
             &workspace_manager,
             &userns_allocator,
+            None,
         )
         .expect("acquisition must succeed");
         let runsc_root_identity = (11, 22);
@@ -15682,6 +16631,7 @@ mod tests {
             PathBuf::from("/abs/staged-rootfs"),
             &workspace_manager,
             &userns_allocator,
+            None,
         )
         .expect("acquisition must succeed");
         let runsc_root_identity = (11, 22);
@@ -15776,6 +16726,7 @@ mod tests {
             PathBuf::from("/abs/staged-rootfs"),
             &workspace_manager,
             &userns_allocator,
+            None,
         );
         assert!(
             result.is_err(),
@@ -16118,7 +17069,7 @@ mod tests {
             command_spec.limits.mem_bytes,
             command_spec.limits.cpu_millis,
         )
-            .expect("establish a real memory cgroup for this drill");
+        .expect("establish a real memory cgroup for this drill");
         let cgroup_identity = cgroup.identity();
         lease
             .bind(container_id.clone(), runsc_root_identity, cgroup_identity)
@@ -16606,7 +17557,10 @@ mod tests {
         assert_eq!(
             writes,
             vec![
-                (dir.join("memory.max"), (64u64 << 20).to_string().into_bytes()),
+                (
+                    dir.join("memory.max"),
+                    (64u64 << 20).to_string().into_bytes()
+                ),
                 (dir.join("memory.swap.max"), b"0".to_vec()),
                 (dir.join("cpu.max"), b"200000 100000".to_vec()),
             ],
@@ -17244,10 +18198,10 @@ mod tests {
                 Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
             }),
             Box::new(move |_spec, _h, usage| {
-                t_settle
-                    .lock()
-                    .unwrap()
-                    .push(format!("settle:{}:{}", usage.cpu_seconds, usage.mem_byte_seconds));
+                t_settle.lock().unwrap().push(format!(
+                    "settle:{}:{}",
+                    usage.cpu_seconds, usage.mem_byte_seconds
+                ));
                 Ok(())
             }),
             Box::new(move |_spec| {
@@ -17389,7 +18343,10 @@ mod tests {
             },
         );
         assert!(
-            matches!(result, Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))),
+            matches!(
+                result,
+                Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))
+            ),
             "a reserve refusal surfaces as a Hook failure, got {result:?}"
         );
         assert_eq!(
@@ -18733,15 +19690,13 @@ mod tests {
 
         #[test]
         fn expected_git_commit_id_refuses_non_hex() {
-            let err =
-                ExpectedGitCommitId::new("g".repeat(40), GitObjectFormat::Sha1).unwrap_err();
+            let err = ExpectedGitCommitId::new("g".repeat(40), GitObjectFormat::Sha1).unwrap_err();
             assert!(err.contains("not lowercase hex"));
         }
 
         #[test]
         fn expected_git_commit_id_refuses_uppercase_hex() {
-            let err =
-                ExpectedGitCommitId::new("A".repeat(40), GitObjectFormat::Sha1).unwrap_err();
+            let err = ExpectedGitCommitId::new("A".repeat(40), GitObjectFormat::Sha1).unwrap_err();
             assert!(err.contains("not lowercase hex"));
         }
 
@@ -18788,7 +19743,10 @@ mod tests {
             for reserved in ["0001", "0002", "0003"] {
                 let mut pos = 0;
                 let err = read_pkt_line(reserved.as_bytes(), &mut pos).unwrap_err();
-                assert!(err.contains("reserved"), "reserved length {reserved} refused");
+                assert!(
+                    err.contains("reserved"),
+                    "reserved length {reserved} refused"
+                );
             }
         }
 
@@ -18824,15 +19782,18 @@ mod tests {
             let oid = sha1_oid(0x11);
             let first = format!("{oid} refs/heads/main\0no-progress ofs-delta shallow\n");
             let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
-            let parsed = parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected)
-                .unwrap();
+            let parsed =
+                parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected).unwrap();
             assert!(parsed.directly_advertised);
         }
 
         #[test]
         fn advertisement_parser_checks_every_ref_line_not_just_the_first() {
             let oid = sha1_oid(0x22);
-            let first = format!("{} refs/heads/main\0no-progress ofs-delta shallow\n", sha1_oid(0x33));
+            let first = format!(
+                "{} refs/heads/main\0no-progress ofs-delta shallow\n",
+                sha1_oid(0x33)
+            );
             let second = format!("{oid} refs/heads/other\n");
             let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
             let parsed =
@@ -18849,8 +19810,8 @@ mod tests {
                 sha1_oid(0x55)
             );
             let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
-            let parsed = parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected)
-                .unwrap();
+            let parsed =
+                parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected).unwrap();
             assert!(!parsed.directly_advertised);
             assert!(parsed.allows_reachable_want);
         }
@@ -18863,8 +19824,8 @@ mod tests {
                 "0".repeat(40)
             );
             let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
-            let parsed = parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected)
-                .unwrap();
+            let parsed =
+                parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected).unwrap();
             assert!(!parsed.directly_advertised);
         }
 
@@ -18876,8 +19837,8 @@ mod tests {
                 sha1_oid(0x77)
             );
             let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
-            let err =
-                parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected).unwrap_err();
+            let err = parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected)
+                .unwrap_err();
             assert!(err.contains("object-format"));
         }
 
@@ -18886,18 +19847,21 @@ mod tests {
             let oid = sha1_oid(0x78);
             let first = format!("{} refs/heads/main\n", sha1_oid(0x79));
             let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
-            let err =
-                parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected).unwrap_err();
+            let err = parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected)
+                .unwrap_err();
             assert!(err.contains("missing a capability section"));
         }
 
         #[test]
         fn advertisement_parser_refuses_a_missing_required_capability() {
             let oid = sha1_oid(0x7a);
-            let first = format!("{} refs/heads/main\0no-progress ofs-delta\n", sha1_oid(0x7b));
+            let first = format!(
+                "{} refs/heads/main\0no-progress ofs-delta\n",
+                sha1_oid(0x7b)
+            );
             let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
-            let err =
-                parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected).unwrap_err();
+            let err = parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected)
+                .unwrap_err();
             assert!(err.contains("does not advertise `shallow`"));
         }
 
@@ -18948,11 +19912,7 @@ mod tests {
             let oid = sha1_oid(0xaa);
             let other = sha1_oid(0xbb);
             let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
-            let response = fetch_response(
-                &[format!("shallow {other}\n")],
-                "NAK",
-                &fake_pack(b"x"),
-            );
+            let response = fetch_response(&[format!("shallow {other}\n")], "NAK", &fake_pack(b"x"));
             let mut out = Vec::new();
             let err =
                 parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
@@ -18978,11 +19938,7 @@ mod tests {
         fn fetch_response_refuses_an_unshallow_line() {
             let oid = sha1_oid(0xdd);
             let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
-            let response = fetch_response(
-                &[format!("unshallow {oid}\n")],
-                "NAK",
-                &fake_pack(b"x"),
-            );
+            let response = fetch_response(&[format!("unshallow {oid}\n")], "NAK", &fake_pack(b"x"));
             let mut out = Vec::new();
             let err =
                 parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
@@ -19033,8 +19989,8 @@ mod tests {
             let pack = fake_pack(&[0u8; 100]);
             let response = fetch_response(&[], "NAK", &pack);
             let mut out = Vec::new();
-            let err = parse_checkout_fetch_response(&response, &expected, &mut out, 10)
-                .unwrap_err();
+            let err =
+                parse_checkout_fetch_response(&response, &expected, &mut out, 10).unwrap_err();
             assert!(err.contains("exceeds"));
         }
 
@@ -19116,10 +20072,7 @@ mod tests {
 
         fn fake_pack_for_tests() -> PrefetchedCheckoutPack {
             PrefetchedCheckoutPack {
-                file: tempfile_for_checkout_pack()
-                    .unwrap()
-                    .into_inner()
-                    .unwrap(),
+                file: tempfile_for_checkout_pack().unwrap().into_inner().unwrap(),
                 shallow: false,
             }
         }
@@ -19241,7 +20194,10 @@ mod tests {
             );
             let oid = drill_git_rev_parse_head(&repo);
             let output = run_gitlink_check(&repo, &oid);
-            assert!(!output.status.success(), "a commit with a gitlink must be refused");
+            assert!(
+                !output.status.success(),
+                "a commit with a gitlink must be refused"
+            );
             assert!(String::from_utf8_lossy(&output.stderr).contains("gitlinks"));
             let _ = std::fs::remove_dir_all(&repo);
         }
@@ -19256,7 +20212,10 @@ mod tests {
             // in real output", not "the upstream command produced nothing because it failed").
             let bogus_oid = "0".repeat(40);
             let output = run_gitlink_check(&repo, &bogus_oid);
-            assert!(!output.status.success(), "an ls-tree failure must be a hard failure");
+            assert!(
+                !output.status.success(),
+                "an ls-tree failure must be a hard failure"
+            );
             assert!(
                 String::from_utf8_lossy(&output.stderr).contains("git ls-tree failed"),
                 "must fail on the ls-tree error, never silently pass as 'no gitlinks': stderr={}",
@@ -19488,9 +20447,10 @@ mod tests {
             let restore_to_runner = |file: &std::fs::File, mode: u32| {
                 // Restore ownership first through CAP_CHOWN; once owner again, chmod is ordinary.
                 // SAFETY: every FD remains live and names only the fresh fixture.
-                assert_eq!(unsafe {
-                    libc::fchown(file.as_raw_fd(), libc::geteuid(), libc::getegid())
-                }, 0);
+                assert_eq!(
+                    unsafe { libc::fchown(file.as_raw_fd(), libc::geteuid(), libc::getegid()) },
+                    0
+                );
                 // SAFETY: the successful fchown above made the current euid the owner.
                 assert_eq!(unsafe { libc::fchmod(file.as_raw_fd(), mode) }, 0);
             };
@@ -19507,8 +20467,7 @@ mod tests {
             let head_meta = head_fd.metadata().unwrap();
             let lock_meta = lock_fd.metadata().unwrap();
             let post_scope_caps = current_thread_capabilities().unwrap();
-            let post_scope_ambient =
-                ambient_capability_is_set(CAP_DAC_READ_SEARCH_NUMBER).unwrap();
+            let post_scope_ambient = ambient_capability_is_set(CAP_DAC_READ_SEARCH_NUMBER).unwrap();
 
             restore_to_runner(&head_fd, 0o600);
             restore_to_runner(&lock_fd, 0o600);
@@ -19538,7 +20497,11 @@ mod tests {
                 (".git/HEAD", head_meta, 0o600),
                 ("Cargo.lock", lock_meta, 0o600),
             ] {
-                assert_eq!(metadata.uid(), subuid, "{label} owner must remain the subuid");
+                assert_eq!(
+                    metadata.uid(),
+                    subuid,
+                    "{label} owner must remain the subuid"
+                );
                 assert_eq!(
                     metadata.gid(),
                     subgid,
@@ -19558,7 +20521,10 @@ mod tests {
                 !capability_is_inheritable(&post_scope_caps, CAP_DAC_READ_SEARCH_NUMBER),
                 "CAP_DAC_READ_SEARCH must never remain inheritable"
             );
-            assert!(!post_scope_ambient, "runsc/child execs must never inherit the cap");
+            assert!(
+                !post_scope_ambient,
+                "runsc/child execs must never inherit the cap"
+            );
         }
 
         // ---- CT-007 slice 5b.2 live drill (Sol's review, round 3): real git-wire (Hop A) + real
@@ -19593,7 +20559,8 @@ mod tests {
 
         #[cfg(feature = "integration")]
         fn drill_stage_lib(rootfs: &Path, soname: &str, host_path: &str) {
-            let real = std::fs::canonicalize(host_path).unwrap_or_else(|_| PathBuf::from(host_path));
+            let real =
+                std::fs::canonicalize(host_path).unwrap_or_else(|_| PathBuf::from(host_path));
             let real_name = real.file_name().unwrap().to_string_lossy().to_string();
             for libdir in ["usr/lib", "lib"] {
                 let dst_real = rootfs.join(libdir).join(&real_name);
@@ -19635,9 +20602,8 @@ mod tests {
                     .expect("git-core helper symlink");
             }
             for destination in ["tmp", "workspace", "repo", "quarantine"] {
-                std::fs::create_dir_all(staged.join(destination)).unwrap_or_else(|error| {
-                    panic!("mkdir /{destination} mount point: {error}")
-                });
+                std::fs::create_dir_all(staged.join(destination))
+                    .unwrap_or_else(|error| panic!("mkdir /{destination} mount point: {error}"));
             }
             staged
         }
@@ -19696,7 +20662,8 @@ mod tests {
             region: &str,
             repo: &str,
         ) -> (String, String) {
-            let bare = resolve_bare_repo_path(root, tenant, region, repo).expect("resolve bare path");
+            let bare =
+                resolve_bare_repo_path(root, tenant, region, repo).expect("resolve bare path");
             std::fs::create_dir_all(bare.parent().unwrap()).expect("mkdir repo parent");
             drill_run_git(&["init", "-q", "--bare", &bare.to_string_lossy()], None);
             let work = root.join("work");
@@ -19721,7 +20688,10 @@ mod tests {
                 Some(&work),
             );
             let newer = drill_rev_parse(&work, "HEAD");
-            drill_run_git(&["push", "-q", &bare.to_string_lossy(), "main"], Some(&work));
+            drill_run_git(
+                &["push", "-q", &bare.to_string_lossy(), "main"],
+                Some(&work),
+            );
             (older, newer)
         }
 
@@ -19815,7 +20785,9 @@ mod tests {
             // `launch_with`'s Enabled path uses) ----
             let mut workspace_base_dir =
                 std::env::home_dir().expect("HOME must be set for this test");
-            workspace_base_dir.push(format!(".local/state/myelin-checkout-drill-workspace-{tag}"));
+            workspace_base_dir.push(format!(
+                ".local/state/myelin-checkout-drill-workspace-{tag}"
+            ));
             let incident_sink: crate::workspace_manager::IncidentSink =
                 Arc::new(|msg: &str| eprintln!("[checkout live drill incident] {msg}"));
             let enabled_backend = GvisorBackend::try_new(
@@ -19852,6 +20824,7 @@ mod tests {
                 git_rootfs.clone(),
                 workspace_manager,
                 userns_allocator,
+                None,
             )
             .expect("acquiring a real workspace + userns lease must succeed on a healthy host");
 
@@ -19880,7 +20853,9 @@ mod tests {
             // ---- cleanup: delete the workspace BEFORE releasing the lease (Sol's review: the
             // central identity invariant is that the subordinate uid/gid is never released/
             // reallocated while its chowned workspace still exists) ----
-            let EnabledLaunchContext { workspace, lease, .. } = context;
+            let EnabledLaunchContext {
+                workspace, lease, ..
+            } = context;
             workspace_manager
                 .delete_workspace(workspace)
                 .expect("delete_workspace must succeed after a real, proven-clean checkout run");
@@ -19927,8 +20902,7 @@ mod tests {
         #[cfg(feature = "test-support")]
         #[test]
         fn evaluate_checkout_finalization_never_confirms_when_teardown_is_unproven() {
-            let Some((allocator, leases_dir)) =
-                real_lease_for_eval_test("eval-teardown-unproven")
+            let Some((allocator, leases_dir)) = real_lease_for_eval_test("eval-teardown-unproven")
             else {
                 eprintln!("[checkout eval test] SKIP: no usable /etc/subuid|subgid range");
                 return;
@@ -19950,10 +20924,15 @@ mod tests {
                     },
                 };
             let ws = temp_dir_for("teardown-unproven-ws");
-            let expected =
-                ExpectedGitCommitId::new(sha1_oid(0xa1), GitObjectFormat::Sha1).unwrap();
-            let result =
-                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xa1), GitObjectFormat::Sha1).unwrap();
+            let result = evaluate_checkout_finalization(
+                finalization,
+                &mut lease,
+                &mut session,
+                1 << 20,
+                &expected,
+                &ws,
+            );
             match result {
                 Err(CheckoutPreparationError::TeardownUnproven { .. }) => {}
                 other => panic!("expected TeardownUnproven, got {other:?}"),
@@ -20009,10 +20988,15 @@ mod tests {
                     evidence,
                 });
             let ws = temp_dir_for("bad-exit-ws");
-            let expected =
-                ExpectedGitCommitId::new(sha1_oid(0xa2), GitObjectFormat::Sha1).unwrap();
-            let result =
-                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xa2), GitObjectFormat::Sha1).unwrap();
+            let result = evaluate_checkout_finalization(
+                finalization,
+                &mut lease,
+                &mut session,
+                1 << 20,
+                &expected,
+                &ws,
+            );
             match result {
                 Err(CheckoutPreparationError::RejectedAfterQuiescence { .. }) => {}
                 other => panic!("expected RejectedAfterQuiescence, got {other:?}"),
@@ -20056,10 +21040,15 @@ mod tests {
                     evidence,
                 });
             let ws = temp_dir_for("stdout-truncated-ws");
-            let expected =
-                ExpectedGitCommitId::new(sha1_oid(0xb1), GitObjectFormat::Sha1).unwrap();
-            let result =
-                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xb1), GitObjectFormat::Sha1).unwrap();
+            let result = evaluate_checkout_finalization(
+                finalization,
+                &mut lease,
+                &mut session,
+                1 << 20,
+                &expected,
+                &ws,
+            );
             match result {
                 Err(CheckoutPreparationError::RejectedAfterQuiescence { message, .. }) => {
                     assert!(message.contains("truncated"));
@@ -20102,10 +21091,15 @@ mod tests {
                     evidence,
                 });
             let ws = temp_dir_for("stream-error-ws");
-            let expected =
-                ExpectedGitCommitId::new(sha1_oid(0xb2), GitObjectFormat::Sha1).unwrap();
-            let result =
-                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xb2), GitObjectFormat::Sha1).unwrap();
+            let result = evaluate_checkout_finalization(
+                finalization,
+                &mut lease,
+                &mut session,
+                1 << 20,
+                &expected,
+                &ws,
+            );
             match result {
                 Err(CheckoutPreparationError::RejectedAfterQuiescence { message, .. }) => {
                     assert!(message.contains("durable log sink write failed"));
@@ -20147,17 +21141,22 @@ mod tests {
                     evidence,
                 });
             let ws = temp_dir_for("bad-confirm-line-ws");
-            let expected =
-                ExpectedGitCommitId::new(sha1_oid(0xa3), GitObjectFormat::Sha1).unwrap();
-            let result =
-                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xa3), GitObjectFormat::Sha1).unwrap();
+            let result = evaluate_checkout_finalization(
+                finalization,
+                &mut lease,
+                &mut session,
+                1 << 20,
+                &expected,
+                &ws,
+            );
             match result {
                 Err(CheckoutPreparationError::RejectedAfterQuiescence { .. }) => {}
                 other => panic!("expected RejectedAfterQuiescence, got {other:?}"),
             }
-            session.release_prepared(lease).expect(
-                "session must have reached Prepared despite the bad confirmation line",
-            );
+            session
+                .release_prepared(lease)
+                .expect("session must have reached Prepared despite the bad confirmation line");
             let _ = std::fs::remove_dir_all(&ws);
             let _ = std::fs::remove_dir_all(&leases_dir);
         }
@@ -20197,8 +21196,14 @@ mod tests {
             let ws = temp_dir_for("bad-host-head-ws");
             std::fs::create_dir_all(ws.join(".git")).unwrap();
             std::fs::write(ws.join(".git/HEAD"), format!("{}\n", sha1_oid(0xa6))).unwrap();
-            let result =
-                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            let result = evaluate_checkout_finalization(
+                finalization,
+                &mut lease,
+                &mut session,
+                1 << 20,
+                &expected,
+                &ws,
+            );
             match result {
                 Err(CheckoutPreparationError::RejectedAfterQuiescence { message, .. }) => {
                     assert!(message.contains("host-side HEAD re-verification disagreed"));
@@ -20248,8 +21253,14 @@ mod tests {
             let ws = temp_dir_for("missing-cargo-lock-ws");
             std::fs::create_dir_all(ws.join(".git")).unwrap();
             std::fs::write(ws.join(".git/HEAD"), format!("{}\n", expected.as_str())).unwrap();
-            let result =
-                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            let result = evaluate_checkout_finalization(
+                finalization,
+                &mut lease,
+                &mut session,
+                1 << 20,
+                &expected,
+                &ws,
+            );
             match result {
                 Err(CheckoutPreparationError::RejectedAfterQuiescence { message, .. }) => {
                     assert!(message.contains("could not hash the materialized Cargo.lock"));
@@ -20296,9 +21307,16 @@ mod tests {
             std::fs::create_dir_all(ws.join(".git")).unwrap();
             std::fs::write(ws.join(".git/HEAD"), format!("{}\n", expected.as_str())).unwrap();
             std::fs::write(ws.join("Cargo.lock"), b"# fake lockfile content\n").unwrap();
-            let result =
-                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
-            let prepared_evidence = result.expect("full agreement must mint PreparedCheckoutEvidence");
+            let result = evaluate_checkout_finalization(
+                finalization,
+                &mut lease,
+                &mut session,
+                1 << 20,
+                &expected,
+                &ws,
+            );
+            let prepared_evidence =
+                result.expect("full agreement must mint PreparedCheckoutEvidence");
             assert_eq!(prepared_evidence.commit_hex(), expected.as_str());
             assert_eq!(prepared_evidence.tree_oid(), tree);
             let mut hasher = Sha256::new();
@@ -20345,11 +21363,20 @@ mod tests {
                 });
             let ws = temp_dir_for("confirm-mismatch-ws");
             let expected = ExpectedGitCommitId::new(sha1_oid(0xa9), GitObjectFormat::Sha1).unwrap();
-            let result =
-                evaluate_checkout_finalization(finalization, &mut lease, &mut session, 1 << 20, &expected, &ws);
+            let result = evaluate_checkout_finalization(
+                finalization,
+                &mut lease,
+                &mut session,
+                1 << 20,
+                &expected,
+                &ws,
+            );
             match result {
                 Err(CheckoutPreparationError::Unreleasable { usage, .. }) => {
-                    assert!(usage.is_some(), "a post-spawn Unreleasable must carry measured usage");
+                    assert!(
+                        usage.is_some(),
+                        "a post-spawn Unreleasable must carry measured usage"
+                    );
                 }
                 other => panic!("expected Unreleasable, got {other:?}"),
             }
@@ -20428,11 +21455,10 @@ mod tests {
 
             #[test]
             fn hop_b_commit_outcome_unknown_is_never_downgraded_to_an_ordinary_retry() {
-                let error = map_checkout_materialization_run_failure(
-                    RunFailure::commit_outcome_unknown(
+                let error =
+                    map_checkout_materialization_run_failure(RunFailure::commit_outcome_unknown(
                         "injected impossible immediate-permit commit ambiguity",
-                    ),
-                );
+                    ));
                 assert_eq!(
                     error.attempt_disposition(),
                     PreparationAttemptDisposition::ReconciliationRequired {
@@ -20444,9 +21470,7 @@ mod tests {
                 );
                 match error {
                     CheckoutPreparationError::RejectedAfterQuiescence {
-                        message,
-                        usage,
-                        ..
+                        message, usage, ..
                     } => {
                         assert_eq!(
                             usage,
@@ -20911,7 +21935,10 @@ mod tests {
                 let advertise_bytes = advertisement_bytes(&oid);
                 // Exactly ONE scripted hop: the fetch must never spawn once the lease is lost.
                 let (executor, remaining) = scripted_executor(vec![Box::new(move || {
-                    Ok((fake_hop_container_run(advertise_bytes, advertise_usage), false))
+                    Ok((
+                        fake_hop_container_run(advertise_bytes, advertise_usage),
+                        false,
+                    ))
                 })]);
                 let cancellation = AtomicBool::new(false);
                 let checkpoint = LostLeaseCheckpoint {
@@ -22136,8 +23163,6 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&root);
             }
 
-
-
             // =================================================================================
             // CT-007 phase-credential generations: the V2 transport / preparation authority.
             //
@@ -22345,8 +23370,11 @@ mod tests {
                     }
                 })]);
                 let cancellation = AtomicBool::new(false);
-                let mut refuse =
-                    || Err(HookError("the workload generation already superseded it".into()));
+                let mut refuse = || {
+                    Err(HookError(
+                        "the workload generation already superseded it".into(),
+                    ))
+                };
                 let err = fetch_checkout_pack_within_parent_attempt_v2_given(
                     &root,
                     TENANT,
@@ -22391,9 +23419,8 @@ mod tests {
             /// the SAME generation as the advertisement all refuse — and the fetch never spawns.
             #[test]
             fn a_divergent_fetch_authorization_refuses_before_the_fetch_spawns() {
-                type Provider = Box<
-                    dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>,
-                >;
+                type Provider =
+                    Box<dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>>;
                 /// (label, expected refusal fragment, provider builder).
                 type DivergentFetchCase = (&'static str, &'static str, fn(&str) -> Provider);
                 let cases: Vec<DivergentFetchCase> = vec![
@@ -22724,7 +23751,6 @@ mod tests {
                     }
                 }
             }
-
         }
     }
 
@@ -22747,7 +23773,8 @@ mod tests {
             CheckoutPreparationSession, PreparationQuiescenceProof, UserNamespaceQuiescenceProof,
         };
         use crate::workspace_manager::{
-            DeleteWorkspaceError, WorkspaceAdmission, WorkspaceManagerError, WorkspaceProvisionError,
+            DeleteWorkspaceError, WorkspaceAdmission, WorkspaceManagerError,
+            WorkspaceProvisionError,
         };
         use crate::workspace_storage::{
             DirectoryWorkspaceStorage, PreparedWorkspace, WorkspaceStorageError,
@@ -22795,7 +23822,10 @@ mod tests {
             // An over-quota checked write refuses BEFORE mutating.
             let refusal = ws.checked_test_quota_write("huge", &vec![0u8; (1 << 20) + 1]);
             assert!(
-                matches!(refusal, Err(WorkspaceStorageError::DirectoryQuotaExceeded { .. })),
+                matches!(
+                    refusal,
+                    Err(WorkspaceStorageError::DirectoryQuotaExceeded { .. })
+                ),
                 "an over-quota checked write refuses, got {refusal:?}"
             );
             assert!(
@@ -22803,8 +23833,15 @@ mod tests {
                 "the refused over-quota write left nothing behind"
             );
             wm.delete_workspace(ws).expect("delete proves absence");
-            assert!(!host.exists(), "the leaf is gone after a proven-absence delete");
-            assert_eq!(wm.capacity_used_bytes(), 0, "capacity released after delete");
+            assert!(
+                !host.exists(),
+                "the leaf is gone after a proven-absence delete"
+            );
+            assert_eq!(
+                wm.capacity_used_bytes(),
+                0,
+                "capacity released after delete"
+            );
             let _ = std::fs::remove_dir_all(&base);
         }
 
@@ -22814,17 +23851,22 @@ mod tests {
             let base = temp_root("t2").join("workspace");
             std::fs::create_dir_all(&base).unwrap();
             let wm = deterministic_workspace_manager_for_tests(base.clone(), 4 << 20).unwrap();
-            let cap = wm.acquire_capacity(4 << 20).expect("lease the whole ceiling");
+            let cap = wm
+                .acquire_capacity(4 << 20)
+                .expect("lease the whole ceiling");
             assert_eq!(wm.capacity_used_bytes(), 4 << 20);
             // Ceiling exhausted: a further request is refused (REAL aggregate accounting).
             assert!(wm.acquire_capacity(1).is_err(), "the ceiling is exhausted");
             let ws = wm
                 .create_workspace("job-t2", 4 << 20, 0, 0, cap)
                 .expect("create consumes the lease");
-            wm.delete_workspace(ws).expect("delete releases the capacity");
+            wm.delete_workspace(ws)
+                .expect("delete releases the capacity");
             assert_eq!(wm.capacity_used_bytes(), 0, "capacity fully returned");
             // Reusable: the freed ceiling admits a fresh lease.
-            let again = wm.acquire_capacity(4 << 20).expect("reuse the freed ceiling");
+            let again = wm
+                .acquire_capacity(4 << 20)
+                .expect("reuse the freed ceiling");
             again.release();
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -22876,7 +23918,10 @@ mod tests {
             probe
                 .release_unused()
                 .expect("the probe lease releases cleanly");
-            assert!(alloc.is_healthy(), "the allocator is STILL clean after the probe");
+            assert!(
+                alloc.is_healthy(),
+                "the allocator is STILL clean after the probe"
+            );
             let _ = std::fs::remove_dir_all(&base);
         }
 
@@ -22886,7 +23931,10 @@ mod tests {
             let root = temp_root("t4");
             let (obs, wm, workspace_base, alloc, userns_base) =
                 run_substituted_checkout_success(&root, "checkout.sentinel", b"shared-provenance");
-            assert!(obs.hopb_write_ok, "the checked Hop B sentinel write succeeded");
+            assert!(
+                obs.hopb_write_ok,
+                "the checked Hop B sentinel write succeeded"
+            );
             assert!(
                 obs.used_after_hopb >= "shared-provenance".len() as u64,
                 "the byte-accounted checkpoint saw Hop B's bytes: {}",
@@ -22904,7 +23952,11 @@ mod tests {
                 obs.sentinel_read_through_mount,
                 "the substituted workload read the sentinel THROUGH the OCI-recorded mount"
             );
-            assert!(obs.settled_ok, "the real settle tail succeeded: {:?}", obs.settle_error);
+            assert!(
+                obs.settled_ok,
+                "the real settle tail succeeded: {:?}",
+                obs.settle_error
+            );
             // Step 8: durable state.
             let child_dirs = std::fs::read_dir(&workspace_base)
                 .unwrap()
@@ -22920,7 +23972,10 @@ mod tests {
             probe
                 .release_unused()
                 .expect("the probe lease releases cleanly");
-            assert!(alloc.is_healthy(), "the allocator is STILL clean after the probe");
+            assert!(
+                alloc.is_healthy(),
+                "the allocator is STILL clean after the probe"
+            );
             let _ = std::fs::remove_dir_all(&workspace_base);
             let _ = std::fs::remove_dir_all(&userns_base);
             let _ = std::fs::remove_dir_all(&root);
@@ -22931,7 +23986,8 @@ mod tests {
         fn cross_backend_base_inode_and_symlink_substitutions_refuse_without_deleting() {
             // (a) A Btrfs-identity capability handed to the directory backend → BackendMismatch.
             let (mut backend, canonical) = open_directory_backend("t5a");
-            let btrfs_cap = PreparedWorkspace::for_tests(canonical.join("x"), 42, canonical.clone());
+            let btrfs_cap =
+                PreparedWorkspace::for_tests(canonical.join("x"), 42, canonical.clone());
             assert!(
                 matches!(
                     backend.delete_workspace(btrfs_cap),
@@ -22952,7 +24008,10 @@ mod tests {
                 ),
                 "backend B refuses backend A's capability"
             );
-            assert!(leaf_a.exists(), "the refused wrong-base delete removed nothing");
+            assert!(
+                leaf_a.exists(),
+                "the refused wrong-base delete removed nothing"
+            );
             backend_a
                 .list_orphaned_workspaces(&std::collections::BTreeSet::new())
                 .and_then(|orphans| {
@@ -22975,7 +24034,10 @@ mod tests {
                 ),
                 "an inode-substituted leaf refuses deletion (absence unproven)"
             );
-            assert!(leaf_c.exists(), "the substituted replacement dir was NOT deleted");
+            assert!(
+                leaf_c.exists(),
+                "the substituted replacement dir was NOT deleted"
+            );
 
             // (d) Symlink substitution: replace the leaf with a symlink → absence unproven, not followed.
             let (mut backend_d, _) = open_directory_backend("t5d");
@@ -23053,8 +24115,14 @@ mod tests {
             let wm = deterministic_workspace_manager_for_tests(base.clone(), 1 << 30)
                 .expect("construction reconciles orphans");
             assert!(matches!(wm.admission(), WorkspaceAdmission::Healthy));
-            let remaining = std::fs::read_dir(&base).unwrap().filter_map(Result::ok).count();
-            assert_eq!(remaining, 0, "every boot orphan was deleted before admission");
+            let remaining = std::fs::read_dir(&base)
+                .unwrap()
+                .filter_map(Result::ok)
+                .count();
+            assert_eq!(
+                remaining, 0,
+                "every boot orphan was deleted before admission"
+            );
             drop(wm);
             let _ = std::fs::remove_dir_all(&base);
 
@@ -23252,8 +24320,8 @@ mod tests {
             let userns_base = root.join("userns");
             std::fs::create_dir_all(&workspace_base).unwrap();
             std::fs::create_dir_all(&userns_base).unwrap();
-            let wm = deterministic_workspace_manager_for_tests(workspace_base.clone(), 1 << 30)
-                .unwrap();
+            let wm =
+                deterministic_workspace_manager_for_tests(workspace_base.clone(), 1 << 30).unwrap();
             let alloc = deterministic_userns_allocator_for_tests(&userns_base, 1).unwrap();
             let spec = substitute_checkout_spec();
             let profile = crate::hardening::HardeningProfile::derive(&spec);
@@ -23265,6 +24333,7 @@ mod tests {
                 PathBuf::from("/abs/staged-rootfs"),
                 &wm,
                 &alloc,
+                None,
             )
             .expect("acquire a real paired workspace + userns lease");
             // Durably bind the lease (Allocated -> Bound) and record the Bound state settle validates.
@@ -23328,7 +24397,10 @@ mod tests {
                 );
             // Hop B + the OCI-mount round-trip still succeeded (the divergence is ONLY in the workload
             // evidence's runsc-root identity) — isolating the failure to the settle provenance check.
-            assert!(obs.hopb_write_ok, "the checked Hop B sentinel write still succeeded");
+            assert!(
+                obs.hopb_write_ok,
+                "the checked Hop B sentinel write still succeeded"
+            );
             assert!(
                 obs.mount_source_matched_workspace,
                 "the retained OCI mount still equals the capsule workspace host path"
@@ -23548,12 +24620,7 @@ mod tests {
             let mut compute_spec = checkout_spec_for_backend(image);
             compute_spec.workspace = crate::WorkspaceSpec::default();
             let err = backend
-                .run_cycle(
-                    &compute_spec,
-                    &ok_hooks(),
-                    sink,
-                    SandboxCancellation::new(),
-                )
+                .run_cycle(&compute_spec, &ok_hooks(), sink, SandboxCancellation::new())
                 .expect_err("compute under legacy hooks refuses at parent-attempt admission");
             match err {
                 SandboxLaunchError::Failed(GvisorError::Hook(HookError(msg))) => assert!(
@@ -23669,8 +24736,10 @@ fn substitute_checkout_spec() -> crate::JobSpec {
 pub(crate) fn deterministic_workspace_manager_for_tests(
     base_dir: std::path::PathBuf,
     host_capacity_bytes: u64,
-) -> Result<crate::workspace_manager::WorkspaceManager, crate::workspace_manager::WorkspaceManagerError>
-{
+) -> Result<
+    crate::workspace_manager::WorkspaceManager,
+    crate::workspace_manager::WorkspaceManagerError,
+> {
     let sink: crate::workspace_manager::IncidentSink =
         std::sync::Arc::new(|msg: &str| eprintln!("[6e.1b workspace incident] {msg}"));
     crate::workspace_manager::WorkspaceManager::try_new(
@@ -23738,6 +24807,7 @@ pub(crate) fn acquire_deterministic_checkout_capsule(
         std::path::PathBuf::from("/abs/staged-rootfs"),
         &workspace_manager,
         &userns_allocator,
+        None,
     )
     .expect("acquisition must succeed against a healthy deterministic manager/allocator");
     (
@@ -23849,11 +24919,13 @@ impl crate::checkout_orchestration::AttemptAuthority for NoOpTestSupportAuthorit
         crate::checkout_orchestration::WorkloadCredentialCarrier,
         crate::checkout_orchestration::AttemptAuthorityError,
     > {
-        Ok(crate::checkout_orchestration::WorkloadCredentialCarrier::new(
-            crate::RunTokenCredential::new("bearer", "jti-noop-workload", 300).unwrap(),
-            Self::authorization_context(),
-            "gen-noop-workload",
-        ))
+        Ok(
+            crate::checkout_orchestration::WorkloadCredentialCarrier::new(
+                crate::RunTokenCredential::new("bearer", "jti-noop-workload", 300).unwrap(),
+                Self::authorization_context(),
+                "gen-noop-workload",
+            ),
+        )
     }
     fn should_requeue(&self) -> bool {
         true
@@ -23916,14 +24988,15 @@ fn run_substituted_checkout_inner(
         NoOpTestSupportAuthority::authorization_context(),
         "gen-mat-6e1b",
     );
-    let (mat_run_token, mat_authorization) = crate::checkout_orchestration::authorize_phase_generation(
-        &hooks,
-        &base_spec,
-        &scope,
-        crate::CheckoutPhase::Materialization,
-        carrier,
-    )
-    .expect("mint the materialization phase authorization");
+    let (mat_run_token, mat_authorization) =
+        crate::checkout_orchestration::authorize_phase_generation(
+            &hooks,
+            &base_spec,
+            &scope,
+            crate::CheckoutPhase::Materialization,
+            carrier,
+        )
+        .expect("mint the materialization phase authorization");
     // Hop B half: real Allocated -> PreparationBound -> Prepared, with the REAL materialization-permit
     // resolve (consuming the authorization) and a substituted git execution.
     let (prepared, hopb_write_ok, used_after_hopb) = match runtime
@@ -23943,16 +25016,20 @@ fn run_substituted_checkout_inner(
     };
     // Workload half: the REAL run_retained_workload_inner (authority phases + the real launch permit
     // acquire+commit + settle), faking only the explicit-userns revalidation + the runsc spawn.
-    let (outcome, used_at_workload_checkpoint, mount_source_matched_workspace, sentinel_read_through_mount) =
-        prepared.substituted_workload_for_test_support(
-            &authority,
-            &hooks,
-            &base_spec,
-            &workspace_manager,
-            sentinel_name,
-            sentinel_bytes,
-            evidence_mode,
-        );
+    let (
+        outcome,
+        used_at_workload_checkpoint,
+        mount_source_matched_workspace,
+        sentinel_read_through_mount,
+    ) = prepared.substituted_workload_for_test_support(
+        &authority,
+        &hooks,
+        &base_spec,
+        &workspace_manager,
+        sentinel_name,
+        sentinel_bytes,
+        evidence_mode,
+    );
     // Map the REAL outcome. `Ran(Ok(_))` is a clean real settle; `Ran(Err(_))` is the settle tail
     // refusing (the negative provenance path lands here); every other variant is a pre-settle disposal
     // (the workload never bound/renewed) — all `settled_ok == false`.
@@ -23962,22 +25039,39 @@ fn run_substituted_checkout_inner(
         RetainedWorkloadOutcome::RunFailed {
             failure,
             disposal_diagnostics,
-        } => (false, Some(format!("RunFailed: {failure:?}; disposal={disposal_diagnostics:?}"))),
+        } => (
+            false,
+            Some(format!(
+                "RunFailed: {failure:?}; disposal={disposal_diagnostics:?}"
+            )),
+        ),
         RetainedWorkloadOutcome::PhaseAuthorityFailed {
             error,
             disposal_diagnostics,
         } => (
             false,
-            Some(format!("PhaseAuthorityFailed: {error:?}; disposal={disposal_diagnostics:?}")),
+            Some(format!(
+                "PhaseAuthorityFailed: {error:?}; disposal={disposal_diagnostics:?}"
+            )),
         ),
         RetainedWorkloadOutcome::LeaseLost {
             lost,
             disposal_diagnostics,
-        } => (false, Some(format!("LeaseLost: {lost:?}; disposal={disposal_diagnostics:?}"))),
+        } => (
+            false,
+            Some(format!(
+                "LeaseLost: {lost:?}; disposal={disposal_diagnostics:?}"
+            )),
+        ),
         RetainedWorkloadOutcome::PermitRefused {
             message,
             disposal_diagnostics,
-        } => (false, Some(format!("PermitRefused: {message}; disposal={disposal_diagnostics:?}"))),
+        } => (
+            false,
+            Some(format!(
+                "PermitRefused: {message}; disposal={disposal_diagnostics:?}"
+            )),
+        ),
     };
     let observation = SubstitutedCheckoutObservation {
         hopb_write_ok,
@@ -24062,7 +25156,8 @@ pub(crate) fn run_substituted_checkout_mismatched_evidence(
 // root. The `#[cfg(test)]` callers (`checkout_preparation_5b2`, `checkout_transport_5b3_3`, the outer
 // `tests` module for `FakeRunsc`) re-import these by path so their existing tests keep compiling.
 #[cfg(any(test, feature = "test-support"))]
-#[allow(dead_code)] // several helpers are consumed only by `#[cfg(test)]` callers and/or the driver.
+#[allow(dead_code)]
+// several helpers are consumed only by `#[cfg(test)]` callers and/or the driver.
 // The executor helpers name the crate-private `RuntimeFinalization`/`GitWireHopFinalization` in their
 // `pub(crate)` signatures — an intentional crate-internal seam, never a public leak.
 #[allow(private_interfaces)]
@@ -24090,7 +25185,11 @@ pub mod checkout_transport_test_support {
     }
 
     /// Assemble a fetch response: optional shallow lines, a flush, a negotiation line, then the pack.
-    pub(crate) fn fetch_response(shallow_lines: &[String], negotiation: &str, pack: &[u8]) -> Vec<u8> {
+    pub(crate) fn fetch_response(
+        shallow_lines: &[String],
+        negotiation: &str,
+        pack: &[u8],
+    ) -> Vec<u8> {
         let mut buf = Vec::new();
         for line in shallow_lines {
             buf.extend(pkt_line_encode(line));
@@ -24273,9 +25372,8 @@ pub mod checkout_transport_test_support {
         let userns_base = root.join("userns");
         std::fs::create_dir_all(&workspace_base).unwrap();
         std::fs::create_dir_all(&userns_base).unwrap();
-        let workspace_manager =
-            deterministic_workspace_manager_for_tests(workspace_base, 1 << 30)
-                .expect("deterministic-directory workspace manager must construct");
+        let workspace_manager = deterministic_workspace_manager_for_tests(workspace_base, 1 << 30)
+            .expect("deterministic-directory workspace manager must construct");
         let userns_allocator = deterministic_userns_allocator_for_tests(&userns_base, 1)
             .expect("deterministic userns allocator must construct (a NON-root user is required)");
         let backend = GvisorBackend {
@@ -24324,8 +25422,8 @@ pub mod checkout_transport_test_support {
             crate::IdemToken("idem-6e2-checkout".into()),
         )
         .unwrap();
-        spec.run_token_authorization =
-            Some(crate::RunTokenAuthorizationContext::CiJob(crate::CiJobAuthorizationContext {
+        spec.run_token_authorization = Some(crate::RunTokenAuthorizationContext::CiJob(
+            crate::CiJobAuthorizationContext {
                 tenant_id: CHECKOUT_TENANT.to_string(),
                 region: CHECKOUT_REGION.to_string(),
                 principal_id: "p".to_string(),
@@ -24341,7 +25439,8 @@ pub mod checkout_transport_test_support {
                 required_capabilities: vec![],
                 checkout_scope: None,
                 credential_binding: None,
-            }));
+            },
+        ));
         spec
     }
 }
