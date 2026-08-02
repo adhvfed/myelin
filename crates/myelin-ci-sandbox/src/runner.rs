@@ -656,10 +656,10 @@ pub struct CompletionClaim {
 ///
 /// A preparation terminal/retry report re-verifies the parent attempt under the durable CAS, which
 /// needs the FULL claim-bound token request — not the seven-field [`CompletionClaim`] a workload
-/// `job.done` carries. This type carries EXACTLY the twelve control-plane `CiJobTokenRequest` fields
+/// `job.done` carries. This type carries EXACTLY the thirteen control-plane `CiJobTokenRequest` fields
 /// (the seven [`CompletionClaim`] identity fields — `tenant`/`run`(=`wf_run_id`)/`job_id`/`idem_token`
-/// /`lease_owner`/`lease_epoch`/`claim_nonce`) plus the five the workload path never needs
-/// (`region`/`ci_run_id`/`token_authority_handle`/`claim_started_at_epoch_secs`/
+/// /`lease_owner`/`lease_epoch`/`claim_nonce`) plus the six the workload path never needs
+/// (`region`/`project_id`/`ci_run_id`/`token_authority_handle`/`claim_started_at_epoch_secs`/
 /// `claim_expires_at_epoch_secs`) — and NO others (no lease-expiry, claim-window, reserve handle,
 /// credential generation, or checkout scope). The control-plane router maps it 1:1 back onto its
 /// `CiJobTokenRequest` to reach the durable preparation CAS; this crate never names that type.
@@ -670,6 +670,7 @@ pub struct CompletionClaim {
 pub struct PreparationReportClaim {
     pub tenant_id: String,
     pub region: String,
+    pub project_id: String,
     pub wf_run_id: String,
     pub ci_run_id: String,
     pub job_id: String,
@@ -791,7 +792,7 @@ pub trait TerminalReporter {
     ) -> Result<RetryableAttemptOutcome, ExecutorError>;
 
     /// **CT-007 slice 5b.3-6d STEP 4: report a checkout PREPARATION terminal (dormant).** Carries the
-    /// full [`PreparationReportClaim`] (the twelve claim-bound identity fields) because a preparation
+    /// full [`PreparationReportClaim`] (the thirteen claim-bound identity fields) because a preparation
     /// terminal re-verifies the parent attempt under the durable CAS — the seven-field
     /// [`CompletionClaim`] a workload `job.done` carries is insufficient. A CI-pipeline reporter maps
     /// the claim onto its durable request and settles/terminalizes. `diagnostic` is separately-derived
@@ -2208,6 +2209,7 @@ mod tests {
         PreparationReportClaim {
             tenant_id: "acme".into(),
             region: "fr-par".into(),
+            project_id: "00000000-0000-0000-0000-000000000001".into(),
             wf_run_id: "11111111-1111-1111-1111-111111111111".into(),
             ci_run_id: "44444444-4444-4444-4444-444444444444".into(),
             job_id: "22222222-2222-2222-2222-222222222222".into(),

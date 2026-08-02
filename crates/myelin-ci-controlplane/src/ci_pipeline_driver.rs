@@ -319,6 +319,7 @@ impl JobRunner for DurableJobRunner {
         let (spec, _previous_token) = spec.into_template();
         let launch = DurableCiJobLaunchTemplate {
             ci_run_id: enq.run_id.clone(),
+            project_id: "00000000-0000-0000-0000-000000000000".into(),
             spec,
             token_authority_handle: authority,
         };
@@ -2310,7 +2311,7 @@ impl CiPipelineReporter {
 
 /// **CT-007 slice 5b.3-6d STEP 4: the exact sandbox [`PreparationReportClaim`] → durable
 /// [`CiJobTokenRequest`] projection.** The mechanical 1:1 inverse of `preparation_report_claim` in
-/// `ci_checkout_composition`: the twelve fields map field-for-field with no drop or reorder, so a
+/// `ci_checkout_composition`: the thirteen fields map field-for-field with no drop or reorder, so a
 /// claim minted at admission reaches the durable preparation CAS byte-identical. The router and the
 /// `CiPipelineReporter` trait impl both use this to reach the inherent durable methods; the round-trip
 /// is proven by a unit test.
@@ -2320,6 +2321,7 @@ pub(crate) fn token_request_from_preparation_report_claim(
     CiJobTokenRequest {
         tenant_id: claim.tenant_id.clone(),
         region: claim.region.clone(),
+        project_id: claim.project_id.clone(),
         wf_run_id: claim.wf_run_id.clone(),
         ci_run_id: claim.ci_run_id.clone(),
         job_id: claim.job_id.clone(),

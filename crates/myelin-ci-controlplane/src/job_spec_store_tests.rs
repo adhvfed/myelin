@@ -52,6 +52,7 @@ fn full_spec(trust: TrustTier, timeout_secs: u32) -> DurableCiJobLaunchTemplate 
     let (spec, _token) = resolved.into_template();
     DurableCiJobLaunchTemplate {
         spec,
+        project_id: "55555555-5555-4555-8555-555555555555".into(),
         ci_run_id: "22222222-2222-2222-2222-222222222222".into(),
         token_authority_handle: "identity-authority:job-1".into(),
     }
