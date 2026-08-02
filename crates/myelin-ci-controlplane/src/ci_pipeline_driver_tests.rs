@@ -885,6 +885,35 @@ fn preparation_completion_receipts_are_disposition_bound_and_externally_pinned()
     );
 }
 
+#[test]
+fn secret_withhold_result_summary_persists_the_machine_reason() {
+    let report = TerminalReport {
+        passed: false,
+        timed_out: false,
+        usage: ResourceUsage {
+            cpu_seconds: 0,
+            mem_byte_seconds: 0,
+        },
+        result_refs: Vec::new(),
+    };
+    let summary = terminal_result_summary(
+        &report,
+        Some(CiJobTerminalDisposition::Preparation(
+            PreparationTerminalDisposition::Failed {
+                phase: myelin_ci_sandbox::PreparationPhase::SecretResolution,
+            },
+        )),
+        Some("secret_withheld:DEPLOY_KEY=capability_unavailable"),
+    );
+    assert_eq!(summary["passed"], false);
+    assert_eq!(summary["workload_started"], false);
+    assert_eq!(summary["disposition"], "secret_resolution_failed");
+    assert_eq!(
+        summary["diagnostic"],
+        "secret_withheld:DEPLOY_KEY=capability_unavailable"
+    );
+}
+
 /// **CT-007 slice 5b.3-6d STEP 4: the twelve-field `CiJobTokenRequest` ↔ `PreparationReportClaim`
 /// mapping is EXACT (no drop, no reorder).** A canonical request with a DISTINCT value in every field
 /// round-trips through the admission-side projection (`preparation_report_claim`) and the reporter-side

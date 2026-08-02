@@ -53,7 +53,8 @@ use std::sync::Mutex;
 
 use myelin_ci_sandbox::{
     derive_checkout_authorization_scope, CompletionClaim, CompletionSettlementOwner, IdemToken,
-    JobKind, JobSpec as SandboxJobSpec, PreparationReportClaim, PreparationRetryReport,
+    JobKind, JobSpec as SandboxJobSpec, PreparationPhase, PreparationReportClaim,
+    PreparationRetryReport,
     PreparationTerminalDisposition, ResourceUsage, RetryableAttemptCause, RetryableAttemptFailure,
     RetryableAttemptOutcome, TerminalReport, TerminalReporter,
 };
@@ -1291,9 +1292,19 @@ async fn verify_preparation_disposition_on_conn(
     .map_err(|_| CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database))?;
 
     match disposition {
+        PreparationTerminalDisposition::Failed {
+            phase: PreparationPhase::SecretResolution,
+        } => {
+            if current.is_some() {
+                return Err(CompletionTxError::Refused);
+            }
+        }
+        PreparationTerminalDisposition::TimedOut {
+            phase: PreparationPhase::SecretResolution,
+        } => return Err(CompletionTxError::Refused),
         PreparationTerminalDisposition::Failed { phase }
         | PreparationTerminalDisposition::TimedOut { phase } => {
-            // Unchanged: Failed/TimedOut REQUIRE the current exact parent row.
+            // Executed checkout preparation requires the current exact parent row.
             current.ok_or(CompletionTxError::Refused)?;
             let terminal = sqlx::query_scalar::<_, i32>(
                 "SELECT 1
@@ -1915,16 +1926,22 @@ impl CiPipelineReporter {
                             .get_launch_template_on_conn(conn, tenant.as_str(), &claim.job_id)
                             .await
                             .map_err(CompletionTxError::Spec)?;
+                        let checkout_scope = derive_checkout_authorization_scope(
+                            JobKind::Ci,
+                            &launch.spec.workspace,
+                        )
+                        .map_err(|_| CompletionTxError::Refused)?;
                         if launch.ci_run_id != claim.ci_run_id
                             || launch.token_authority_handle != claim.token_authority_handle
                             || launch.spec.idem_token.0 != claim.idem_token
                             || launch.spec.meter_to.reserve_id != reserve_handle
-                            || derive_checkout_authorization_scope(
-                                JobKind::Ci,
-                                &launch.spec.workspace,
-                            )
-                            .map_err(|_| CompletionTxError::Refused)?
-                            .is_none()
+                            || (checkout_scope.is_none()
+                                && !matches!(
+                                    disposition,
+                                    PreparationTerminalDisposition::Failed {
+                                        phase: PreparationPhase::SecretResolution
+                                    }
+                                ))
                         {
                             return Err(CompletionTxError::Refused);
                         }
@@ -1964,7 +1981,16 @@ impl CiPipelineReporter {
                                 job_id: &claim.job_id,
                                 reserve_handle: &reserve_handle,
                                 base_usage,
-                                parent_expectation: CiPrelaunchParentExpectation::Required,
+                                parent_expectation: if matches!(
+                                    disposition,
+                                    PreparationTerminalDisposition::Failed {
+                                        phase: PreparationPhase::SecretResolution
+                                    }
+                                ) {
+                                    CiPrelaunchParentExpectation::OptionalBeforeLaunch
+                                } else {
+                                    CiPrelaunchParentExpectation::Required
+                                },
                                 unresolved_policy: CiPrelaunchUnresolvedPolicy::Refuse,
                             },
                         )
@@ -2014,11 +2040,20 @@ impl CiPipelineReporter {
                             reserve_handle: &reserve_handle,
                             completion_receipt: &receipts.current_v4,
                         };
-                        // CT-007 5b.3-6d: AttemptsExhausted may terminalize a generation that was
-                        // refused admission (no current-generation parent row), so it routes through
-                        // the exhausted-variant CAS whose parent predicate is policy-exhaustion.
-                        // Failed/TimedOut keep the current-row CAS.
+                        // Secret resolution occurs before parent-attempt admission and uses its own
+                        // exact leased-generation CAS. AttemptsExhausted may also lack the current
+                        // parent but proves exhaustion against prior policy rows. Executed checkout
+                        // Failed/TimedOut keeps the current-parent CAS.
                         let claim_outcome = match disposition {
+                            PreparationTerminalDisposition::Failed {
+                                phase: PreparationPhase::SecretResolution,
+                            } => {
+                                CiJobQueueStore::consume_secret_withheld_claim_on_conn(
+                                    conn,
+                                    consume_spec,
+                                )
+                                .await?
+                            }
                             PreparationTerminalDisposition::AttemptsExhausted => {
                                 CiJobQueueStore::consume_preparation_claim_exhausted_on_conn(
                                     conn,

@@ -513,13 +513,18 @@ async fn real_v2_wiring(
     )
     .await
     .expect("compose the production Identity authorities");
-    let wiring = ci_runner_v2_wiring(provider.clone(), &identity, tokio::runtime::Handle::current())
-        .expect("compose the dormant V2 runner wiring")
-        .into_parts();
-    let reporter = ci_production_runtime_factory(provider, tokio::runtime::Handle::current())
+    let reporter = ci_production_runtime_factory(provider.clone(), tokio::runtime::Handle::current())
         .expect("compose production V4 runtime")
         .reporter_router()
         .expect("compose production V4 reporter router");
+    let wiring = ci_runner_v2_wiring(
+        provider,
+        &identity,
+        tokio::runtime::Handle::current(),
+        reporter.clone(),
+    )
+        .expect("compose the dormant V2 runner wiring")
+        .into_parts();
     (wiring.0, wiring.1, reporter)
 }
 

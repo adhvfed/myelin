@@ -72,6 +72,9 @@ pub mod hardening;
 mod launch_gate;
 pub mod notif_rules;
 pub mod redaction;
+pub use redaction::{
+    ResolvedJobSecrets, ResolvedSecretEnv, SecretInjectionError,
+};
 pub mod replay;
 pub mod runner;
 pub mod self_hosted;
@@ -188,6 +191,9 @@ pub struct JobSpec {
     /// Secret references resolved by the **in-boundary broker**, scoped to THIS job only (CI-1;
     /// arch 02 §7.3) — never baked into images, never forwarded via the runtime.
     pub secret_refs: Vec<SecretRef>,
+    /// Ephemeral broker resolution coupled to its exact redaction plan. Private and non-serializable:
+    /// durable templates and records retain only `secret_refs`.
+    resolved_secrets: ResolvedJobSecrets,
     /// Egress policy — **default-deny**, allowlist opt-in; the cloud-metadata endpoint, the
     /// control-plane/internal RPC, and any cross-tenant network are ALWAYS blocked (arch 02 §5.3).
     pub egress: EgressPolicy,
@@ -706,6 +712,7 @@ impl JobSpec {
             command,
             env,
             secret_refs,
+            resolved_secrets: ResolvedJobSecrets::default(),
             egress,
             limits,
             workspace,
@@ -734,6 +741,30 @@ impl JobSpec {
             idem_token: self.idem_token,
         };
         (template, self.run_token)
+    }
+
+    /// Attach the complete broker resolution immediately before launch. The checked constructor is
+    /// the only mutation path, so secret env and redaction coverage cannot be separated.
+    pub fn with_resolved_secrets(
+        mut self,
+        bindings: Vec<ResolvedSecretEnv>,
+    ) -> Result<Self, SecretInjectionError> {
+        self.resolved_secrets = ResolvedJobSecrets::for_job(&self, bindings)?;
+        Ok(self)
+    }
+
+    /// Validate the fail-closed injected-env ↔ redaction-plan equality before launch.
+    pub fn validate_secret_coverage(&self) -> Result<(), SecretInjectionError> {
+        self.resolved_secrets.validate_for_job(self)
+    }
+
+    /// Number of broker-resolved env entries attached to this ephemeral launch spec.
+    pub fn resolved_secret_count(&self) -> usize {
+        self.resolved_secrets.len()
+    }
+
+    pub(crate) fn resolved_secrets(&self) -> &ResolvedJobSecrets {
+        &self.resolved_secrets
     }
 }
 
@@ -789,6 +820,7 @@ impl JobSpecTemplate {
             command: self.command,
             env: self.env,
             secret_refs: self.secret_refs,
+            resolved_secrets: ResolvedJobSecrets::default(),
             egress: self.egress,
             limits: self.limits,
             workspace: self.workspace,

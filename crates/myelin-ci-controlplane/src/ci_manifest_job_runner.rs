@@ -9,14 +9,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use myelin_ci_sandbox::{
-    EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind as SandboxJobKind,
-    JobSpecTemplate as SandboxJobSpecTemplate, MeterTarget, ResourceLimits, RunTokenCredential,
-    SecretRef, TrustTier as SandboxTrustTier, WorkspaceSpec,
+    EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind as SandboxJobKind, JobSpec,
+    JobSpecTemplate as SandboxJobSpecTemplate, MeterTarget, ResourceLimits,
+    RunTokenAuthorizationContext, RunTokenCredential, SecretRef, TrustTier as SandboxTrustTier,
+    WorkspaceSpec,
 };
 use myelin_flow::{
     ActivityError, JobKind, JobRunner, JobSpec as FlowJobSpec, PgFlowWorker, PgResolvedDriveInput,
     PgWorkerError,
 };
+use myelin_identity::{
+    AuthzError, Consistency, DataRole, IdentityService, Principal, PrincipalId, PrincipalKind,
+    PrincipalStatus,
+};
+use myelin_tenancy::{ArtifactRef, Region, TenantId};
 
 use crate::ci_drive_manifest::{
     CiDriveManifestV1, CiManifestLaneV1, CiManifestTrustTierV1, GrantedCiJobV1,
@@ -29,6 +35,114 @@ use crate::job_queue_store::DurableEnqueue;
 use crate::job_spec_store::{CiJobSpecStore, DurableCiJobLaunchTemplate};
 use crate::scheduler::Lane;
 use crate::CI_PIPELINE_WF_TYPE;
+use crate::{
+    SecretBroker, SecretCapability, SecretLaunchError, WithheldSecret, WithholdReason,
+};
+
+/// Claim-time secret resolution port used by the real durable manifest launch reconstruction. The
+/// returned `JobSpec` is the only value allowed onward to the sandbox, so a withhold/error reaches the
+/// leased-job workflow as a material-free resolver refusal instead of becoming `BindingSetMismatch`.
+pub type CiJobSecretResolver =
+    Arc<dyn Fn(&TenantId, JobSpec) -> Result<JobSpec, SecretLaunchError> + Send + Sync>;
+
+/// Material-free, stable diagnostic persisted for a terminal secret withhold. Secret names are
+/// validated manifest machine tokens and reasons come from the closed [`WithholdReason`] vocabulary.
+pub(crate) fn secret_withhold_machine_reason(withheld: &[WithheldSecret]) -> String {
+    let mut reason = String::from("secret_withheld:");
+    for (index, item) in withheld.iter().enumerate() {
+        if index != 0 {
+            reason.push(',');
+        }
+        reason.push_str(&item.name);
+        reason.push('=');
+        reason.push_str(item.reason.as_token());
+    }
+    reason
+}
+
+/// Fail-closed production fallback for a deployment with no composed secret-store capability. Empty
+/// jobs still receive a checked empty binding set; secret-bearing jobs are withheld observably.
+pub fn unavailable_ci_job_secret_resolver() -> CiJobSecretResolver {
+    Arc::new(|_tenant, spec| {
+        if spec.secret_refs.is_empty() {
+            return spec
+                .with_resolved_secrets(Vec::new())
+                .map_err(SecretLaunchError::Injection);
+        }
+        let reason = if spec.trust_tier == SandboxTrustTier::UntrustedFork {
+            WithholdReason::UntrustedFork
+        } else {
+            WithholdReason::CapabilityUnavailable
+        };
+        Err(SecretLaunchError::Withheld(
+            spec.secret_refs
+                .iter()
+                .map(|secret| WithheldSecret {
+                    name: secret.name.clone(),
+                    reason,
+                })
+                .collect(),
+        ))
+    })
+}
+
+/// Adapt the real in-boundary broker to the durable CI launch port. The subject is rebuilt only from
+/// the server-resolved, non-persistable claim authorization context; a missing or cross-tenant
+/// context fails closed before the capability or Identity service is called.
+pub fn secret_broker_ci_job_resolver<C, I>(
+    capability: Arc<C>,
+    identity: Arc<I>,
+    consistency: Consistency,
+) -> CiJobSecretResolver
+where
+    C: SecretCapability + Send + Sync + 'static,
+    I: IdentityService + Send + Sync + 'static,
+{
+    Arc::new(move |tenant, spec| {
+        let context = match spec.run_token_authorization.as_ref() {
+            Some(RunTokenAuthorizationContext::CiJob(context)) => context.clone(),
+            None => {
+                return Err(SecretLaunchError::Authorization(AuthzError::FailClosed(
+                    "CI secret resolution requires a claim authorization context".into(),
+                )));
+            }
+        };
+        if context.tenant_id != tenant.0 {
+            return Err(SecretLaunchError::Authorization(AuthzError::FailClosed(
+                "CI secret resolution tenant does not match the authorized claim".into(),
+            )));
+        }
+        let subject = Principal::new(
+            tenant.clone(),
+            Region::new(context.region),
+            PrincipalId(context.principal_id),
+            PrincipalKind::Service,
+            DataRole::Processor,
+            PrincipalStatus::Active,
+        );
+        SecretBroker::new(capability.as_ref(), identity.as_ref()).resolve_for_launch(
+            spec,
+            &subject,
+            |secret| ArtifactRef(secret.handle.clone()),
+            &consistency,
+        )
+    })
+}
+
+/// The production claim reconstruction's final step: attach the claim credential, then resolve the
+/// exact manifest-carried secret refs before the `JobSpec` can reach `RunnerAgent`.
+pub(crate) fn resolve_claim_launch_secrets(
+    tenant: &TenantId,
+    template: SandboxJobSpecTemplate,
+    run_token: RunTokenCredential,
+    authorization: RunTokenAuthorizationContext,
+    secrets: &CiJobSecretResolver,
+) -> Result<JobSpec, SecretLaunchError> {
+    secrets(
+        tenant,
+        template.resolve_with_authorization(run_token, Some(authorization)),
+    )
+}
 
 /// Owned, retry-stable authority request for one exact live scheduler claim. The epoch + nonce are
 /// the activity generation: acknowledgement-loss retries reuse it, while a reaper/new claim changes
@@ -297,8 +411,9 @@ fn manifest_dispatch_parts(
         idem_token: flow.idem_token.clone(),
         stage: job.name.clone(),
         claim_window_secs,
-        reservation_write_version:
-            crate::ReservationWriteVersionMarker::derive_from_reserve_handle(&job.reserve_handle),
+        reservation_write_version: crate::ReservationWriteVersionMarker::derive_from_reserve_handle(
+            &job.reserve_handle,
+        ),
     };
     Ok((
         enqueue,
@@ -342,6 +457,54 @@ pub(crate) fn validate_run_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn secret_template() -> SandboxJobSpecTemplate {
+        SandboxJobSpecTemplate::new(
+            SandboxJobKind::Ci,
+            ImageRef::pinned(format!("registry.example/job@sha256:{}", "a".repeat(64))).unwrap(),
+            vec!["/bin/true".into()],
+            Vec::new(),
+            vec![SecretRef {
+                name: "DEPLOY_KEY".into(),
+                handle: "myelin://acme/ci/secret/deploy".into(),
+            }],
+            EgressPolicy::deny_all(),
+            ResourceLimits {
+                cpu_millis: 1000,
+                mem_bytes: 256 * 1024 * 1024,
+                disk_bytes: 1024 * 1024 * 1024,
+                tmpfs_bytes: 64 * 1024 * 1024,
+                pids_max: 64,
+                timeout_secs: 30,
+            },
+            WorkspaceSpec::default(),
+            SandboxTrustTier::Trusted,
+            MeterTarget {
+                reserve_id: "reserve:secret-test".into(),
+            },
+            IdemToken("idem:secret-test".into()),
+        )
+        .unwrap()
+    }
+
+    fn authorization() -> RunTokenAuthorizationContext {
+        RunTokenAuthorizationContext::CiJob(myelin_ci_sandbox::CiJobAuthorizationContext {
+            tenant_id: "acme".into(),
+            region: "fr-par".into(),
+            principal_id: "ci-job".into(),
+            wf_run_id: "wf".into(),
+            job_id: "job".into(),
+            lease_owner: "runner".into(),
+            lease_epoch: 1,
+            claim_nonce: "nonce".into(),
+            claim_started_at_epoch_secs: 1,
+            claim_expires_at_epoch_secs: 2,
+            reserve_id: "reserve:secret-test".into(),
+            required_capabilities: Vec::new(),
+            checkout_scope: None,
+            credential_binding: None,
+        })
+    }
 
     #[test]
     fn maps_every_manifest_lane_and_trust_tier_exactly() {
@@ -428,6 +591,48 @@ mod tests {
         assert!(
             (MAX_CI_JOB_TOKEN_TTL_SECS as i64)
                 < crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS
+        );
+    }
+
+    #[test]
+    fn production_claim_launch_path_resolves_or_withholds_before_sandbox() {
+        let resolver: CiJobSecretResolver = Arc::new(|tenant, spec| {
+            assert_eq!(tenant.0, "acme");
+            spec.with_resolved_secrets(vec![myelin_ci_sandbox::ResolvedSecretEnv::new(
+                "DEPLOY_KEY",
+                "production-material",
+            )])
+            .map_err(SecretLaunchError::Injection)
+        });
+        let injected = resolve_claim_launch_secrets(
+            &TenantId::from_token("acme"),
+            secret_template(),
+            RunTokenCredential::new("bearer", "jti", 60).unwrap(),
+            authorization(),
+            &resolver,
+        )
+        .unwrap();
+        assert_eq!(injected.resolved_secret_count(), 1);
+        assert!(injected.validate_secret_coverage().is_ok());
+
+        let withheld = resolve_claim_launch_secrets(
+            &TenantId::from_token("acme"),
+            secret_template(),
+            RunTokenCredential::new("bearer", "jti", 60).unwrap(),
+            authorization(),
+            &unavailable_ci_job_secret_resolver(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            withheld.to_string(),
+            "secret launch withheld: DEPLOY_KEY=capability_unavailable"
+        );
+        let SecretLaunchError::Withheld(withheld) = withheld else {
+            panic!("unavailable capability must produce a typed withhold");
+        };
+        assert_eq!(
+            secret_withhold_machine_reason(&withheld),
+            "secret_withheld:DEPLOY_KEY=capability_unavailable"
         );
     }
 }

@@ -87,6 +87,9 @@ pub fn initial_phase_purpose(checkout: Option<&CheckoutAuthorizationScope>) -> C
 /// meet, so a phase can never be journaled through a hand-written mismatched token.
 fn journal_phase(phase: PreparationPhase) -> CiPrelaunchUsagePhase {
     match phase {
+        PreparationPhase::SecretResolution => {
+            unreachable!("secret resolution is terminalized before checkout journaling")
+        }
         PreparationPhase::CheckoutTransport => CiPrelaunchUsagePhase::CheckoutTransport,
         PreparationPhase::CheckoutMaterialization => CiPrelaunchUsagePhase::CheckoutMaterialization,
     }

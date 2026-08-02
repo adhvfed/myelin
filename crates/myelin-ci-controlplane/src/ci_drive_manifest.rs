@@ -14,7 +14,7 @@ use myelin_tenancy::{Region, TenantId};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool, Row};
 
-use crate::CI_PIPELINE_WF_TYPE;
+use crate::{secret_broker::parse_canonical_secret_handle, CI_PIPELINE_WF_TYPE};
 
 pub const CI_DRIVE_MANIFEST_SCHEMA_V1: u32 = 1;
 pub const CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN: &str = "myelin.ci.drive-manifest.v1";
@@ -313,7 +313,7 @@ impl CiDriveManifestV1 {
             validate_collection_len("environment", job.env.len())?;
             for (name, handle) in &job.secret_handles {
                 validate_machine_token("secret environment name", name)?;
-                validate_bounded("secret handle", handle)?;
+                validate_tenant_secret_handle(handle, &self.tenant_id)?;
                 if job.env.contains_key(name) {
                     return invalid("a secret name cannot also carry a literal environment value");
                 }
@@ -878,6 +878,17 @@ fn validate_canonical_ref(
     Ok(())
 }
 
+fn validate_tenant_secret_handle(handle: &str, tenant: &str) -> Result<(), CiDriveManifestError> {
+    validate_bounded("secret handle", handle)?;
+    let Some(parsed) = parse_canonical_secret_handle(handle) else {
+        return invalid("secret handle is not a strict canonical tenant-scoped secret identity");
+    };
+    if parsed.tenant != tenant {
+        return invalid("secret handle is not bound to the manifest tenant");
+    }
+    Ok(())
+}
+
 fn invalid<T>(detail: impl Into<String>) -> Result<T, CiDriveManifestError> {
     Err(CiDriveManifestError::Invalid(detail.into()))
 }
@@ -1019,6 +1030,48 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("reserve handles must be unique"));
+    }
+
+    #[test]
+    fn secret_handles_are_bound_to_the_manifest_tenant() {
+        let mut valid = manifest();
+        valid.jobs[0]
+            .secret_handles
+            .insert("DEPLOY_KEY".into(), "myelin://acme/ci/secret/deploy".into());
+        valid.validate().unwrap();
+
+        valid.jobs[0].secret_handles.insert(
+            "DEPLOY_KEY".into(),
+            "myelin://victim/ci/secret/deploy".into(),
+        );
+        assert!(valid
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("manifest tenant"));
+    }
+
+    #[test]
+    fn secret_handles_reject_every_noncanonical_alias_vector() {
+        for handle in [
+            "myelin://acme/ci/secret/secret:deploy",
+            "myelin://acme/ci/secret/..",
+            "myelin://acme/ci/secret/%2f",
+            "myelin://acme/ci/secret/deploy\0",
+            "junkmyelin://acme/ci/secret/deploy",
+            "myelin://acme/ci/secret/deploy/",
+            "myelin:///ci/secret/deploy",
+            "myelin://acme/ci/secret/",
+        ] {
+            let mut invalid = manifest();
+            invalid.jobs[0]
+                .secret_handles
+                .insert("DEPLOY_KEY".into(), handle.into());
+            assert!(
+                invalid.validate().is_err(),
+                "manifest admitted noncanonical secret handle {handle:?}"
+            );
+        }
     }
 
     #[test]
