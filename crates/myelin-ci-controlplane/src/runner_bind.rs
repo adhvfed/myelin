@@ -51,12 +51,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myelin_ci_sandbox::asset_registry::{GvisorAssetRegistry, RootfsAssetBinding};
+use myelin_ci_sandbox::asset_registry::{
+    CargoVendorAssetBinding, GvisorAssetRegistry, RootfsAssetBinding,
+};
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    derive_checkout_authorization_scope, resolved_gvisor_rootfs, resolved_gvisor_rust_rootfs,
-    verified_gvisor_git_rootfs, ImageRef, JobKind, JobSpec, LeaseStore, QueuedJob, RunnerError,
-    RunnerHooks, TrustTier, GVISOR_GIT_ROOTFS_SHA256, LINUX_RUST_V1_ROOTFS_SHA256,
+    derive_checkout_authorization_scope, resolved_gvisor_cargo_vendor, resolved_gvisor_rootfs,
+    resolved_gvisor_rust_rootfs, verified_gvisor_git_rootfs, ImageRef, JobKind, JobSpec,
+    LeaseStore, QueuedJob, RunnerError, RunnerHooks, TrustTier, CARGO_VENDOR_SMOKE_LOCK_SHA256,
+    CARGO_VENDOR_SMOKE_TREE_SHA256, GVISOR_GIT_ROOTFS_SHA256, LINUX_RUST_V1_ROOTFS_SHA256,
     LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_storage::s3blob::S3BlobStore;
@@ -86,6 +89,9 @@ use myelin_tenancy::{Region, TenantId};
 /// - `myelin.local/git-v1-rootfs@sha256:<GVISOR_GIT_ROOTFS_SHA256>` → the git-bearing checkout and
 ///   git-wire rootfs. Its resolver also validates the complete `/tmp`, `/workspace`, `/repo`, and
 ///   `/quarantine` destination set before registry construction hashes it.
+/// - `myelin.local/cargo-vendor-smoke-v1@sha256:<CARGO_VENDOR_SMOKE_TREE_SHA256>` → the exact
+///   Cargo.lock-keyed vendor tree. It is registered and verified at startup only; no job selects or
+///   mounts it until the separate gVisor wiring slice lands.
 ///
 /// **Composition-root placement, not `myelin-ci-sandbox`:** this function lives here (the CI
 /// control-plane's composition root), not in `myelin-ci-sandbox`, because the SPECIFIC bindings
@@ -102,36 +108,46 @@ use myelin_tenancy::{Region, TenantId};
 /// than silently limping along and discovering the problem mid-launch.
 pub fn production_gvisor_registry() -> Arc<GvisorAssetRegistry> {
     Arc::new(
-        GvisorAssetRegistry::from_bindings(vec![
-            RootfsAssetBinding {
-                image: ImageRef::pinned(format!(
-                    "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
+        GvisorAssetRegistry::from_bindings_with_cargo_vendor(
+            vec![
+                RootfsAssetBinding {
+                    image: ImageRef::pinned(format!(
+                        "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
+                    ))
+                    .expect("the founder-pipeline image reference is a well-formed digest pin"),
+                    rootfs: resolved_gvisor_rootfs(),
+                },
+                RootfsAssetBinding {
+                    image: ImageRef::pinned(format!(
+                        "myelin.local/linux-rust-v1-rootfs@sha256:{LINUX_RUST_V1_ROOTFS_SHA256}"
+                    ))
+                    .expect("the linux-rust-v1 image reference is a well-formed digest pin"),
+                    rootfs: resolved_gvisor_rust_rootfs(),
+                },
+                RootfsAssetBinding {
+                    image: ImageRef::pinned(format!(
+                        "myelin.local/git-v1-rootfs@sha256:{GVISOR_GIT_ROOTFS_SHA256}"
+                    ))
+                    .expect("the git rootfs image reference is a well-formed digest pin"),
+                    // This resolver verifies all four fixed OCI destinations and the same canonical
+                    // digest first; registry construction then independently verifies the pin.
+                    rootfs: verified_gvisor_git_rootfs().expect(
+                        "the git rootfs and every fixed OCI mountpoint must verify before runner startup",
+                    ),
+                },
+            ],
+            vec![CargoVendorAssetBinding {
+                reference: ImageRef::pinned(format!(
+                    "myelin.local/cargo-vendor-smoke-v1@sha256:{CARGO_VENDOR_SMOKE_TREE_SHA256}"
                 ))
-                .expect("the founder-pipeline image reference is a well-formed digest pin"),
-                rootfs: resolved_gvisor_rootfs(),
-            },
-            RootfsAssetBinding {
-                image: ImageRef::pinned(format!(
-                    "myelin.local/linux-rust-v1-rootfs@sha256:{LINUX_RUST_V1_ROOTFS_SHA256}"
-                ))
-                .expect("the linux-rust-v1 image reference is a well-formed digest pin"),
-                rootfs: resolved_gvisor_rust_rootfs(),
-            },
-            RootfsAssetBinding {
-                image: ImageRef::pinned(format!(
-                    "myelin.local/git-v1-rootfs@sha256:{GVISOR_GIT_ROOTFS_SHA256}"
-                ))
-                .expect("the git rootfs image reference is a well-formed digest pin"),
-                // This resolver verifies all four fixed OCI destinations and the same canonical
-                // digest first; `from_bindings` then independently verifies the registry pin.
-                rootfs: verified_gvisor_git_rootfs().expect(
-                    "the git rootfs and every fixed OCI mountpoint must verify before runner startup",
-                ),
-            },
-        ])
+                .expect("the Cargo vendor asset reference is a well-formed digest pin"),
+                root: resolved_gvisor_cargo_vendor(),
+                cargo_lock_sha256: CARGO_VENDOR_SMOKE_LOCK_SHA256.to_string(),
+            }],
+        )
         .expect(
             "production runner assets must verify at startup — a runner that cannot prove its own \
-             configured rootfs assets must refuse to start rather than launch jobs it cannot verify",
+             configured assets must refuse to start rather than launch jobs it cannot verify",
         ),
     )
 }
@@ -1259,8 +1275,8 @@ mod secret_withhold_terminal_tests {
 }
 
 /// A direct test for [`production_gvisor_registry`] itself — before this, nothing called it; every
-/// test built its own ad-hoc registry. All three real staged assets (`linux-small-v1`,
-/// `linux-rust-v1`, `git-v1`)
+/// test built its own ad-hoc registry. All four real staged assets (`linux-small-v1`,
+/// `linux-rust-v1`, `git-v1`, `cargo-vendor-smoke-v1`)
 /// are present on the founder-dogfood host this was written on, so this is a REAL, non-skipped
 /// assertion here (matching this repo's existing runsc/KVM graceful-skip convention, this test would
 /// need to skip on a host without the assets staged — but per the CT-007 gate 2/4 brief, this host
@@ -1274,13 +1290,20 @@ mod production_gvisor_registry_tests {
         let base_dir = resolved_gvisor_rootfs();
         let rust_dir = resolved_gvisor_rust_rootfs();
         let git_dir = myelin_ci_sandbox::resolved_gvisor_git_rootfs();
-        if !base_dir.is_dir() || !rust_dir.is_dir() || !git_dir.is_dir() {
+        let cargo_vendor_dir = resolved_gvisor_cargo_vendor();
+        if !base_dir.is_dir()
+            || !rust_dir.is_dir()
+            || !git_dir.is_dir()
+            || !cargo_vendor_dir.is_dir()
+        {
             eprintln!(
                 "constructs_and_resolves_all_real_images_to_their_expected_paths: SKIPPED — a \
-                 staged base ({}) / rust ({}) / git ({}) rootfs is absent on this machine",
+                 staged base ({}) / rust ({}) / git ({}) rootfs or Cargo vendor ({}) is absent on \
+                 this machine",
                 base_dir.display(),
                 rust_dir.display(),
-                git_dir.display()
+                git_dir.display(),
+                cargo_vendor_dir.display()
             );
             return;
         }
@@ -1299,6 +1322,10 @@ mod production_gvisor_registry_tests {
             "myelin.local/git-v1-rootfs@sha256:{GVISOR_GIT_ROOTFS_SHA256}"
         ))
         .unwrap();
+        let cargo_vendor_reference = ImageRef::pinned(format!(
+            "myelin.local/cargo-vendor-smoke-v1@sha256:{CARGO_VENDOR_SMOKE_TREE_SHA256}"
+        ))
+        .unwrap();
 
         let verified_small = registry
             .resolve(&small_image)
@@ -1309,6 +1336,9 @@ mod production_gvisor_registry_tests {
         let verified_git = registry
             .resolve(&git_image)
             .expect("the production registry must resolve git-v1");
+        let verified_cargo_vendor = registry
+            .resolve_cargo_vendor(&cargo_vendor_reference)
+            .expect("the production registry must resolve cargo-vendor-smoke-v1");
 
         assert_eq!(
             verified_small.path(),
@@ -1324,6 +1354,21 @@ mod production_gvisor_registry_tests {
             verified_git.path(),
             std::fs::canonicalize(&git_dir).unwrap(),
             "git-v1 must resolve to the same verified canonical path used by checkout"
+        );
+        assert_eq!(
+            verified_cargo_vendor.path(),
+            std::fs::canonicalize(&cargo_vendor_dir).unwrap(),
+            "cargo-vendor-smoke-v1 must resolve to the manifest-selected canonical path"
+        );
+        assert_eq!(
+            verified_cargo_vendor.digest_hex(),
+            CARGO_VENDOR_SMOKE_TREE_SHA256,
+            "cargo-vendor-smoke-v1 must round-trip its canonical-tree pin"
+        );
+        assert_eq!(
+            verified_cargo_vendor.cargo_lock_sha256(),
+            CARGO_VENDOR_SMOKE_LOCK_SHA256,
+            "cargo-vendor-smoke-v1 must round-trip its exact Cargo.lock key"
         );
     }
 }

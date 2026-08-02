@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 use crate::canonical_tar;
 use crate::ImageRef;
+use sha2::{Digest, Sha256};
 
 /// One raw, UNVERIFIED asset binding: the image reference it is pinned under, and the on-disk
 /// rootfs directory as given by the caller (typically the result of an env-var-backed resolver like
@@ -47,6 +48,45 @@ pub struct RootfsAssetBinding {
     pub rootfs: PathBuf,
 }
 
+/// One raw, unverified Cargo vendor-tree binding. The reference pins the complete asset tree while
+/// `cargo_lock_sha256` binds that tree to the exact `Cargo.lock` it was produced from. This slice
+/// registers and verifies the asset only; mounting it into a workload remains a separate concern.
+#[derive(Clone, Debug)]
+pub struct CargoVendorAssetBinding {
+    pub reference: ImageRef,
+    pub root: PathBuf,
+    pub cargo_lock_sha256: String,
+}
+
+/// Canonical-tree digest committed for `runner-assets.toml`'s `cargo-vendor-smoke-v1` row.
+pub const CARGO_VENDOR_SMOKE_TREE_SHA256: &str =
+    "9fcc19c65ae0a47de4b241c30f9eb3613cd74adf315f763e6f91d74b31eec8eb";
+/// SHA-256 of the exact fixture `Cargo.lock` used to build `cargo-vendor-smoke-v1`.
+pub const CARGO_VENDOR_SMOKE_LOCK_SHA256: &str =
+    "fc5b44e66527fdda3cbef94d7ee128f77f0919dc176e0ae8198a717b8ca7c603";
+/// Host path override for the staged Cargo vendor asset.
+pub const ENV_GVISOR_CARGO_VENDOR: &str = "MYELIN_GVISOR_CARGO_VENDOR";
+
+/// Compute a regular file's SHA-256 for manifest/source-key synchronization and asset validation.
+pub fn file_sha256_hex(path: &Path) -> std::io::Result<String> {
+    std::fs::read(path).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Resolve the staged `cargo-vendor-smoke-v1` path using its manifest-declared env override and
+/// default path. This performs path selection only; [`GvisorAssetRegistry`] remains the authority
+/// that canonicalizes, metadata-checks, and digest-verifies the selected tree.
+pub fn resolved_gvisor_cargo_vendor() -> PathBuf {
+    if let Ok(path) = std::env::var(ENV_GVISOR_CARGO_VENDOR) {
+        return PathBuf::from(path);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("gvisor-assets")
+        .join("cargo-vendor-smoke-v1")
+}
+
 /// A closed, explicit map from an EXACT `ImageRef` reference string to the ALREADY-VERIFIED rootfs
 /// it is pinned to. Constructed once at composition-root time via [`GvisorAssetRegistry::from_bindings`]
 /// (see `myelin-ci-controlplane`'s `runner_bind.rs` for the real founder-pipeline registry, and each
@@ -58,6 +98,7 @@ pub struct RootfsAssetBinding {
 #[derive(Debug)]
 pub struct GvisorAssetRegistry {
     verified: HashMap<String, VerifiedRootfs>,
+    cargo_vendor: HashMap<String, VerifiedCargoVendor>,
 }
 
 /// A rootfs whose canonical-tree digest has been recomputed, in-process, and PROVEN to match the
@@ -68,6 +109,30 @@ pub struct GvisorAssetRegistry {
 pub struct VerifiedRootfs {
     path: PathBuf,
     digest_hex: String,
+}
+
+/// A Cargo vendor asset whose complete canonical tree, safe shared-tree metadata, and embedded
+/// `Cargo.lock` identity were verified at registry construction. Its fields are private so callers
+/// can obtain it only through [`GvisorAssetRegistry::resolve_cargo_vendor`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedCargoVendor {
+    path: PathBuf,
+    digest_hex: String,
+    cargo_lock_sha256: String,
+}
+
+impl VerifiedCargoVendor {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn digest_hex(&self) -> &str {
+        &self.digest_hex
+    }
+
+    pub fn cargo_lock_sha256(&self) -> &str {
+        &self.cargo_lock_sha256
+    }
 }
 
 impl VerifiedRootfs {
@@ -129,6 +194,8 @@ pub enum AssetRegistryError {
         expected_uid: u32,
         actual_uid: u32,
     },
+    /// A Cargo vendor asset is structurally malformed or has an invalid lockfile pin.
+    InvalidCargoVendor { root: PathBuf, reason: String },
 }
 
 impl std::fmt::Display for AssetRegistryError {
@@ -200,6 +267,11 @@ impl std::fmt::Display for AssetRegistryError {
                 rootfs.display(),
                 path.display()
             ),
+            AssetRegistryError::InvalidCargoVendor { root, reason } => write!(
+                f,
+                "gvisor asset registry: Cargo vendor asset {} is invalid: {reason}",
+                root.display()
+            ),
         }
     }
 }
@@ -217,12 +289,30 @@ impl GvisorAssetRegistry {
     pub fn from_bindings(
         bindings: Vec<RootfsAssetBinding>,
     ) -> Result<GvisorAssetRegistry, AssetRegistryError> {
+        Self::from_bindings_with_cargo_vendor(bindings, Vec::new())
+    }
+
+    /// Construct the closed rootfs registry together with a closed Cargo vendor-tree registry.
+    /// Every tree passes the same ownership/mode-hardened canonical walk before construction can
+    /// succeed; no workload mount or Cargo configuration is performed here.
+    pub fn from_bindings_with_cargo_vendor(
+        bindings: Vec<RootfsAssetBinding>,
+        cargo_vendor_bindings: Vec<CargoVendorAssetBinding>,
+    ) -> Result<GvisorAssetRegistry, AssetRegistryError> {
         // The runner account is also the owner of its private asset store. Capture the effective
         // uid once so every binding in this registry is checked against one stable authority. An
         // externally configurable uid would let configuration redefine which foreign owner is
         // trusted and is unnecessary for the current single-owner store model.
         // SAFETY: `geteuid` takes no pointers and has no preconditions.
         let expected_owner_uid = unsafe { libc::geteuid() };
+        Self::from_bindings_with_owner(bindings, cargo_vendor_bindings, expected_owner_uid)
+    }
+
+    fn from_bindings_with_owner(
+        bindings: Vec<RootfsAssetBinding>,
+        cargo_vendor_bindings: Vec<CargoVendorAssetBinding>,
+        expected_owner_uid: u32,
+    ) -> Result<GvisorAssetRegistry, AssetRegistryError> {
         let mut verified = HashMap::with_capacity(bindings.len());
         for binding in bindings {
             if verified.contains_key(&binding.image.reference) {
@@ -233,7 +323,158 @@ impl GvisorAssetRegistry {
             let result = Self::verify_binding(&binding, expected_owner_uid)?;
             verified.insert(binding.image.reference.clone(), result);
         }
-        Ok(GvisorAssetRegistry { verified })
+        let mut cargo_vendor = HashMap::with_capacity(cargo_vendor_bindings.len());
+        for binding in cargo_vendor_bindings {
+            if verified.contains_key(&binding.reference.reference)
+                || cargo_vendor.contains_key(&binding.reference.reference)
+            {
+                return Err(AssetRegistryError::DuplicateReference {
+                    reference: binding.reference.reference,
+                });
+            }
+            let result = Self::verify_cargo_vendor_binding(&binding, expected_owner_uid)?;
+            cargo_vendor.insert(binding.reference.reference.clone(), result);
+        }
+        Ok(GvisorAssetRegistry {
+            verified,
+            cargo_vendor,
+        })
+    }
+
+    fn verify_cargo_vendor_binding(
+        binding: &CargoVendorAssetBinding,
+        expected_owner_uid: u32,
+    ) -> Result<VerifiedCargoVendor, AssetRegistryError> {
+        let (algorithm, expected_hex) = binding.reference.parse_digest().ok_or_else(|| {
+            AssetRegistryError::InvalidCargoVendor {
+                root: binding.root.clone(),
+                reason: "reference must carry a supported digest pin".to_string(),
+            }
+        })?;
+        if algorithm != "sha256" {
+            return Err(AssetRegistryError::UnsupportedDigestAlgorithm {
+                reference: binding.reference.reference.clone(),
+                algorithm: algorithm.to_string(),
+            });
+        }
+        if binding.cargo_lock_sha256.len() != 64
+            || !binding
+                .cargo_lock_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(AssetRegistryError::InvalidCargoVendor {
+                root: binding.root.clone(),
+                reason: "cargo_lock_sha256 must be exactly 64 hexadecimal characters".to_string(),
+            });
+        }
+
+        let canon = std::fs::canonicalize(&binding.root).map_err(|error| {
+            AssetRegistryError::InvalidCargoVendor {
+                root: binding.root.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        if canon == Path::new("/") || !canon.is_dir() {
+            return Err(AssetRegistryError::InvalidCargoVendor {
+                root: canon,
+                reason: "must canonicalize to a real, non-root directory".to_string(),
+            });
+        }
+
+        for relative in ["vendor", ".cargo"] {
+            let path = canon.join(relative);
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                AssetRegistryError::InvalidCargoVendor {
+                    root: canon.clone(),
+                    reason: format!("required {relative}/ directory is absent: {error}"),
+                }
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(AssetRegistryError::InvalidCargoVendor {
+                    root: canon.clone(),
+                    reason: format!("required {relative}/ must be a real directory"),
+                });
+            }
+        }
+        for relative in [".cargo/config.toml", "Cargo.lock"] {
+            let path = canon.join(relative);
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                AssetRegistryError::InvalidCargoVendor {
+                    root: canon.clone(),
+                    reason: format!("required {relative} is absent: {error}"),
+                }
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(AssetRegistryError::InvalidCargoVendor {
+                    root: canon.clone(),
+                    reason: format!("required {relative} must be a real regular file"),
+                });
+            }
+        }
+
+        let actual_lock_sha256 = file_sha256_hex(&canon.join("Cargo.lock")).map_err(|error| {
+            AssetRegistryError::InvalidCargoVendor {
+                root: canon.clone(),
+                reason: format!("could not read required Cargo.lock: {error}"),
+            }
+        })?;
+        if actual_lock_sha256 != binding.cargo_lock_sha256 {
+            return Err(AssetRegistryError::InvalidCargoVendor {
+                root: canon.clone(),
+                reason: format!(
+                    "embedded Cargo.lock is sha256:{actual_lock_sha256}, expected sha256:{}",
+                    binding.cargo_lock_sha256
+                ),
+            });
+        }
+
+        let actual_hex = Self::verify_asset_tree(&canon, expected_owner_uid)?;
+        if actual_hex != expected_hex {
+            return Err(AssetRegistryError::DigestMismatch {
+                reference: binding.reference.reference.clone(),
+                expected: expected_hex.to_string(),
+                actual: actual_hex,
+            });
+        }
+        Ok(VerifiedCargoVendor {
+            path: canon,
+            digest_hex: actual_hex,
+            cargo_lock_sha256: binding.cargo_lock_sha256.clone(),
+        })
+    }
+
+    fn verify_asset_tree(
+        canon: &Path,
+        expected_owner_uid: u32,
+    ) -> Result<String, AssetRegistryError> {
+        canonical_tar::verified_asset_tree_sha256_hex(canon, expected_owner_uid).map_err(|error| {
+            match error {
+                canonical_tar::AssetTreeVerificationError::Io(error) => {
+                    AssetRegistryError::Hashing {
+                        rootfs: canon.to_path_buf(),
+                        reason: error.to_string(),
+                    }
+                }
+                canonical_tar::AssetTreeVerificationError::GroupOrWorldWritable { path, mode } => {
+                    AssetRegistryError::GroupOrWorldWritable {
+                        rootfs: canon.to_path_buf(),
+                        path,
+                        mode,
+                    }
+                }
+                canonical_tar::AssetTreeVerificationError::UnexpectedOwner {
+                    path,
+                    expected_uid,
+                    actual_uid,
+                } => AssetRegistryError::UnexpectedOwner {
+                    rootfs: canon.to_path_buf(),
+                    path,
+                    expected_uid,
+                    actual_uid,
+                },
+            }
+        })
     }
 
     /// The one-time verification a construction-time binding undergoes: a supported (`sha256`)
@@ -300,32 +541,7 @@ impl GvisorAssetRegistry {
             });
         }
 
-        let actual_hex = canonical_tar::verified_asset_tree_sha256_hex(&canon, expected_owner_uid)
-            .map_err(|error| match error {
-                canonical_tar::AssetTreeVerificationError::Io(error) => {
-                    AssetRegistryError::Hashing {
-                        rootfs: canon.clone(),
-                        reason: error.to_string(),
-                    }
-                }
-                canonical_tar::AssetTreeVerificationError::GroupOrWorldWritable { path, mode } => {
-                    AssetRegistryError::GroupOrWorldWritable {
-                        rootfs: canon.clone(),
-                        path,
-                        mode,
-                    }
-                }
-                canonical_tar::AssetTreeVerificationError::UnexpectedOwner {
-                    path,
-                    expected_uid,
-                    actual_uid,
-                } => AssetRegistryError::UnexpectedOwner {
-                    rootfs: canon.clone(),
-                    path,
-                    expected_uid,
-                    actual_uid,
-                },
-            })?;
+        let actual_hex = Self::verify_asset_tree(&canon, expected_owner_uid)?;
         if actual_hex != expected_hex {
             return Err(AssetRegistryError::DigestMismatch {
                 reference: image.reference.clone(),
@@ -349,6 +565,19 @@ impl GvisorAssetRegistry {
             .ok_or_else(|| AssetRegistryError::UnknownImage {
                 reference: image.reference.clone(),
             })
+    }
+
+    /// Resolve an exact Cargo vendor-tree reference to the startup-verified capability. This is an
+    /// O(1) lookup and does not imply that any job mounts or otherwise consumes the asset.
+    pub fn resolve_cargo_vendor(
+        &self,
+        reference: &ImageRef,
+    ) -> Result<&VerifiedCargoVendor, AssetRegistryError> {
+        self.cargo_vendor.get(&reference.reference).ok_or_else(|| {
+            AssetRegistryError::UnknownImage {
+                reference: reference.reference.clone(),
+            }
+        })
     }
 }
 
@@ -722,5 +951,127 @@ mod tests {
         )])
         .expect_err("an absent registered path must refuse construction, not panic");
         assert!(matches!(err, AssetRegistryError::InvalidRootfsPath { .. }));
+    }
+
+    fn cargo_vendor_fixture(tag: &str) -> (PathBuf, ImageRef, String) {
+        let root = std::env::temp_dir().join(format!(
+            "myelin-cargo-vendor-registry-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let crate_dir = root.join("vendor/itoa-1.0.15");
+        let cargo_dir = root.join(".cargo");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::create_dir_all(&cargo_dir).unwrap();
+        fs::write(crate_dir.join("lib.rs"), b"external crate").unwrap();
+        fs::write(
+            cargo_dir.join("config.toml"),
+            b"[source.crates-io]\nreplace-with='vendored-sources'\n",
+        )
+        .unwrap();
+        let lock_bytes = b"# exact fixture lock\n";
+        fs::write(root.join("Cargo.lock"), lock_bytes).unwrap();
+
+        for dir in [&root, &root.join("vendor"), &crate_dir, &cargo_dir] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for file in [
+            crate_dir.join("lib.rs"),
+            cargo_dir.join("config.toml"),
+            root.join("Cargo.lock"),
+        ] {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let digest = canonical_tar::canonical_tree_sha256_hex(&root).unwrap();
+        let reference =
+            ImageRef::pinned(format!("test.local/cargo-vendor-{tag}@sha256:{digest}")).unwrap();
+        let lock_sha256 = format!("{:x}", Sha256::digest(lock_bytes));
+        (root, reference, lock_sha256)
+    }
+
+    fn cargo_vendor_binding(
+        reference: ImageRef,
+        root: impl Into<PathBuf>,
+        cargo_lock_sha256: impl Into<String>,
+    ) -> CargoVendorAssetBinding {
+        CargoVendorAssetBinding {
+            reference,
+            root: root.into(),
+            cargo_lock_sha256: cargo_lock_sha256.into(),
+        }
+    }
+
+    #[test]
+    fn verified_cargo_vendor_resolution_round_trips_all_pinned_identity() {
+        let (root, reference, lock_sha256) = cargo_vendor_fixture("round-trip");
+        let expected_tree_sha256 = reference.parse_digest().unwrap().1.to_string();
+        let registry = GvisorAssetRegistry::from_bindings_with_cargo_vendor(
+            Vec::new(),
+            vec![cargo_vendor_binding(reference.clone(), &root, &lock_sha256)],
+        )
+        .expect("the complete vendor tree verifies at registry construction");
+
+        let verified = registry
+            .resolve_cargo_vendor(&reference)
+            .expect("the exact registered reference resolves");
+        assert_eq!(verified.path(), fs::canonicalize(&root).unwrap());
+        assert_eq!(verified.digest_hex(), expected_tree_sha256);
+        assert_eq!(verified.cargo_lock_sha256(), lock_sha256);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_vendor_writable_or_foreign_owned_entry_is_refused_by_shared_tree_walk() {
+        let (writable_root, writable_reference, lock_sha256) = cargo_vendor_fixture("writable");
+        let writable_path = writable_root.join("vendor/itoa-1.0.15/lib.rs");
+        fs::set_permissions(&writable_path, fs::Permissions::from_mode(0o664)).unwrap();
+        let writable_error = GvisorAssetRegistry::from_bindings_with_cargo_vendor(
+            Vec::new(),
+            vec![cargo_vendor_binding(
+                writable_reference,
+                &writable_root,
+                &lock_sha256,
+            )],
+        )
+        .expect_err("a group-writable vendor entry must refuse registry construction");
+        assert!(matches!(
+            writable_error,
+            AssetRegistryError::GroupOrWorldWritable { ref path, mode, .. }
+                if path == &writable_path && mode == 0o664
+        ));
+        let _ = fs::remove_dir_all(writable_root);
+
+        let (foreign_root, foreign_reference, foreign_lock_sha256) =
+            cargo_vendor_fixture("foreign-owner");
+        // Exercise the registry's private owner-parameterized constructor so this unit test remains
+        // rootless: asking it to trust a different uid makes every real entry foreign-owned without
+        // mutating host ownership. Production always supplies `geteuid()` above.
+        // SAFETY: `geteuid` takes no pointers and has no preconditions.
+        let actual_uid = unsafe { libc::geteuid() };
+        let foreign_expected_uid = if actual_uid == 0 { 1 } else { 0 };
+        let foreign_error = GvisorAssetRegistry::from_bindings_with_owner(
+            Vec::new(),
+            vec![cargo_vendor_binding(
+                foreign_reference,
+                &foreign_root,
+                foreign_lock_sha256,
+            )],
+            foreign_expected_uid,
+        )
+        .expect_err("a foreign-owned vendor entry must refuse registry construction");
+        assert!(matches!(
+            foreign_error,
+            AssetRegistryError::UnexpectedOwner {
+                expected_uid,
+                actual_uid: owner_uid,
+                ..
+            } if expected_uid == foreign_expected_uid && owner_uid == actual_uid
+        ));
+        let _ = fs::remove_dir_all(foreign_root);
     }
 }
