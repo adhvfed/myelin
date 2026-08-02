@@ -821,6 +821,7 @@ async fn run_reporter_scenario(
         tokio::runtime::Handle::current(),
         identity.token_issuer().clone(),
         myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
+        production_reporter.clone(),
     );
     let runner_labels: Vec<String> = LINUX_SMALL_V1_RUNNER_LABELS
         .iter()

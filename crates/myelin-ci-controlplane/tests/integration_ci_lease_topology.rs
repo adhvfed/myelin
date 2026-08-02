@@ -26,7 +26,8 @@ use myelin_ci_controlplane::{
     ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support,
     claim_window_secs_for_template, durable_spec_resolver_test_support,
     resolve_prelaunch_usage_on_conn, CiJobLaunchClaim, CiJobSpecStore, CiJobTokenIssueError,
-    CiJobTokenIssuer, CiJobTokenRequest, CiPrelaunchParentExpectation,
+    CiJobTokenIssuer, CiJobTokenRequest, CiPipelineReporterFactory,
+    CiPipelineReporterFactoryError, CiPipelineReporterRouter, CiPrelaunchParentExpectation,
     CiPrelaunchSettlementIdentity, CiPrelaunchUnresolvedPolicy, DurableCiJobLaunchTemplate,
     DurableEnqueue, Lane, CI_RUNNER_EXECUTION_LEASE_TTL_SECS, MAX_CI_JOB_CLAIM_WINDOW_SECS,
 };
@@ -35,6 +36,7 @@ use myelin_ci_sandbox::{
     RunTokenCredential, TrustTier, WorkspaceSpec,
 };
 use myelin_storage::{HotTables, PgMigrator};
+use myelin_tenancy::Region;
 use sqlx::{Executor, PgPool, Row};
 
 /// Independent `PgMigrator` sequences against the same live PostgreSQL deadlock on the migration
@@ -47,6 +49,12 @@ const REGION: &str = "fr-par";
 const REPO_REF: &str = "myelin://lease-topology/git/repo/core";
 const COMMIT_OID: &str = "deadbeef00deadbeef00deadbeef00deadbeef00";
 const RESERVE_HANDLE: &str = "ci-reserve:v2:lease-topology";
+
+fn unused_secret_terminal_reporter() -> CiPipelineReporterRouter {
+    let factory: CiPipelineReporterFactory =
+        Arc::new(|_, _| Err(CiPipelineReporterFactoryError));
+    CiPipelineReporterRouter::new(Region(REGION.into()), factory).unwrap()
+}
 
 fn app_url() -> String {
     std::env::var("DATABASE_URL")
@@ -390,6 +398,7 @@ async fn a_legacy_null_window_row_claims_flat_and_refuses_checkout_before_any_mi
             tokio::runtime::Handle::current(),
             Arc::new(NeverMintIssuer(mints.clone())),
             myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
+            unused_secret_terminal_reporter(),
         );
 
         // The non-checkout legacy row is claimed under the flat fallback and resolves normally.

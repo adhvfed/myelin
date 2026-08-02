@@ -42,8 +42,9 @@ use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support,
     durable_spec_resolver_test_support, CiJobSpecStoreError, CiJobTokenIssueError,
-    CiJobTokenIssuer, CiJobTokenRequest, DurableCiJobLaunchTemplate, DurableEnqueue,
-    DurableLeaseAdapter, EnqueueOutcome, Lane, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
+    CiJobTokenIssuer, CiJobTokenRequest, CiPipelineReporterFactory,
+    CiPipelineReporterFactoryError, CiPipelineReporterRouter, DurableCiJobLaunchTemplate,
+    DurableEnqueue, DurableLeaseAdapter, EnqueueOutcome, Lane, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
     ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
@@ -73,6 +74,11 @@ fn app_url() -> String {
 }
 fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
+}
+fn unused_secret_terminal_reporter(region: &str) -> CiPipelineReporterRouter {
+    let factory: CiPipelineReporterFactory =
+        Arc::new(|_, _| Err(CiPipelineReporterFactoryError));
+    CiPipelineReporterRouter::new(Region(region.into()), factory).unwrap()
 }
 fn schema_name(tag: &str) -> String {
     format!("ci_ct004d1_{}_{}", std::process::id(), tag)
@@ -513,6 +519,7 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
         tokio::runtime::Handle::current(),
         claim_token_issuer(),
         myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
+        unused_secret_terminal_reporter(region),
     );
     let adapter = DurableLeaseAdapter::new(
         ci_region_queue_store_test_support(admin.clone()),
@@ -826,6 +833,7 @@ async fn trusted_runner_never_executes_a_dispatched_untrusted_fork() {
         tokio::runtime::Handle::current(),
         claim_token_issuer(),
         myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
+        unused_secret_terminal_reporter(region),
     );
     let adapter = DurableLeaseAdapter::new(
         ci_region_queue_store_test_support(admin.clone()),
@@ -908,6 +916,7 @@ async fn a_leased_row_without_a_spec_resolves_fail_closed() {
         tokio::runtime::Handle::current(),
         claim_token_issuer(),
         myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
+        unused_secret_terminal_reporter(region),
     );
     let adapter = DurableLeaseAdapter::new(
         ci_region_queue_store_test_support(admin.clone()),
