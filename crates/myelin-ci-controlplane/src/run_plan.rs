@@ -35,6 +35,16 @@ pub const MAX_IMAGE_BYTES: usize = 2_048;
 pub const MAX_COMMAND_ARGS: usize = 64;
 /// Maximum aggregate UTF-8 bytes across one command vector.
 pub const MAX_COMMAND_BYTES: usize = 32 * 1024;
+/// Maximum argv entries in a structured build request (the tool itself is platform-supplied).
+pub const MAX_STRUCTURED_BUILD_ARGS: usize = 16;
+/// Maximum UTF-8 byte length of one structured build argument.
+pub const MAX_STRUCTURED_BUILD_ARG_BYTES: usize = 256;
+/// Server-controlled Cargo home used by structured Cargo build jobs.
+///
+/// This slice only removes the tenant-shell override surface. A later dependency-cache boundary must
+/// mount the attested vendored inputs here read-only and bind a non-overridable Cargo configuration;
+/// this constant alone does not make the build attestation-hermetic.
+pub const PLATFORM_CARGO_HOME: &str = "/opt/myelin/cargo-home";
 /// Maximum matrix axes attached to a resolved job.
 pub const MAX_MATRIX_AXES: usize = 16;
 /// Maximum UTF-8 byte length of a matrix axis name.
@@ -114,12 +124,51 @@ pub struct ResolvedJobV2 {
     pub image: String,
     /// Exact argv request. No shell or fallback executable is inferred.
     pub command: Vec<String>,
+    /// Optional platform-invoked build recipe. Legacy V2 producers omit this field, preserving their
+    /// canonical bytes exactly. Exactly one of a non-empty `command` or `build` is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<StructuredBuildV1>,
     /// Concrete DAG-node dependencies, sorted strictly.
     pub needs: Vec<String>,
     /// Reserved generator marker. Version 2 refuses `true` until fragment ingestion exists.
     pub is_generator: bool,
     /// Deterministically ordered resolved matrix axes.
     pub matrix_key: BTreeMap<String, String>,
+}
+
+/// Bounded tool identifiers supported by the platform-owned structured build vehicle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuredBuildToolV1 {
+    Cargo,
+}
+
+/// A tenant-authored build recipe whose executable, environment, and accepted argument grammar are
+/// owned by the platform. The initial Cargo recipe is intentionally minimal: only
+/// `cargo build --locked` is admitted, so options such as `--config` cannot reopen the Cargo
+/// boundary. This is a no-tenant-shell vehicle, not yet an attested-hermetic build boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredBuildV1 {
+    pub tool: StructuredBuildToolV1,
+    pub args: Vec<String>,
+}
+
+impl StructuredBuildV1 {
+    /// Validate this recipe against the platform's bounded, non-shell argument grammar.
+    pub fn validate_for_job(&self, job_name: &str) -> Result<(), RunPlanError> {
+        validate_structured_build(job_name, self)
+    }
+
+    /// Construct the exact direct argv executed by the sandbox. No shell executable or `-c` program
+    /// is accepted from the tenant or inserted by this translation.
+    pub fn platform_argv(&self) -> Vec<String> {
+        match self.tool {
+            StructuredBuildToolV1::Cargo => std::iter::once("cargo".to_owned())
+                .chain(self.args.iter().cloned())
+                .collect(),
+        }
+    }
 }
 
 /// Public carrier for either canonical resolved-plan wire version.
@@ -800,6 +849,24 @@ fn validate_plan_v2(plan: &ResolvedRunPlanV2) -> Result<(), RunPlanError> {
                 job.name, job.stage
             ));
         }
+        match &job.build {
+            Some(build) => {
+                if !job.command.is_empty() {
+                    return invalid(format!(
+                        "version-2 job `{}` must declare either command or build, never both",
+                        job.name
+                    ));
+                }
+                build.validate_for_job(&job.name)?;
+            }
+            None if job.command.is_empty() => {
+                return invalid(format!(
+                    "version-2 job `{}` must declare either command or build",
+                    job.name
+                ));
+            }
+            None => {}
+        }
     }
     let compatibility = ResolvedRunPlanV1 {
         schema_version: RUN_PLAN_SCHEMA_V1,
@@ -809,7 +876,10 @@ fn validate_plan_v2(plan: &ResolvedRunPlanV2) -> Result<(), RunPlanError> {
             .map(|job| ResolvedJobV1 {
                 name: job.name.clone(),
                 image: job.image.clone(),
-                command: job.command.clone(),
+                command: job
+                    .build
+                    .as_ref()
+                    .map_or_else(|| job.command.clone(), StructuredBuildV1::platform_argv),
                 needs: job.needs.clone(),
                 is_generator: job.is_generator,
                 matrix_key: job.matrix_key.clone(),
@@ -817,6 +887,37 @@ fn validate_plan_v2(plan: &ResolvedRunPlanV2) -> Result<(), RunPlanError> {
             .collect(),
     };
     validate_plan(&compatibility)
+}
+
+fn validate_structured_build(
+    job_name: &str,
+    build: &StructuredBuildV1,
+) -> Result<(), RunPlanError> {
+    if build.args.is_empty() || build.args.len() > MAX_STRUCTURED_BUILD_ARGS {
+        return invalid(format!(
+            "job `{job_name}` structured build args must contain 1..={MAX_STRUCTURED_BUILD_ARGS} entries"
+        ));
+    }
+    for argument in &build.args {
+        if argument.is_empty() || argument.len() > MAX_STRUCTURED_BUILD_ARG_BYTES {
+            return invalid(format!(
+                "job `{job_name}` structured build argument is empty or exceeds {MAX_STRUCTURED_BUILD_ARG_BYTES} bytes"
+            ));
+        }
+        if !argument.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'=')
+        }) {
+            return invalid(format!(
+                "job `{job_name}` structured build argument contains shell metacharacters or unsupported bytes"
+            ));
+        }
+    }
+    match build.tool {
+        StructuredBuildToolV1::Cargo if build.args == ["build", "--locked"] => Ok(()),
+        StructuredBuildToolV1::Cargo => invalid(format!(
+            "job `{job_name}` Cargo build recipe must be exactly `build --locked`"
+        )),
+    }
 }
 
 fn validate_matrix(job: &ResolvedJobV1) -> Result<(), RunPlanError> {

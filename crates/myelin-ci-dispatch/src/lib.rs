@@ -94,8 +94,8 @@ pub use resolve::{
     reserve_and_start, resolve_snapshot, resolve_versioned_snapshot, snapshot_ref, CheckContext,
     CiDefinition, CiPlanContract, CiRunWrite, JobDef, JobKind, ResolveError, ResolvedJob,
     ResolvedJobV1, ResolvedJobV2, ResolvedRunPlanV1, ResolvedRunPlanV2, ResolvedSnapshot,
-    ResolvedSnapshotExt, RunFacts, StartHandoff, StartSpec, VersionedCiDefinition,
-    VersionedResolvedSnapshot, CI_PIPELINE_WF_TYPE,
+    ResolvedSnapshotExt, RunFacts, StartHandoff, StartSpec, StructuredBuildToolV1,
+    StructuredBuildV1, VersionedCiDefinition, VersionedResolvedSnapshot, CI_PIPELINE_WF_TYPE,
 };
 
 use myelin_substrate::{

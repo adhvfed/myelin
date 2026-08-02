@@ -258,8 +258,9 @@ pub use run_plan::{
     decode_resolved_run_plan, derive_concrete_job_name, load_launch_run_plan_v2,
     load_resolved_run_plan, CiExecutionProfileV1, CiExecutionRequestV1, PreparedRunPlan,
     PreparedRunPlanV2, RedispatchReason, ResolvedJobV1, ResolvedJobV2, ResolvedRunPlanV1,
-    ResolvedRunPlanV2, RunPlanError, VersionedResolvedRunPlan, EXECUTION_REQUEST_SCHEMA_V1,
-    LAUNCH_REQUEST_DIGEST_V1_DOMAIN, RUN_PLAN_SCHEMA_V1, RUN_PLAN_SCHEMA_V2,
+    ResolvedRunPlanV2, RunPlanError, StructuredBuildToolV1, StructuredBuildV1,
+    VersionedResolvedRunPlan, EXECUTION_REQUEST_SCHEMA_V1, LAUNCH_REQUEST_DIGEST_V1_DOMAIN,
+    PLATFORM_CARGO_HOME, RUN_PLAN_SCHEMA_V1, RUN_PLAN_SCHEMA_V2,
 };
 /// Exact `(tenant, region)` PostgreSQL starter that co-commits the canonical `ci_job` DAG ledger and
 /// pre-minted workflow start with the durable CI run's `queued -> running` transition.
