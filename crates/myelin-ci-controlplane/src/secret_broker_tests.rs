@@ -14,7 +14,39 @@ use myelin_identity::{
     RunToken, SubjectTree, TupleDelta, Zookie,
 };
 use myelin_tenancy::{ArtifactRef, TenantId};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+
+fn launch_spec(tier: TrustTier) -> JobSpec {
+    use myelin_ci_sandbox::{
+        EgressPolicy, IdemToken, ImageRef, JobKind, MeterTarget, ResourceLimits,
+        RunTokenCredential, WorkspaceSpec,
+    };
+
+    JobSpec::new(
+        JobKind::Ci,
+        ImageRef::pinned(format!("registry.example/job@sha256:{}", "a".repeat(64))).unwrap(),
+        vec!["/bin/print-env".into()],
+        Vec::new(),
+        refs(),
+        EgressPolicy::deny_all(),
+        ResourceLimits {
+            cpu_millis: 1000,
+            mem_bytes: 256 * 1024 * 1024,
+            disk_bytes: 1024 * 1024 * 1024,
+            tmpfs_bytes: 64 * 1024 * 1024,
+            pids_max: 64,
+            timeout_secs: 30,
+        },
+        WorkspaceSpec::default(),
+        tier,
+        RunTokenCredential::new("ephemeral-bearer", "jti:secret-test", 60).unwrap(),
+        MeterTarget {
+            reserve_id: "reserve:secret-test".into(),
+        },
+        IdemToken("idem:secret-test".into()),
+    )
+    .unwrap()
+}
 
 // ---------------------------------------------------------------------------
 // Test doubles (the FROZEN consumed surfaces — never a second real impl).
@@ -382,6 +414,179 @@ fn empty_refs_resolve_to_empty() {
         res.all_resolved(),
         "vacuously all-resolved when there are no refs"
     );
+}
+
+#[test]
+fn resolve_for_launch_couples_every_resolved_value_to_sandbox_injection() {
+    let cap = FakeCapability::with(&["h:registry", "h:deploy"]);
+    let id = FakeIdentity::granting(&[
+        "myelin://acme/ci/secret/h:registry",
+        "myelin://acme/ci/secret/h:deploy",
+    ]);
+    let broker = SecretBroker::new(&cap, &id);
+
+    let spec = broker
+        .resolve_for_launch(launch_spec(TrustTier::Trusted), &subject(), secret_object_of, &at())
+        .expect("all granted handles resolve into one covered launch value");
+
+    assert_eq!(spec.resolved_secret_count(), 2);
+    assert!(spec.validate_secret_coverage().is_ok());
+    let rendered = format!("{spec:?}");
+    assert!(!rendered.contains("material:h:registry"));
+    assert!(!rendered.contains("material:h:deploy"));
+}
+
+#[test]
+fn injected_material_is_absent_from_durable_ci_records_and_result_records() {
+    use crate::ci_drive_manifest::{
+        CiDriveManifestV1, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
+        CiManifestTrustTierV1, CiManifestWorkspaceV1, GrantedCiJobV1,
+    };
+    use crate::ci_run_store::CiRunInsert;
+    use crate::job_spec_store::DurableCiJobLaunchTemplate;
+    use myelin_ci_sandbox::{ResourceUsage, SandboxResult};
+
+    let material = "material:h:registry";
+    let cap = FakeCapability::with(&["h:registry", "h:deploy"]);
+    let id = FakeIdentity::granting(&[
+        "myelin://acme/ci/secret/h:registry",
+        "myelin://acme/ci/secret/h:deploy",
+    ]);
+    let broker = SecretBroker::new(&cap, &id);
+    let injected = broker
+        .resolve_for_launch(launch_spec(TrustTier::Trusted), &subject(), secret_object_of, &at())
+        .unwrap();
+
+    let (template, _credential) = injected.into_template();
+    let durable_spec = DurableCiJobLaunchTemplate {
+        spec: template,
+        ci_run_id: "44444444-4444-8444-8444-444444444444".into(),
+        token_authority_handle: "mint:job".into(),
+    };
+    let durable_spec_json = serde_json::to_string(&durable_spec).unwrap();
+
+    let manifest = CiDriveManifestV1 {
+        schema_version: 1,
+        tenant_id: "acme".into(),
+        region: "fr-par".into(),
+        wf_run_id: "33333333-3333-8333-8333-333333333333".into(),
+        ci_run_id: "44444444-4444-8444-8444-444444444444".into(),
+        source_snapshot_ref: format!(
+            "myelin://acme/ci/artifact/snapshot-blake3:{}",
+            "b".repeat(64)
+        ),
+        source_plan_schema_version: 2,
+        launch_request_digest: "c".repeat(64),
+        workflow_type: crate::CI_PIPELINE_WF_TYPE.into(),
+        workflow_definition_version: 1,
+        workflow_code_hash: "d".repeat(64),
+        authority_policy_revision: "policy:v1".into(),
+        repo_ref: "myelin://acme/git/repo/core".into(),
+        commit_oid: "deadbeef".into(),
+        run_ref: "myelin://acme/ci/run/44444444-4444-8444-8444-444444444444".into(),
+        started_at: "2026-08-02T00:00:00Z".into(),
+        trust_tier: CiManifestTrustTierV1::Trusted,
+        check_attempts: BTreeMap::from([("build".into(), 1)]),
+        merge_waiter: None,
+        jobs: vec![GrantedCiJobV1 {
+            job_id: "11111111-1111-8111-8111-111111111111".into(),
+            stage: "build".into(),
+            name: "build".into(),
+            check_context: "build".into(),
+            needs: Vec::new(),
+            matrix_key: BTreeMap::new(),
+            image: format!("registry.example/job@sha256:{}", "a".repeat(64)),
+            command: vec!["/bin/print-env".into()],
+            env: BTreeMap::new(),
+            secret_handles: BTreeMap::from([
+                ("DEPLOY_KEY".into(), "h:deploy".into()),
+                ("REGISTRY_TOKEN".into(), "h:registry".into()),
+            ]),
+            egress_allow: Vec::new(),
+            limits: CiManifestLimitsV1 {
+                cpu_millis: 1000,
+                mem_bytes: 256 * 1024 * 1024,
+                disk_bytes: 1024 * 1024 * 1024,
+                pids_max: 64,
+                timeout_secs: 30,
+            },
+            workspace: CiManifestWorkspaceV1 {
+                repo_ref: "myelin://acme/git/repo/core".into(),
+                commit_oid: "deadbeef".into(),
+                read_only_root: true,
+                tmpfs_scratch: true,
+            },
+            scheduling: CiManifestSchedulingV1 {
+                lane: CiManifestLaneV1::Batch,
+                labels: Vec::new(),
+                concurrency_group: None,
+                fair_key: "project:core".into(),
+            },
+            reserve_handle: "reserve:secret-test".into(),
+            token_authority_handle: "mint:job".into(),
+            continue_on_error: false,
+        }],
+    };
+    let manifest_json = serde_json::to_string(&manifest).unwrap();
+    let ci_run = CiRunInsert {
+        tenant_id: "acme".into(),
+        region: "fr-par".into(),
+        run_id: "44444444-4444-8444-8444-444444444444".into(),
+        project_id: "55555555-5555-8555-8555-555555555555".into(),
+        pipeline_id: "66666666-6666-8666-8666-666666666666".into(),
+        wf_run_id: "33333333-3333-8333-8333-333333333333".into(),
+        definition_snapshot: "myelin://acme/ci/artifact/snapshot".into(),
+        trigger_kind: "push".into(),
+        concurrency_group: None,
+        pr_head_generation: None,
+        trust_tier: "trusted".into(),
+        state: "queued".into(),
+        correlation_id: "correlation".into(),
+        cause_event_id: None,
+        cause_depth: 0,
+        caused_by: None,
+        repo_ref: Some("myelin://acme/git/repo/core".into()),
+        commit_oid: Some("deadbeef".into()),
+        triggered_by: None,
+    };
+    let result = SandboxResult::stub_ok(ResourceUsage {
+        cpu_seconds: 1,
+        mem_byte_seconds: 1,
+    });
+
+    for record in [
+        durable_spec_json,
+        manifest_json,
+        format!("{ci_run:?}"),
+        format!("{result:?}"),
+    ] {
+        assert!(!record.contains(material));
+        assert!(!record.contains("material:h:deploy"));
+    }
+}
+
+#[test]
+fn withheld_secret_rejects_launch_with_observable_reason() {
+    let cap = FakeCapability::with(&["h:registry", "h:deploy"]);
+    let id = FakeIdentity::granting(&["myelin://acme/ci/secret/h:registry"]);
+    let broker = SecretBroker::new(&cap, &id);
+
+    let error = broker
+        .resolve_for_launch(launch_spec(TrustTier::Trusted), &subject(), secret_object_of, &at())
+        .expect_err("partial secret resolution must reject the whole launch");
+
+    assert_eq!(
+        error.to_string(),
+        "secret launch withheld: DEPLOY_KEY=not_granted"
+    );
+    assert!(matches!(
+        error,
+        SecretLaunchError::Withheld(ref withheld)
+            if withheld == &[WithheldSecret {
+                name: "DEPLOY_KEY".into(),
+                reason: WithholdReason::NotGranted,
+            }]
+    ));
 }
 
 // ---------------------------------------------------------------------------

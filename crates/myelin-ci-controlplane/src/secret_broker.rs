@@ -45,12 +45,15 @@
 //! `Decision::Allow` check, or resolving an un-referenced name all flip a pinned assertion. A `< 90%`
 //! survivor count is a regression — the floor is never weakened to pass.
 
-use myelin_ci_sandbox::{SecretRef, TrustTier};
+use myelin_ci_sandbox::{
+    JobSpec, ResolvedSecretEnv, SecretInjectionError, SecretRef, TrustTier,
+};
 use myelin_identity::{
     Consistency, Decision, IdentityService, Permission, Principal, Result as IdResult,
 };
 use myelin_tenancy::ArtifactRef;
 use std::fmt;
+use zeroize::Zeroize;
 
 /// **The READ permission on a `ci_secret` (the FROZEN `secret.read` gate, contract 4.9).** The ONLY
 /// path to a secret is a DIRECT `secret#direct_reader@subject` grant resolving `read` (CI-1 §1 — NOT
@@ -77,6 +80,12 @@ impl fmt::Debug for ResolvedSecret {
             .field("name", &self.name)
             .field("value", &"[REDACTED]")
             .finish()
+    }
+}
+
+impl Drop for ResolvedSecret {
+    fn drop(&mut self) {
+        self.value.zeroize();
     }
 }
 
@@ -139,6 +148,48 @@ pub struct SecretResolution {
     /// One outcome per referenced name, in spec order.
     pub outcomes: Vec<SecretOutcome>,
 }
+
+/// One visible, material-free reason a launch was refused by the all-or-nothing secret policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WithheldSecret {
+    pub name: String,
+    pub reason: WithholdReason,
+}
+
+/// A fail-closed refusal while composing the ephemeral, secret-bearing sandbox launch spec.
+#[derive(Debug)]
+pub enum SecretLaunchError {
+    /// The ReBAC check itself failed; no launch spec was produced.
+    Authorization(myelin_identity::AuthzError),
+    /// At least one declared secret was withheld. Policy is all-or-nothing: the workload is not
+    /// launched with a surprising partial environment, and every reason remains observable.
+    Withheld(Vec<WithheldSecret>),
+    /// The sandbox rejected the binding-set or env↔needle coupling.
+    Injection(SecretInjectionError),
+}
+
+impl fmt::Display for SecretLaunchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authorization(_) => {
+                formatter.write_str("secret launch authorization failed")
+            }
+            Self::Withheld(withheld) => {
+                formatter.write_str("secret launch withheld: ")?;
+                for (index, item) in withheld.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str(",")?;
+                    }
+                    write!(formatter, "{}={}", item.name, item.reason.as_token())?;
+                }
+                Ok(())
+            }
+            Self::Injection(error) => write!(formatter, "secret launch injection refused: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SecretLaunchError {}
 
 impl SecretResolution {
     /// **The number of secrets that RESOLVED to material (the CI-D7 quantified gate).** For a
@@ -302,6 +353,53 @@ impl<'a, C: SecretCapability, I: IdentityService> SecretBroker<'a, C, I> {
             }
         }
         Ok(SecretResolution { outcomes })
+    }
+
+    /// Resolve and attach a job's secret material at the ephemeral launch-composition boundary.
+    ///
+    /// This is the single control-plane bridge from opaque `SecretRef` handles to the sandbox's
+    /// inseparable [`myelin_ci_sandbox::ResolvedJobSecrets`] value. The launch policy is deliberately
+    /// all-or-nothing: any withhold rejects the launch with its material-free machine reason rather
+    /// than silently deleting an env entry. On success, [`JobSpec::with_resolved_secrets`] derives
+    /// both OCI env and the redaction plan from the same bindings and checks exact coverage.
+    pub fn resolve_for_launch(
+        &self,
+        spec: JobSpec,
+        subject: &Principal,
+        secret_object_of: impl Fn(&SecretRef) -> ArtifactRef,
+        at: &Consistency,
+    ) -> Result<JobSpec, SecretLaunchError> {
+        let resolution = self
+            .resolve(
+                spec.trust_tier,
+                subject,
+                secret_object_of,
+                &spec.secret_refs,
+                at,
+            )
+            .map_err(SecretLaunchError::Authorization)?;
+
+        let withheld: Vec<WithheldSecret> = resolution
+            .outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                SecretOutcome::Resolved(_) => None,
+                SecretOutcome::Withheld { name, reason } => Some(WithheldSecret {
+                    name: name.clone(),
+                    reason: *reason,
+                }),
+            })
+            .collect();
+        if !withheld.is_empty() {
+            return Err(SecretLaunchError::Withheld(withheld));
+        }
+
+        let bindings = resolution
+            .resolved()
+            .map(|secret| ResolvedSecretEnv::new(secret.name.clone(), secret.value.clone()))
+            .collect();
+        spec.with_resolved_secrets(bindings)
+            .map_err(SecretLaunchError::Injection)
     }
 
     /// **Mint an OIDC short-lived audience-scoped federated credential (contract 4.7, arch §7.3).** CI

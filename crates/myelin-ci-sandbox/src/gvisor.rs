@@ -687,7 +687,7 @@ enum OciExecutionLayout {
 /// profile is attached, the network namespace carries no interface when egress is default-deny, and
 /// the untrusted process runs as a NON-ROOT uid/gid ([`UNTRUSTED_UID`]/[`UNTRUSTED_GID`]). This is a
 /// RUNNABLE OCI config (`process.cwd` + `process.env` are set) — `runsc run --bundle` executes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OciConfig {
     args: Vec<String>,
     root_readonly: bool,
@@ -712,9 +712,9 @@ pub struct OciConfig {
     /// `disk_bytes` (that field is the disk-backed ephemeral-workspace quota — unrelated to this
     /// RAM-backed tmpfs).
     tmpfs_bytes: u64,
-    /// CT-006a: EXTRA `process.env` entries (`"KEY=VALUE"`) appended after the base `PATH`. EMPTY for
-    /// every CI/agent job; the git-wire path sets `GIT_PROTOCOL=version=2` / `GIT_EXEC_PATH` so the
-    /// sandboxed canonical `git` speaks protocol-v2 and finds its `git-core` helpers.
+    /// CT-006a / CI-1: EXTRA `process.env` entries (`"KEY=VALUE"`) appended after the base `PATH`.
+    /// Ordinary jobs carry literal env plus broker-resolved secret env; the git-wire path sets
+    /// `GIT_PROTOCOL=version=2` / `GIT_EXEC_PATH` so sandboxed canonical `git` finds its helpers.
     extra_env: Vec<String>,
     /// CT-007 slice 3, piece 6: the ONE source of truth for rootfs-path resolution, host mounts,
     /// user-namespace mode, and workspace mounting — replacing what were three independent fields
@@ -722,6 +722,39 @@ pub struct OciConfig {
     /// sync with each other. [`Self::invocation_mode`] and [`Self::to_json`] both derive everything
     /// from this ONE field, so neither can ever disagree with what the other implies.
     layout: OciExecutionLayout,
+}
+
+impl std::fmt::Debug for OciConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env_names: Vec<&str> = self
+            .extra_env
+            .iter()
+            .map(|entry| entry.split_once('=').map_or(entry.as_str(), |(name, _)| name))
+            .collect();
+        formatter
+            .debug_struct("OciConfig")
+            .field("args", &self.args)
+            .field("root_readonly", &self.root_readonly)
+            .field("drop_all_caps", &self.drop_all_caps)
+            .field("no_new_privileges", &self.no_new_privileges)
+            .field("seccomp", &self.seccomp)
+            .field("has_network", &self.has_network)
+            .field("pids_max", &self.pids_max)
+            .field("mem_bytes", &self.mem_bytes)
+            .field("tmpfs_bytes", &self.tmpfs_bytes)
+            .field("env_names", &env_names)
+            .field("layout", &self.layout)
+            .finish()
+    }
+}
+
+impl Drop for OciConfig {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for entry in &mut self.extra_env {
+            entry.zeroize();
+        }
+    }
 }
 
 /// Render one OCI `mounts` bind-mount entry. Source/dest are JSON-escaped via `{:?}` so a path can
@@ -755,16 +788,15 @@ impl OciConfig {
     /// Build the OCI config from a job + its derived hardening profile (the same profile the
     /// Firecracker backend enforces — backend-independent).
     pub fn from_spec(spec: &JobSpec, profile: &HardeningProfile) -> OciConfig {
-        // CT-007 gate 2: propagate the job's declared (non-secret) environment into `process.env`.
-        // `EnvVar` carries only literal values — secrets are resolved in-boundary from `SecretRef`
-        // and never appear here — so a plain `NAME=VALUE` render is correct; `to_json` JSON-escapes
-        // each entry, so a value can carry no config-injection. The base PATH is emitted first, then
-        // these entries, so a job that re-declares PATH takes effect (last-wins).
-        let extra_env = spec
+        // CT-007 gate 2 + CI-1: literals and broker-resolved secrets enter only OCI `process.env`.
+        // `ResolvedJobSecrets` is the one inseparable value that also owns the redaction plan; its
+        // private fields prevent an env-only injection. The base PATH is emitted first.
+        let mut extra_env: Vec<String> = spec
             .env
             .iter()
             .map(|e| format!("{}={}", e.name, e.value))
             .collect();
+        extra_env.extend(spec.resolved_secrets().process_env());
         Self::for_fixed_command(spec.command.clone(), spec.limits.mem_bytes, profile)
             .with_extra_env(extra_env)
     }
@@ -2550,6 +2582,8 @@ impl GvisorBackend {
     /// Build the OCI config a launch WOULD use for `spec` (the hardened profile derived + the OCI
     /// JSON assembled), without running. Asserts the mandatory profile is in force.
     pub fn oci_config(spec: &JobSpec) -> Result<OciConfig, GvisorError> {
+        spec.validate_secret_coverage()
+            .map_err(|error| GvisorError::Runtime(format!("secret injection refused: {error}")))?;
         let profile = HardeningProfile::derive(spec);
         profile.assert_enforced().map_err(GvisorError::Hardening)?;
         Ok(OciConfig::from_spec(spec, &profile))
@@ -2677,6 +2711,11 @@ impl GvisorBackend {
         hooks
             .enforce_isolation_floor(spec)
             .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
+        spec.validate_secret_coverage().map_err(|error| {
+            SandboxLaunchError::Failed(GvisorError::Runtime(format!(
+                "secret injection refused: {error}"
+            )))
+        })?;
         let profile = HardeningProfile::derive(spec);
         profile
             .assert_enforced()
@@ -3748,6 +3787,11 @@ impl GvisorBackend {
         hooks
             .enforce_isolation_floor(spec)
             .map_err(CheckoutOrchestrationError::Hook)?;
+        spec.validate_secret_coverage().map_err(|error| {
+            CheckoutOrchestrationError::Hook(HookError(format!(
+                "secret injection refused: {error}"
+            )))
+        })?;
         let profile = HardeningProfile::derive(spec);
         profile
             .assert_enforced()
@@ -4379,7 +4423,7 @@ fn run_production_container_streaming(
     // `bind_then_continue` — a deterministic seam covering that exact security property with a bare
     // counting closure, with no real runsc spawn involved.
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
-    let redaction = RedactionPlan::for_job(spec);
+    let redaction = spec.resolved_secrets().redaction_plan().clone();
     // The single `run_and_capture` continuation — invoked at most once, by whichever bind path below
     // succeeds (mutually-exclusive match arms, so the moved `launch_permit`/`output` are fine).
     let revalidate = || {
@@ -6281,9 +6325,9 @@ fn cap_total_job_output(output: Arc<dyn SandboxOutputSink>) -> Arc<dyn SandboxOu
 /// chunks to the job-wide, total-byte-capped durable-output callback.
 ///
 /// A callback failure is remembered, but the pipe is still drained to EOF so the guest cannot
-/// deadlock behind a full pipe and defeat timeout/teardown. Redaction is applied before the callback.
-/// Today every plan is empty because secret injection is absent; CI-1 owns the already-documented
-/// cross-chunk streaming masker obligation when it introduces real needles.
+/// deadlock behind a full pipe and defeat timeout/teardown. Redaction is applied before the callback,
+/// with a per-stream carry buffer so a secret split across arbitrary pipe reads cannot cross into
+/// durable output.
 fn drain_capped_streaming<R: Read>(
     mut reader: R,
     limit: usize,
@@ -6294,6 +6338,7 @@ fn drain_capped_streaming<R: Read>(
     let mut truncated = false;
     let mut first_output_error = None;
     let mut chunk = [0u8; 64 * 1024];
+    let mut redactor = output.redaction.streaming();
     loop {
         match reader.read(&mut chunk) {
             Ok(0) => break,
@@ -6306,9 +6351,11 @@ fn drain_capped_streaming<R: Read>(
                     truncated = true;
                 }
                 if first_output_error.is_none() {
-                    let redacted = output.redaction.redact(&chunk[..n]);
-                    if let Err(error) = output.sink.emit(stream, &redacted) {
-                        first_output_error = Some(error);
+                    let redacted = redactor.push(&chunk[..n]);
+                    if !redacted.is_empty() {
+                        if let Err(error) = output.sink.emit(stream, &redacted) {
+                            first_output_error = Some(error);
+                        }
                     }
                 }
             }
@@ -6319,6 +6366,14 @@ fn drain_capped_streaming<R: Read>(
                     first_output_error = Some(format!("read guest output: {error}"));
                 }
                 break;
+            }
+        }
+    }
+    if first_output_error.is_none() {
+        let redacted = redactor.finish();
+        if !redacted.is_empty() {
+            if let Err(error) = output.sink.emit(stream, &redacted) {
+                first_output_error = Some(error);
             }
         }
     }
@@ -6459,9 +6514,9 @@ fn build_result(spec: &JobSpec, o: &RunscOutcome, redaction: &RedactionPlan) -> 
     // BOUNDARY REDACTION (CT-004f sub-step 1): mask the job's CI-managed secret needles in the captured
     // streams HERE — the last step before the bytes populate `SandboxResult` and cross back toward the
     // durable log pipeline — so no injected secret is sealed into the content-addressed log store. The
-    // plan is EMPTY today (nothing injects secrets), so this is a no-op; it is a REQUIRED argument so no
-    // capture path can forward un-redacted bytes, and CI-1 secret injection must populate it (see
-    // `crate::redaction`). Redaction runs on the already-per-stream-bounded bytes.
+    // plan is empty for non-secret jobs and populated from the same resolved bindings as OCI env for
+    // secret-bearing jobs. It is a REQUIRED argument so no capture path can forward un-redacted bytes.
+    // Redaction runs on the already-per-stream-bounded bytes.
     //
     // The drain threads ALREADY applied the correct per-stream bound ([`run_and_capture`]): stdout is
     // bounded by its [`StdoutMode`] (256 KiB head for CI/agent; the generous git-wire cap, disk-staged),
@@ -12154,6 +12209,27 @@ mod tests {
     }
 
     #[test]
+    fn streaming_drain_masks_an_injected_value_split_across_pipe_reads() {
+        let sink = Arc::new(RecordingOutput::default());
+        let output = StreamingOutput {
+            sink: sink.clone(),
+            redaction: RedactionPlan::for_needles([b"split-secret".to_vec()]),
+        };
+        let reader = std::io::Cursor::new(b"before split-".as_slice())
+            .chain(std::io::Cursor::new(b"secret after".as_slice()));
+
+        let (_head, _truncated, error) = drain_capped_streaming(
+            reader,
+            1024,
+            SandboxOutputStream::Stdout,
+            &output,
+        );
+
+        assert_eq!(error, None);
+        assert_eq!(*sink.bytes.lock().unwrap(), b"before *** after");
+    }
+
+    #[test]
     fn streaming_capture_total_log_cap_truncates_with_marker_and_stops_growth() {
         let payload_limit = 1024;
         let total_limit = payload_limit + TOTAL_LOG_TRUNCATION_MARKER.len();
@@ -12671,8 +12747,8 @@ mod tests {
     }
 
     // CT-004f sub-step 1: `build_result` APPLIES the redaction plan to both captured streams — the
-    // boundary seam is wired, not just the `RedactionPlan` unit. A populated plan (the shape CI-1
-    // injection will pass) masks the needle before it reaches `SandboxResult`.
+    // boundary seam is wired, not just the `RedactionPlan` unit. A populated injection plan masks the
+    // needle before it reaches `SandboxResult`.
     #[test]
     fn build_result_masks_needles_in_both_streams() {
         let s = spec(vec![]);
@@ -12689,8 +12765,44 @@ mod tests {
         assert_eq!(res.stderr, b"error: *** invalid".to_vec());
     }
 
-    // The empty plan (the ONLY state reachable today — nothing injects secrets) is a pass-through:
-    // captured output is byte-unchanged.
+    #[test]
+    fn injected_secret_value_is_absent_from_sandbox_result_when_workload_prints_it() {
+        let mut s = spec(vec![]);
+        s.secret_refs = vec![crate::SecretRef {
+            name: "DEPLOY_TOKEN".into(),
+            handle: "opaque:deploy".into(),
+        }];
+        let material = ["printed", "-secret-material"].concat();
+        let s = s
+            .with_resolved_secrets(vec![crate::ResolvedSecretEnv::new(
+                "DEPLOY_TOKEN",
+                material.clone(),
+            )])
+            .expect("binding and plan are derived together");
+        let stdout = format!("stdout:{material}");
+        let stderr = format!("stderr:{material}");
+        let outcome = outcome(stdout.as_bytes(), stderr.as_bytes());
+
+        let result = build_result(
+            &s,
+            &outcome,
+            s.resolved_secrets().redaction_plan(),
+        );
+
+        assert_eq!(result.stdout, b"stdout:***");
+        assert_eq!(result.stderr, b"stderr:***");
+        assert!(!result
+            .stdout
+            .windows(material.len())
+            .any(|window| window == material.as_bytes()));
+        assert!(!result
+            .stderr
+            .windows(material.len())
+            .any(|window| window == material.as_bytes()));
+        assert!(!format!("{result:?}").contains(&material));
+    }
+
+    // A non-secret job's empty plan remains a pass-through: captured output is byte-unchanged.
     #[test]
     fn build_result_empty_plan_is_byte_identity() {
         let s = spec(vec![]);
@@ -13118,6 +13230,29 @@ mod tests {
             json.contains("PATH=/usr/local/sbin"),
             "base PATH lost: {json}"
         );
+    }
+
+    #[test]
+    fn injected_secret_reaches_oci_process_env_without_entering_debug_records() {
+        let mut s = spec(vec![]);
+        s.secret_refs = vec![crate::SecretRef {
+            name: "DEPLOY_TOKEN".into(),
+            handle: "opaque:deploy".into(),
+        }];
+        let material = ["boundary", "-only-material"].concat();
+        let s = s
+            .with_resolved_secrets(vec![crate::ResolvedSecretEnv::new(
+                "DEPLOY_TOKEN",
+                material.clone(),
+            )])
+            .expect("the exact declared binding set must couple to redaction");
+
+        let cfg = GvisorBackend::oci_config(&s).expect("covered injection is launchable");
+        let json = cfg.to_json();
+        assert!(json.contains(&format!("DEPLOY_TOKEN={material}")));
+        assert!(!format!("{s:?}").contains(&material));
+        assert!(!format!("{:?}", s.resolved_secrets().redaction_plan()).contains(&material));
+        assert!(!format!("{cfg:?}").contains(&material));
     }
 
     /// Empty host-mount collections are still valid (git-wire's OWN quarantine mount is genuinely
