@@ -405,24 +405,20 @@ mod tests {
 
     #[test]
     fn writable_asset_entry_refuses_registry_construction_with_path_and_mode() {
+        // NOTE: symlinks are deliberately NOT in this "refuses" set — a symlink's 0o777 mode is
+        // meaningless (see `writable_symlink_is_accepted` below and canonical_tar's symlink skip).
         for (tag, relative_path, mode, kind) in [
             ("group-writable-file", "payload", 0o664, "file"),
             ("world-writable-dir", "writable-dir", 0o757, "dir"),
-            ("writable-symlink", "payload-link", 0o777, "symlink"),
         ] {
             let fixture = Fixture::new(tag, b"content whose mode is pinned");
             let offending_path = fixture.dir.join(relative_path);
             match kind {
                 "file" => {}
                 "dir" => fs::create_dir(&offending_path).unwrap(),
-                "symlink" => {
-                    std::os::unix::fs::symlink("payload", &offending_path).unwrap();
-                }
                 _ => unreachable!(),
             }
-            if kind != "symlink" {
-                fs::set_permissions(&offending_path, fs::Permissions::from_mode(mode)).unwrap();
-            }
+            fs::set_permissions(&offending_path, fs::Permissions::from_mode(mode)).unwrap();
 
             // Pin the tree only after introducing the unsafe mode. Before the hardening, its
             // content digest is valid and registry construction therefore accepts it.
@@ -441,6 +437,21 @@ mod tests {
                 "error must name offending mode: {rendered}"
             );
         }
+    }
+
+    /// A `0o777` symlink (every real rootfs carries them — `/etc/mtab`, `/bin/sh`, `lib64`) must NOT
+    /// refuse registry construction: a symlink's own mode is ignored by the kernel (no write-through),
+    /// and retargeting it needs write on its PARENT DIRECTORY, which IS mode-verified. Rejecting it
+    /// would refuse every real staged rootfs asset.
+    #[test]
+    fn writable_symlink_is_accepted() {
+        let fixture = Fixture::new("accepted-symlink", b"real content");
+        std::os::unix::fs::symlink("payload", fixture.dir.join("link")).unwrap();
+        let digest = canonical_tar::canonical_tree_sha256_hex(&fixture.dir).unwrap();
+        let image =
+            ImageRef::pinned(format!("test.local/accepted-symlink-rootfs@sha256:{digest}")).unwrap();
+        GvisorAssetRegistry::from_bindings(vec![binding(image, &fixture.dir)])
+            .expect("a 0o777 symlink must not refuse asset-registry construction");
     }
 
     #[test]
