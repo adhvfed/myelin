@@ -746,7 +746,8 @@ impl CiJobQueueStore {
                 .bind(generation.expires_at_epoch_secs)
                 .bind(ci_run_id)
                 .bind(generation.token_authority_handle.clone())
-                .bind(generation.idem_token.clone());
+                .bind(generation.idem_token.clone())
+                .bind(generation.checkout_commit.clone());
         }
         let row = query
             .fetch_optional(&mut *transaction)

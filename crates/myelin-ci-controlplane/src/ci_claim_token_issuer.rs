@@ -272,20 +272,28 @@ pub(crate) fn authority_from_durable_claim(
         || launch_template.token_authority_handle != job.token_authority_handle
         || launch_template.spec.idem_token.0 != claim.idem_token
         || launch_template.spec.meter_to.reserve_id != job.reserve_handle
+        || launch_template.spec.workspace.commit.as_deref()
+            != authority.checkout_commit.as_deref()
     {
         return Err(refused(
             "durable ci_job_spec launch template identity differs from the locked claim/run/manifest",
         ));
     }
     verify_dispatched_spec_matches_granted_workspace(&launch_template.spec, &job.workspace)?;
-    // A persisted v1/v2 handle represents an authority generation in which reserve_id was absent.
-    // Verify that exact historical shape, then return the fully reconstructed authority so every
-    // credential minted now still signs the locked manifest/spec reservation during convergence.
+    // Persisted legacy handles are verified in their exact historical shape, then the fully
+    // reconstructed current authority is returned so credentials minted during convergence still
+    // sign the locked manifest/spec checkout commit and reservation.
     let mut handle_authority = authority.clone();
     if claim.token_authority_handle.starts_with("ci-token-authority:v1:")
         || claim.token_authority_handle.starts_with("ci-token-authority:v2:")
     {
         handle_authority.reserve_id = None;
+    }
+    if claim.token_authority_handle.starts_with("ci-token-authority:v1:")
+        || claim.token_authority_handle.starts_with("ci-token-authority:v2:")
+        || claim.token_authority_handle.starts_with("ci-token-authority:v3:")
+    {
+        handle_authority.checkout_commit = None;
     }
     if !ManifestBoundCiJobTokenAuthority::verifies(
         &handle_authority,
@@ -363,6 +371,9 @@ pub fn runtime_authorities_from_durable_claim(
             policy_revision: manifest.authority_policy_revision.clone(),
             limits: job.limits.clone(),
             reserve_id: Some(job.reserve_handle.clone()),
+            checkout_commit: checkout
+                .as_ref()
+                .map(|scope| scope.commit_hex().to_owned()),
             checkout,
         });
     }
@@ -606,6 +617,9 @@ mod tests {
             policy_revision: "linux-small-v1:1".into(),
             limits: limits(),
             reserve_id: Some("reserve:test".into()),
+            checkout_commit: checkout
+                .as_ref()
+                .map(|scope| scope.commit_hex().to_owned()),
             checkout,
         };
         let token_authority_handle = ManifestBoundCiJobTokenAuthority::handle_for(&authority);
@@ -845,6 +859,16 @@ mod tests {
             &substituted_reserve,
         )
         .is_err());
+
+        let mut substituted_checkout_commit = default_launch_template(&claim);
+        substituted_checkout_commit.spec.workspace.commit = Some("f".repeat(40));
+        assert!(authority_from_durable_claim(
+            &claim,
+            &run(),
+            &manifest,
+            &substituted_checkout_commit,
+        )
+        .is_err());
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1069,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_v2_and_v3_digests_never_collide_for_the_same_request() {
+    fn v1_v2_v3_and_v4_digests_never_collide_for_the_same_request() {
         let (manifest, claim) = manifest_and_claim();
         let authority = authority_from_durable_claim(
             &claim,
@@ -1086,10 +1110,15 @@ mod tests {
             "ci-token-authority:v2:{}",
             crate::ci_launch_authority::token_authority_digest_v2(&authority)
         );
-        let v3 = ManifestBoundCiJobTokenAuthority::handle_for(&authority);
-        assert!(v3.starts_with("ci-token-authority:v3:"));
+        let v3 = format!(
+            "ci-token-authority:v3:{}",
+            crate::ci_launch_authority::token_authority_digest_v3(&authority)
+        );
+        let v4 = ManifestBoundCiJobTokenAuthority::handle_for(&authority);
+        assert!(v4.starts_with("ci-token-authority:v4:"));
         assert_ne!(v1, v2);
         assert_ne!(v2, v3);
+        assert_ne!(v3, v4);
     }
 
     /// A fully literal, fixed authority request — never built from `run()`/`manifest_and_claim()`,
@@ -1118,6 +1147,7 @@ mod tests {
                 timeout_secs: 600,
             },
             reserve_id: None,
+            checkout_commit: None,
             checkout: None,
         }
     }
@@ -1145,6 +1175,13 @@ mod tests {
         CiJobRuntimeAuthorityRequest {
             reserve_id: Some("ci-reserve:v2:golden-reservation".into()),
             ..golden_checkout_authority()
+        }
+    }
+
+    fn golden_v4_checkout_authority() -> CiJobRuntimeAuthorityRequest {
+        CiJobRuntimeAuthorityRequest {
+            checkout_commit: Some("2".repeat(40)),
+            ..golden_reserved_checkout_authority()
         }
     }
 
@@ -1191,12 +1228,51 @@ mod tests {
 
     #[test]
     fn golden_v3_digest_for_a_fixed_reserved_checkout_request_is_pinned() {
-        let handle =
-            ManifestBoundCiJobTokenAuthority::handle_for(&golden_reserved_checkout_authority());
+        let handle = format!(
+            "ci-token-authority:v3:{}",
+            crate::ci_launch_authority::token_authority_digest_v3(
+                &golden_reserved_checkout_authority()
+            )
+        );
         assert_eq!(
             handle,
             "ci-token-authority:v3:221ff4047769fab4fe443ea4bf0298d9141520ab56f25f297a57fdf147bf2d9c"
         );
+    }
+
+    #[test]
+    fn golden_v4_digest_for_a_fixed_commit_attested_checkout_request_is_pinned() {
+        let handle = ManifestBoundCiJobTokenAuthority::handle_for(&golden_v4_checkout_authority());
+        assert_eq!(
+            handle,
+            "ci-token-authority:v4:d23c3d0ce5c53a784d8a81f76e65c5ffa77d00c5e52697fc53c1fe26c4eb53e3"
+        );
+    }
+
+    #[test]
+    fn v4_digest_and_verification_bind_the_exact_checkout_commit() {
+        let base = golden_v4_checkout_authority();
+        let handle = ManifestBoundCiJobTokenAuthority::handle_for(&base);
+        let other_scope = myelin_ci_sandbox::derive_checkout_authorization_scope(
+            JobKind::Ci,
+            &myelin_ci_sandbox::WorkspaceSpec {
+                repo_ref: Some("myelin://golden-tenant/git/repo/widgets".into()),
+                commit: Some("3".repeat(40)),
+            },
+        )
+        .unwrap();
+        let other = CiJobRuntimeAuthorityRequest {
+            checkout_commit: Some("3".repeat(40)),
+            checkout: other_scope,
+            ..base
+        };
+        assert_ne!(
+            crate::ci_launch_authority::token_authority_digest_v4(
+                &golden_v4_checkout_authority()
+            ),
+            crate::ci_launch_authority::token_authority_digest_v4(&other)
+        );
+        assert!(!ManifestBoundCiJobTokenAuthority::verifies(&other, &handle));
     }
 
     #[test]
@@ -1211,6 +1287,7 @@ mod tests {
         .unwrap();
         authority.checkout = None;
         authority.reserve_id = None;
+        authority.checkout_commit = None;
         let legacy_v1_handle = format!(
             "ci-token-authority:v1:{}",
             crate::ci_launch_authority::token_authority_digest(&authority)
@@ -1246,6 +1323,7 @@ mod tests {
             .unwrap()
             .remove(0);
         historical.reserve_id = None;
+        historical.checkout_commit = None;
         let legacy_v2_handle = format!(
             "ci-token-authority:v2:{}",
             crate::ci_launch_authority::token_authority_digest_v2(&historical)
@@ -1260,6 +1338,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(authority.reserve_id.as_deref(), Some("reserve:test"));
+        assert_eq!(
+            authority.checkout_commit.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+    }
+
+    #[test]
+    fn a_persisted_v3_manifest_converges_and_new_credential_authority_gains_checkout_commit() {
+        let (mut manifest, mut claim) = manifest_and_claim();
+        let mut historical = runtime_authorities_from_durable_claim(&claim, &run(), &manifest)
+            .unwrap()
+            .remove(0);
+        historical.checkout_commit = None;
+        let legacy_v3_handle = format!(
+            "ci-token-authority:v3:{}",
+            crate::ci_launch_authority::token_authority_digest_v3(&historical)
+        );
+        manifest.jobs[0].token_authority_handle = legacy_v3_handle.clone();
+        claim.token_authority_handle = legacy_v3_handle;
+        let authority = authority_from_durable_claim(
+            &claim,
+            &run(),
+            &manifest,
+            &default_launch_template(&claim),
+        )
+        .unwrap();
+        assert_eq!(
+            authority.checkout_commit.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
     }
 
     #[test]

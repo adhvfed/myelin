@@ -70,6 +70,11 @@ pub struct CiJobRuntimeAuthorityRequest {
     /// authority is minted. `None` is also the explicit compatibility shape for a persisted v1/v2
     /// token-authority handle, whose frozen digest never attested this field.
     pub reserve_id: Option<String>,
+    /// The exact checkout commit attested by current token-authority handles. Kept as a distinct
+    /// authority fact (despite also appearing inside `checkout`) so v4 can make commit presence a
+    /// fail-closed, versioned contract without reinterpreting any frozen v1/v2/v3 byte stream.
+    /// `None` is the explicit compatibility shape for a persisted legacy handle.
+    pub checkout_commit: Option<String>,
     /// CT-007 slice 5b.3-2b: the job's checkout target, when it has one. `None` for an ordinary
     /// compute job (never present in this workspace's CI jobs today, since `ci_run.repo_ref`/
     /// `.commit_oid` are always non-empty for a CI run — see `run_plan::parse_snapshot_ref`
@@ -804,25 +809,25 @@ fn pg_row(error: sqlx::Error) -> PgError {
 const CI_TOKEN_AUTHORITY_V1_HANDLE_PREFIX: &str = "ci-token-authority:v1:";
 const CI_TOKEN_AUTHORITY_V2_HANDLE_PREFIX: &str = "ci-token-authority:v2:";
 const CI_TOKEN_AUTHORITY_V3_HANDLE_PREFIX: &str = "ci-token-authority:v3:";
+const CI_TOKEN_AUTHORITY_V4_HANDLE_PREFIX: &str = "ci-token-authority:v4:";
 
 /// Content-addressed token-authority reference. The immutable manifest persists this handle, and a
 /// later claim-bound issuer can reload the manifest and recompute it before minting. The hash binds
 /// every locked identity, source, workflow, policy, and limit field; it contains no secret and grants
 /// no authority by itself.
 ///
-/// New handles are `v3`, binding both checkout scope and the allocated reservation. The v1 and v2
-/// encoders remain byte-frozen. Rolling-fleet verification accepts either older version only when
-/// `reserve_id` is explicitly absent; v1 additionally requires `checkout: None`, because those
-/// facts did not exist in their respective digest generations and cannot be reinterpreted as
-/// attested after the fact.
+/// New handles are `v4`, explicitly binding the exact checkout commit in addition to v3's checkout
+/// scope and allocated reservation. The v1/v2/v3 encoders remain byte-frozen. Rolling-fleet
+/// verification accepts an older version only when every fact introduced after that generation is
+/// explicitly absent; absent legacy facts can never be reinterpreted as attested after the fact.
 #[derive(Clone, Debug, Default)]
 pub struct ManifestBoundCiJobTokenAuthority;
 
 impl ManifestBoundCiJobTokenAuthority {
     pub fn handle_for(request: &CiJobRuntimeAuthorityRequest) -> String {
         format!(
-            "{CI_TOKEN_AUTHORITY_V3_HANDLE_PREFIX}{}",
-            token_authority_digest_v3(request)
+            "{CI_TOKEN_AUTHORITY_V4_HANDLE_PREFIX}{}",
+            token_authority_digest_v4(request)
         )
     }
 
@@ -832,17 +837,31 @@ impl ManifestBoundCiJobTokenAuthority {
     /// pre-existing `v1` manifest handle (minted before this slice) still verifies for a compute
     /// job.
     pub fn verifies(request: &CiJobRuntimeAuthorityRequest, handle: &str) -> bool {
+        if let Some(digest_hex) = handle.strip_prefix(CI_TOKEN_AUTHORITY_V4_HANDLE_PREFIX) {
+            if request.checkout_commit.as_deref()
+                != request.checkout.as_ref().map(CheckoutAuthorizationScope::commit_hex)
+            {
+                return false;
+            }
+            return digest_hex == token_authority_digest_v4(request).to_string();
+        }
         if let Some(digest_hex) = handle.strip_prefix(CI_TOKEN_AUTHORITY_V3_HANDLE_PREFIX) {
+            if request.checkout_commit.is_some() {
+                return false;
+            }
             return digest_hex == token_authority_digest_v3(request).to_string();
         }
         if let Some(digest_hex) = handle.strip_prefix(CI_TOKEN_AUTHORITY_V2_HANDLE_PREFIX) {
-            if request.reserve_id.is_some() {
+            if request.reserve_id.is_some() || request.checkout_commit.is_some() {
                 return false;
             }
             return digest_hex == token_authority_digest_v2(request).to_string();
         }
         if let Some(digest_hex) = handle.strip_prefix(CI_TOKEN_AUTHORITY_V1_HANDLE_PREFIX) {
-            if request.checkout.is_some() || request.reserve_id.is_some() {
+            if request.checkout.is_some()
+                || request.reserve_id.is_some()
+                || request.checkout_commit.is_some()
+            {
                 return false;
             }
             return digest_hex == token_authority_digest(request).to_string();
@@ -943,6 +962,9 @@ fn prepare_linux_small_requests(
             policy_revision: LINUX_SMALL_V1_POLICY_REVISION.into(),
             limits: limits.clone(),
             reserve_id: None,
+            checkout_commit: checkout
+                .as_ref()
+                .map(|scope| scope.commit_hex().to_owned()),
             checkout: checkout.clone(),
         });
     }
@@ -1141,7 +1163,7 @@ const CI_TOKEN_AUTHORITY_V3_DOMAIN: &[u8] = b"myelin.ci.token-authority.v3\0";
 /// Task #91: the reserve-attested token-authority digest. This is a wholly separate encoder so the
 /// frozen v1/v2 byte streams cannot drift. It repeats v2's complete canonical encoding under a new
 /// domain, then appends an explicit reserve-id presence discriminator and the length-prefixed id.
-fn token_authority_digest_v3(request: &CiJobRuntimeAuthorityRequest) -> blake3::Hash {
+pub(crate) fn token_authority_digest_v3(request: &CiJobRuntimeAuthorityRequest) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(CI_TOKEN_AUTHORITY_V3_DOMAIN);
     for value in [
@@ -1193,6 +1215,76 @@ fn token_authority_digest_v3(request: &CiJobRuntimeAuthorityRequest) -> blake3::
             hash_length_prefixed(&mut hasher, reserve_id.as_bytes());
         }
     }
+    hasher.finalize()
+}
+
+const CI_TOKEN_AUTHORITY_V4_DOMAIN: &[u8] = b"myelin.ci.token-authority.v4\0";
+
+/// Slice #28: a separate v4 encoder preserves the complete v3 byte stream while adding an explicit
+/// exact-checkout-commit fact. The presence discriminator is load-bearing for rolling convergence:
+/// a historical v1/v2/v3 handle verifies only after reconstruction clears this post-generation
+/// field, while every newly materialized checkout authority carries `Some(exact commit)`.
+pub(crate) fn token_authority_digest_v4(request: &CiJobRuntimeAuthorityRequest) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CI_TOKEN_AUTHORITY_V4_DOMAIN);
+    for value in [
+        request.tenant_id.as_str(),
+        request.region.as_str(),
+        request.ci_run_id.as_str(),
+        request.wf_run_id.as_str(),
+        request.project_id.as_str(),
+        request.job_id.as_str(),
+        request.stage.as_str(),
+        request.concrete_name.as_str(),
+        request.trigger_kind.as_str(),
+        request.trust_tier.as_str(),
+        request.source_snapshot_digest.as_str(),
+        request.workflow_code_hash.as_str(),
+        request.policy_revision.as_str(),
+    ] {
+        hash_length_prefixed(&mut hasher, value.as_bytes());
+    }
+    hasher.update(&request.workflow_definition_version.to_be_bytes());
+    hasher.update(&request.limits.cpu_millis.to_be_bytes());
+    hasher.update(&request.limits.mem_bytes.to_be_bytes());
+    hasher.update(&request.limits.disk_bytes.to_be_bytes());
+    hasher.update(&request.limits.pids_max.to_be_bytes());
+    hasher.update(&request.limits.timeout_secs.to_be_bytes());
+    match &request.checkout {
+        None => {
+            hasher.update(&[0u8]);
+        }
+        Some(scope) => {
+            hasher.update(&[1u8]);
+            hash_length_prefixed(&mut hasher, scope.tenant().0.as_bytes());
+            hash_length_prefixed(&mut hasher, scope.repo_ref().0.as_bytes());
+            hash_length_prefixed(&mut hasher, scope.repo_id().as_bytes());
+            hash_length_prefixed(&mut hasher, scope.commit_hex().as_bytes());
+            let format_tag: u8 = match scope.commit_format() {
+                myelin_ci_sandbox::GitObjectFormat::Sha1 => 1,
+                myelin_ci_sandbox::GitObjectFormat::Sha256 => 2,
+            };
+            hasher.update(&[format_tag]);
+        }
+    };
+    match &request.reserve_id {
+        None => {
+            hasher.update(&[0u8]);
+        }
+        Some(reserve_id) => {
+            hasher.update(&[1u8]);
+            hash_length_prefixed(&mut hasher, reserve_id.as_bytes());
+        }
+    };
+    match &request.checkout_commit {
+        None => {
+            hasher.update(&[0u8]);
+        }
+        Some(commit) => {
+            hasher.update(&[1u8]);
+            hash_length_prefixed(&mut hasher, commit.as_bytes());
+        }
+    };
     hasher.finalize()
 }
 
@@ -1682,6 +1774,7 @@ mod tests {
                 policy_revision: LINUX_SMALL_V1_POLICY_REVISION.into(),
                 limits: linux_small_limits(),
                 reserve_id: None,
+                checkout_commit: None,
                 checkout,
             }
         }
@@ -1938,6 +2031,7 @@ mod tests {
                 policy_revision: LINUX_SMALL_V1_POLICY_REVISION.into(),
                 limits: linux_small_limits(),
                 reserve_id: None,
+                checkout_commit: None,
                 checkout: None,
             }
         }
@@ -2565,7 +2659,7 @@ mod tests {
             );
             assert!(grant
                 .token_authority_handle
-                .starts_with("ci-token-authority:v3:"));
+                .starts_with("ci-token-authority:v4:"));
         }
         assert_ne!(
             authority.jobs[0].token_authority_handle,
@@ -2707,6 +2801,7 @@ mod tests {
         changed!(workflow_code_hash, "ci-body-v2".into());
         changed!(policy_revision, "linux-small-v1:2".into());
         changed!(reserve_id, Some("reserve:substituted".into()));
+        changed!(checkout_commit, Some("f".repeat(40)));
         let mut cpu_limits = base.limits.clone();
         cpu_limits.cpu_millis += 1;
         changed!(limits, cpu_limits);

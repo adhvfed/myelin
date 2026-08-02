@@ -131,6 +131,7 @@ async fn seed_fixture(
         policy_revision: "linux-small-v1:1".into(),
         limits: limits.clone(),
         reserve_id: None,
+        checkout_commit: Some(checkout_scope().commit_hex().to_owned()),
         checkout: Some(checkout_scope()),
     };
     let provider = PgTierPCiJobBudgetReservation::new(

@@ -299,6 +299,7 @@ fn manifest(
             policy_revision: "ci-policy:2026-07-21".into(),
             limits: executable.limits.clone(),
             reserve_id: Some(executable.reserve_handle.clone()),
+            checkout_commit: Some(executable.workspace.commit_oid.clone()),
             checkout: derive_checkout_authorization_scope(
                 JobKind::Ci,
                 &WorkspaceSpec {

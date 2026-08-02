@@ -164,6 +164,7 @@ fn authority() -> CiJobRuntimeAuthorityRequest {
             timeout_secs: 600,
         },
         reserve_id: Some(reserve_handle(PRIMARY_JOB_ID, '1')),
+        checkout_commit: Some(COMMIT_OID.into()),
         checkout: Some(checkout_scope()),
     }
 }

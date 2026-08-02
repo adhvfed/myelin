@@ -291,10 +291,19 @@ impl V2CheckoutComposition {
         checkout: Option<&CheckoutAuthorizationScope>,
     ) -> Result<(MintedPhaseCredential, RunTokenAuthorizationContext), AttemptAuthorityError> {
         let purpose = initial_phase_purpose(checkout);
-        let minted = bridge(&self.rt, self.credential_store.mint_phase_credential(claim, purpose))
-            .map_err(|error| AttemptAuthorityError(error.to_string()))?;
-        let context =
-            ci_job_phase_authorization_context(claim, reserve_id, checkout, &minted.binding);
+        let minted = bridge(
+            &self.rt,
+            self.credential_store.mint_phase_credential_for_checkout_scope(
+                claim, purpose, checkout,
+            ),
+        )
+        .map_err(|error| AttemptAuthorityError(error.to_string()))?;
+        let context = ci_job_phase_authorization_context(
+            claim,
+            reserve_id,
+            minted.checkout.as_ref(),
+            &minted.binding,
+        );
         Ok((minted, context))
     }
 
@@ -389,16 +398,19 @@ impl DurableAttemptAuthority {
         let minted = bridge(
             &self.rt,
             self.credential_store
-                .mint_phase_credential(&self.claim, purpose),
+                .mint_phase_credential_for_checkout_scope(
+                    &self.claim,
+                    purpose,
+                    self.checkout.as_ref(),
+                ),
         )
         .map_err(|error| AttemptAuthorityError(error.to_string()))?;
-        let context =
-            ci_job_phase_authorization_context(
-                &self.claim,
-                &self.reserve_handle,
-                self.checkout.as_ref(),
-                &minted.binding,
-            );
+        let context = ci_job_phase_authorization_context(
+            &self.claim,
+            &self.reserve_handle,
+            minted.checkout.as_ref(),
+            &minted.binding,
+        );
         Ok((minted.credential, context, minted.binding.generation_id))
     }
 }
