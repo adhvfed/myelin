@@ -12378,7 +12378,7 @@ mod tests {
     fn streaming_drain_masks_an_injected_value_split_across_pipe_reads() {
         let sink = Arc::new(RecordingOutput::default());
         let output = StreamingOutput { sink: sink.clone() };
-        let redaction = RedactionPlan::for_needles([b"split-secret".to_vec()]);
+        let redaction = RedactionPlan::for_needles([b"split-secret".to_vec()]).unwrap();
         let reader = std::io::Cursor::new(b"before split-".as_slice())
             .chain(std::io::Cursor::new(b"secret after".as_slice()));
 
@@ -12406,7 +12406,7 @@ mod tests {
         let mut input = vec![b'a'; SANDBOX_CAPTURE_BOUND - prefix_len];
         input.extend_from_slice(secret);
         input.extend(std::iter::repeat_n(b'z', SANDBOX_CAPTURE_BOUND));
-        let redaction = RedactionPlan::for_needles([secret.to_vec()]);
+        let redaction = RedactionPlan::for_needles([secret.to_vec()]).unwrap();
 
         let (head, truncated, error) = drain_capped_streaming(
             std::io::Cursor::new(input),
@@ -13005,7 +13005,7 @@ mod tests {
         let needle = [b"AK".as_slice(), b"IAsecret"].concat();
         let stdout = [b"deploying with ".as_slice(), needle.as_slice(), b" now"].concat();
         let stderr = [b"error: ".as_slice(), needle.as_slice(), b" invalid"].concat();
-        let plan = RedactionPlan::for_needles([needle.clone()]);
+        let plan = RedactionPlan::for_needles([needle.clone()]).unwrap();
         let o = outcome(&stdout, &stderr);
         let res = build_result(&s, &o, &plan);
         assert!(res.stdout.starts_with(b"deploying with "));

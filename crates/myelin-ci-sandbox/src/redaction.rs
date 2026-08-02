@@ -40,7 +40,7 @@ use zeroize::Zeroize;
 
 /// A set of exact-value needles to mask from a job's captured output at the sandbox boundary. See the
 /// module docs for the (precise, do-not-overclaim) security model and the choke-point rationale.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RedactionPlan {
     /// The exact byte values to mask, populated from the same resolved bindings as the guest env via
     /// [`RedactionPlan::for_job`]. Needles are held as bytes (a secret is not necessarily UTF-8) and
@@ -50,6 +50,25 @@ pub struct RedactionPlan {
     /// marker non-collidable and prevents adjacent markers or marker boundaries reconstructing one.
     marker: Vec<u8>,
 }
+
+impl Default for RedactionPlan {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+/// Plan construction failed because no non-empty delimiter can separate redacted spans without
+/// itself containing (or joining into) a configured needle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RedactionPlanError;
+
+impl fmt::Display for RedactionPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("no collision-free non-empty redaction marker exists")
+    }
+}
+
+impl std::error::Error for RedactionPlanError {}
 
 impl fmt::Debug for RedactionPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -66,14 +85,17 @@ impl RedactionPlan {
     pub fn none() -> RedactionPlan {
         RedactionPlan {
             needles: Vec::new(),
-            marker: Vec::new(),
+            marker: b"[myelin-redacted]".to_vec(),
         }
     }
 
     /// Derive the per-job plan from the SAME resolved bindings that become the guest environment.
     /// This constructor is deliberately private to the module: callers attach material through
     /// [`ResolvedJobSecrets::for_job`], which immediately checks exact coverage.
-    fn for_job(_spec: &JobSpec, bindings: &[ResolvedSecretEnv]) -> RedactionPlan {
+    fn for_job(
+        _spec: &JobSpec,
+        bindings: &[ResolvedSecretEnv],
+    ) -> Result<RedactionPlan, RedactionPlanError> {
         RedactionPlan::for_needles(
             bindings
                 .iter()
@@ -84,11 +106,13 @@ impl RedactionPlan {
     /// Build a plan from explicit needles. Empty needles are dropped (masking the empty string would
     /// replace between every byte). Production injection rejects empty values before reaching this
     /// helper; the filtering keeps direct masker callers safe too.
-    pub fn for_needles(needles: impl IntoIterator<Item = Vec<u8>>) -> RedactionPlan {
+    pub fn for_needles(
+        needles: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Result<RedactionPlan, RedactionPlanError> {
         let mut needles: Vec<Vec<u8>> = needles.into_iter().filter(|n| !n.is_empty()).collect();
         needles.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-        let marker = collision_free_marker(&needles);
-        RedactionPlan { needles, marker }
+        let marker = collision_free_marker(&needles)?;
+        Ok(RedactionPlan { needles, marker })
     }
 
     /// `true` iff there is nothing to mask.
@@ -243,6 +267,8 @@ pub enum SecretInjectionError {
     EnvNameCollision { name: String },
     /// The plan did not contain exactly one matching needle for every injected value.
     CoverageMismatch,
+    /// No non-empty marker can make exact-value replacement safe for this pathological needle set.
+    UnsafeRedactionPlan,
 }
 
 impl fmt::Display for SecretInjectionError {
@@ -261,6 +287,9 @@ impl fmt::Display for SecretInjectionError {
             ),
             Self::CoverageMismatch => formatter
                 .write_str("injected secret environment and redaction-plan coverage disagree"),
+            Self::UnsafeRedactionPlan => formatter.write_str(
+                "resolved secret set cannot be represented by a collision-free redaction plan",
+            ),
         }
     }
 }
@@ -272,7 +301,7 @@ impl std::error::Error for SecretInjectionError {}
 /// Its fields are private, it has no serde implementation, and the checked constructor enforces the
 /// exact declared-ref set plus exact needle coverage. Consequently, a caller cannot attach a guest
 /// secret env entry without attaching its matching redaction needle.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ResolvedJobSecrets {
     bindings: Vec<ResolvedSecretEnv>,
     redaction: RedactionPlan,
@@ -287,17 +316,6 @@ impl fmt::Debug for ResolvedJobSecrets {
             .field("bindings", &self.bindings)
             .field("redaction", &"[REDACTED PLAN]")
             .finish()
-    }
-}
-
-impl Default for ResolvedJobSecrets {
-    fn default() -> Self {
-        Self {
-            bindings: Vec::new(),
-            redaction: RedactionPlan::none(),
-            authorized_trust_tier: None,
-            authorized_refs: Vec::new(),
-        }
     }
 }
 
@@ -329,7 +347,8 @@ impl ResolvedJobSecrets {
                 name: binding.name.clone(),
             });
         }
-        let redaction = RedactionPlan::for_job(spec, &bindings);
+        let redaction = RedactionPlan::for_job(spec, &bindings)
+            .map_err(|_| SecretInjectionError::UnsafeRedactionPlan)?;
         let resolved = Self {
             bindings,
             redaction,
@@ -422,19 +441,25 @@ fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Choose one delimiter byte absent from every needle and repeat it into a bounded marker. Because no
-/// needle contains the delimiter at all, no needle can occur inside a marker, across two adjacent
-/// markers, or across a marker/plaintext boundary. Production secret values are UTF-8 strings, so at
-/// least one byte in 0x80..=0xff is always absent; the empty fallback keeps direct arbitrary-byte test
-/// callers safe even if their combined needle alphabet covers all 256 byte values.
-fn collision_free_marker(needles: &[Vec<u8>]) -> Vec<u8> {
+/// Choose one delimiter byte absent from every needle and repeat it into a bounded, non-empty marker.
+/// Because no needle contains the delimiter at all, no needle can occur inside a marker, across two
+/// adjacent markers, or across a marker/plaintext boundary. Production secret values are UTF-8
+/// strings, so at least one invalid standalone UTF-8 byte is absent. An arbitrary-byte needle set
+/// that collectively covers all 256 byte values has no marker satisfying this proof and is rejected
+/// fail-closed instead of silently substituting the empty string.
+fn collision_free_marker(needles: &[Vec<u8>]) -> Result<Vec<u8>, RedactionPlanError> {
+    if needles.is_empty() {
+        return Ok(b"[myelin-redacted]".to_vec());
+    }
     const PREFERRED: &[u8] = b"#~^|!%+?@";
     let delimiter = PREFERRED
         .iter()
         .copied()
         .chain((0u8..=u8::MAX).filter(|byte| !PREFERRED.contains(byte)))
         .find(|candidate| needles.iter().all(|needle| !needle.contains(candidate)));
-    delimiter.map_or_else(Vec::new, |byte| vec![byte; 3])
+    delimiter
+        .map(|byte| vec![byte; 3])
+        .ok_or(RedactionPlanError)
 }
 
 #[cfg(test)]
@@ -463,7 +488,8 @@ mod tests {
 
     #[test]
     fn masks_every_occurrence_of_each_needle() {
-        let plan = RedactionPlan::for_needles([b"s3cr3t".to_vec(), b"hunter2".to_vec()]);
+        let plan =
+            RedactionPlan::for_needles([b"s3cr3t".to_vec(), b"hunter2".to_vec()]).unwrap();
         let got = plan.redact(b"token=s3cr3t and again s3cr3t; pw=hunter2");
         assert!(!contains_bytes(&got, b"s3cr3t"));
         assert!(!contains_bytes(&got, b"hunter2"));
@@ -471,7 +497,7 @@ mod tests {
 
     #[test]
     fn masks_non_utf8_needles() {
-        let plan = RedactionPlan::for_needles([vec![0xff, 0x00, 0xfe]]);
+        let plan = RedactionPlan::for_needles([vec![0xff, 0x00, 0xfe]]).unwrap();
         let mut input = b"before".to_vec();
         input.extend_from_slice(&[0xff, 0x00, 0xfe]);
         input.extend_from_slice(b"after");
@@ -481,26 +507,27 @@ mod tests {
 
     #[test]
     fn empty_needles_are_dropped_not_masked_between_every_byte() {
-        let plan = RedactionPlan::for_needles([Vec::new(), b"keep".to_vec()]);
+        let plan = RedactionPlan::for_needles([Vec::new(), b"keep".to_vec()]).unwrap();
         assert!(!contains_bytes(&plan.redact(b"keep this"), b"keep"));
     }
 
     #[test]
     fn adjacent_and_boundary_occurrences() {
-        let plan = RedactionPlan::for_needles([b"ab".to_vec()]);
+        let plan = RedactionPlan::for_needles([b"ab".to_vec()]).unwrap();
         assert!(!contains_bytes(&plan.redact(b"abab"), b"ab"));
         assert!(!contains_bytes(&plan.redact(b"xabx"), b"ab"));
     }
 
     #[test]
     fn overlapping_needles_mask_the_longest_injected_value_first() {
-        let plan = RedactionPlan::for_needles([b"prefix".to_vec(), b"prefix-and-rest".to_vec()]);
+        let plan =
+            RedactionPlan::for_needles([b"prefix".to_vec(), b"prefix-and-rest".to_vec()]).unwrap();
         assert!(!contains_bytes(&plan.redact(b"prefix-and-rest"), b"prefix"));
     }
 
     #[test]
     fn streaming_masker_covers_a_needle_split_across_capture_chunks() {
-        let plan = RedactionPlan::for_needles([b"split-secret".to_vec()]);
+        let plan = RedactionPlan::for_needles([b"split-secret".to_vec()]).unwrap();
         let mut stream = plan.streaming();
         let mut output = stream.push(b"before split-");
         output.extend(stream.push(b"secret after"));
@@ -517,7 +544,7 @@ mod tests {
             b"[redacted]".to_vec(),
             b"x".to_vec(),
         ];
-        let plan = RedactionPlan::for_needles(needles.clone());
+        let plan = RedactionPlan::for_needles(needles.clone()).unwrap();
         let output = plan.redact(b"***[redacted]x** *");
         for needle in needles {
             assert!(
@@ -530,10 +557,34 @@ mod tests {
     #[test]
     fn adjacent_markers_cannot_synthesize_another_secret() {
         let synthesized = b"######".to_vec();
-        let plan =
-            RedactionPlan::for_needles([b"left".to_vec(), b"right".to_vec(), synthesized.clone()]);
+        let plan = RedactionPlan::for_needles([
+            b"left".to_vec(),
+            b"right".to_vec(),
+            synthesized.clone(),
+        ])
+        .unwrap();
         let output = plan.redact(b"leftright");
         assert!(!contains_bytes(&output, &synthesized));
+    }
+
+    #[test]
+    fn all_byte_alphabet_is_rejected_instead_of_using_an_empty_marker() {
+        let all_bytes: Vec<u8> = (0u8..=u8::MAX).collect();
+        let error = RedactionPlan::for_needles([
+            all_bytes,
+            b"ab".to_vec(),
+            b"X".to_vec(),
+        ])
+        .expect_err("a marker-less plan must be refused fail-closed");
+        assert_eq!(error, RedactionPlanError);
+    }
+
+    #[test]
+    fn replacing_the_middle_byte_cannot_synthesize_another_secret() {
+        let plan = RedactionPlan::for_needles([b"ab".to_vec(), b"X".to_vec()]).unwrap();
+        let output = plan.redact(b"aXb");
+        assert!(!contains_bytes(&output, b"ab"));
+        assert!(!contains_bytes(&output, b"X"));
     }
 
     #[test]

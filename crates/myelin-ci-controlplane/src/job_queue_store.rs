@@ -74,7 +74,8 @@ use crate::scheduler::CANCEL_SUPERSEDED_QUERY;
 use crate::scheduler::{
     EnqueueOutcome, Lane, AUTHORIZE_JOB_LAUNCH_QUERY, COMPLETE_JOB_QUERY, CONSUME_CLAIM_QUERY,
     CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY, CONSUME_PREPARATION_CLAIM_QUERY, HEARTBEAT_QUERY,
-    INSERT_JOB_QUEUE_QUERY, READ_COMPLETION_DISPOSITION_QUERY, RENEW_PREPARATION_LEASE_QUERY,
+    CONSUME_SECRET_WITHHELD_CLAIM_QUERY, INSERT_JOB_QUEUE_QUERY, READ_COMPLETION_DISPOSITION_QUERY,
+    RENEW_PREPARATION_LEASE_QUERY,
     REQUEUE_PREPARATION_CLAIM_QUERY, RESET_REQUEUED_PREPARATION_CI_JOB_SURFACE_QUERY,
     VERIFY_JOB_LAUNCH_LIVE_QUERY,
 };
@@ -977,6 +978,74 @@ impl CiJobQueueStore {
                AND q.run_id = $4::uuid AND q.idem_token = $5 AND q.stage = $6
                AND q.state = 'terminal' AND q.completion_receipt = $7
                AND EXISTS (
+                 SELECT 1 FROM ci_job_parent_attempt p
+                 WHERE p.tenant_id = q.tenant_id AND p.region = q.region
+                   AND p.job_id = q.job_id AND p.wf_run_id = q.run_id
+                   AND p.ci_run_id = $8::uuid AND p.reserve_handle = $9
+                   AND p.lease_owner = $10 AND p.lease_epoch = $11
+                   AND p.claim_nonce = $12::uuid
+                   AND p.claim_started_at_epoch_secs = $13
+                   AND p.claim_expires_at_epoch_secs = $14
+               )",
+        )
+        .bind(spec.tenant_id)
+        .bind(spec.region)
+        .bind(spec.job_id)
+        .bind(spec.wf_run_id)
+        .bind(spec.idem_token)
+        .bind(spec.stage)
+        .bind(spec.completion_receipt)
+        .bind(spec.ci_run_id)
+        .bind(spec.reserve_handle)
+        .bind(spec.lease_owner)
+        .bind(spec.lease_epoch)
+        .bind(spec.claim_nonce)
+        .bind(spec.claim_started_at_epoch_secs)
+        .bind(spec.claim_expires_at_epoch_secs)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        Ok(if replay.is_some() {
+            ClaimConsumeOutcome::AlreadyConsumed
+        } else {
+            ClaimConsumeOutcome::Refused
+        })
+    }
+
+    /// Consume an exact still-leased generation whose declared secrets were withheld before any
+    /// parent attempt or sandbox execution began.
+    pub(crate) async fn consume_secret_withheld_claim_on_conn(
+        conn: &mut sqlx::PgConnection,
+        spec: PreparationClaimConsumeSpec<'_>,
+    ) -> Result<ClaimConsumeOutcome, PgError> {
+        let consumed = sqlx::query(CONSUME_SECRET_WITHHELD_CLAIM_QUERY)
+            .bind(spec.tenant_id)
+            .bind(spec.region)
+            .bind(spec.job_id)
+            .bind(spec.wf_run_id)
+            .bind(spec.idem_token)
+            .bind(spec.lease_owner)
+            .bind(spec.lease_epoch)
+            .bind(spec.claim_nonce)
+            .bind(spec.stage)
+            .bind(spec.claim_started_at_epoch_secs)
+            .bind(spec.claim_expires_at_epoch_secs)
+            .bind(spec.ci_run_id)
+            .bind(spec.reserve_handle)
+            .bind(spec.completion_receipt)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+        if consumed.is_some() {
+            return Ok(ClaimConsumeOutcome::Consumed);
+        }
+        let replay = sqlx::query_scalar::<_, i32>(
+            "SELECT 1
+             FROM job_queue q
+             WHERE q.tenant_id = $1 AND q.region = $2 AND q.job_id = $3::uuid
+               AND q.run_id = $4::uuid AND q.idem_token = $5 AND q.stage = $6
+               AND q.state = 'terminal' AND q.completion_receipt = $7
+               AND NOT EXISTS (
                  SELECT 1 FROM ci_job_parent_attempt p
                  WHERE p.tenant_id = q.tenant_id AND p.region = q.region
                    AND p.job_id = q.job_id AND p.wf_run_id = q.run_id

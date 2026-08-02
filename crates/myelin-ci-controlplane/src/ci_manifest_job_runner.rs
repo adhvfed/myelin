@@ -45,6 +45,21 @@ use crate::{
 pub type CiJobSecretResolver =
     Arc<dyn Fn(&TenantId, JobSpec) -> Result<JobSpec, SecretLaunchError> + Send + Sync>;
 
+/// Material-free, stable diagnostic persisted for a terminal secret withhold. Secret names are
+/// validated manifest machine tokens and reasons come from the closed [`WithholdReason`] vocabulary.
+pub(crate) fn secret_withhold_machine_reason(withheld: &[WithheldSecret]) -> String {
+    let mut reason = String::from("secret_withheld:");
+    for (index, item) in withheld.iter().enumerate() {
+        if index != 0 {
+            reason.push(',');
+        }
+        reason.push_str(&item.name);
+        reason.push('=');
+        reason.push_str(item.reason.as_token());
+    }
+    reason
+}
+
 /// Fail-closed production fallback for a deployment with no composed secret-store capability. Empty
 /// jobs still receive a checked empty binding set; secret-bearing jobs are withheld observably.
 pub fn unavailable_ci_job_secret_resolver() -> CiJobSecretResolver {
@@ -57,7 +72,7 @@ pub fn unavailable_ci_job_secret_resolver() -> CiJobSecretResolver {
         let reason = if spec.trust_tier == SandboxTrustTier::UntrustedFork {
             WithholdReason::UntrustedFork
         } else {
-            WithholdReason::NotGranted
+            WithholdReason::CapabilityUnavailable
         };
         Err(SecretLaunchError::Withheld(
             spec.secret_refs
@@ -610,7 +625,14 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             withheld.to_string(),
-            "secret launch withheld: DEPLOY_KEY=not_granted"
+            "secret launch withheld: DEPLOY_KEY=capability_unavailable"
+        );
+        let SecretLaunchError::Withheld(withheld) = withheld else {
+            panic!("unavailable capability must produce a typed withhold");
+        };
+        assert_eq!(
+            secret_withhold_machine_reason(&withheld),
+            "secret_withheld:DEPLOY_KEY=capability_unavailable"
         );
     }
 }

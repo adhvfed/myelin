@@ -37,7 +37,15 @@ impl SecretCapability for AlwaysResolves {
         object: &ArtifactRef,
         handle: &str,
     ) -> Option<String> {
-        (tenant.0 == "acme" && object.0 == handle).then(|| format!("PROD-SECRET-MATERIAL:{handle}"))
+        let expected_prefix = format!("myelin://{}/ci/secret/", tenant.0);
+        let id = handle.strip_prefix(&expected_prefix)?;
+        (!id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            && object.0 == handle)
+            .then(|| format!("PROD-SECRET-MATERIAL:{handle}"))
     }
 }
 

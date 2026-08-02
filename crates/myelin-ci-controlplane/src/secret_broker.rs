@@ -99,6 +99,9 @@ pub enum WithholdReason {
     /// `secret.read` (the DIRECT NARROW non-inheritance, CI-1 §1) — a protected secret without an
     /// explicit grant.
     NotGranted,
+    /// No secret-store capability is composed in this cell. This is a terminal launch refusal, not
+    /// an absent-spec condition for the lease reaper to retry forever.
+    CapabilityUnavailable,
 }
 
 impl WithholdReason {
@@ -107,6 +110,7 @@ impl WithholdReason {
         match self {
             WithholdReason::UntrustedFork => "untrusted_fork",
             WithholdReason::NotGranted => "not_granted",
+            WithholdReason::CapabilityUnavailable => "capability_unavailable",
         }
     }
 }
@@ -121,7 +125,8 @@ pub enum SecretOutcome {
     Withheld {
         /// The env var name that was withheld (the run does not get this binding).
         name: String,
-        /// Why it was withheld (a machine token — `untrusted_fork` | `not_granted`).
+        /// Why it was withheld (a machine token — `untrusted_fork` | `not_granted` |
+        /// `capability_unavailable`).
         reason: WithholdReason,
     },
 }
@@ -233,18 +238,73 @@ pub trait SecretCapability {
     ) -> Option<String>;
 }
 
+const MAX_SECRET_HANDLE_SEGMENT_BYTES: usize = 128;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CanonicalSecretHandle<'a> {
+    pub tenant: &'a str,
+    pub id: &'a str,
+}
+
+/// Parse the only secret-handle spelling accepted at either the manifest or broker boundary.
+///
+/// Both variable segments use the deliberately smaller grammar `[A-Za-z0-9_-]{1,128}`. In
+/// particular, `.`/`:`/`%` and `/` are impossible, so the reference cannot acquire traversal,
+/// encoding, anchor, or type-prefix semantics in a downstream parser. The final `object_key` checks
+/// pin the exact authz identity to `secret:<id>` and reject any future normalization drift.
+pub(crate) fn parse_canonical_secret_handle(handle: &str) -> Option<CanonicalSecretHandle<'_>> {
+    let rest = handle.strip_prefix("myelin://")?;
+    let mut segments = rest.split('/');
+    let tenant = segments.next()?;
+    let subsystem = segments.next()?;
+    let object_type = segments.next()?;
+    let id = segments.next()?;
+    if segments.next().is_some()
+        || subsystem != "ci"
+        || object_type != "secret"
+        || !strict_secret_segment(tenant)
+        || !strict_secret_segment(id)
+    {
+        return None;
+    }
+
+    let canonical = format!("myelin://{tenant}/ci/secret/{id}");
+    if handle != canonical {
+        return None;
+    }
+    let key = myelin_refs::object_key(&ArtifactRef(canonical))?;
+    if key.tenant.as_deref() != Some(tenant)
+        || key.subsystem.as_deref() != Some("ci")
+        || key.object_type.as_deref() != Some("secret")
+        || key.id != id
+        || key.tuple_key() != format!("secret:{id}")
+    {
+        return None;
+    }
+
+    Some(CanonicalSecretHandle { tenant, id })
+}
+
+fn strict_secret_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= MAX_SECRET_HANDLE_SEGMENT_BYTES
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 fn tenant_bound_secret_object(
     tenant: &TenantId,
     sref: &SecretRef,
     secret_object_of: &impl Fn(&SecretRef) -> ArtifactRef,
 ) -> Option<ArtifactRef> {
-    let expected_prefix = format!("myelin://{}/ci/secret/", tenant.0);
-    let secret_id = sref.handle.strip_prefix(&expected_prefix)?;
-    if secret_id.is_empty() || secret_id.contains(['/', '#']) {
+    let parsed = parse_canonical_secret_handle(&sref.handle)?;
+    if parsed.tenant != tenant.0 {
         return None;
     }
     let object = secret_object_of(sref);
-    (object.0 == sref.handle).then_some(object)
+    let authorized = parse_canonical_secret_handle(&object.0)?;
+    (authorized == parsed && object.0 == sref.handle).then_some(object)
 }
 
 /// **An OIDC short-lived audience-scoped federated credential (contract 4.7, arch §7.3).** CI mints
