@@ -86,11 +86,84 @@ const BLOCK_SIZE: u64 = 512;
 /// | sha256sum`.
 pub fn canonical_tree_sha256_hex(dir: &Path) -> io::Result<String> {
     let digest = canonical_tree_sha256(dir)?;
+    Ok(hex_digest(digest))
+}
+
+fn hex_digest(digest: [u8; 32]) -> String {
     let mut hex = String::with_capacity(64);
     for byte in digest {
         hex.push_str(&format!("{byte:02x}"));
     }
-    Ok(hex)
+    hex
+}
+
+/// A DAC invariant violation found while hashing a registry-backed shared asset tree.
+///
+/// This is deliberately separate from the generic canonical-tree hasher: callers that only need
+/// to reproduce the canonical tar recipe can still hash arbitrary fixtures, while registry
+/// construction uses [`verified_asset_tree_sha256_hex`] and refuses unsafe on-disk metadata.
+#[derive(Debug)]
+pub(crate) enum AssetTreeVerificationError {
+    Io(io::Error),
+    GroupOrWorldWritable {
+        path: PathBuf,
+        mode: u32,
+    },
+    UnexpectedOwner {
+        path: PathBuf,
+        expected_uid: u32,
+        actual_uid: u32,
+    },
+}
+
+impl std::fmt::Display for AssetTreeVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(f),
+            Self::GroupOrWorldWritable { path, mode } => write!(
+                f,
+                "verified asset entry {} has unsafe mode {mode:04o}: group/world-writable bits \
+                 0022 must be clear",
+                path.display()
+            ),
+            Self::UnexpectedOwner {
+                path,
+                expected_uid,
+                actual_uid,
+            } => write!(
+                f,
+                "verified asset entry {} is owned by uid {actual_uid}, expected asset-store owner \
+                 uid {expected_uid}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AssetTreeVerificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::GroupOrWorldWritable { .. } | Self::UnexpectedOwner { .. } => None,
+        }
+    }
+}
+
+impl From<io::Error> for AssetTreeVerificationError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Hash a registry-backed shared asset while enforcing that every entry is DAC-unwritable by
+/// non-owners and is owned by `expected_uid`. Validation and hashing consume the same lstat result
+/// for each root/file/directory/symlink entry, so unsafe metadata can never produce a verified
+/// digest.
+pub(crate) fn verified_asset_tree_sha256_hex(
+    dir: &Path,
+    expected_uid: u32,
+) -> Result<String, AssetTreeVerificationError> {
+    canonical_tree_sha256_impl(dir, Some(expected_uid)).map(hex_digest)
 }
 
 /// Compute the canonical-tree SHA-256 digest of `dir` as raw bytes.
@@ -104,6 +177,20 @@ pub fn canonical_tree_sha256_hex(dir: &Path) -> io::Result<String> {
 /// directory) — hashing the symlink path WITHOUT this canonicalization would `lstat` the root as a
 /// symlink and silently produce a completely different (wrong) digest.
 pub fn canonical_tree_sha256(dir: &Path) -> io::Result<[u8; 32]> {
+    match canonical_tree_sha256_impl(dir, None) {
+        Ok(digest) => Ok(digest),
+        Err(AssetTreeVerificationError::Io(error)) => Err(error),
+        Err(
+            AssetTreeVerificationError::GroupOrWorldWritable { .. }
+            | AssetTreeVerificationError::UnexpectedOwner { .. },
+        ) => unreachable!("no asset metadata policy is requested by the generic hasher"),
+    }
+}
+
+fn canonical_tree_sha256_impl(
+    dir: &Path,
+    expected_uid: Option<u32>,
+) -> Result<[u8; 32], AssetTreeVerificationError> {
     let dir = fs::canonicalize(dir)?;
     let entries = collect_sorted_entries(&dir)?;
     let mut sink = HashingSink {
@@ -113,7 +200,11 @@ pub fn canonical_tree_sha256(dir: &Path) -> io::Result<[u8; 32]> {
     {
         let mut seen_hardlinks: HashMap<(u64, u64), Vec<u8>> = HashMap::new();
         for entry in &entries {
-            append_entry(&mut sink, entry, &mut seen_hardlinks)?;
+            let metadata = fs::symlink_metadata(&entry.abs_path)?;
+            if let Some(expected_uid) = expected_uid {
+                verify_asset_entry_metadata(&entry.abs_path, &metadata, expected_uid)?;
+            }
+            append_entry(&mut sink, entry, &metadata, &mut seen_hardlinks)?;
         }
         // End-of-archive: two zero blocks (1024 bytes), matching GNU tar.
         sink.write_zeros(2 * BLOCK_SIZE)?;
@@ -128,6 +219,33 @@ pub fn canonical_tree_sha256(dir: &Path) -> io::Result<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     Ok(out)
+}
+
+/// Enforce the registry's per-entry DAC policy. Kept as a small helper so the ownership refusal can
+/// be unit-tested without requiring privilege to chown a fixture to another uid.
+pub(crate) fn verify_asset_entry_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    expected_uid: u32,
+) -> Result<(), AssetTreeVerificationError> {
+    let mode = metadata.mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(AssetTreeVerificationError::GroupOrWorldWritable {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+
+    let actual_uid = metadata.uid();
+    if actual_uid != expected_uid {
+        return Err(AssetTreeVerificationError::UnexpectedOwner {
+            path: path.to_path_buf(),
+            expected_uid,
+            actual_uid,
+        });
+    }
+
+    Ok(())
 }
 
 /// A single archive member: its exact archived name (raw bytes, `./`-prefixed, trailing `/` for a
@@ -327,9 +445,9 @@ fn write_long_entry(sink: &mut HashingSink, typeflag: u8, payload: &[u8]) -> io:
 fn append_entry(
     sink: &mut HashingSink,
     entry: &Entry,
+    meta: &fs::Metadata,
     seen_hardlinks: &mut HashMap<(u64, u64), Vec<u8>>,
 ) -> io::Result<()> {
-    let meta = fs::symlink_metadata(&entry.abs_path)?;
     let mode = meta.mode() & 0o7777;
     let name = entry.archive_name.as_slice();
 

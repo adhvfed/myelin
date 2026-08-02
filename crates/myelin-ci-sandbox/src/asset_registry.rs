@@ -114,6 +114,21 @@ pub enum AssetRegistryError {
     },
     /// Hashing the registered directory failed (I/O error, unsupported file type, …).
     Hashing { rootfs: PathBuf, reason: String },
+    /// A shared asset entry is writable by its group or by everyone. Such an entry could be
+    /// mutated by a non-owner after its content was hashed.
+    GroupOrWorldWritable {
+        rootfs: PathBuf,
+        path: PathBuf,
+        mode: u32,
+    },
+    /// A shared asset entry is not owned by the runner process's effective uid (the asset-store
+    /// owner), so another uid retains authority to mutate it after verification.
+    UnexpectedOwner {
+        rootfs: PathBuf,
+        path: PathBuf,
+        expected_uid: u32,
+        actual_uid: u32,
+    },
 }
 
 impl std::fmt::Display for AssetRegistryError {
@@ -162,6 +177,29 @@ impl std::fmt::Display for AssetRegistryError {
                 "gvisor asset registry: failed to hash registered rootfs {}: {reason}",
                 rootfs.display()
             ),
+            AssetRegistryError::GroupOrWorldWritable {
+                rootfs,
+                path,
+                mode,
+            } => write!(
+                f,
+                "gvisor asset registry: registered rootfs {} contains entry {} with unsafe mode \
+                 {mode:04o}: group/world-writable bits 0022 must be clear",
+                rootfs.display(),
+                path.display()
+            ),
+            AssetRegistryError::UnexpectedOwner {
+                rootfs,
+                path,
+                expected_uid,
+                actual_uid,
+            } => write!(
+                f,
+                "gvisor asset registry: registered rootfs {} contains entry {} owned by uid \
+                 {actual_uid}, expected runner/asset-store owner uid {expected_uid}",
+                rootfs.display(),
+                path.display()
+            ),
         }
     }
 }
@@ -179,6 +217,12 @@ impl GvisorAssetRegistry {
     pub fn from_bindings(
         bindings: Vec<RootfsAssetBinding>,
     ) -> Result<GvisorAssetRegistry, AssetRegistryError> {
+        // The runner account is also the owner of its private asset store. Capture the effective
+        // uid once so every binding in this registry is checked against one stable authority. An
+        // externally configurable uid would let configuration redefine which foreign owner is
+        // trusted and is unnecessary for the current single-owner store model.
+        // SAFETY: `geteuid` takes no pointers and has no preconditions.
+        let expected_owner_uid = unsafe { libc::geteuid() };
         let mut verified = HashMap::with_capacity(bindings.len());
         for binding in bindings {
             if verified.contains_key(&binding.image.reference) {
@@ -186,7 +230,7 @@ impl GvisorAssetRegistry {
                     reference: binding.image.reference,
                 });
             }
-            let result = Self::verify_binding(&binding)?;
+            let result = Self::verify_binding(&binding, expected_owner_uid)?;
             verified.insert(binding.image.reference.clone(), result);
         }
         Ok(GvisorAssetRegistry { verified })
@@ -196,7 +240,10 @@ impl GvisorAssetRegistry {
     /// digest algorithm, a real canonicalized non-root directory, and a recomputed canonical-tree
     /// digest that matches the digest embedded in `binding.image`. Every failure mode is a typed,
     /// fail-closed [`AssetRegistryError`] — never a panic, never a silent warning.
-    fn verify_binding(binding: &RootfsAssetBinding) -> Result<VerifiedRootfs, AssetRegistryError> {
+    fn verify_binding(
+        binding: &RootfsAssetBinding,
+        expected_owner_uid: u32,
+    ) -> Result<VerifiedRootfs, AssetRegistryError> {
         let image = &binding.image;
         let (algorithm, expected_hex) =
             image
@@ -253,12 +300,32 @@ impl GvisorAssetRegistry {
             });
         }
 
-        let actual_hex = canonical_tar::canonical_tree_sha256_hex(&canon).map_err(|e| {
-            AssetRegistryError::Hashing {
-                rootfs: canon.clone(),
-                reason: e.to_string(),
-            }
-        })?;
+        let actual_hex = canonical_tar::verified_asset_tree_sha256_hex(&canon, expected_owner_uid)
+            .map_err(|error| match error {
+                canonical_tar::AssetTreeVerificationError::Io(error) => {
+                    AssetRegistryError::Hashing {
+                        rootfs: canon.clone(),
+                        reason: error.to_string(),
+                    }
+                }
+                canonical_tar::AssetTreeVerificationError::GroupOrWorldWritable { path, mode } => {
+                    AssetRegistryError::GroupOrWorldWritable {
+                        rootfs: canon.clone(),
+                        path,
+                        mode,
+                    }
+                }
+                canonical_tar::AssetTreeVerificationError::UnexpectedOwner {
+                    path,
+                    expected_uid,
+                    actual_uid,
+                } => AssetRegistryError::UnexpectedOwner {
+                    rootfs: canon.clone(),
+                    path,
+                    expected_uid,
+                    actual_uid,
+                },
+            })?;
         if actual_hex != expected_hex {
             return Err(AssetRegistryError::DigestMismatch {
                 reference: image.reference.clone(),
@@ -289,6 +356,7 @@ impl GvisorAssetRegistry {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     /// A throwaway real directory containing one file, hashed with the SAME pure-Rust hasher the
     /// registry itself uses — so a test can register a genuinely digest-matching binding without
@@ -312,6 +380,9 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             fs::create_dir(dir.join("workspace")).unwrap();
             fs::write(dir.join("payload"), content).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(dir.join("workspace"), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(dir.join("payload"), fs::Permissions::from_mode(0o644)).unwrap();
             let digest = canonical_tar::canonical_tree_sha256_hex(&dir).unwrap();
             let image =
                 ImageRef::pinned(format!("test.local/{tag}-rootfs@sha256:{digest}")).unwrap();
@@ -330,6 +401,82 @@ mod tests {
             image,
             rootfs: rootfs.into(),
         }
+    }
+
+    #[test]
+    fn writable_asset_entry_refuses_registry_construction_with_path_and_mode() {
+        for (tag, relative_path, mode, kind) in [
+            ("group-writable-file", "payload", 0o664, "file"),
+            ("world-writable-dir", "writable-dir", 0o757, "dir"),
+            ("writable-symlink", "payload-link", 0o777, "symlink"),
+        ] {
+            let fixture = Fixture::new(tag, b"content whose mode is pinned");
+            let offending_path = fixture.dir.join(relative_path);
+            match kind {
+                "file" => {}
+                "dir" => fs::create_dir(&offending_path).unwrap(),
+                "symlink" => {
+                    std::os::unix::fs::symlink("payload", &offending_path).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            if kind != "symlink" {
+                fs::set_permissions(&offending_path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+
+            // Pin the tree only after introducing the unsafe mode. Before the hardening, its
+            // content digest is valid and registry construction therefore accepts it.
+            let digest = canonical_tar::canonical_tree_sha256_hex(&fixture.dir).unwrap();
+            let image =
+                ImageRef::pinned(format!("test.local/{tag}-rootfs@sha256:{digest}")).unwrap();
+            let error = GvisorAssetRegistry::from_bindings(vec![binding(image, &fixture.dir)])
+                .expect_err("a group/world-writable asset entry must refuse construction");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(&offending_path.display().to_string()),
+                "error must name offending path: {rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("{mode:04o}")),
+                "error must name offending mode: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_owned_asset_entry_refuses_metadata_verification() {
+        let fixture = Fixture::new("foreign-owner", b"owner-owned content");
+        let path = fixture.dir.join("payload");
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let actual_uid = std::os::unix::fs::MetadataExt::uid(&metadata);
+        let foreign_expected_uid = if actual_uid == 0 { 1 } else { 0 };
+
+        let error =
+            canonical_tar::verify_asset_entry_metadata(&path, &metadata, foreign_expected_uid)
+                .expect_err("metadata owned by another uid must be refused");
+        assert!(matches!(
+            error,
+            canonical_tar::AssetTreeVerificationError::UnexpectedOwner {
+                path: ref offending_path,
+                expected_uid,
+                actual_uid: owner_uid,
+            } if offending_path == &path
+                && expected_uid == foreign_expected_uid
+                && owner_uid == actual_uid
+        ));
+    }
+
+    #[test]
+    fn owner_owned_0755_dirs_and_0644_files_are_accepted() {
+        let fixture = Fixture::new("safe-metadata", b"clean asset content");
+        let registry =
+            GvisorAssetRegistry::from_bindings(vec![binding(fixture.image.clone(), &fixture.dir)])
+                .expect("owner-owned tree with conservative modes must verify");
+
+        assert_eq!(
+            registry.resolve(&fixture.image).unwrap().path(),
+            fs::canonicalize(&fixture.dir).unwrap()
+        );
     }
 
     /// (a) An unknown `ImageRef` refuses before any reserve/spawn is attempted — here, before
