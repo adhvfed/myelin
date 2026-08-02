@@ -150,7 +150,7 @@ fn empty_directory_matches_shell_recipe() {
 /// staged `linux-rust-v1` asset (resolved the SAME way `runner-assets.toml`'s row resolves it: env
 /// var `MYELIN_GVISOR_RUST_ROOTFS`, else the documented default path
 /// `~/.local/share/gvisor-assets/rust-rootfs`) and assert it equals the digest ALREADY committed in
-/// `runner-assets.toml` (`7cff5227e39276b02a2f501fd7dd29299a8341a28f02c09f83726b10f052bffa`).
+/// `runner-assets.toml` (`01e3c39339a58f7440e4ac4efd9aad0e04b3f6a16610903074cbc894ad23a127`).
 /// Genuinely, honestly SKIPPED if the asset isn't staged on this machine (this repo's existing
 /// runsc/KVM graceful-skip convention) — never a vacuous pass. `MYELIN_REQUIRE_RUST_ROOTFS_PIN=1`
 /// hard-requires it (this is exercised for REAL on the founder dogfood host this was written on).
