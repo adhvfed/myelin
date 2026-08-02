@@ -280,6 +280,9 @@ pub enum FcError {
     Hook(crate::HookError),
     /// The mandatory hardening profile could not be asserted in force (fail-closed before boot).
     Hardening(String),
+    /// Secret-bearing launches are OCI-only until Firecracker can inject without staging material
+    /// in its host-side command script.
+    SecretInjection(String),
     /// R0.1: the per-tap egress firewall could not be emitted+applied (a hostname allowlist entry is
     /// unenforceable, or `nft -f` failed) — the job is REFUSED fail-closed; no NIC is attached.
     Egress(EgressEnforceError),
@@ -292,6 +295,9 @@ impl std::fmt::Display for FcError {
         match self {
             FcError::Hook(e) => write!(f, "firecracker backend: guarantee hook failed: {e}"),
             FcError::Hardening(s) => write!(f, "firecracker backend: hardening not enforced: {s}"),
+            FcError::SecretInjection(s) => {
+                write!(f, "firecracker backend: secret injection refused: {s}")
+            }
             FcError::Egress(e) => write!(f, "firecracker backend: egress not enforced: {e}"),
             FcError::Vmm(s) => write!(f, "firecracker backend: VMM error: {s}"),
         }
@@ -461,6 +467,13 @@ impl FirecrackerBackend {
     where
         F: FnOnce(&JobSpec, &HardeningProfile, LaunchPermit) -> Result<GuestRun, String>,
     {
+        spec.validate_secret_coverage()
+            .map_err(|error| FcError::SecretInjection(error.to_string()))?;
+        if spec.resolved_secret_count() != 0 {
+            return Err(FcError::SecretInjection(
+                "resolved secrets require the in-boundary OCI process-env path".into(),
+            ));
+        }
         // #4 isolation floor FIRST — the hardening profile must hold before any code runs.
         hooks.enforce_isolation_floor(spec)?;
         // The mandatory backend-independent hardening profile (arch 02 §5.3).
@@ -572,7 +585,7 @@ fn run_production_guest_streaming(
     };
 
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
-    let redaction = RedactionPlan::for_job(spec);
+    let redaction = spec.resolved_secrets().redaction_plan().clone();
     let command_capture = CommandStreamSpec {
         nonce: nonce.clone(),
         output,

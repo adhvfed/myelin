@@ -379,7 +379,7 @@ pub use supply_chain::{
 // none new (the broker composes the FROZEN `SecretRef`/`TrustTier`/`IdentityService::check` surfaces).
 pub use secret_broker::{
     OidcCredential, ResolvedSecret, SecretBroker, SecretCapability, SecretOutcome,
-    SecretResolution, WithholdReason, SECRET_READ_PERMISSION,
+    SecretLaunchError, SecretResolution, WithheldSecret, WithholdReason, SECRET_READ_PERMISSION,
 };
 
 // CI-P24 (P-367, M4): DEPLOYMENTS & the protected-env HITL gate (arch 03 §1.2). The deploy state
