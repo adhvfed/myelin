@@ -7,6 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use myelin_ci_sandbox::gvisor::{
+    CARGO_SOURCE_REPLACE_CONFIG, CARGO_VENDOR_DIRECTORY_CONFIG,
+};
 use myelin_ci_sandbox::ImageRef;
 use myelin_storage::{BlobError, BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
@@ -143,9 +146,11 @@ pub enum StructuredBuildToolV1 {
 
 /// A tenant-authored build recipe whose executable, environment, and accepted argument grammar are
 /// owned by the platform. The initial Cargo recipe is intentionally minimal: only
-/// `cargo build --locked` is admitted, so options such as `--config` cannot reopen the Cargo
-/// boundary. The gVisor launcher binds the structured recipe to its server-owned offline vendor
-/// source; attesting tenant-authored path/git dependency policy remains a separate layer.
+/// `cargo build --locked` is admitted from the tenant, so tenant options such as `--config` cannot
+/// reopen the Cargo boundary. [`Self::platform_argv`] appends the server-owned source overrides;
+/// `[patch]`, `[replace]`, `paths`, and path/git dependencies can resolve only to code already in
+/// the tenant's own workspace while offline, so their acceptability is an attestation-policy
+/// concern rather than a dependency-fetch escape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StructuredBuildV1 {
@@ -165,6 +170,12 @@ impl StructuredBuildV1 {
         match self.tool {
             StructuredBuildToolV1::Cargo => std::iter::once("cargo".to_owned())
                 .chain(self.args.iter().cloned())
+                .chain([
+                    "--config".to_owned(),
+                    CARGO_SOURCE_REPLACE_CONFIG.to_owned(),
+                    "--config".to_owned(),
+                    CARGO_VENDOR_DIRECTORY_CONFIG.to_owned(),
+                ])
                 .collect(),
         }
     }

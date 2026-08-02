@@ -120,6 +120,8 @@ pub struct VerifiedCargoVendor {
     digest_hex: String,
     cargo_lock_sha256: String,
     expected_owner_uid: u32,
+    device: u64,
+    inode: u64,
 }
 
 impl VerifiedCargoVendor {
@@ -135,11 +137,16 @@ impl VerifiedCargoVendor {
         &self.cargo_lock_sha256
     }
 
+    pub(crate) fn identity(&self) -> (u64, u64) {
+        (self.device, self.inode)
+    }
+
     /// Re-verify the complete shared asset at the verify-to-use boundary and bind it to the
     /// independently host-hashed lockfile from the materialized tenant workspace. Startup
     /// verification is not launch authority for bytes that may have drifted since startup.
-    pub(crate) fn verify_before_spawn(
+    pub(crate) fn verify_before_spawn_at(
         &self,
+        fd_bound_root: &Path,
         materialized_cargo_lock_sha256: &str,
     ) -> Result<(), String> {
         if materialized_cargo_lock_sha256 != self.cargo_lock_sha256 {
@@ -149,12 +156,13 @@ impl VerifiedCargoVendor {
             ));
         }
 
-        let actual_lock_sha256 = file_sha256_hex(&self.path.join("Cargo.lock")).map_err(|error| {
-            format!(
-                "could not re-read Cargo vendor asset lock {} before spawn: {error}",
-                self.path.join("Cargo.lock").display()
-            )
-        })?;
+        let actual_lock_sha256 =
+            file_sha256_hex(&fd_bound_root.join("Cargo.lock")).map_err(|error| {
+                format!(
+                    "could not re-read fd-bound Cargo vendor asset lock {} before spawn: {error}",
+                    self.path.join("Cargo.lock").display()
+                )
+            })?;
         if actual_lock_sha256 != self.cargo_lock_sha256 {
             return Err(format!(
                 "Cargo vendor asset {} lock drifted before spawn: expected sha256:{}, computed sha256:{actual_lock_sha256}",
@@ -163,13 +171,16 @@ impl VerifiedCargoVendor {
             ));
         }
 
-        let actual = GvisorAssetRegistry::verify_asset_tree(&self.path, self.expected_owner_uid)
-            .map_err(|error| {
-                format!(
-                    "could not re-verify Cargo vendor asset {} before spawn: {error}",
-                    self.path.display()
-                )
-            })?;
+        let actual = GvisorAssetRegistry::verify_asset_tree(
+            fd_bound_root,
+            self.expected_owner_uid,
+        )
+        .map_err(|error| {
+            format!(
+                "could not re-verify fd-bound Cargo vendor asset {} before spawn: {error}",
+                self.path.display()
+            )
+        })?;
         if actual != self.digest_hex {
             return Err(format!(
                 "Cargo vendor asset {} drifted before spawn: expected canonical-tree sha256:{}, computed sha256:{actual}",
@@ -483,11 +494,20 @@ impl GvisorAssetRegistry {
                 actual: actual_hex,
             });
         }
+        let metadata = std::fs::symlink_metadata(&canon).map_err(|error| {
+            AssetRegistryError::InvalidCargoVendor {
+                root: canon.clone(),
+                reason: format!("could not capture verified root identity: {error}"),
+            }
+        })?;
+        use std::os::unix::fs::MetadataExt as _;
         Ok(VerifiedCargoVendor {
             path: canon,
             digest_hex: actual_hex,
             cargo_lock_sha256: binding.cargo_lock_sha256.clone(),
             expected_owner_uid,
+            device: metadata.dev(),
+            inode: metadata.ino(),
         })
     }
 

@@ -1573,6 +1573,12 @@ fn granted_jobs_v2(
                         .into(),
                 )));
             }
+            if job.build.is_some() && !grant.egress_allow.is_empty() {
+                return Err(PgCiStarterError::LaunchAuthority(CiLaunchAuthorityError(
+                    "a structured Cargo build requires an empty egress grant (network=none)"
+                        .into(),
+                )));
+            }
             let mut needs = expected
                 .needs
                 .iter()
@@ -2546,7 +2552,18 @@ mod tests {
 
         let jobs = granted_jobs_v2(&record, &prepared, &expected, &authority).unwrap();
         let build = &jobs[0];
-        assert_eq!(build.command, ["cargo", "build", "--locked"]);
+        assert_eq!(
+            build.command,
+            [
+                "cargo",
+                "build",
+                "--locked",
+                "--config",
+                "source.crates-io.replace-with=\"vendored\"",
+                "--config",
+                "source.vendored.directory=\"/opt/myelin/cargo-vendor\"",
+            ]
+        );
         assert!(!build
             .command
             .iter()
@@ -2557,6 +2574,23 @@ mod tests {
         let free_form = &jobs[1];
         assert_eq!(free_form.command, ["/bin/test"]);
         assert_eq!(free_form.env, authority.jobs[1].env);
+    }
+
+    #[test]
+    fn structured_cargo_job_refuses_a_nonempty_egress_grant() {
+        let (record, prepared) = prepared_plan_v2_with_structured_build(true);
+        let expected = expected_ci_jobs_v2(&record, &prepared).unwrap();
+        let mut build_grant = launch_grant("build");
+        build_grant.egress_allow = vec!["registry.example:443".into()];
+        let authority = CiLaunchAuthorityV1 {
+            policy_revision: "policy-v1".into(),
+            jobs: vec![build_grant, launch_grant("test")],
+            merge_waiter: None,
+        };
+
+        let error = granted_jobs_v2(&record, &prepared, &expected, &authority)
+            .expect_err("structured Cargo must fail closed unless egress is empty");
+        assert!(error.to_string().contains("empty egress"), "{error}");
     }
 
     #[test]
