@@ -31,6 +31,11 @@ use myelin_refs::ArtifactRef;
 use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::{BlobStore, ContentHash, DurableCostLedger};
 use myelin_tenancy::{Region, TenantId};
+use myelin_ci_sandbox::gvisor::{
+    CARGO_SOURCE_REPLACE_ENV, CARGO_VENDOR_DIRECTORY_ENV, ENV_CARGO_VENDOR_ASSET,
+    OCI_CARGO_VENDOR_MOUNT,
+};
+use myelin_ci_sandbox::CARGO_VENDOR_SMOKE_TREE_SHA256;
 use sqlx::{PgPool, Row};
 
 use crate::ci_drive_manifest::{
@@ -1607,8 +1612,9 @@ fn granted_jobs_v2(
 /// their historical argv/env byte-for-byte. Structured Cargo jobs receive an argv constructed by the
 /// platform and fixed Cargo environment values that overwrite any conflicting grant value.
 ///
-/// There is deliberately no shell in this translation. Full attested hermeticity remains contingent
-/// on the later read-only vendored dependency/config boundary and Cargo.lock attestation check.
+/// There is deliberately no shell in this translation. The sandbox consumes the selector and fixed
+/// Cargo configuration below to install its read-only vendor boundary; proving that tenant-authored
+/// path/git dependencies used no additional workspace code remains a separate attestation policy.
 fn platform_owned_execution(
     job: &ResolvedJobV2,
     granted_env: &BTreeMap<String, String>,
@@ -1619,6 +1625,20 @@ fn platform_owned_execution(
     let mut env = granted_env.clone();
     env.insert("CARGO_HOME".into(), PLATFORM_CARGO_HOME.into());
     env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+    env.insert(
+        CARGO_SOURCE_REPLACE_ENV.into(),
+        "vendored".into(),
+    );
+    env.insert(
+        CARGO_VENDOR_DIRECTORY_ENV.into(),
+        OCI_CARGO_VENDOR_MOUNT.into(),
+    );
+    env.insert(
+        ENV_CARGO_VENDOR_ASSET.into(),
+        format!(
+            "myelin.local/cargo-vendor-smoke-v1@sha256:{CARGO_VENDOR_SMOKE_TREE_SHA256}"
+        ),
+    );
     (build.platform_argv(), env)
 }
 
@@ -2536,6 +2556,48 @@ mod tests {
 
         let free_form = &jobs[1];
         assert_eq!(free_form.command, ["/bin/test"]);
+        assert_eq!(free_form.env, authority.jobs[1].env);
+    }
+
+    #[test]
+    fn structured_cargo_lowering_sets_the_server_vendor_selector_only_on_the_build_job() {
+        let (record, prepared) = prepared_plan_v2_with_structured_build(true);
+        let expected = expected_ci_jobs_v2(&record, &prepared).unwrap();
+        let authority = CiLaunchAuthorityV1 {
+            policy_revision: "policy-v1".into(),
+            jobs: vec![launch_grant("build"), launch_grant("test")],
+            merge_waiter: None,
+        };
+
+        let jobs = granted_jobs_v2(&record, &prepared, &expected, &authority).unwrap();
+        let build = &jobs[0];
+        assert_eq!(build.env.get("CARGO_HOME").unwrap(), "/tmp/cargo-home");
+        assert_eq!(build.env.get("CARGO_NET_OFFLINE").unwrap(), "true");
+        assert_eq!(
+            build.env.get(CARGO_SOURCE_REPLACE_ENV).unwrap(),
+            "vendored"
+        );
+        assert_eq!(
+            build.env.get(CARGO_VENDOR_DIRECTORY_ENV).unwrap(),
+            OCI_CARGO_VENDOR_MOUNT
+        );
+        assert_eq!(
+            build.env.get(ENV_CARGO_VENDOR_ASSET).unwrap(),
+            &format!(
+                "myelin.local/cargo-vendor-smoke-v1@sha256:{CARGO_VENDOR_SMOKE_TREE_SHA256}"
+            )
+        );
+
+        let free_form = &jobs[1];
+        for reserved in [
+            "CARGO_HOME",
+            "CARGO_NET_OFFLINE",
+            CARGO_SOURCE_REPLACE_ENV,
+            CARGO_VENDOR_DIRECTORY_ENV,
+            ENV_CARGO_VENDOR_ASSET,
+        ] {
+            assert!(!free_form.env.contains_key(reserved), "{reserved}");
+        }
         assert_eq!(free_form.env, authority.jobs[1].env);
     }
 
