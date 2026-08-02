@@ -65,8 +65,13 @@ impl FakeCapability {
     }
 }
 impl SecretCapability for FakeCapability {
-    fn resolve_handle(&self, handle: &str) -> Option<String> {
-        if self.known.contains(handle) {
+    fn resolve_handle(
+        &self,
+        tenant: &TenantId,
+        object: &ArtifactRef,
+        handle: &str,
+    ) -> Option<String> {
+        if tenant.0 == "acme" && object.0 == handle && self.known.contains(handle) {
             Some(format!("material:{handle}"))
         } else {
             None
@@ -80,17 +85,17 @@ impl SecretCapability for FakeCapability {
 /// structural short-circuit).
 struct FakeIdentity {
     granted: HashSet<String>,
-    checks: std::cell::RefCell<Vec<String>>,
+    checks: std::sync::Mutex<Vec<String>>,
 }
 impl FakeIdentity {
     fn granting(objects: &[&str]) -> Self {
         FakeIdentity {
             granted: objects.iter().map(|o| o.to_string()).collect(),
-            checks: std::cell::RefCell::new(Vec::new()),
+            checks: std::sync::Mutex::new(Vec::new()),
         }
     }
     fn check_count(&self) -> usize {
-        self.checks.borrow().len()
+        self.checks.lock().unwrap().len()
     }
 }
 impl IdentityService for FakeIdentity {
@@ -105,7 +110,7 @@ impl IdentityService for FakeIdentity {
         _at: &Consistency,
         _cav: Option<&CaveatContext>,
     ) -> IdResult<Decision> {
-        self.checks.borrow_mut().push(o.0.clone());
+        self.checks.lock().unwrap().push(o.0.clone());
         // The broker only ever asks for `read` on a secret object.
         assert_eq!(
             p.0, SECRET_READ_PERMISSION,
@@ -196,11 +201,11 @@ fn refs() -> Vec<SecretRef> {
     vec![
         SecretRef {
             name: "REGISTRY_TOKEN".into(),
-            handle: "h:registry".into(),
+            handle: "myelin://acme/ci/secret/registry".into(),
         },
         SecretRef {
             name: "DEPLOY_KEY".into(),
-            handle: "h:deploy".into(),
+            handle: "myelin://acme/ci/secret/deploy".into(),
         },
     ]
 }
@@ -208,7 +213,7 @@ fn refs() -> Vec<SecretRef> {
 /// Map a `SecretRef` to its `ci_secret` ArtifactRef (the gate object) — the per-job scope is the
 /// handle, so the object id is derived from it (deterministic).
 fn secret_object_of(r: &SecretRef) -> ArtifactRef {
-    ArtifactRef(format!("myelin://acme/ci/secret/{}", r.handle))
+    ArtifactRef(r.handle.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -219,10 +224,13 @@ fn secret_object_of(r: &SecretRef) -> ArtifactRef {
 fn fork_resolves_to_zero_secrets() {
     // A fork run whose subject WOULD be granted both secrets if it were trusted — the grant is a
     // misconfiguration the structural defence must survive.
-    let cap = FakeCapability::with(&["h:registry", "h:deploy"]);
+    let cap = FakeCapability::with(&[
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
+    ]);
     let id = FakeIdentity::granting(&[
-        "myelin://acme/ci/secret/h:registry",
-        "myelin://acme/ci/secret/h:deploy",
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
     ]);
     let broker = SecretBroker::new(&cap, &id);
 
@@ -269,9 +277,12 @@ fn fork_resolves_to_zero_secrets() {
 
 #[test]
 fn trusted_resolves_only_referenced_granted_names() {
-    let cap = FakeCapability::with(&["h:registry", "h:deploy"]);
+    let cap = FakeCapability::with(&[
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
+    ]);
     // Grant ONLY the registry secret (not the deploy key) — the DIRECT NARROW grant.
-    let id = FakeIdentity::granting(&["myelin://acme/ci/secret/h:registry"]);
+    let id = FakeIdentity::granting(&["myelin://acme/ci/secret/registry"]);
     let broker = SecretBroker::new(&cap, &id);
 
     let res = broker
@@ -289,7 +300,10 @@ fn trusted_resolves_only_referenced_granted_names() {
     let resolved: Vec<_> = res.resolved().collect();
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].name, "REGISTRY_TOKEN");
-    assert_eq!(resolved[0].value, "material:h:registry");
+    assert_eq!(
+        resolved[0].value,
+        "material:myelin://acme/ci/secret/registry"
+    );
 
     // The ungranted deploy key is withheld (NotGranted), never leaked.
     assert!(matches!(
@@ -309,7 +323,10 @@ fn trusted_resolves_only_referenced_granted_names() {
 
 #[test]
 fn protected_without_grant_withholds_all() {
-    let cap = FakeCapability::with(&["h:registry", "h:deploy"]);
+    let cap = FakeCapability::with(&[
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
+    ]);
     // No grants at all — a protected secret without an explicit DIRECT grant.
     let id = FakeIdentity::granting(&[]);
     let broker = SecretBroker::new(&cap, &id);
@@ -343,7 +360,7 @@ fn granted_but_stale_handle_withholds_observably() {
     // The subject IS granted, but the handle does not resolve (a stale binding) — withheld, never a
     // panic or a silent leak.
     let cap = FakeCapability::with(&[]); // no handle resolves
-    let id = FakeIdentity::granting(&["myelin://acme/ci/secret/h:registry"]);
+    let id = FakeIdentity::granting(&["myelin://acme/ci/secret/registry"]);
     let broker = SecretBroker::new(&cap, &id);
 
     let res = broker
@@ -367,12 +384,51 @@ fn granted_but_stale_handle_withholds_observably() {
 }
 
 #[test]
+fn cross_tenant_handle_cannot_use_an_authorized_local_object() {
+    let victim_handle = "myelin://victim/ci/secret/deploy";
+    let cap = FakeCapability::with(&[victim_handle]);
+    let id = FakeIdentity::granting(&["myelin://acme/ci/secret/deploy"]);
+    let broker = SecretBroker::new(&cap, &id);
+    let forged = vec![SecretRef {
+        name: "DEPLOY_KEY".into(),
+        handle: victim_handle.into(),
+    }];
+
+    let resolution = broker
+        .resolve(
+            TrustTier::Trusted,
+            &subject(),
+            |_| ArtifactRef("myelin://acme/ci/secret/deploy".into()),
+            &forged,
+            &at(),
+        )
+        .unwrap();
+
+    assert_eq!(resolution.secret_count(), 0);
+    assert!(matches!(
+        resolution.outcomes[0],
+        SecretOutcome::Withheld {
+            reason: WithholdReason::NotGranted,
+            ..
+        }
+    ));
+    assert_eq!(
+        id.check_count(),
+        0,
+        "scope mismatch is refused before authz"
+    );
+}
+
+#[test]
 fn self_hosted_is_trusted_for_secret_resolution() {
     // A self-hosted member run is trusted CODE — it resolves its granted secrets (it is NOT a fork).
-    let cap = FakeCapability::with(&["h:registry", "h:deploy"]);
+    let cap = FakeCapability::with(&[
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
+    ]);
     let id = FakeIdentity::granting(&[
-        "myelin://acme/ci/secret/h:registry",
-        "myelin://acme/ci/secret/h:deploy",
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
     ]);
     let broker = SecretBroker::new(&cap, &id);
 
@@ -418,22 +474,70 @@ fn empty_refs_resolve_to_empty() {
 
 #[test]
 fn resolve_for_launch_couples_every_resolved_value_to_sandbox_injection() {
-    let cap = FakeCapability::with(&["h:registry", "h:deploy"]);
+    let cap = FakeCapability::with(&[
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
+    ]);
     let id = FakeIdentity::granting(&[
-        "myelin://acme/ci/secret/h:registry",
-        "myelin://acme/ci/secret/h:deploy",
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
     ]);
     let broker = SecretBroker::new(&cap, &id);
 
     let spec = broker
-        .resolve_for_launch(launch_spec(TrustTier::Trusted), &subject(), secret_object_of, &at())
+        .resolve_for_launch(
+            launch_spec(TrustTier::Trusted),
+            &subject(),
+            secret_object_of,
+            &at(),
+        )
         .expect("all granted handles resolve into one covered launch value");
 
     assert_eq!(spec.resolved_secret_count(), 2);
     assert!(spec.validate_secret_coverage().is_ok());
     let rendered = format!("{spec:?}");
-    assert!(!rendered.contains("material:h:registry"));
-    assert!(!rendered.contains("material:h:deploy"));
+    assert!(!rendered.contains("material:myelin://acme/ci/secret/registry"));
+    assert!(!rendered.contains("material:myelin://acme/ci/secret/deploy"));
+}
+
+#[test]
+fn production_secret_resolver_calls_broker_with_claim_bound_subject() {
+    use myelin_ci_sandbox::{CiJobAuthorizationContext, RunTokenAuthorizationContext};
+    use std::sync::Arc;
+
+    let cap = Arc::new(FakeCapability::with(&[
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
+    ]));
+    let id = Arc::new(FakeIdentity::granting(&[
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
+    ]));
+    let resolver = crate::secret_broker_ci_job_resolver(cap, id.clone(), at());
+    let mut spec = launch_spec(TrustTier::Trusted);
+    spec.run_token_authorization = Some(RunTokenAuthorizationContext::CiJob(
+        CiJobAuthorizationContext {
+            tenant_id: "acme".into(),
+            region: "fr-par".into(),
+            principal_id: "ci-job".into(),
+            wf_run_id: "wf".into(),
+            job_id: "job".into(),
+            lease_owner: "runner".into(),
+            lease_epoch: 1,
+            claim_nonce: "nonce".into(),
+            claim_started_at_epoch_secs: 1,
+            claim_expires_at_epoch_secs: 2,
+            reserve_id: "reserve:secret-test".into(),
+            required_capabilities: Vec::new(),
+            checkout_scope: None,
+            credential_binding: None,
+        },
+    ));
+
+    let resolved = resolver(&TenantId::from_token("acme"), spec).unwrap();
+    assert_eq!(resolved.resolved_secret_count(), 2);
+    assert!(resolved.validate_secret_coverage().is_ok());
+    assert_eq!(id.check_count(), 2);
 }
 
 #[test]
@@ -446,15 +550,23 @@ fn injected_material_is_absent_from_durable_ci_records_and_result_records() {
     use crate::job_spec_store::DurableCiJobLaunchTemplate;
     use myelin_ci_sandbox::{ResourceUsage, SandboxResult};
 
-    let material = "material:h:registry";
-    let cap = FakeCapability::with(&["h:registry", "h:deploy"]);
+    let material = "material:myelin://acme/ci/secret/registry";
+    let cap = FakeCapability::with(&[
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
+    ]);
     let id = FakeIdentity::granting(&[
-        "myelin://acme/ci/secret/h:registry",
-        "myelin://acme/ci/secret/h:deploy",
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
     ]);
     let broker = SecretBroker::new(&cap, &id);
     let injected = broker
-        .resolve_for_launch(launch_spec(TrustTier::Trusted), &subject(), secret_object_of, &at())
+        .resolve_for_launch(
+            launch_spec(TrustTier::Trusted),
+            &subject(),
+            secret_object_of,
+            &at(),
+        )
         .unwrap();
 
     let (template, _credential) = injected.into_template();
@@ -499,8 +611,11 @@ fn injected_material_is_absent_from_durable_ci_records_and_result_records() {
             command: vec!["/bin/print-env".into()],
             env: BTreeMap::new(),
             secret_handles: BTreeMap::from([
-                ("DEPLOY_KEY".into(), "h:deploy".into()),
-                ("REGISTRY_TOKEN".into(), "h:registry".into()),
+                ("DEPLOY_KEY".into(), "myelin://acme/ci/secret/deploy".into()),
+                (
+                    "REGISTRY_TOKEN".into(),
+                    "myelin://acme/ci/secret/registry".into(),
+                ),
             ]),
             egress_allow: Vec::new(),
             limits: CiManifestLimitsV1 {
@@ -561,18 +676,26 @@ fn injected_material_is_absent_from_durable_ci_records_and_result_records() {
         format!("{result:?}"),
     ] {
         assert!(!record.contains(material));
-        assert!(!record.contains("material:h:deploy"));
+        assert!(!record.contains("material:myelin://acme/ci/secret/deploy"));
     }
 }
 
 #[test]
 fn withheld_secret_rejects_launch_with_observable_reason() {
-    let cap = FakeCapability::with(&["h:registry", "h:deploy"]);
-    let id = FakeIdentity::granting(&["myelin://acme/ci/secret/h:registry"]);
+    let cap = FakeCapability::with(&[
+        "myelin://acme/ci/secret/registry",
+        "myelin://acme/ci/secret/deploy",
+    ]);
+    let id = FakeIdentity::granting(&["myelin://acme/ci/secret/registry"]);
     let broker = SecretBroker::new(&cap, &id);
 
     let error = broker
-        .resolve_for_launch(launch_spec(TrustTier::Trusted), &subject(), secret_object_of, &at())
+        .resolve_for_launch(
+            launch_spec(TrustTier::Trusted),
+            &subject(),
+            secret_object_of,
+            &at(),
+        )
         .expect_err("partial secret resolution must reject the whole launch");
 
     assert_eq!(

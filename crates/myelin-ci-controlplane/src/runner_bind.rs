@@ -138,7 +138,10 @@ pub fn production_gvisor_registry() -> Arc<GvisorAssetRegistry> {
 
 use crate::ci_claim_token_issuer::LockedManifestCiJobTokenIssuer;
 use crate::ci_identity_adapter::ci_job_authorization_context;
-use crate::ci_manifest_job_runner::{validate_run_token, CiJobTokenIssuer, CiJobTokenRequest};
+use crate::ci_manifest_job_runner::{
+    resolve_claim_launch_secrets, validate_run_token, CiJobSecretResolver, CiJobTokenIssuer,
+    CiJobTokenRequest,
+};
 use crate::ci_pipeline_reporter_router::CiPipelineReporterRouter;
 use crate::job_spec_store::MAX_JOB_TIMEOUT_SECS;
 use crate::{
@@ -615,18 +618,16 @@ impl CiRunnerLoop {
                     run_id,
                     signal_outcome,
                     diagnostic,
-                }) => {
-                    match diagnostic {
-                        Some(diagnostic) => eprintln!(
-                            "ci-runner[{worker_id}]: preparation terminalized job {job_id} for run \
+                }) => match diagnostic {
+                    Some(diagnostic) => eprintln!(
+                        "ci-runner[{worker_id}]: preparation terminalized job {job_id} for run \
                              {run_id} (job.done={signal_outcome:?}, diagnostic={diagnostic})"
-                        ),
-                        None => eprintln!(
-                            "ci-runner[{worker_id}]: preparation terminalized job {job_id} for run \
+                    ),
+                    None => eprintln!(
+                        "ci-runner[{worker_id}]: preparation terminalized job {job_id} for run \
                              {run_id} (job.done={signal_outcome:?})"
-                        ),
-                    }
-                }
+                    ),
+                },
                 Ok(myelin_ci_sandbox::RunnerCycleOutcome::PreparationRetryable {
                     job_id,
                     report,
@@ -766,8 +767,9 @@ pub fn durable_spec_resolver(
     region: impl Into<String>,
     rt: tokio::runtime::Handle,
     token_issuer: LockedManifestCiJobTokenIssuer,
+    secrets: CiJobSecretResolver,
 ) -> JobSpecResolver {
-    durable_spec_resolver_with_issuer(store, region, rt, Arc::new(token_issuer))
+    durable_spec_resolver_with_issuer(store, region, rt, Arc::new(token_issuer), secrets)
 }
 
 /// Legacy V1 fixture seam under the crate's established dev-only `test-support` boundary. The
@@ -779,8 +781,9 @@ pub fn durable_spec_resolver_test_support(
     region: impl Into<String>,
     rt: tokio::runtime::Handle,
     token_issuer: Arc<dyn CiJobTokenIssuer>,
+    secrets: CiJobSecretResolver,
 ) -> JobSpecResolver {
-    durable_spec_resolver_with_issuer(store, region, rt, token_issuer)
+    durable_spec_resolver_with_issuer(store, region, rt, token_issuer, secrets)
 }
 
 fn durable_spec_resolver_with_issuer(
@@ -788,6 +791,7 @@ fn durable_spec_resolver_with_issuer(
     region: impl Into<String>,
     rt: tokio::runtime::Handle,
     token_issuer: Arc<dyn CiJobTokenIssuer>,
+    secrets: CiJobSecretResolver,
 ) -> JobSpecResolver {
     let region = region.into();
     Arc::new(move |leased: &LeasedJob| {
@@ -843,9 +847,14 @@ fn durable_spec_resolver_with_issuer(
         );
         let run_token = bridge(&rt, token_issuer.mint(request)).map_err(|e| e.to_string())?;
         validate_run_token(&run_token, &launch.token_authority_handle).map_err(|e| e.0)?;
-        Ok(launch
-            .spec
-            .resolve_with_authorization(run_token, Some(authorization)))
+        resolve_claim_launch_secrets(
+            &TenantId(leased.tenant_id.clone()),
+            launch.spec,
+            run_token,
+            authorization,
+            &secrets,
+        )
+        .map_err(|error| error.to_string())
     })
 }
 
@@ -862,6 +871,7 @@ pub fn durable_v2_spec_resolver(
     region: impl Into<String>,
     rt: tokio::runtime::Handle,
     checkout_composition: crate::ci_checkout_composition::V2CheckoutComposition,
+    secrets: CiJobSecretResolver,
 ) -> JobSpecResolver {
     let region = region.into();
     Arc::new(move |leased: &LeasedJob| {
@@ -914,9 +924,14 @@ pub fn durable_v2_spec_resolver(
             )
             .map_err(|e| e.to_string())?;
         validate_run_token(&minted.credential, &launch.token_authority_handle).map_err(|e| e.0)?;
-        Ok(launch
-            .spec
-            .resolve_with_authorization(minted.credential, Some(authorization)))
+        resolve_claim_launch_secrets(
+            &TenantId(leased.tenant_id.clone()),
+            launch.spec,
+            minted.credential,
+            authorization,
+            &secrets,
+        )
+        .map_err(|error| error.to_string())
     })
 }
 

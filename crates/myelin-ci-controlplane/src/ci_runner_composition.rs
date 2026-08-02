@@ -175,6 +175,23 @@ pub fn ci_runner_v2_wiring(
     identity: &CiRunnerIdentityAuthorities,
     rt: tokio::runtime::Handle,
 ) -> Result<CiRunnerV2Wiring, HookError> {
+    ci_runner_v2_wiring_with_secret_resolver(
+        provider,
+        identity,
+        rt,
+        crate::ci_manifest_job_runner::unavailable_ci_job_secret_resolver(),
+    )
+}
+
+/// Compose the same production runner path with the cell's concrete in-boundary secret resolver.
+/// This is the injection seam for the shared secret-store capability; the default composition above
+/// remains fail-closed and reports withholds when that capability is unavailable.
+pub fn ci_runner_v2_wiring_with_secret_resolver(
+    provider: SubstrateProvider,
+    identity: &CiRunnerIdentityAuthorities,
+    rt: tokio::runtime::Handle,
+    secrets: crate::ci_manifest_job_runner::CiJobSecretResolver,
+) -> Result<CiRunnerV2Wiring, HookError> {
     let pool = provider.db_pool().clone();
     let region = provider.config().region.clone();
     let composition = crate::ci_checkout_composition::V2CheckoutComposition::new(
@@ -189,6 +206,7 @@ pub fn ci_runner_v2_wiring(
         region,
         rt.clone(),
         composition.clone(),
+        secrets,
     );
     let hooks = ci_runner_v2_hooks(provider, identity.launch_authorizer(), composition, rt);
     Ok(CiRunnerV2Wiring { resolver, hooks })

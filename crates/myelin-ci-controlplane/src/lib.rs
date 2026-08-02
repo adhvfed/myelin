@@ -119,8 +119,9 @@ pub use ci_launch_authority::{
     TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
 };
 pub use ci_manifest_job_runner::{
-    register_durable_ci_manifest_pipeline, CiJobTokenIssueError, CiJobTokenIssuer,
-    CiJobTokenRequest, CiManifestDurableJobRunner,
+    register_durable_ci_manifest_pipeline, secret_broker_ci_job_resolver,
+    unavailable_ci_job_secret_resolver, CiJobSecretResolver, CiJobTokenIssueError,
+    CiJobTokenIssuer, CiJobTokenRequest, CiManifestDurableJobRunner,
 };
 pub use ci_manifest_pipeline::{
     decode_resolved_ci_manifest, drive_resolved_ci_manifest_pipeline,
@@ -134,6 +135,7 @@ pub use ci_runner_composition::{
 };
 pub use ci_runner_composition::{
     ci_runner_hooks, ci_runner_identity_authorities, ci_runner_v2_wiring,
+    ci_runner_v2_wiring_with_secret_resolver,
     CiRunnerIdentityAuthorities, CiRunnerIdentityCompositionError, CiRunnerV2Wiring,
 };
 #[cfg(any(test, feature = "test-support"))]
