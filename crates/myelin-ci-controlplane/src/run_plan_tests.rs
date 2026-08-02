@@ -265,7 +265,18 @@ fn structured_cargo_recipe_is_canonical_and_constructs_direct_argv() {
     assert_eq!(decoded, VersionedResolvedRunPlan::V2(plan.clone()));
 
     let build = plan.jobs[0].build.as_ref().unwrap();
-    assert_eq!(build.platform_argv(), ["cargo", "build", "--locked"]);
+    assert_eq!(
+        build.platform_argv(),
+        [
+            "cargo",
+            "build",
+            "--locked",
+            "--config",
+            "source.crates-io.replace-with=\"vendored\"",
+            "--config",
+            "source.vendored.directory=\"/opt/myelin/cargo-vendor\"",
+        ]
+    );
     assert!(!build
         .platform_argv()
         .iter()
@@ -287,6 +298,18 @@ fn structured_build_validation_rejects_shell_unknown_tool_and_oversized_args() {
     assert!(matches!(
         oversized.canonical_bytes(),
         Err(RunPlanError::InvalidPlan { detail }) if detail.contains("exceeds 256 bytes")
+    ));
+
+    let mut tenant_config = structured_cargo_plan_v2();
+    tenant_config.jobs[0].build.as_mut().unwrap().args = vec![
+        "build".into(),
+        "--locked".into(),
+        "--config".into(),
+        "source.crates-io.replace-with=tenant".into(),
+    ];
+    assert!(matches!(
+        tenant_config.canonical_bytes(),
+        Err(RunPlanError::InvalidPlan { detail }) if detail.contains("exactly `build --locked`")
     ));
 
     let valid = structured_cargo_plan_v2().canonical_bytes().unwrap();

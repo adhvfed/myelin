@@ -7,6 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use myelin_ci_sandbox::gvisor::{
+    CARGO_SOURCE_REPLACE_CONFIG, CARGO_VENDOR_DIRECTORY_CONFIG,
+};
 use myelin_ci_sandbox::ImageRef;
 use myelin_storage::{BlobError, BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
@@ -39,12 +42,10 @@ pub const MAX_COMMAND_BYTES: usize = 32 * 1024;
 pub const MAX_STRUCTURED_BUILD_ARGS: usize = 16;
 /// Maximum UTF-8 byte length of one structured build argument.
 pub const MAX_STRUCTURED_BUILD_ARG_BYTES: usize = 256;
-/// Server-controlled Cargo home used by structured Cargo build jobs.
-///
-/// This slice only removes the tenant-shell override surface. A later dependency-cache boundary must
-/// mount the attested vendored inputs here read-only and bind a non-overridable Cargo configuration;
-/// this constant alone does not make the build attestation-hermetic.
-pub const PLATFORM_CARGO_HOME: &str = "/opt/myelin/cargo-home";
+/// Server-controlled Cargo home used by structured Cargo build jobs. It is writable because it
+/// lives under the sandbox's size-bounded `/tmp`; the server-owned `config.toml` inside it is a
+/// separate read-only bind mount installed by the gVisor launch boundary.
+pub const PLATFORM_CARGO_HOME: &str = myelin_ci_sandbox::gvisor::STRUCTURED_CARGO_HOME;
 /// Maximum matrix axes attached to a resolved job.
 pub const MAX_MATRIX_AXES: usize = 16;
 /// Maximum UTF-8 byte length of a matrix axis name.
@@ -145,8 +146,11 @@ pub enum StructuredBuildToolV1 {
 
 /// A tenant-authored build recipe whose executable, environment, and accepted argument grammar are
 /// owned by the platform. The initial Cargo recipe is intentionally minimal: only
-/// `cargo build --locked` is admitted, so options such as `--config` cannot reopen the Cargo
-/// boundary. This is a no-tenant-shell vehicle, not yet an attested-hermetic build boundary.
+/// `cargo build --locked` is admitted from the tenant, so tenant options such as `--config` cannot
+/// reopen the Cargo boundary. [`Self::platform_argv`] appends the server-owned source overrides;
+/// `[patch]`, `[replace]`, `paths`, and path/git dependencies can resolve only to code already in
+/// the tenant's own workspace while offline, so their acceptability is an attestation-policy
+/// concern rather than a dependency-fetch escape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StructuredBuildV1 {
@@ -166,6 +170,12 @@ impl StructuredBuildV1 {
         match self.tool {
             StructuredBuildToolV1::Cargo => std::iter::once("cargo".to_owned())
                 .chain(self.args.iter().cloned())
+                .chain([
+                    "--config".to_owned(),
+                    CARGO_SOURCE_REPLACE_CONFIG.to_owned(),
+                    "--config".to_owned(),
+                    CARGO_VENDOR_DIRECTORY_CONFIG.to_owned(),
+                ])
                 .collect(),
         }
     }
