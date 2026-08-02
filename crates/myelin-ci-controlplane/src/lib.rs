@@ -54,14 +54,14 @@
 
 pub mod artifact_cache;
 pub mod check_emitter;
+/// CT-007 slice 5b.3-6d STEP 3: the dormant control-plane composition for the sandbox checkout
+/// orchestrator — the real durable `AttemptAuthority`/resolver/parent-admission backings.
+pub mod ci_checkout_composition;
 /// Claim-time durable authority verification in front of the raw Identity credential minter.
 pub mod ci_claim_token_issuer;
 /// The immutable, topology-derived scheduler claim window — the per-generation hard ceiling the
 /// heartbeat-extendable execution lease is renewed inside.
 pub mod ci_claim_window;
-/// CT-007 slice 5b.3-6d STEP 3: the dormant control-plane composition for the sandbox checkout
-/// orchestrator — the real durable `AttemptAuthority`/resolver/parent-admission backings.
-pub mod ci_checkout_composition;
 /// CT-007 phase-credential generations: the append-only per-purpose credential log, its
 /// digest-form signed generation binding, and the retained per-boundary execution gates.
 pub mod ci_credential_generation;
@@ -89,21 +89,22 @@ pub mod ci_runtime_composition;
 /// The subsystem-owned total grammar for the durable `myelin ci` read surface.
 pub mod cli;
 pub use ci_claim_token_issuer::{CiJobCredentialMinter, LockedManifestCiJobTokenIssuer};
+pub use ci_credential_generation::{
+    acquire_phase_generation_ownership, lock_phase_generation_query, phase_generation_id,
+    verify_phase_generation_live, CiCredentialGenerationError, CiCredentialGenerationOutcome,
+    CiCredentialPurpose, CiJobCredentialGenerationStore, CiJobCredentialWriteVersion,
+    CiPhaseCredentialBinding, CiPhaseCredentialMintRequest, CiPhaseCredentialMinter,
+    CiPhaseGenerationGate, CiPhaseGenerationInputs, MintedPhaseCredential,
+    RetainedCiPhaseGeneration, CI_PHASE_CREDENTIAL_BINDING_V1,
+    CI_PHASE_CREDENTIAL_GENERATION_PREFIX, CI_PHASE_CREDENTIAL_V1_DOMAIN,
+    VERIFY_PHASE_GENERATION_QUERY,
+};
 pub use ci_drive_manifest::{
     ci_check_context_v1, CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1,
     CiJobLaunchGrantV1, CiLaunchAuthorityV1, CiManifestLaneV1, CiManifestLimitsV1,
     CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiMergeWaiterV1,
     GrantedCiJobV1, CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN, CI_DRIVE_MANIFEST_SCHEMA_V1,
     MAX_CI_DRIVE_MANIFEST_BYTES,
-};
-pub use ci_credential_generation::{
-    acquire_phase_generation_ownership, lock_phase_generation_query, phase_generation_id,
-    verify_phase_generation_live, CiCredentialGenerationError,
-    CiCredentialGenerationOutcome, CiCredentialPurpose, CiJobCredentialGenerationStore,
-    CiJobCredentialWriteVersion, CiPhaseCredentialBinding, CiPhaseCredentialMintRequest,
-    CiPhaseCredentialMinter, CiPhaseGenerationGate, CiPhaseGenerationInputs, MintedPhaseCredential,
-    RetainedCiPhaseGeneration, CI_PHASE_CREDENTIAL_BINDING_V1, CI_PHASE_CREDENTIAL_GENERATION_PREFIX,
-    CI_PHASE_CREDENTIAL_V1_DOMAIN, VERIFY_PHASE_GENERATION_QUERY,
 };
 pub use ci_identity_adapter::{
     ci_job_authorization_context, ci_job_phase_authorization_context, expected_phase_jti,
@@ -114,9 +115,8 @@ pub use ci_launch_authority::{
     CiAttemptBudgetPolicy, CiAttemptBudgetRevision, CiJobBudgetReservationProvider,
     CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority, ManifestBoundCiJobTokenAuthority,
     OperationalReservationWriteVersion, PgTierPCiJobBudgetReservation,
-    ReservationWriteVersionMarker, TierPOperationalCiJobPricer,
-    LINUX_SMALL_V1_POLICY_REVISION, LINUX_SMALL_V1_RUNNER_LABELS,
-    TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
+    ReservationWriteVersionMarker, TierPOperationalCiJobPricer, LINUX_SMALL_V1_POLICY_REVISION,
+    LINUX_SMALL_V1_RUNNER_LABELS, TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
 };
 pub use ci_manifest_job_runner::{
     register_durable_ci_manifest_pipeline, secret_broker_ci_job_resolver,
@@ -128,6 +128,12 @@ pub use ci_manifest_pipeline::{
     register_ci_manifest_pipeline, run_ci_manifest_pipeline, CiManifestInputResolver,
     CiManifestPipelineOutcome,
 };
+pub use ci_prelaunch_usage_journal::{
+    resolve_prelaunch_usage_on_conn, CiJobParentAttempt, CiParentAttemptAdmission,
+    CiPrelaunchJournalOutcome, CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity,
+    CiPrelaunchUnresolvedPolicy, CiPrelaunchUsageAccrual, CiPrelaunchUsageJournal,
+    CiPrelaunchUsageJournalError, CiPrelaunchUsagePhase,
+};
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use ci_runner_composition::{
@@ -135,27 +141,20 @@ pub use ci_runner_composition::{
 };
 pub use ci_runner_composition::{
     ci_runner_hooks, ci_runner_identity_authorities, ci_runner_v2_wiring,
-    ci_runner_v2_wiring_with_secret_resolver,
-    CiRunnerIdentityAuthorities, CiRunnerIdentityCompositionError, CiRunnerV2Wiring,
+    ci_runner_v2_wiring_with_secret_resolver, CiRunnerIdentityAuthorities,
+    CiRunnerIdentityCompositionError, CiRunnerV2Wiring,
 };
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use ci_runtime_composition::ci_production_runtime_factory_test_support;
 pub use ci_runtime_composition::{
     ci_manifest_pipeline_definition, ci_production_runtime_factory, ActivationReadinessProbe,
-    CiProductionRuntimeFactory,
-    CiProductionWorkflowPoller, CiRuntimeCompositionError, CiSupersededDefinitionBacklog,
-    CutoverPlan,
-    CiSupersededDefinitionGuardError, CiWorkflowFanoutBatch, CI_FLOW_OUTBOX_SCHEMA_VERSION,
+    CiProductionRuntimeFactory, CiProductionWorkflowPoller, CiRuntimeCompositionError,
+    CiSupersededDefinitionBacklog, CiSupersededDefinitionGuardError, CiWorkflowFanoutBatch,
+    CutoverPlan, CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS, CI_FLOW_OUTBOX_SCHEMA_VERSION,
     CI_FLOW_WORKER_LEASE_TTL_SECS, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
-    CI_MANIFEST_PIPELINE_VERSION, CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS,
-    MAX_CI_WORKFLOW_DRIVES_PER_SCOPE, MAX_CI_WORKFLOW_SCOPES_PER_PASS,
-};
-pub use ci_prelaunch_usage_journal::{
-    resolve_prelaunch_usage_on_conn, CiJobParentAttempt, CiParentAttemptAdmission,
-    CiPrelaunchJournalOutcome, CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity,
-    CiPrelaunchUnresolvedPolicy, CiPrelaunchUsageAccrual, CiPrelaunchUsageJournal,
-    CiPrelaunchUsageJournalError, CiPrelaunchUsagePhase,
+    CI_MANIFEST_PIPELINE_VERSION, MAX_CI_WORKFLOW_DRIVES_PER_SCOPE,
+    MAX_CI_WORKFLOW_SCOPES_PER_PASS,
 };
 /// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
 /// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`
@@ -280,6 +279,7 @@ pub use pg_pipeline_starter::{
 /// `test-support` feature and is not part of the default production build.
 pub mod ci_pipeline_driver;
 pub mod ci_pipeline_reporter_router;
+pub mod ci_secret_store;
 pub mod floor_followons;
 pub mod holder;
 /// CT-004c.1: the REGION-scoped, CROSS-TENANT half of the durable scheduler — the raw `CLAIM_QUERY` /
@@ -308,8 +308,9 @@ pub mod runner_bind;
 pub mod schedule_and_run_job;
 pub mod scheduler;
 pub mod schema;
+/// Tenant-scoped, ReBAC-gated management of durable CI secrets and their use bindings.
+pub mod secret_admin;
 pub mod secret_broker;
-pub mod ci_secret_store;
 pub mod supply_chain;
 pub mod surfacing;
 pub mod surfacing_index;
@@ -381,13 +382,17 @@ pub use supply_chain::{
 // credentials (4.7) over static keys; a fork is refused those too. MUTATION-SCORE FLOOR: the broker is
 // mandatory-core (security-load-bearing) — `cargo-mutants` ≥ 90% viable mutants caught. FLOOR named:
 // none new (the broker composes the FROZEN `SecretRef`/`TrustTier`/`IdentityService::check` surfaces).
-pub use secret_broker::{
-    OidcCredential, ResolvedSecret, SecretBroker, SecretCapability, SecretOutcome,
-    SecretLaunchError, SecretResolution, WithheldSecret, WithholdReason, SECRET_READ_PERMISSION,
-};
 pub use ci_secret_store::{
     durable_ci_job_secret_resolver, CiSecretStoreError, DurableCiSecretStore,
     DurableSecretCapability,
+};
+pub use secret_admin::{
+    SecretAdmin, SecretAdminError, SecretBindingScope, SecretMaterial, SecretMetadata,
+    SECRET_ADMIN_PERMISSION,
+};
+pub use secret_broker::{
+    OidcCredential, ResolvedSecret, SecretBroker, SecretCapability, SecretLaunchError,
+    SecretOutcome, SecretResolution, WithheldSecret, WithholdReason, SECRET_READ_PERMISSION,
 };
 
 // CI-P24 (P-367, M4): DEPLOYMENTS & the protected-env HITL gate (arch 03 §1.2). The deploy state
@@ -576,8 +581,8 @@ pub use surfacing_tools::{
 pub use scheduler::{
     lane_token, state_token, ClaimRequest, Claimed, EnqueueOutcome, JobState, Lane, QueuedJob,
     SchedulerState, AUTHORIZE_JOB_LAUNCH_QUERY, AUTHORIZE_JOB_LAUNCH_V2_QUERY,
-    CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY,
-    COMPLETE_JOB_QUERY, HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
+    CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, COMPLETE_JOB_QUERY, HEARTBEAT_QUERY,
+    INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
 };
 
 // CT-004c.1 (CI backend reconcile-and-harden — durability plumbing): the REAL durable `job_queue`
@@ -702,21 +707,14 @@ pub use migrations::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, ci_durable_hot_tables,
     ci_durable_migrations, make_tenant_scoped_ddl, ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL,
     ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL,
-    ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
-    ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL,
-    ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL,
-    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, ARTIFACT_TABLE,
-    CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DRIVE_MANIFEST_TABLE,
-    CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID,
-    CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID,
-    CI_PIPELINE_VERSION_BACKLOG_PROBE_MIGRATION_ID,
-    CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL, SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL,
-    SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL,
-    ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL, CREATE_CI_JOB_PARENT_ATTEMPT_DDL,
-    CREATE_CI_JOB_PRELAUNCH_USAGE_DDL,
-    CI_DURABLE_WRITER_IDS, CI_JOB_ACCOUNTING_DISPOSITION_V4_MIGRATION_ID,
+    ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL, ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL,
+    ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
+    ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
+    ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+    ARTIFACT_TABLE, CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE,
+    CI_DRIVE_MANIFEST_TABLE, CI_DURABLE_WRITER_IDS, CI_JOB_ACCOUNTING_DISPOSITION_V4_MIGRATION_ID,
     CI_JOB_ACCOUNTING_DISPOSITION_V4_VERDICT_MIGRATION_ID, CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID,
     CI_JOB_ACCOUNTING_TABLE, CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID,
     CI_JOB_QUEUE_CLAIM_TIME_MIGRATION_ID, CI_JOB_QUEUE_CLAIM_WINDOW_MIGRATION_ID,
@@ -724,28 +722,32 @@ pub use migrations::{
     CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID, CI_JOB_RUN_LEDGER_INDEX,
     CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID, CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID,
     CI_JOB_SPEC_STAGE_MIGRATION_ID, CI_JOB_SPEC_TABLE, CI_JOB_TABLE,
-    CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
-    CI_RUN_CHECK_ATTEMPT_TABLE, CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
-    CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID, CI_RUN_QUEUED_REGION_INDEX,
-    CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID, CI_RUN_SURFACE_REPO_CREATED_INDEX,
-    CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID, CI_RUN_TABLE,
-    CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID,
-    CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID, CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID,
-    CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID, CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID,
-    CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL, CREATE_CHECK_ATTEMPT_DDL,
-    CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_ACCOUNTING_DDL,
-    CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL,
-    CREATE_CI_REGION_SCHEDULER_RLS_DDL, CREATE_CI_RUN_CHECK_ATTEMPT_DDL, CREATE_CI_RUN_DDL,
-    CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL, CREATE_CI_RUN_SURFACE_REPO_CREATED_INDEX_DDL,
-    CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
-    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL,
-    CREATE_CI_SECRET_DDL, CREATE_SECRET_BINDING_DDL, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE,
-    FAIR_DEFICIT_TABLE,
-    GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL, GRANT_SCHEDULER_CLAIM_NONCE_DDL,
-    GRANT_SCHEDULER_CLAIM_TIME_DDL, GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE,
-    JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE,
-    RUNNER_TABLE, CI_SECRET_TABLE, SECRET_BINDING_TABLE, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
-    VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL,
+    CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID, CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID,
+    CI_PIPELINE_VERSION_BACKLOG_PROBE_MIGRATION_ID, CI_REGION_SCHEDULER_RLS_MIGRATION_ID,
+    CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID, CI_RUN_CHECK_ATTEMPT_TABLE,
+    CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID, CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID,
+    CI_RUN_QUEUED_REGION_INDEX, CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID,
+    CI_RUN_SURFACE_REPO_CREATED_INDEX, CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID,
+    CI_RUN_TABLE, CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID,
+    CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
+    CI_SCHEDULER_CLAIM_TIME_GRANT_MIGRATION_ID, CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID,
+    CI_SECRET_TABLE, CI_SECRET_VERSION_HIGH_WATER_MIGRATION_ID, CI_SECRET_VERSION_HIGH_WATER_TABLE,
+    CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID, CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL,
+    CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL,
+    CREATE_CI_JOB_ACCOUNTING_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_PARENT_ATTEMPT_DDL,
+    CREATE_CI_JOB_PRELAUNCH_USAGE_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL,
+    CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL, CREATE_CI_REGION_SCHEDULER_RLS_DDL,
+    CREATE_CI_RUN_CHECK_ATTEMPT_DDL, CREATE_CI_RUN_DDL, CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL,
+    CREATE_CI_RUN_SURFACE_REPO_CREATED_INDEX_DDL, CREATE_CI_SECRET_DDL,
+    CREATE_CI_SECRET_VERSION_HIGH_WATER_DDL, CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL,
+    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL, CREATE_SECRET_BINDING_DDL,
+    DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE, GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL,
+    GRANT_SCHEDULER_CLAIM_NONCE_DDL, GRANT_SCHEDULER_CLAIM_TIME_DDL,
+    GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE, JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX,
+    JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE, RUNNER_TABLE, SECRET_BINDING_TABLE,
+    SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL, SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL,
+    VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL, VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL,
 };
 
 pub use permanent_gates::{
@@ -1148,8 +1150,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            64,
-            "all 22 tables (incl. the encrypted ci_secret store), three ci_run forward ALTERs, 9 concurrent indexes, the ledger validator, 6 job_queue ALTERs (4 claim/completion + the claim-window expand and its validation), the ci_job_spec-stage and three accounting ALTERs, scheduler RLS boundary, 3 claim-column grants, 4 ci_run/workflow discovery grants (incl. the wf_version grant the cutover fence needs), 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, the prelaunch deadline expand, the cutover fence's database-wide backlog probe plus its predecessor-row seed, and the 4 CT-007 5b.3-6e.1 activation-chassis migrations (reservation-marker expand + validate + readiness index + readiness probe) are present"
+            69,
+            "all 24 tables (including encrypted secrets, tombstones, and universal high-water), 3 secret-admin scope/index/integrity migrations, and every previously shipped CI follow-on are present"
         );
         assert!(
             spec.consumers.is_empty(),
