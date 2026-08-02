@@ -93,6 +93,11 @@ pub const CACHE_ENTRY_TABLE: &str = "cache_entry";
 pub const ENVIRONMENT_TABLE: &str = "environment";
 pub const DEPLOYMENT_TABLE: &str = "deployment";
 pub const SECRET_BINDING_TABLE: &str = "secret_binding";
+/// The shared CI secret-material store. Unlike `secret_binding`, this table contains no manifest
+/// binding or plaintext value: only tenant-DEK ciphertext and the envelope fields needed to open it.
+pub const CI_SECRET_TABLE: &str = "ci_secret";
+/// Additive migration for the encrypted store, appended after every migration present at #34's base.
+pub const CI_SECRET_MIGRATION_ID: &str = "ci_0023_ci_secret";
 /// CI's metering-projection table. **CT-004m rename:** NAMED `ci_cost_event` (not `cost_event`) so it
 /// does NOT collide with Storage's money-ledger `cost_event` (myelin-storage migration `0050`,
 /// `reserve_settle_durable::COST_LEDGER_MIGRATION`) in the ONE shared `myelin` database every service
@@ -688,6 +693,24 @@ CREATE TABLE IF NOT EXISTS secret_binding (
   scope      text NOT NULL,
   value_ref  text NOT NULL,
   PRIMARY KEY (tenant_id, project_id, name, scope)
+)";
+
+/// `ci_secret` — tenant-owned secret material sealed through Storage's tenant-DEK column cipher.
+/// The plaintext has no column and therefore cannot be persisted accidentally. `pii_key_ref` pins
+/// the exact tenant-DEK epoch; `nonce` + `ciphertext` are the complete AES-256-GCM at-rest form.
+pub const CREATE_CI_SECRET_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS ci_secret (
+  tenant_id  text        NOT NULL,
+  region     text        NOT NULL,
+  secret_id  text        NOT NULL CHECK (secret_id ~ '^[A-Za-z0-9_-]{1,128}$'),
+  name       text        NOT NULL CHECK (octet_length(name) BETWEEN 1 AND 128),
+  pii_key_ref text       NOT NULL,
+  nonce      bytea       NOT NULL CHECK (octet_length(nonce) = 12),
+  ciphertext bytea       NOT NULL CHECK (octet_length(ciphertext) >= 16),
+  version    bigint      NOT NULL DEFAULT 1 CHECK (version > 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, secret_id)
 )";
 
 /// `ci_cost_event` (arch 01 §3.7 — D8) — one row per metered unit; wholesale & markup separate
@@ -1894,6 +1917,11 @@ fn create_statements() -> Vec<(&'static str, &'static str, String)> {
             CI_JOB_CREDENTIAL_GENERATION_TABLE,
             CREATE_CI_JOB_CREDENTIAL_GENERATION_DDL.to_string(),
         ),
+        (
+            CI_SECRET_MIGRATION_ID,
+            CI_SECRET_TABLE,
+            CREATE_CI_SECRET_DDL.to_string(),
+        ),
     ]
 }
 
@@ -2104,6 +2132,12 @@ pub fn make_tenant_scoped_ddl(table: &str) -> String {
 pub fn ci_controlplane_migrations() -> Migrations {
     let mut migrations = Vec::new();
     for (id, table, create) in create_statements() {
+        // `ci_secret` is a new #34 migration and must remain physically appended after every id
+        // already shipped at the base revision. It stays in `create_statements` so all generic table
+        // shape/RLS tests cover it, but is assembled once at the tail below.
+        if table == CI_SECRET_TABLE {
+            continue;
+        }
         migrations.push(assemble_ci_migration(id, table, create));
         if table == CI_RUN_TABLE {
             migrations.push(Migration::plain_on(
@@ -2328,6 +2362,11 @@ pub fn ci_controlplane_migrations() -> Migrations {
         CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID,
         SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL,
     ));
+    migrations.push(assemble_ci_migration(
+        CI_SECRET_MIGRATION_ID,
+        CI_SECRET_TABLE,
+        CREATE_CI_SECRET_DDL.to_owned(),
+    ));
     Migrations::of(migrations)
 }
 
@@ -2413,13 +2452,13 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
 mod tests {
     use super::*;
 
-    /// **All twenty-one CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
+    /// **All twenty-two CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
     /// The complete arch 01 §3 control-plane schema (+ CT-004d.1's `ci_job_spec` + CT-007 slice
     /// 5b.3-4a.2's prelaunch-usage journal pair + CT-007's phase-credential generation log) lands
     /// here; `ci_run` precedes `ci_job` (the FK dependency). This is the prompt's "the complete
     /// forward-only data-model migrations" gate.
     #[test]
-    fn all_twenty_controlplane_tables_are_present_fk_ordered() {
+    fn all_twenty_two_controlplane_tables_are_present_fk_ordered() {
         let migrations = ci_controlplane_migrations();
         let tables: Vec<&str> = migrations
             .0
@@ -2451,8 +2490,9 @@ mod tests {
                 CI_JOB_PARENT_ATTEMPT_TABLE,
                 CI_JOB_PRELAUNCH_USAGE_TABLE,
                 CI_JOB_CREDENTIAL_GENERATION_TABLE,
+                CI_SECRET_TABLE,
             ],
-            "all 21 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
+            "all 22 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
         );
         // ci_run precedes ci_job (the FK target before the FK source).
         let run_pos = tables.iter().position(|t| *t == CI_RUN_TABLE).unwrap();
@@ -2465,6 +2505,20 @@ mod tests {
             run_pos < manifest_pos && run_pos < job_pos,
             "ci_run is created before both FK dependants"
         );
+    }
+
+    #[test]
+    fn ci_secret_schema_has_a_ciphertext_at_rest_floor() {
+        assert!(CREATE_CI_SECRET_DDL.contains("nonce      bytea"));
+        assert!(CREATE_CI_SECRET_DDL.contains("ciphertext bytea"));
+        assert!(CREATE_CI_SECRET_DDL.contains("pii_key_ref text"));
+        assert!(CREATE_CI_SECRET_DDL.contains("PRIMARY KEY (tenant_id, secret_id)"));
+        for forbidden in [" plaintext", " material", " secret_value", " value text"] {
+            assert!(
+                !CREATE_CI_SECRET_DDL.contains(forbidden),
+                "ci_secret must have no plaintext-at-rest column: {forbidden}"
+            );
+        }
     }
 
     /// **Every CI table is `(tenant_id, region)`-first with a tenant-first primary key (contract
@@ -2979,29 +3033,34 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the claim-window validation is in the set");
         // The claim-window pair sits immediately before the wf_version grant, the backlog probe, the
         // cutover fence-row seed, and the CT-007 5b.3-6e.1 activation-chassis tail (4 migrations).
-        assert_eq!(expand, ids.len() - 10);
-        assert_eq!(validate, ids.len() - 9);
+        assert_eq!(expand, ids.len() - 11);
+        assert_eq!(validate, ids.len() - 10);
         // The activation chassis (ci_0022*) is appended AFTER the cutover fence-row seed, in order,
-        // and the readiness probe is now the last of all.
+        // followed by the Stage-B sentinel; #34's new secret-store migration is the absolute tail.
         assert_eq!(
-            ids[ids.len() - 6],
+            ids[ids.len() - 7],
             CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID,
             "the cutover fence's predecessor-row seed precedes only the ci_0022* chassis"
         );
         assert_eq!(
-            &ids[ids.len() - 5..ids.len() - 1],
+            &ids[ids.len() - 6..ids.len() - 2],
             &[
                 CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID,
                 CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID,
                 CI_JOB_QUEUE_ACTIVATION_READINESS_INDEX_MIGRATION_ID,
                 CI_V2_ACTIVATION_READINESS_PROBE_MIGRATION_ID,
             ],
-            "the CT-007 5b.3-6e.1 activation chassis is appended last, in expand→validate→index→probe order"
+            "the CT-007 5b.3-6e.1 activation chassis retains expand→validate→index→probe order"
+        );
+        assert_eq!(
+            ids[ids.len() - 2],
+            CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID,
+            "Stage B appends the retired-v3 sentinel after the activation chassis"
         );
         assert_eq!(
             ids[ids.len() - 1],
-            CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID,
-            "Stage B appends the retired-v3 sentinel after the activation chassis"
+            CI_SECRET_MIGRATION_ID,
+            "the new encrypted secret store is appended after every migration shipped at the base"
         );
         assert!(
             expand
@@ -3021,8 +3080,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            63,
-            "21 table/RLS (incl. the CT-007 credential-generation log) + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate) + 1 ci_job_spec-stage ALTER + 3 ci_job_accounting ALTERs + 1 scheduler-boundary + 3 scheduler claim grants + 4 scheduler ci_run/workflow discovery grants (incl. wf_version) + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand + 4 CT-007 5b.3-6e.1 activation-chassis (reservation-marker expand + validate + readiness index + readiness probe)"
+            64,
+            "22 table/RLS (incl. the encrypted ci_secret store) + 3 ci_run ALTERs + 9 concurrent-index + 1 index-validation + 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate) + 1 ci_job_spec-stage ALTER + 3 ci_job_accounting ALTERs + 1 scheduler-boundary + 3 scheduler claim grants + 4 scheduler ci_run/workflow discovery grants (incl. wf_version) + 1 scheduler ci_job reap-reset grant + 1 prelaunch-usage reaper index + 1 scheduler prelaunch-usage reap grant + 1 prelaunch deadline expand + 4 CT-007 5b.3-6e.1 activation-chassis (reservation-marker expand + validate + readiness index + readiness probe)"
         );
         for m in &migrations.0 {
             assert!(
@@ -3153,8 +3212,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            63,
-            "the runner applied all 21 table/RLS (incl. the CT-007 credential-generation log), 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate), 1 ci_job_spec-stage ALTER, 3 ci_job_accounting ALTERs, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, 1 prelaunch deadline expand, and the 4 CT-007 5b.3-6e.1 activation-chassis migrations (reservation-marker expand + validate + readiness index + readiness probe)"
+            64,
+            "the runner applied all 22 table/RLS (incl. the encrypted ci_secret store), 3 ci_run ALTERs, 9 concurrent-index, 1 index-validation, 6 job_queue ALTERs (4 claim/completion + claim-window expand + validate), 1 ci_job_spec-stage ALTER, 3 ci_job_accounting ALTERs, 1 scheduler-boundary, 3 scheduler claim grants, 3 scheduler ci_run/workflow discovery grants, 1 scheduler ci_job reap-reset grant, 1 prelaunch-usage reaper index, 1 scheduler prelaunch-usage reap grant, 1 prelaunch deadline expand, and the 4 CT-007 5b.3-6e.1 activation-chassis migrations (reservation-marker expand + validate + readiness index + readiness probe)"
         );
         assert_eq!(
             runner.applied()[0],
@@ -3218,10 +3277,11 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             workflow_id_grant.ddl,
             GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL
         );
-        let ci_job_reap_reset_grant = migrations.0.iter().rev().nth(10).expect(
-            "the ci_job reap-reset grant precedes only the claim-window pair, the wf_version grant, \
-             the backlog probe, the cutover fence-row seed, and the 4-migration 5b.3-6e.1 chassis",
-        );
+        let ci_job_reap_reset_grant = migrations
+            .0
+            .iter()
+            .find(|migration| migration.id == CI_SCHEDULER_CI_JOB_REAP_RESET_GRANT_MIGRATION_ID)
+            .expect("the ci_job reap-reset grant remains present under its immutable id");
         assert_eq!(
             ci_job_reap_reset_grant.id,
             CI_SCHEDULER_CI_JOB_REAP_RESET_GRANT_MIGRATION_ID
