@@ -138,7 +138,10 @@ pub fn production_gvisor_registry() -> Arc<GvisorAssetRegistry> {
 
 use crate::ci_claim_token_issuer::LockedManifestCiJobTokenIssuer;
 use crate::ci_identity_adapter::ci_job_authorization_context;
-use crate::ci_manifest_job_runner::{validate_run_token, CiJobTokenIssuer, CiJobTokenRequest};
+use crate::ci_manifest_job_runner::{
+    resolve_claim_launch_secrets, secret_withhold_machine_reason, validate_run_token,
+    CiJobSecretResolver, CiJobTokenIssuer, CiJobTokenRequest,
+};
 use crate::ci_pipeline_reporter_router::CiPipelineReporterRouter;
 use crate::job_spec_store::MAX_JOB_TIMEOUT_SECS;
 use crate::{
@@ -173,6 +176,77 @@ pub const CI_RUNNER_EXECUTION_LEASE_TTL_SECS: i64 = MAX_JOB_TIMEOUT_SECS as i64 
 /// of an unresolved job). In production the impl reads the durable spec store the dispatch writes
 /// (CT-004d); the CT-004c.2 test injects a real compute spec.
 pub type JobSpecResolver = Arc<dyn Fn(&LeasedJob) -> Result<JobSpec, String> + Send + Sync>;
+
+trait SecretWithholdTerminalizer {
+    fn terminalize(
+        &self,
+        claim: &CiJobTokenRequest,
+        diagnostic: &str,
+    ) -> Result<(), String>;
+}
+
+impl SecretWithholdTerminalizer for CiPipelineReporterRouter {
+    fn terminalize(
+        &self,
+        claim: &CiJobTokenRequest,
+        diagnostic: &str,
+    ) -> Result<(), String> {
+        use myelin_ci_sandbox::{
+            PreparationPhase, PreparationReportClaim, PreparationTerminalDisposition,
+            TerminalReporter,
+        };
+
+        let report_claim = PreparationReportClaim {
+            tenant_id: claim.tenant_id.clone(),
+            region: claim.region.clone(),
+            wf_run_id: claim.wf_run_id.clone(),
+            ci_run_id: claim.ci_run_id.clone(),
+            job_id: claim.job_id.clone(),
+            token_authority_handle: claim.token_authority_handle.clone(),
+            idem_token: claim.idem_token.clone(),
+            lease_owner: claim.lease_owner.clone(),
+            lease_epoch: claim.lease_epoch,
+            claim_nonce: claim.claim_nonce.clone(),
+            claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
+            claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
+        };
+        self.report_preparation_terminal(
+            &report_claim,
+            PreparationTerminalDisposition::Failed {
+                phase: PreparationPhase::SecretResolution,
+            },
+            Some(diagnostic),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("terminal secret-withhold settlement failed: {error}"))
+    }
+}
+
+fn finish_claim_secret_resolution(
+    resolution: Result<JobSpec, crate::SecretLaunchError>,
+    claim: &CiJobTokenRequest,
+    terminalizer: &impl SecretWithholdTerminalizer,
+) -> Result<JobSpec, String> {
+    match resolution {
+        Ok(spec) => Ok(spec),
+        Err(crate::SecretLaunchError::Withheld(withheld)) => {
+            let diagnostic = secret_withhold_machine_reason(&withheld);
+            terminalizer.terminalize(claim, &diagnostic)?;
+            Err(format!(
+                "secret-bearing claim settled terminally: {diagnostic}"
+            ))
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn finish_v1_claim_secret_resolution(
+    resolution: Result<JobSpec, crate::SecretLaunchError>,
+    claim: &CiJobTokenRequest,
+    terminalizer: &impl SecretWithholdTerminalizer,
+) -> Result<JobSpec, String> {
+    finish_claim_secret_resolution(resolution, claim, terminalizer)
+}
 
 /// Bridge one async durable-store call to the sync [`LeaseStore`] port. The runner loop drives this
 /// from a dedicated OFF-runtime thread, so `block_on` runs directly; the `try_current` guard falls
@@ -615,18 +689,16 @@ impl CiRunnerLoop {
                     run_id,
                     signal_outcome,
                     diagnostic,
-                }) => {
-                    match diagnostic {
-                        Some(diagnostic) => eprintln!(
-                            "ci-runner[{worker_id}]: preparation terminalized job {job_id} for run \
+                }) => match diagnostic {
+                    Some(diagnostic) => eprintln!(
+                        "ci-runner[{worker_id}]: preparation terminalized job {job_id} for run \
                              {run_id} (job.done={signal_outcome:?}, diagnostic={diagnostic})"
-                        ),
-                        None => eprintln!(
-                            "ci-runner[{worker_id}]: preparation terminalized job {job_id} for run \
+                    ),
+                    None => eprintln!(
+                        "ci-runner[{worker_id}]: preparation terminalized job {job_id} for run \
                              {run_id} (job.done={signal_outcome:?})"
-                        ),
-                    }
-                }
+                    ),
+                },
                 Ok(myelin_ci_sandbox::RunnerCycleOutcome::PreparationRetryable {
                     job_id,
                     report,
@@ -760,14 +832,26 @@ pub fn spec_store_unavailable_resolver() -> JobSpecResolver {
 /// **Fail-closed by construction:** a missing spec ([`CiJobSpecStoreError::SpecNotFound`]) or a corrupt
 /// one ([`CiJobSpecStoreError::CorruptSpec`]) returns `Err` — the claim becomes a no-op (`None`), the
 /// row stays leased, and the reaper recovers it. The runner NEVER launches a fabricated/default spec;
-/// the stored spec is the only thing that executes.
+/// the stored spec is the only thing that executes. A typed secret withhold is different: like the V2
+/// resolver, V1 reports `SecretResolution` failure through `secret_terminal_reporter`, whose
+/// exact-generation CAS atomically terminalizes the queue row, emits failed `job.done`, settles
+/// accounting, and persists only the material-free secret name/reason diagnostic.
 pub fn durable_spec_resolver(
     store: CiJobSpecStore,
     region: impl Into<String>,
     rt: tokio::runtime::Handle,
     token_issuer: LockedManifestCiJobTokenIssuer,
+    secrets: CiJobSecretResolver,
+    secret_terminal_reporter: CiPipelineReporterRouter,
 ) -> JobSpecResolver {
-    durable_spec_resolver_with_issuer(store, region, rt, Arc::new(token_issuer))
+    durable_spec_resolver_with_issuer(
+        store,
+        region,
+        rt,
+        Arc::new(token_issuer),
+        secrets,
+        secret_terminal_reporter,
+    )
 }
 
 /// Legacy V1 fixture seam under the crate's established dev-only `test-support` boundary. The
@@ -779,8 +863,17 @@ pub fn durable_spec_resolver_test_support(
     region: impl Into<String>,
     rt: tokio::runtime::Handle,
     token_issuer: Arc<dyn CiJobTokenIssuer>,
+    secrets: CiJobSecretResolver,
+    secret_terminal_reporter: CiPipelineReporterRouter,
 ) -> JobSpecResolver {
-    durable_spec_resolver_with_issuer(store, region, rt, token_issuer)
+    durable_spec_resolver_with_issuer(
+        store,
+        region,
+        rt,
+        token_issuer,
+        secrets,
+        secret_terminal_reporter,
+    )
 }
 
 fn durable_spec_resolver_with_issuer(
@@ -788,6 +881,8 @@ fn durable_spec_resolver_with_issuer(
     region: impl Into<String>,
     rt: tokio::runtime::Handle,
     token_issuer: Arc<dyn CiJobTokenIssuer>,
+    secrets: CiJobSecretResolver,
+    secret_terminal_reporter: CiPipelineReporterRouter,
 ) -> JobSpecResolver {
     let region = region.into();
     Arc::new(move |leased: &LeasedJob| {
@@ -841,11 +936,16 @@ fn durable_spec_resolver_with_issuer(
             &launch.spec.meter_to.reserve_id,
             checkout.as_ref(),
         );
-        let run_token = bridge(&rt, token_issuer.mint(request)).map_err(|e| e.to_string())?;
+        let run_token = bridge(&rt, token_issuer.mint(request.clone())).map_err(|e| e.to_string())?;
         validate_run_token(&run_token, &launch.token_authority_handle).map_err(|e| e.0)?;
-        Ok(launch
-            .spec
-            .resolve_with_authorization(run_token, Some(authorization)))
+        let resolution = resolve_claim_launch_secrets(
+            &TenantId(leased.tenant_id.clone()),
+            launch.spec,
+            run_token,
+            authorization,
+            &secrets,
+        );
+        finish_v1_claim_secret_resolution(resolution, &request, &secret_terminal_reporter)
     })
 }
 
@@ -862,6 +962,8 @@ pub fn durable_v2_spec_resolver(
     region: impl Into<String>,
     rt: tokio::runtime::Handle,
     checkout_composition: crate::ci_checkout_composition::V2CheckoutComposition,
+    secrets: CiJobSecretResolver,
+    secret_terminal_reporter: CiPipelineReporterRouter,
 ) -> JobSpecResolver {
     let region = region.into();
     Arc::new(move |leased: &LeasedJob| {
@@ -914,9 +1016,14 @@ pub fn durable_v2_spec_resolver(
             )
             .map_err(|e| e.to_string())?;
         validate_run_token(&minted.credential, &launch.token_authority_handle).map_err(|e| e.0)?;
-        Ok(launch
-            .spec
-            .resolve_with_authorization(minted.credential, Some(authorization)))
+        let resolution = resolve_claim_launch_secrets(
+            &TenantId(leased.tenant_id.clone()),
+            launch.spec,
+            minted.credential,
+            authorization,
+            &secrets,
+        );
+        finish_claim_secret_resolution(resolution, &request, &secret_terminal_reporter)
     })
 }
 
@@ -983,6 +1090,166 @@ mod shutdown_tests {
         let (sender, mut receiver) = tokio::sync::watch::channel(false);
         drop(sender);
         assert!(runner_shutdown_requested(&mut receiver));
+    }
+}
+
+#[cfg(test)]
+mod secret_withhold_terminal_tests {
+    use super::*;
+    use crate::{SecretLaunchError, WithheldSecret, WithholdReason};
+    use myelin_ci_sandbox::{
+        CiJobAuthorizationContext, EgressPolicy, IdemToken, JobSpecTemplate, MeterTarget,
+        ResourceLimits, RunTokenAuthorizationContext, RunTokenCredential, SecretRef, WorkspaceSpec,
+    };
+    use std::sync::Mutex;
+
+    struct RecordingTerminalizer {
+        terminal: Mutex<bool>,
+        failed_job_done: Mutex<bool>,
+        accounting_settled: Mutex<bool>,
+        reaper_eligible: Mutex<bool>,
+        diagnostic: Mutex<Option<String>>,
+    }
+
+    impl Default for RecordingTerminalizer {
+        fn default() -> Self {
+            Self {
+                terminal: Mutex::new(false),
+                failed_job_done: Mutex::new(false),
+                accounting_settled: Mutex::new(false),
+                reaper_eligible: Mutex::new(true),
+                diagnostic: Mutex::new(None),
+            }
+        }
+    }
+
+    impl SecretWithholdTerminalizer for RecordingTerminalizer {
+        fn terminalize(
+            &self,
+            _claim: &CiJobTokenRequest,
+            diagnostic: &str,
+        ) -> Result<(), String> {
+            *self.terminal.lock().unwrap() = true;
+            *self.failed_job_done.lock().unwrap() = true;
+            *self.accounting_settled.lock().unwrap() = true;
+            *self.reaper_eligible.lock().unwrap() = false;
+            *self.diagnostic.lock().unwrap() = Some(diagnostic.to_owned());
+            Ok(())
+        }
+    }
+
+    fn claim() -> CiJobTokenRequest {
+        CiJobTokenRequest {
+            tenant_id: "acme".into(),
+            region: "fr-par".into(),
+            wf_run_id: "10000000-0000-0000-0000-000000000001".into(),
+            ci_run_id: "20000000-0000-0000-0000-000000000001".into(),
+            job_id: "30000000-0000-0000-0000-000000000001".into(),
+            token_authority_handle: "authority:job".into(),
+            idem_token: "idem:job".into(),
+            lease_owner: "runner:1".into(),
+            lease_epoch: 1,
+            claim_nonce: "40000000-0000-0000-0000-000000000001".into(),
+            claim_started_at_epoch_secs: 1_000,
+            claim_expires_at_epoch_secs: 1_300,
+        }
+    }
+
+    #[test]
+    fn unavailable_secret_resolution_is_terminal_and_not_claimable_again() {
+        let terminalizer = RecordingTerminalizer::default();
+        let resolution = Err(SecretLaunchError::Withheld(vec![WithheldSecret {
+            name: "DEPLOY_KEY".into(),
+            reason: WithholdReason::CapabilityUnavailable,
+        }]));
+
+        let error = finish_claim_secret_resolution(resolution, &claim(), &terminalizer)
+            .expect_err("withhold settles failed and never produces a launch spec");
+        assert!(error.contains("settled terminally"));
+        assert_eq!(
+            terminalizer.diagnostic.lock().unwrap().as_deref(),
+            Some("secret_withheld:DEPLOY_KEY=capability_unavailable")
+        );
+        assert!(
+            *terminalizer.terminal.lock().unwrap(),
+            "the exact claim is terminal, so a lease/reaper predicate cannot select it again"
+        );
+
+        let query = crate::scheduler::CONSUME_SECRET_WITHHELD_CLAIM_QUERY;
+        assert!(query.contains("SET state = 'terminal'"));
+        assert!(query.contains("q.state = 'leased'"));
+        assert!(query.contains("q.lease_epoch = $7"));
+        assert!(query.contains("q.claim_nonce = $8::uuid"));
+        assert!(query.contains("AND NOT EXISTS ("));
+    }
+
+    #[test]
+    fn v1_unavailable_secret_job_is_terminally_settled_and_not_re_leased_or_reaped() {
+        let claim = claim();
+        let template = JobSpecTemplate::new(
+            JobKind::Ci,
+            ImageRef::pinned(format!("registry.example/job@sha256:{}", "a".repeat(64))).unwrap(),
+            vec!["/bin/true".into()],
+            Vec::new(),
+            vec![SecretRef {
+                name: "DEPLOY_KEY".into(),
+                handle: "myelin://acme/ci/secret/opaque-handle".into(),
+            }],
+            EgressPolicy::deny_all(),
+            ResourceLimits {
+                cpu_millis: 1_000,
+                mem_bytes: 256 * 1024 * 1024,
+                disk_bytes: 1024 * 1024 * 1024,
+                tmpfs_bytes: 64 * 1024 * 1024,
+                pids_max: 64,
+                timeout_secs: 30,
+            },
+            WorkspaceSpec::default(),
+            TrustTier::Trusted,
+            MeterTarget {
+                reserve_id: "reserve:secret-test".into(),
+            },
+            IdemToken(claim.idem_token.clone()),
+        )
+        .unwrap();
+        let authorization = RunTokenAuthorizationContext::CiJob(CiJobAuthorizationContext {
+            tenant_id: claim.tenant_id.clone(),
+            region: claim.region.clone(),
+            principal_id: "ci-job".into(),
+            wf_run_id: claim.wf_run_id.clone(),
+            job_id: claim.job_id.clone(),
+            lease_owner: claim.lease_owner.clone(),
+            lease_epoch: claim.lease_epoch,
+            claim_nonce: claim.claim_nonce.clone(),
+            claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
+            claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
+            reserve_id: "reserve:secret-test".into(),
+            required_capabilities: Vec::new(),
+            checkout_scope: None,
+            credential_binding: None,
+        });
+        let resolution = resolve_claim_launch_secrets(
+            &TenantId(claim.tenant_id.clone()),
+            template,
+            RunTokenCredential::new("bearer", "jti:v1-secret-test", 60).unwrap(),
+            authorization,
+            &crate::unavailable_ci_job_secret_resolver(),
+        );
+        let terminalizer = RecordingTerminalizer::default();
+
+        let error = finish_v1_claim_secret_resolution(resolution, &claim, &terminalizer)
+            .expect_err("V1 withhold must settle terminally and never produce a launch spec");
+        assert!(error.contains("settled terminally"));
+        assert!(*terminalizer.terminal.lock().unwrap());
+        assert!(*terminalizer.failed_job_done.lock().unwrap());
+        assert!(*terminalizer.accounting_settled.lock().unwrap());
+        assert!(!*terminalizer.reaper_eligible.lock().unwrap());
+        let diagnostic = terminalizer.diagnostic.lock().unwrap();
+        assert_eq!(
+            diagnostic.as_deref(),
+            Some("secret_withheld:DEPLOY_KEY=capability_unavailable")
+        );
+        assert!(!diagnostic.as_deref().unwrap().contains("opaque-handle"));
     }
 }
 

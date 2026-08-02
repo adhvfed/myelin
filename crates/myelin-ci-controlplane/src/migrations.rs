@@ -801,6 +801,8 @@ ALTER TABLE ci_job_accounting
           'workload_passed',
           'workload_failed',
           'workload_timed_out',
+          'secret_resolution_failed',
+          'secret_resolution_timed_out',
           'checkout_transport_failed',
           'checkout_transport_timed_out',
           'checkout_materialization_failed',
@@ -826,6 +828,7 @@ ALTER TABLE ci_job_accounting
       OR CASE terminal_disposition
         WHEN 'workload_passed' THEN passed AND NOT timed_out AND NOT skipped
         WHEN 'workload_timed_out' THEN NOT passed AND timed_out AND NOT skipped
+        WHEN 'secret_resolution_timed_out' THEN NOT passed AND timed_out AND NOT skipped
         WHEN 'checkout_transport_timed_out' THEN NOT passed AND timed_out AND NOT skipped
         WHEN 'checkout_materialization_timed_out' THEN NOT passed AND timed_out AND NOT skipped
         WHEN 'skipped_before_start' THEN NOT passed AND NOT timed_out AND skipped

@@ -78,6 +78,12 @@ impl CiJobTerminalDisposition {
             Self::WorkloadFailed => "workload_failed",
             Self::WorkloadTimedOut => "workload_timed_out",
             Self::Preparation(PreparationTerminalDisposition::Failed {
+                phase: PreparationPhase::SecretResolution,
+            }) => "secret_resolution_failed",
+            Self::Preparation(PreparationTerminalDisposition::TimedOut {
+                phase: PreparationPhase::SecretResolution,
+            }) => "secret_resolution_timed_out",
+            Self::Preparation(PreparationTerminalDisposition::Failed {
                 phase: PreparationPhase::CheckoutTransport,
             }) => "checkout_transport_failed",
             Self::Preparation(PreparationTerminalDisposition::TimedOut {
@@ -103,6 +109,16 @@ impl CiJobTerminalDisposition {
             "workload_passed" => Self::WorkloadPassed,
             "workload_failed" => Self::WorkloadFailed,
             "workload_timed_out" => Self::WorkloadTimedOut,
+            "secret_resolution_failed" => {
+                Self::Preparation(PreparationTerminalDisposition::Failed {
+                    phase: PreparationPhase::SecretResolution,
+                })
+            }
+            "secret_resolution_timed_out" => {
+                Self::Preparation(PreparationTerminalDisposition::TimedOut {
+                    phase: PreparationPhase::SecretResolution,
+                })
+            }
             "checkout_transport_failed" => {
                 Self::Preparation(PreparationTerminalDisposition::Failed {
                     phase: PreparationPhase::CheckoutTransport,

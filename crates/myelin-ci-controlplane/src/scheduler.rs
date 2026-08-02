@@ -617,6 +617,52 @@ WHERE q.tenant_id = $1
   )
 RETURNING q.job_id";
 
+/// Terminalize a secret-bearing claim that was withheld before any sandbox or checkout preparation
+/// began. It binds the complete live lease generation and requires that no parent-attempt row exists
+/// for it; therefore this path cannot be used to forge a result for executed work. The durable
+/// diagnostic is written by the terminal reporter in the same transaction.
+pub const CONSUME_SECRET_WITHHELD_CLAIM_QUERY: &str = "\
+UPDATE job_queue AS q
+SET state = 'terminal', completion_receipt = $14, lease_owner = NULL, lease_expires = NULL
+WHERE q.tenant_id = $1
+  AND q.region = $2
+  AND q.job_id = $3::uuid
+  AND q.run_id = $4::uuid
+  AND q.idem_token = $5
+  AND q.lease_owner = $6
+  AND q.lease_epoch = $7
+  AND q.claim_nonce = $8::uuid
+  AND q.stage = $9
+  AND FLOOR(EXTRACT(EPOCH FROM q.claim_started_at))::bigint = $10
+  AND FLOOR(EXTRACT(EPOCH FROM q.claim_expires_at))::bigint = $11
+  AND q.claim_expires_at > statement_timestamp()
+  AND q.state = 'leased'
+  AND q.completion_receipt IS NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM ci_job_parent_attempt AS parent
+    WHERE parent.tenant_id = q.tenant_id
+      AND parent.region = q.region
+      AND parent.job_id = q.job_id
+      AND parent.wf_run_id = q.run_id
+      AND parent.ci_run_id = $12::uuid
+      AND parent.reserve_handle = $13
+      AND parent.lease_owner = $6
+      AND parent.lease_epoch = q.lease_epoch
+      AND parent.claim_nonce = q.claim_nonce
+      AND parent.claim_started_at_epoch_secs = $10
+      AND parent.claim_expires_at_epoch_secs = $11
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM ci_job AS surface
+    WHERE surface.tenant_id = q.tenant_id
+      AND surface.region = q.region
+      AND surface.job_id = q.job_id
+      AND surface.state IN ('queued', 'leased')
+  )
+RETURNING q.job_id";
+
 /// **CT-007 slice 5b.3-6d: the exhausted-variant preparation-completion CAS.** Byte-for-byte
 /// [`CONSUME_PREPARATION_CLAIM_QUERY`] EXCEPT the parent-attempt predicate. The original requires a
 /// parent-attempt row for the CURRENT claim generation (`lease_owner = $6 AND lease_epoch =

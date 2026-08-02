@@ -448,7 +448,7 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
     let prepared_mode = PreparedRuntimeMode::Rootless;
     let mode = require_oci_layout_matches_prepared_mode(&config, &prepared_mode)
         .map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
-    let bundle = stage_production_bundle(&config, &rootfs)
+    let mut bundle = stage_production_bundle(&config, &rootfs)
         .map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
     let container_id = format!(
         "myelin-preflight-{}-{}",
@@ -461,10 +461,15 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
     let cgroup = match MemoryCgroup::create(config.mem_bytes, 1000) {
         Ok(cgroup) => cgroup,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&bundle);
-            return Err(format!(
-                "CI runner sandbox host preflight failed: establish memory cgroup: {e}"
-            ));
+            let cleanup = bundle.cleanup();
+            return Err(match cleanup {
+                Ok(()) => format!(
+                    "CI runner sandbox host preflight failed: establish memory cgroup: {e}"
+                ),
+                Err(cleanup) => format!(
+                    "CI runner sandbox host preflight failed: establish memory cgroup: {e}; {cleanup}"
+                ),
+            });
         }
     };
     let (result, child_retirement) = run_and_capture(
@@ -477,6 +482,7 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
             stdin: None,
             stdout_mode: StdoutMode::CappedHead,
             cancellation: &NEVER_CANCELLED,
+            redaction: RedactionPlan::none(),
             output: None,
         },
         None,
@@ -491,9 +497,17 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         RUNTIME_QUIESCE_TIMEOUT,
         child_retirement,
     );
-    let _ = std::fs::remove_dir_all(&bundle);
+    let cleanup_result = bundle.cleanup();
     let outcome = preflight_capture_and_teardown_result(result, finalize_result)
-        .map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
+        .map_err(|error| format!("CI runner sandbox host preflight failed: {error}"));
+    let outcome = match (outcome, cleanup_result) {
+        (Ok(outcome), Ok(())) => outcome,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(cleanup)) => {
+            return Err(format!("CI runner sandbox host preflight failed: {cleanup}"));
+        }
+        (Err(error), Err(cleanup)) => return Err(format!("{error}; {cleanup}")),
+    };
     if outcome.timed_out || outcome.exit != Some(1) {
         let stderr = String::from_utf8_lossy(&outcome.stderr);
         let stderr: String = stderr.chars().take(512).collect();
@@ -687,7 +701,7 @@ enum OciExecutionLayout {
 /// profile is attached, the network namespace carries no interface when egress is default-deny, and
 /// the untrusted process runs as a NON-ROOT uid/gid ([`UNTRUSTED_UID`]/[`UNTRUSTED_GID`]). This is a
 /// RUNNABLE OCI config (`process.cwd` + `process.env` are set) — `runsc run --bundle` executes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OciConfig {
     args: Vec<String>,
     root_readonly: bool,
@@ -712,9 +726,9 @@ pub struct OciConfig {
     /// `disk_bytes` (that field is the disk-backed ephemeral-workspace quota — unrelated to this
     /// RAM-backed tmpfs).
     tmpfs_bytes: u64,
-    /// CT-006a: EXTRA `process.env` entries (`"KEY=VALUE"`) appended after the base `PATH`. EMPTY for
-    /// every CI/agent job; the git-wire path sets `GIT_PROTOCOL=version=2` / `GIT_EXEC_PATH` so the
-    /// sandboxed canonical `git` speaks protocol-v2 and finds its `git-core` helpers.
+    /// CT-006a / CI-1: EXTRA `process.env` entries (`"KEY=VALUE"`) appended after the base `PATH`.
+    /// Ordinary jobs carry literal env plus broker-resolved secret env; the git-wire path sets
+    /// `GIT_PROTOCOL=version=2` / `GIT_EXEC_PATH` so sandboxed canonical `git` finds its helpers.
     extra_env: Vec<String>,
     /// CT-007 slice 3, piece 6: the ONE source of truth for rootfs-path resolution, host mounts,
     /// user-namespace mode, and workspace mounting — replacing what were three independent fields
@@ -722,6 +736,39 @@ pub struct OciConfig {
     /// sync with each other. [`Self::invocation_mode`] and [`Self::to_json`] both derive everything
     /// from this ONE field, so neither can ever disagree with what the other implies.
     layout: OciExecutionLayout,
+}
+
+impl std::fmt::Debug for OciConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env_names: Vec<&str> = self
+            .extra_env
+            .iter()
+            .map(|entry| entry.split_once('=').map_or(entry.as_str(), |(name, _)| name))
+            .collect();
+        formatter
+            .debug_struct("OciConfig")
+            .field("args", &self.args)
+            .field("root_readonly", &self.root_readonly)
+            .field("drop_all_caps", &self.drop_all_caps)
+            .field("no_new_privileges", &self.no_new_privileges)
+            .field("seccomp", &self.seccomp)
+            .field("has_network", &self.has_network)
+            .field("pids_max", &self.pids_max)
+            .field("mem_bytes", &self.mem_bytes)
+            .field("tmpfs_bytes", &self.tmpfs_bytes)
+            .field("env_names", &env_names)
+            .field("layout", &self.layout)
+            .finish()
+    }
+}
+
+impl Drop for OciConfig {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for entry in &mut self.extra_env {
+            entry.zeroize();
+        }
+    }
 }
 
 /// Render one OCI `mounts` bind-mount entry. Source/dest are JSON-escaped via `{:?}` so a path can
@@ -755,16 +802,15 @@ impl OciConfig {
     /// Build the OCI config from a job + its derived hardening profile (the same profile the
     /// Firecracker backend enforces — backend-independent).
     pub fn from_spec(spec: &JobSpec, profile: &HardeningProfile) -> OciConfig {
-        // CT-007 gate 2: propagate the job's declared (non-secret) environment into `process.env`.
-        // `EnvVar` carries only literal values — secrets are resolved in-boundary from `SecretRef`
-        // and never appear here — so a plain `NAME=VALUE` render is correct; `to_json` JSON-escapes
-        // each entry, so a value can carry no config-injection. The base PATH is emitted first, then
-        // these entries, so a job that re-declares PATH takes effect (last-wins).
-        let extra_env = spec
+        // CT-007 gate 2 + CI-1: literals and broker-resolved secrets enter only OCI `process.env`.
+        // `ResolvedJobSecrets` is the one inseparable value that also owns the redaction plan; its
+        // private fields prevent an env-only injection. The base PATH is emitted first.
+        let mut extra_env: Vec<String> = spec
             .env
             .iter()
             .map(|e| format!("{}={}", e.name, e.value))
             .collect();
+        extra_env.extend(spec.resolved_secrets().process_env());
         Self::for_fixed_command(spec.command.clone(), spec.limits.mem_bytes, profile)
             .with_extra_env(extra_env)
     }
@@ -899,6 +945,14 @@ impl OciConfig {
     /// Serialize to a minimal OCI `config.json` (`runsc run --bundle <dir>` consumes it). The
     /// posture flags reflect the real enforced state, so a test over this JSON asserts the posture.
     pub fn to_json(&self) -> String {
+        self.to_json_zeroizing().to_string()
+    }
+
+    /// Production serializer for config files that may contain injected secret environment values.
+    /// Every secret-bearing buffer created here is zeroized when it leaves scope.
+    fn to_json_zeroizing(&self) -> zeroize::Zeroizing<String> {
+        use std::fmt::Write as _;
+
         let args = self
             .args
             .iter()
@@ -912,14 +966,18 @@ impl OciConfig {
             "{ \"type\": \"network\", \"path\": \"\" }"
         };
         // `process.env`: the base PATH first, then any extra entries (e.g. GIT_PROTOCOL) — JSON-quoted.
-        let mut envs = vec![format!(
+        let mut env_json = zeroize::Zeroizing::new(String::new());
+        write!(
+            &mut *env_json,
             "{:?}",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        )];
+        )
+        .expect("writing JSON into a String cannot fail");
         for e in &self.extra_env {
-            envs.push(format!("{e:?}"));
+            env_json.push_str(", ");
+            write!(&mut *env_json, "{e:?}")
+                .expect("writing JSON into a String cannot fail");
         }
-        let env_json = envs.join(", ");
         // `mounts`: the size-bounded writable `/tmp` tmpfs first (byte-unchanged), then whatever
         // host mounts this config's layout implies (CT-006a's git-wire repo/quarantine binds, or
         // CT-007 slice 3's fixed workspace bind) — `OciExecutionLayout` only ever produces one
@@ -999,7 +1057,7 @@ impl OciConfig {
                 ),
             ),
         };
-        format!(
+        zeroize::Zeroizing::new(format!(
             "{{\n  \"ociVersion\": \"1.0.0\",\n  \"process\": {{\n    \
              \"user\": {{ \"uid\": {uid}, \"gid\": {gid} }},\n    \
              \"args\": [{args}],\n    \"cwd\": {process_cwd:?},\n    \
@@ -1017,7 +1075,7 @@ impl OciConfig {
             gid = UNTRUSTED_GID,
             args = args,
             process_cwd = process_cwd,
-            env_json = env_json,
+            env_json = &*env_json,
             nnp = self.no_new_privileges,
             ro = self.root_readonly,
             mounts_json = mounts_json,
@@ -1025,7 +1083,7 @@ impl OciConfig {
             pids = self.pids_max,
             namespaces_json = namespaces_json,
             id_mappings_json = id_mappings_json,
-        )
+        ))
     }
 
     /// True iff the OCI root is read-only.
@@ -2550,6 +2608,8 @@ impl GvisorBackend {
     /// Build the OCI config a launch WOULD use for `spec` (the hardened profile derived + the OCI
     /// JSON assembled), without running. Asserts the mandatory profile is in force.
     pub fn oci_config(spec: &JobSpec) -> Result<OciConfig, GvisorError> {
+        spec.validate_secret_coverage()
+            .map_err(|error| GvisorError::Runtime(format!("secret injection refused: {error}")))?;
         let profile = HardeningProfile::derive(spec);
         profile.assert_enforced().map_err(GvisorError::Hardening)?;
         Ok(OciConfig::from_spec(spec, &profile))
@@ -2677,6 +2737,11 @@ impl GvisorBackend {
         hooks
             .enforce_isolation_floor(spec)
             .map_err(|e| SandboxLaunchError::Failed(e.into()))?;
+        spec.validate_secret_coverage().map_err(|error| {
+            SandboxLaunchError::Failed(GvisorError::Runtime(format!(
+                "secret injection refused: {error}"
+            )))
+        })?;
         let profile = HardeningProfile::derive(spec);
         profile
             .assert_enforced()
@@ -3748,6 +3813,11 @@ impl GvisorBackend {
         hooks
             .enforce_isolation_floor(spec)
             .map_err(CheckoutOrchestrationError::Hook)?;
+        spec.validate_secret_coverage().map_err(|error| {
+            CheckoutOrchestrationError::Hook(HookError(format!(
+                "secret injection refused: {error}"
+            )))
+        })?;
         let profile = HardeningProfile::derive(spec);
         profile
             .assert_enforced()
@@ -4140,7 +4210,14 @@ impl SandboxBackend for GvisorBackend {
         let proc = self.live.lock().unwrap().remove(&h.guest_id);
         if let Some(mut proc) = proc {
             let r = proc.child.kill();
-            let _ = std::fs::remove_dir_all(&proc.bundle_dir);
+            if let Err(error) = std::fs::remove_dir_all(&proc.bundle_dir) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(GvisorError::Runtime(format!(
+                        "bundle dir {:?} removal failed: {error}",
+                        proc.bundle_dir
+                    )));
+                }
+            }
             r.map_err(GvisorError::Runtime)?;
         }
         Ok(())
@@ -4352,7 +4429,7 @@ fn run_production_container_streaming(
     // downstream use below shares.
     let mode = prep.mode;
 
-    let bundle_dir = stage_production_bundle(cfg, rootfs).map_err(RunFailure::uncommitted)?;
+    let mut bundle = stage_production_bundle(cfg, rootfs).map_err(RunFailure::uncommitted)?;
 
     // CT-003b (SI-017): establish the OUT-OF-BAND memory cgroup BEFORE spawning runsc and FAIL
     // CLOSED if it cannot be established (rootless runsc would otherwise run the workload's
@@ -4364,8 +4441,10 @@ fn run_production_container_streaming(
     let cgroup = match MemoryCgroup::create(spec.limits.mem_bytes, spec.limits.cpu_millis) {
         Ok(cgroup) => cgroup,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&bundle_dir);
-            return Err(RunFailure::uncommitted(e));
+            return Err(RunFailure::uncommitted(match bundle.cleanup() {
+                Ok(()) => e,
+                Err(cleanup) => format!("{e}; {cleanup}"),
+            }));
         }
     };
 
@@ -4379,7 +4458,7 @@ fn run_production_container_streaming(
     // `bind_then_continue` — a deterministic seam covering that exact security property with a bare
     // counting closure, with no real runsc spawn involved.
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
-    let redaction = RedactionPlan::for_job(spec);
+    let redaction = spec.resolved_secrets().redaction_plan().clone();
     // The single `run_and_capture` continuation — invoked at most once, by whichever bind path below
     // succeeds (mutually-exclusive match arms, so the moved `launch_permit`/`output` are fine).
     let revalidate = || {
@@ -4389,7 +4468,7 @@ fn run_production_container_streaming(
     let capture = || {
         run_and_capture(
             bin,
-            &bundle_dir,
+            &bundle,
             container_id,
             timeout,
             spec.limits.mem_bytes,
@@ -4397,10 +4476,8 @@ fn run_production_container_streaming(
                 stdin: None, // CI/agent jobs receive no stdin (the git-wire path supplies the body).
                 stdout_mode: StdoutMode::CappedHead,
                 cancellation: cancellation.as_atomic(),
-                output: output.map(|sink| StreamingOutput {
-                    sink,
-                    redaction: redaction.clone(),
-                }),
+                redaction: redaction.clone(),
+                output: output.map(|sink| StreamingOutput { sink }),
             },
             Some(launch_permit),
             mode,
@@ -4457,33 +4534,42 @@ fn run_production_container_streaming(
             // Never call `run_and_capture` after a bind failure — no exec may ever follow a
             // failed/unconfirmed bind. Checked-quiesce the cgroup nobody will use, and clean up
             // the bundle, before surfacing the failure.
-            let _ = std::fs::remove_dir_all(&bundle_dir);
-            return Err(match cgroup.quiesce(RUNTIME_QUIESCE_TIMEOUT) {
+            let cleanup = bundle.cleanup();
+            let mut failure = match cgroup.quiesce(RUNTIME_QUIESCE_TIMEOUT) {
                 Ok(_) => RunFailure::uncommitted(message),
                 Err(e) => RunFailure::uncommitted(format!(
                     "{message} AND cgroup quiescence also failed ({e})"
                 )),
-            });
+            };
+            if let Err(cleanup) = cleanup {
+                failure = augment_run_failure_message(failure, cleanup);
+            }
+            return Err(failure);
         }
     };
     let primary: Result<ContainerRun, RunFailure> = match result {
         Ok(outcome) => {
             let result = build_result(spec, &outcome, &redaction);
-            Ok(ContainerRun {
-                child: Box::new(SpawnedRunsc {
-                    bin,
-                    container_id: container_id.to_string(),
-                    mode,
+            match bundle.cleanup() {
+                Ok(()) => Ok(ContainerRun {
+                    child: Box::new(SpawnedRunsc {
+                        bin,
+                        container_id: container_id.to_string(),
+                        mode,
+                    }),
+                    bundle_dir: bundle.path.clone(),
+                    result,
+                    run_error: outcome.stream_error,
                 }),
-                bundle_dir,
-                result,
-                run_error: outcome.stream_error,
-            })
+                Err(cleanup) => Err(RunFailure::executed(cleanup, result.usage)),
+            }
         }
         Err(e) => {
-            // Spawning/waiting failed before a trustworthy result — clean up + surface honestly.
-            let _ = std::fs::remove_dir_all(&bundle_dir);
-            Err(e)
+            // Spawning/waiting failed before a trustworthy result — checked cleanup + surface both.
+            Err(match bundle.cleanup() {
+                Ok(()) => e,
+                Err(cleanup) => augment_run_failure_message(e, cleanup),
+            })
         }
     };
     // Checked teardown replaces the old best-effort `delete_container`/`cgroup.cleanup()` pair —
@@ -4520,24 +4606,120 @@ fn unique_suffix() -> u128 {
     (nanos << 24) | (seq & 0xff_ffff)
 }
 
+/// RAII ownership of a per-job private OCI bundle. Normal cleanup is checked and can fail the launch;
+/// `Drop` is the guaranteed rollback for unwinding/error paths that cannot return another result.
+struct BundleCleanupGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl BundleCleanupGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        if !self.armed {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&self.path)
+            .map_err(|error| format!("bundle dir {:?} removal failed: {error}", self.path))?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for BundleCleanupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cleanup().unwrap_or_else(|error| {
+                // Continuing after a secret-bearing bundle could not be removed is never safe.
+                // During an existing unwind this deliberately aborts via a double panic rather
+                // than silently persisting the file; on an ordinary drop it makes the failure
+                // observable to the caller/test harness.
+                panic!("fail-closed secret bundle cleanup: {error}")
+            });
+        }
+    }
+}
+
+struct StagedProductionBundle {
+    path: PathBuf,
+    cleanup: BundleCleanupGuard,
+}
+
+impl StagedProductionBundle {
+    fn cleanup(&mut self) -> Result<(), String> {
+        self.cleanup.cleanup()
+    }
+}
+
+impl std::ops::Deref for StagedProductionBundle {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
 /// Stage a self-contained OCI bundle in a temp dir — the SAME pattern as
 /// `escape_drill_gvisor_test::stage_bundle` (no forked recipe): a `rootfs` symlink → the staged
 /// minimal rootfs (`runsc` reads `root.path = "rootfs"` relative to the bundle) + the production
 /// `config.json` from [`OciConfig::to_json`]. Returns the bundle dir.
-fn stage_production_bundle(cfg: &OciConfig, rootfs: &Path) -> Result<PathBuf, String> {
+fn stage_production_bundle(
+    cfg: &OciConfig,
+    rootfs: &Path,
+) -> Result<StagedProductionBundle, String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
     let bundle = std::env::temp_dir().join(format!(
         "myelin-gvisor-prod-{}-{}",
         std::process::id(),
         unique_suffix()
     ));
-    let _ = std::fs::remove_dir_all(&bundle);
-    std::fs::create_dir_all(&bundle).map_err(|e| format!("create bundle dir {bundle:?}: {e}"))?;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&bundle)
+        .map_err(|e| format!("create private bundle dir {bundle:?}: {e}"))?;
+    let mut staged = StagedProductionBundle {
+        path: bundle.clone(),
+        cleanup: BundleCleanupGuard::new(bundle.clone()),
+    };
     #[cfg(unix)]
-    std::os::unix::fs::symlink(rootfs, bundle.join("rootfs"))
-        .map_err(|e| format!("symlink rootfs into bundle: {e}"))?;
-    std::fs::write(bundle.join("config.json"), cfg.to_json())
-        .map_err(|e| format!("write config.json: {e}"))?;
-    Ok(bundle)
+    if let Err(error) = std::os::unix::fs::symlink(rootfs, bundle.join("rootfs")) {
+        let cleanup = staged.cleanup();
+        return Err(match cleanup {
+            Ok(()) => format!("symlink rootfs into bundle: {error}"),
+            Err(cleanup) => format!("symlink rootfs into bundle: {error}; {cleanup}"),
+        });
+    }
+    let config_path = bundle.join("config.json");
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&config_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let cleanup = staged.cleanup();
+            return Err(match cleanup {
+                Ok(()) => format!("create private config.json: {error}"),
+                Err(cleanup) => format!("create private config.json: {error}; {cleanup}"),
+            });
+        }
+    };
+    let json = cfg.to_json_zeroizing();
+    if let Err(error) = file.write_all(json.as_bytes()).and_then(|()| file.sync_all()) {
+        drop(file);
+        let cleanup = staged.cleanup();
+        return Err(match cleanup {
+            Ok(()) => format!("write private config.json: {error}"),
+            Err(cleanup) => format!("write private config.json: {error}; {cleanup}"),
+        });
+    }
+    drop(file);
+    Ok(staged)
 }
 
 /// The `runsc` GLOBAL flags (BEFORE the subcommand) `mode` implies — the ONE place any of
@@ -5893,6 +6075,7 @@ fn run_and_capture_impl(
         stdin,
         stdout_mode,
         cancellation,
+        redaction,
         output,
     } = options;
     let has_streaming_output = output.is_some();
@@ -6016,17 +6199,22 @@ fn run_and_capture_impl(
     //     seam then REFUSES loudly — never a silently-truncated pack). Both keep reading past the bound
     //     so the container never blocks on a full pipe (no deadlock that would defeat the timeout).
     let stdout_output = output.clone();
+    let stdout_redaction = redaction.clone();
     let th_out = std::thread::spawn(move || match (stdout_mode, stdout_output) {
         (StdoutMode::CappedHead, Some(output)) => drain_capped_streaming(
             &mut out,
             SANDBOX_CAPTURE_BOUND,
             SandboxOutputStream::Stdout,
-            &output,
+            Some(&output),
+            &stdout_redaction,
         ),
-        (StdoutMode::CappedHead, None) => {
-            let (head, truncated) = drain_capped(&mut out, SANDBOX_CAPTURE_BOUND);
-            (head, truncated, None)
-        }
+        (StdoutMode::CappedHead, None) => drain_capped_streaming(
+            &mut out,
+            SANDBOX_CAPTURE_BOUND,
+            SandboxOutputStream::Stdout,
+            None,
+            &stdout_redaction,
+        ),
         (StdoutMode::StreamToFile { bound }, _) => {
             let (head, truncated) = drain_to_temp_file(&mut out, bound);
             (head, truncated, None)
@@ -6039,11 +6227,21 @@ fn run_and_capture_impl(
                 &mut err,
                 SANDBOX_CAPTURE_BOUND,
                 SandboxOutputStream::Stderr,
-                &output,
+                Some(&output),
+                &redaction,
             );
             (head, error)
         }
-        None => (drain_capped(&mut err, SANDBOX_CAPTURE_BOUND).0, None),
+        None => {
+            let (head, _, error) = drain_capped_streaming(
+                &mut err,
+                SANDBOX_CAPTURE_BOUND,
+                SandboxOutputStream::Stderr,
+                None,
+                &redaction,
+            );
+            (head, error)
+        }
     });
 
     let timed_out;
@@ -6171,6 +6369,7 @@ struct RunCaptureOptions<'a> {
     stdin: Option<StdinSource>,
     stdout_mode: StdoutMode,
     cancellation: &'a AtomicBool,
+    redaction: RedactionPlan,
     output: Option<StreamingOutput>,
 }
 
@@ -6189,7 +6388,6 @@ enum StdinSource {
 #[derive(Clone)]
 struct StreamingOutput {
     sink: Arc<dyn SandboxOutputSink>,
-    redaction: RedactionPlan,
 }
 
 /// One marker is stored inside (not in addition to) the total per-job log ceiling. Reserving its
@@ -6281,34 +6479,32 @@ fn cap_total_job_output(output: Arc<dyn SandboxOutputSink>) -> Arc<dyn SandboxOu
 /// chunks to the job-wide, total-byte-capped durable-output callback.
 ///
 /// A callback failure is remembered, but the pipe is still drained to EOF so the guest cannot
-/// deadlock behind a full pipe and defeat timeout/teardown. Redaction is applied before the callback.
-/// Today every plan is empty because secret injection is absent; CI-1 owns the already-documented
-/// cross-chunk streaming masker obligation when it introduces real needles.
+/// deadlock behind a full pipe and defeat timeout/teardown. Redaction is applied before the callback,
+/// with a per-stream carry buffer so a secret split across arbitrary pipe reads cannot cross into
+/// durable output.
 fn drain_capped_streaming<R: Read>(
     mut reader: R,
     limit: usize,
     stream: SandboxOutputStream,
-    output: &StreamingOutput,
+    output: Option<&StreamingOutput>,
+    redaction: &RedactionPlan,
 ) -> (Vec<u8>, bool, Option<String>) {
     let mut head = Vec::new();
     let mut truncated = false;
     let mut first_output_error = None;
     let mut chunk = [0u8; 64 * 1024];
+    let mut redactor = redaction.streaming();
     loop {
         match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
-                if head.len() < limit {
-                    let take = (limit - head.len()).min(n);
-                    head.extend_from_slice(&chunk[..take]);
-                    truncated |= take < n;
-                } else {
-                    truncated = true;
-                }
-                if first_output_error.is_none() {
-                    let redacted = output.redaction.redact(&chunk[..n]);
-                    if let Err(error) = output.sink.emit(stream, &redacted) {
-                        first_output_error = Some(error);
+                let redacted = redactor.push(&chunk[..n]);
+                append_capped(&mut head, &redacted, limit, &mut truncated);
+                if first_output_error.is_none() && !redacted.is_empty() {
+                    if let Some(output) = output {
+                        if let Err(error) = output.sink.emit(stream, &redacted) {
+                            first_output_error = Some(error);
+                        }
                     }
                 }
             }
@@ -6322,7 +6518,23 @@ fn drain_capped_streaming<R: Read>(
             }
         }
     }
+    let redacted = redactor.finish();
+    append_capped(&mut head, &redacted, limit, &mut truncated);
+    if first_output_error.is_none() && !redacted.is_empty() {
+        if let Some(output) = output {
+            if let Err(error) = output.sink.emit(stream, &redacted) {
+                first_output_error = Some(error);
+            }
+        }
+    }
     (head, truncated, first_output_error)
+}
+
+fn append_capped(head: &mut Vec<u8>, bytes: &[u8], limit: usize, truncated: &mut bool) {
+    let remaining = limit.saturating_sub(head.len());
+    let take = remaining.min(bytes.len());
+    head.extend_from_slice(&bytes[..take]);
+    *truncated |= take < bytes.len();
 }
 
 /// **Drain a child stream straight to a host TEMP FILE under a generous byte cap (the git-wire path,
@@ -6459,9 +6671,9 @@ fn build_result(spec: &JobSpec, o: &RunscOutcome, redaction: &RedactionPlan) -> 
     // BOUNDARY REDACTION (CT-004f sub-step 1): mask the job's CI-managed secret needles in the captured
     // streams HERE — the last step before the bytes populate `SandboxResult` and cross back toward the
     // durable log pipeline — so no injected secret is sealed into the content-addressed log store. The
-    // plan is EMPTY today (nothing injects secrets), so this is a no-op; it is a REQUIRED argument so no
-    // capture path can forward un-redacted bytes, and CI-1 secret injection must populate it (see
-    // `crate::redaction`). Redaction runs on the already-per-stream-bounded bytes.
+    // plan is empty for non-secret jobs and populated from the same resolved bindings as OCI env for
+    // secret-bearing jobs. It is a REQUIRED argument so no capture path can forward un-redacted bytes.
+    // Redaction runs on the already-per-stream-bounded bytes.
     //
     // The drain threads ALREADY applied the correct per-stream bound ([`run_and_capture`]): stdout is
     // bounded by its [`StdoutMode`] (256 KiB head for CI/agent; the generous git-wire cap, disk-staged),
@@ -7675,6 +7887,7 @@ fn run_git_wire_container_raw(
             stdin: Some(StdinSource::Bytes(stdin)),
             stdout_mode: StdoutMode::StreamToFile { bound: wire_cap },
             cancellation,
+            redaction: RedactionPlan::none(),
             output: None,
         },
         Some(launch_permit),
@@ -7754,17 +7967,28 @@ impl std::fmt::Display for StageBundleError {
 /// failure left the just-created directory behind unconditionally — now best-effort cleaned up, with
 /// the outcome reported via [`StageBundleError::leaked`] rather than silently discarded.
 fn stage_config_only_bundle(cfg: &OciConfig, label: &str) -> Result<PathBuf, StageBundleError> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
     let bundle = std::env::temp_dir().join(format!(
         "myelin-{label}-bundle-{}-{}",
         std::process::id(),
         unique_suffix()
     ));
-    let _ = std::fs::remove_dir_all(&bundle);
-    std::fs::create_dir_all(&bundle).map_err(|e| StageBundleError {
-        message: format!("create bundle dir {bundle:?}: {e}"),
-        leaked: false, // create_dir_all failing never leaves a NEW directory behind
-    })?;
-    if let Err(e) = std::fs::write(bundle.join("config.json"), cfg.to_json()) {
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&bundle)
+        .map_err(|e| StageBundleError {
+            message: format!("create bundle dir {bundle:?}: {e}"),
+            leaked: false,
+        })?;
+    let json = cfg.to_json_zeroizing();
+    let write_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(bundle.join("config.json"))
+        .and_then(|mut file| file.write_all(json.as_bytes()).and_then(|()| file.sync_all()));
+    if let Err(e) = write_result {
         return Err(match std::fs::remove_dir_all(&bundle) {
             Ok(()) => StageBundleError {
                 message: format!("write config.json: {e}"),
@@ -10567,10 +10791,8 @@ fn run_checkout_preparation_inner(
             stdin: Some(StdinSource::File(spec.pack.file)),
             stdout_mode: StdoutMode::CappedHead,
             cancellation,
-            output: output.map(|sink| StreamingOutput {
-                sink,
-                redaction: RedactionPlan::none(),
-            }),
+            redaction: RedactionPlan::none(),
+            output: output.map(|sink| StreamingOutput { sink }),
         },
         Some(launch_permit),
         mode,
@@ -12131,16 +12353,15 @@ mod tests {
         let sink = Arc::new(RecordingOutput::default());
         let capped: Arc<dyn SandboxOutputSink> =
             Arc::new(TotalLogCappedOutput::new(sink.clone()));
-        let output = StreamingOutput {
-            sink: capped,
-            redaction: RedactionPlan::none(),
-        };
+        let output = StreamingOutput { sink: capped };
+        let redaction = RedactionPlan::none();
 
         let (head, truncated, error) = drain_capped_streaming(
             std::io::Cursor::new(&input),
             1024,
             SandboxOutputStream::Stdout,
-            &output,
+            Some(&output),
+            &redaction,
         );
 
         assert_eq!(error, None);
@@ -12154,6 +12375,107 @@ mod tests {
     }
 
     #[test]
+    fn streaming_drain_masks_an_injected_value_split_across_pipe_reads() {
+        let sink = Arc::new(RecordingOutput::default());
+        let output = StreamingOutput { sink: sink.clone() };
+        let redaction = RedactionPlan::for_needles([b"split-secret".to_vec()]).unwrap();
+        let reader = std::io::Cursor::new(b"before split-".as_slice())
+            .chain(std::io::Cursor::new(b"secret after".as_slice()));
+
+        let (_head, _truncated, error) = drain_capped_streaming(
+            reader,
+            1024,
+            SandboxOutputStream::Stdout,
+            Some(&output),
+            &redaction,
+        );
+
+        assert_eq!(error, None);
+        assert!(!sink
+            .bytes
+            .lock()
+            .unwrap()
+            .windows(b"split-secret".len())
+            .any(|window| window == b"split-secret"));
+    }
+
+    #[test]
+    fn result_head_redacts_before_truncating_a_boundary_straddling_secret() {
+        let secret = b"BOUNDARY-STRADDLING-SECRET";
+        let prefix_len = secret.len() / 2;
+        let mut input = vec![b'a'; SANDBOX_CAPTURE_BOUND - prefix_len];
+        input.extend_from_slice(secret);
+        input.extend(std::iter::repeat_n(b'z', SANDBOX_CAPTURE_BOUND));
+        let redaction = RedactionPlan::for_needles([secret.to_vec()]).unwrap();
+
+        let (head, truncated, error) = drain_capped_streaming(
+            std::io::Cursor::new(input),
+            SANDBOX_CAPTURE_BOUND,
+            SandboxOutputStream::Stdout,
+            None,
+            &redaction,
+        );
+
+        assert_eq!(error, None);
+        assert!(truncated);
+        assert!(!head.windows(secret.len()).any(|window| window == secret));
+        assert!(!head[..].ends_with(&secret[..prefix_len]));
+    }
+
+    #[test]
+    fn production_secret_bundle_is_owner_only_and_drop_cleans_post_stage_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let rootfs = std::env::temp_dir().join(format!(
+            "myelin-secret-bundle-rootfs-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir(&rootfs).unwrap();
+        let mut job = spec(vec![]);
+        job.secret_refs = vec![crate::SecretRef {
+            name: "DEPLOY_TOKEN".into(),
+            handle: "myelin://acme/ci/secret/deploy".into(),
+        }];
+        let job = job
+            .with_resolved_secrets(vec![crate::ResolvedSecretEnv::new(
+                "DEPLOY_TOKEN",
+                "secret-bundle-material",
+            )])
+            .unwrap();
+        let cfg = GvisorBackend::oci_config(&job).unwrap();
+        let (bundle_path, post_stage): (PathBuf, Result<(), &'static str>) = {
+            let staged = stage_production_bundle(&cfg, &rootfs).unwrap();
+            let config_path = staged.path.join("config.json");
+
+            assert_eq!(
+                std::fs::metadata(&staged.path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&config_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+
+            (
+                staged.path.clone(),
+                Err("simulated post-stage launch failure"),
+            )
+        };
+        assert_eq!(post_stage.unwrap_err(), "simulated post-stage launch failure");
+        assert!(!bundle_path.exists());
+        std::fs::remove_dir_all(rootfs).unwrap();
+    }
+
+    #[test]
     fn streaming_capture_total_log_cap_truncates_with_marker_and_stops_growth() {
         let payload_limit = 1024;
         let total_limit = payload_limit + TOTAL_LOG_TRUNCATION_MARKER.len();
@@ -12164,15 +12486,16 @@ mod tests {
         ));
         let output = StreamingOutput {
             sink: capped.clone(),
-            redaction: RedactionPlan::none(),
         };
+        let redaction = RedactionPlan::none();
         let input = vec![b'x'; 256 * 1024];
 
         let (_head, truncated, error) = drain_capped_streaming(
             std::io::Cursor::new(&input),
             128,
             SandboxOutputStream::Stdout,
-            &output,
+            Some(&output),
+            &redaction,
         );
         assert_eq!(error, None);
         assert!(truncated, "the diagnostic head is also truncated");
@@ -12671,8 +12994,8 @@ mod tests {
     }
 
     // CT-004f sub-step 1: `build_result` APPLIES the redaction plan to both captured streams — the
-    // boundary seam is wired, not just the `RedactionPlan` unit. A populated plan (the shape CI-1
-    // injection will pass) masks the needle before it reaches `SandboxResult`.
+    // boundary seam is wired, not just the `RedactionPlan` unit. A populated injection plan masks the
+    // needle before it reaches `SandboxResult`.
     #[test]
     fn build_result_masks_needles_in_both_streams() {
         let s = spec(vec![]);
@@ -12682,15 +13005,55 @@ mod tests {
         let needle = [b"AK".as_slice(), b"IAsecret"].concat();
         let stdout = [b"deploying with ".as_slice(), needle.as_slice(), b" now"].concat();
         let stderr = [b"error: ".as_slice(), needle.as_slice(), b" invalid"].concat();
-        let plan = RedactionPlan::for_needles([needle]);
+        let plan = RedactionPlan::for_needles([needle.clone()]).unwrap();
         let o = outcome(&stdout, &stderr);
         let res = build_result(&s, &o, &plan);
-        assert_eq!(res.stdout, b"deploying with *** now".to_vec());
-        assert_eq!(res.stderr, b"error: *** invalid".to_vec());
+        assert!(res.stdout.starts_with(b"deploying with "));
+        assert!(res.stdout.ends_with(b" now"));
+        assert!(res.stderr.starts_with(b"error: "));
+        assert!(res.stderr.ends_with(b" invalid"));
+        assert!(!res.stdout.windows(needle.len()).any(|window| window == needle));
+        assert!(!res.stderr.windows(needle.len()).any(|window| window == needle));
     }
 
-    // The empty plan (the ONLY state reachable today — nothing injects secrets) is a pass-through:
-    // captured output is byte-unchanged.
+    #[test]
+    fn injected_secret_value_is_absent_from_sandbox_result_when_workload_prints_it() {
+        let mut s = spec(vec![]);
+        s.secret_refs = vec![crate::SecretRef {
+            name: "DEPLOY_TOKEN".into(),
+            handle: "opaque:deploy".into(),
+        }];
+        let material = ["printed", "-secret-material"].concat();
+        let s = s
+            .with_resolved_secrets(vec![crate::ResolvedSecretEnv::new(
+                "DEPLOY_TOKEN",
+                material.clone(),
+            )])
+            .expect("binding and plan are derived together");
+        let stdout = format!("stdout:{material}");
+        let stderr = format!("stderr:{material}");
+        let outcome = outcome(stdout.as_bytes(), stderr.as_bytes());
+
+        let result = build_result(
+            &s,
+            &outcome,
+            s.resolved_secrets().redaction_plan(),
+        );
+
+        assert!(result.stdout.starts_with(b"stdout:"));
+        assert!(result.stderr.starts_with(b"stderr:"));
+        assert!(!result
+            .stdout
+            .windows(material.len())
+            .any(|window| window == material.as_bytes()));
+        assert!(!result
+            .stderr
+            .windows(material.len())
+            .any(|window| window == material.as_bytes()));
+        assert!(!format!("{result:?}").contains(&material));
+    }
+
+    // A non-secret job's empty plan remains a pass-through: captured output is byte-unchanged.
     #[test]
     fn build_result_empty_plan_is_byte_identity() {
         let s = spec(vec![]);
@@ -13118,6 +13481,29 @@ mod tests {
             json.contains("PATH=/usr/local/sbin"),
             "base PATH lost: {json}"
         );
+    }
+
+    #[test]
+    fn injected_secret_reaches_oci_process_env_without_entering_debug_records() {
+        let mut s = spec(vec![]);
+        s.secret_refs = vec![crate::SecretRef {
+            name: "DEPLOY_TOKEN".into(),
+            handle: "opaque:deploy".into(),
+        }];
+        let material = ["boundary", "-only-material"].concat();
+        let s = s
+            .with_resolved_secrets(vec![crate::ResolvedSecretEnv::new(
+                "DEPLOY_TOKEN",
+                material.clone(),
+            )])
+            .expect("the exact declared binding set must couple to redaction");
+
+        let cfg = GvisorBackend::oci_config(&s).expect("covered injection is launchable");
+        let json = cfg.to_json();
+        assert!(json.contains(&format!("DEPLOY_TOKEN={material}")));
+        assert!(!format!("{s:?}").contains(&material));
+        assert!(!format!("{:?}", s.resolved_secrets().redaction_plan()).contains(&material));
+        assert!(!format!("{cfg:?}").contains(&material));
     }
 
     /// Empty host-mount collections are still valid (git-wire's OWN quarantine mount is genuinely
@@ -15755,6 +16141,7 @@ mod tests {
                 stdin: None,
                 stdout_mode: StdoutMode::CappedHead,
                 cancellation: &NEVER_CANCELLED,
+                redaction: RedactionPlan::none(),
                 output: None,
             },
             None,
