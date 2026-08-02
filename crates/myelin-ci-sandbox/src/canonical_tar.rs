@@ -228,6 +228,16 @@ pub(crate) fn verify_asset_entry_metadata(
     metadata: &fs::Metadata,
     expected_uid: u32,
 ) -> Result<(), AssetTreeVerificationError> {
+    // A symlink's OWN mode/owner are not security-relevant to the "unwritable by non-owners"
+    // invariant: its permission bits are 0o777 by construction and ignored by the kernel (you cannot
+    // write *through* a symlink to change asset content), and retargeting it requires WRITE on its
+    // PARENT DIRECTORY — which IS mode/owner-verified as a directory entry. The symlink's target path
+    // is covered by the canonical-tar digest. Enforcing 0o022 here would reject every real rootfs
+    // (docker exports carry symlinks like /etc/mtab -> /proc/mounts, /bin/sh, lib64), so skip it.
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+
     let mode = metadata.mode() & 0o7777;
     if mode & 0o022 != 0 {
         return Err(AssetTreeVerificationError::GroupOrWorldWritable {
@@ -237,7 +247,11 @@ pub(crate) fn verify_asset_entry_metadata(
     }
 
     let actual_uid = metadata.uid();
-    if actual_uid != expected_uid {
+    // Trusted asset owners: the registry-constructing process's own uid (it staged/owns the store) OR
+    // root. Anything else — notably a mapped SUBUID (the untrusted workload's range) — is refused: a
+    // subuid-owned entry could be mutated by that subuid. (root and the store owner are trusted; the
+    // group/world-writable check above already bars non-owner writes for either.)
+    if actual_uid != expected_uid && actual_uid != 0 {
         return Err(AssetTreeVerificationError::UnexpectedOwner {
             path: path.to_path_buf(),
             expected_uid,
@@ -576,6 +590,38 @@ mod tests {
             "a populated tree hashes differently from an empty one"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (the #31a symlink false-positive): a `0o777` SYMLINK — which every real rootfs
+    /// carries (`/etc/mtab -> /proc/mounts`, `/bin/sh`, `lib64`) — must NOT trip the group/world-
+    /// writable refusal in the VERIFIED (expected_uid) path. A symlink's mode is meaningless (you
+    /// cannot write through it; retargeting needs parent-dir write, which the dir entry IS checked
+    /// for). Before the symlink-skip fix this rejected every staged rootfs asset.
+    #[test]
+    fn verified_tree_accepts_world_moded_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "myelin-canonical-tar-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.join("real"), b"content").unwrap();
+        fs::set_permissions(dir.join("real"), fs::Permissions::from_mode(0o644)).unwrap();
+        // lstat'd as `lrwxrwxrwx` (0o777) — must be accepted, not refused as world-writable.
+        std::os::unix::fs::symlink("/proc/mounts", dir.join("mtab")).unwrap();
+        // SAFETY: `geteuid` is a pure syscall with no arguments and no shared state.
+        let uid = unsafe { libc::geteuid() };
+        let verified = verified_asset_tree_sha256_hex(&dir, uid)
+            .expect("a symlink's 0o777 mode must not trip the writable refusal");
+        // Verification does not alter the digest — it equals the unverified hash of the same tree.
+        assert_eq!(verified, canonical_tree_sha256_hex(&dir).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 
