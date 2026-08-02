@@ -223,7 +223,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-CONTAINER_ID="$(docker create "${RUST_IMAGE_TAG}" true)"
+CONTAINER_ID="$(docker create "${RUST_IMAGE_TAG}" sh -c 'rustup component add clippy')"
+
+echo "build-rust-rootfs: installing the pinned toolchain's clippy component ..." >&2
+docker start -a "${CONTAINER_ID}" >&2
 
 echo "build-rust-rootfs: exporting ${RUST_IMAGE_TAG} filesystem (container ${CONTAINER_ID}) to ${TMP} ..." >&2
 docker export "${CONTAINER_ID}" | tar -x -C "${TMP}"
@@ -235,6 +238,10 @@ CONTAINER_ID=""
 # It is part of the content-addressed asset (and therefore the digest below), never something
 # runsc may create in the shared verified tree after registry construction.
 mkdir -p "${TMP}/workspace"
+# The Cargo dependency asset is a separate digest-pinned tree mounted read-only here. This fixed
+# destination is part of the rootfs digest and must remain empty; runsc may never create it after
+# the rootfs has been verified.
+mkdir -p "${TMP}/opt/myelin/cargo-vendor"
 
 # --- PATH-reachability fixup (pure filesystem content — no OciConfig/hardening code touched) ------
 TOOLCHAIN_DIR="$(find "${TMP}/usr/local/rustup/toolchains" -mindepth 1 -maxdepth 1 -type d | head -1)"
@@ -256,6 +263,8 @@ for relative in bin/sh bin/false; do
 done
 [[ -x "${TMP}/usr/local/bin/rustc" ]] || die "post-fixup sanity check failed: usr/local/bin/rustc is not executable"
 [[ -x "${TMP}/usr/local/bin/cargo" ]] || die "post-fixup sanity check failed: usr/local/bin/cargo is not executable"
+[[ -x "${TMP}/usr/local/bin/cargo-clippy" ]] || die "post-fixup sanity check failed: usr/local/bin/cargo-clippy is not executable"
+[[ -x "${TMP}/usr/local/bin/clippy-driver" ]] || die "post-fixup sanity check failed: usr/local/bin/clippy-driver is not executable"
 
 echo "build-rust-rootfs: verifying rustc/cargo run standalone (no ambient env) ..." >&2
 if ! env -i "${TMP}/usr/local/bin/rustc" --version >&2; then
@@ -263,6 +272,9 @@ if ! env -i "${TMP}/usr/local/bin/rustc" --version >&2; then
 fi
 if ! env -i "${TMP}/usr/local/bin/cargo" --version >&2; then
   die "staged cargo does not run standalone under env -i — the toolchain fixup is broken"
+fi
+if ! env -i "${TMP}/usr/local/bin/cargo-clippy" --version >&2; then
+  die "staged cargo-clippy does not run standalone under env -i — the toolchain fixup is broken"
 fi
 
 echo "build-rust-rootfs: computing canonical-tree sha256 digest ..." >&2
