@@ -109,6 +109,8 @@ pub struct GvisorAssetRegistry {
 pub struct VerifiedRootfs {
     path: PathBuf,
     digest_hex: String,
+    device: u64,
+    inode: u64,
 }
 
 /// A Cargo vendor asset whose complete canonical tree, safe shared-tree metadata, and embedded
@@ -202,6 +204,13 @@ impl VerifiedRootfs {
     /// encoded.
     pub fn digest_hex(&self) -> &str {
         &self.digest_hex
+    }
+
+    /// Filesystem identity captured around the one-time digest verification. Consumers re-check
+    /// this identity after opening the base with `O_PATH|O_DIRECTORY|O_NOFOLLOW`, then use only the
+    /// held descriptor so a pathname replacement cannot substitute a different tree.
+    pub fn identity(&self) -> (u64, u64) {
+        (self.device, self.inode)
     }
 }
 
@@ -670,6 +679,14 @@ impl GvisorAssetRegistry {
             });
         }
 
+        use std::os::unix::fs::MetadataExt as _;
+        let identity_before = std::fs::symlink_metadata(&canon).map_err(|error| {
+            AssetRegistryError::InvalidRootfsPath {
+                rootfs: canon.clone(),
+                reason: format!("stat rootfs identity before verification: {error}"),
+            }
+        })?;
+        let identity_before = (identity_before.dev(), identity_before.ino());
         let actual_hex = Self::verify_asset_tree(&canon, expected_owner_uid)?;
         if actual_hex != expected_hex {
             return Err(AssetRegistryError::DigestMismatch {
@@ -679,9 +696,28 @@ impl GvisorAssetRegistry {
             });
         }
 
+        let identity_after = std::fs::symlink_metadata(&canon).map_err(|error| {
+            AssetRegistryError::InvalidRootfsPath {
+                rootfs: canon.clone(),
+                reason: format!("stat rootfs identity after verification: {error}"),
+            }
+        })?;
+        let identity_after = (identity_after.dev(), identity_after.ino());
+        if identity_after != identity_before {
+            return Err(AssetRegistryError::InvalidRootfsPath {
+                rootfs: canon,
+                reason: format!(
+                    "rootfs identity changed during digest verification (started \
+                     {identity_before:?}, ended {identity_after:?})"
+                ),
+            });
+        }
+
         Ok(VerifiedRootfs {
             path: canon,
             digest_hex: actual_hex,
+            device: identity_before.0,
+            inode: identity_before.1,
         })
     }
 

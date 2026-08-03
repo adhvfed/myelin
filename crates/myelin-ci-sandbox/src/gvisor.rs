@@ -2124,6 +2124,15 @@ pub struct GvisorBackend {
     /// The boot-validated checkout repository root selection. Constructors initialize it disabled;
     /// the activated runner composition replaces it with its boot-validated enabled config.
     checkout: GvisorCheckoutConfig,
+    /// CT-007 #26/#27: the per-job rootfs copy-on-write overlay manager. When `Some`, EVERY launch's
+    /// guest root is a fresh per-job OverlayFS merged view whose read-only lower is the once-verified
+    /// base inode — so all host-side mount-target creation and gofer writes land in the per-job upper
+    /// and the shared, digest-pinned base tree is NEVER mutated across jobs (the #26 base-immutability
+    /// property; the #27 verify-to-use fd-binding + identity re-check lives inside the manager). `None`
+    /// (every existing constructor's default, and the git-wire path) uses the verified base directly —
+    /// the exact pre-integration behavior, so all existing callers/tests are byte-unchanged. Opt in
+    /// via [`Self::with_rootfs_overlay_manager`]; production enables it in the runner composition.
+    rootfs_overlay: Option<Arc<crate::rootfs_overlay::RootfsOverlayManager>>,
 }
 
 /// Backend-level workspace/user-namespace integration — a SINGLE enum, never two independent
@@ -2925,6 +2934,29 @@ pub struct ContainerRun {
     pub run_error: Option<String>,
 }
 
+/// The guest root materialized for ONE launch (CT-007 #26/#27). `path` is what the launch stages as
+/// `root.path` and precreates mount targets under. When `overlay` is `Some`, that path is a per-job
+/// OverlayFS merged view and the held [`RootfsOverlay`](crate::rootfs_overlay::RootfsOverlay) guard
+/// keeps the mount + its fd-bound lower alive for the whole launch and tears the overlay down on
+/// drop (which the launch schedules AFTER `run(...)` returns — i.e. after runsc has exited and the
+/// OCI bundle was cleaned). When `overlay` is `None`, `path` is the verified base itself and there is
+/// nothing to tear down: the exact pre-integration behavior.
+struct JobGuestRoot {
+    path: PathBuf,
+    // A pure RAII teardown guard: never read, held only so the per-job OverlayFS mount + its fd-bound
+    // lower stay alive for the whole launch and are unmounted/removed on drop (scheduled AFTER
+    // `run(...)` returns). `None` when no overlay manager is installed.
+    #[allow(dead_code)]
+    overlay: Option<crate::rootfs_overlay::RootfsOverlay>,
+}
+
+impl JobGuestRoot {
+    /// The path to stage as `root.path` / precreate mount targets under for this launch.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl GvisorBackend {
     /// A new backend with no live containers, resolving every ordinary (non-git-wire) launch's
     /// `spec.image` through `registry` — the real launch authority (CT-007 gate 2/4). There is no
@@ -2936,6 +2968,7 @@ impl GvisorBackend {
             registry: Some(registry),
             workspace_integration: WorkspaceIntegration::Disabled,
             checkout: GvisorCheckoutConfig::disabled(),
+            rootfs_overlay: None,
         }
     }
 
@@ -2953,6 +2986,7 @@ impl GvisorBackend {
             registry: None,
             workspace_integration: WorkspaceIntegration::Disabled,
             checkout: GvisorCheckoutConfig::disabled(),
+            rootfs_overlay: None,
         }
     }
 
@@ -3043,6 +3077,7 @@ impl GvisorBackend {
             registry: Some(registry),
             workspace_integration,
             checkout: GvisorCheckoutConfig::disabled(),
+            rootfs_overlay: None,
         })
     }
 
@@ -3053,6 +3088,65 @@ impl GvisorBackend {
     pub fn with_checkout_config(mut self, checkout: GvisorCheckoutConfig) -> GvisorBackend {
         self.checkout = checkout;
         self
+    }
+
+    /// CT-007 #26/#27: install the per-job rootfs CoW overlay manager (the runner composition builds
+    /// and initializes it ONCE at startup — [`RootfsOverlayManager::initialize`] enters the runner's
+    /// private mount namespace under [`RootfsOverlayMode::OverlayFs`] before any worker thread is
+    /// spawned). Once installed, EVERY compute/checkout launch derives its guest root as a fresh
+    /// per-job overlay ([`Self::materialize_job_guest_root`]) instead of mounting the shared base tree
+    /// directly, so the digest-pinned base never drifts across jobs.
+    #[allow(dead_code)]
+    pub fn with_rootfs_overlay_manager(
+        mut self,
+        manager: Arc<crate::rootfs_overlay::RootfsOverlayManager>,
+    ) -> GvisorBackend {
+        self.rootfs_overlay = Some(manager);
+        self
+    }
+
+    /// Derive the guest root for ONE job. With a rootfs overlay manager installed (#26/#27) this
+    /// mints a fresh per-job OverlayFS view whose read-only lower is the once-verified base inode
+    /// (the returned [`JobGuestRoot`] owns the teardown guard for the whole launch); without one it
+    /// returns the verified base path directly, byte-for-byte the pre-integration behavior. Either
+    /// way [`JobGuestRoot::path`] is what the caller stages as `root.path` and precreates mount
+    /// targets under — so when the overlay is active every such write lands in the per-job upper, not
+    /// the shared base.
+    ///
+    /// `job_key` must be a safe single path component; the caller passes the freshly minted container
+    /// id, which already satisfies that.
+    fn materialize_job_guest_root(
+        &self,
+        verified_rootfs: &crate::asset_registry::VerifiedRootfs,
+        job_key: &str,
+    ) -> Result<JobGuestRoot, String> {
+        match &self.rootfs_overlay {
+            None => Ok(JobGuestRoot {
+                path: verified_rootfs.path().to_path_buf(),
+                overlay: None,
+            }),
+            Some(manager) => {
+                // The host-visible merged root is owned by THIS runner process (the euid runsc/the
+                // gofer run as), so mount-target precreation and gofer opens can traverse it; chown to
+                // self needs no CAP_CHOWN. `root.readonly=true` still makes the guest see `/` as
+                // read-only — the writable upper only absorbs HOST-side layout, it never grants the
+                // untrusted workload a writable guest root.
+                let workload_root = crate::rootfs_overlay::WorkloadRootPermissions::new(
+                    // SAFETY: `geteuid`/`getegid` are always-successful, side-effect-free syscalls.
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                    0o755,
+                )
+                .map_err(|error| format!("derive per-job overlay root permissions: {error}"))?;
+                let overlay = manager
+                    .create_overlay(verified_rootfs, job_key, workload_root)
+                    .map_err(|error| format!("create per-job rootfs overlay: {error}"))?;
+                Ok(JobGuestRoot {
+                    path: overlay.path().to_path_buf(),
+                    overlay: Some(overlay),
+                })
+            }
+        }
     }
 
     /// Build the OCI config a launch WOULD use for `spec` (the hardened profile derived + the OCI
@@ -3292,6 +3386,25 @@ impl GvisorBackend {
         )
             -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure>,
     {
+        // CT-007 #26/#27: derive THIS job's guest root before building the OCI layout. With a rootfs
+        // overlay manager installed, `job_guest_root.path()` is a fresh per-job OverlayFS merged view
+        // (verified base as the read-only lower); every use of the base path below — the workspace
+        // layout's `absolute_rootfs`, the cargo-vendor mount-target precreation, and the staged
+        // `root.path` — flows through it, so mount-target creation and gofer writes land in the per-job
+        // upper and never mutate the shared pinned base. Without a manager it IS the verified base
+        // (unchanged behavior). The guard is held for the whole call and torn down after `run()`.
+        let job_guest_root = match self.materialize_job_guest_root(verified_rootfs, &container_id) {
+            Ok(root) => root,
+            Err(message) => {
+                return Err(self.dispose_run_failure(
+                    spec,
+                    hooks,
+                    &reserve,
+                    RunFailure::uncommitted(format!("per-job rootfs overlay: {message}")),
+                ));
+            }
+        };
+
         // CT-007 slice 3, piece 7c: acquire capacity + a userns lease + a real workspace, and
         // build the explicit-userns OCI layout from them — `Disabled` keeps the plain Rootless
         // `cfg` unchanged. `enabled_context` is `Some` for the REST of this call's lifetime
@@ -3307,7 +3420,7 @@ impl GvisorBackend {
                 spec,
                 &profile,
                 &container_id,
-                verified_rootfs.path().to_path_buf(),
+                job_guest_root.path().to_path_buf(),
                 workspace_manager,
                 userns_allocator,
                 cargo_vendor,
@@ -3435,7 +3548,7 @@ impl GvisorBackend {
             spec,
             &cfg,
             launch_permit,
-            verified_rootfs.path(),
+            job_guest_root.path(),
             &container_id,
             prep,
         );
@@ -4323,6 +4436,21 @@ impl GvisorBackend {
         let verified_rootfs = registry
             .resolve(&spec.image)
             .map_err(|e| CheckoutOrchestrationError::Hook(HookError(e.to_string())))?;
+        // CT-007 #26/#27: derive THIS job's per-job CoW guest root up front (same mechanism the
+        // compute path uses in `launch_compute_common_body`). With a rootfs overlay manager installed,
+        // `checkout_guest_root.path()` is a fresh per-job OverlayFS merged view (verified base as the
+        // read-only lower) — so the checkout workload's `root.path` and its mount-target precreation
+        // land in the per-job upper, never the shared pinned base. The guard is held across the whole
+        // orchestration and torn down on drop; a failure here (or any early return below) cleans it up.
+        // Without a manager it is the verified base itself — the exact pre-integration behavior.
+        let checkout_guest_root = self
+            .materialize_job_guest_root(
+                verified_rootfs,
+                &format!("checkout-{}-{}", std::process::id(), unique_suffix()),
+            )
+            .map_err(|e| {
+                CheckoutOrchestrationError::Hook(HookError(format!("per-job rootfs overlay: {e}")))
+            })?;
         let cargo_vendor = selected_cargo_vendor(spec, registry)
             .map_err(|e| CheckoutOrchestrationError::Hook(HookError(e)))?;
         let (workspace_manager, userns_allocator) = match &self.workspace_integration {
@@ -4499,7 +4627,7 @@ impl GvisorBackend {
         let runtime = match checkout_runtime::AcquiredCheckoutRuntime::acquire(
             spec,
             &profile,
-            verified_rootfs.path().to_path_buf(),
+            checkout_guest_root.path().to_path_buf(),
             workspace_manager,
             userns_allocator,
             cargo_vendor,
@@ -4556,7 +4684,7 @@ impl GvisorBackend {
             runtime,
             preparation_spec,
             workspace_manager,
-            verified_rootfs.path(),
+            checkout_guest_root.path(),
         )
     }
 }
@@ -13940,6 +14068,154 @@ mod tests {
         ));
         assert!(!userns_called.load(Ordering::SeqCst));
         assert!(!workspace_called.load(Ordering::SeqCst));
+    }
+
+    /// CT-007 #26/#27 INTEGRATION PROOF — the reproduced release blocker (gate-2 green drill,
+    /// 2026-08-03): a build job MUTATED the shared digest-pinned base rootfs on the host (its
+    /// canonical digest drifted `91ffb0fa… -> eb7248a1…` after one job), so the NEXT runner startup
+    /// panicked `DigestMismatch` at asset re-verify. Cause: per-job mount-target creation / gofer
+    /// writes landed in the SHARED base tree instead of a per-job ephemeral layer.
+    ///
+    /// This drives a REAL launch through `launch_with` -> `launch_compute_common_body` with a per-job
+    /// rootfs overlay manager installed (deterministic mode: no `CAP_SYS_ADMIN`/kernel OverlayFS
+    /// needed, but the SAME integration seam production uses — `materialize_job_guest_root` substitutes
+    /// the overlay merged view for the base everywhere the base path flowed). The injected run closure
+    /// stands in for runsc + the gofer: it WRITES into the guest root it is handed (a new mount-target
+    /// directory + file, and a delete of a base file), exactly the host-side layout mutation that
+    /// corrupted the base before. The property whose violation caused the panic is asserted directly:
+    /// the base tree's canonical digest is BYTE-IDENTICAL before and after the job, and none of the
+    /// job's writes reached the base — they were absorbed by the per-job overlay (a DIFFERENT path).
+    #[test]
+    fn compute_launch_guest_root_is_a_per_job_overlay_leaving_the_base_byte_pristine() {
+        use crate::asset_registry::{GvisorAssetRegistry, RootfsAssetBinding};
+        use crate::rootfs_overlay::{RootfsOverlayManager, RootfsOverlayMode};
+        use crate::{canonical_tree_sha256_hex, ImageRef};
+
+        // A dedicated, isolated pinned base rootfs tree (never the shared per-process fixture dir).
+        let root = std::env::temp_dir().join(format!(
+            "myelin-overlay-integration-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let base = root.join("pinned-base");
+        let overlays = root.join("overlays");
+        std::fs::create_dir_all(base.join("etc")).unwrap();
+        std::fs::create_dir(base.join("workspace")).unwrap();
+        std::fs::create_dir_all(base.join("opt/myelin/cargo-vendor")).unwrap();
+        std::fs::write(base.join("etc/keep"), b"keep").unwrap();
+        std::fs::write(base.join("delete-me"), b"delete").unwrap();
+        let digest = canonical_tree_sha256_hex(&base).unwrap();
+        let image = ImageRef::pinned(format!("test.local/overlay-int@sha256:{digest}")).unwrap();
+
+        let registry = Arc::new(
+            GvisorAssetRegistry::from_bindings(vec![RootfsAssetBinding {
+                image: image.clone(),
+                rootfs: base.clone(),
+            }])
+            .expect("the pinned base verifies"),
+        );
+        let manager = Arc::new(
+            RootfsOverlayManager::initialize(
+                RootfsOverlayMode::DeterministicDirectoryForTests {
+                    overlays_dir: overlays.clone(),
+                },
+                Arc::new(|_message: &str| {}),
+            )
+            .expect("the deterministic overlay manager initializes"),
+        );
+        let backend = GvisorBackend::new(registry).with_rootfs_overlay_manager(manager);
+
+        // A minimal image-bearing compute spec resolving to the pinned base above.
+        let job = JobSpec::new(
+            JobKind::Agent,
+            image,
+            vec!["true".into()],
+            vec![],
+            vec![],
+            EgressPolicy { allow: vec![] },
+            ResourceLimits {
+                cpu_millis: 1000,
+                mem_bytes: 256 << 20,
+                disk_bytes: 1 << 30,
+                tmpfs_bytes: 1 << 30,
+                pids_max: 64,
+                timeout_secs: 120,
+            },
+            WorkspaceSpec::default(),
+            TrustTier::UntrustedFork,
+            RunTokenCredential::new("test-bearer", "j", 300).unwrap(),
+            MeterTarget {
+                reserve_id: "r".into(),
+            },
+            IdemToken("idem-overlay-int-1".into()),
+        )
+        .unwrap();
+
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec: &JobSpec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_spec| Ok(())),
+            Box::new(|_spec| Ok(())),
+        );
+
+        let base_digest_before = canonical_tree_sha256_hex(&base).unwrap();
+        let observed_root = Arc::new(Mutex::new(None::<PathBuf>));
+        let seen = observed_root.clone();
+        let base_for_closure = base.clone();
+
+        let launch = backend
+            .launch_with(
+                &job,
+                &hooks,
+                move |_spec, _cfg, _permit, rootfs, _container_id, _prep| {
+                    // The run closure receives the per-job guest root. It MUST be the overlay merged
+                    // view, NOT the shared base.
+                    assert_ne!(
+                        rootfs, base_for_closure,
+                        "the launch must NOT hand runsc the shared pinned base as its guest root"
+                    );
+                    // The merged view is a fully-populated copy of the verified base.
+                    assert_eq!(std::fs::read_to_string(rootfs.join("etc/keep")).unwrap(), "keep");
+                    // Simulate the exact host-side mutation that corrupted the base before: create a
+                    // fresh mount-target directory + file, and delete a base file. All must land in
+                    // the per-job upper, never the shared base.
+                    std::fs::create_dir(rootfs.join("workspace/gofer-mount-target")).unwrap();
+                    std::fs::write(rootfs.join("workspace/gofer-mount-target/x"), b"job-write")
+                        .unwrap();
+                    std::fs::remove_file(rootfs.join("delete-me")).unwrap();
+                    *seen.lock().unwrap() = Some(rootfs.to_path_buf());
+                    Ok(fake_finalization())
+                },
+            )
+            .expect("the compute path launches");
+        assert!(launch.output_complete);
+
+        // THE property whose violation caused the DigestMismatch panic: the shared pinned base is
+        // byte-identical before and after the job.
+        assert_eq!(
+            canonical_tree_sha256_hex(&base).unwrap(),
+            base_digest_before,
+            "the pinned base rootfs digest must be byte-identical after a job that wrote to its root"
+        );
+        // None of the job's host-side writes reached the base tree.
+        assert!(
+            base.join("delete-me").exists(),
+            "a base file the job deleted (in the overlay) must still exist in the base"
+        );
+        assert!(
+            !base.join("workspace/gofer-mount-target").exists(),
+            "a mount target the job created (in the overlay) must NOT appear in the base"
+        );
+        // The guest root the run closure actually saw was a distinct per-job overlay path.
+        let observed = observed_root.lock().unwrap().clone().expect("run observed a root");
+        assert_ne!(observed, base, "the guest root was a per-job overlay, not the base");
+        assert!(
+            observed.starts_with(&overlays),
+            "the per-job overlay lives under the manager's overlay root: {observed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn ok_hooks() -> RunnerHooks {
@@ -25435,6 +25711,7 @@ pub mod checkout_transport_test_support {
                 userns_allocator,
             },
             checkout: GvisorCheckoutConfig::disabled(),
+            rootfs_overlay: None,
         };
         (backend, image)
     }

@@ -76,6 +76,7 @@ pub use redaction::{
     ResolvedJobSecrets, ResolvedSecretEnv, SecretInjectionError,
 };
 pub mod replay;
+pub mod rootfs_overlay;
 pub mod runner;
 pub mod self_hosted;
 pub mod snapshot_pool;
