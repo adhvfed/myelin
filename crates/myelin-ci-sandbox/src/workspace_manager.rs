@@ -2198,6 +2198,7 @@ mod tests {
     /// Boot-time reconciliation actually deletes a pre-existing orphan (simulating a prior
     /// process's crash mid-job) BEFORE the manager ever reports `Healthy`.
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn boot_reconciliation_deletes_a_preexisting_orphan_before_reporting_healthy() {
         let base = btrfs_test_base("boot-reconcile");
         if !ephemeral_disk_available(&base) {
@@ -2238,6 +2239,7 @@ mod tests {
     /// re-check) against a REAL Btrfs backend that is genuinely still healthy — proving the happy
     /// path re-validates in place rather than merely never being exercised.
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn check_health_succeeds_against_a_real_still_healthy_backend() {
         let base = btrfs_test_base("health-check-real-happy-path");
         if !ephemeral_disk_available(&base) {
@@ -2262,6 +2264,7 @@ mod tests {
     /// confirming it disappears from disk, its `job_key` leaves the active set, and its capacity
     /// is released back to the pool.
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn create_workspace_then_delete_workspace_releases_capacity_and_clears_active_job_id() {
         let base = btrfs_test_base("create-then-delete");
         if !ephemeral_disk_available(&base) {
@@ -2310,6 +2313,7 @@ mod tests {
     /// separately fire the generic `CapacityLease` abandonment message on top of it, since the
     /// capacity lease is abandoned together with (not independently of) the workspace it backs.
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn dropping_a_managed_workspace_without_deleting_poisons_the_manager_with_one_incident() {
         let base = btrfs_test_base("drop-without-delete");
         if !ephemeral_disk_available(&base) {

@@ -96,6 +96,18 @@ sha2.workspace = true
 
 [features]
 test-support = []
+# CT-007 gate-4: opt-in lane for the substrate-requiring unit tests. OFF by default (and NOT in
+# `default`), so the hermetic workspace `cargo test --lib` — which runs unprivileged in gVisor with
+# `--network=none`, no delegated cgroup v2, no btrfs, no staged gvisor-assets, HOME=/nonexistent —
+# sees every such test as `ignored` (honest, still type-checked) and the test lane goes GREEN in ANY
+# environment. Turn it ON only on the privileged HOST/dogfood lane
+# (`--features myelin-ci-sandbox/privileged-host-tests`, alongside the `test-support` that workspace
+# feature-unification already supplies there) to actually exercise those tests against real substrate:
+# real delegated cgroup v2, btrfs subvolumes, a real runsc + staged `gvisor-assets/git-rootfs`, a real
+# user namespace, and real host filesystem symlink/O_NOFOLLOW semantics. Coverage is not lost, only
+# relocated to the lane that can run it. Kept a leaf `= []` (never enables `test-support` itself) so a
+# stray `--features privileged-host-tests` can never silently pull in more than the ignore-flip.
+privileged-host-tests = []
 # Two REAL live-stack proofs, both DB/VM-free by default:
 #   - tests/hardened_boot_selftest.rs (CI-P2) boots a Firecracker microVM with the full hardening
 #     profile ON; gated to SKIP gracefully without /dev/kvm or `firecracker`.

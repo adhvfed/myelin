@@ -1752,6 +1752,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn full_privileged_lifecycle_create_quota_verify_exceed_delete_sync() {
         let Some(mut storage) = open_or_skip_privileged("lifecycle") else {
             return;
@@ -1816,6 +1817,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn zero_quota_is_rejected() {
         // No CAP_SYS_ADMIN needed — quota_bytes==0 is rejected before any btrfs call at all.
         let Some(mut storage) = open_or_skip_env("zero-quota") else {
@@ -1831,6 +1833,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn orphan_listing_verifies_before_filtering_and_finds_the_real_orphan() {
         let Some(mut storage) = open_or_skip_privileged("orphan-listing") else {
             return;
@@ -1870,6 +1873,7 @@ mod tests {
     /// DIFFERENT one, even though `PreparedWorkspace`'s fields are private (private fields alone
     /// prevented forgery, not misdirected use of a genuinely-minted capability).
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn a_capability_from_one_storage_is_refused_by_another() {
         let Some(mut storage_a) = open_or_skip_privileged("cross-storage-a") else {
             return;
@@ -1924,6 +1928,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn orphan_listing_reports_a_non_subvolume_entry_loudly_even_if_its_name_is_active() {
         // No CAP_SYS_ADMIN needed — listing only stats + reads rootid, neither privileged.
         let Some(mut storage) = open_or_skip_env("stray-entry") else {

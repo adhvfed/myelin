@@ -18166,6 +18166,7 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn quiesce_succeeds_on_an_empty_real_cgroup_and_removes_it() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -18180,6 +18181,7 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn quiesce_kills_a_descendant_detached_outside_the_runtime_process_group() {
         // The whole point of `cgroup.kill` (over a mere process-group signal) is that it reaches
         // EVERY member of the cgroup subtree, regardless of session/process-group — including a
@@ -18243,6 +18245,7 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn quiesce_succeeds_without_the_caller_ever_reaping_a_killed_direct_child() {
         // `populated` tracks LIVENESS, not reap status — quiesce() must not depend on the caller
         // having `wait()`-ed its child first, only on `cgroup.kill` having actually killed it.
@@ -18270,6 +18273,7 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn quiesce_refuses_to_mint_evidence_when_an_unexpected_child_cgroup_blocks_removal() {
         // `populated=0` can be true (this cgroup itself holds no processes) while `rmdir` still
         // refuses because a child cgroup exists underneath it — quiescence must not be treated as
@@ -18298,6 +18302,7 @@ mod tests {
     /// silently giving up because THIS attempt failed.
     #[cfg(feature = "test-support")]
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn drop_retries_removal_after_an_earlier_failed_cleanup_call() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -18365,6 +18370,7 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn quiesce_detects_an_identity_change_and_refuses_to_mint_evidence() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -18426,6 +18432,7 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn launch_watchdog_cgroup_kills_a_descendant_outside_the_runtime_process_group() {
         use std::time::Instant;
         let cgroup = MemoryCgroup::create(64 << 20, 1000)
@@ -19610,6 +19617,7 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn finalize_runtime_mints_evidence_on_a_clean_rootless_teardown() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -19638,6 +19646,7 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn finalize_runtime_refuses_when_the_direct_child_was_not_confirmed_reaped() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -19666,6 +19675,7 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn finalize_runtime_refuses_when_the_container_delete_is_not_confirmed() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -19694,6 +19704,7 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn finalize_runtime_skips_the_delete_but_still_quiesces_when_namespace_identity_drifts() {
         // `/bin/false` stands in for a `runsc delete` that would fail — but it must never even be
         // invoked here, since the (injected) namespace-identity revalidation reports a drift first.
@@ -19739,6 +19750,7 @@ mod tests {
     /// cgroup identities.
     #[cfg(feature = "test-support")]
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn finalize_runtime_mints_explicit_userns_evidence_when_the_identity_still_matches() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -20527,6 +20539,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
         fn checkout_script_gitlink_check_passes_a_clean_commit() {
             let repo = temp_dir_for("gitlink-check-clean");
             drill_git_ok(&["init", "-q", "-b", "main"], &repo);
@@ -20550,6 +20563,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
         fn checkout_script_gitlink_check_refuses_a_gitlink() {
             let repo = temp_dir_for("gitlink-check-refuses");
             drill_git_ok(&["init", "-q", "-b", "main"], &repo);
@@ -20588,6 +20602,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
         fn checkout_script_gitlink_check_fails_closed_when_ls_tree_itself_fails() {
             let repo = temp_dir_for("gitlink-check-ls-tree-fails");
             drill_git_ok(&["init", "-q", "-b", "main"], &repo);
@@ -20647,6 +20662,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
         fn verify_workspace_head_refuses_a_symlinked_git_directory() {
             let ws = temp_dir_for("symlink-git");
             let real = temp_dir_for("symlink-git-target");
@@ -22225,6 +22241,7 @@ mod tests {
             // ---- happy path ----
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn happy_path_executes_exactly_two_immediate_gated_hops_and_checked_adds_usage() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xd1);
@@ -22304,6 +22321,7 @@ mod tests {
             }
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn a_lost_preparation_lease_refuses_between_advertise_and_fetch_and_retains_usage() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xd9);
@@ -22370,6 +22388,7 @@ mod tests {
             }
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn a_live_preparation_lease_checkpoint_lets_hop_a_complete() {
                 struct LiveCheckpoint {
                     calls: std::sync::Mutex<u32>,
@@ -22426,6 +22445,7 @@ mod tests {
             // ---- every failure point retains usage already incurred ----
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn advertisement_parse_failure_retains_advertisement_usage() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xd2);
@@ -22479,6 +22499,7 @@ mod tests {
             }
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn fetch_pre_spawn_failure_retains_advertisement_usage() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xd3);
@@ -22535,6 +22556,7 @@ mod tests {
             }
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn fetch_post_spawn_executed_failure_retains_advertisement_plus_fetch_usage() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xd4);
@@ -22602,6 +22624,7 @@ mod tests {
             // ---- arithmetic overflow refuses loudly ----
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn usage_aggregation_overflow_refuses_loudly() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xd5);
@@ -22683,6 +22706,7 @@ mod tests {
             // ---- teardown-unproven is distinct and still carries usage ----
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn kill_failure_on_a_successful_hop_yields_teardown_unproven_and_retains_usage() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xd6);
@@ -22738,6 +22762,7 @@ mod tests {
             }
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn truncated_output_combined_with_kill_failure_preserves_both_messages() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xd7);
@@ -22792,6 +22817,7 @@ mod tests {
             }
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn run_error_combined_with_kill_failure_preserves_both_messages() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xd8);
@@ -22851,6 +22877,7 @@ mod tests {
             // ---- no live handle or bundle remains after return, on ANY path ----
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn successful_transport_leaves_no_bundle_dirs_behind() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xd9);
@@ -22938,6 +22965,7 @@ mod tests {
             // accepted just because its stdout happens to parse ----
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn not_passed_advertisement_is_never_accepted_as_success() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xda);
@@ -22985,6 +23013,7 @@ mod tests {
             }
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn not_passed_fetch_is_never_accepted_as_success() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xdb);
@@ -23055,6 +23084,7 @@ mod tests {
             // outcome (RuntimeFinalization::Failed) must never be collapsed into an ordinary Failed ----
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn production_shaped_teardown_failure_is_reported_as_teardown_unproven() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xdc);
@@ -23148,6 +23178,7 @@ mod tests {
             // ---- Sol's round-1 review, blocker 4: numerical usage is not a lifecycle marker ----
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn zero_usage_advertisement_then_fetch_pre_spawn_failure_is_still_failed_not_refused() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xdd);
@@ -23211,6 +23242,7 @@ mod tests {
             // must never be silently reported as the free `Refused` ----
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn bundle_cleanup_failure_forces_teardown_unproven_even_on_the_first_hop() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xde);
@@ -23287,6 +23319,7 @@ mod tests {
             // simultaneous guest-result failure ----
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn non_passing_result_inside_a_teardown_failure_preserves_both_reasons() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xdf);
@@ -23377,6 +23410,7 @@ mod tests {
             // failure must not erase it ----
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn commit_outcome_unknown_inside_a_teardown_failure_is_still_teardown_unproven() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xe0);
@@ -23459,6 +23493,7 @@ mod tests {
             // TeardownUnproven even when the hop's own result is Ok ----
 
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn bundle_cleanup_failure_forces_teardown_unproven_even_on_an_otherwise_successful_hop()
             {
                 let root = staged_repo_root();
@@ -23734,6 +23769,7 @@ mod tests {
             /// **Advertisement succeeds but the fetch mint refuses: the fetch never spawns, and the
             /// advertisement's already-measured usage survives into the error.**
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn a_refused_fetch_mint_never_spawns_the_fetch_and_keeps_the_advertisement_usage() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xd3);
@@ -23803,6 +23839,7 @@ mod tests {
             /// The fetch provider returning a WRONG-PHASE authorization, a MISMATCHED credential, or
             /// the SAME generation as the advertisement all refuse — and the fetch never spawns.
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn a_divergent_fetch_authorization_refuses_before_the_fetch_spawns() {
                 type Provider =
                     Box<dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>>;
@@ -23930,6 +23967,7 @@ mod tests {
             /// **The V2 happy path: each leg spawns under its OWN credential and its OWN durable
             /// phase permit.** This is what makes a >5-minute Hop A survivable at all.
             #[test]
+            #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
             fn the_v2_transport_spawns_each_leg_under_its_own_credential_and_phase_permit() {
                 let root = staged_repo_root();
                 let oid = sha1_oid(0xd5);
@@ -24892,6 +24930,7 @@ mod tests {
         /// `--features test-support` (the deterministic substrate this whole slice rests on).
         #[cfg(feature = "test-support")]
         #[test]
+        #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
         fn orchestrated_checkout_drives_two_gated_hops_to_a_clean_workload_launch() {
             use crate::checkout_orchestration::CheckoutContinuationOutcome;
             use crate::gvisor::checkout_transport_test_support::stage_checkout_repo_root;

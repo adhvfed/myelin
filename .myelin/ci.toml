@@ -1,17 +1,28 @@
-# Founder-dogfood pipeline. The single job is intentionally small: it proves the complete
-# push -> dispatch -> sandbox -> durable logs -> check projection path without spending a hosted
-# build. Its bounded two-minute observation window is long enough to attach the required CLI and
-# browser live consumers before the marker is emitted. The image digest is the canonical-tree
-# SHA-256 of the staged linux-small-v1 rootfs used by this personal-production cell, including the
-# empty precreated /workspace bind target so repeated jobs never mutate the verified tree; P0
-# replaces this one-cell binding with the release supply-chain.
+# Founder-dogfood pipeline — CT-007 gate-4 cutover. A real 3-job build/test/clippy DAG on
+# Myelin's OWN workspace, executed offline in gVisor by the dogfood runner. This is the pipeline
+# that replaces GitHub Actions: `build` compiles the whole workspace from the pinned full-workspace
+# Cargo vendor (`--locked`, --network=none), then `test` (unit `--lib`) and `clippy`
+# (`--all-targets -D warnings`) fan out from it. The image is the canonical-tree SHA-256 of the
+# staged linux-rust-v1 (Rust-capable) rootfs pinned in runner-assets.toml.
 schema_version = 2
 on = "push"
 
 [execution]
-profile = "linux-small-v1"
+profile = "linux-build-v1"
 
 [[jobs]]
 name = "build"
-image = "myelin.local/linux-small-v1-rootfs@sha256:65f0f6f242cd4412b4ad56250eadb0a459a59a71b49d21485e68da6a3d5cb975"
-command = ["/bin/sh", "-c", "printf '%s\\n' 'myelin-ci-acceptance-window-open'; /bin/sleep 120; printf '%s\\n' 'MYELIN-CI-a005e32fc1bb0c2b64e7d40ac1a01236'"]
+image = "myelin.local/linux-rust-v1-rootfs@sha256:e6684d70e026a1433a7e32e2d29c100468d08579ef532834fdd27d4808c35a60"
+build = { tool = "cargo", args = ["build", "--locked"] }
+
+[[jobs]]
+name = "test"
+image = "myelin.local/linux-rust-v1-rootfs@sha256:e6684d70e026a1433a7e32e2d29c100468d08579ef532834fdd27d4808c35a60"
+build = { tool = "cargo", args = ["test", "--locked", "--lib"] }
+needs = ["build"]
+
+[[jobs]]
+name = "clippy"
+image = "myelin.local/linux-rust-v1-rootfs@sha256:e6684d70e026a1433a7e32e2d29c100468d08579ef532834fdd27d4808c35a60"
+build = { tool = "cargo", args = ["clippy", "--locked", "--all-targets", "--", "-D", "warnings"] }
+needs = ["build"]

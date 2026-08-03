@@ -4429,6 +4429,7 @@ mod tests {
     /// necessarily owned by the test process), which is a real, separate, ALSO-correct refusal but
     /// not the one this test targets.
     #[test]
+    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests")]
     fn open_dir_component_no_follow_refuses_a_symlinked_component() {
         let base = test_base("symlinked-ancestor");
         std::fs::create_dir_all(&base).unwrap();
