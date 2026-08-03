@@ -112,6 +112,7 @@ fn valid_plan_v2() -> ResolvedRunPlanV2 {
         image: job.image,
         command: job.command,
         build: None,
+        selected_cargo_vendor: None,
         needs: job.needs,
         is_generator: job.is_generator,
         matrix_key: job.matrix_key,
@@ -281,6 +282,48 @@ fn structured_cargo_recipe_is_canonical_and_constructs_direct_argv() {
         .platform_argv()
         .iter()
         .any(|arg| arg == "/bin/sh" || arg == "-c"));
+}
+
+/// **Wire byte-stability for the additive `selected_cargo_vendor` field (CT-007 gate 4, blocker 1).**
+/// A legacy V2 producer that never sets the field emits canonical bytes with NO `selected_cargo_vendor`
+/// key (proven byte-for-byte against `version_two_canonical_wire_...`'s pinned string), and those
+/// legacy bytes still decode and re-serialize byte-identically. A plan that DOES carry a selection
+/// round-trips through decode with the field preserved, and its canonical bytes DO carry the key.
+#[test]
+fn selected_cargo_vendor_is_additive_and_byte_stable_on_the_v2_wire() {
+    // (a) Legacy V2 without the field: the key never appears, and the exact bytes round-trip.
+    let legacy = structured_cargo_plan_v2();
+    assert!(legacy.jobs[0].selected_cargo_vendor.is_none());
+    let legacy_bytes = legacy.canonical_bytes().expect("legacy V2 canonical bytes");
+    assert!(
+        !String::from_utf8_lossy(&legacy_bytes).contains("selected_cargo_vendor"),
+        "a legacy producer must never emit the additive key"
+    );
+    let redecoded = decode_resolved_run_plan(&legacy_bytes).expect("legacy V2 decodes");
+    assert_eq!(redecoded.canonical_bytes().unwrap(), legacy_bytes);
+
+    // (b) A plan carrying a stamped, server-selected vendor: the key IS present, and decode
+    //     preserves the exact reference; re-serialization is byte-identical.
+    let mut selected = structured_cargo_plan_v2();
+    let reference = myelin_ci_sandbox::cargo_vendor_smoke_reference();
+    selected.jobs[0].selected_cargo_vendor = Some(reference.clone());
+    let selected_bytes = selected.canonical_bytes().expect("selected V2 canonical bytes");
+    assert!(String::from_utf8_lossy(&selected_bytes)
+        .contains(&format!("\"selected_cargo_vendor\":\"{reference}\"")));
+    let decoded = decode_resolved_run_plan(&selected_bytes).expect("selected V2 decodes");
+    assert_eq!(decoded, VersionedResolvedRunPlan::V2(selected.clone()));
+    assert_eq!(decoded.canonical_bytes().unwrap(), selected_bytes);
+
+    // The two wires are genuinely different bytes: the field is not a no-op.
+    assert_ne!(legacy_bytes, selected_bytes);
+
+    // (c) A selection on a NON-build job is refused fail-closed by wire validation.
+    let mut bogus = valid_plan_v2();
+    bogus.jobs[0].selected_cargo_vendor = Some(reference);
+    assert!(matches!(
+        bogus.canonical_bytes(),
+        Err(RunPlanError::InvalidPlan { detail }) if detail.contains("vendor selection without a structured build")
+    ));
 }
 
 #[test]

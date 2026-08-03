@@ -757,11 +757,18 @@ fn deserialize_ci_config<T: DeserializeOwned>(
 mod tests {
     use super::*;
     use crate::resolve::{
-        resolve_snapshot, resolve_versioned_snapshot, CiPlanContract, ResolveError,
-        ResolvedSnapshot, ResolvedSnapshotExt, VersionedCiDefinition, VersionedResolvedSnapshot,
+        resolve_snapshot, resolve_versioned_snapshot, resolve_versioned_snapshot_with_cargo_vendor,
+        CiPlanContract, ResolveError, ResolvedSnapshot, ResolvedSnapshotExt, VersionedCiDefinition,
+        VersionedResolvedSnapshot,
     };
     use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
     use myelin_tenancy::TenantId;
+
+    /// The committed smoke-fixture root `Cargo.lock` — its SHA-256 is
+    /// `CARGO_VENDOR_SMOKE_LOCK_SHA256`, so it selects the registered smoke vendor. Stable across
+    /// dependency bumps (unlike the workspace root lock), keeping these tests deterministic.
+    const SMOKE_CARGO_LOCK: &[u8] =
+        include_bytes!("../../../testing/fixtures/cargo-vendor-smoke/Cargo.lock");
 
     // Digest-pinned images (the resolver's supply-chain floor accepts only `@<algo>:<hex>`).
     const PINNED_BUILD: &str = "registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000";
@@ -947,13 +954,44 @@ build = {{ tool = "cargo", args = ["build", "--locked"] }}
         );
 
         let store = FsBlobStore::new();
-        let (snapshot, _) =
-            resolve_versioned_snapshot(&definition, &store, &TenantId("acme".into())).unwrap();
+        let (snapshot, _) = resolve_versioned_snapshot_with_cargo_vendor(
+            &definition,
+            &store,
+            &TenantId("acme".into()),
+            Some(SMOKE_CARGO_LOCK),
+        )
+        .unwrap();
         let VersionedResolvedSnapshot::V2(plan) = snapshot else {
             panic!("structured builds require and retain the V2 wire")
         };
         assert!(plan.jobs[0].command.is_empty());
         assert!(plan.jobs[0].build.is_some());
+        // The smoke-fixture lock keys the server-trusted smoke vendor, stamped into the build job.
+        assert_eq!(
+            plan.jobs[0].selected_cargo_vendor.as_deref(),
+            Some(myelin_ci_sandbox::cargo_vendor_smoke_reference().as_str())
+        );
+
+        // Fail-closed: a structured build with NO root Cargo.lock cannot select a vendor.
+        assert!(matches!(
+            resolve_versioned_snapshot_with_cargo_vendor(
+                &definition,
+                &FsBlobStore::new(),
+                &TenantId("acme".into()),
+                None,
+            ),
+            Err(ResolveError::CargoVendorLockMissing)
+        ));
+        // Fail-closed: a lock matching no registered vendor is refused, never a default tree.
+        assert!(matches!(
+            resolve_versioned_snapshot_with_cargo_vendor(
+                &definition,
+                &FsBlobStore::new(),
+                &TenantId("acme".into()),
+                Some(b"# not a registered lock\n"),
+            ),
+            Err(ResolveError::CargoVendorUnmatched { .. })
+        ));
 
         let legacy = format!(
             r#"on = "push"
@@ -1012,13 +1050,20 @@ build = {{ tool = "cargo", args = ["build", "--locked"] }}
         );
 
         // The whole DAG still resolves and retains the V2 wire with per-job structured builds.
-        let (snapshot, _) =
-            resolve_versioned_snapshot(&def, &FsBlobStore::new(), &TenantId("acme".into()))
-                .unwrap();
+        let (snapshot, _) = resolve_versioned_snapshot_with_cargo_vendor(
+            &def,
+            &FsBlobStore::new(),
+            &TenantId("acme".into()),
+            Some(SMOKE_CARGO_LOCK),
+        )
+        .unwrap();
         let VersionedResolvedSnapshot::V2(plan) = snapshot else {
             panic!("structured builds require the V2 wire")
         };
         assert!(plan.jobs.iter().all(|job| job.build.is_some()));
+        // Every structured build shares the one server-trusted vendor selected from the root lock.
+        assert!(plan.jobs.iter().all(|job| job.selected_cargo_vendor.as_deref()
+            == Some(myelin_ci_sandbox::cargo_vendor_smoke_reference().as_str())));
 
         // A non-allowlisted recipe (integration tests need live backends `--network=none` blocks).
         let rejected = format!(

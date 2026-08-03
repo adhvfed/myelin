@@ -300,6 +300,14 @@ pub enum ResolveError {
     InvalidPlan(String),
     /// Two expanded jobs resolved to the same concrete machine-token node name.
     ConcreteNameCollision(String),
+    /// A structured Cargo build was authored but the repository's root `Cargo.lock` could not be
+    /// materialized at the pushed ref — the offline vendor tree cannot be selected without it, so the
+    /// build is refused fail-closed (an offline `cargo build --locked` with no lock is unbuildable).
+    CargoVendorLockMissing,
+    /// The repository's root `Cargo.lock` at the pushed ref matches NO registered, server-trusted
+    /// Cargo vendor tree — the structured build is refused fail-closed rather than mounting an
+    /// unregistered or default vendor. Carries the offending lock SHA-256 for a self-describing error.
+    CargoVendorUnmatched { lock_sha256: String },
 }
 
 /// **The hard ceiling on the total number of matrix-expanded job instances a single CI definition may
@@ -342,6 +350,19 @@ impl std::fmt::Display for ResolveError {
             ),
             ResolveError::InvalidPlan(detail) => write!(f, "invalid resolved CI plan: {detail}"),
             ResolveError::ConcreteNameCollision(name) => write!(f, "matrix expansion produced duplicate concrete job name `{name}`"),
+            ResolveError::CargoVendorLockMissing => write!(
+                f,
+                "a structured Cargo build was authored but the repository has no root `Cargo.lock` at \
+                 the pushed ref — refused fail-closed (an offline `cargo build --locked` needs a \
+                 committed lock, and the server-trusted vendor tree is selected from it)"
+            ),
+            ResolveError::CargoVendorUnmatched { lock_sha256 } => write!(
+                f,
+                "the repository's root `Cargo.lock` (sha256:{lock_sha256}) matches no registered, \
+                 server-trusted Cargo vendor tree — the structured build is refused fail-closed \
+                 rather than mounting an unregistered or default vendor (register a vendor built \
+                 from exactly this lock)"
+            ),
         }
     }
 }
@@ -500,6 +521,29 @@ pub fn resolve_versioned_snapshot(
     blobs: &dyn BlobStore,
     tenant: &TenantId,
 ) -> Result<(VersionedResolvedSnapshot, ContentHash), ResolveError> {
+    resolve_versioned_snapshot_with_cargo_vendor(def, blobs, tenant, None)
+}
+
+/// **Resolve with lockfile-keyed Cargo vendor selection (CT-007 gate 4, blocker 1).** Identical to
+/// [`resolve_versioned_snapshot`], but additionally selects the SERVER-TRUSTED, digest-pinned Cargo
+/// vendor tree for every structured build job by matching the repository's ROOT `Cargo.lock` (read
+/// at the pushed ref by the caller — the same ref the `.myelin/ci.*` config was read from) against
+/// the registered vendors, and STAMPS the selected reference into each build job's
+/// [`ResolvedJobV2::selected_cargo_vendor`] so it is content-addressed into the CAS snapshot and
+/// flows to the control-plane lowering.
+///
+/// Fail-closed: if any structured build is present, `root_cargo_lock` MUST be `Some` (else
+/// [`ResolveError::CargoVendorLockMissing`]) and its SHA-256 MUST match a registered vendor (else
+/// [`ResolveError::CargoVendorUnmatched`]). The tenant can therefore only ever be handed a reference
+/// the server registered and digest-pinned; the sandbox re-validates it against its closed registry
+/// and re-binds it to the checked-out lock before spawn. When no job carries a structured build the
+/// lock is irrelevant and MUST NOT be required.
+pub fn resolve_versioned_snapshot_with_cargo_vendor(
+    def: &VersionedCiDefinition,
+    blobs: &dyn BlobStore,
+    tenant: &TenantId,
+    root_cargo_lock: Option<&[u8]>,
+) -> Result<(VersionedResolvedSnapshot, ContentHash), ResolveError> {
     if def.jobs.is_empty() {
         return Err(ResolveError::EmptyDefinition);
     }
@@ -539,6 +583,22 @@ pub fn resolve_versioned_snapshot(
         }
     }
 
+    // LOCKFILE-KEYED VENDOR SELECTION (CT-007 gate 4, blocker 1). A structured Cargo build runs
+    // OFFLINE against a read-only vendor tree, so it needs the exact server-trusted vendor built from
+    // this repo's root Cargo.lock. Select it ONCE (one root lock per workspace) and fail closed unless
+    // a registered vendor matches. Only computed when a structured build is actually present, so a
+    // non-Cargo pipeline never depends on a committed Cargo.lock.
+    let selected_cargo_vendor: Option<String> = if def.jobs.iter().any(|j| j.build.is_some()) {
+        let lock = root_cargo_lock.ok_or(ResolveError::CargoVendorLockMissing)?;
+        let lock_sha256 = myelin_ci_sandbox::cargo_lock_sha256_hex(lock);
+        Some(
+            myelin_ci_sandbox::select_registered_cargo_vendor(&lock_sha256)
+                .ok_or(ResolveError::CargoVendorUnmatched { lock_sha256 })?,
+        )
+    } else {
+        None
+    };
+
     // Resolve + expand. Collect into a Vec, then sort by instance name for the deterministic order.
     let mut resolved: Vec<ResolvedJobV2> = Vec::new();
     for j in &def.jobs {
@@ -560,6 +620,11 @@ pub fn resolve_versioned_snapshot(
                 name: instance_name(&j.name, &assignment),
                 image: j.image.clone(),
                 command: j.command.clone(),
+                // A build job carries the resolve-time vendor selection; a non-build job carries
+                // none. `and` avoids a panic if the two predicates ever drift on a refactor — a
+                // build reaching here with no selection stamps `None`, which `platform_owned_execution`
+                // then refuses fail-closed (CorruptRun) rather than mounting a default tree.
+                selected_cargo_vendor: j.build.as_ref().and(selected_cargo_vendor.clone()),
                 build: j.build.clone(),
                 needs: Vec::new(),
                 is_generator: j.kind == JobKind::Generate,

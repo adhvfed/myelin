@@ -126,11 +126,13 @@ pub use gvisor::{
 // `launch_with` resolves + verifies `spec.image` against it BEFORE any resource is reserved. The
 // rust-capable runner asset's own resolver is exported alongside the base/git ones above.
 pub use asset_registry::{
+    cargo_lock_sha256_hex, cargo_vendor_smoke_reference, cargo_vendor_workspace_reference,
     file_sha256_hex, resolved_gvisor_cargo_vendor, resolved_gvisor_cargo_vendor_workspace,
-    AssetRegistryError, CargoVendorAssetBinding, GvisorAssetRegistry, RootfsAssetBinding,
-    VerifiedCargoVendor, VerifiedRootfs, CARGO_VENDOR_SMOKE_LOCK_SHA256,
-    CARGO_VENDOR_SMOKE_TREE_SHA256, CARGO_VENDOR_WORKSPACE_LOCK_SHA256,
-    CARGO_VENDOR_WORKSPACE_TREE_SHA256, ENV_GVISOR_CARGO_VENDOR, ENV_GVISOR_CARGO_VENDOR_WORKSPACE,
+    select_registered_cargo_vendor, AssetRegistryError, CargoVendorAssetBinding,
+    GvisorAssetRegistry, RootfsAssetBinding, VerifiedCargoVendor, VerifiedRootfs,
+    CARGO_VENDOR_SMOKE_LOCK_SHA256, CARGO_VENDOR_SMOKE_TREE_SHA256,
+    CARGO_VENDOR_WORKSPACE_LOCK_SHA256, CARGO_VENDOR_WORKSPACE_TREE_SHA256, ENV_GVISOR_CARGO_VENDOR,
+    ENV_GVISOR_CARGO_VENDOR_WORKSPACE,
 };
 pub use canonical_tar::canonical_tree_sha256_hex;
 pub use gvisor::{

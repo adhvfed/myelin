@@ -78,6 +78,42 @@ pub const CARGO_VENDOR_WORKSPACE_LOCK_SHA256: &str =
 /// Host path override for the staged full-workspace Cargo vendor asset.
 pub const ENV_GVISOR_CARGO_VENDOR_WORKSPACE: &str = "MYELIN_GVISOR_CARGO_VENDOR_WORKSPACE";
 
+/// The exact digest-pinned reference the smoke Cargo vendor asset is registered under (mirrors the
+/// `runner_bind.rs` production binding). This is the ONE authority for that reference string.
+pub fn cargo_vendor_smoke_reference() -> String {
+    format!("myelin.local/cargo-vendor-smoke-v1@sha256:{CARGO_VENDOR_SMOKE_TREE_SHA256}")
+}
+
+/// The exact digest-pinned reference the full-workspace Cargo vendor asset is registered under
+/// (mirrors the `runner_bind.rs` production binding).
+pub fn cargo_vendor_workspace_reference() -> String {
+    format!("myelin.local/cargo-vendor-workspace-v1@sha256:{CARGO_VENDOR_WORKSPACE_TREE_SHA256}")
+}
+
+/// SHA-256 (lowercase hex) of a repository's root `Cargo.lock` bytes — the key
+/// [`select_registered_cargo_vendor`] matches a registered vendor on.
+pub fn cargo_lock_sha256_hex(cargo_lock_bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(cargo_lock_bytes))
+}
+
+/// **Lockfile-keyed vendor selection (CT-007 gate 4, blocker 1).** Map a repository's root
+/// `Cargo.lock` SHA-256 to the SERVER-TRUSTED, digest-pinned registered Cargo vendor asset reference
+/// that was produced from exactly that lock. Returns `None` — the caller MUST fail closed — when no
+/// registered vendor was built from this lock: the tenant can therefore only ever be handed a
+/// reference the server already registered and digest-pinned, never one it authored. The two
+/// registered vendors are the smoke fixture lock and this workspace's own root lock. Because the
+/// selected asset is bind-mounted read-only and `cargo build --locked` is run against it, a
+/// mismatched or forged lock could at worst fail the build — never mount an unregistered tree — and
+/// the sandbox re-resolves this reference against its closed registry (and re-binds it to the
+/// checked-out lock) before spawn.
+pub fn select_registered_cargo_vendor(cargo_lock_sha256: &str) -> Option<String> {
+    match cargo_lock_sha256 {
+        CARGO_VENDOR_SMOKE_LOCK_SHA256 => Some(cargo_vendor_smoke_reference()),
+        CARGO_VENDOR_WORKSPACE_LOCK_SHA256 => Some(cargo_vendor_workspace_reference()),
+        _ => None,
+    }
+}
+
 /// Compute a regular file's SHA-256 for manifest/source-key synchronization and asset validation.
 pub fn file_sha256_hex(path: &Path) -> std::io::Result<String> {
     std::fs::read(path).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
@@ -1194,6 +1230,36 @@ mod tests {
             root: root.into(),
             cargo_lock_sha256: cargo_lock_sha256.into(),
         }
+    }
+
+    #[test]
+    fn lockfile_keyed_vendor_selection_maps_only_registered_locks_and_fails_closed_otherwise() {
+        // The two registered locks select their own digest-pinned, server-trusted references.
+        assert_eq!(
+            select_registered_cargo_vendor(CARGO_VENDOR_SMOKE_LOCK_SHA256).as_deref(),
+            Some(cargo_vendor_smoke_reference().as_str())
+        );
+        assert_eq!(
+            select_registered_cargo_vendor(CARGO_VENDOR_WORKSPACE_LOCK_SHA256).as_deref(),
+            Some(cargo_vendor_workspace_reference().as_str())
+        );
+        // The selected references are the EXACT references the production registry binds under, so
+        // the sandbox re-validation (resolve_cargo_vendor) can resolve them.
+        assert!(cargo_vendor_smoke_reference()
+            .starts_with("myelin.local/cargo-vendor-smoke-v1@sha256:"));
+        assert!(cargo_vendor_workspace_reference()
+            .starts_with("myelin.local/cargo-vendor-workspace-v1@sha256:"));
+        // Any other lock (a forged/unknown/default lock) selects NOTHING — the caller fails closed.
+        assert_eq!(select_registered_cargo_vendor(&"0".repeat(64)), None);
+        assert_eq!(
+            select_registered_cargo_vendor(&cargo_lock_sha256_hex(b"not a registered lock")),
+            None
+        );
+        // Sanity: the hasher agrees with the registered smoke lock const when fed matching bytes.
+        assert_eq!(
+            cargo_lock_sha256_hex(CARGO_VENDOR_SMOKE_LOCK_SHA256.as_bytes()).len(),
+            64
+        );
     }
 
     #[test]

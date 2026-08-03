@@ -95,8 +95,8 @@ use crate::dispatch::{
     compile_trigger, stamp_trust, OnTrigger, RunProvenance, TrustStamp, TRIGGER_CONSUMER,
 };
 use crate::resolve::{
-    reserve_and_start, resolve_versioned_snapshot, snapshot_ref, CheckContext, ResolveError,
-    RunFacts, StartHandoff, VersionedCiDefinition,
+    reserve_and_start, resolve_versioned_snapshot_with_cargo_vendor, snapshot_ref, CheckContext,
+    ResolveError, RunFacts, StartHandoff, VersionedCiDefinition,
 };
 
 /// A canonical, readable git storage root validated before broker intake is constructed.
@@ -265,6 +265,15 @@ const CI_CONFIG_CANDIDATES: &[(&str, ConfigFormat)] = &[
     (".myelin/ci.toml", ConfigFormat::Toml),
     (".myelin/ci.json", ConfigFormat::Json),
 ];
+
+/// The repository-root `Cargo.lock` path read at the pushed ref to key the server-trusted Cargo
+/// vendor selection for a structured build (CT-007 gate 4, blocker 1).
+const ROOT_CARGO_LOCK_PATH: &str = "Cargo.lock";
+
+/// Hard ceiling on the root `Cargo.lock` bytes read for vendor selection. Far above any real lock
+/// (this workspace's 443-crate lock is well under 1 MiB) and bounded so a hostile push cannot force
+/// an unbounded read. A lock above this is refused fail-closed as an invalid read.
+const MAX_CARGO_LOCK_BYTES: usize = 8 * 1024 * 1024;
 
 /// **Resolve the pushed repo's `.myelin/ci.*` at `oid`** — try `.myelin/ci.toml`, then
 /// `.myelin/ci.json`. `Ok(None)` iff NEITHER exists (a clean "no pipeline armed" skip, NOT an error);
@@ -940,7 +949,31 @@ pub fn plan_dispatch(
     let stamp: TrustStamp = stamp_trust(&provenance);
 
     // 6. Resolve the CAS snapshot — a ResolveError (floating tag / cycle) is a fail-closed skip.
-    let (_snapshot, address) = match resolve_versioned_snapshot(&def, blobs, &tenant) {
+    //    A structured Cargo build additionally needs the server-trusted vendor tree selected from the
+    //    repo's ROOT Cargo.lock at THIS ref (the same ref the config was read from). Read the lock
+    //    ONLY when a structured build is present, so a non-Cargo pipeline never depends on a committed
+    //    lock; a backend read failure is the SAME fail-closed skip as a failed config read.
+    let root_cargo_lock: Option<Vec<u8>> = if def.jobs.iter().any(|job| job.build.is_some()) {
+        match reader.read_repo_file_bounded(
+            &tenant.0,
+            &region,
+            &facts.repo,
+            &facts.new_oid,
+            ROOT_CARGO_LOCK_PATH,
+            MAX_CARGO_LOCK_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => return DispatchOutcome::Skip(SkipReason::ReadFailed(e)),
+        }
+    } else {
+        None
+    };
+    let (_snapshot, address) = match resolve_versioned_snapshot_with_cargo_vendor(
+        &def,
+        blobs,
+        &tenant,
+        root_cargo_lock.as_deref(),
+    ) {
         Ok(r) => r,
         Err(e) => return DispatchOutcome::Skip(SkipReason::ResolveError(e)),
     };

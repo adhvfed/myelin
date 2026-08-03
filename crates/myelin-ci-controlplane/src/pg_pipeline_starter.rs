@@ -35,7 +35,6 @@ use myelin_ci_sandbox::gvisor::{
     CARGO_SOURCE_REPLACE_ENV, CARGO_VENDOR_DIRECTORY_ENV, ENV_CARGO_VENDOR_ASSET,
     OCI_CARGO_VENDOR_MOUNT,
 };
-use myelin_ci_sandbox::CARGO_VENDOR_SMOKE_TREE_SHA256;
 use sqlx::{PgPool, Row};
 
 use crate::ci_drive_manifest::{
@@ -1585,7 +1584,7 @@ fn granted_jobs_v2(
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
             needs.sort();
-            let (command, env) = platform_owned_execution(job, &grant.env);
+            let (command, env) = platform_owned_execution(job, &grant.env)?;
             Ok(GrantedCiJobV1 {
                 job_id: expected.job_id.to_string(),
                 stage: job.stage.clone(),
@@ -1624,10 +1623,23 @@ fn granted_jobs_v2(
 fn platform_owned_execution(
     job: &ResolvedJobV2,
     granted_env: &BTreeMap<String, String>,
-) -> (Vec<String>, BTreeMap<String, String>) {
+) -> Result<(Vec<String>, BTreeMap<String, String>), PgCiStarterError> {
     let Some(build) = &job.build else {
-        return (job.command.clone(), granted_env.clone());
+        return Ok((job.command.clone(), granted_env.clone()));
     };
+    // A structured Cargo build MUST carry the resolve-time, server-selected vendor reference (keyed to
+    // the repository's root Cargo.lock). Refuse fail-closed if it is absent rather than falling back to
+    // a hardcoded default tree — that hardcoded-smoke fallback was the gate-4 blocker-1 gap. The
+    // selection is always a REGISTERED, digest-pinned reference, and the sandbox independently
+    // re-validates it against its closed asset registry (and re-binds it to the checked-out Cargo.lock)
+    // before spawn.
+    let vendor = job.selected_cargo_vendor.as_deref().ok_or_else(|| {
+        PgCiStarterError::CorruptRun(format!(
+            "structured Cargo build job `{}` has no server-selected Cargo vendor asset; refusing to \
+             launch (dispatch must key the vendor to the repository's root Cargo.lock)",
+            job.name
+        ))
+    })?;
     let mut env = granted_env.clone();
     env.insert("CARGO_HOME".into(), PLATFORM_CARGO_HOME.into());
     env.insert("CARGO_NET_OFFLINE".into(), "true".into());
@@ -1639,13 +1651,8 @@ fn platform_owned_execution(
         CARGO_VENDOR_DIRECTORY_ENV.into(),
         OCI_CARGO_VENDOR_MOUNT.into(),
     );
-    env.insert(
-        ENV_CARGO_VENDOR_ASSET.into(),
-        format!(
-            "myelin.local/cargo-vendor-smoke-v1@sha256:{CARGO_VENDOR_SMOKE_TREE_SHA256}"
-        ),
-    );
-    (build.platform_argv(), env)
+    env.insert(ENV_CARGO_VENDOR_ASSET.into(), vendor.to_string());
+    Ok((build.platform_argv(), env))
 }
 
 fn build_drive_manifest_v1(
@@ -2262,6 +2269,8 @@ mod tests {
                         tool: crate::StructuredBuildToolV1::Cargo,
                         args: vec!["build".into(), "--locked".into()],
                     }),
+                    selected_cargo_vendor: structured_build
+                        .then(myelin_ci_sandbox::cargo_vendor_smoke_reference),
                     needs: Vec::new(),
                     is_generator: false,
                     matrix_key: BTreeMap::new(),
@@ -2272,6 +2281,7 @@ mod tests {
                     image: PINNED_IMAGE.into(),
                     command: vec!["/bin/test".into()],
                     build: None,
+                    selected_cargo_vendor: None,
                     needs: vec!["build".into()],
                     is_generator: false,
                     matrix_key: BTreeMap::new(),
@@ -2617,9 +2627,7 @@ mod tests {
         );
         assert_eq!(
             build.env.get(ENV_CARGO_VENDOR_ASSET).unwrap(),
-            &format!(
-                "myelin.local/cargo-vendor-smoke-v1@sha256:{CARGO_VENDOR_SMOKE_TREE_SHA256}"
-            )
+            &myelin_ci_sandbox::cargo_vendor_smoke_reference()
         );
 
         let free_form = &jobs[1];

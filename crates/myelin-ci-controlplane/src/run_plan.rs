@@ -143,6 +143,14 @@ pub struct ResolvedJobV2 {
     /// canonical bytes exactly. Exactly one of a non-empty `command` or `build` is accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<StructuredBuildV1>,
+    /// The server-selected, digest-pinned Cargo vendor asset reference for this structured build,
+    /// chosen at resolve time by matching the repository's root `Cargo.lock` SHA-256 against the
+    /// registered (server-trusted) vendors. Present only on structured Cargo build jobs; legacy V2
+    /// producers and every non-build job omit it, preserving their canonical bytes exactly. The
+    /// control-plane lowering refuses a structured build that reaches launch without this selection,
+    /// and the sandbox independently re-validates the reference against its closed asset registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_cargo_vendor: Option<String>,
     /// Concrete DAG-node dependencies, sorted strictly.
     pub needs: Vec<String>,
     /// Reserved generator marker. Version 2 refuses `true` until fragment ingestion exists.
@@ -911,6 +919,12 @@ fn validate_plan_v2(plan: &ResolvedRunPlanV2) -> Result<(), RunPlanError> {
                 ));
             }
             None => {}
+        }
+        if job.selected_cargo_vendor.is_some() && job.build.is_none() {
+            return invalid(format!(
+                "version-2 job `{}` carries a Cargo vendor selection without a structured build",
+                job.name
+            ));
         }
     }
     let compatibility = ResolvedRunPlanV1 {
