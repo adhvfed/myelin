@@ -74,6 +74,14 @@ printf '%s\n' \
   '[net]' \
   'offline = true' >"${TMP}/.cargo/config.toml"
 
+# The vendor tree is bind-mounted READ-ONLY into the sandbox and read there by a non-owner mapped
+# subuid — every entry MUST be world-readable (dirs world-traversable) or the offline build fails
+# with a bare EACCES on a vendored source file (some crates ship 0640 files). Guarantee it here so
+# the pinned tree is readable by construction; the registry ALSO enforces this fail-closed at verify
+# (GvisorAssetRegistry::verify_cargo_vendor_world_readable). `a+rX` only adds x to dirs/already-x
+# files, so it is a no-op on an already-world-readable tree (the committed smoke pin is unchanged).
+chmod -R a+rX "${TMP}"
+
 DIGEST="$(canonical_tree_sha256 "${TMP}")"
 PIN="$(committed_digest)"
 if [[ -n "${PIN}" && "${PIN}" != "${DIGEST}" && "${ALLOW_DIGEST_CHANGE:-0}" != "1" ]]; then

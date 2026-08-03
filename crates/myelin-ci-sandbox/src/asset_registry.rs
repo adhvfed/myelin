@@ -494,6 +494,17 @@ impl GvisorAssetRegistry {
                 actual: actual_hex,
             });
         }
+
+        // A Cargo vendor tree is bind-mounted READ-ONLY into the sandbox and read there by the
+        // WORKLOAD uid — a mapped subuid that is neither the asset's owner nor in its group. Unlike
+        // the rootfs (whose Debian userland legitimately carries owner-only files such as
+        // /etc/shadow), EVERY entry of a vendor tree must therefore be world-readable, or the offline
+        // `cargo build --locked` fails deep inside the sandbox with a bare EACCES on a vendored source
+        // file (observed: 17 crate files staged 0640 -> "Permission denied" opening
+        // vendor/fnv-1.0.7/LICENSE-APACHE). The canonical-tar digest verifies content + refuses
+        // group/world-WRITABLE, but says nothing about readability, so enforce it here, fail-closed at
+        // registry construction, where the diagnostic names the offending path instead of the runtime.
+        Self::verify_cargo_vendor_world_readable(&canon)?;
         let metadata = std::fs::symlink_metadata(&canon).map_err(|error| {
             AssetRegistryError::InvalidCargoVendor {
                 root: canon.clone(),
@@ -509,6 +520,57 @@ impl GvisorAssetRegistry {
             device: metadata.dev(),
             inode: metadata.ino(),
         })
+    }
+
+    /// Fail-closed check that every entry of a Cargo vendor tree is readable by the sandbox's
+    /// non-owner workload uid: regular files world-readable (o+r), directories world-traversable
+    /// (o+rx). Symlinks are exempt — their own permission bits are meaningless to the kernel and the
+    /// target is covered by the canonical-tar digest (mirrors the writable-check's symlink exemption).
+    /// Iterative DFS via `symlink_metadata` (never follows a symlink out of the tree). Called ONLY for
+    /// cargo-vendor assets — NOT rootfs trees, whose Debian userland legitimately carries owner-only
+    /// files (e.g. /etc/shadow) that a world-readability rule would wrongly reject.
+    fn verify_cargo_vendor_world_readable(root: &Path) -> Result<(), AssetRegistryError> {
+        use std::os::unix::fs::MetadataExt as _;
+        let invalid = |reason: String| AssetRegistryError::InvalidCargoVendor {
+            root: root.to_path_buf(),
+            reason,
+        };
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .map_err(|error| invalid(format!("could not read {}: {error}", dir.display())))?;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    invalid(format!("could not read an entry under {}: {error}", dir.display()))
+                })?;
+                let path = entry.path();
+                let metadata = std::fs::symlink_metadata(&path)
+                    .map_err(|error| invalid(format!("could not stat {}: {error}", path.display())))?;
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let mode = metadata.mode() & 0o7777;
+                if file_type.is_dir() {
+                    if mode & 0o005 != 0o005 {
+                        return Err(invalid(format!(
+                            "vendor directory {} has mode {mode:04o}; every directory must be \
+                             world-traversable (o+rx) so the sandbox's non-owner build uid can read \
+                             the read-only vendor mount",
+                            path.display()
+                        )));
+                    }
+                    stack.push(path);
+                } else if file_type.is_file() && mode & 0o004 == 0 {
+                    return Err(invalid(format!(
+                        "vendor file {} has mode {mode:04o}; every file must be world-readable (o+r) \
+                         so the sandbox's non-owner build uid can read the read-only vendor mount",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn verify_asset_tree(
@@ -1069,6 +1131,39 @@ mod tests {
             reference,
             root: root.into(),
             cargo_lock_sha256: cargo_lock_sha256.into(),
+        }
+    }
+
+    #[test]
+    fn cargo_vendor_with_a_non_world_readable_file_is_refused_fail_closed() {
+        let (root, _reference, lock_sha256) = cargo_vendor_fixture("non-readable");
+        // The exact shape the gate-2 full-workspace drill hit: a vendored source file staged
+        // owner+group-only (0640). It is NOT group/world-writable, so the canonical-tar digest
+        // accepts it — but the in-sandbox non-owner build uid would get EACCES on the RO mount.
+        let offending = root.join("vendor/itoa-1.0.15/lib.rs");
+        fs::set_permissions(&offending, fs::Permissions::from_mode(0o640)).unwrap();
+        // Re-pin the reference to the now-different tree digest so the readability check (which runs
+        // AFTER the digest match) is what refuses — not a DigestMismatch.
+        let digest = canonical_tar::canonical_tree_sha256_hex(&root).unwrap();
+        let reference =
+            ImageRef::pinned(format!("test.local/cargo-vendor-nonreadable@sha256:{digest}")).unwrap();
+        let err = GvisorAssetRegistry::from_bindings_with_cargo_vendor(
+            Vec::new(),
+            vec![cargo_vendor_binding(reference, &root, &lock_sha256)],
+        )
+        .expect_err("a vendor tree with a non-world-readable file must refuse construction");
+        match err {
+            AssetRegistryError::InvalidCargoVendor { reason, .. } => {
+                assert!(
+                    reason.contains("world-readable"),
+                    "reason should name the readability rule: {reason}"
+                );
+                assert!(
+                    reason.contains("lib.rs"),
+                    "reason should name the offending path: {reason}"
+                );
+            }
+            other => panic!("expected InvalidCargoVendor, got {other:?}"),
         }
     }
 
