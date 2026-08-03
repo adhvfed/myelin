@@ -12,8 +12,27 @@
 
 use myelin_agent::{
     BudgetView, DryRun, EffectKind, EventId, InboxEvent, ProposedEffect, StepOutcome, Submission,
-    SystemContext, ToolCall, ToolDef, ToolName, ToolSchema, ToolSurface,
+    SystemContext, ToolCall, ToolCallId, ToolDef, ToolName, ToolSchema, ToolSurface,
 };
+
+/// A name-only scoped tool schema (empty description + permissive schema) — these tests exercise
+/// only the tool name.
+fn schema(name: &str) -> ToolSchema {
+    ToolSchema {
+        name: ToolName(name.into()),
+        description: String::new(),
+        input_schema: "{}".into(),
+    }
+}
+
+/// A tool call with a deterministic id and null arguments; the id links its later result back.
+fn call(name: &str) -> ToolCall {
+    ToolCall {
+        id: ToolCallId(format!("call:{name}")),
+        name: ToolName(name.into()),
+        arguments: serde_json::Value::Null,
+    }
+}
 use myelin_agent_service::{
     encode_proposed, ApplyError, CapabilityCheck, DelegationLookup, DryRunBridge, DryRunPlanner,
     EffectBudget, EffectCost, MockAgentRuntime, MockScript, PipelineSignals, PlanThenApply,
@@ -157,11 +176,11 @@ fn effect_for(name: &ToolName) -> Option<PlannedEffect> {
 fn script() -> MockScript {
     MockScript::new(
         SystemContext("agent-7".into()),
-        vec![ToolSchema("merge".into()), ToolSchema("post".into())],
+        vec![schema("merge"), schema("post")],
         BudgetView(1000),
         vec![
-            StepOutcome::UseTools(vec![ToolCall(ToolName("merge".into()))]),
-            StepOutcome::UseTools(vec![ToolCall(ToolName("post".into()))]),
+            StepOutcome::UseTools(vec![call("merge")]),
+            StepOutcome::UseTools(vec![call("post")]),
             StepOutcome::Submit(Submission("done".into())),
         ],
     )

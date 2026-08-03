@@ -6,26 +6,22 @@
 //! [`StepOutcome::Submit`]. This is the exact spike loop-body, one decision at a time — the
 //! multi-turn DRIVING loop is a separate later slice in the service (it is NOT built here).
 //!
-//! ## Conversation → request mapping, and the seam limits it exposes (READ THIS)
-//! The frozen [`myelin_agent`] seam carries LESS structure than either vendor wire needs. The
-//! mapping is therefore best-effort and LOSSY in named places — the honest slice-1 state:
+//! ## Conversation → request mapping (the widened seam carries real ids/arguments/schemas)
+//! The [`myelin_agent`] seam now carries the structure a real tool-calling loop needs, so the
+//! mapping is faithful — no synthesized ids, no positional matching, no dropped arguments:
 //!
 //! - **`Conversation` has no distinct user-goal turn** — the task is folded into `SystemContext`
 //!   (`{system}`), so the request's `system` carries the whole framing and (on the first step) there
 //!   are no prior turns. This is faithful for Tier-0 single decisions.
-//! - **`ToolSchema(String)` is an opaque name-only newtype** — it carries no description and no JSON
-//!   Schema, so each [`ToolSpec`] is built with an empty description + a permissive object schema.
-//!   The rich schema lives on `ToolDef.input_schema`, which the `Conversation` does NOT carry (it
-//!   carries `ToolSchema`); wiring the real schema through is a seam-widening follow-on.
-//! - **`ToolCall(ToolName)` and `ToolResult(String)` carry no call id and no arguments** — so a
-//!   reconstructed prior turn cannot recover the provider's real call ids/arguments. We synthesize
-//!   deterministic ids (`call_<turn>_<i>`) and match tool results positionally to the preceding
-//!   assistant turn, which keeps the reconstructed OpenAI request WIRE-VALID for a well-formed
-//!   (assistant-tools → results) history, but it is NOT the provider's original id/argument data.
-//! - **On the way out, `StepOutcome::UseTools(Vec<ToolCall>)` can hold only tool NAMES** — the
-//!   model's chosen call ids and arguments are DROPPED when we map a [`ModelReply::ToolCalls`] into
-//!   the seam. The real multi-turn loop needs the seam widened (or a platform-side side-channel) to
-//!   carry ids+arguments so a tool result can be routed and linked back. Flagged, not hidden.
+//! - **`ToolSchema { name, description, input_schema }` carries the real tool spec** — each
+//!   [`ToolSpec`] is built from the tool's real description + its JSON-schema string (mirroring
+//!   `ToolDef.input_schema`), parsed into the normalized [`ToolSpec::input_schema`] object.
+//! - **`ToolCall { id, name, arguments }` and `ToolOutcome { call_id, result }` carry the real
+//!   linkage** — a reconstructed assistant turn replays the model's own call ids + chosen arguments,
+//!   and each tool result is keyed back to its call by the real `call_id` (no positional matching).
+//! - **On the way out, `StepOutcome::UseTools(Vec<ToolCall>)` carries the model's real ids +
+//!   arguments** — a [`ModelReply::ToolCalls`] maps straight through, so the next turn can route each
+//!   call and link its result back by id.
 //!
 //! ## Fail-closed at a sync, non-`Result` seam
 //! [`AgentRuntime::step`] returns a bare [`StepOutcome`] (no `Result`) and cannot panic, so a model
@@ -40,7 +36,7 @@ use crate::client::{
     ToolSpec, Usage,
 };
 use myelin_agent::{
-    AgentRuntime, Conversation, StepOutcome, Submission, ToolCall, ToolName, ToolSchema, Turn,
+    AgentRuntime, Conversation, StepOutcome, Submission, ToolCall, ToolCallId, ToolName, Turn,
 };
 
 /// One step's full result: the seam decision PLUS the provider usage report the metering slice
@@ -104,35 +100,36 @@ impl AgentRuntime for LlmAgentRuntime {
     }
 }
 
-/// Translate the platform-owned [`Conversation`] into a normalized [`ModelRequest`]. See the module
-/// docs for the seam limits this mapping exposes (name-only tools, synthesized call ids, dropped
-/// arguments).
+/// Translate the platform-owned [`Conversation`] into a normalized [`ModelRequest`]. The widened
+/// seam carries the tool spec (name + description + schema), the model's real call ids/arguments, and
+/// each result keyed back to its call — so the mapping is faithful (see the module docs).
 pub(crate) fn build_request(conv: &Conversation, max_output_tokens: Option<u32>) -> ModelRequest {
     let tools = conv
         .tools
         .iter()
-        .map(|ToolSchema(name)| ToolSpec {
-            name: name.clone(),
-            // The opaque `ToolSchema` newtype carries no description/schema; the rich schema lives on
-            // `ToolDef.input_schema`, which the Conversation does not carry (seam limit — see docs).
-            description: String::new(),
-            input_schema: serde_json::json!({"type": "object"}),
+        .map(|schema| ToolSpec {
+            name: schema.name.0.clone(),
+            description: schema.description.clone(),
+            // `ToolSchema.input_schema` mirrors `ToolDef.input_schema` (a JSON-schema string); parse
+            // it to the normalized object carrier, falling back to a permissive object schema if the
+            // string is empty/unparseable so the request stays wire-valid.
+            input_schema: serde_json::from_str(&schema.input_schema)
+                .unwrap_or_else(|_| serde_json::json!({"type": "object"})),
         })
         .collect();
 
     let mut turns = Vec::new();
-    for (index, turn) in conv.turns.iter().enumerate() {
+    for turn in conv.turns.iter() {
         match turn {
             Turn::Model(StepOutcome::UseTools(calls)) => {
                 let tool_calls = calls
                     .iter()
-                    .enumerate()
-                    .map(|(i, ToolCall(ToolName(name)))| ToolCallRequest {
-                        // Synthesized, deterministic id — the seam does not carry the real one.
-                        id: format!("call_{index}_{i}"),
-                        name: name.clone(),
-                        // The seam does not carry the model's chosen arguments.
-                        arguments: serde_json::Value::Null,
+                    .map(|call| ToolCallRequest {
+                        // The model's own call id — carried through the seam, not synthesized.
+                        id: call.id.0.clone(),
+                        name: call.name.0.clone(),
+                        // The model's chosen arguments — carried through the seam.
+                        arguments: call.arguments.clone(),
                     })
                     .collect();
                 turns.push(ModelTurn::Assistant {
@@ -149,13 +146,12 @@ pub(crate) fn build_request(conv: &Conversation, max_output_tokens: Option<u32>)
                 });
             }
             Turn::ToolResults(results) => {
-                // Match each result positionally to the preceding assistant turn's synthesized ids.
+                // Each result is keyed back to its call by the real `call_id` (no positional match).
                 let results = results
                     .iter()
-                    .enumerate()
-                    .map(|(i, myelin_agent::ToolResult(content))| ToolCallResult {
-                        id: format!("call_{}_{i}", index.saturating_sub(1)),
-                        content: content.clone(),
+                    .map(|outcome| ToolCallResult {
+                        id: outcome.call_id.0.clone(),
+                        content: outcome.result.0.clone(),
                     })
                     .collect();
                 turns.push(ModelTurn::ToolResults(results));
@@ -177,15 +173,19 @@ pub(crate) fn build_request(conv: &Conversation, max_output_tokens: Option<u32>)
     }
 }
 
-/// Map a normalized [`ModelReply`] to the seam's [`StepOutcome`]. Tool calls collapse to tool NAMES
-/// (the seam's `ToolCall(ToolName)` carries no id/arguments — see the module docs); a final answer
-/// becomes a [`Submission`].
+/// Map a normalized [`ModelReply`] to the seam's [`StepOutcome`]. Each tool call carries the model's
+/// real `{id, name, arguments}` straight through the widened seam so the next turn can route it and
+/// link its result back by id; a final answer becomes a [`Submission`].
 pub(crate) fn map_reply(reply: ModelReply) -> StepOutcome {
     match reply {
         ModelReply::ToolCalls(calls) => StepOutcome::UseTools(
             calls
                 .into_iter()
-                .map(|c| ToolCall(ToolName(c.name)))
+                .map(|c| ToolCall {
+                    id: ToolCallId(c.id),
+                    name: ToolName(c.name),
+                    arguments: c.arguments,
+                })
                 .collect(),
         ),
         ModelReply::Final { content } => StepOutcome::Submit(Submission(content)),
@@ -197,13 +197,25 @@ mod tests {
     use super::*;
     use crate::client::{ModelReply, ModelResponse, Usage};
     use crate::mock::MockModelClient;
-    use myelin_agent::{BudgetView, SystemContext};
+    use myelin_agent::{BudgetView, SystemContext, ToolOutcome, ToolResult, ToolSchema};
 
     fn conv_with_tools() -> Conversation {
         Conversation {
             system: SystemContext("you are labelled as an agent".into()),
             turns: vec![],
-            tools: vec![ToolSchema("search".into()), ToolSchema("read_file".into())],
+            tools: vec![
+                ToolSchema {
+                    name: ToolName("search".into()),
+                    description: "full-text search".into(),
+                    input_schema: r#"{"type":"object","properties":{"q":{"type":"string"}}}"#
+                        .into(),
+                },
+                ToolSchema {
+                    name: ToolName("read_file".into()),
+                    description: "read a file".into(),
+                    input_schema: "{}".into(),
+                },
+            ],
             budget: BudgetView(1000),
         }
     }
@@ -225,15 +237,24 @@ mod tests {
         let runtime = LlmAgentRuntime::new(Box::new(client));
 
         let report = runtime.try_step(&conv_with_tools()).unwrap();
+        // The model's real id + chosen arguments ride straight through the widened seam.
         assert_eq!(
             report.outcome,
-            StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))])
+            StepOutcome::UseTools(vec![ToolCall {
+                id: ToolCallId("call_x".into()),
+                name: ToolName("search".into()),
+                arguments: serde_json::json!({"q": "panic"}),
+            }])
         );
         assert!(matches!(report.usage, Usage::Reported { .. }));
         // The trait step projects out the same outcome.
         assert_eq!(
             runtime.step(&conv_with_tools()),
-            StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))])
+            StepOutcome::UseTools(vec![ToolCall {
+                id: ToolCallId("call_x".into()),
+                name: ToolName("search".into()),
+                arguments: serde_json::json!({"q": "panic"}),
+            }])
         );
     }
 
@@ -298,26 +319,33 @@ mod tests {
     #[test]
     fn build_request_maps_system_and_tools_and_reconstructs_history() {
         let mut conv = conv_with_tools();
-        conv.turns.push(Turn::Model(StepOutcome::UseTools(vec![
-            ToolCall(ToolName("search".into())),
-        ])));
-        conv.turns.push(Turn::ToolResults(vec![myelin_agent::ToolResult(
-            "match at foo.rs:10".into(),
-        )]));
+        conv.turns
+            .push(Turn::Model(StepOutcome::UseTools(vec![ToolCall {
+                id: ToolCallId("call_abc".into()),
+                name: ToolName("search".into()),
+                arguments: serde_json::json!({"q": "panic"}),
+            }])));
+        conv.turns.push(Turn::ToolResults(vec![ToolOutcome {
+            call_id: ToolCallId("call_abc".into()),
+            result: ToolResult("match at foo.rs:10".into()),
+        }]));
 
         let request = build_request(&conv, Some(128));
         assert_eq!(request.system, "you are labelled as an agent");
         assert_eq!(request.tools.len(), 2);
         assert_eq!(request.tools[0].name, "search");
+        // The real tool description + parsed JSON-schema ride through (no longer name-only).
+        assert_eq!(request.tools[0].description, "full-text search");
+        assert_eq!(request.tools[0].input_schema["type"], "object");
         assert_eq!(request.max_output_tokens, Some(128));
 
-        // The assistant turn's synthesized id must match the tool-result's linked id (wire-valid).
+        // The assistant turn's real call id matches the tool-result's linked id (wire-valid).
         match (&request.turns[0], &request.turns[1]) {
-            (
-                ModelTurn::Assistant { tool_calls, .. },
-                ModelTurn::ToolResults(results),
-            ) => {
+            (ModelTurn::Assistant { tool_calls, .. }, ModelTurn::ToolResults(results)) => {
+                assert_eq!(tool_calls[0].id, "call_abc");
                 assert_eq!(tool_calls[0].id, results[0].id);
+                // The model's chosen arguments ride through too (not dropped/nulled).
+                assert_eq!(tool_calls[0].arguments, serde_json::json!({"q": "panic"}));
             }
             other => panic!("unexpected reconstruction: {other:?}"),
         }

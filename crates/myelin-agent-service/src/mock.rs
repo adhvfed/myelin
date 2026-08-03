@@ -63,7 +63,7 @@
 
 use myelin_agent::{
     AgentRuntime, BudgetView, Conversation, StepOutcome, Submission, SystemContext, ToolCall,
-    ToolName, ToolResult, ToolSchema, Turn,
+    ToolOutcome, ToolResult, ToolSchema, Turn,
 };
 
 // ───────────────────────── §3.2 — the scripted brain's fixture ─────────────────────────
@@ -255,8 +255,9 @@ pub struct TraceHistory {
 pub enum HistoryEntry {
     /// A prior model step (the brain's recorded decision for that turn).
     Model(StepOutcome),
-    /// The results of the tool calls the platform routed for the prior step.
-    ToolResults(Vec<ToolResult>),
+    /// The results of the tool calls the platform routed for the prior step, each linked back to its
+    /// call by id.
+    ToolResults(Vec<ToolOutcome>),
 }
 
 impl TraceHistory {
@@ -270,8 +271,8 @@ impl TraceHistory {
         self.entries.push(HistoryEntry::Model(step));
     }
 
-    /// Append the tool results the platform routed for the prior step.
-    pub fn push_tool_results(&mut self, results: Vec<ToolResult>) {
+    /// Append the tool results the platform routed for the prior step (each linked to its call).
+    pub fn push_tool_results(&mut self, results: Vec<ToolOutcome>) {
         self.entries.push(HistoryEntry::ToolResults(results));
     }
 
@@ -413,10 +414,14 @@ pub fn replay_bounded(
 /// Fabricate DETERMINISTIC tool results for the brain's requested calls (`tool:<name>:result` per
 /// [`ToolCall`]) — a pure function of the calls so the conversation reconstruction is reproducible.
 /// The REAL execution is the hands / the apply pipeline (AG-P6/AG-P15); this keeps AG-D9 sandbox-free.
-fn scripted_tool_results(calls: &[ToolCall]) -> Vec<ToolResult> {
+fn scripted_tool_results(calls: &[ToolCall]) -> Vec<ToolOutcome> {
     calls
         .iter()
-        .map(|ToolCall(ToolName(name))| ToolResult(format!("tool:{name}:result")))
+        .map(|call| ToolOutcome {
+            // Link each scripted result back to its call by the model-minted id.
+            call_id: call.id.clone(),
+            result: ToolResult(format!("tool:{}:result", call.name.0)),
+        })
         .collect()
 }
 
@@ -481,17 +486,46 @@ pub fn select_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_agent::Submission;
+    use myelin_agent::{Submission, ToolCallId, ToolName};
+
+    /// A name-only scoped tool schema (empty description + permissive schema) — the fields the
+    /// widened seam carries; these tests only exercise the tool name.
+    fn schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            name: ToolName(name.into()),
+            description: String::new(),
+            input_schema: "{}".into(),
+        }
+    }
+
+    /// A tool call with a deterministic id and null arguments — the scripted brain chooses no real
+    /// arguments; the id links its later [`ToolOutcome`] back (see [`outcome`]).
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId(format!("call:{name}")),
+            name: ToolName(name.into()),
+            arguments: serde_json::Value::Null,
+        }
+    }
+
+    /// The deterministic scripted [`ToolOutcome`] `scripted_tool_results` produces for [`call(name)`]
+    /// — the result `tool:<name>:result` keyed back to that call's id.
+    fn outcome(name: &str) -> ToolOutcome {
+        ToolOutcome {
+            call_id: ToolCallId(format!("call:{name}")),
+            result: ToolResult(format!("tool:{name}:result")),
+        }
+    }
 
     fn search_then_read_then_submit() -> MockScript {
         // A three-turn script: search, then read, then submit — the canonical multi-turn run.
         MockScript::new(
             SystemContext("you are agent-7; you are labelled as an agent".into()),
-            vec![ToolSchema("search".into()), ToolSchema("read".into())],
+            vec![schema("search"), schema("read")],
             BudgetView(100),
             vec![
-                StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))]),
-                StepOutcome::UseTools(vec![ToolCall(ToolName("read".into()))]),
+                StepOutcome::UseTools(vec![call("search")]),
+                StepOutcome::UseTools(vec![call("read")]),
                 StepOutcome::Submit(Submission("the answer".into())),
             ],
         )
@@ -514,7 +548,7 @@ mod tests {
         );
         assert_eq!(
             a,
-            StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))]),
+            StepOutcome::UseTools(vec![call("search")]),
             "the opening turn replays step[0] (search)"
         );
 
@@ -523,7 +557,7 @@ mod tests {
         later.turns.push(Turn::Model(a.clone()));
         assert_eq!(
             brain.step(&later),
-            StepOutcome::UseTools(vec![ToolCall(ToolName("read".into()))]),
+            StepOutcome::UseTools(vec![call("read")]),
             "one model turn taken → replay step[1] (read)"
         );
     }
@@ -541,8 +575,10 @@ mod tests {
         conv.turns
             .push(Turn::Model(StepOutcome::Submit(Submission("a".into()))));
         assert_eq!(model_turns_taken(&conv), 1, "one model turn → position 1");
-        conv.turns
-            .push(Turn::ToolResults(vec![ToolResult("r".into())]));
+        conv.turns.push(Turn::ToolResults(vec![ToolOutcome {
+            call_id: ToolCallId("call:r".into()),
+            result: ToolResult("r".into()),
+        }]));
         assert_eq!(
             model_turns_taken(&conv),
             1,
@@ -575,8 +611,8 @@ mod tests {
         assert_eq!(
             first.outcomes,
             vec![
-                StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))]),
-                StepOutcome::UseTools(vec![ToolCall(ToolName("read".into()))]),
+                StepOutcome::UseTools(vec![call("search")]),
+                StepOutcome::UseTools(vec![call("read")]),
                 StepOutcome::Submit(Submission("the answer".into())),
             ],
             "the replayed StepOutcome stream IS the script, in order"
@@ -634,14 +670,12 @@ mod tests {
         );
         assert_eq!(
             c1.turns[0],
-            Turn::Model(StepOutcome::UseTools(vec![ToolCall(ToolName(
-                "search".into()
-            ))]))
+            Turn::Model(StepOutcome::UseTools(vec![call("search")]))
         );
         assert_eq!(
             c1.turns[1],
-            Turn::ToolResults(vec![ToolResult("tool:search:result".into())]),
-            "the routed tool result is DETERMINISTIC (tool:<name>:result)"
+            Turn::ToolResults(vec![outcome("search")]),
+            "the routed tool result is DETERMINISTIC (tool:<name>:result), linked to its call id"
         );
 
         // turn 2 (the submit turn): the transcript holds search+result, read+result (4 turns).
@@ -661,7 +695,7 @@ mod tests {
         struct NeverSubmits;
         impl AgentRuntime for NeverSubmits {
             fn step(&self, _conv: &Conversation) -> StepOutcome {
-                StepOutcome::UseTools(vec![ToolCall(ToolName("loop".into()))])
+                StepOutcome::UseTools(vec![call("loop")])
             }
         }
         let framing = MockScript::new(SystemContext("sys".into()), vec![], BudgetView(0), vec![]);
@@ -787,10 +821,8 @@ mod tests {
     fn build_conversation_is_deterministic() {
         let script = search_then_read_then_submit();
         let mut history = TraceHistory::new();
-        history.push_model(StepOutcome::UseTools(vec![ToolCall(ToolName(
-            "search".into(),
-        ))]));
-        history.push_tool_results(vec![ToolResult("tool:search:result".into())]);
+        history.push_model(StepOutcome::UseTools(vec![call("search")]));
+        history.push_tool_results(vec![outcome("search")]);
 
         let a = build_conversation(&script, &history);
         let b = build_conversation(&script, &history);
@@ -834,7 +866,7 @@ mod tests {
             BudgetView(0),
             vec![
                 StepOutcome::Submit(Submission("early".into())),
-                StepOutcome::UseTools(vec![ToolCall(ToolName("t".into()))]),
+                StepOutcome::UseTools(vec![call("t")]),
             ],
         );
         assert!(
@@ -885,7 +917,7 @@ mod tests {
         assert_eq!(h.len(), 0, "a fresh history has len 0 (kills -> 1)");
         assert!(h.is_empty(), "a fresh history is_empty (kills -> false)");
         h.push_model(StepOutcome::Submit(Submission("a".into())));
-        h.push_tool_results(vec![ToolResult("r".into())]);
+        h.push_tool_results(vec![outcome("r")]);
         assert_eq!(h.len(), 2, "two entries → len 2 (kills -> 0 / -> 1)");
         assert!(
             !h.is_empty(),

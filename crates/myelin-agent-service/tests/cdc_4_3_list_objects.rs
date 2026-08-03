@@ -85,6 +85,16 @@ fn def(name: &str, subsystem: &str) -> ToolDef {
     }
 }
 
+/// The brain-facing schema `build_scoped_tool_list` projects for a tool registered via [`def`]
+/// (empty description + the `def` fixture's `"{}"` input schema).
+fn schema(name: &str) -> ToolSchema {
+    ToolSchema {
+        name: ToolName(name.into()),
+        description: String::new(),
+        input_schema: "{}".into(),
+    }
+}
+
 /// **CDC 4.3/4.10 — the consumer scopes over `tool_def`/`tool.use` at the run's zookie, in ONE call,
 /// and carries the provider's zookie back.** The consumer's contract obligations against the 4.3
 /// provider: ONE call (no N+1), the right `(permission, type)` arguments, and the 4.10 zookie
@@ -139,9 +149,9 @@ fn consumer_scopes_over_tool_def_in_one_call_and_carries_the_zookie() {
     assert_eq!(scoped.zookie, Zookie("z-rev-42".into()));
     // The brain sees exactly the scoped subset (git/merge + issues/close, NOT ci/deploy).
     assert_eq!(scoped.tools.len(), 2);
-    assert!(scoped.tools.contains(&ToolSchema("merge".into())));
-    assert!(scoped.tools.contains(&ToolSchema("close".into())));
-    assert!(!scoped.tools.contains(&ToolSchema("deploy".into())));
+    assert!(scoped.tools.contains(&schema("merge")));
+    assert!(scoped.tools.contains(&schema("close")));
+    assert!(!scoped.tools.contains(&schema("deploy")));
 }
 
 /// **CDC 4.3 — the `Filter{set_expr}` push-down lowers to ONE conjoinable predicate (no post-filter).**

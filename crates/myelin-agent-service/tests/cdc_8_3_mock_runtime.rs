@@ -19,22 +19,50 @@
 
 use myelin_agent::{
     AgentRuntime, BudgetView, Conversation, StepOutcome, Submission, SystemContext, ToolCall,
-    ToolName, ToolResult, ToolSchema, Turn,
+    ToolCallId, ToolName, ToolOutcome, ToolResult, ToolSchema, Turn,
 };
 use myelin_agent_service::{
     build_conversation, model_turns_taken, replay, select_runtime, MockAgentRuntime, MockScript,
     RuntimeFlag, TraceHistory,
 };
 
+/// A name-only scoped tool schema (empty description + permissive schema) — these tests exercise
+/// only the tool name.
+fn schema(name: &str) -> ToolSchema {
+    ToolSchema {
+        name: ToolName(name.into()),
+        description: String::new(),
+        input_schema: "{}".into(),
+    }
+}
+
+/// A tool call with a deterministic id and null arguments; the id links its later result back.
+fn call(name: &str) -> ToolCall {
+    ToolCall {
+        id: ToolCallId(format!("call:{name}")),
+        name: ToolName(name.into()),
+        arguments: serde_json::Value::Null,
+    }
+}
+
+/// The deterministic scripted `ToolOutcome` the mock routes for [`call(name)`] — `tool:<name>:result`
+/// keyed back to that call's id.
+fn outcome(name: &str) -> ToolOutcome {
+    ToolOutcome {
+        call_id: ToolCallId(format!("call:{name}")),
+        result: ToolResult(format!("tool:{name}:result")),
+    }
+}
+
 /// A canonical multi-turn fixture: search → read → submit (two tool turns, then the terminal answer).
 fn script() -> MockScript {
     MockScript::new(
         SystemContext("you are agent-7; you are labelled as an agent".into()),
-        vec![ToolSchema("search".into()), ToolSchema("read".into())],
+        vec![schema("search"), schema("read")],
         BudgetView(100),
         vec![
-            StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))]),
-            StepOutcome::UseTools(vec![ToolCall(ToolName("read".into()))]),
+            StepOutcome::UseTools(vec![call("search")]),
+            StepOutcome::UseTools(vec![call("read")]),
             StepOutcome::Submit(Submission("the answer".into())),
         ],
     )
@@ -52,7 +80,7 @@ fn cdc_8_3_mock_runtime_is_a_pure_function_of_the_conversation() {
     let opening = Conversation::default();
     match provider.step(&opening) {
         StepOutcome::UseTools(calls) => {
-            assert_eq!(calls, vec![ToolCall(ToolName("search".into()))]);
+            assert_eq!(calls, vec![call("search")]);
         }
         other => panic!("expected UseTools (search) on the opening turn, got {other:?}"),
     }
@@ -60,12 +88,8 @@ fn cdc_8_3_mock_runtime_is_a_pure_function_of_the_conversation() {
     // CONSUMER (the loop): after the search step was appended (one model turn) → step[1] (read).
     let mut conv = Conversation::default();
     conv.turns
-        .push(Turn::Model(StepOutcome::UseTools(vec![ToolCall(
-            ToolName("search".into()),
-        )])));
-    conv.turns.push(Turn::ToolResults(vec![ToolResult(
-        "tool:search:result".into(),
-    )]));
+        .push(Turn::Model(StepOutcome::UseTools(vec![call("search")])));
+    conv.turns.push(Turn::ToolResults(vec![outcome("search")]));
     assert_eq!(
         model_turns_taken(&conv),
         1,
@@ -73,18 +97,14 @@ fn cdc_8_3_mock_runtime_is_a_pure_function_of_the_conversation() {
     );
     assert_eq!(
         provider.step(&conv),
-        StepOutcome::UseTools(vec![ToolCall(ToolName("read".into()))]),
+        StepOutcome::UseTools(vec![call("read")]),
         "after one model turn the brain replays step[1] (read)"
     );
 
     // CONSUMER (the loop): after the read step → step[2] (the terminal Submit).
     conv.turns
-        .push(Turn::Model(StepOutcome::UseTools(vec![ToolCall(
-            ToolName("read".into()),
-        )])));
-    conv.turns.push(Turn::ToolResults(vec![ToolResult(
-        "tool:read:result".into(),
-    )]));
+        .push(Turn::Model(StepOutcome::UseTools(vec![call("read")])));
+    conv.turns.push(Turn::ToolResults(vec![outcome("read")]));
     assert!(
         matches!(provider.step(&conv), StepOutcome::Submit(_)),
         "after two model turns the brain submits (it only ever PROPOSES — plan-then-apply survives)"
@@ -109,8 +129,8 @@ fn ag_d9_golden_replay_is_byte_identical_across_runs() {
     assert_eq!(
         first.outcomes,
         vec![
-            StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))]),
-            StepOutcome::UseTools(vec![ToolCall(ToolName("read".into()))]),
+            StepOutcome::UseTools(vec![call("search")]),
+            StepOutcome::UseTools(vec![call("read")]),
             StepOutcome::Submit(Submission("the answer".into())),
         ],
         "the golden StepOutcome stream is the scripted queue, in order"
@@ -146,10 +166,8 @@ fn cdc_8_3_use_mock_flag_is_a_real_flag_on_the_same_seam() {
 fn cdc_8_3_build_conversation_reconstructs_from_platform_history() {
     let s = script();
     let mut history = TraceHistory::new();
-    history.push_model(StepOutcome::UseTools(vec![ToolCall(ToolName(
-        "search".into(),
-    ))]));
-    history.push_tool_results(vec![ToolResult("tool:search:result".into())]);
+    history.push_model(StepOutcome::UseTools(vec![call("search")]));
+    history.push_tool_results(vec![outcome("search")]);
 
     let conv = build_conversation(&s, &history);
     assert_eq!(

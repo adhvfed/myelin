@@ -14,7 +14,19 @@
 //! - the **CONSUMER** is the platform loop (`Agent::handle`): it builds the `Conversation` and reads
 //!   the `StepOutcome` — `UseTools` (call these tools, step me again) or `Submit` (final answer).
 
-use myelin_agent::{AgentRuntime, Conversation, StepOutcome, Submission, ToolCall, ToolName};
+use myelin_agent::{
+    AgentRuntime, Conversation, StepOutcome, Submission, ToolCall, ToolCallId, ToolName,
+};
+
+/// A tool call with a deterministic id and null arguments (this scripted brain chooses no real
+/// arguments); the id links its later result back at the widened seam.
+fn call(name: &str) -> ToolCall {
+    ToolCall {
+        id: ToolCallId(format!("call:{name}")),
+        name: ToolName(name.into()),
+        arguments: serde_json::Value::Null,
+    }
+}
 
 /// **PROVIDER side of 8.3 (a runtime).** A deterministic scripted brain — the `--use-mock` shape:
 /// `step` is a pure function of the conversation; the platform owns history, the runtime is
@@ -24,7 +36,7 @@ struct ProviderRuntime;
 impl AgentRuntime for ProviderRuntime {
     fn step(&self, conv: &Conversation) -> StepOutcome {
         if conv.turns.is_empty() {
-            StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))])
+            StepOutcome::UseTools(vec![call("search")])
         } else {
             StepOutcome::Submit(Submission("final".into()))
         }
@@ -39,7 +51,7 @@ fn cdc_8_3_step_is_a_pure_function_of_the_conversation() {
     let opening = Conversation::default();
     match provider.step(&opening) {
         StepOutcome::UseTools(calls) => {
-            assert_eq!(calls, vec![ToolCall(ToolName("search".into()))]);
+            assert_eq!(calls, vec![call("search")]);
         }
         other => panic!("expected UseTools on the opening turn, got {other:?}"),
     }

@@ -317,7 +317,20 @@ where
         .catalogue_tool_ids()
         .into_iter()
         .filter(|(_, id)| predicate.admits(id))
-        .map(|(name, _)| ToolSchema(name.0))
+        .map(|(name, _)| {
+            // Project each admitted tool to the brain-facing schema. The JSON-schema mirrors the
+            // registered `ToolDef.input_schema` so the model can produce valid arguments; `ToolDef`
+            // carries no human description at this seam, so it is left empty.
+            let input_schema = catalogue
+                .resolve(&name)
+                .map(|def| def.input_schema.clone())
+                .unwrap_or_else(|| "{}".to_string());
+            ToolSchema {
+                name,
+                description: String::new(),
+                input_schema,
+            }
+        })
         .collect();
 
     ScopedToolList {
@@ -455,6 +468,16 @@ mod tests {
         }
     }
 
+    /// The brain-facing schema `build_scoped_tool_list` projects for a tool registered via [`def`]
+    /// (empty description + the `def` fixture's `"{}"` input schema).
+    fn schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            name: ToolName(name.into()),
+            description: String::new(),
+            input_schema: "{}".into(),
+        }
+    }
+
     // ───────────────────────── the no-N+1 GATE (query_count == 1) ─────────────────────────────
 
     /// **The scoped tool list is computed in a SINGLE query (no N+1) — `query_count == 1`
@@ -492,9 +515,9 @@ mod tests {
         assert_eq!(scoped.query_count, 1, "the no-N+1 GATE: one query");
         // The brain sees ONLY the three scoped tools (the delegation-scoped subset).
         assert_eq!(scoped.tools.len(), 3);
-        assert!(scoped.tools.contains(&ToolSchema("tool-0".into())));
-        assert!(scoped.tools.contains(&ToolSchema("tool-2".into())));
-        assert!(!scoped.tools.contains(&ToolSchema("tool-3".into())));
+        assert!(scoped.tools.contains(&schema("tool-0")));
+        assert!(scoped.tools.contains(&schema("tool-2")));
+        assert!(!scoped.tools.contains(&schema("tool-3")));
         // The zookie watermark is carried back (4.10 — read-your-writes at apply).
         assert_eq!(scoped.zookie, Zookie("z-7".into()));
     }
@@ -644,7 +667,7 @@ mod tests {
         };
         let scoped = build_scoped_tool_list(&cat, &lo, "psn:agent", &Zookie("z-0".into()));
         assert!(
-            scoped.tools.contains(&ToolSchema("merge".into())),
+            scoped.tools.contains(&schema("merge")),
             "merge was scoped in"
         );
 
@@ -672,7 +695,7 @@ mod tests {
     #[test]
     fn scope_is_stamped_onto_the_conversation() {
         let scoped = ScopedToolList {
-            tools: vec![ToolSchema("read".into()), ToolSchema("merge".into())],
+            tools: vec![schema("read"), schema("merge")],
             zookie: Zookie("z".into()),
             query_count: 1,
         };

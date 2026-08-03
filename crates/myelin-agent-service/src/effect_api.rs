@@ -74,7 +74,7 @@
 
 use myelin_agent::{
     EffectApi, EffectAuthority, EffectKind, EffectResult, EventId, GateId, ProposedEffect, RunCtx,
-    ToolDef, ToolName, ToolSurface,
+    ToolCall, ToolDef, ToolName, ToolSurface,
 };
 use myelin_identity::{
     CaveatContext, Consistency, ConsistencyMode, Decision, EffectivePolicy, FieldId, Permission,
@@ -801,6 +801,41 @@ pub fn validate_schema(input_schema: &str, input_json: &str) -> Result<(), Strin
     }
 
     Ok(())
+}
+
+/// **THE UNTRUSTED-ARGUMENTS ENFORCEMENT SEAM — validate a [`ToolCall`]'s model-chosen `arguments`
+/// against the tool's [`ToolDef::input_schema`] BEFORE the call is dispatched to any tool.**
+///
+/// `ToolCall::arguments` is **untrusted model output** (the brain widened seam, §2.1). A real
+/// tool-calling loop MUST route every `ToolCall` through this checkpoint before it dispatches the
+/// call — for EVERY effect kind (a `read`/`compute`/`external` tool that goes to the hands, as well
+/// as a `mutate` tool that goes to [`PlanThenApply`]). It reuses the SAME bounded JSON-Schema
+/// semantics as the plan-then-apply step-1 [`validate_schema`] gate, so a `mutate` call validated
+/// here and re-validated at apply gets one consistent verdict (defence in depth, never a weaker
+/// check at the earlier boundary).
+///
+/// **TODO (the tool-calling loop slice):** the platform loop that turns a
+/// [`StepOutcome::UseTools`](myelin_agent::StepOutcome::UseTools) into real tool invocations does not
+/// exist yet (VISION §3 — the mock fabricates results, the dry-run maps names to fixture effects, so
+/// no `ToolCall::arguments` are dispatched to a live tool today). That loop MUST call this function
+/// on each `ToolCall` and refuse to dispatch on `Err` — this is the seam it fills, so the untrusted
+/// arguments are NEVER handed to a tool unvalidated.
+pub fn validate_tool_arguments(def: &ToolDef, arguments: &serde_json::Value) -> Result<(), String> {
+    // Serialise the arguments to the string form the bounded JSON-Schema validator reads, then apply
+    // the exact same check the plan-then-apply SCHEMA gate applies to `input_json` (one ACL meaning).
+    let input_json = serde_json::to_string(arguments)
+        .map_err(|e| format!("tool arguments are not serialisable JSON: {e}"))?;
+    validate_schema(&def.input_schema, &input_json)
+}
+
+/// Convenience over [`validate_tool_arguments`]: resolve the [`ToolCall`]'s tool in the `catalogue`
+/// and validate its `arguments`. An unregistered tool is `Err` (a call the run may not make must not
+/// be dispatched). The future tool-calling loop calls this at the dispatch boundary.
+pub fn validate_call<S: ToolSurface>(catalogue: &S, call: &ToolCall) -> Result<(), String> {
+    let def = catalogue
+        .resolve(&call.name)
+        .ok_or_else(|| format!("tool `{}` is not registered in the catalogue", call.name.0))?;
+    validate_tool_arguments(def, &call.arguments)
 }
 
 /// Whether a JSON value matches a JSON-Schema primitive `type` name (the bounded type set).
@@ -2033,6 +2068,53 @@ mod tests {
             validate_schema(no_type, r#"[1,2,3]"#).is_ok(),
             "a schema without type:object admits an array"
         );
+    }
+
+    /// **The untrusted-arguments enforcement seam validates a `ToolCall`'s arguments against the
+    /// tool's `ToolDef.input_schema` — the SAME verdict the step-1 SCHEMA gate reaches.** Well-formed
+    /// arguments pass; a missing required field / a mistyped field / a non-object is `Err` (so the
+    /// future loop refuses to dispatch). An unregistered tool is `Err` via [`validate_call`].
+    #[test]
+    fn validate_tool_arguments_enforces_the_schema_before_dispatch() {
+        use myelin_agent::{ToolCall, ToolCallId};
+        use serde_json::json;
+
+        let def = tool_def("create_issue", &["issue.write"], false, EffectKind::Mutate);
+
+        // Well-formed model output (the required `title` string is present) passes.
+        assert!(validate_tool_arguments(&def, &json!({"title": "CI is red"})).is_ok());
+        // A missing required field is rejected (untrusted output must not be dispatched).
+        assert!(validate_tool_arguments(&def, &json!({})).is_err());
+        // A mistyped field is rejected.
+        assert!(validate_tool_arguments(&def, &json!({"title": 7})).is_err());
+        // A non-object (a `type:object` schema) is rejected — e.g. a `Null` placeholder.
+        assert!(validate_tool_arguments(&def, &serde_json::Value::Null).is_err());
+
+        // `validate_call` resolves the tool then validates; an unregistered tool is refused.
+        struct Cat {
+            defs: Vec<ToolDef>,
+        }
+        impl ToolSurface for Cat {
+            fn register_tool(&mut self, d: ToolDef) {
+                self.defs.push(d);
+            }
+            fn resolve(&self, name: &ToolName) -> Option<&ToolDef> {
+                self.defs.iter().find(|d| &d.name == name)
+            }
+        }
+        let cat = Cat { defs: vec![def] };
+        let good = ToolCall {
+            id: ToolCallId("c1".into()),
+            name: ToolName("create_issue".into()),
+            arguments: json!({"title": "ok"}),
+        };
+        assert!(validate_call(&cat, &good).is_ok());
+        let unknown = ToolCall {
+            id: ToolCallId("c2".into()),
+            name: ToolName("no_such_tool".into()),
+            arguments: json!({}),
+        };
+        assert!(validate_call(&cat, &unknown).is_err());
     }
 
     /// **`json_type_matches` is exact across EVERY primitive type (kills the per-arm delete + the

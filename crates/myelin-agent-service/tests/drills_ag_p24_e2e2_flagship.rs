@@ -65,7 +65,7 @@
 
 use myelin_agent::{
     BudgetView, EffectKind, EffectResult, EventId, GateId, StepOutcome, Submission, SystemContext,
-    ToolCall, ToolDef, ToolName, ToolSurface,
+    ToolCall, ToolCallId, ToolDef, ToolName, ToolSurface,
 };
 use myelin_agent_service::dispatch::{classify, DispatchDecision, DispatchTrigger};
 use myelin_agent_service::dry_run::proposed_effect_sequence;
@@ -89,6 +89,16 @@ use myelin_tenancy::{ArtifactRef, TenantId};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
+
+/// A tool call with a deterministic id and null arguments; the id links its later result back at the
+/// widened seam. This drill's scripted brain chooses no real arguments.
+fn call(name: &str) -> ToolCall {
+    ToolCall {
+        id: ToolCallId(format!("call:{name}")),
+        name: ToolName(name.into()),
+        arguments: serde_json::Value::Null,
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // The scenario constants.
@@ -379,9 +389,9 @@ fn triage_script() -> MockScript {
         BudgetView(100),
         vec![
             StepOutcome::UseTools(vec![
-                ToolCall(ToolName("create_issue".into())),
-                ToolCall(ToolName("post_chat_message".into())),
-                ToolCall(ToolName("git.merge".into())),
+                call("create_issue"),
+                call("post_chat_message"),
+                call("git.merge"),
             ]),
             StepOutcome::Submit(Submission(
                 "filed the issue, discussed, proposed the merge".into(),

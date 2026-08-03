@@ -198,10 +198,10 @@ pub use mock::{
 // consumer seams (4.2 check / 4.5 delegation / tenant / 11.7 budget / subsystem public-endpoint
 // apply) + the AG-D2 denial signals (0 privileged fallback by construction).
 pub use effect_api::{
-    decode_proposed, effect_gate_key, effect_gate_key_str, encode_proposed, validate_schema,
-    ApplyError, CapabilityCheck, DelegationLookup, EffectApiBridge, EffectBudget, EffectCost,
-    PipelineSignals, PipelineStep, PlanThenApply, PlanVerdict, PlannedEffect, SubsystemApply,
-    TenantGuard,
+    decode_proposed, effect_gate_key, effect_gate_key_str, encode_proposed, validate_call,
+    validate_schema, validate_tool_arguments, ApplyError, CapabilityCheck, DelegationLookup,
+    EffectApiBridge, EffectBudget, EffectCost, PipelineSignals, PipelineStep, PlanThenApply,
+    PlanVerdict, PlannedEffect, SubsystemApply, TenantGuard,
 };
 
 // ToolHands::exec on the unified sandbox (AG-P15 → P-226, M2-C, contract 8.4 — the Fabric half): the

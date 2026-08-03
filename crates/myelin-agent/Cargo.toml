@@ -12,6 +12,9 @@ publish = false
 myelin-identity = { path = "../myelin-identity" }
 myelin-events = { path = "../myelin-events" }
 serde.workspace = true
+# `ToolCall.arguments` is the model's chosen JSON input (untrusted model output), carried at
+# the brain seam as a `serde_json::Value` so a real LLM runtime can round-trip real arguments.
+serde_json.workspace = true
 
 [dev-dependencies]
 # The value-type wire-shape round-trip test (the frozen 8.1 ToolDef field list + the

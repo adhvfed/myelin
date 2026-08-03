@@ -84,10 +84,20 @@ pub struct Conversation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SystemContext(pub String);
 
-/// A tool the run may call, as the brain sees it (architecture §2.1). Opaque until the
-/// delegation-scoped tool-list lands (AG-P7 → P-219).
+/// A tool the run may call, as the brain sees it (architecture §2.1) — the delegation-scoped
+/// tool-list projection (AG-P7 → P-219). This is the tool "as the brain sees it" so the model can
+/// produce valid arguments: the `input_schema` mirrors [`ToolDef::input_schema`], the JSON-schema the
+/// model's chosen [`ToolCall::arguments`] are validated against before dispatch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ToolSchema(pub String);
+pub struct ToolSchema {
+    /// The tool name (the catalogue key half; mirrors [`ToolDef::name`]).
+    pub name: ToolName,
+    /// A human-readable description the brain reads to choose the tool.
+    pub description: String,
+    /// The JSON Schema (as a string) for the tool's input — mirrors [`ToolDef::input_schema`]; the
+    /// model produces arguments to satisfy it.
+    pub input_schema: String,
+}
 
 /// The remaining-reserve view the brain reads to decide whether to `Submit` early (architecture
 /// §2.1). Opaque until the reserve/settle cost gate lands (AG-P14 → P-227).
@@ -95,13 +105,13 @@ pub struct ToolSchema(pub String);
 pub struct BudgetView(pub u64);
 
 /// One turn of the platform-owned conversation history (architecture §2.1; Phase-3 §2.1):
-/// `Model(StepOutcome) | ToolResults(Vec<ToolResult>) | Approval(ApprovalNote)`.
+/// `Model(StepOutcome) | ToolResults(Vec<ToolOutcome>) | Approval(ApprovalNote)`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Turn {
     /// A model step (the brain's decision for this turn).
     Model(StepOutcome),
-    /// The results of the tool calls the brain requested.
-    ToolResults(Vec<ToolResult>),
+    /// The results of the tool calls the brain requested, each linked back to its call by id.
+    ToolResults(Vec<ToolOutcome>),
     /// An HITL approval note appended to the trace (the card text is humanised, AG-P11 → P-223).
     Approval(ApprovalNote),
 }
@@ -111,9 +121,26 @@ pub enum Turn {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalNote(pub String);
 
-/// A proposed tool call the brain emits (architecture §2.1; contract 8.3).
+/// The model-chosen identity of a single tool call, minted by the brain so each later
+/// [`ToolOutcome`] can be linked back to the call it answers (architecture §2.1; contract 8.3). Both
+/// vendors require this linkage (OpenAI a `tool` message with a `tool_call_id`; Anthropic a
+/// `tool_result` block with a `tool_use_id`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallId(pub String);
+
+/// A proposed tool call the brain emits (architecture §2.1; contract 8.3). Carries the call `id`
+/// (so its result can be linked back), the tool `name`, and the model's chosen `arguments`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolCall(pub ToolName);
+pub struct ToolCall {
+    /// The model-minted call id; the matching [`ToolOutcome::call_id`] links the result back.
+    pub id: ToolCallId,
+    /// Which tool to call (the catalogue key half; resolves to a [`ToolDef`]).
+    pub name: ToolName,
+    /// The model's chosen JSON input for the call. **UNTRUSTED model output** — before a
+    /// `ToolCall` is dispatched to a tool, these arguments MUST be validated against that tool's
+    /// [`ToolDef::input_schema`]; the brain only ever *proposes* (plan-then-apply survives, §2.1).
+    pub arguments: serde_json::Value,
+}
 
 /// A final submission from the brain — its answer / proposed effects (architecture §2.1).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,11 +167,23 @@ pub struct Command(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult(pub String);
 
+/// A tool [`ToolResult`] linked back to the [`ToolCall`] it answers (architecture §2.1; contract
+/// 8.3/8.4). The platform records these into [`Turn::ToolResults`] so the brain's next step sees
+/// each result keyed to the call it requested — the linkage both vendors require (an OpenAI `tool`
+/// message / an Anthropic `tool_result` block carrying the originating call id).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutcome {
+    /// The [`ToolCall::id`] this result answers.
+    pub call_id: ToolCallId,
+    /// The hands' execution result for that call.
+    pub result: ToolResult,
+}
+
 // ───────────────────────── §4.2 the tool surface — ToolDef (the frozen field list) ──────────────
 
 /// The lookup key into the one tool catalogue (architecture §4.2; contract 8.1). `ToolDef` is
 /// versioned (forward-only) and keyed by `(subsystem, name, version)`; this is the `name` half.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ToolName(pub String);
 
 /// How an effect routes (architecture §5.0; contract 8.1 `effect_kind`): the platform loop routes
@@ -567,7 +606,11 @@ mod tests {
     /// distinguishable and carry their payload.
     #[test]
     fn step_outcome_variants_are_distinct() {
-        let use_tools = StepOutcome::UseTools(vec![ToolCall(ToolName("t".into()))]);
+        let use_tools = StepOutcome::UseTools(vec![ToolCall {
+            id: ToolCallId("call-1".into()),
+            name: ToolName("t".into()),
+            arguments: serde_json::Value::Null,
+        }]);
         let submit = StepOutcome::Submit(Submission("a".into()));
         assert_ne!(use_tools, submit);
         assert!(matches!(use_tools, StepOutcome::UseTools(ref v) if v.len() == 1));

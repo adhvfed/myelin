@@ -54,7 +54,7 @@ use crate::effect_api::{
 };
 use crate::mock::{build_conversation, MockScript, TraceHistory, MOCK_MAX_STEPS};
 use myelin_agent::{
-    AgentRuntime, DryRun, InboxEvent, ProposedEffect, StepOutcome, ToolCall, ToolName, ToolResult,
+    AgentRuntime, DryRun, InboxEvent, ProposedEffect, StepOutcome, ToolName, ToolOutcome, ToolResult,
     ToolSurface,
 };
 
@@ -94,17 +94,28 @@ where
             StepOutcome::UseTools(calls) => {
                 // map each call the loop would route to EffectApi (§5.0) to a ProposedEffect, in
                 // order. `effect_for` returns None for a read/compute call (not a proposed effect).
-                for ToolCall(name) in calls {
-                    if let Some(plan) = effect_for(name) {
+                //
+                // SECURITY BOUNDARY: `call.arguments` is untrusted model output. The REAL
+                // tool-calling loop (VISION §3, not built here) MUST pass each call through
+                // `crate::effect_api::validate_tool_arguments` before dispatch. This dry-run maps by
+                // NAME to a fixture `PlannedEffect` and never dispatches `call.arguments`, so there is
+                // no unvalidated argument reaching a tool here; the mutate path's own step-1
+                // `validate_schema` gate still re-checks the effect input at apply.
+                for call in calls {
+                    if let Some(plan) = effect_for(&call.name) {
                         effects.push(crate::effect_api::encode_proposed(&plan));
                     }
                 }
                 // append the model step + DETERMINISTIC scripted tool results so the next
                 // conversation reconstruction is reproducible (the SAME determinism the replay uses).
+                // Each result is linked back to its call by the model-minted `call_id`.
                 history.push_model(outcome.clone());
-                let results: Vec<ToolResult> = calls
+                let results: Vec<ToolOutcome> = calls
                     .iter()
-                    .map(|ToolCall(ToolName(n))| ToolResult(format!("tool:{n}:result")))
+                    .map(|call| ToolOutcome {
+                        call_id: call.id.clone(),
+                        result: ToolResult(format!("tool:{}:result", call.name.0)),
+                    })
                     .collect();
                 history.push_tool_results(results);
             }
@@ -316,8 +327,8 @@ mod tests {
     use crate::effect_api::{ApplyError, EffectCost, PipelineSignals, PipelineStep};
     use crate::mock::MockAgentRuntime;
     use myelin_agent::{
-        BudgetView, EffectKind, EventId, StepOutcome, Submission, SystemContext, ToolDef,
-        ToolSchema,
+        BudgetView, EffectKind, EventId, StepOutcome, Submission, SystemContext, ToolCall,
+        ToolCallId, ToolDef, ToolSchema,
     };
     use myelin_identity::{
         CaveatContext, Consistency, Decision, EffectivePolicy, Permission, Principal, PrincipalId,
@@ -328,6 +339,26 @@ mod tests {
     use std::collections::BTreeSet;
 
     // ───────── REAL seams (the same shapes the apply-pipeline CDC uses) ─────────
+
+    /// A name-only scoped tool schema (empty description + permissive schema) — the fields the
+    /// widened seam carries; these tests only exercise the tool name.
+    fn schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            name: ToolName(name.into()),
+            description: String::new(),
+            input_schema: "{}".into(),
+        }
+    }
+
+    /// A tool call with a deterministic id and null arguments — the scripted brain chooses no real
+    /// arguments here; the id links its later result back.
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId(format!("call:{name}")),
+            name: ToolName(name.into()),
+            arguments: serde_json::Value::Null,
+        }
+    }
 
     struct Catalogue {
         defs: Vec<ToolDef>,
@@ -461,13 +492,13 @@ mod tests {
         MockScript::new(
             SystemContext("you are agent-7".into()),
             vec![
-                ToolSchema("git.merge".into()),
-                ToolSchema("chat.post_message".into()),
+                schema("git.merge"),
+                schema("chat.post_message"),
             ],
             BudgetView(100),
             vec![
-                StepOutcome::UseTools(vec![ToolCall(ToolName("git.merge".into()))]),
-                StepOutcome::UseTools(vec![ToolCall(ToolName("chat.post_message".into()))]),
+                StepOutcome::UseTools(vec![call("git.merge")]),
+                StepOutcome::UseTools(vec![call("chat.post_message")]),
                 StepOutcome::Submit(Submission("done".into())),
             ],
         )
@@ -627,11 +658,11 @@ mod tests {
     fn read_and_compute_calls_are_not_proposed_effects() {
         let script = MockScript::new(
             SystemContext("s".into()),
-            vec![ToolSchema("search".into()), ToolSchema("git.merge".into())],
+            vec![schema("search"), schema("git.merge")],
             BudgetView(0),
             vec![
-                StepOutcome::UseTools(vec![ToolCall(ToolName("search".into()))]),
-                StepOutcome::UseTools(vec![ToolCall(ToolName("git.merge".into()))]),
+                StepOutcome::UseTools(vec![call("search")]),
+                StepOutcome::UseTools(vec![call("git.merge")]),
                 StepOutcome::Submit(Submission("done".into())),
             ],
         );
@@ -676,10 +707,10 @@ mod tests {
 
         let script = MockScript::new(
             SystemContext("s".into()),
-            vec![ToolSchema("git.merge".into())],
+            vec![schema("git.merge")],
             BudgetView(0),
             vec![
-                StepOutcome::UseTools(vec![ToolCall(ToolName("git.merge".into()))]),
+                StepOutcome::UseTools(vec![call("git.merge")]),
                 StepOutcome::Submit(Submission("done".into())),
             ],
         );

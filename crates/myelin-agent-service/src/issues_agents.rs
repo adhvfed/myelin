@@ -56,7 +56,7 @@
 
 use myelin_agent::{
     BudgetView, EffectKind, ProposedEffect, StepOutcome, Submission, SystemContext, ToolCall,
-    ToolDef, ToolName, ToolSchema, ToolSurface,
+    ToolCallId, ToolDef, ToolName, ToolSchema, ToolSurface,
 };
 use myelin_issues::rebac_fragment::object_types as issue_objects;
 
@@ -365,14 +365,23 @@ pub fn mock_forecast_agent(input: &ForecastInput) -> MockAgentRuntime {
 pub fn mock_triage_agent(issue_ref: &str) -> MockAgentRuntime {
     // a one-turn triage: propose the `triage` advisory tool, then submit the suggestion strip. The
     // tool the brain names is the advisory `triage` (mapped to a ProposedEffect by the dispatch tier).
+    let triage_tool = crate::issues_tools::TRIAGE_TOOL;
     let script = MockScript::new(
         SystemContext("issues.triage agent (mock; labelled as an agent)".into()),
-        vec![ToolSchema(crate::issues_tools::TRIAGE_TOOL.to_string())],
+        vec![ToolSchema {
+            name: ToolName(triage_tool.to_string()),
+            // No ToolDef is in scope here; the advisory tool carries no rich schema at this seam.
+            description: String::new(),
+            input_schema: "{}".into(),
+        }],
         BudgetView(0),
         vec![
-            StepOutcome::UseTools(vec![ToolCall(ToolName(
-                crate::issues_tools::TRIAGE_TOOL.to_string(),
-            ))]),
+            StepOutcome::UseTools(vec![ToolCall {
+                // Deterministic id for the scripted call; the advisory triage takes no arguments.
+                id: ToolCallId(format!("call:{triage_tool}")),
+                name: ToolName(triage_tool.to_string()),
+                arguments: serde_json::Value::Null,
+            }]),
             StepOutcome::Submit(Submission(format!(
                 "triage(suggestion strip): proposed triage for {issue_ref} (S9 — the human accepts)"
             ))),
