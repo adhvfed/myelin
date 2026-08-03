@@ -930,9 +930,20 @@ build = {{ tool = "cargo", args = ["build", "--locked"] }}
         );
         let definition = parse_versioned_ci_config(toml.as_bytes(), "toml").unwrap();
         assert!(definition.jobs[0].command.is_empty());
+        // `platform_argv()` appends the server-owned hermetic source overrides after the
+        // tenant-authored `cargo build --locked`: the tenant supplies only the leading recipe,
+        // and the platform forces offline resolution against the vendored crate tree (#30/#35).
         assert_eq!(
             definition.jobs[0].build.as_ref().unwrap().platform_argv(),
-            ["cargo", "build", "--locked"]
+            [
+                "cargo",
+                "build",
+                "--locked",
+                "--config",
+                myelin_ci_sandbox::gvisor::CARGO_SOURCE_REPLACE_CONFIG,
+                "--config",
+                myelin_ci_sandbox::gvisor::CARGO_VENDOR_DIRECTORY_CONFIG,
+            ]
         );
 
         let store = FsBlobStore::new();
