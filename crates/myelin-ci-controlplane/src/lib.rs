@@ -112,11 +112,13 @@ pub use ci_identity_adapter::{
     IdentityCiJobLaunchAuthorizer, CI_JOB_PRINCIPAL_ID, CI_JOB_REQUIRED_CAPABILITIES,
 };
 pub use ci_launch_authority::{
-    CiAttemptBudgetPolicy, CiAttemptBudgetRevision, CiJobBudgetReservationProvider,
-    CiJobRuntimeAuthorityRequest, LinuxSmallV1LaunchAuthority, ManifestBoundCiJobTokenAuthority,
+    runner_labels_for_profile, runner_labels_for_profiles, CiAttemptBudgetPolicy,
+    CiAttemptBudgetRevision, CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest,
+    LinuxSmallV1LaunchAuthority, ManifestBoundCiJobTokenAuthority,
     OperationalReservationWriteVersion, PgTierPCiJobBudgetReservation,
-    ReservationWriteVersionMarker, TierPOperationalCiJobPricer, LINUX_SMALL_V1_POLICY_REVISION,
-    LINUX_SMALL_V1_RUNNER_LABELS, TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
+    ReservationWriteVersionMarker, TierPOperationalCiJobPricer, LINUX_BUILD_V1_RUNNER_LABELS,
+    LINUX_SMALL_V1_POLICY_REVISION, LINUX_SMALL_V1_RUNNER_LABELS,
+    TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING,
 };
 pub use ci_manifest_job_runner::{
     register_durable_ci_manifest_pipeline, secret_broker_ci_job_resolver,

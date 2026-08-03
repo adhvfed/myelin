@@ -949,18 +949,45 @@ struct CiExecutionProfilePolicy {
 }
 
 fn limits_and_policy_for_profile(profile: CiExecutionProfileV1) -> CiExecutionProfilePolicy {
+    let runner_labels = runner_labels_for_profile(profile);
     match profile {
         CiExecutionProfileV1::LinuxSmallV1 => CiExecutionProfilePolicy {
             limits: linux_small_limits(),
             policy_revision: LINUX_SMALL_V1_POLICY_REVISION,
-            runner_labels: LINUX_SMALL_V1_RUNNER_LABELS,
+            runner_labels,
         },
         CiExecutionProfileV1::LinuxBuildV1 => CiExecutionProfilePolicy {
             limits: linux_build_limits(),
             policy_revision: LINUX_BUILD_V1_POLICY_REVISION,
-            runner_labels: LINUX_BUILD_V1_RUNNER_LABELS,
+            runner_labels,
         },
     }
+}
+
+/// The exact scheduler labels a runner must advertise to be eligible to CLAIM a job whose launch
+/// authority stamps `profile`. Single source of truth for the profile→label mapping, shared by the
+/// authority (which stamps a job's required labels) and the runner composition (which advertises the
+/// labels of the profiles a host is provisioned to serve). Claim eligibility is a subset test — a
+/// job's required labels must be ⊆ the runner's advertised set — so advertising a superset is safe.
+pub fn runner_labels_for_profile(profile: CiExecutionProfileV1) -> [&'static str; 2] {
+    match profile {
+        CiExecutionProfileV1::LinuxSmallV1 => LINUX_SMALL_V1_RUNNER_LABELS,
+        CiExecutionProfileV1::LinuxBuildV1 => LINUX_BUILD_V1_RUNNER_LABELS,
+    }
+}
+
+/// The sorted, de-duplicated union of runner labels across `profiles` — the exact label set a runner
+/// host advertises when it is provisioned to serve those profiles. `linux` is shared across profiles
+/// and appears once. An empty `profiles` yields an empty set (a runner serving no profile claims
+/// nothing); callers that require at least one profile enforce that upstream.
+pub fn runner_labels_for_profiles(profiles: &[CiExecutionProfileV1]) -> Vec<String> {
+    profiles
+        .iter()
+        .flat_map(|profile| runner_labels_for_profile(*profile))
+        .map(|label| label.to_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn prepare_linux_small_requests(

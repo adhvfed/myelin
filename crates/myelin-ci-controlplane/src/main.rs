@@ -63,6 +63,14 @@ enum StartupRefusal {
     NonTerminalNullStageBacklog {
         count: i64,
     },
+    /// CT-007 gate 2: `MYELIN_CI_RUNNER_EXECUTION_PROFILES` names a profile this binary does not
+    /// serve — refuse loudly rather than silently advertise a truncated label set (which would make
+    /// the intended profile's jobs unclaimable and strand them queued).
+    UnknownRunnerExecutionProfile(String),
+    NonUnicodeRunnerExecutionProfiles(OsString),
+    /// The variable is present but names no profile after trimming — refuse rather than advertise an
+    /// empty label set (a runner that claims nothing). Omit the variable for the default instead.
+    EmptyRunnerExecutionProfiles,
 }
 
 impl fmt::Display for StartupRefusal {
@@ -96,9 +104,32 @@ impl fmt::Display for StartupRefusal {
                  stage (a pre-rewire rolling-upgrade backlog completion cannot safely attribute); the \
                  activation guard requires zero such rows"
             ),
+            Self::UnknownRunnerExecutionProfile(value) => write!(
+                f,
+                "invalid {ENV_CI_RUNNER_EXECUTION_PROFILES} entry {value:?}; allowed profiles are \
+                 `linux-small-v1` and `linux-build-v1`"
+            ),
+            Self::NonUnicodeRunnerExecutionProfiles(value) => write!(
+                f,
+                "invalid {ENV_CI_RUNNER_EXECUTION_PROFILES} value {value:?} contains non-UTF-8 bytes"
+            ),
+            Self::EmptyRunnerExecutionProfiles => write!(
+                f,
+                "{ENV_CI_RUNNER_EXECUTION_PROFILES} names no profiles; omit it for the default \
+                 `linux-small-v1`"
+            ),
         }
     }
 }
+
+/// The comma-separated set of execution profiles this runner host is provisioned to serve. Each
+/// entry is a [`myelin_ci_controlplane::CiExecutionProfileV1`] label; the runner advertises the
+/// sorted union of their scheduler labels (via
+/// [`myelin_ci_controlplane::runner_labels_for_profiles`]) and can then CLAIM a job iff the job's
+/// required labels are a subset of that set. Unset defaults to `linux-small-v1` alone, so an
+/// existing small-only runner is byte-unchanged; a build-capable host sets e.g.
+/// `linux-small-v1,linux-build-v1` (a build host has the cargo/clippy rootfs + build-sized RAM).
+const ENV_CI_RUNNER_EXECUTION_PROFILES: &str = "MYELIN_CI_RUNNER_EXECUTION_PROFILES";
 
 impl std::error::Error for StartupRefusal {}
 
@@ -114,6 +145,39 @@ fn verify_startup_activation(
             Err(StartupRefusal::NonUnicodeRunnerSetting(value))
         }
     }
+}
+
+/// Resolve the runner's advertised execution-profile set from `MYELIN_CI_RUNNER_EXECUTION_PROFILES`.
+/// Pure (env `Result` passed in) so tests inject values. Unset → the default `[LinuxSmallV1]` (an
+/// existing runner is unchanged); present → parse each comma-separated label, deduplicating while
+/// preserving first-seen order, refusing on any unknown label or an all-empty value. The order of the
+/// returned profiles does not matter — the caller advertises the SORTED union of their labels.
+fn resolve_runner_execution_profiles(
+    setting: Result<String, std::env::VarError>,
+) -> Result<Vec<myelin_ci_controlplane::CiExecutionProfileV1>, StartupRefusal> {
+    let value = match setting {
+        Err(std::env::VarError::NotPresent) => {
+            return Ok(vec![myelin_ci_controlplane::CiExecutionProfileV1::LinuxSmallV1]);
+        }
+        Err(std::env::VarError::NotUnicode(value)) => {
+            return Err(StartupRefusal::NonUnicodeRunnerExecutionProfiles(value));
+        }
+        Ok(value) => value,
+    };
+    let mut profiles = Vec::new();
+    for token in value.split(',').map(str::trim).filter(|token| !token.is_empty()) {
+        match myelin_ci_controlplane::CiExecutionProfileV1::from_label(token) {
+            Some(profile) if !profiles.contains(&profile) => profiles.push(profile),
+            Some(_) => {}
+            None => {
+                return Err(StartupRefusal::UnknownRunnerExecutionProfile(token.to_owned()));
+            }
+        }
+    }
+    if profiles.is_empty() {
+        return Err(StartupRefusal::EmptyRunnerExecutionProfiles);
+    }
+    Ok(profiles)
 }
 
 fn checkout_workspace_capability_requested(
@@ -720,12 +784,18 @@ async fn run(runner_host_requested: bool) {
             }
         };
         let (runner_resolver, runner_hooks) = runner_wiring.into_parts();
+        let runner_execution_profiles = match resolve_runner_execution_profiles(std::env::var(
+            ENV_CI_RUNNER_EXECUTION_PROFILES,
+        )) {
+            Ok(profiles) => profiles,
+            Err(refusal) => {
+                eprintln!("ci-controlplane: startup refused: {refusal}");
+                std::process::exit(1);
+            }
+        };
         let runner = myelin_ci_controlplane::CiRunnerLoop::new(
             format!("ci-runner-{}", std::process::id()),
-            myelin_ci_controlplane::LINUX_SMALL_V1_RUNNER_LABELS
-                .iter()
-                .map(|label| (*label).to_owned())
-                .collect(),
+            myelin_ci_controlplane::runner_labels_for_profiles(&runner_execution_profiles),
             vec![myelin_ci_sandbox::TrustTier::Trusted],
             provider.config().region.clone(),
             myelin_ci_controlplane::CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
@@ -900,10 +970,75 @@ impl ShutdownSignals {
 mod tests {
     use super::{
         checkout_workspace_capability_requested, prepare_checkout_config_given,
-        verify_startup_activation, StartupRefusal,
+        resolve_runner_execution_profiles, verify_startup_activation, StartupRefusal,
     };
+    use myelin_ci_controlplane::{runner_labels_for_profiles, CiExecutionProfileV1};
     use std::env::VarError;
     use std::ffi::OsString;
+
+    #[test]
+    fn unset_runner_profiles_default_to_small_only_and_leave_labels_byte_unchanged() {
+        let profiles = resolve_runner_execution_profiles(Err(VarError::NotPresent)).unwrap();
+        assert_eq!(profiles, vec![CiExecutionProfileV1::LinuxSmallV1]);
+        // The advertised label set is EXACTLY the historical hardcoded set — an existing
+        // small-only runner is unchanged when the variable is absent.
+        assert_eq!(
+            runner_labels_for_profiles(&profiles),
+            vec!["linux".to_owned(), "linux-small-v1".to_owned()]
+        );
+    }
+
+    #[test]
+    fn build_capable_host_advertises_the_sorted_deduped_union() {
+        let profiles =
+            resolve_runner_execution_profiles(Ok("linux-small-v1,linux-build-v1".to_owned()))
+                .unwrap();
+        assert_eq!(
+            profiles,
+            vec![
+                CiExecutionProfileV1::LinuxSmallV1,
+                CiExecutionProfileV1::LinuxBuildV1
+            ]
+        );
+        // `linux` is shared and appears once; the set is sorted so it is a stable advertised set.
+        assert_eq!(
+            runner_labels_for_profiles(&profiles),
+            vec![
+                "linux".to_owned(),
+                "linux-build-v1".to_owned(),
+                "linux-small-v1".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn runner_profiles_dedupe_and_ignore_blank_entries() {
+        let profiles = resolve_runner_execution_profiles(Ok(
+            " linux-build-v1 , , linux-build-v1 ".to_owned()
+        ))
+        .unwrap();
+        assert_eq!(profiles, vec![CiExecutionProfileV1::LinuxBuildV1]);
+    }
+
+    #[test]
+    fn unknown_or_empty_runner_profiles_fail_closed() {
+        assert_eq!(
+            resolve_runner_execution_profiles(Ok("linux-mega-v1".to_owned())),
+            Err(StartupRefusal::UnknownRunnerExecutionProfile(
+                "linux-mega-v1".to_owned()
+            ))
+        );
+        assert_eq!(
+            resolve_runner_execution_profiles(Ok("  , ".to_owned())),
+            Err(StartupRefusal::EmptyRunnerExecutionProfiles)
+        );
+        assert_eq!(
+            resolve_runner_execution_profiles(Err(VarError::NotUnicode(OsString::from("x")))),
+            Err(StartupRefusal::NonUnicodeRunnerExecutionProfiles(
+                OsString::from("x")
+            ))
+        );
+    }
 
     #[test]
     fn production_runner_flag_is_explicit_opt_in_and_malformed_values_fail_closed() {

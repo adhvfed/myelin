@@ -93,6 +93,20 @@ pub enum CiExecutionProfileV1 {
     LinuxBuildV1,
 }
 
+impl CiExecutionProfileV1 {
+    /// Parse a profile from its canonical `linux-<class>-v1` label (identical to the serde rename and
+    /// to the runner label the launch authority stamps); `None` for any unrecognized label. The
+    /// runner composition uses this to turn `MYELIN_CI_RUNNER_EXECUTION_PROFILES` into the profile set
+    /// it advertises labels for.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "linux-small-v1" => Some(Self::LinuxSmallV1),
+            "linux-build-v1" => Some(Self::LinuxBuildV1),
+            _ => None,
+        }
+    }
+}
+
 /// Versioned authored execution request nested in a version-2 resolved plan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
