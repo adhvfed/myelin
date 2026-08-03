@@ -88,6 +88,7 @@ pub mod notif_http;
 pub mod repo_authz;
 pub mod repo_authz_live;
 pub mod request;
+pub mod secret_admin_cmd;
 pub mod server;
 pub mod session;
 pub mod sse;
@@ -143,6 +144,9 @@ pub use repo_authz_live::{
     RepoBootstrapGrants, TupleRepoBootstrap, REPO_ADMIN_RELATION,
 };
 pub use request::{EdgeRequest, EdgeResponse};
+pub use secret_admin_cmd::{
+    execute_secret_command, SecretCommand, SecretCommandError, SecretCommandOutput, SecretTarget,
+};
 pub use server::{
     serve_edge, serve_edge_until_shutdown, serve_edge_until_shutdown_with_probe, ReadinessCheck,
     ReadinessProbe, ShutdownOutcome,
