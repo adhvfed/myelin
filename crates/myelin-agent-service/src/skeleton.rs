@@ -80,8 +80,8 @@
 use crate::effect_api::validate_call;
 use crate::tool_exec::ToolExecutor;
 use myelin_agent::{
-    Agent, AgentRuntime, Conversation, InboxEvent, RunOutcome, StepOutcome, Submission, ToolOutcome,
-    ToolSurface, Turn,
+    Agent, AgentRuntime, Conversation, InboxEvent, MeteredRuntime, MeteredStep, RunOutcome,
+    StepOutcome, Submission, TokenUsage, ToolOutcome, ToolSurface, Turn,
 };
 use myelin_events::{
     Actor, AggregateKey, DataRole, EmitContextBase, EventDraft, EventType, Timestamp, Visibility,
@@ -148,6 +148,11 @@ impl AgentRuntime for SkeletonAgentRuntime {
         ))
     }
 }
+
+/// The SKELETON has no model, so it has no usage source: it inherits the default
+/// [`MeteredRuntime::step_metered`] (the plain submit + [`TokenUsage::NotReported`]). Explicit (not
+/// blanket) so the vendor `LlmAgentRuntime` override does not collide under coherence.
+impl MeteredRuntime for SkeletonAgentRuntime {}
 
 // ───────────────────────── per-run identity: the revoke seam (4.7) + the child-env anti-leak ─────
 
@@ -233,6 +238,22 @@ pub struct SkeletonTelemetry {
     runs_completed: u64,
     /// The number of runs killed mid-flight (AG-D8): the token is STILL revoked on teardown.
     runs_killed: u64,
+    // ───────── raw per-run token usage totals (contract 8.3; NON-FINANCIAL — observability only) ──
+    //
+    // The run's total RAW provider token counts, accumulated per turn from the metered brain step
+    // ([`MeteredRuntime::step_metered`]). This is a NEW, separate observability signal — it holds NO
+    // money and does NOT touch the reserve/settle ledger above: pricing these counts into a bill is a
+    // separate, decision-gated slice. A SKELETON/Mock run reports NotReported every turn, so its token
+    // totals stay 0 and the balanced-ledger assertions are unaffected.
+    /// Total non-cached prompt (input) tokens across all reported turns (saturating).
+    tokens_input: u64,
+    /// Total cached prompt (input) tokens across all reported turns (saturating).
+    tokens_cached_input: u64,
+    /// Total completion (output) tokens across all reported turns (saturating).
+    tokens_output: u64,
+    /// The number of turns whose usage was [`TokenUsage::NotReported`] (a usage-less brain, or a
+    /// provider that omitted usage). The future metering slice reads this to fail closed.
+    turns_usage_not_reported: u64,
 }
 
 impl SkeletonTelemetry {
@@ -273,6 +294,43 @@ impl SkeletonTelemetry {
     /// The number of runs killed mid-flight (AG-D8).
     pub fn runs_killed(&self) -> u64 {
         self.runs_killed
+    }
+    /// Total raw non-cached prompt (input) tokens across all reported turns (NON-FINANCIAL).
+    pub fn tokens_input(&self) -> u64 {
+        self.tokens_input
+    }
+    /// Total raw cached prompt (input) tokens across all reported turns (NON-FINANCIAL).
+    pub fn tokens_cached_input(&self) -> u64 {
+        self.tokens_cached_input
+    }
+    /// Total raw completion (output) tokens across all reported turns (NON-FINANCIAL).
+    pub fn tokens_output(&self) -> u64 {
+        self.tokens_output
+    }
+    /// The number of turns whose usage was [`TokenUsage::NotReported`] (the fail-closed signal).
+    pub fn turns_usage_not_reported(&self) -> u64 {
+        self.turns_usage_not_reported
+    }
+
+    /// **Accumulate ONE metered turn's raw token usage (contract 8.3; observability only).** A
+    /// reported turn saturating-adds its raw counts into the run totals; a `NotReported` turn bumps
+    /// the not-reported counter (the future metering slice fails closed on it). This touches NO money
+    /// and NO reserve/settle state — token totals are a separate signal from the cost ledger.
+    fn record_token_usage(&mut self, usage: &TokenUsage) {
+        match usage {
+            TokenUsage::Reported {
+                input,
+                cached_input,
+                output,
+            } => {
+                self.tokens_input = self.tokens_input.saturating_add(*input);
+                self.tokens_cached_input = self.tokens_cached_input.saturating_add(*cached_input);
+                self.tokens_output = self.tokens_output.saturating_add(*output);
+            }
+            TokenUsage::NotReported => {
+                self.turns_usage_not_reported = self.turns_usage_not_reported.saturating_add(1);
+            }
+        }
     }
 
     fn record_reserve(&mut self, amount: u64) {
@@ -491,7 +549,7 @@ impl SkeletonAgent {
     /// down on EVERY path (completed, killed, or errored) — the teardown is unconditional.
     pub fn handle_run(
         &self,
-        runtime: &dyn AgentRuntime,
+        runtime: &dyn MeteredRuntime,
         sub: &mut RunSubstrate<'_>,
         telemetry: &mut SkeletonTelemetry,
         kill: RunOutcomeKind,
@@ -579,7 +637,13 @@ impl SkeletonAgent {
         //     completed / killed / refused paths.
         let mut submission: Option<Submission> = None;
         for _turn in 0..DEFAULT_MAX_TURNS {
-            match runtime.step(&conv) {
+            // Step the brain OBSERVABLY: the decision PLUS its raw token usage. Accumulate the usage
+            // into the run telemetry (a NEW, separate observability signal — NON-FINANCIAL: no
+            // pricing, no reserve/settle touch). The SKELETON/Mock report NotReported, so their token
+            // totals stay 0 and the balanced-ledger assertions are unchanged.
+            let MeteredStep { outcome, usage } = runtime.step_metered(&conv);
+            telemetry.record_token_usage(&usage);
+            match outcome {
                 StepOutcome::Submit(s) => {
                     // Terminal — record the model step into the transcript, then fall through to the
                     // (unchanged) trace → settle → teardown chain below.
@@ -1357,6 +1421,7 @@ mod tests {
                 }
             }
         }
+        impl MeteredRuntime for DriveBrain {}
 
         let brain = DriveBrain::default();
         let agent_loop = SkeletonAgent::new();
@@ -1422,6 +1487,7 @@ mod tests {
             }])
         }
     }
+    impl MeteredRuntime for AlwaysUseTool {}
 
     /// **A run that never submits terminates GRACEFULLY at max_turns (the runaway guard) — bounded, no
     /// panic, teardown still fires.** After exactly [`DEFAULT_MAX_TURNS`] executed tool turns the loop
@@ -1541,5 +1607,147 @@ mod tests {
         assert_eq!(tele.tokens_revoked(), 1, "torn down on the executor-error path");
         assert_eq!(tele.traces_written(), 0);
         assert_eq!(tele.runs_completed(), 0);
+    }
+
+    // ───────── raw token-usage telemetry (contract 8.3; NON-FINANCIAL — observability only) ──────
+
+    /// **A SKELETON run's token totals are 0 / NotReported, and the ledger is UNAFFECTED.** The
+    /// SKELETON has no model, so its single submit turn reports no usage: the token totals stay 0, the
+    /// not-reported counter reads 1 (the one turn), and the balanced reserve/settle ledger is
+    /// untouched (token usage is a NEW, separate signal from the cost ledger).
+    #[test]
+    fn skeleton_run_token_totals_are_zero_and_not_reported() {
+        let rt = SkeletonAgentRuntime::new();
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut tele = SkeletonTelemetry::new();
+        let cat = MockToolSurface::new();
+        let exec = MockToolExecutor::new();
+        let mut sub = substrate(
+            "Rtok0", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+        );
+
+        agent_loop
+            .handle_run(&rt, &mut sub, &mut tele, RunOutcomeKind::Completed)
+            .expect("the SKELETON chain completes");
+
+        assert_eq!(tele.tokens_input(), 0, "no model → 0 input tokens");
+        assert_eq!(tele.tokens_cached_input(), 0, "no model → 0 cached tokens");
+        assert_eq!(tele.tokens_output(), 0, "no model → 0 output tokens");
+        assert_eq!(
+            tele.turns_usage_not_reported(),
+            1,
+            "the one submit turn reported no usage (fail-closed signal)"
+        );
+        // The token signal did NOT perturb the reserve/settle ledger.
+        assert!(tele.ledger_balanced(), "reserved == settled is unaffected");
+        assert_eq!(tele.reserved(), 10);
+        assert_eq!(tele.settled(), 10);
+    }
+
+    /// **A multi-turn run accumulates the per-turn raw token counts into telemetry (observability
+    /// only).** A brain with a real `step_metered` override reporting fixed counts drives search →
+    /// read → submit (three metered steps); the loop saturating-sums each turn's counts into the run
+    /// totals, and the reserve/settle ledger stays balanced (token totals are a separate signal — no
+    /// pricing, no gating).
+    #[test]
+    fn run_accumulates_per_turn_token_usage_into_telemetry() {
+        #[derive(Default)]
+        struct MeteredBrain;
+        impl AgentRuntime for MeteredBrain {
+            fn step(&self, conv: &Conversation) -> StepOutcome {
+                match model_turns(conv) {
+                    0 => StepOutcome::UseTools(vec![tool_call("search")]),
+                    1 => StepOutcome::UseTools(vec![tool_call("read")]),
+                    _ => StepOutcome::Submit(Submission("done".into())),
+                }
+            }
+        }
+        // The REAL metered override: report fixed raw counts every step (the only brain with a usage
+        // source in this test). NON-FINANCIAL — raw counts, no pricing.
+        impl MeteredRuntime for MeteredBrain {
+            fn step_metered(&self, conv: &Conversation) -> MeteredStep {
+                MeteredStep {
+                    outcome: self.step(conv),
+                    usage: TokenUsage::Reported {
+                        input: 100,
+                        cached_input: 20,
+                        output: 5,
+                    },
+                }
+            }
+        }
+        fn model_turns(conv: &Conversation) -> usize {
+            conv.turns
+                .iter()
+                .filter(|t| matches!(t, Turn::Model(_)))
+                .count()
+        }
+
+        let brain = MeteredBrain;
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut tele = SkeletonTelemetry::new();
+        let cat = MockToolSurface::with([tool_def("search"), tool_def("read")]);
+        let exec = MockToolExecutor::new();
+        let mut sub = substrate(
+            "Rtok", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+        );
+
+        let out = agent_loop
+            .handle_run(&brain, &mut sub, &mut tele, RunOutcomeKind::Completed)
+            .expect("the metered run completes");
+        assert!(out.0.contains("completed"), "the run completed: {out:?}");
+
+        // Three metered steps (search, read, submit) × (100, 20, 5) summed into the run totals.
+        assert_eq!(tele.tokens_input(), 300, "3 turns × 100 input");
+        assert_eq!(tele.tokens_cached_input(), 60, "3 turns × 20 cached");
+        assert_eq!(tele.tokens_output(), 15, "3 turns × 5 output");
+        assert_eq!(
+            tele.turns_usage_not_reported(),
+            0,
+            "every turn reported usage"
+        );
+        // The token signal is SEPARATE: the reserve/settle ledger is still balanced + unchanged.
+        assert!(tele.ledger_balanced(), "reserved == settled is unaffected");
+        assert_eq!(tele.reserved(), 10);
+        assert_eq!(tele.settled(), 10);
+    }
+
+    /// **`record_token_usage` sums reported counts + counts NotReported turns (mutation-floor).** A
+    /// mix of reported and not-reported turns lands in the right totals — a mutant that drops a field
+    /// or miscounts flips an assertion.
+    #[test]
+    fn record_token_usage_sums_reported_and_counts_not_reported() {
+        let mut t = SkeletonTelemetry::new();
+        t.record_token_usage(&TokenUsage::Reported {
+            input: 10,
+            cached_input: 2,
+            output: 3,
+        });
+        t.record_token_usage(&TokenUsage::NotReported);
+        t.record_token_usage(&TokenUsage::Reported {
+            input: 5,
+            cached_input: 1,
+            output: 4,
+        });
+        assert_eq!(t.tokens_input(), 15);
+        assert_eq!(t.tokens_cached_input(), 3);
+        assert_eq!(t.tokens_output(), 7);
+        assert_eq!(t.turns_usage_not_reported(), 1);
     }
 }

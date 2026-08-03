@@ -62,8 +62,8 @@
 //!   `run.trace_ref` `ArtifactRef` are the SKELETON's (AG-P4) + the schema's (AG-P2).
 
 use myelin_agent::{
-    AgentRuntime, BudgetView, Conversation, StepOutcome, Submission, SystemContext, ToolCall,
-    ToolOutcome, ToolResult, ToolSchema, Turn,
+    AgentRuntime, BudgetView, Conversation, MeteredRuntime, StepOutcome, Submission, SystemContext,
+    ToolCall, ToolOutcome, ToolResult, ToolSchema, Turn,
 };
 
 // ───────────────────────── §3.2 — the scripted brain's fixture ─────────────────────────
@@ -232,6 +232,11 @@ impl AgentRuntime for MockAgentRuntime {
         self.script.step_at(n)
     }
 }
+
+/// The Mock is a scripted brain with no model, so it has no usage source: it inherits the default
+/// [`MeteredRuntime::step_metered`] (the scripted decision + [`myelin_agent::TokenUsage::NotReported`]).
+/// Explicit (not blanket) so the vendor `LlmAgentRuntime` override does not collide under coherence.
+impl MeteredRuntime for MockAgentRuntime {}
 
 // ───────────────────────── §2.1 — the platform-owned history (the trace) ─────────────────────────
 

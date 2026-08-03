@@ -28,7 +28,7 @@
 //! AgentRunGate/CostLedger proven against the live PG tier by P-103/P-146) → no new integration drill
 //! owed (recorded in the P-227 report).
 
-use myelin_agent::{AgentRuntime, Conversation, StepOutcome};
+use myelin_agent::{AgentRuntime, Conversation, MeteredRuntime, StepOutcome};
 use myelin_agent_service::{
     runaway_brain, AgentFabricCostSignal, MockToolExecutor, MockToolSurface, RunOutcomeKind,
     RunSubstrate, RunTokenRevoker, RunawaySelfLimiter, RunawayStep, SkeletonAgent, SkeletonError,
@@ -350,6 +350,7 @@ fn ag_d11_limiter_is_brain_independent() {
             StepOutcome::Submit(myelin_agent::Submission("other".into()))
         }
     }
+    impl MeteredRuntime for OtherBrain {}
     let other = OtherBrain;
     let agent_loop = SkeletonAgent::new();
     let revoker = ProviderRevoker::default();

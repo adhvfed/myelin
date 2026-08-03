@@ -36,7 +36,8 @@ use crate::client::{
     ToolSpec, Usage,
 };
 use myelin_agent::{
-    AgentRuntime, Conversation, StepOutcome, Submission, ToolCall, ToolCallId, ToolName, Turn,
+    AgentRuntime, Conversation, MeteredRuntime, MeteredStep, StepOutcome, Submission, TokenUsage,
+    ToolCall, ToolCallId, ToolName, Turn,
 };
 
 /// One step's full result: the seam decision PLUS the provider usage report the metering slice
@@ -97,6 +98,52 @@ impl AgentRuntime for LlmAgentRuntime {
                 "agent runtime error (fail-closed, run aborted): {e}"
             ))),
         }
+    }
+}
+
+/// **THE REAL METERED OVERRIDE (contract 8.3; NON-FINANCIAL).** `LlmAgentRuntime` is the one brain
+/// with a real usage source, so it overrides [`MeteredRuntime::step_metered`] to report the
+/// provider's raw token counts. It calls [`LlmAgentRuntime::try_step`] and maps the vendor
+/// [`Usage`] → the platform [`TokenUsage`] (the sanctioned vendor→platform mapping — the platform
+/// crate never sees `myelin_agent_model::client::Usage`). On a [`ModelError`] it degrades EXACTLY as
+/// the trait [`AgentRuntime::step`] does — a terminal fail-closed [`Submit`] with
+/// [`TokenUsage::NotReported`] — so an errored step is never billed and the bounded loop ends
+/// cleanly. Raw counts only: no pricing, no money (that is a separate, decision-gated slice).
+impl MeteredRuntime for LlmAgentRuntime {
+    fn step_metered(&self, conv: &Conversation) -> MeteredStep {
+        match self.try_step(conv) {
+            Ok(report) => MeteredStep {
+                outcome: report.outcome,
+                usage: map_usage(report.usage),
+            },
+            // Fail closed, mirroring `AgentRuntime::step`: a terminal Submit ends the loop with no
+            // further paid call, and NotReported so the metering slice never prices an errored call.
+            Err(e) => MeteredStep {
+                outcome: StepOutcome::Submit(Submission(format!(
+                    "agent runtime error (fail-closed, run aborted): {e}"
+                ))),
+                usage: TokenUsage::NotReported,
+            },
+        }
+    }
+}
+
+/// Map the vendor [`Usage`] to the platform [`TokenUsage`] — the ONE place the vendor usage type
+/// crosses into the platform seam vocabulary (the `no-llm-in-platform` boundary keeps `Usage` inside
+/// this crate). Raw counts pass straight through; a missing provider block stays `NotReported` (never
+/// fabricated).
+pub(crate) fn map_usage(usage: Usage) -> TokenUsage {
+    match usage {
+        Usage::Reported {
+            input,
+            cached_input,
+            output,
+        } => TokenUsage::Reported {
+            input,
+            cached_input,
+            output,
+        },
+        Usage::NotReported => TokenUsage::NotReported,
     }
 }
 
@@ -349,6 +396,69 @@ mod tests {
             }
             other => panic!("unexpected reconstruction: {other:?}"),
         }
+    }
+
+    #[test]
+    fn step_metered_reports_the_mapped_provider_counts() {
+        let client = MockModelClient::ok(ModelResponse {
+            reply: ModelReply::Final {
+                content: "the bug is at foo.rs:10".into(),
+            },
+            usage: Usage::Reported {
+                input: 60,
+                cached_input: 10,
+                output: 12,
+            },
+        });
+        let runtime = LlmAgentRuntime::new(Box::new(client));
+        let metered = runtime.step_metered(&conv_with_tools());
+        assert_eq!(
+            metered.outcome,
+            StepOutcome::Submit(Submission("the bug is at foo.rs:10".into()))
+        );
+        // The vendor Usage mapped straight through to the platform TokenUsage (raw counts, no price).
+        assert_eq!(
+            metered.usage,
+            TokenUsage::Reported {
+                input: 60,
+                cached_input: 10,
+                output: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn step_metered_maps_not_reported_usage_to_token_usage_not_reported() {
+        let client = MockModelClient::ok(ModelResponse {
+            reply: ModelReply::Final {
+                content: "done".into(),
+            },
+            usage: Usage::NotReported,
+        });
+        let runtime = LlmAgentRuntime::new(Box::new(client));
+        // The runtime NEVER fabricates a count — NotReported rides through so the metering slice can
+        // fail the run closed.
+        assert_eq!(
+            runtime.step_metered(&conv_with_tools()).usage,
+            TokenUsage::NotReported
+        );
+    }
+
+    #[test]
+    fn step_metered_fails_closed_on_model_error_with_not_reported() {
+        let client = MockModelClient::err(ModelError::Http {
+            status: 500,
+            body: "upstream boom".into(),
+        });
+        let runtime = LlmAgentRuntime::new(Box::new(client));
+        let metered = runtime.step_metered(&conv_with_tools());
+        // A model error degrades to a terminal fail-closed Submit (mirroring `step`) with no usage —
+        // an errored step is never billed.
+        match metered.outcome {
+            StepOutcome::Submit(Submission(text)) => assert!(text.contains("fail-closed")),
+            other => panic!("expected a fail-closed Submit, got {other:?}"),
+        }
+        assert_eq!(metered.usage, TokenUsage::NotReported);
     }
 
     #[test]

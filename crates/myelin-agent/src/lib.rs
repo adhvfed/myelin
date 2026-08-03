@@ -156,6 +156,39 @@ pub enum StepOutcome {
     Submit(Submission),
 }
 
+/// **Raw provider token usage for ONE model step (contract 8.3; NON-FINANCIAL — counts only).**
+///
+/// This is the *platform-side* projection of the vendor's per-call token accounting. It lives HERE,
+/// in the seam crate, so the driving loop (`myelin-agent-service`) can observe a run's token usage
+/// WITHOUT depending on the vendor crate `myelin-agent-model` (the `no-llm-in-platform` boundary,
+/// contract 1.6). The vendor→platform mapping (`myelin_agent_model::client::Usage` → this type) is
+/// the sanctioned job of `myelin-agent-model`'s `MeteredRuntime` override.
+///
+/// **Raw counts, never fabricated.** These are the provider's own token counts. A provider that
+/// omits its usage block surfaces [`TokenUsage::NotReported`] — the runtime never estimates a count.
+/// [`TokenUsage::NotReported`] is what the future metering slice reads to **fail closed** (never
+/// price an unmetered call). This carrier is *observability only*: it holds NO money, NO pricing, NO
+/// wallet — pricing raw counts into a bill (wholesale/markup, micro-units) is a SEPARATE,
+/// decision-gated follow-on slice that lives outside this crate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TokenUsage {
+    /// The provider reported token counts for the step. `input` is the non-cached prompt tokens
+    /// (standard input tier); `cached_input` is the tokens served from the prompt cache (a cheaper
+    /// tier); `output` is the completion tokens. Raw counts — no pricing.
+    Reported {
+        /// Non-cached prompt tokens (standard input tier).
+        input: u64,
+        /// Cached prompt tokens (cache-hit tier).
+        cached_input: u64,
+        /// Completion (output) tokens.
+        output: u64,
+    },
+    /// The provider omitted usage (or the brain has no usage source, e.g. Skeleton/Mock). The future
+    /// metering slice MUST fail the run closed on this — never estimate a count.
+    #[default]
+    NotReported,
+}
+
 // ───────────────────────── §2.2 the hands — value types (sandboxed exec) ────────────────────────
 
 /// A sandboxed command for the hands (architecture §2.2; contract 8.4). Carries only
@@ -332,6 +365,41 @@ pub trait AgentRuntime {
     fn step(&self, conv: &Conversation) -> StepOutcome;
 }
 
+/// **One brain step PLUS its raw token usage (contract 8.3; NON-FINANCIAL).** The seam decision
+/// [`StepOutcome`] together with the [`TokenUsage`] the model reported for it, so the driving loop
+/// can accumulate per-turn token counts into a run's telemetry. Observability only — no pricing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeteredStep {
+    /// The brain's decision this step (use tools, or submit).
+    pub outcome: StepOutcome,
+    /// The provider's raw token counts for this step ([`TokenUsage::NotReported`] if none/unmetered).
+    pub usage: TokenUsage,
+}
+
+/// **THE METERED BRAIN SEAM** — one step *observably*: the decision AND its raw token usage
+/// (contract 8.3; NON-FINANCIAL — counts only, no pricing). A super-trait of [`AgentRuntime`] with a
+/// DEFAULT [`step_metered`](MeteredRuntime::step_metered): a brain with no usage source (the SKELETON,
+/// the Mock) reports [`TokenUsage::NotReported`] for free; only the real vendor brain
+/// (`LlmAgentRuntime`) overrides it to map the provider's usage → [`TokenUsage`].
+///
+/// **Why explicit per-type impls, NOT a blanket `impl<T: AgentRuntime> MeteredRuntime for T`.** A
+/// blanket impl would collide (trait coherence) with the vendor crate's real override
+/// `impl MeteredRuntime for LlmAgentRuntime` — the compiler cannot know the two don't overlap. So
+/// each runtime gets an explicit `impl MeteredRuntime for <Type> {}` (the default is inherited for
+/// free by the Skeleton/Mock), and `LlmAgentRuntime` gets a real body. The default method means an
+/// empty impl is genuinely empty — the seam costs a usage-less brain one line.
+pub trait MeteredRuntime: AgentRuntime {
+    /// One step PLUS its token usage. The default is the plain [`AgentRuntime::step`] paired with
+    /// [`TokenUsage::NotReported`] (a brain with no usage source). The LLM runtime overrides this to
+    /// report the provider's real counts.
+    fn step_metered(&self, conv: &Conversation) -> MeteredStep {
+        MeteredStep {
+            outcome: self.step(conv),
+            usage: TokenUsage::NotReported,
+        }
+    }
+}
+
 /// **THE LOOP** (architecture §2.3; contract 8.5; AG-3). A platform-owned, **bounded, driven**
 /// multi-turn loop — NOT a single call, NOT the runtime's responsibility, NOT a strategy seam
 /// (identical for mock and real). A run is a durable workflow; nested causality is preserved.
@@ -457,6 +525,11 @@ mod tests {
         }
     }
 
+    // The explicit (empty) MeteredRuntime impl — a usage-less brain inherits the default
+    // `step_metered` (NotReported). Explicit, NOT blanket, so the vendor `LlmAgentRuntime` override
+    // does not collide under coherence.
+    impl MeteredRuntime for Mock {}
+
     impl Agent for Mock {
         fn handle(&self, _inbox: InboxEvent, runtime: &dyn AgentRuntime) -> RunOutcome {
             // The bounded loop body lands in AG-P4 (→ P-216). Here it drives one `step` so the
@@ -528,6 +601,42 @@ mod tests {
             m.step(&Conversation::default()),
             StepOutcome::Submit(_)
         ));
+    }
+
+    /// 8.3 — the default [`MeteredRuntime::step_metered`] pairs the plain `step` decision with
+    /// [`TokenUsage::NotReported`] (a usage-less brain reports no counts, never fabricates one).
+    #[test]
+    fn metered_runtime_default_step_is_not_reported() {
+        let m = Mock { catalogue: vec![] };
+        let metered = m.step_metered(&Conversation::default());
+        assert_eq!(metered.outcome, StepOutcome::Submit(Submission("ok".into())));
+        assert_eq!(metered.usage, TokenUsage::NotReported);
+        // The default projects the SAME outcome the plain seam returns.
+        assert_eq!(metered.outcome, m.step(&Conversation::default()));
+    }
+
+    /// The [`TokenUsage`] carrier round-trips its raw counts (Reported ≠ NotReported; Default is
+    /// NotReported — the fail-closed default the metering slice reads).
+    #[test]
+    fn token_usage_carries_raw_counts_and_defaults_not_reported() {
+        assert_eq!(TokenUsage::default(), TokenUsage::NotReported);
+        let reported = TokenUsage::Reported {
+            input: 50,
+            cached_input: 8,
+            output: 12,
+        };
+        assert_ne!(reported, TokenUsage::NotReported);
+        assert!(matches!(
+            reported,
+            TokenUsage::Reported {
+                input: 50,
+                cached_input: 8,
+                output: 12
+            }
+        ));
+        // The wire shape is frozen (a renamed/dropped count field fails the round-trip).
+        let json = serde_json::to_string(&reported).unwrap();
+        assert_eq!(reported, serde_json::from_str(&json).unwrap());
     }
 
     /// 8.5 — `Agent::handle(InboxEvent, &dyn AgentRuntime) -> RunOutcome` compiles and the brain is

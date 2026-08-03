@@ -11,7 +11,7 @@
 //! This is the CDC the prompt's TESTS field names ("the provider+consumer CDC for 8.5") for the
 //! loop-body deliverable — distinct from, and extending, the AG-P1 signature CDC (no duplication).
 
-use myelin_agent::{AgentRuntime, Conversation, StepOutcome};
+use myelin_agent::{AgentRuntime, Conversation, MeteredRuntime, StepOutcome};
 use myelin_agent_service::{
     MockToolExecutor, MockToolSurface, RunOutcomeKind, RunSubstrate, RunTokenRevoker, SkeletonAgent,
     SkeletonAgentRuntime, SkeletonTelemetry,
@@ -154,6 +154,7 @@ fn consumer_loop_drives_any_runtime_through_the_dyn_seam() {
             StepOutcome::Submit(myelin_agent::Submission("other".into()))
         }
     }
+    impl MeteredRuntime for OtherSubmit {}
     let tenant = TenantId("acme".into());
     let agent_loop = SkeletonAgent::new();
     let revoker = ProviderRevoker::default();
@@ -184,7 +185,7 @@ fn consumer_loop_drives_any_runtime_through_the_dyn_seam() {
         journal: WfJournal::new(),
         now_secs: 2000,
     };
-    let dyn_rt: &dyn AgentRuntime = &OtherSubmit;
+    let dyn_rt: &dyn MeteredRuntime = &OtherSubmit;
     let out = agent_loop
         .handle_run(dyn_rt, &mut sub, &mut tele, RunOutcomeKind::Completed)
         .expect("the loop drives a different brain through the seam");
