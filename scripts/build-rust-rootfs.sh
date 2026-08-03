@@ -105,7 +105,7 @@ ASSETS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets"
 STAGED="${MYELIN_GVISOR_RUST_ROOTFS:-${ASSETS_DIR}/rust-rootfs}"
 VERSIONS_DIR="${STAGED}.versions"
 MANAGED_MARKER="${STAGED}.myelin-managed"
-RUST_IMAGE_TAG="${RUST_IMAGE_TAG:-rust:1.82-slim-bookworm}"
+RUST_IMAGE_TAG="${RUST_IMAGE_TAG:-rust:1.95-slim-bookworm}"
 
 die() { echo "build-rust-rootfs: $*" >&2; exit 1; }
 
