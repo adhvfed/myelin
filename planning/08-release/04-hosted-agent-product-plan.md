@@ -99,10 +99,57 @@ The Fabric is built; four specific pieces are not (verified 2026-08-03, see
    Today the balance is a *parameter with no backing table*. This is the critical-path gap (not
    Stripe).
 
-## 5. Roadmap — thin end-to-end slices, built from the end goal
+## 5. Execution environments — the agent's workspace
+
+The agent won't always need a full environment, but often will. Model it as **three tiers**, all
+reusing the CT-007 gVisor core (isolation kernel, digest-pinned rootfs/toolchain images, the
+hardened exact-commit checkout, resource caps, the escape attestation, the `agent_job()` seam —
+the *hard* part, security, is done and adversarially proven):
+
+- **Tier 0 — no environment.** Pure reasoning + read tools (read / search / read-issue) and
+  mutations via the governed APIs (comment, open a PR). No sandbox, zero compute cost. Covers a
+  large share of real work: review a PR, triage an issue, answer a codebase question, draft a doc.
+  **Slice 1 is entirely Tier 0.**
+- **Tier 1 — ephemeral one-shot compute.** A single sandboxed command ("run the tests, report what
+  failed"). Almost literally today's `agent_job()` — the cheapest reuse.
+- **Tier 2 — warm session workspace.** A persistent sandboxed checkout + toolchain the agent
+  iterates in across many commands; the resulting *diff* becomes a PR. "The full environment," and
+  the real new work.
+
+**Trust-model note (important).** A CI job is safe because its *recipe is restricted* (closed
+allowlist + hermetic `--network=none`). An agent's value is running *arbitrary* commands, so its
+safety comes entirely from **containment** — isolation + egress control + resource caps + a
+disposable workspace — not from restricting the command. Same gVisor core, inverted trust model.
+This is the line an **independent pentest** must probe before public launch — a bigger trust
+surface than CI ever presented.
+
+**The genuinely new work is all in Tier 2, additive to the CI sandbox (not a rewrite):**
+1. **Session lifecycle** — a workspace warm across tool-calls (idle timeout / checkpoint), not torn
+   down per command. The per-job CoW overlay primitive (tasks #26/#27, currently parked as SotA
+   hardening) is exactly the substrate: a shared warm base image + a per-session ephemeral upper =
+   cheap warm sessions. That parked work becomes load-bearing here.
+2. **Controlled egress (the biggest untrusted-multi-tenant decision).** CI can be `--network=none`;
+   an agent often needs *some* network (deps, an API). Needs a deny-by-default **egress allowlist
+   proxy** (package registries + the model relay only; hard-block cloud-metadata / RFC-1918 /
+   cross-tenant). The #1 exfil/abuse surface; does not exist yet.
+3. **Workspace-diff → governed mutation** — the path from "agent edited files in the sandbox" to "a
+   PR through the same governed flow a human uses."
+4. **Compute as a second cost dimension** — a warm environment burns CPU/RAM on top of tokens.
+   Ignore for v1 dogfood; for public launch, meter sandbox-seconds as a second dimension or fold
+   into a higher markup. Affects the "unsurprising cost" promise.
+
+Sequence: **Tier 0 → 1 → 2.** Egress control is the gating design problem for Tier 2.
+
+## 6. Roadmap — thin end-to-end slices, built from the end goal
 
 Each slice is a **complete vertical** (a usable increment), not a horizontal layer. Scope is
 discovered by widening, not by front-loading.
+
+**Refactoring is scheduled in, not deferred.** Between slices — and within them where it lowers
+risk — take deliberate refactoring passes. Pleasant code is easier to work with and more
+future-proof; treat a cleanup as a first-class unit of work, sized small or large as the code
+warrants, rather than something that only happens under duress. (Load-bearing/security refactors
+still get an independent adversarial review before landing.)
 
 - **Slice 1 — the walking skeleton (the whole loop, thinnest).**
   A hosted **Luna** session runs against one real tenant repo: reads context via a governed **read**
@@ -126,7 +173,7 @@ discovered by widening, not by front-loading.
   review this PR"), abuse/cost controls for public untrusted users, and an independent pentest
   before the X → HN launch.
 
-## 6. Open decisions carried
+## 7. Open decisions carried
 
 - **EU sovereignty vs US model APIs** — Luna/Anthropic are US sub-processors reached over egress
   while `Region` pins data to `fr-par`. *Resolved for v1 dogfooding on our own repo (US APIs OK,
