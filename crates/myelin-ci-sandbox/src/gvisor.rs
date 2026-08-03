@@ -7478,7 +7478,7 @@ pub const LINUX_SMALL_V1_ROOTFS_SHA256: &str =
 /// The canonical-tree sha256 of the STAGED `linux-rust-v1` rootfs [`resolved_gvisor_rust_rootfs`]
 /// resolves by default — the SAME digest committed in `runner-assets.toml`'s `linux-rust-v1` row.
 pub const LINUX_RUST_V1_ROOTFS_SHA256: &str =
-    "91ffb0fa8e33ba7f32223b686d8bf1f204f0727ae8354e326758206a68107873";
+    "e6684d70e026a1433a7e32e2d29c100468d08579ef532834fdd27d4808c35a60";
 
 /// Canonical-tree digest of the staged git-bearing rootfs. Unlike the former env-path-only
 /// checkout authority, this pin covers the complete tree including every fixed OCI mount target.

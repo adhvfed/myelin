@@ -242,6 +242,15 @@ mkdir -p "${TMP}/workspace"
 # destination is part of the rootfs digest and must remain empty; runsc may never create it after
 # the rootfs has been verified.
 mkdir -p "${TMP}/opt/myelin/cargo-vendor"
+# The structured Cargo build mounts a tmpfs Cargo home at /tmp/cargo-home and binds the server
+# .cargo config file at /tmp/cargo-home/config.toml (nested inside it). BOTH mount targets must be
+# part of the rootfs digest: otherwise runsc's gofer creates them in the shared verified tree at
+# launch (owned by the runner host uid), drifting the pinned digest so the NEXT runner startup fails
+# asset re-verification with DigestMismatch (the CT-007 #26/#27 restart-integrity bug — proven by a
+# 2-job+restart drill). Precreate the directory AND the nested config-file target so no launch-time
+# host write to the base ever occurs. Same rationale as /workspace and /opt/myelin/cargo-vendor above.
+mkdir -p "${TMP}/tmp/cargo-home"
+touch "${TMP}/tmp/cargo-home/config.toml"
 
 # --- PATH-reachability fixup (pure filesystem content — no OciConfig/hardening code touched) ------
 TOOLCHAIN_DIR="$(find "${TMP}/usr/local/rustup/toolchains" -mindepth 1 -maxdepth 1 -type d | head -1)"

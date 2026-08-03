@@ -75,7 +75,7 @@ source_image_digest = "sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f
 # finding /bin/sh — caught by actually re-running the prod-exec test, not assumed green). Fixed by
 # chmod 0755 on the temp dir before populating it; the raw `docker export` step itself was
 # independently confirmed byte-for-byte reproducible across separate container creates.
-canonical_tree_sha256 = "91ffb0fa8e33ba7f32223b686d8bf1f204f0727ae8354e326758206a68107873"
+canonical_tree_sha256 = "e6684d70e026a1433a7e32e2d29c100468d08579ef532834fdd27d4808c35a60"
 # CT-007 gate 2/4 (registry slice, 2026-07-25): the digest-pinned `ImageRef` reference
 # `GvisorAssetRegistry` (crates/myelin-ci-sandbox/src/asset_registry.rs) resolves against this row's
 # staged directory. The digest embedded after `@sha256:` MUST equal `canonical_tree_sha256` above —
@@ -83,7 +83,7 @@ canonical_tree_sha256 = "91ffb0fa8e33ba7f32223b686d8bf1f204f0727ae8354e326758206
 # consistency unconditionally (no staged directory required). This is the row that closes the
 # "JobSpec.image is not yet bound to this asset at launch" gap the STATUS note above used to name —
 # nothing dispatches this image yet, but the registry now carries the binding honestly.
-image = "myelin.local/linux-rust-v1-rootfs@sha256:91ffb0fa8e33ba7f32223b686d8bf1f204f0727ae8354e326758206a68107873"
+image = "myelin.local/linux-rust-v1-rootfs@sha256:e6684d70e026a1433a7e32e2d29c100468d08579ef532834fdd27d4808c35a60"
 note = "Docker-pull + docker-export of an official Debian-slim rust image, NOT a hand-chased host-lib copy (unlike scripts/stage-git-rootfs.sh's git precedent) — the host cargo/rustc pull in dozens of transitive shared libs (libgit2, libssl, libcurl, icu, ...) that would make a hand-staged tree fragile and not a real immutable release artifact. Proven end to end by crates/myelin-ci-sandbox/tests/rust_capable_rootfs_prod_exec_test.rs: a real `runsc` sandbox on the SAME GvisorBackend::launch path every other job uses runs `rustc --version && cargo --version` and asserts non-root uid + no network egress, unchanged hardening. As of CT-007 gate 2/4's registry slice, this is a REAL registry entry (myelin-ci-controlplane's production_gvisor_registry()), not just a manifest row — though no dispatched job names this image yet."
 
 [[asset]]
