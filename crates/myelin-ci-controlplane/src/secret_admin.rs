@@ -19,7 +19,8 @@ use crate::secret_broker::strict_secret_segment;
 pub const SECRET_ADMIN_PERMISSION: &str = ADMINISTER;
 
 const SECRET_ID_DOMAIN: &[u8] = b"myelin-ci-managed-secret-id:v1";
-const MAX_SECRET_MATERIAL_BYTES: usize = 64 * 1024;
+/// Maximum plaintext accepted by the service and every transport adapter before encryption.
+pub const MAX_SECRET_MATERIAL_BYTES: usize = 64 * 1024;
 
 /// Secret input owned by the call. Debug is always redacted and the allocation is zeroized on drop,
 /// including every success and error path after encryption.

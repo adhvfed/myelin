@@ -1,9 +1,9 @@
 //! # `edge` — the edge-gateway binary (MR-014 / R4.0)
 //!
 //! The thin deployable shim. With NO arguments it composes the [`Gateway`] over the real auth
-//! components and SERVES it on a TCP listener (as before). With the `bootstrap` / `revoke` operator
-//! subcommands it runs the SAME config/provider/migrations/KMS/cell-root composition and then performs
-//! an operator-plane action instead of serving:
+//! components and SERVES it on a TCP listener (as before). With the `bootstrap` / `revoke` / `secret`
+//! operator subcommands it runs the SAME config/provider/migrations/KMS/cell-root composition and
+//! then performs an operator-plane action instead of serving:
 //!
 //! - `edge` (no args) → serve.
 //! - `edge bootstrap --tenant <t> --principal <id> --issues-project <uuid> [--display-name <s>]
@@ -11,6 +11,8 @@
 //!   → idempotently seed the principal + mint a capability token that authenticates against a
 //!   SEPARATELY-running serving edge (same DB + seal key). Prints the token to STDOUT exactly once.
 //! - `edge revoke --jti <jti> --tenant <t> [--region <r>]` → durably revoke a token (S7 denylist).
+//! - `edge secret <create|update|rotate|delete|list|grant-binding|revoke-binding> ...` → authenticate
+//!   `MYELIN_TOKEN`, enforce CI-project administration, and manage durable encrypted CI secrets.
 //!
 //! **The R4.0 make-or-break (P-527 / MR-025 follow-on):** the cell token authority is now DURABLE —
 //! [`DurableCellRootBacking::load_or_generate`] recovers the sealed Ed25519 seed + macaroon MAC key
@@ -31,16 +33,17 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
-    bootstrap_principal_and_mint, recover_placed_git_at_boot, register_ci, register_git_durable,
-    register_git_wire, register_issues, register_notif, serve_edge_until_shutdown_with_probe,
-    spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
-    AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
-    Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method, ReadinessCheck,
-    ReadinessProbe, ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
+    bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot, register_ci,
+    register_git_durable, register_git_wire, register_issues, register_notif,
+    serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler, AuthProvider,
+    AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
+    DurableGitBackend, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
+    ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget,
+    ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
-    AuthzError, FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget,
+    AuthzError, Credential, FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget,
 };
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, DpopReplayGuard, HumanSsoAuthenticator, JwkSet,
@@ -307,7 +310,7 @@ fn git_root_is_writable(root: &Path) -> bool {
 
 /// The composed durable core: the provider pool + the durable KMS engine + the DURABLE cell token
 /// authority + the runtime handle. Built once by [`compose_core`]; consumed by [`serve`] /
-/// [`operator_bootstrap`] / [`operator_revoke`].
+/// [`operator_bootstrap`] / [`operator_revoke`] / [`operator_secret`].
 struct ComposedCore {
     provider: SubstrateProvider,
     kms: Arc<KmsEngine>,
@@ -740,7 +743,7 @@ async fn compose_core(cell_id: String) -> ComposedCore {
 }
 
 // =================================================================================================
-// argv dispatch — no args = serve; `bootstrap` / `revoke` = operator-plane actions.
+// argv dispatch — no args = serve; `bootstrap` / `revoke` / `secret` = operator-plane actions.
 // =================================================================================================
 
 #[tokio::main]
@@ -770,9 +773,13 @@ async fn main() {
             let runtime = runtime_config_or_exit(false);
             operator_revoke(compose_core(runtime.cell_id).await, &args[1..]).await;
         }
+        Some("secret") => {
+            let runtime = runtime_config_or_exit(false);
+            operator_secret(compose_core(runtime.cell_id).await, &args[1..]).await;
+        }
         Some(other) => {
             eprintln!(
-                "edge: unknown subcommand `{other}` (expected: <none> = serve | bootstrap | revoke)"
+                "edge: unknown subcommand `{other}` (expected: <none> = serve | bootstrap | revoke | secret)"
             );
             std::process::exit(2);
         }
@@ -835,24 +842,8 @@ async fn serve(
     // token is rejected; a token minted before a restart still verifies, R4.0). Arc'd because the
     // R2.1a StoreBackedCheck (the per-run-token minter) shares the SAME cell authority the verifier
     // trusts — one cell, one trust anchor.
-    let authn = Arc::new(CapabilityAuthenticator::with_verifier(
-        PrincipalStore::with_pg(
-            kms.clone(),
-            DurablePrincipalBacking::new(provider.clone()),
-            handle.clone(),
-        ),
-        Arc::new(
-            PasetoCapabilityVerifier::new(cell.trust_anchor()).with_replay_guard(
-                DpopReplayGuard::with_pg(
-                    DurableReplayBacking::new(provider.clone()),
-                    handle.clone(),
-                ),
-            ),
-        ),
-        RevocationStore::with_pg(
-            DurableRevocationBacking::new(provider.clone()),
-            handle.clone(),
-        ),
+    let authn = Arc::new(durable_capability_authenticator(
+        &provider, &kms, &cell, &handle,
     ));
 
     // R2.5 — the human/SSO login over the durable S1 directory (OIDC opt-in; refuse-not-mock otherwise).
@@ -1170,7 +1161,7 @@ async fn shutdown_signal() -> Result<(), String> {
 }
 
 // =================================================================================================
-// operator subcommands — `bootstrap` (mint) + `revoke` (S7 denylist). Never an HTTP surface.
+// operator subcommands — bootstrap, revoke, and authenticated secret administration. No HTTP surface.
 // =================================================================================================
 
 async fn operator_bootstrap(core: ComposedCore, args: &[String]) {
@@ -1279,6 +1270,213 @@ async fn operator_revoke(core: ComposedCore, args: &[String]) {
     eprintln!("edge revoke: token jti `{jti}` revoked in tenant `{tenant}` region `{region}` (durable S7 denylist — the deny survives restart)");
 }
 
+async fn operator_secret(core: ComposedCore, args: &[String]) {
+    let ComposedCore {
+        provider,
+        kms,
+        cell,
+        handle,
+        ..
+    } = core;
+
+    let Some(operation) = args.first().map(String::as_str) else {
+        secret_usage_and_exit();
+    };
+    let operation_args = &args[1..];
+    validate_secret_operation_args(operation, operation_args)
+        .unwrap_or_else(|error| secret_error_and_exit(error));
+    let tenant = required_flag(operation_args, "--tenant");
+    let project = match operation {
+        "list" => flag(operation_args, "--project"),
+        "create" | "update" | "rotate" | "delete" | "grant-binding" | "revoke-binding" => {
+            Some(required_flag(operation_args, "--project"))
+        }
+        _ => secret_usage_and_exit(),
+    };
+    let name = match operation {
+        "list" => None,
+        _ => Some(required_flag(operation_args, "--name")),
+    };
+    let scope = match operation {
+        "grant-binding" | "revoke-binding" => Some(required_flag(operation_args, "--scope")),
+        _ => None,
+    };
+
+    let target = || SecretTarget {
+        tenant: &tenant,
+        project: project
+            .as_deref()
+            .expect("non-list commands require project"),
+        name: name.as_deref().expect("non-list commands require name"),
+    };
+    let command = match operation {
+        "create" => SecretCommand::Create(target()),
+        "update" => SecretCommand::Update(target()),
+        "rotate" => SecretCommand::Rotate(target()),
+        "delete" => SecretCommand::Delete(target()),
+        "list" => SecretCommand::List {
+            tenant: &tenant,
+            project: project.as_deref(),
+        },
+        "grant-binding" => SecretCommand::GrantBinding {
+            target: target(),
+            scope: scope.as_deref().expect("binding command requires scope"),
+        },
+        "revoke-binding" => SecretCommand::RevokeBinding {
+            target: target(),
+            scope: scope.as_deref().expect("binding command requires scope"),
+        },
+        _ => unreachable!("operation was validated above"),
+    };
+
+    // The token is an environment-only carrier (the dogfood contract); Credential owns and
+    // zeroizes the material on drop. Authentication errors are collapsed by the command body.
+    let credential = std::env::var("MYELIN_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(|material| Credential {
+            scheme: std::env::var("MYELIN_TOKEN_SCHEME")
+                .unwrap_or_else(|_| EDGE_DEFAULT_TOKEN_SCHEME.to_owned()),
+            material,
+        });
+
+    // Same production PASETO/S1/S7/replay authenticator as serve(), plus the same durable S3
+    // authorization engine with Git admitted before CI for the CI fragment's repo inheritance.
+    let authenticator = durable_capability_authenticator(&provider, &kms, &cell, &handle);
+    let identity = Arc::new(StoreBackedCheck::with_pg(
+        provider.clone(),
+        kms.clone(),
+        cell,
+        handle.clone(),
+    ));
+    for admission in identity.admit_git_fragment() {
+        if let FragmentAdmit::Rejected { reason } = admission {
+            eprintln!("edge secret: authorization schema is unavailable: {reason}");
+            std::process::exit(1);
+        }
+    }
+    for admission in identity.admit_ci_fragment() {
+        if let FragmentAdmit::Rejected { reason } = admission {
+            eprintln!("edge secret: authorization schema is unavailable: {reason}");
+            std::process::exit(1);
+        }
+    }
+    let secret_store = Arc::new(myelin_ci_controlplane::DurableCiSecretStore::with_pg(
+        provider.db_pool().clone(),
+        kms,
+        Region::new(provider.config().region.clone()),
+        handle,
+    ));
+    let mut stdin = std::io::stdin().lock();
+    let output = execute_secret_command(
+        &authenticator,
+        identity,
+        secret_store,
+        credential,
+        command,
+        &mut stdin,
+    )
+    .unwrap_or_else(|error| secret_error_and_exit(error));
+    println!("{}", output.render());
+}
+
+fn durable_capability_authenticator(
+    provider: &SubstrateProvider,
+    kms: &Arc<KmsEngine>,
+    cell: &Arc<CellTokenAuthority>,
+    handle: &tokio::runtime::Handle,
+) -> CapabilityAuthenticator {
+    CapabilityAuthenticator::with_verifier(
+        PrincipalStore::with_pg(
+            kms.clone(),
+            DurablePrincipalBacking::new(provider.clone()),
+            handle.clone(),
+        ),
+        Arc::new(
+            PasetoCapabilityVerifier::new(cell.trust_anchor()).with_replay_guard(
+                DpopReplayGuard::with_pg(
+                    DurableReplayBacking::new(provider.clone()),
+                    handle.clone(),
+                ),
+            ),
+        ),
+        RevocationStore::with_pg(
+            DurableRevocationBacking::new(provider.clone()),
+            handle.clone(),
+        ),
+    )
+}
+
+fn secret_error_and_exit(error: SecretCommandError) -> ! {
+    eprintln!("edge secret: {error}");
+    std::process::exit(error.exit_code());
+}
+
+fn secret_usage_and_exit() -> ! {
+    eprintln!(
+        "usage: edge secret {{create|update|rotate|delete|list|grant-binding|revoke-binding}} \
+         --tenant <tenant> [--project <uuid>] [--name <name>] [--scope project|job:<uuid>]"
+    );
+    std::process::exit(2);
+}
+
+fn validate_secret_operation_args(
+    operation: &str,
+    args: &[String],
+) -> Result<(), SecretCommandError> {
+    let allowed = match operation {
+        "create" | "update" | "rotate" | "delete" => &["--tenant", "--project", "--name"][..],
+        "list" => &["--tenant", "--project"][..],
+        "grant-binding" | "revoke-binding" => &["--tenant", "--project", "--name", "--scope"][..],
+        _ => return Err(SecretCommandError::BadParam("unknown secret operation")),
+    };
+    let mut seen = Vec::with_capacity(allowed.len());
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if !argument.starts_with("--") {
+            return Err(SecretCommandError::BadParam(
+                "positional arguments are not permitted",
+            ));
+        }
+        let (name, inline_value) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(name, value)| {
+                (name, Some(value))
+            });
+        if !allowed.contains(&name) {
+            return Err(SecretCommandError::BadParam(
+                "unknown flag is not permitted for this operation",
+            ));
+        }
+        if seen.contains(&name) {
+            return Err(SecretCommandError::BadParam(
+                "duplicate flags are not permitted",
+            ));
+        }
+        seen.push(name);
+
+        match inline_value {
+            Some("") => {
+                return Err(SecretCommandError::BadParam(
+                    "flag values must be non-empty",
+                ));
+            }
+            Some(_) => index += 1,
+            None => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(SecretCommandError::BadParam("flag requires a value"));
+                };
+                if value.starts_with("--") {
+                    return Err(SecretCommandError::BadParam("flag requires a value"));
+                }
+                index += 2;
+            }
+        }
+    }
+    Ok(())
+}
+
 // =================================================================================================
 // Tiny hand-rolled argv helpers (no clap — clap is not a workspace dep; the repo idiom for a main is
 // std::env::args parsing). Each is total over a malformed argv.
@@ -1360,6 +1558,39 @@ mod runtime_config_tests {
             rootfs.canonicalize().unwrap().display().to_string(),
             runsc.canonicalize().unwrap().display().to_string(),
         )
+    }
+
+    #[test]
+    fn edge_secret_create_rejects_unknown_flags_and_positional_arguments() {
+        let base = [
+            "--tenant".to_string(),
+            "tenant-a".to_string(),
+            "--project".to_string(),
+            "11111111-1111-4111-8111-111111111111".to_string(),
+            "--name".to_string(),
+            "DEPLOY_KEY".to_string(),
+        ];
+        assert!(validate_secret_operation_args("create", &base).is_ok());
+
+        let mut unknown_flag = base.to_vec();
+        unknown_flag.extend(["--material".to_string(), "SECRET".to_string()]);
+        let error = validate_secret_operation_args("create", &unknown_flag).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(
+            error.to_string(),
+            "secret parameter error: unknown flag is not permitted for this operation"
+        );
+        assert!(!error.to_string().contains("SECRET"));
+
+        let mut positional = base.to_vec();
+        positional.push("SECRET".to_string());
+        let error = validate_secret_operation_args("create", &positional).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(
+            error.to_string(),
+            "secret parameter error: positional arguments are not permitted"
+        );
+        assert!(!error.to_string().contains("SECRET"));
     }
 
     #[test]

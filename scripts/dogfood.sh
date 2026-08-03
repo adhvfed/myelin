@@ -24,6 +24,9 @@
 #                                            ./scripts/dogfood.sh bootstrap -- --tenant acme --principal founder \
 #                                              --issues-project 20aee030-c7fa-4757-8243-700faf528690
 #                                          prints the capability token to STDOUT (nothing else)
+#   printf '%s' "$SECRET" | ./scripts/dogfood.sh secret -- <operation> <flags>
+#                                          run authenticated `edge secret ...`; secret material for
+#                                          create/update/rotate is read only from STDIN
 #   ./scripts/dogfood.sh web               print (or, with EXEC=1, run) the frontend start wired to
 #                                          MYELIN_EDGE_URL=http://127.0.0.1:8080
 #
@@ -514,6 +517,23 @@ case "${cmd}" in
     echo "dogfood: minting an operator token (edge bootstrap $*) — the token prints to STDOUT" >&2
     exec cargo run --quiet -p myelin-edge --bin edge -- bootstrap "$@"
     ;;
+  secret)
+    # Everything after an optional `--` is passed straight to `edge secret`. STDIN remains attached
+    # so create/update/rotate material never enters argv or the environment.
+    if [[ "${1:-}" == "--" ]]; then shift; fi
+    load_env
+    if [[ -z "${MYELIN_TOKEN:-}" ]]; then
+      echo "dogfood: MYELIN_TOKEN is required for secret administration" >&2
+      exit 2
+    fi
+    token_re='^v4\.public\.[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+(\|[A-Za-z0-9_-]+)?$'
+    if [[ ! "${MYELIN_TOKEN}" =~ ${token_re} || ! "${MYELIN_TOKEN_SCHEME:-agent}" =~ ^[a-z0-9._-]+$ ]]; then
+      echo "dogfood: token or token scheme has a noncanonical transport shape" >&2
+      exit 2
+    fi
+    echo "dogfood: running authenticated edge secret operator command" >&2
+    exec cargo run --quiet -p myelin-edge --bin edge -- secret "$@"
+    ;;
   web)
     export MYELIN_EDGE_URL="http://127.0.0.1:8080"
     # The web create action injects this one server-side target. Export only these non-secret
@@ -540,7 +560,7 @@ cd frontend/apps/web && pnpm install && pnpm dev
 EOF
     ;;
   *)
-    echo "usage: $0 {env|edge|ci|publisher|verify-ci-rootfs|dispatch|git-checks|verify-check <repo> <pr> <head-oid> [context]|verify-ci <run> <job> <marker> [evidence-dir]|bootstrap -- <flags>|web}" >&2
+    echo "usage: $0 {env|edge|ci|publisher|verify-ci-rootfs|dispatch|git-checks|verify-check <repo> <pr> <head-oid> [context]|verify-ci <run> <job> <marker> [evidence-dir]|bootstrap -- <flags>|secret -- <operation> <flags>|web}" >&2
     exit 2
     ;;
 esac

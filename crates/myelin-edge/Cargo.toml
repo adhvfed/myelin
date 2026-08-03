@@ -137,6 +137,9 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Secret-operator unit tests use CI's encrypted in-memory durable-store double. Production keeps the
+# feature-less dependency above and always wires `DurableCiSecretStore::with_pg`.
+myelin-ci-controlplane = { path = "../myelin-ci-controlplane", features = ["test-support"] }
 # MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
 # `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
 # posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
