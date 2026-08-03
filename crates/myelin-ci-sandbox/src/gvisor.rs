@@ -595,7 +595,8 @@ pub const CARGO_VENDOR_DIRECTORY_CONFIG: &str =
     "source.vendored.directory=\"/opt/myelin/cargo-vendor\"";
 const OCI_CARGO_CONFIG_MOUNT: &str = "/tmp/cargo-home/config.toml";
 const TEST_SERVER_CARGO_CONFIG_SOURCE: &str = "/server-owned/cargo/config.toml";
-const TEST_FD_BOUND_CARGO_VENDOR_SOURCE: &str = "/proc/123/fd/456/vendor";
+const TEST_CARGO_VENDOR_MOUNT_SOURCE: &str =
+    "/var/lib/myelin/gvisor-assets/cargo-vendor-smoke-v1/vendor";
 const CARGO_VENDOR_SOURCE_NAME: &str = "vendored";
 
 /// Canonical server policy artifact mounted read-only at `$CARGO_HOME/config.toml`. This and the
@@ -755,14 +756,23 @@ struct CargoVendorBoundary {
 }
 
 /// A per-launch capability for the exact vendor-tree inode verified immediately before bundle
-/// staging. The OCI source is derived from this held descriptor, so renaming/replacing the registry
-/// pathname after verification cannot redirect the runtime's mount open to another tree.
+/// staging. The held descriptor content-verifies the tree TOCTOU-safely (through the fd, not the
+/// pathname); the OCI mount source is the verified REAL canonical path, because the gVisor gofer
+/// opens the mount source from outside the runner's mount namespace and cannot resolve a
+/// `/proc/<pid>/fd/N` source (it fails to `setns`, `join container mntns: operation not permitted`).
+/// The pinned rootfs — an equally security-critical, content-addressed asset-store tree — is mounted
+/// by real path for the same reason; this makes the vendor mount consistent with it.
 ///
-/// Residual scope: a host actor running as the trusted asset-store uid could still mutate children
-/// inside this exact directory inode between the re-walk and runsc's descendant opens. Tenant and
-/// workload ids cannot do so because registry verification enforces owner plus mode invariants;
-/// this is the same defense-in-depth, same-uid host-compromise class already scoped for the CoW and
-/// workspace fd-binding work, not a tenant fetch or cross-tenant escape.
+/// Trust boundary (NOT same-uid immunity): renaming/replacing the registry pathname between the
+/// final identity check and the gofer's open CAN redirect the mount — but only for a host actor
+/// running as the trusted asset-store owner uid (or root). The sandbox tenant/subuid and any
+/// different-uid co-tenant CANNOT: the asset store is platform-owned, not tenant-writable, and
+/// registry verification enforces owner + no-group/world-write on the asset root and descendants.
+/// So this is the same trusted-service-account / host-compromise class already scoped for the CoW
+/// and checkout fd-binding work (the real remedy there is genuinely immutable storage — EROFS /
+/// fs-verity / a root-owned publication boundary — not an fd-pinned mount), NOT a tenant or
+/// cross-tenant escape. The asset PATH (incl. any `MYELIN_GVISOR_CARGO_VENDOR` override) is trusted
+/// deployment configuration, exactly like the rootfs and runsc-binary paths.
 struct FdBoundCargoVendor {
     _root_fd: OwnedFd,
     root_identity: (u64, u64),
@@ -1151,9 +1161,11 @@ impl OciConfig {
     }
 
     /// Open the registered canonical tree with `O_PATH|O_NOFOLLOW`, bind it to the identity captured
-    /// at registry verification, re-verify through that held descriptor, and return the exact
-    /// descriptor-derived source the OCI runtime must mount. The descriptor remains owned by the
-    /// staged bundle until after runtime teardown.
+    /// at registry verification, re-verify the content through that held descriptor, and return the
+    /// exact verified REAL-PATH source the OCI runtime must mount (the gVisor gofer cannot open a
+    /// `/proc/<pid>/fd/N` magic-symlink source — it fails to `setns` into the runner's mount
+    /// namespace under the sandbox's empty capabilities). The descriptor remains owned by the staged
+    /// bundle until after runtime teardown, pinning the verified inode.
     fn fd_bind_cargo_vendor_before_spawn(&self) -> Result<Option<FdBoundCargoVendor>, String> {
         match &self.layout {
             OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
@@ -1244,8 +1256,27 @@ impl OciConfig {
                     ));
                 }
 
+                // Mount the VERIFIED REAL PATH, not the `/proc/<pid>/fd/N` magic symlink. The
+                // gVisor gofer opens the mount source from OUTSIDE the runner's mount namespace and
+                // cannot `setns` into it under the sandbox's empty capabilities — a `/proc/pid/fd`
+                // source fails with `join container mntns: operation not permitted`, exactly as the
+                // pinned rootfs bind (also a verified, content-addressed asset-store tree) is mounted
+                // by its real path. Verification stays fd-bound (content-checked through the held
+                // descriptor above); the real path was just re-confirmed to resolve to that exact
+                // inode, and `_root_fd` keeps the inode pinned through teardown.
+                //
+                // Honest residual scope (NOT same-uid immunity — the held fd does NOT snapshot
+                // directory contents, and swapping the `vendor` child does not change the root's
+                // (dev,ino)): between the final identity check and the gofer's open, a host actor
+                // running as the trusted asset-store owner uid (or root) COULD rename/replace the
+                // path and redirect the mount. The sandbox tenant/subuid and any different-uid
+                // co-tenant CANNOT — the store is platform-owned, not tenant-writable, and registry
+                // verification enforces owner + no-group/world-write. This is the trusted-service /
+                // host-compromise class (contrast the tenant-writable checkout tree, [[#27]]); its
+                // real remedy is immutable storage (EROFS / fs-verity / root-owned publication), out
+                // of scope here. The asset path is trusted deployment configuration, like the rootfs.
                 Ok(Some(FdBoundCargoVendor {
-                    vendor_mount_source: fd_bound_root.join("vendor"),
+                    vendor_mount_source: boundary.asset.path().join("vendor"),
                     _root_fd: root_fd,
                     root_identity: opened_identity,
                 }))
@@ -1300,7 +1331,7 @@ impl OciConfig {
             .then(|| Path::new(TEST_SERVER_CARGO_CONFIG_SOURCE));
         let cargo_vendor_source = self
             .has_cargo_vendor()
-            .then(|| Path::new(TEST_FD_BOUND_CARGO_VENDOR_SOURCE));
+            .then(|| Path::new(TEST_CARGO_VENDOR_MOUNT_SOURCE));
         self.to_json_zeroizing_with_cargo_sources(cargo_config_source, cargo_vendor_source)
     }
 
@@ -1398,7 +1429,7 @@ impl OciConfig {
                     // The verified asset root also carries its lock/config metadata. Only the actual
                     // `cargo vendor` directory is projected at Cargo's fixed directory-source path.
                     let vendor_source = cargo_vendor_host_source.ok_or_else(|| {
-                        "refusing Cargo vendor OCI config without an fd-bound vendor source"
+                        "refusing Cargo vendor OCI config without a verified vendor source"
                             .to_string()
                     })?;
                     mounts.push(bind_mount_json(OCI_CARGO_VENDOR_MOUNT, vendor_source, true));
@@ -5131,8 +5162,8 @@ impl Drop for BundleCleanupGuard {
 struct StagedProductionBundle {
     path: PathBuf,
     cleanup: BundleCleanupGuard,
-    // Held across staging, spawn, execution, and teardown so the descriptor-derived mount source
-    // can never be recycled to another inode while runsc may still open it.
+    // Held across staging, spawn, execution, and teardown so the verified vendor inode stays pinned
+    // (not reclaimed/recycled) while runsc may still open the real-path mount source.
     _cargo_vendor: Option<FdBoundCargoVendor>,
 }
 
@@ -13444,12 +13475,12 @@ mod tests {
         let fixture = cargo_boundary_fixture("typed-source-refusal");
         let cfg = wired_cargo_config(&fixture);
         let config_source = Path::new(TEST_SERVER_CARGO_CONFIG_SOURCE);
-        let vendor_source = Path::new(TEST_FD_BOUND_CARGO_VENDOR_SOURCE);
+        let vendor_source = Path::new(TEST_CARGO_VENDOR_MOUNT_SOURCE);
 
         let missing_vendor = cfg
             .to_json_zeroizing_with_cargo_sources(Some(config_source), None)
-            .expect_err("a missing fd-bound vendor source must be a typed refusal");
-        assert!(missing_vendor.contains("without an fd-bound vendor source"));
+            .expect_err("a missing verified vendor source must be a typed refusal");
+        assert!(missing_vendor.contains("without a verified vendor source"));
 
         let missing_config = cfg
             .to_json_zeroizing_with_cargo_sources(None, Some(vendor_source))
@@ -13556,20 +13587,50 @@ mod tests {
         assert!(error.contains("drifted before spawn"), "{error}");
     }
 
+    /// **Path A (real-path vendor mount) contract.** The gVisor gofer cannot open a `/proc/pid/fd`
+    /// magic-symlink source (it fails to `setns` into the runner mntns: `join container mntns:
+    /// operation not permitted`), so the OCI mount source is the VERIFIED CANONICAL REAL PATH — like
+    /// the pinned rootfs. This is deliberately NOT swap-immune against the trusted asset-store owner
+    /// uid (that host-compromise class needs immutable storage, out of scope). The guarantees it DOES
+    /// keep, asserted here: (1) the mount source is a real path (never a `/proc/fd` symlink the gofer
+    /// rejects) resolving to the verified vendored crate, (2) the OCI config consumes exactly that
+    /// path, and (3) a persistent pathname replacement makes the NEXT launch fail closed on the
+    /// re-open identity check.
     #[test]
-    fn verified_cargo_vendor_mount_is_fd_bound_across_pathname_rename() {
-        let fixture = cargo_boundary_fixture("fd-bound-rename");
+    fn verified_cargo_vendor_mount_uses_canonical_real_path_and_reverifies_next_launch() {
+        let fixture = cargo_boundary_fixture("vendor-real-path");
         let cfg = wired_cargo_config(&fixture);
         let staged = stage_production_bundle(&cfg, &fixture.rootfs)
             .expect("the unchanged tree must verify and stage");
-        let fd_source = staged
+        let source = staged
             ._cargo_vendor
             .as_ref()
-            .expect("structured staging holds the vendor fd")
+            .expect("structured staging holds the verified vendor capability")
             .vendor_mount_source
             .clone();
-        let original = std::fs::read_to_string(fd_source.join("itoa-1.0.15/lib.rs")).unwrap();
 
+        // (1) A real path the gofer can open — NOT a `/proc/<pid>/fd/N` magic symlink — resolving to
+        // the verified vendored crate.
+        assert!(
+            !source.starts_with("/proc/"),
+            "vendor mount source must be a real path the gofer can open, not a /proc/fd symlink: \
+             {source:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("itoa-1.0.15/lib.rs")).unwrap(),
+            "pub fn fixture() {}",
+        );
+        // (2) The OCI config consumes exactly that real-path source.
+        let staged_json = std::fs::read_to_string(staged.path.join("config.json")).unwrap();
+        assert!(
+            staged_json.contains(&format!("\"source\": {:?}", source.to_string_lossy())),
+            "the OCI mount must consume the verified canonical real-path source: {staged_json}"
+        );
+
+        // (3) A persistent pathname replacement makes the NEXT launch fail closed: the re-open +
+        // identity check refuses the replacement inode. (This does NOT claim same-launch swap
+        // immunity — the mount source is now the real path — but the fd-bound re-verification still
+        // catches a durable swap at the next stage.)
         let asset_path = fixture.root.join("asset");
         let moved_path = fixture.root.join("asset-moved-after-verify");
         std::fs::rename(&asset_path, &moved_path).unwrap();
@@ -13580,16 +13641,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            std::fs::read_to_string(fd_source.join("itoa-1.0.15/lib.rs")).unwrap(),
-            original,
-            "the staged mount source must continue to resolve through the held original inode"
-        );
-        let staged_json = std::fs::read_to_string(staged.path.join("config.json")).unwrap();
-        assert!(
-            staged_json.contains(&format!("\"source\": {:?}", fd_source.to_string_lossy())),
-            "the OCI mount must consume the fd-derived source: {staged_json}"
-        );
         let error = match stage_production_bundle(&cfg, &fixture.rootfs) {
             Ok(_) => panic!("a later launch must refuse the replacement pathname inode"),
             Err(error) => error,
