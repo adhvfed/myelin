@@ -1150,8 +1150,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            69,
-            "all 24 tables (including encrypted secrets, tombstones, and universal high-water), 3 secret-admin scope/index/integrity migrations, and every previously shipped CI follow-on are present"
+            70,
+            "all 24 tables (including encrypted secrets, tombstones, and universal high-water), 3 secret-admin scope/index/integrity migrations, every previously shipped CI follow-on, and the ci_0017d disposition widening are present"
         );
         assert!(
             spec.consumers.is_empty(),

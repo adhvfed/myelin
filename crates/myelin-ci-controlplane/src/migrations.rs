@@ -210,6 +210,16 @@ pub const CI_JOB_ACCOUNTING_DISPOSITION_V4_MIGRATION_ID: &str =
 /// original v4 column/receipt migration has already been applied and is checksum-immutable.
 pub const CI_JOB_ACCOUNTING_DISPOSITION_V4_VERDICT_MIGRATION_ID: &str =
     "ci_0017c_ci_job_accounting_disposition_v4_verdict";
+/// Forward-only migration id that extends the v4 disposition vocabulary with the two
+/// secret-resolution terminals (`secret_resolution_failed`, `secret_resolution_timed_out`) required
+/// by the #31b/#34 in-boundary secret path. The values CANNOT be edited into the already-applied,
+/// checksum-immutable `ci_0017b`/`ci_0017c` DDL (that in-place edit shipped in 76bf32c3 and made
+/// every previously-migrated DB — including the live dogfood DB — un-bootable); instead this
+/// migration replaces the two CHECK constraints in one atomic, data-preserving `ALTER TABLE`
+/// (`DROP CONSTRAINT x, ADD CONSTRAINT x` with a strict superset — no row can be invalidated).
+/// Appended AFTER every previously shipped id so no applied sequence is reordered.
+pub const CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_MIGRATION_ID: &str =
+    "ci_0017d_ci_job_accounting_disposition_v4_secret_resolution";
 /// Forward-only migration id for [`ALTER_JOB_QUEUE_ADD_COMPLETION_DDL`]. A sub-migration of the
 /// already-applied `ci_0004_job_queue` table, applied immediately after it (the `ci_0002a` convention)
 /// so the `ci_0004` create stays byte-frozen. Its ADD COLUMNs are non-blocking (a constant-default
@@ -908,8 +918,6 @@ ALTER TABLE ci_job_accounting
           'workload_passed',
           'workload_failed',
           'workload_timed_out',
-          'secret_resolution_failed',
-          'secret_resolution_timed_out',
           'checkout_transport_failed',
           'checkout_transport_timed_out',
           'checkout_materialization_failed',
@@ -929,6 +937,58 @@ ALTER TABLE ci_job_accounting
 /// is a separate forward migration so the already-applied v4 column/receipt DDL remains byte-frozen.
 pub const ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL: &str = "\
 ALTER TABLE ci_job_accounting
+  ADD CONSTRAINT ci_job_accounting_terminal_disposition_v4_verdict
+    CHECK (
+      terminal_disposition IS NULL
+      OR CASE terminal_disposition
+        WHEN 'workload_passed' THEN passed AND NOT timed_out AND NOT skipped
+        WHEN 'workload_timed_out' THEN NOT passed AND timed_out AND NOT skipped
+        WHEN 'checkout_transport_timed_out' THEN NOT passed AND timed_out AND NOT skipped
+        WHEN 'checkout_materialization_timed_out' THEN NOT passed AND timed_out AND NOT skipped
+        WHEN 'skipped_before_start' THEN NOT passed AND NOT timed_out AND skipped
+        WHEN 'cancelled_during_preparation' THEN NOT passed AND NOT timed_out AND skipped
+        ELSE NOT passed AND NOT timed_out AND NOT skipped
+      END
+    )";
+
+/// Forward-only extension of the v4 disposition vocabulary with the two secret-resolution terminals.
+/// Replaces BOTH `ci_0017b`/`ci_0017c` CHECK constraints in ONE atomic `ALTER TABLE`: each
+/// `DROP CONSTRAINT x, ADD CONSTRAINT x` re-adds a STRICT SUPERSET (the enum gains
+/// `secret_resolution_failed`/`secret_resolution_timed_out`; the verdict gains the matching
+/// `secret_resolution_timed_out` timeout arm, and `secret_resolution_failed` falls to the existing
+/// `ELSE NOT passed AND NOT timed_out AND NOT skipped` arm). No existing row can be invalidated, so
+/// the re-add validates against a live table without a scan failure; a mistaken NARROWING would
+/// instead fail at apply and block boot — never destroy data. This is the ONLY forward-only way to
+/// widen a shipped CHECK enum: it cannot be edited in place (checksum-immutable) and cannot be
+/// relaxed by a second conjunctive CHECK. The resulting constraints are semantically identical
+/// (equivalent definitions and enforcement — only the catalog OIDs differ) to what 76bf32c3 wrongly
+/// baked into `ci_0017b`/`ci_0017c` in place.
+pub const ALTER_CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_DDL: &str = "\
+ALTER TABLE ci_job_accounting
+  DROP CONSTRAINT ci_job_accounting_terminal_disposition_v4,
+  ADD CONSTRAINT ci_job_accounting_terminal_disposition_v4
+    CHECK (
+      (terminal_disposition IS NULL AND completion_receipt_v4 IS NULL)
+      OR (
+        terminal_disposition IN (
+          'workload_passed',
+          'workload_failed',
+          'workload_timed_out',
+          'secret_resolution_failed',
+          'secret_resolution_timed_out',
+          'checkout_transport_failed',
+          'checkout_transport_timed_out',
+          'checkout_materialization_failed',
+          'checkout_materialization_timed_out',
+          'preparation_attempts_exhausted',
+          'skipped_before_start',
+          'cancelled_during_preparation',
+          'cancelled_after_workload_launch'
+        )
+        AND completion_receipt_v4 ~ '^v4:[0-9a-f]{64}$'
+      )
+    ),
+  DROP CONSTRAINT ci_job_accounting_terminal_disposition_v4_verdict,
   ADD CONSTRAINT ci_job_accounting_terminal_disposition_v4_verdict
     CHECK (
       terminal_disposition IS NULL
@@ -2476,6 +2536,15 @@ pub fn ci_controlplane_migrations() -> Migrations {
         CI_SECRET_VERSION_HIGH_WATER_TABLE,
         CREATE_CI_SECRET_VERSION_HIGH_WATER_DDL.to_owned(),
     ));
+    // Forward-only widening of the v4 disposition CHECK enums with the secret-resolution terminals.
+    // Appended after every previously shipped id (it atomically DROP+ADDs a strict superset of the
+    // already-applied `ci_0017b`/`ci_0017c` constraints — see the DDL const for why this is the only
+    // immutability- and forward-only-respecting way to extend a shipped CHECK enum).
+    migrations.push(Migration::plain_on(
+        CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_MIGRATION_ID,
+        ALTER_CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_DDL,
+        CI_JOB_ACCOUNTING_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -2560,6 +2629,29 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The applied-and-immutable disposition migrations keep their shipped checksums (regression
+    /// guard for the 76bf32c3 class of bug).** `ci_0017b` / `ci_0017c` were already applied to real
+    /// databases — the live dogfood ledger recorded EXACTLY these blake3 values. Editing their DDL in
+    /// place changes the checksum, so the boot-time immutability guard (`applied migrations are
+    /// immutable`) refuses to start against every such DB. That failure was invisible until a real
+    /// binary met a real ledger; this golden turns it into an immediate unit-test failure. New
+    /// disposition values MUST land as a forward migration (see `ci_0017d`), never by editing these.
+    #[test]
+    fn shipped_disposition_migrations_are_checksum_frozen() {
+        use myelin_storage::pg_migrator::ddl_checksum;
+        assert_eq!(
+            ddl_checksum(ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL),
+            "blake3:1ebb53e026947d09199e3162092c81af778740841d941f56483ef397b413e01c",
+            "ci_0017b DDL is checksum-frozen (already applied + immutable); widen the disposition enum \
+             via a forward migration, never by editing this const"
+        );
+        assert_eq!(
+            ddl_checksum(ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL),
+            "blake3:13ef0a21602ade14a087aa433f8de6f9432cb1079f9cd2c468fe216d9074ab68",
+            "ci_0017c verdict DDL is checksum-frozen (already applied + immutable)"
+        );
+    }
 
     /// **All twenty-three CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
     /// The complete arch 01 §3 control-plane schema (+ CT-004d.1's `ci_job_spec` + CT-007 slice
@@ -3242,18 +3334,19 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the claim-window validation is in the set");
         // The claim-window pair sits immediately before the wf_version grant, the backlog probe, the
         // cutover fence-row seed, and the CT-007 5b.3-6e.1 activation-chassis tail (4 migrations).
-        assert_eq!(expand, ids.len() - 16);
-        assert_eq!(validate, ids.len() - 15);
+        assert_eq!(expand, ids.len() - 17);
+        assert_eq!(validate, ids.len() - 16);
         // The activation chassis (ci_0022*) is appended AFTER the cutover fence-row seed, in order,
         // followed by the Stage-B sentinel, #34's secret store, then SecretAdmin's online scope,
-        // uniqueness, binding-integrity, version-tombstone, and universal-high-water migrations.
+        // uniqueness, binding-integrity, version-tombstone, universal-high-water, and finally the
+        // ci_0017d secret-resolution disposition widening (appended last of all).
         assert_eq!(
-            ids[ids.len() - 12],
+            ids[ids.len() - 13],
             CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID,
             "the cutover fence's predecessor-row seed precedes only the ci_0022* chassis"
         );
         assert_eq!(
-            &ids[ids.len() - 11..ids.len() - 7],
+            &ids[ids.len() - 12..ids.len() - 8],
             &[
                 CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID,
                 CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID,
@@ -3263,17 +3356,17 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             "the CT-007 5b.3-6e.1 activation chassis retains expand→validate→index→probe order"
         );
         assert_eq!(
-            ids[ids.len() - 7],
+            ids[ids.len() - 8],
             CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID,
             "Stage B appends the retired-v3 sentinel after the activation chassis"
         );
         assert_eq!(
-            ids[ids.len() - 6],
+            ids[ids.len() - 7],
             CI_SECRET_MIGRATION_ID,
             "the new encrypted secret store is appended after every migration shipped at the base"
         );
         assert_eq!(
-            &ids[ids.len() - 5..],
+            &ids[ids.len() - 6..ids.len() - 1],
             &[
                 CI_SECRET_ADMIN_SCOPE_MIGRATION_ID,
                 CI_SECRET_ADMIN_UNIQUE_MIGRATION_ID,
@@ -3282,6 +3375,11 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 CI_SECRET_VERSION_HIGH_WATER_MIGRATION_ID,
             ],
             "SecretAdmin appends ownership, uniqueness, binding integrity, tombstones, then the universal version high-water"
+        );
+        assert_eq!(
+            ids[ids.len() - 1],
+            CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_MIGRATION_ID,
+            "the ci_0017d secret-resolution disposition widening is appended LAST of all (after every previously shipped id, including the secret store) so no applied sequence is reordered"
         );
         assert!(
             expand
@@ -3301,9 +3399,23 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            69,
-            "24 table/RLS (including encrypted secrets, tombstones, and universal high-water) + 3 secret-admin scope/index/integrity migrations + the previously shipped CI follow-ons"
+            70,
+            "24 table/RLS (including encrypted secrets, tombstones, and universal high-water) + 3 secret-admin scope/index/integrity migrations + the previously shipped CI follow-ons + the ci_0017d disposition widening"
         );
+        // The next token after a `<KW> CONSTRAINT` clause is the constraint name (a comma may follow).
+        fn constraint_names(upper_ddl: &str, keyword: &str) -> Vec<String> {
+            upper_ddl
+                .match_indices(keyword)
+                .map(|(i, _)| {
+                    upper_ddl[i + keyword.len()..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches(',')
+                        .to_string()
+                })
+                .collect()
+        }
         for m in &migrations.0 {
             assert!(
                 !myelin_substrate::is_destructive(m.ddl),
@@ -3322,7 +3434,6 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 "DROP FUNCTION",
                 "DROP ROLE",
                 "DROP INDEX",
-                "DROP CONSTRAINT",
                 "DROP DATABASE",
                 "DROP OWNED",
             ] {
@@ -3331,6 +3442,42 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                     "no `{destructive}` in migration {}",
                     m.id
                 );
+            }
+            // `DROP CONSTRAINT` is permitted ONLY as a data-preserving REPLACEMENT: every dropped
+            // constraint name must be re-added in the SAME migration DDL. This is the only
+            // forward-only way to widen a shipped CHECK enum — a shipped constraint is
+            // checksum-immutable (cannot be edited in place; that in-place edit is exactly the
+            // 76bf32c3 bug that made the dogfood DB un-bootable) and a CHECK cannot be relaxed by a
+            // second conjunctive CHECK. Re-adding a strict superset invalidates no existing row (so
+            // the online re-validate cannot fail on live data); a mistaken NARROWING instead fails
+            // at apply and blocks boot — it never destroys data. A bare `DROP CONSTRAINT` with no
+            // matching `ADD CONSTRAINT` remains forbidden.
+            let dropped = constraint_names(&upper, "DROP CONSTRAINT");
+            if !dropped.is_empty() {
+                // A static test CANNOT prove that a re-added SQL predicate is a superset of the one it
+                // replaced, so a bare "DROP+ADD is fine" rule would silently admit a NARROWING that
+                // breaks boot on live data. Instead, DROP CONSTRAINT is gated on an explicit audited
+                // allowlist: each listed migration's exact DDL is pinned to its const later in this
+                // test, so adding a new constraint-replacement forces a human to (a) list it here and
+                // (b) confirm-by-pinning that its re-added constraint is a strict superset.
+                const CONSTRAINT_REPLACEMENT_ALLOWLIST: &[&str] =
+                    &[CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_MIGRATION_ID];
+                assert!(
+                    CONSTRAINT_REPLACEMENT_ALLOWLIST.contains(&m.id),
+                    "migration {} uses DROP CONSTRAINT but is not on the audited constraint-replacement \
+                     allowlist — add it there AND pin its exact DDL below, only after confirming every \
+                     re-added constraint is a STRICT SUPERSET of the one it replaces",
+                    m.id
+                );
+                let added = constraint_names(&upper, "ADD CONSTRAINT");
+                for name in &dropped {
+                    assert!(
+                        added.contains(name),
+                        "migration {} drops constraint {name} without re-adding it in the same DDL \
+                         (only a data-preserving DROP+ADD replacement is allowed)",
+                        m.id
+                    );
+                }
             }
             if m.ddl.contains("CREATE TABLE") {
                 assert!(
@@ -3356,6 +3503,11 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(
                     m.ddl,
                     ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL
+                );
+            } else if m.id == CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_MIGRATION_ID {
+                assert_eq!(
+                    m.ddl,
+                    ALTER_CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_DDL
                 );
             } else if m.id == CI_JOB_QUEUE_COMPLETION_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL);
@@ -3437,7 +3589,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            69,
+            70,
             "the runner applied the complete 24-table schema plus every additive follow-on"
         );
         assert_eq!(
