@@ -970,6 +970,69 @@ build = {{ tool = "cargo", args = ["build", "--locked"] }}
     }
 
     #[test]
+    fn structured_test_and_clippy_recipes_parse_and_lower_on_v2() {
+        let job = |name: &str, recipe: &str| {
+            format!(
+                "[[jobs]]\nname=\"{name}\"\nimage=\"{PINNED_BUILD}\"\nbuild = {{ tool = \"cargo\", args = {recipe} }}\n"
+            )
+        };
+        let toml = format!(
+            "schema_version = 2\non = \"push\"\n[execution]\nprofile = \"linux-build-v1\"\n{}{}{}",
+            job("build", "[\"build\", \"--locked\"]"),
+            job("unit", "[\"test\", \"--locked\", \"--lib\"]"),
+            job(
+                "lint",
+                "[\"clippy\", \"--locked\", \"--all-targets\", \"--\", \"-D\", \"warnings\"]"
+            ),
+        );
+        let def = parse_versioned_ci_config(toml.as_bytes(), "toml").expect("v2 recipes parse");
+        let replace = myelin_ci_sandbox::gvisor::CARGO_SOURCE_REPLACE_CONFIG;
+        let vendor = myelin_ci_sandbox::gvisor::CARGO_VENDOR_DIRECTORY_CONFIG;
+
+        assert_eq!(
+            def.jobs[1].build.as_ref().unwrap().platform_argv(),
+            ["cargo", "test", "--locked", "--lib", "--config", replace, "--config", vendor]
+        );
+        // clippy: the vendor --config pairs land BEFORE the `--`, so `-D warnings` reaches the driver.
+        assert_eq!(
+            def.jobs[2].build.as_ref().unwrap().platform_argv(),
+            [
+                "cargo",
+                "clippy",
+                "--locked",
+                "--all-targets",
+                "--config",
+                replace,
+                "--config",
+                vendor,
+                "--",
+                "-D",
+                "warnings"
+            ]
+        );
+
+        // The whole DAG still resolves and retains the V2 wire with per-job structured builds.
+        let (snapshot, _) =
+            resolve_versioned_snapshot(&def, &FsBlobStore::new(), &TenantId("acme".into()))
+                .unwrap();
+        let VersionedResolvedSnapshot::V2(plan) = snapshot else {
+            panic!("structured builds require the V2 wire")
+        };
+        assert!(plan.jobs.iter().all(|job| job.build.is_some()));
+
+        // A non-allowlisted recipe (integration tests need live backends `--network=none` blocks).
+        let rejected = format!(
+            "schema_version = 2\non = \"push\"\n[execution]\nprofile = \"linux-build-v1\"\n{}",
+            job("bad", "[\"test\", \"--locked\"]"),
+        );
+        assert!(matches!(
+            parse_versioned_ci_config(rejected.as_bytes(), "toml"),
+            Err(VersionedCiConfigError::Legacy(CiConfigError::InvalidBuild { detail, .. }))
+                if detail.contains("not in the platform allowlist")
+        ));
+    }
+
+    #[test]
     fn structured_build_authored_fields_fail_closed() {
         let config = |build: &str| {
             format!(

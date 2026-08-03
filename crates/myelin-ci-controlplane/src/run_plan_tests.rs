@@ -309,7 +309,7 @@ fn structured_build_validation_rejects_shell_unknown_tool_and_oversized_args() {
     ];
     assert!(matches!(
         tenant_config.canonical_bytes(),
-        Err(RunPlanError::InvalidPlan { detail }) if detail.contains("exactly `build --locked`")
+        Err(RunPlanError::InvalidPlan { detail }) if detail.contains("not in the platform allowlist")
     ));
 
     let valid = structured_cargo_plan_v2().canonical_bytes().unwrap();
@@ -787,4 +787,150 @@ fn matrix_axes_and_values_are_bounded_machine_tokens() {
         .map(|index| (format!("axis_{index:02}"), "value".into()))
         .collect();
     assert_invalid(plan, "more than 16 matrix axes");
+}
+
+/// Helper: a structured Cargo recipe validates iff it is in the platform allowlist.
+fn recipe_is_admitted(args: &[&str]) -> bool {
+    let build = StructuredBuildV1 {
+        tool: StructuredBuildToolV1::Cargo,
+        args: args.iter().map(|s| (*s).to_owned()).collect(),
+    };
+    build.validate_for_job("job").is_ok()
+}
+
+/// The three widened job kinds — build, unit test, and clippy — are each admitted, and
+/// `platform_argv` lowers each to the exact hermetic argv (vendor `--config` before any `--`).
+#[test]
+fn structured_build_allowlist_admits_build_test_and_clippy_with_exact_argv() {
+    let lower = |args: &[&str]| {
+        StructuredBuildV1 {
+            tool: StructuredBuildToolV1::Cargo,
+            args: args.iter().map(|s| (*s).to_owned()).collect(),
+        }
+        .platform_argv()
+    };
+    let replace = "source.crates-io.replace-with=\"vendored\"";
+    let vendor = "source.vendored.directory=\"/opt/myelin/cargo-vendor\"";
+
+    // build — unchanged: vendor --config appended at the end.
+    assert!(recipe_is_admitted(&["build", "--locked"]));
+    assert_eq!(
+        lower(&["build", "--locked"]),
+        ["cargo", "build", "--locked", "--config", replace, "--config", vendor]
+    );
+
+    // test --lib — offline-safe unit tests; vendor --config appended at the end (no `--`).
+    assert!(recipe_is_admitted(&["test", "--locked", "--lib"]));
+    assert_eq!(
+        lower(&["test", "--locked", "--lib"]),
+        ["cargo", "test", "--locked", "--lib", "--config", replace, "--config", vendor]
+    );
+
+    // test --lib --workspace — same, fanned across the workspace.
+    assert!(recipe_is_admitted(&[
+        "test",
+        "--locked",
+        "--lib",
+        "--workspace"
+    ]));
+    assert_eq!(
+        lower(&["test", "--locked", "--lib", "--workspace"]),
+        [
+            "cargo",
+            "test",
+            "--locked",
+            "--lib",
+            "--workspace",
+            "--config",
+            replace,
+            "--config",
+            vendor
+        ]
+    );
+
+    // clippy — vendor --config inserted BEFORE the `--`, so `-D warnings` still reaches the driver.
+    assert!(recipe_is_admitted(&[
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+    ]));
+    assert_eq!(
+        lower(&[
+            "clippy",
+            "--locked",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings"
+        ]),
+        [
+            "cargo",
+            "clippy",
+            "--locked",
+            "--all-targets",
+            "--config",
+            replace,
+            "--config",
+            vendor,
+            "--",
+            "-D",
+            "warnings"
+        ]
+    );
+}
+
+/// The `build --locked` lowering is BYTE-IDENTICAL to the pre-widening output (the platform vendor
+/// suffix appended verbatim, nothing reordered).
+#[test]
+fn structured_build_argv_is_byte_unchanged_for_build() {
+    let build = StructuredBuildV1 {
+        tool: StructuredBuildToolV1::Cargo,
+        args: vec!["build".into(), "--locked".into()],
+    };
+    // The exact bytes the single-recipe grammar produced before this slice.
+    let expected: Vec<String> = [
+        "cargo",
+        "build",
+        "--locked",
+        "--config",
+        "source.crates-io.replace-with=\"vendored\"",
+        "--config",
+        "source.vendored.directory=\"/opt/myelin/cargo-vendor\"",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    assert_eq!(build.platform_argv(), expected);
+}
+
+/// Anything outside the closed allowlist is refused with the typed `InvalidPlan` error: bare
+/// subcommands, integration-test recipes, non-cargo subcommands, and any attempt to smuggle a flag.
+#[test]
+fn structured_build_allowlist_rejects_everything_else() {
+    for rejected in [
+        &["build"][..],                                       // missing --locked
+        &["test"][..],                                        // bare test
+        &["test", "--locked"][..],                            // missing --lib (integration unsafe)
+        &["test", "--locked", "--workspace"][..],             // --workspace without --lib
+        &["test", "--locked", "--lib", "--all-features"][..], // extra flag
+        &["clippy", "--locked", "--all-targets"][..],         // missing the -- -D warnings tail
+        &["clippy", "--locked"][..],
+        &["run", "--locked"][..], // arbitrary subcommand
+        &["build", "--locked", "--target-dir", "/x"][..], // path-reopening option
+        &["build", "--locked", "--offline"][..],
+        &[
+            "build",
+            "--locked",
+            "--config",
+            "source.crates-io.replace-with=tenant",
+        ][..],
+    ] {
+        assert!(
+            !recipe_is_admitted(rejected),
+            "recipe must be refused: {rejected:?}"
+        );
+    }
 }

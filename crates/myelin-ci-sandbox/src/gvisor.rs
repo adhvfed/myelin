@@ -605,6 +605,33 @@ const CARGO_VENDOR_SOURCE_NAME: &str = "vendored";
 /// discovered config file (including workspace config and legacy `$CARGO_HOME/config`).
 pub const SERVER_CARGO_CONFIG_TOML: &str = "[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = \"/opt/myelin/cargo-vendor\"\n";
 
+/// The exact lowered argvs the platform-owned structured Cargo grammar produces
+/// (`myelin_ci_controlplane::run_plan`'s `StructuredBuildV1::platform_argv` over its
+/// `CARGO_RECIPE_ALLOWLIST`): `build`, unit `test --lib` (and `--workspace`), and `clippy`. The
+/// sandbox RE-VALIDATES `spec.command` against this closed set as defense in depth — it does not
+/// trust the control-plane's lowering; a job whose argv is not one of these cannot select a Cargo
+/// vendor asset. Kept in lockstep with the grammar by a cross-crate sync test in
+/// myelin-ci-controlplane. The vendor `--config` pairs land BEFORE clippy's `--` separator so the
+/// `-D warnings` driver flags still reach clippy.
+fn is_admitted_structured_cargo_argv(command: &[String]) -> bool {
+    let r = CARGO_SOURCE_REPLACE_CONFIG;
+    let v = CARGO_VENDOR_DIRECTORY_CONFIG;
+    let admitted: [Vec<&str>; 4] = [
+        vec!["cargo", "build", "--locked", "--config", r, "--config", v],
+        vec!["cargo", "test", "--locked", "--lib", "--config", r, "--config", v],
+        vec![
+            "cargo", "test", "--locked", "--lib", "--workspace", "--config", r, "--config", v,
+        ],
+        vec![
+            "cargo", "clippy", "--locked", "--all-targets", "--config", r, "--config", v, "--",
+            "-D", "warnings",
+        ],
+    ];
+    admitted
+        .iter()
+        .any(|argv| command.iter().map(String::as_str).eq(argv.iter().copied()))
+}
+
 fn validated_cargo_vendor_reference(spec: &JobSpec) -> Result<Option<ImageRef>, String> {
     let values = |name: &str| {
         spec.env
@@ -617,20 +644,9 @@ fn validated_cargo_vendor_reference(spec: &JobSpec) -> Result<Option<ImageRef>, 
     if selectors.is_empty() {
         return Ok(None);
     }
-    if spec.kind != JobKind::Ci
-        || spec.command
-            != [
-                "cargo",
-                "build",
-                "--locked",
-                "--config",
-                CARGO_SOURCE_REPLACE_CONFIG,
-                "--config",
-                CARGO_VENDOR_DIRECTORY_CONFIG,
-            ]
-    {
+    if spec.kind != JobKind::Ci || !is_admitted_structured_cargo_argv(&spec.command) {
         return Err(
-            "a Cargo vendor asset may be selected only for the platform-owned structured CI Cargo build"
+            "a Cargo vendor asset may be selected only for a platform-owned structured CI Cargo recipe (build / test --lib / clippy)"
                 .to_string(),
         );
     }
@@ -13679,6 +13695,47 @@ mod tests {
         assert!(!json.contains(OCI_CARGO_CONFIG_MOUNT), "{json}");
         assert!(!json.contains("CARGO_HOME="), "{json}");
         assert!(!json.contains("CARGO_NET_OFFLINE="), "{json}");
+    }
+
+    #[test]
+    fn structured_cargo_argv_allowlist_admits_build_test_clippy_and_rejects_others() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let r = CARGO_SOURCE_REPLACE_CONFIG;
+        let v = CARGO_VENDOR_DIRECTORY_CONFIG;
+        // The exact four lowered argvs the control-plane grammar produces are all admitted.
+        for argv in [
+            vec!["cargo", "build", "--locked", "--config", r, "--config", v],
+            vec!["cargo", "test", "--locked", "--lib", "--config", r, "--config", v],
+            vec![
+                "cargo", "test", "--locked", "--lib", "--workspace", "--config", r, "--config", v,
+            ],
+            vec![
+                "cargo", "clippy", "--locked", "--all-targets", "--config", r, "--config", v, "--",
+                "-D", "warnings",
+            ],
+        ] {
+            assert!(
+                is_admitted_structured_cargo_argv(&s(&argv)),
+                "must admit {argv:?}"
+            );
+        }
+        // Anything outside the closed set is refused — a tenant cannot drop `--locked`, run a
+        // non-allowlisted subcommand, reorder the vendor `--config` after clippy's `--`, or shell out.
+        for argv in [
+            vec!["cargo", "build"],
+            vec!["cargo", "run", "--locked", "--config", r, "--config", v],
+            vec!["cargo", "test", "--config", r, "--config", v],
+            vec![
+                "cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings", "--config",
+                r, "--config", v,
+            ],
+            vec!["/bin/sh", "-c", "cargo build"],
+        ] {
+            assert!(
+                !is_admitted_structured_cargo_argv(&s(&argv)),
+                "must reject {argv:?}"
+            );
+        }
     }
 
     #[test]

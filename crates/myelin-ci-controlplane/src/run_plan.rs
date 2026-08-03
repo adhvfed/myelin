@@ -7,9 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use myelin_ci_sandbox::gvisor::{
-    CARGO_SOURCE_REPLACE_CONFIG, CARGO_VENDOR_DIRECTORY_CONFIG,
-};
+use myelin_ci_sandbox::gvisor::{CARGO_SOURCE_REPLACE_CONFIG, CARGO_VENDOR_DIRECTORY_CONFIG};
 use myelin_ci_sandbox::ImageRef;
 use myelin_storage::{BlobError, BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
@@ -161,9 +159,11 @@ pub enum StructuredBuildToolV1 {
 }
 
 /// A tenant-authored build recipe whose executable, environment, and accepted argument grammar are
-/// owned by the platform. The initial Cargo recipe is intentionally minimal: only
-/// `cargo build --locked` is admitted from the tenant, so tenant options such as `--config` cannot
-/// reopen the Cargo boundary. [`Self::platform_argv`] appends the server-owned source overrides;
+/// owned by the platform. The Cargo grammar is a strict closed allowlist
+/// ([`CARGO_RECIPE_ALLOWLIST`]) of `--locked`, offline-safe recipes — `build`, unit `test --lib`
+/// (optionally `--workspace`), and `clippy --all-targets -- -D warnings` — so tenant options such as
+/// `--config` cannot reopen the Cargo boundary. [`Self::platform_argv`] inserts the server-owned
+/// source overrides (before any `--` driver separator);
 /// `[patch]`, `[replace]`, `paths`, and path/git dependencies can resolve only to code already in
 /// the tenant's own workspace while offline, so their acceptability is an attestation-policy
 /// concern rather than a dependency-fetch escape.
@@ -182,17 +182,36 @@ impl StructuredBuildV1 {
 
     /// Construct the exact direct argv executed by the sandbox. No shell executable or `-c` program
     /// is accepted from the tenant or inserted by this translation.
+    ///
+    /// The platform's two vendor `--config` pairs are inserted immediately BEFORE the first `--`
+    /// separator in the recipe, if any. A `--` in a Cargo recipe (e.g. `clippy ... -- -D warnings`)
+    /// forwards every following token to the compiler/driver, so appending `--config` after it would
+    /// hand the platform source overrides to `rustc` instead of Cargo. Recipes without a `--`
+    /// (`build`/`test`) keep the historical trailing-append output byte-for-byte.
     pub fn platform_argv(&self) -> Vec<String> {
         match self.tool {
-            StructuredBuildToolV1::Cargo => std::iter::once("cargo".to_owned())
-                .chain(self.args.iter().cloned())
-                .chain([
+            StructuredBuildToolV1::Cargo => {
+                let vendor = [
                     "--config".to_owned(),
                     CARGO_SOURCE_REPLACE_CONFIG.to_owned(),
                     "--config".to_owned(),
                     CARGO_VENDOR_DIRECTORY_CONFIG.to_owned(),
-                ])
-                .collect(),
+                ];
+                let mut argv = Vec::with_capacity(1 + self.args.len() + vendor.len());
+                argv.push("cargo".to_owned());
+                match self.args.iter().position(|arg| arg == "--") {
+                    Some(split) => {
+                        argv.extend(self.args[..split].iter().cloned());
+                        argv.extend(vendor);
+                        argv.extend(self.args[split..].iter().cloned());
+                    }
+                    None => {
+                        argv.extend(self.args.iter().cloned());
+                        argv.extend(vendor);
+                    }
+                }
+                argv
+            }
         }
     }
 }
@@ -939,12 +958,49 @@ fn validate_structured_build(
         }
     }
     match build.tool {
-        StructuredBuildToolV1::Cargo if build.args == ["build", "--locked"] => Ok(()),
-        StructuredBuildToolV1::Cargo => invalid(format!(
-            "job `{job_name}` Cargo build recipe must be exactly `build --locked`"
-        )),
+        StructuredBuildToolV1::Cargo => {
+            let recipe: Vec<&str> = build.args.iter().map(String::as_str).collect();
+            if CARGO_RECIPE_ALLOWLIST.contains(&recipe.as_slice()) {
+                Ok(())
+            } else {
+                invalid(format!(
+                    "job `{job_name}` Cargo recipe is not in the platform allowlist; admitted recipes are \
+                     `build --locked`, `test --locked --lib`, `test --locked --lib --workspace`, and \
+                     `clippy --locked --all-targets -- -D warnings`"
+                ))
+            }
+        }
     }
 }
+
+/// The exact, closed set of tenant-supplied Cargo recipes the platform will lower and run. Every
+/// entry is `--locked` (no network resolution), offline-safe under `--network=none`, and cannot
+/// reopen the Cargo source boundary: the tenant supplies only this leading recipe and
+/// [`StructuredBuildV1::platform_argv`] owns the vendor `--config` suffix. Widen ONLY by adding a
+/// fixed vector here; never by admitting free-form tokens, `--config`, `--target-dir`, path/patch
+/// options, or any tenant-chosen flag.
+///
+/// - `build --locked` — the original compile recipe (argv unchanged).
+/// - `test --locked --lib` — unit tests only. `--lib` is REQUIRED: integration/`--test` targets
+///   routinely need live network backends, which the `--network=none` sandbox blocks, so they are
+///   deliberately not admitted.
+/// - `test --locked --lib --workspace` — the same, fanned across every workspace member's lib tests.
+/// - `clippy --locked --all-targets -- -D warnings` — lint every target and fail on any warning. The
+///   `-- -D warnings` tail is a compiler-driver flag; `platform_argv` inserts the vendor `--config`
+///   pairs before the `--` so they reach Cargo, not `rustc`.
+const CARGO_RECIPE_ALLOWLIST: &[&[&str]] = &[
+    &["build", "--locked"],
+    &["test", "--locked", "--lib"],
+    &["test", "--locked", "--lib", "--workspace"],
+    &[
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ],
+];
 
 fn validate_matrix(job: &ResolvedJobV1) -> Result<(), RunPlanError> {
     if job.matrix_key.len() > MAX_MATRIX_AXES {
