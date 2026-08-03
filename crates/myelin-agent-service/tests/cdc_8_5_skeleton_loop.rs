@@ -13,8 +13,8 @@
 
 use myelin_agent::{AgentRuntime, Conversation, StepOutcome};
 use myelin_agent_service::{
-    RunOutcomeKind, RunSubstrate, RunTokenRevoker, SkeletonAgent, SkeletonAgentRuntime,
-    SkeletonTelemetry,
+    MockToolExecutor, MockToolSurface, RunOutcomeKind, RunSubstrate, RunTokenRevoker, SkeletonAgent,
+    SkeletonAgentRuntime, SkeletonTelemetry,
 };
 use myelin_flow::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenMinter, WfJournal};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
@@ -87,6 +87,10 @@ fn provider_skeleton_loop_drives_the_chained_substrate_path() {
     let mut ledger = CostLedger::new();
     let outbox = myelin_events::OutboxStore::new();
     let mut tele = SkeletonTelemetry::new();
+    // The SKELETON registers no tools: an EMPTY catalogue + a no-op executor (the loop body is
+    // never entered — the SKELETON submits on turn 0).
+    let cat = MockToolSurface::new();
+    let exec = MockToolExecutor::new();
 
     let mut sub = RunSubstrate {
         tenant: tenant.clone(),
@@ -98,6 +102,8 @@ fn provider_skeleton_loop_drives_the_chained_substrate_path() {
         caveats: DelegationCaveats(vec!["delegated:human-x".into()]),
         token_ttl_secs: 300,
         revoker: &revoker,
+        catalogue: &cat,
+        executor: &exec,
         gate: &mut gate,
         ledger: &mut ledger,
         available: MinorUnits(100),
@@ -155,6 +161,8 @@ fn consumer_loop_drives_any_runtime_through_the_dyn_seam() {
     let mut ledger = CostLedger::new();
     let outbox = myelin_events::OutboxStore::new();
     let mut tele = SkeletonTelemetry::new();
+    let cat = MockToolSurface::new();
+    let exec = MockToolExecutor::new();
     let mut sub = RunSubstrate {
         tenant: tenant.clone(),
         region: Region("fr-par".into()),
@@ -165,6 +173,8 @@ fn consumer_loop_drives_any_runtime_through_the_dyn_seam() {
         caveats: DelegationCaveats(vec![]),
         token_ttl_secs: 300,
         revoker: &revoker,
+        catalogue: &cat,
+        executor: &exec,
         gate: &mut gate,
         ledger: &mut ledger,
         available: MinorUnits(100),

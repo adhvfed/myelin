@@ -119,6 +119,7 @@ pub mod migrations;
 pub mod mock;
 pub mod schema;
 pub mod skeleton;
+pub mod tool_exec;
 pub mod tool_scope;
 pub mod trace_seam;
 
@@ -143,8 +144,20 @@ pub use dsr::{
 // loop body + the per-run identity (mint/revoke/anti-leak) + the contract-1.8 telemetry signals.
 pub use skeleton::{
     ChildEnv, RunOutcomeKind, RunSubstrate, RunTokenRevoker, SkeletonAgent, SkeletonAgentRuntime,
-    SkeletonError, SkeletonTelemetry, AGENT_RUN_TRACED_EVENT, SKELETON_STEP_UNIT,
+    SkeletonError, SkeletonTelemetry, AGENT_RUN_TRACED_EVENT, DEFAULT_MAX_TURNS, SKELETON_STEP_UNIT,
 };
+
+// The bounded driving loop's `ToolExecutor` seam (the loop half of 8.5): turn one VALIDATED
+// `ToolCall` into a `ToolResult`. This slice ships ONLY the seam + the test doubles; the three real
+// per-route impls (Read→subsystem read, Compute→SandboxToolHands::exec, Mutate/External→
+// EffectApi::apply) are named-but-unwired follow-ons (route_of decides which). NO metering here —
+// the per-call cost meter + spend cap is a decision-gated follow-on; the loop's runaway guard is the
+// max-turns bound (DEFAULT_MAX_TURNS).
+pub use tool_exec::{ToolExecError, ToolExecutor};
+// The in-process test doubles (test-support gated, mirroring the crate's other mocks — the `tests/`
+// integration targets reach them via the self `test-support` dev-dependency; NEVER in the prod DAG).
+#[cfg(any(test, feature = "test-support"))]
+pub use tool_exec::{MockToolExecutor, MockToolSurface};
 
 // The M6 dogfood loop (AG-P26 → P-517): the platform's own triage agent runs on the self-hosting CI
 // graph (a real Myelin CI failure → explicit-first dispatch → a costed triage run) with a BALANCED

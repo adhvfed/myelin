@@ -30,8 +30,9 @@
 
 use myelin_agent::{AgentRuntime, Conversation, StepOutcome};
 use myelin_agent_service::{
-    runaway_brain, AgentFabricCostSignal, RunOutcomeKind, RunSubstrate, RunTokenRevoker,
-    RunawaySelfLimiter, RunawayStep, SkeletonAgent, SkeletonError, SkeletonTelemetry,
+    runaway_brain, AgentFabricCostSignal, MockToolExecutor, MockToolSurface, RunOutcomeKind,
+    RunSubstrate, RunTokenRevoker, RunawaySelfLimiter, RunawayStep, SkeletonAgent, SkeletonError,
+    SkeletonTelemetry,
 };
 use myelin_flow::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenMinter, WfJournal};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
@@ -115,6 +116,10 @@ fn ag_d11_runaway_mock_loop_stops_at_the_wallet_never_interrupting() {
     // The wallet affords exactly 5 runs of 10; the runaway loop tries 12.
     let limiter = RunawaySelfLimiter::new(MinorUnits(50), MinorUnits(10));
     let attempts = 12u64;
+    // The runaway brain submits on turn 0 (single-turn) → an EMPTY catalogue + a no-op executor
+    // (the driving loop's tool body is never entered).
+    let cat = MockToolSurface::new();
+    let exec = MockToolExecutor::new();
 
     // Drive each run through the REAL SkeletonAgent::handle_run path. `drive_one` builds a fresh
     // substrate over the SHARED gate/ledger (per-run mutable borrows are scoped to this call), drives
@@ -136,6 +141,8 @@ fn ag_d11_runaway_mock_loop_stops_at_the_wallet_never_interrupting() {
                 caveats: DelegationCaveats(vec!["delegated:human-x".into()]),
                 token_ttl_secs: 300,
                 revoker: &revoker,
+                catalogue: &cat,
+                executor: &exec,
                 gate: &mut gate,
                 ledger: &mut ledger,
                 available,
@@ -272,6 +279,8 @@ fn ag_d11_a_live_in_flight_run_survives_an_exhausted_wallet() {
     let outbox = myelin_events::OutboxStore::new();
     let minter: Arc<dyn myelin_events::IdMinter> = Arc::new(myelin_events::MonotonicMinter::new());
     let mut tele = SkeletonTelemetry::new();
+    let cat = MockToolSurface::new();
+    let exec = MockToolExecutor::new();
     let limiter = RunawaySelfLimiter::new(MinorUnits(0), MinorUnits(10));
     let steps = limiter.run_loop(
         &brain,
@@ -288,6 +297,8 @@ fn ag_d11_a_live_in_flight_run_survives_an_exhausted_wallet() {
                 caveats: DelegationCaveats(vec![]),
                 token_ttl_secs: 300,
                 revoker: &revoker,
+                catalogue: &cat,
+                executor: &exec,
                 gate: &mut gate,
                 ledger: &mut ledger,
                 available,
@@ -355,6 +366,9 @@ fn ag_d11_limiter_is_brain_independent() {
     let mut spent = MinorUnits(0);
     let mut completed = 0u64;
     let mut refused = 0u64;
+    // OtherBrain submits on turn 0 → an EMPTY catalogue + a no-op executor (loop body never entered).
+    let cat = MockToolSurface::new();
+    let exec = MockToolExecutor::new();
     for i in 0..attempts {
         let available = MinorUnits(wallet.0.saturating_sub(spent.0));
         let mut sub = RunSubstrate {
@@ -367,6 +381,8 @@ fn ag_d11_limiter_is_brain_independent() {
             caveats: DelegationCaveats(vec![]),
             token_ttl_secs: 300,
             revoker: &revoker,
+            catalogue: &cat,
+            executor: &exec,
             gate: &mut gate,
             ledger: &mut ledger,
             available,

@@ -831,7 +831,7 @@ pub fn validate_tool_arguments(def: &ToolDef, arguments: &serde_json::Value) -> 
 /// Convenience over [`validate_tool_arguments`]: resolve the [`ToolCall`]'s tool in the `catalogue`
 /// and validate its `arguments`. An unregistered tool is `Err` (a call the run may not make must not
 /// be dispatched). The future tool-calling loop calls this at the dispatch boundary.
-pub fn validate_call<S: ToolSurface>(catalogue: &S, call: &ToolCall) -> Result<(), String> {
+pub fn validate_call<S: ToolSurface + ?Sized>(catalogue: &S, call: &ToolCall) -> Result<(), String> {
     let def = catalogue
         .resolve(&call.name)
         .ok_or_else(|| format!("tool `{}` is not registered in the catalogue", call.name.0))?;

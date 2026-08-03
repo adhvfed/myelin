@@ -77,8 +77,11 @@
 //!   `myelin-flow`'s [`WfCtx`](myelin_flow::WfCtx) co-commit (9.2). The CDC pairs each with a real
 //!   provider impl (`tests/`).
 
+use crate::effect_api::validate_call;
+use crate::tool_exec::ToolExecutor;
 use myelin_agent::{
-    Agent, AgentRuntime, Conversation, InboxEvent, RunOutcome, StepOutcome, Submission,
+    Agent, AgentRuntime, Conversation, InboxEvent, RunOutcome, StepOutcome, Submission, ToolOutcome,
+    ToolSurface, Turn,
 };
 use myelin_events::{
     Actor, AggregateKey, DataRole, EmitContextBase, EventDraft, EventType, Timestamp, Visibility,
@@ -101,6 +104,18 @@ pub const AGENT_RUN_TRACED_EVENT: &str = "agent.run.traced";
 /// The dimension EXISTS so the settle ledger is a real `(unit, wholesale, markup)` row; the SKELETON
 /// settles ZERO units (reserved == settled at the floor estimate, refund == reserved).
 pub const SKELETON_STEP_UNIT: &str = "skeleton.step";
+
+/// **The bounded driving loop's max-turns ceiling (§2.3 — the bounded, driven multi-turn loop).**
+/// The runaway guard for THIS slice: the loop steps the brain at most `DEFAULT_MAX_TURNS` times; a
+/// brain that never [`Submit`](StepOutcome::Submit)s within the bound terminates the run GRACEFULLY
+/// as [`SkeletonError::MaxTurnsExhausted`] (never an unbounded loop, never a panic). A well-formed
+/// run submits far below this.
+///
+/// This is a coarse structural bound, NOT metering: the per-call token cost → wallet debit + spend
+/// cap is a SEPARATE, decision-gated follow-on (the reserve/settle gate is untouched here). It sits
+/// alongside the run's other independent ceilings (the reserve/settle budget the gate enforces at
+/// dispatch, and the causal-depth ceiling the flow runtime enforces).
+pub const DEFAULT_MAX_TURNS: usize = 16;
 
 // ───────────────────────── 8.3 — the SKELETON runtime (no model, no tools) ──────────────────────
 
@@ -306,6 +321,24 @@ pub enum SkeletonError {
     /// The durable-workflow co-commit (the trace journal row + its emit) failed (9.2 / 2.2). Loud —
     /// a step is either fully journaled-and-emitted or neither (FLOW-D5).
     CoCommit(String),
+    /// A proposed [`ToolCall`](myelin_agent::ToolCall) FAILED the `validate_call` security checkpoint
+    /// (the tool is unregistered, or its untrusted model arguments don't satisfy the tool's schema).
+    /// The run aborts FAIL-CLOSED — the unvalidated arguments are NEVER dispatched to a tool (§2.1,
+    /// plan-then-apply survives). The teardown STILL fires. Carries the loud validation reason.
+    ToolValidationRejected(String),
+    /// The [`ToolExecutor`] returned an error executing an already-validated call. Surfaced LOUD; the
+    /// run aborts and the teardown STILL fires (never a silent half-run, EI-01 §2).
+    ToolExecFailed(String),
+    /// The bounded driving loop reached [`DEFAULT_MAX_TURNS`] without the brain submitting (the
+    /// runaway guard for this slice). The run terminates GRACEFULLY — 0 trace written, the teardown
+    /// fires, and the reservation is left in-flight (the never-interrupt invariant, exactly as on a
+    /// mid-flight kill). This is a coarse structural bound, NOT metering (a decision-gated follow-on).
+    MaxTurnsExhausted {
+        /// The run that exhausted its turn budget.
+        run_id: String,
+        /// The turn ceiling that was hit ([`DEFAULT_MAX_TURNS`]).
+        turns: usize,
+    },
 }
 
 impl core::fmt::Display for SkeletonError {
@@ -314,6 +347,14 @@ impl core::fmt::Display for SkeletonError {
             SkeletonError::DispatchRefused(m) => write!(f, "SKELETON dispatch refused: {m}"),
             SkeletonError::MintFailed(m) => write!(f, "SKELETON mint failed: {m}"),
             SkeletonError::CoCommit(m) => write!(f, "SKELETON co-commit failed: {m}"),
+            SkeletonError::ToolValidationRejected(m) => {
+                write!(f, "SKELETON tool-call validation rejected (fail-closed): {m}")
+            }
+            SkeletonError::ToolExecFailed(m) => write!(f, "SKELETON tool execution failed: {m}"),
+            SkeletonError::MaxTurnsExhausted { run_id, turns } => write!(
+                f,
+                "SKELETON bounded loop exhausted: run={run_id} reached max_turns={turns} without a submit"
+            ),
         }
     }
 }
@@ -358,6 +399,16 @@ pub struct RunSubstrate<'a> {
     pub token_ttl_secs: u64,
     /// The contract-4.7 revoke seam — the teardown revoke (idempotent, even on crash).
     pub revoker: &'a dyn RunTokenRevoker,
+    /// The one permissioned tool catalogue (8.1) the driving loop validates each proposed
+    /// [`ToolCall`](myelin_agent::ToolCall) against ([`validate_call`], the security checkpoint). The
+    /// SKELETON registers NO tools, so its catalogue is EMPTY and the loop body is never entered (the
+    /// brain submits on turn 0). The delegation-scoped subset (AG-P7) is the same [`ToolSurface`].
+    pub catalogue: &'a dyn ToolSurface,
+    /// The [`ToolExecutor`] seam — turns a VALIDATED [`ToolCall`](myelin_agent::ToolCall) into a
+    /// [`ToolResult`](myelin_agent::ToolResult). The loop's tool-dispatch dependency; the three real
+    /// per-route impls (Read→subsystem read, Compute→sandbox exec, Mutate/External→EffectApi) are
+    /// named-but-unwired follow-ons. Unused by the SKELETON (it never proposes a tool).
+    pub executor: &'a dyn ToolExecutor,
     /// The reserve/settle gate (11.7) that fronts the run — no balance → no run.
     pub gate: &'a mut AgentRunGate,
     /// The Storage-owned durable cost ledger the gate drives (11.7).
@@ -506,27 +557,97 @@ impl SkeletonAgent {
             /* rand_seed */ 0,
         );
 
-        // (3) BUILD the conversation — EMPTY for the SKELETON (no trace history, no tools). The build
-        //     proves the seam; the from-trace build (AG-1) + the delegation-scoped tool subset (AG-P7)
-        //     are the named floors.
-        let conv = Conversation::default();
+        // (3) BUILD the conversation — EMPTY at the start (no trace history). The loop appends the
+        //     brain's model steps + the tool results it routes so a stateful brain (the mock/LLM,
+        //     which reads its own prior turns to know its position) advances; the SKELETON submits on
+        //     turn 0 so the loop body is never entered. The from-trace build (AG-1) + the
+        //     delegation-scoped tool subset (AG-P7) are the named floors.
+        let mut conv = Conversation::default();
 
-        // (4) STEP the brain (the §5.0 routing point). The SKELETON submits immediately — no tools to
-        //     route. A mock/LLM brain would loop here (UseTools → route → append → step again); the
-        //     loop body is identical, only the decision differs. A UseTools from the SKELETON is
-        //     impossible by construction, but we route defensively: the SKELETON never has tools, so a
-        //     non-Submit is a contract bug we surface rather than silently drop.
-        let submission = match runtime.step(&conv) {
-            StepOutcome::Submit(s) => s,
-            StepOutcome::UseTools(_) => {
-                // The SKELETON has no tools; a UseTools is a contract violation. Tear down + abort
-                // LOUD (never silently route a tool the SKELETON cannot run).
+        // (4) DRIVE the bounded multi-turn loop (§2.3/§5.1 — build_conversation → step → route →
+        //     append → step again). The ONE platform-owned loop, identical for mock and real; only the
+        //     brain's decision differs. Each turn steps the brain and, per outcome:
+        //       - Submit   → terminal: break with the submission (the SKELETON's single turn ends here,
+        //         so its behaviour is UNCHANGED — it never enters the UseTools body);
+        //       - UseTools → the §5.0 routing point: VALIDATE each call (the security checkpoint —
+        //         fail-closed on Err; the untrusted model arguments are NEVER dispatched), EXECUTE it
+        //         through the ToolExecutor seam, append the results to the conversation, and step again.
+        //     The loop is BOUNDED by DEFAULT_MAX_TURNS (the runaway guard for this slice — NOT
+        //     metering; the per-call cost meter + spend cap is a decision-gated follow-on, and the
+        //     reserve/settle gate is untouched). The teardown is UNCONDITIONAL on every early-exit
+        //     path below (validation abort, executor error, max-turns exhaustion) exactly as on the
+        //     completed / killed / refused paths.
+        let mut submission: Option<Submission> = None;
+        for _turn in 0..DEFAULT_MAX_TURNS {
+            match runtime.step(&conv) {
+                StepOutcome::Submit(s) => {
+                    // Terminal — record the model step into the transcript, then fall through to the
+                    // (unchanged) trace → settle → teardown chain below.
+                    conv.turns.push(Turn::Model(StepOutcome::Submit(s.clone())));
+                    submission = Some(s);
+                    break;
+                }
+                StepOutcome::UseTools(calls) => {
+                    // Advance the transcript with the brain's decision (a stateful brain reads its own
+                    // prior model turns to know its position — the platform owns history, §2.1).
+                    conv.turns
+                        .push(Turn::Model(StepOutcome::UseTools(calls.clone())));
+                    let mut outcomes: Vec<ToolOutcome> = Vec::with_capacity(calls.len());
+                    for call in &calls {
+                        // THE SECURITY CHECKPOINT (fail-closed): an unregistered tool, or arguments
+                        // that don't satisfy the tool's schema, ABORT the run — the untrusted args are
+                        // NEVER handed to a tool (§2.1). The teardown still fires (unconditional).
+                        if let Err(reason) = validate_call(sub.catalogue, call) {
+                            drop(ctx); // abandon the co-commit — 0 ghost trace, 0 lost emit.
+                            self.teardown(sub, &token, teardown_at, telemetry);
+                            return Err(SkeletonError::ToolValidationRejected(reason));
+                        }
+                        // Validated ⇒ the tool resolves; hand its ToolDef + the call to the executor.
+                        // Resolve defensively (fail-closed, never panic) even though validation proved
+                        // it registered.
+                        let def = match sub.catalogue.resolve(&call.name) {
+                            Some(def) => def,
+                            None => {
+                                drop(ctx);
+                                self.teardown(sub, &token, teardown_at, telemetry);
+                                return Err(SkeletonError::ToolValidationRejected(format!(
+                                    "tool `{}` vanished from the catalogue after validation",
+                                    call.name.0
+                                )));
+                            }
+                        };
+                        match sub.executor.execute(def, call) {
+                            Ok(result) => outcomes.push(ToolOutcome {
+                                call_id: call.id.clone(),
+                                result,
+                            }),
+                            Err(e) => {
+                                drop(ctx);
+                                self.teardown(sub, &token, teardown_at, telemetry);
+                                return Err(SkeletonError::ToolExecFailed(e.to_string()));
+                            }
+                        }
+                    }
+                    // Append the routed tool results so the next step sees each keyed to its call id,
+                    // then continue the loop → step again.
+                    conv.turns.push(Turn::ToolResults(outcomes));
+                }
+            }
+        }
+
+        // The bounded guard tripped: the brain never submitted within DEFAULT_MAX_TURNS. Terminate
+        // GRACEFULLY — abandon the co-commit (0 ghost trace), tear down the token (unconditional), and
+        // surface the exhaustion LOUD. The reservation is left in-flight (the never-interrupt
+        // invariant, exactly as on a mid-flight kill). Never an unbounded loop, never a panic.
+        let submission = match submission {
+            Some(s) => s,
+            None => {
+                drop(ctx);
                 self.teardown(sub, &token, teardown_at, telemetry);
-                return Err(SkeletonError::CoCommit(
-                    "SKELETON runtime returned UseTools but has no tools (contract 8.3 violation) \
-                     — tools land in AG-P6/AG-P15"
-                        .into(),
-                ));
+                return Err(SkeletonError::MaxTurnsExhausted {
+                    run_id: sub.run_id.clone(),
+                    turns: DEFAULT_MAX_TURNS,
+                });
             }
         };
 
@@ -651,6 +772,8 @@ impl Agent for SkeletonAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_exec::{MockToolExecutor, MockToolSurface, ToolExecError};
+    use myelin_agent::{EffectKind, ToolCall, ToolCallId, ToolDef, ToolName, ToolResult};
     use myelin_identity::{PrincipalId, PrincipalKind};
     use std::sync::Arc;
 
@@ -729,10 +852,15 @@ mod tests {
     }
 
     /// Build a [`RunSubstrate`] for a run (the dispatch tier builds this from the delivered event).
+    /// `catalogue` + `executor` are the driving loop's tool seams — an EMPTY catalogue + a no-op
+    /// executor for a SKELETON run (it proposes no tools); a tool-driving test passes a seeded
+    /// catalogue + a scripted [`MockToolExecutor`].
     #[allow(clippy::too_many_arguments)]
     fn substrate<'a>(
         run_id: &str,
         revoker: &'a FakeRevoker,
+        catalogue: &'a dyn ToolSurface,
+        executor: &'a dyn ToolExecutor,
         gate: &'a mut AgentRunGate,
         ledger: &'a mut CostLedger,
         outbox: &'a myelin_events::OutboxStore,
@@ -750,6 +878,8 @@ mod tests {
             caveats: DelegationCaveats(vec!["delegated:human-x".into()]),
             token_ttl_secs: 300,
             revoker,
+            catalogue,
+            executor,
             gate,
             ledger,
             available: MinorUnits(available),
@@ -789,9 +919,14 @@ mod tests {
         let mut ledger = CostLedger::new();
         let outbox = myelin_events::OutboxStore::new();
         let mut tele = SkeletonTelemetry::new();
+        // The SKELETON registers no tools: an EMPTY catalogue + a no-op executor (never entered).
+        let cat = MockToolSurface::new();
+        let exec = MockToolExecutor::new();
         let mut sub = substrate(
             "R1",
             &revoker,
+            &cat,
+            &exec,
             &mut gate,
             &mut ledger,
             &outbox,
@@ -867,9 +1002,13 @@ mod tests {
         let mut ledger = CostLedger::new();
         let outbox = myelin_events::OutboxStore::new();
         let mut tele = SkeletonTelemetry::new();
+        let cat = MockToolSurface::new();
+        let exec = MockToolExecutor::new();
         let mut sub = substrate(
             "R2",
             &revoker,
+            &cat,
+            &exec,
             &mut gate,
             &mut ledger,
             &outbox,
@@ -957,7 +1096,11 @@ mod tests {
         let outbox = myelin_events::OutboxStore::new();
         let mut tele = SkeletonTelemetry::new();
         // available (1) < estimate (10) → no balance, no run.
-        let mut sub = substrate("R3", &revoker, &mut gate, &mut ledger, &outbox, 1, 10, 1000);
+        let cat = MockToolSurface::new();
+        let exec = MockToolExecutor::new();
+        let mut sub = substrate(
+            "R3", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 1, 10, 1000,
+        );
 
         let err = agent_loop
             .handle_run(&rt, &mut sub, &mut tele, RunOutcomeKind::Completed)
@@ -1113,11 +1256,290 @@ mod tests {
             cc.contains("co-commit failed"),
             "Display renders the co-commit failure: {cc}"
         );
+        let val = SkeletonError::ToolValidationRejected("bad args".into()).to_string();
+        let exec = SkeletonError::ToolExecFailed("subsystem down".into()).to_string();
+        let maxt = SkeletonError::MaxTurnsExhausted {
+            run_id: "Rx".into(),
+            turns: 16,
+        }
+        .to_string();
+        assert!(
+            val.contains("validation rejected"),
+            "Display renders the validation rejection: {val}"
+        );
+        assert!(
+            exec.contains("tool execution failed"),
+            "Display renders the executor failure: {exec}"
+        );
+        assert!(
+            maxt.contains("max_turns=16"),
+            "Display renders the max-turns exhaustion: {maxt}"
+        );
         assert_ne!(refused, mint);
         assert_ne!(mint, cc);
+        assert_ne!(val, exec);
+        assert_ne!(exec, maxt);
         assert!(
             !refused.is_empty(),
             "the error message is non-empty (kills fmt -> Ok(default))"
         );
+    }
+
+    // ───────── the bounded driving loop (the ToolExecutor seam + validate → execute → append) ────
+
+    /// A permissive [`ToolDef`] (empty schema — any args validate) for a tool-driving test.
+    fn tool_def(name: &str) -> ToolDef {
+        ToolDef {
+            name: ToolName(name.into()),
+            subsystem: "test".into(),
+            version: 1,
+            input_schema: "{}".into(),
+            required_caps: vec![],
+            effect_kind: EffectKind::Read,
+            side_effecting: false,
+            requires_approval: false,
+            exposed_over_mcp: false,
+        }
+    }
+
+    /// A tool call with a deterministic id + empty-object args (satisfies the permissive schema).
+    fn tool_call(name: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId(format!("call:{name}")),
+            name: ToolName(name.into()),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    /// **The driving loop runs N tool turns then submits: the executor sees the VALIDATED calls, the
+    /// conversation accumulates the ToolOutcomes, and the run settles + tears down.** A brain that
+    /// drives `search → read → submit` (two tool turns) proves the loop body — validate → execute →
+    /// append → step again — and that the completed chain (trace, balanced ledger, revoke) is intact.
+    #[test]
+    fn loop_drives_tool_turns_then_submits() {
+        // A brain that inspects the platform-owned transcript: it records how many `ToolResults` turns
+        // it can see at each step (proving the loop appended them) and drives search → read → submit.
+        #[derive(Default)]
+        struct DriveBrain {
+            tool_result_turns_seen: std::sync::Mutex<Vec<usize>>,
+            outcomes_at_submit: std::sync::Mutex<Vec<ToolOutcome>>,
+        }
+        impl AgentRuntime for DriveBrain {
+            fn step(&self, conv: &Conversation) -> StepOutcome {
+                let model_turns = conv
+                    .turns
+                    .iter()
+                    .filter(|t| matches!(t, Turn::Model(_)))
+                    .count();
+                let tr_turns = conv
+                    .turns
+                    .iter()
+                    .filter(|t| matches!(t, Turn::ToolResults(_)))
+                    .count();
+                self.tool_result_turns_seen.lock().unwrap().push(tr_turns);
+                match model_turns {
+                    0 => StepOutcome::UseTools(vec![tool_call("search")]),
+                    1 => StepOutcome::UseTools(vec![tool_call("read")]),
+                    _ => {
+                        // At the submit step, snapshot the accumulated tool outcomes (proves the loop
+                        // threaded each executor result back into the conversation).
+                        let outcomes: Vec<ToolOutcome> = conv
+                            .turns
+                            .iter()
+                            .flat_map(|t| match t {
+                                Turn::ToolResults(rs) => rs.clone(),
+                                _ => Vec::new(),
+                            })
+                            .collect();
+                        *self.outcomes_at_submit.lock().unwrap() = outcomes;
+                        StepOutcome::Submit(Submission("done".into()))
+                    }
+                }
+            }
+        }
+
+        let brain = DriveBrain::default();
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut tele = SkeletonTelemetry::new();
+        let cat = MockToolSurface::with([tool_def("search"), tool_def("read")]);
+        let exec = MockToolExecutor::new();
+        let mut sub = substrate(
+            "Rtools", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+        );
+
+        let out = agent_loop
+            .handle_run(&brain, &mut sub, &mut tele, RunOutcomeKind::Completed)
+            .expect("the tool-driving run completes");
+        assert!(out.0.contains("completed"), "the run completed: {out:?}");
+
+        // THE EXECUTOR SAW THE VALIDATED CALLS, in order (search then read).
+        assert_eq!(exec.call_count(), 2, "one execute per tool turn");
+        let seen = exec.calls();
+        assert_eq!(seen[0].name, ToolName("search".into()));
+        assert_eq!(seen[1].name, ToolName("read".into()));
+
+        // THE CONVERSATION ACCUMULATED THE ToolOutcomes: the brain saw 0 tool-results turns at step 0,
+        // 1 at step 1, 2 at the submit step (each UseTools appended exactly one ToolResults turn).
+        assert_eq!(
+            *brain.tool_result_turns_seen.lock().unwrap(),
+            vec![0, 1, 2],
+            "each tool turn appended a ToolResults turn the next step reads"
+        );
+        let submit_outcomes = brain.outcomes_at_submit.lock().unwrap().clone();
+        assert_eq!(submit_outcomes.len(), 2, "both tool round-trips accumulated");
+        assert_eq!(submit_outcomes[0].call_id, ToolCallId("call:search".into()));
+        assert_eq!(
+            submit_outcomes[0].result,
+            ToolResult("mock-exec:search:ok".into()),
+            "the executor's result was threaded back, keyed to its call"
+        );
+        assert_eq!(submit_outcomes[1].call_id, ToolCallId("call:read".into()));
+
+        // THE RUN SETTLED + TORE DOWN: one trace, balanced ledger, token revoked, run completed.
+        assert_eq!(tele.traces_written(), 1);
+        assert!(tele.ledger_balanced(), "reserved == settled");
+        assert_eq!(tele.tokens_revoked(), 1, "torn down on the completed path");
+        assert_eq!(tele.runs_completed(), 1);
+    }
+
+    /// A brain that ALWAYS proposes one (registered) tool and NEVER submits — drives the loop to its
+    /// max-turns ceiling.
+    struct AlwaysUseTool(ToolName);
+    impl AgentRuntime for AlwaysUseTool {
+        fn step(&self, _conv: &Conversation) -> StepOutcome {
+            StepOutcome::UseTools(vec![ToolCall {
+                id: ToolCallId("c".into()),
+                name: self.0.clone(),
+                arguments: serde_json::json!({}),
+            }])
+        }
+    }
+
+    /// **A run that never submits terminates GRACEFULLY at max_turns (the runaway guard) — bounded, no
+    /// panic, teardown still fires.** After exactly [`DEFAULT_MAX_TURNS`] executed tool turns the loop
+    /// returns [`SkeletonError::MaxTurnsExhausted`]; the token is revoked, and no trace is written.
+    #[test]
+    fn loop_hits_max_turns_and_terminates_gracefully() {
+        let brain = AlwaysUseTool(ToolName("loop".into()));
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut tele = SkeletonTelemetry::new();
+        let cat = MockToolSurface::with([tool_def("loop")]);
+        let exec = MockToolExecutor::new();
+        let mut sub = substrate(
+            "Rmax", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+        );
+
+        let err = agent_loop
+            .handle_run(&brain, &mut sub, &mut tele, RunOutcomeKind::Completed)
+            .expect_err("a never-submitting brain trips the bounded ceiling");
+        match err {
+            SkeletonError::MaxTurnsExhausted { run_id, turns } => {
+                assert_eq!(run_id, "Rmax");
+                assert_eq!(turns, DEFAULT_MAX_TURNS, "the exact ceiling that tripped");
+            }
+            other => panic!("expected MaxTurnsExhausted, got {other:?}"),
+        }
+        // it ran EXACTLY max_turns tool executions, then stopped (bounded — never hung).
+        assert_eq!(
+            exec.call_count(),
+            DEFAULT_MAX_TURNS,
+            "one execute per bounded turn, then graceful termination"
+        );
+        // the teardown STILL fired (unconditional), and no trace was written (0 ghost).
+        assert_eq!(tele.tokens_revoked(), 1, "torn down on the max-turns path");
+        assert_eq!(tele.traces_written(), 0, "no trace on an exhausted run");
+        assert_eq!(tele.runs_completed(), 0);
+        assert_eq!(tele.runs_killed(), 0);
+    }
+
+    /// **A tool call that FAILS `validate_call` aborts the run FAIL-CLOSED — no dispatch, teardown
+    /// still fires.** The brain proposes an UNREGISTERED tool against the (empty) catalogue; the
+    /// security checkpoint rejects it BEFORE the executor is ever called, the run aborts with
+    /// [`SkeletonError::ToolValidationRejected`], and the token is torn down.
+    #[test]
+    fn loop_validation_failure_aborts_fail_closed_without_dispatch() {
+        let brain = AlwaysUseTool(ToolName("ghost".into())); // never registered
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut tele = SkeletonTelemetry::new();
+        // EMPTY catalogue → the proposed `ghost` tool is unregistered → validate_call fails.
+        let cat = MockToolSurface::new();
+        let exec = MockToolExecutor::new();
+        let mut sub = substrate(
+            "Rbad", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+        );
+
+        let err = agent_loop
+            .handle_run(&brain, &mut sub, &mut tele, RunOutcomeKind::Completed)
+            .expect_err("an unvalidated tool call aborts the run");
+        assert!(
+            matches!(err, SkeletonError::ToolValidationRejected(_)),
+            "fail-closed on validation: {err}"
+        );
+        // FAIL-CLOSED: the executor was NEVER called — the untrusted args were not dispatched.
+        assert_eq!(exec.call_count(), 0, "0 dispatch on a validation failure");
+        // but the token was STILL torn down (the teardown is unconditional), and no trace was written.
+        assert_eq!(tele.tokens_revoked(), 1, "torn down on the validation-abort path");
+        assert_eq!(tele.traces_written(), 0);
+        assert_eq!(tele.runs_completed(), 0);
+    }
+
+    /// **An executor ERROR mid-loop aborts the run + tears down (LOUD, fail-closed).** The call
+    /// validates, but the [`ToolExecutor`] returns an error → the run aborts with
+    /// [`SkeletonError::ToolExecFailed`], torn down, no trace.
+    #[test]
+    fn loop_executor_error_aborts_and_tears_down() {
+        let brain = AlwaysUseTool(ToolName("read".into()));
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut tele = SkeletonTelemetry::new();
+        let cat = MockToolSurface::with([tool_def("read")]);
+        // The executor fails on the first call.
+        let exec = MockToolExecutor::with_results([Err(ToolExecError::Failed("subsystem down".into()))]);
+        let mut sub = substrate(
+            "Rerr", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+        );
+
+        let err = agent_loop
+            .handle_run(&brain, &mut sub, &mut tele, RunOutcomeKind::Completed)
+            .expect_err("an executor error aborts the run");
+        assert!(
+            matches!(err, SkeletonError::ToolExecFailed(_)),
+            "loud executor failure: {err}"
+        );
+        assert_eq!(exec.call_count(), 1, "the failing call was attempted once");
+        assert_eq!(tele.tokens_revoked(), 1, "torn down on the executor-error path");
+        assert_eq!(tele.traces_written(), 0);
+        assert_eq!(tele.runs_completed(), 0);
     }
 }
