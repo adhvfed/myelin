@@ -17249,6 +17249,7 @@ mod tests {
                 userns_allocator,
             },
             checkout: GvisorCheckoutConfig::disabled(),
+            rootfs_overlay: None,
         };
         let reserve_called = Arc::new(AtomicBool::new(false));
         let reserve_called_in_hook = reserve_called.clone();
