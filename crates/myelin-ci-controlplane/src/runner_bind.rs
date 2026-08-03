@@ -56,11 +56,12 @@ use myelin_ci_sandbox::asset_registry::{
 };
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    derive_checkout_authorization_scope, resolved_gvisor_cargo_vendor, resolved_gvisor_rootfs,
-    resolved_gvisor_rust_rootfs, verified_gvisor_git_rootfs, ImageRef, JobKind, JobSpec,
-    LeaseStore, QueuedJob, RunnerError, RunnerHooks, TrustTier, CARGO_VENDOR_SMOKE_LOCK_SHA256,
-    CARGO_VENDOR_SMOKE_TREE_SHA256, GVISOR_GIT_ROOTFS_SHA256, LINUX_RUST_V1_ROOTFS_SHA256,
-    LINUX_SMALL_V1_ROOTFS_SHA256,
+    derive_checkout_authorization_scope, resolved_gvisor_cargo_vendor,
+    resolved_gvisor_cargo_vendor_workspace, resolved_gvisor_rootfs, resolved_gvisor_rust_rootfs,
+    verified_gvisor_git_rootfs, ImageRef, JobKind, JobSpec, LeaseStore, QueuedJob, RunnerError,
+    RunnerHooks, TrustTier, CARGO_VENDOR_SMOKE_LOCK_SHA256, CARGO_VENDOR_SMOKE_TREE_SHA256,
+    CARGO_VENDOR_WORKSPACE_LOCK_SHA256, CARGO_VENDOR_WORKSPACE_TREE_SHA256, GVISOR_GIT_ROOTFS_SHA256,
+    LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_storage::s3blob::S3BlobStore;
 use myelin_tenancy::{Region, TenantId};
@@ -92,6 +93,10 @@ use myelin_tenancy::{Region, TenantId};
 /// - `myelin.local/cargo-vendor-smoke-v1@sha256:<CARGO_VENDOR_SMOKE_TREE_SHA256>` → the exact
 ///   Cargo.lock-keyed vendor tree. It is registered and verified at startup only; no job selects or
 ///   mounts it until the separate gVisor wiring slice lands.
+/// - `myelin.local/cargo-vendor-workspace-v1@sha256:<CARGO_VENDOR_WORKSPACE_TREE_SHA256>` → the
+///   full-workspace (443-crate) vendor tree keyed to this repo's own root Cargo.lock. ADDITIVE +
+///   DORMANT alongside the smoke asset (Gate-3 prerequisite): registered and verified at startup
+///   through the identical asset walk; no dispatched job selects or mounts it yet.
 ///
 /// **Composition-root placement, not `myelin-ci-sandbox`:** this function lives here (the CI
 /// control-plane's composition root), not in `myelin-ci-sandbox`, because the SPECIFIC bindings
@@ -136,14 +141,30 @@ pub fn production_gvisor_registry() -> Arc<GvisorAssetRegistry> {
                     ),
                 },
             ],
-            vec![CargoVendorAssetBinding {
-                reference: ImageRef::pinned(format!(
-                    "myelin.local/cargo-vendor-smoke-v1@sha256:{CARGO_VENDOR_SMOKE_TREE_SHA256}"
-                ))
-                .expect("the Cargo vendor asset reference is a well-formed digest pin"),
-                root: resolved_gvisor_cargo_vendor(),
-                cargo_lock_sha256: CARGO_VENDOR_SMOKE_LOCK_SHA256.to_string(),
-            }],
+            vec![
+                CargoVendorAssetBinding {
+                    reference: ImageRef::pinned(format!(
+                        "myelin.local/cargo-vendor-smoke-v1@sha256:{CARGO_VENDOR_SMOKE_TREE_SHA256}"
+                    ))
+                    .expect("the Cargo vendor asset reference is a well-formed digest pin"),
+                    root: resolved_gvisor_cargo_vendor(),
+                    cargo_lock_sha256: CARGO_VENDOR_SMOKE_LOCK_SHA256.to_string(),
+                },
+                // ADDITIVE + DORMANT (Gate-3 prerequisite): the full-workspace 443-crate vendor
+                // tree keyed to this repo's own root Cargo.lock. Registered and verified at startup
+                // through the SAME from_bindings_with_cargo_vendor path (canonical digest + embedded
+                // Cargo.lock identity + world-readable check) as the smoke asset above; no dispatched
+                // job selects or mounts it yet. A future full-workspace build-test-clippy job's
+                // JobSpec.image would resolve EITHER this or the smoke reference.
+                CargoVendorAssetBinding {
+                    reference: ImageRef::pinned(format!(
+                        "myelin.local/cargo-vendor-workspace-v1@sha256:{CARGO_VENDOR_WORKSPACE_TREE_SHA256}"
+                    ))
+                    .expect("the workspace Cargo vendor asset reference is a well-formed digest pin"),
+                    root: resolved_gvisor_cargo_vendor_workspace(),
+                    cargo_lock_sha256: CARGO_VENDOR_WORKSPACE_LOCK_SHA256.to_string(),
+                },
+            ],
         )
         .expect(
             "production runner assets must verify at startup — a runner that cannot prove its own \

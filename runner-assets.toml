@@ -117,3 +117,28 @@ mount_destination = "/opt/myelin/cargo-vendor"
 canonical_tree_sha256 = "9fcc19c65ae0a47de4b241c30f9eb3613cd74adf315f763e6f91d74b31eec8eb"
 image = "myelin.local/cargo-vendor-smoke-v1@sha256:9fcc19c65ae0a47de4b241c30f9eb3613cd74adf315f763e6f91d74b31eec8eb"
 note = "Exact Cargo.lock-keyed cargo vendor tree for the external-dependency smoke crate. The production registry resolves and verifies the complete canonical tree at startup through the shared ownership/mode-hardened asset walk. The fixed mount destination is recorded for the next slice; this slice does not mount the tree, install Cargo source replacement, or select it for any job."
+
+[[asset]]
+id = "cargo-vendor-workspace-v1"
+capability = "cargo-vendor"
+covers_job = "build-test-clippy"
+stage_script = "scripts/build-cargo-vendor-asset.sh"
+env_var = "MYELIN_GVISOR_CARGO_VENDOR_WORKSPACE"
+default_path = "~/.local/share/gvisor-assets/cargo-vendor-workspace-v1"
+# Unlike the smoke row (keyed to a tiny checked-in fixture Cargo.lock), this asset is keyed to THIS
+# repo's own root workspace Cargo.lock — the full 443-crate dependency closure the real
+# `build-test-clippy` job needs to `cargo build/test/clippy --locked` fully offline. The source is
+# therefore the workspace root `Cargo.lock` itself, not a fixture.
+source_image = "Cargo.lock"
+source_image_digest = "sha256:9a503ad7a2d64a4eb7e6b98a4d3c7150d446fdf4bc73527abb0ff6b998e3d251"
+lockfile_sha256 = "9a503ad7a2d64a4eb7e6b98a4d3c7150d446fdf4bc73527abb0ff6b998e3d251"
+mount_destination = "/opt/myelin/cargo-vendor"
+# Canonical-tree content digest of the STAGED, WORLD-READABLE full-workspace vendor tree (443
+# crates + embedded root Cargo.lock + .cargo/config.toml source-replacement). Computed via the SAME
+# `tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --format=gnu -C <dir> -cf - . |
+# sha256sum` recipe every other row uses; proven green in the gate-2 full-workspace re-drill. The
+# tree is staged `chmod -R a+rX` (0755 dirs, a+rX files) so the non-owner sandbox subuid can read
+# every vendored source — the registry's `verify_cargo_vendor_world_readable` refuses it otherwise.
+canonical_tree_sha256 = "c2f6229625dd25ac26f356a34764026eb61b7c227fbd60cc470ab333bdf89fd2"
+image = "myelin.local/cargo-vendor-workspace-v1@sha256:c2f6229625dd25ac26f356a34764026eb61b7c227fbd60cc470ab333bdf89fd2"
+note = "Full-workspace (443-crate) Cargo.lock-keyed cargo vendor tree, keyed to this repo's own root Cargo.lock. ADDITIVE + DORMANT alongside cargo-vendor-smoke-v1: the production registry resolves and verifies this complete canonical tree at startup through the SAME ownership/mode-hardened asset walk and world-readable check as the smoke asset, but no dispatched job mounts it, installs Cargo source replacement, or selects it yet. It is the vendor asset a future real full-workspace `.myelin/ci.toml` build-test-clippy job will mount at the recorded destination."

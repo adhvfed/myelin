@@ -67,6 +67,17 @@ pub const CARGO_VENDOR_SMOKE_LOCK_SHA256: &str =
 /// Host path override for the staged Cargo vendor asset.
 pub const ENV_GVISOR_CARGO_VENDOR: &str = "MYELIN_GVISOR_CARGO_VENDOR";
 
+/// Canonical-tree digest committed for `runner-assets.toml`'s `cargo-vendor-workspace-v1` row — the
+/// FULL-workspace (443-crate) vendor tree keyed to this repo's own root `Cargo.lock`. Additive and
+/// dormant alongside the smoke asset: registered and verified at startup, mounted by no job yet.
+pub const CARGO_VENDOR_WORKSPACE_TREE_SHA256: &str =
+    "c2f6229625dd25ac26f356a34764026eb61b7c227fbd60cc470ab333bdf89fd2";
+/// SHA-256 of the exact workspace root `Cargo.lock` embedded in `cargo-vendor-workspace-v1`.
+pub const CARGO_VENDOR_WORKSPACE_LOCK_SHA256: &str =
+    "9a503ad7a2d64a4eb7e6b98a4d3c7150d446fdf4bc73527abb0ff6b998e3d251";
+/// Host path override for the staged full-workspace Cargo vendor asset.
+pub const ENV_GVISOR_CARGO_VENDOR_WORKSPACE: &str = "MYELIN_GVISOR_CARGO_VENDOR_WORKSPACE";
+
 /// Compute a regular file's SHA-256 for manifest/source-key synchronization and asset validation.
 pub fn file_sha256_hex(path: &Path) -> std::io::Result<String> {
     std::fs::read(path).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
@@ -85,6 +96,21 @@ pub fn resolved_gvisor_cargo_vendor() -> PathBuf {
         .join("share")
         .join("gvisor-assets")
         .join("cargo-vendor-smoke-v1")
+}
+
+/// Resolve the staged `cargo-vendor-workspace-v1` path using its manifest-declared env override and
+/// default path. Mirrors [`resolved_gvisor_cargo_vendor`] exactly for the full-workspace asset; path
+/// selection only — [`GvisorAssetRegistry`] remains the canonicalize/metadata/digest authority.
+pub fn resolved_gvisor_cargo_vendor_workspace() -> PathBuf {
+    if let Ok(path) = std::env::var(ENV_GVISOR_CARGO_VENDOR_WORKSPACE) {
+        return PathBuf::from(path);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("gvisor-assets")
+        .join("cargo-vendor-workspace-v1")
 }
 
 /// A closed, explicit map from an EXACT `ImageRef` reference string to the ALREADY-VERIFIED rootfs

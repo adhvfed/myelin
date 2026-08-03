@@ -37,7 +37,8 @@
 
 use myelin_ci_sandbox::{canonical_tree_sha256_hex, file_sha256_hex};
 use myelin_ci_sandbox::{
-    CARGO_VENDOR_SMOKE_LOCK_SHA256, CARGO_VENDOR_SMOKE_TREE_SHA256, GVISOR_GIT_ROOTFS_SHA256,
+    CARGO_VENDOR_SMOKE_LOCK_SHA256, CARGO_VENDOR_SMOKE_TREE_SHA256,
+    CARGO_VENDOR_WORKSPACE_LOCK_SHA256, CARGO_VENDOR_WORKSPACE_TREE_SHA256, GVISOR_GIT_ROOTFS_SHA256,
     LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use serde::Deserialize;
@@ -367,5 +368,65 @@ fn cargo_vendor_manifest_row_is_mechanically_synced_to_code_and_fixture() {
     assert_eq!(
         actual_fixture_lock_sha256, CARGO_VENDOR_SMOKE_LOCK_SHA256,
         "the checked-in fixture Cargo.lock moved without an intentional asset rebuild/repin"
+    );
+}
+
+/// Gate-3 prerequisite: the full-workspace `cargo-vendor-workspace-v1` row is pinned the SAME way
+/// the smoke row is — capability/job/env/mount vocabulary, canonical-tree digest synced to the
+/// registry const, `image` digest carrying the same complete-tree pin, and the embedded-lock key
+/// synced to BOTH the registry const AND the row's own `source_image_digest`. Its `source_image` is
+/// this repo's OWN root `Cargo.lock`, so this ALSO asserts the workspace lock key is the digest of
+/// the live root lockfile — a drift here means the vendor tree no longer matches the workspace it
+/// claims to vendor. Mirrors `cargo_vendor_manifest_row_is_mechanically_synced_to_code_and_fixture`.
+#[test]
+fn cargo_vendor_workspace_manifest_row_is_mechanically_synced_to_code_and_lockfile() {
+    let manifest = load_real_manifest();
+    let row = manifest
+        .asset
+        .iter()
+        .find(|row| row.id == "cargo-vendor-workspace-v1")
+        .expect("runner-assets.toml must have a `cargo-vendor-workspace-v1` row");
+
+    assert_eq!(row.capability, "cargo-vendor");
+    assert_eq!(row.covers_job, "build-test-clippy");
+    assert_eq!(row.stage_script, "scripts/build-cargo-vendor-asset.sh");
+    assert_eq!(row.env_var, "MYELIN_GVISOR_CARGO_VENDOR_WORKSPACE");
+    assert_eq!(
+        row.default_path,
+        "~/.local/share/gvisor-assets/cargo-vendor-workspace-v1"
+    );
+    assert_eq!(row.source_image, "Cargo.lock");
+    assert_eq!(
+        row.mount_destination.as_deref(),
+        Some("/opt/myelin/cargo-vendor")
+    );
+
+    assert_eq!(
+        row.canonical_tree_sha256, CARGO_VENDOR_WORKSPACE_TREE_SHA256,
+        "the registry's workspace Cargo vendor tree constant must match runner-assets.toml"
+    );
+    assert_eq!(
+        parse_sha256_digest(&row.image),
+        Some(CARGO_VENDOR_WORKSPACE_TREE_SHA256),
+        "the workspace Cargo vendor reference must carry the same complete-tree pin"
+    );
+    assert_eq!(
+        row.lockfile_sha256.as_deref(),
+        Some(CARGO_VENDOR_WORKSPACE_LOCK_SHA256),
+        "the registered workspace asset's lock key must match runner-assets.toml"
+    );
+    assert_eq!(
+        row.source_image_digest,
+        format!("sha256:{CARGO_VENDOR_WORKSPACE_LOCK_SHA256}"),
+        "the source-image digest must name the same exact workspace lockfile key"
+    );
+
+    let root_lock = workspace_root().join(&row.source_image);
+    let actual_root_lock_sha256 = file_sha256_hex(&root_lock)
+        .unwrap_or_else(|error| panic!("hash root lock {}: {error}", root_lock.display()));
+    assert_eq!(
+        actual_root_lock_sha256, CARGO_VENDOR_WORKSPACE_LOCK_SHA256,
+        "the workspace root Cargo.lock moved without an intentional asset rebuild/repin — the \
+         vendor tree no longer matches the workspace it claims to vendor"
     );
 }
