@@ -1,0 +1,40 @@
+[package]
+name = "myelin-agent-model"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The VENDOR-BRAIN crate (AG-P25 → the hosted-agent slice-1 kernel). This is the SINGLE sanctioned
+# home for a model SDK / prompt / model-name string in the whole workspace — the one place the
+# `no-llm-in-platform` lint (contract 1.6) is excluded (a whole-crate boundary; see the named entry
+# in `myelin-lints/tests/workspace_clean.rs` + `myelin-lints/src/bin/lint-gate.rs`). Everything else
+# stays provider-agnostic behind the `AgentRuntime` strategy seam (crate `myelin-agent`, AG-P1).
+#
+# It productionizes the proven Luna spike (`scripts/agent-spike/agent.py`) onto the real seam: a
+# vendor-neutral `ModelClient` trait, a real `LunaClient` over OpenAI `/v1/chat/completions`, and an
+# `LlmAgentRuntime: AgentRuntime` that maps a `Conversation` to a `ModelClient` request and the reply
+# to a `StepOutcome`. A LEAF crate above the glue crate `myelin-agent`; nothing depends back on it.
+[dependencies]
+myelin-agent = { path = "../myelin-agent" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# THE HTTP CLIENT — hyper 1.x + rustls DIRECTLY (no reqwest), the SAME minimal transport stack the
+# edge CLI (`myelin-cli`) uses. Every package here is ALREADY in Cargo.lock through the storage/AWS
+# stack + the CLI, so the real Luna egress adds NO new dependency. rustls verifies the server name +
+# chain; the provider API key rides ONLY in the `Authorization` header and is never logged.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "aws-lc-rs", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "net", "macros", "io-util", "time"] }
+
+[features]
+default = []
+# The in-memory `MockModelClient` double (the deterministic test seam). Behind a `test-support`
+# feature so downstream service tests can construct an `LlmAgentRuntime` without a network — the same
+# in-memory-double discipline the other crates use (`myelin-events`/`myelin-storage` test-support).
+test-support = []

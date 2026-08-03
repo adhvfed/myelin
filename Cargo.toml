@@ -53,6 +53,14 @@ members = [
     # nothing in the production DAG depends back on it; substrate_is_root()/identity_is_sink() are
     # preserved (a service is the graph's terminal consumer). See crates/myelin-agent-service/src/lib.rs.
     "crates/myelin-agent-service",
+    # The VENDOR-BRAIN crate (AG-P25 → the hosted-agent slice-1 kernel): the real `LlmAgentRuntime`
+    # + the `ModelClient` vendor abstraction + the real `LunaClient`. This is the SINGLE sanctioned
+    # home for a model SDK / prompt / model-name string in the whole workspace — the one place the
+    # `no-llm-in-platform` lint (contract 1.6) is excluded (a whole-crate boundary, named LOUD in
+    # myelin-lints/tests/workspace_clean.rs + myelin-lints/src/bin/lint-gate.rs). A LEAF consumer
+    # above the glue crate `myelin-agent`; nothing in the production DAG depends back on it. See
+    # crates/myelin-agent-model/src/lib.rs.
+    "crates/myelin-agent-model",
     "crates/myelin-gdpr",
     # The GDPR/Audit SERVICE crate (P-GA-19 → P-062): the tamper-evident audit log core — the
     # outbox-only audit CONSUMER + the per-tenant hash-chain + the Merkle leaves + the

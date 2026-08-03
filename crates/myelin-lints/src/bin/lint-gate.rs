@@ -263,6 +263,14 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // firecracker.rs / gvisor.rs), never a silent skip.
     "myelin-ci-sandbox/src/firecracker.rs",
     "myelin-ci-sandbox/src/gvisor.rs",
+    // The VENDOR-BRAIN crate (AG-P25): the SINGLE sanctioned home for a model SDK / prompt /
+    // model-name string — the `no-llm-in-platform` (contract 1.6) exception. The rest of the
+    // platform stays provider-agnostic behind the `AgentRuntime` strategy seam; every
+    // provider-specific string (the `gpt-5.6-luna` id, the `api.openai.com` endpoint,
+    // `reasoning_effort`, the Luna wire mapping) is QUARANTINED here behind that seam, so swapping
+    // Luna→Anthropic→an EU model is a change to this one crate only. A whole-crate boundary BY
+    // DESIGN (product-plan §4.1). NAMED, LOUD; the lint stays FULLY live over every OTHER crate.
+    "myelin-agent-model/src/",
     "myelin-lints/",
     "/tests/",
     "/fixtures/",
