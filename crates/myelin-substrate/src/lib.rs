@@ -327,6 +327,23 @@ pub use topology::{
 /// Seconds (frozen unit, architecture §2.10) — the fail-static window bounds.
 pub type Seconds = u64;
 
+/// **True only under the opt-in host/perf test lane** (`--features myelin-substrate/host-perf-tests`).
+///
+/// Wall-clock SLA-budget assertions (`elapsed < budget`, `measured_us <= budget_us`) are enforced
+/// ONLY when this is `true`. In the hermetic CI `cargo test --lib` lane the feature is OFF: the
+/// tests run in a DEBUG build under gVisor CPU contention, where a wall-clock budget calibrated for
+/// a stable release/host lane is inherently flaky (a live drill measured a 250 ms budget blown to
+/// 801 ms purely by sandbox slowdown, ~3.2×). There the measurement STILL runs (the timing code and
+/// every CORRECTNESS assertion around it are untouched) but the SLA-budget assertion is skipped.
+///
+/// The perf SLA is guarded on the stable host/perf lane by enabling the feature:
+/// `cargo test --features myelin-substrate/host-perf-tests`. Keep `host-perf-tests` OUT of every
+/// crate's `default` features and off the plain-workspace `cargo test` so the hermetic lane never
+/// re-arms these budgets.
+pub const fn perf_budget_enforced() -> bool {
+    cfg!(feature = "host-perf-tests")
+}
+
 /// The validated, env-first service config (architecture §3.2; contract 1.1). Opaque
 /// string-backed on this floor; the env-first `Config::from_env()` parse of the real
 /// `DATABASE_URL`/broker/KMS/region knobs lands with the driver (**P-S15**). `serve`
