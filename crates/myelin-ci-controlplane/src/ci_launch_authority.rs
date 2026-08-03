@@ -1,7 +1,8 @@
-//! Policy-owned launch grants for the first executable CI profile.
+//! Policy-owned launch grants for supported executable CI profiles.
 //!
-//! Customer V2 plans may request `linux-small-v1`, but they carry no runtime authority. This module
-//! turns that request into fixed, server-owned isolation and scheduling terms. It delegates the
+//! Customer V2 plans may request a supported execution profile, but they carry no runtime
+//! authority. This module turns that request into fixed, server-owned isolation and scheduling
+//! terms. It delegates the
 //! durable capacity reservation to one explicit provider, while deriving a content-bound token-authority
 //! reference locally; the existing claim-time `CiJobTokenIssuer` remains the only bearer-mint seam.
 //! Keeping those capabilities separate matters for Tier P: Identity can become real without
@@ -35,6 +36,9 @@ use sqlx::{PgPool, Row};
 pub const LINUX_SMALL_V1_POLICY_REVISION: &str = "linux-small-v1:1";
 /// Exact scheduler labels emitted by the production policy and advertised by its runner pool.
 pub const LINUX_SMALL_V1_RUNNER_LABELS: [&str; 2] = ["linux", "linux-small-v1"];
+pub const LINUX_BUILD_V1_POLICY_REVISION: &str = "linux-build-v1:1";
+/// Exact scheduler labels required by the build-profile runner pool.
+pub const LINUX_BUILD_V1_RUNNER_LABELS: [&str; 2] = ["linux", "linux-build-v1"];
 /// Production-for-one ceiling on durable Tier-P reservations for one tenant and region.
 ///
 /// Reservations cover every queued DAG job, so this is deliberately distinct from the measured
@@ -870,8 +874,8 @@ impl ManifestBoundCiJobTokenAuthority {
     }
 }
 
-/// Server policy for the only V2 execution profile currently accepted. Resource limits, default
-/// deny egress, batch scheduling, and fair-share identity are constants owned here—not plan fields.
+/// Server policy for the supported V2 execution profiles. Resource limits, default-deny egress,
+/// batch scheduling, and fair-share identity are constants owned here—not plan fields.
 #[derive(Clone)]
 pub struct LinuxSmallV1LaunchAuthority {
     budget_reservations: Arc<dyn CiJobBudgetReservationProvider>,
@@ -895,12 +899,19 @@ impl CiLaunchAuthorityMaterializer for LinuxSmallV1LaunchAuthority {
         Box<dyn Future<Output = Result<CiLaunchAuthorityV1, CiLaunchAuthorityError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let (limits, requests) = prepare_linux_small_requests(record, prepared, definition)?;
+            let (profile_policy, requests) =
+                prepare_linux_small_requests(record, prepared, definition)?;
             let reserve_handles = self
                 .budget_reservations
                 .reserve_batch(requests.clone())
                 .await?;
-            finish_linux_small_authority(record, prepared, limits, &requests, reserve_handles)
+            finish_linux_small_authority(
+                record,
+                prepared,
+                profile_policy,
+                &requests,
+                reserve_handles,
+            )
         })
     }
 
@@ -914,13 +925,41 @@ impl CiLaunchAuthorityMaterializer for LinuxSmallV1LaunchAuthority {
         Box<dyn Future<Output = Result<CiLaunchAuthorityV1, CiLaunchAuthorityError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let (limits, requests) = prepare_linux_small_requests(record, prepared, definition)?;
+            let (profile_policy, requests) =
+                prepare_linux_small_requests(record, prepared, definition)?;
             let reserve_handles = self
                 .budget_reservations
                 .reserve_batch_in_tx(conn, requests.clone())
                 .await?;
-            finish_linux_small_authority(record, prepared, limits, &requests, reserve_handles)
+            finish_linux_small_authority(
+                record,
+                prepared,
+                profile_policy,
+                &requests,
+                reserve_handles,
+            )
         })
+    }
+}
+
+struct CiExecutionProfilePolicy {
+    limits: CiManifestLimitsV1,
+    policy_revision: &'static str,
+    runner_labels: [&'static str; 2],
+}
+
+fn limits_and_policy_for_profile(profile: CiExecutionProfileV1) -> CiExecutionProfilePolicy {
+    match profile {
+        CiExecutionProfileV1::LinuxSmallV1 => CiExecutionProfilePolicy {
+            limits: linux_small_limits(),
+            policy_revision: LINUX_SMALL_V1_POLICY_REVISION,
+            runner_labels: LINUX_SMALL_V1_RUNNER_LABELS,
+        },
+        CiExecutionProfileV1::LinuxBuildV1 => CiExecutionProfilePolicy {
+            limits: linux_build_limits(),
+            policy_revision: LINUX_BUILD_V1_POLICY_REVISION,
+            runner_labels: LINUX_BUILD_V1_RUNNER_LABELS,
+        },
     }
 }
 
@@ -928,13 +967,10 @@ fn prepare_linux_small_requests(
     record: &CiRunRecord,
     prepared: &PreparedRunPlanV2,
     definition: &CiWorkflowDefinitionPin,
-) -> Result<(CiManifestLimitsV1, Vec<CiJobRuntimeAuthorityRequest>), CiLaunchAuthorityError> {
+) -> Result<(CiExecutionProfilePolicy, Vec<CiJobRuntimeAuthorityRequest>), CiLaunchAuthorityError> {
     let run_id = validate_run_scope(record, prepared)?;
     launch_concurrency_group(record)?;
-    if prepared.plan().execution.profile != CiExecutionProfileV1::LinuxSmallV1 {
-        return Err(refused("unsupported CI execution profile"));
-    }
-    let limits = linux_small_limits();
+    let profile_policy = limits_and_policy_for_profile(prepared.plan().execution.profile);
     let checkout = checkout_scope_for_run(record)?;
     let mut requests = Vec::with_capacity(prepared.plan().jobs.len());
     for job in &prepared.plan().jobs {
@@ -959,8 +995,8 @@ fn prepare_linux_small_requests(
             source_snapshot_digest: prepared.content_hash().to_multihash_string(),
             workflow_definition_version: definition.version(),
             workflow_code_hash: definition.code_hash().into(),
-            policy_revision: LINUX_SMALL_V1_POLICY_REVISION.into(),
-            limits: limits.clone(),
+            policy_revision: profile_policy.policy_revision.into(),
+            limits: profile_policy.limits.clone(),
             reserve_id: None,
             checkout_commit: checkout
                 .as_ref()
@@ -968,13 +1004,13 @@ fn prepare_linux_small_requests(
             checkout: checkout.clone(),
         });
     }
-    Ok((limits, requests))
+    Ok((profile_policy, requests))
 }
 
 fn finish_linux_small_authority(
     record: &CiRunRecord,
     prepared: &PreparedRunPlanV2,
-    limits: CiManifestLimitsV1,
+    profile_policy: CiExecutionProfilePolicy,
     requests: &[CiJobRuntimeAuthorityRequest],
     reserve_handles: Vec<String>,
 ) -> Result<CiLaunchAuthorityV1, CiLaunchAuthorityError> {
@@ -1009,10 +1045,11 @@ fn finish_linux_small_authority(
             env: BTreeMap::new(),
             secret_handles: BTreeMap::new(),
             egress_allow: Vec::new(),
-            limits: limits.clone(),
+            limits: profile_policy.limits.clone(),
             scheduling: CiManifestSchedulingV1 {
                 lane: CiManifestLaneV1::Batch,
-                labels: LINUX_SMALL_V1_RUNNER_LABELS
+                labels: profile_policy
+                    .runner_labels
                     .iter()
                     .map(|label| (*label).to_owned())
                     .collect(),
@@ -1024,7 +1061,7 @@ fn finish_linux_small_authority(
         });
     }
     Ok(CiLaunchAuthorityV1 {
-        policy_revision: LINUX_SMALL_V1_POLICY_REVISION.into(),
+        policy_revision: profile_policy.policy_revision.into(),
         jobs: grants,
         merge_waiter: None,
     })
@@ -1295,6 +1332,16 @@ fn linux_small_limits() -> CiManifestLimitsV1 {
         disk_bytes: 1024 * 1024 * 1024,
         pids_max: 128,
         timeout_secs: 600,
+    }
+}
+
+fn linux_build_limits() -> CiManifestLimitsV1 {
+    CiManifestLimitsV1 {
+        cpu_millis: 8_000,
+        mem_bytes: 8 * 1024 * 1024 * 1024,
+        disk_bytes: 8 * 1024 * 1024 * 1024,
+        pids_max: 1024,
+        timeout_secs: 1800,
     }
 }
 
@@ -2564,13 +2611,13 @@ mod tests {
         );
     }
 
-    fn fixture() -> (CiRunRecord, PreparedRunPlanV2) {
+    fn fixture_with_profile(profile: CiExecutionProfileV1) -> (CiRunRecord, PreparedRunPlanV2) {
         let tenant = TenantId("acme".into());
         let plan = ResolvedRunPlanV2 {
             schema_version: RUN_PLAN_SCHEMA_V2,
             execution: CiExecutionRequestV1 {
                 schema_version: EXECUTION_REQUEST_SCHEMA_V1,
-                profile: CiExecutionProfileV1::LinuxSmallV1,
+                profile,
             },
             jobs: vec![
                 ResolvedJobV2 {
@@ -2625,6 +2672,10 @@ mod tests {
         (record, prepared)
     }
 
+    fn fixture() -> (CiRunRecord, PreparedRunPlanV2) {
+        fixture_with_profile(CiExecutionProfileV1::LinuxSmallV1)
+    }
+
     #[tokio::test]
     async fn customer_profile_becomes_fixed_default_deny_server_grants() {
         let (record, prepared) = fixture();
@@ -2634,6 +2685,7 @@ mod tests {
         let authority = policy.materialize(&record, &prepared, &pin).await.unwrap();
 
         assert_eq!(authority.policy_revision, LINUX_SMALL_V1_POLICY_REVISION);
+        assert_eq!(authority.policy_revision, "linux-small-v1:1");
         assert_eq!(authority.jobs.len(), 2);
         assert!(authority.merge_waiter.is_none());
         for grant in &authority.jobs {
@@ -2641,6 +2693,7 @@ mod tests {
             assert!(grant.secret_handles.is_empty());
             assert!(grant.egress_allow.is_empty());
             assert_eq!(grant.limits, linux_small_limits());
+            assert_eq!(grant.limits.mem_bytes, 256 * 1024 * 1024);
             assert_eq!(grant.scheduling.lane, CiManifestLaneV1::Batch);
             assert_eq!(
                 grant.scheduling.labels,
@@ -2699,6 +2752,37 @@ mod tests {
             assert_eq!(request.workflow_code_hash, "ci-body-v1");
             assert_eq!(request.policy_revision, LINUX_SMALL_V1_POLICY_REVISION);
             assert_eq!(request.limits, linux_small_limits());
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_build_profile_becomes_build_sized_server_grants() {
+        let (record, prepared) = fixture_with_profile(CiExecutionProfileV1::LinuxBuildV1);
+        let runtime = Arc::new(RecordingBudget::default());
+        let policy = policy(runtime.clone());
+        let pin = CiWorkflowDefinitionPin::new(1, "ci-body-v1").unwrap();
+        let authority = policy.materialize(&record, &prepared, &pin).await.unwrap();
+
+        assert_eq!(authority.policy_revision, LINUX_BUILD_V1_POLICY_REVISION);
+        assert_eq!(authority.policy_revision, "linux-build-v1:1");
+        assert_eq!(authority.jobs.len(), 2);
+        for grant in &authority.jobs {
+            assert_eq!(grant.limits, linux_build_limits());
+            assert_eq!(grant.limits.mem_bytes, 8 * 1024 * 1024 * 1024);
+            assert_eq!(
+                grant.scheduling.labels,
+                LINUX_BUILD_V1_RUNNER_LABELS
+                    .iter()
+                    .map(|label| (*label).to_owned())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let batches = runtime.batches.lock().unwrap();
+        assert_eq!(batches.len(), 1);
+        for request in &batches[0] {
+            assert_eq!(request.policy_revision, LINUX_BUILD_V1_POLICY_REVISION);
+            assert_eq!(request.limits, linux_build_limits());
         }
     }
 

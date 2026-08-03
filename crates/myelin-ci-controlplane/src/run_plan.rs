@@ -81,7 +81,7 @@ pub struct ResolvedJobV1 {
     pub matrix_key: BTreeMap<String, String>,
 }
 
-/// The one execution profile that the first version-2 authored request can name.
+/// The execution profiles that a version-2 authored request can name.
 ///
 /// This is a request, not a server grant: it carries no trust, token, secret, egress, workspace,
 /// resource, scheduling, metering, or check authority.
@@ -89,6 +89,8 @@ pub struct ResolvedJobV1 {
 pub enum CiExecutionProfileV1 {
     #[serde(rename = "linux-small-v1")]
     LinuxSmallV1,
+    #[serde(rename = "linux-build-v1")]
+    LinuxBuildV1,
 }
 
 /// Versioned authored execution request nested in a version-2 resolved plan.

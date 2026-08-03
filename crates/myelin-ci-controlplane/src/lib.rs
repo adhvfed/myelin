@@ -71,8 +71,8 @@ pub mod ci_credential_generation;
 pub mod ci_drive_manifest;
 /// Real Identity PASETO/S7 adapter at claim-time mint and final pre-launch authorization.
 pub mod ci_identity_adapter;
-/// Server-owned mapping from the authored `linux-small-v1` request to fixed default-deny runtime
-/// terms plus explicit durable budget/token authority handles.
+/// Server-owned mapping from supported authored execution-profile requests to fixed default-deny
+/// runtime terms plus explicit durable budget/token authority handles.
 pub mod ci_launch_authority;
 /// Exact manifest job identity, sandbox translation, and explicit token authority.
 pub mod ci_manifest_job_runner;

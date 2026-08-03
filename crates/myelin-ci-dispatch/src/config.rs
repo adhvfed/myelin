@@ -320,9 +320,9 @@ impl std::fmt::Display for VersionedCiConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Legacy(error) => error.fmt(f),
-            Self::PartialExecutionContract => write!(f, "version-2 CI execution requests require both `schema_version = 2` and `[execution] profile = \"linux-small-v1\"`; legacy version 1 must omit both fields"),
+            Self::PartialExecutionContract => write!(f, "version-2 CI execution requests require both `schema_version = 2` and a supported `[execution] profile`; legacy version 1 must omit both fields"),
             Self::UnsupportedSchemaVersion { version } => write!(f, "unsupported authored CI schema version `{version}` — omit it for legacy version 1 or use schema version 2"),
-            Self::UnsupportedExecutionProfile { profile } => write!(f, "unsupported CI execution profile `{profile}` — the first version-2 contract supports only `linux-small-v1`"),
+            Self::UnsupportedExecutionProfile { profile } => write!(f, "unsupported CI execution profile `{profile}` — version 2 supports `linux-small-v1` and `linux-build-v1`"),
         }
     }
 }
@@ -591,6 +591,7 @@ impl VersionedAuthoredCi {
                 };
                 let profile = match profile_name.as_str() {
                     "linux-small-v1" => myelin_ci_controlplane::CiExecutionProfileV1::LinuxSmallV1,
+                    "linux-build-v1" => myelin_ci_controlplane::CiExecutionProfileV1::LinuxBuildV1,
                     _ => {
                         return Err(VersionedCiConfigError::UnsupportedExecutionProfile {
                             profile: profile_name,
@@ -893,6 +894,22 @@ command = ["build"]
                 OnTrigger::Push,
                 parse_ci_config(VALID_TOML.as_bytes(), "toml").unwrap().jobs,
             )
+        );
+    }
+
+    #[test]
+    fn linux_build_v1_parses_to_the_build_execution_request() {
+        let authored = format!(
+            "schema_version=2\non=\"push\"\n[execution]\nprofile=\"linux-build-v1\"\n[[jobs]]\nname=\"build\"\nimage=\"{PINNED_BUILD}\"\ncommand=[\"build\"]\n"
+        );
+        let definition = parse_versioned_ci_config(authored.as_bytes(), "toml").unwrap();
+
+        assert_eq!(
+            definition.contract,
+            CiPlanContract::V2(myelin_ci_controlplane::CiExecutionRequestV1 {
+                schema_version: myelin_ci_controlplane::EXECUTION_REQUEST_SCHEMA_V1,
+                profile: myelin_ci_controlplane::CiExecutionProfileV1::LinuxBuildV1,
+            })
         );
     }
 
