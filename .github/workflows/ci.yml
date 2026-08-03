@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main 2026-07-20
         with:
@@ -45,7 +45,7 @@ jobs:
       - name: Build the locked, stripped, checksummed edge release bundle
         run: scripts/build-edge-release.sh
       - name: Upload the edge release bundle
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: edge-release-${{ runner.arch }}
           path: target/release-bundles/*.tar.gz*
@@ -73,13 +73,13 @@ jobs:
       # Deterministic test-only key; deployments inject 32 random bytes from their secret manager.
       MYELIN_WEB_SESSION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pnpm
         uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           package_json_file: frontend/package.json
       - name: Install Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: pnpm
@@ -98,7 +98,7 @@ jobs:
         run: pnpm --filter @myelin/web test:e2e
       - name: Upload Playwright traces on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: frontend-playwright-results
           path: frontend/apps/web/test-results
@@ -112,7 +112,7 @@ jobs:
       IMAGE: myelin-web:ci
       SMOKE_CONTAINER: myelin-web-smoke
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the digest-pinned production web image
         run: docker build --file frontend/apps/web/Dockerfile --tag "$IMAGE" .
       - name: Reject a production container without an explicit edge upstream
@@ -184,7 +184,7 @@ jobs:
     # myelin-lints tests; there is deliberately NO `|| true` / `continue-on-error` anywhere.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: L4 plan-row traceability over the introduced commit range
@@ -225,7 +225,7 @@ jobs:
     # leans on (the contract-coverage scanner passes).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
       # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
       - name: Free disk space
@@ -253,7 +253,7 @@ jobs:
     # scorecard_ratchet test proves dropping a row OR flipping it green-without-proof reds the gate.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
       # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
       - name: Free disk space
@@ -284,7 +284,7 @@ jobs:
     # proves dropping a drill OR flipping it green-without-proof reds the gate.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
       # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
       - name: Free disk space
@@ -314,7 +314,7 @@ jobs:
     # reds the gate.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
       # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
       - name: Free disk space
@@ -335,7 +335,7 @@ jobs:
   build-test-clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
       # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
       - name: Free disk space
