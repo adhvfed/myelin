@@ -45,7 +45,7 @@ sha2.workspace = true
 # behind a narrow trait; "cite proven structures, do not hand-roll crypto"). The
 # `getrandom` feature gives us `aead::OsRng` for key + nonce generation. The self-hostable
 # engine seam (Vault-Transit-class) fronts this in-process software engine on this floor.
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 
 # ------------------------------------------------------------------------------------------
 # REAL backends — NON-OPTIONAL as of MR-009b Wave 1 (the durable-un-gate compile foundation).

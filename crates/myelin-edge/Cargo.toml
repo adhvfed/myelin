@@ -101,7 +101,7 @@ percent-encoding = "2.3"
 # Basic base64(user:pass)` header on the WIRE routes only: `git push/clone http://…` sends Basic, and
 # the PASSWORD carries the capability-token material (R4.0 item C). Already in Cargo.lock via identity —
 # promoting it to a direct dep adds ZERO new crates.
-base64 = "0.22"
+base64 = "0.23"
 
 # Repository-list continuation cursors bind their last visible slug to the verified tenant/region
 # and the durable catalogue namespace without carrying either scope value in cleartext.
@@ -165,7 +165,7 @@ myelin-edge = { path = ".", features = ["test-support"] }
 # The Basic-auth git-wire oracle (R4.0 item C) forms `Authorization: Basic base64(user:token)` to
 # hand `git` via `http.extraHeader` (the exact bytes git would send natively). base64 (0.22) is the
 # same pin the crate itself uses.
-base64 = "0.22"
+base64 = "0.23"
 
 [features]
 default = []

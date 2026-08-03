@@ -108,7 +108,7 @@ blake3.workspace = true
 hex.workspace = true
 # Opaque Git-ref pagination cursors use canonical unpadded base64url framing. The decoded frame is
 # strictly bounded and versioned; BLAKE3 supplies its repository/query scope and namespace fence.
-base64 = "0.22"
+base64 = "0.23"
 
 # git2 (libgit2) — the in-process READ backend of the GitCore layered seam (GIT-P8 / P-269,
 # arch 01 §2.2). The architecture-NAMED fallback (gix-preferred is the OQ-1 floor, GIT-P33), used
@@ -120,7 +120,7 @@ base64 = "0.22"
 git2.workspace = true
 # Cross-process per-ref linearisation locks for durable receive-pack. Already pinned in Cargo.lock;
 # its safe API preserves this crate's `forbid(unsafe_code)` boundary.
-fs4 = "0.13"
+fs4 = "1.1"
 
 # The content-addressed object backing — the `BlobStore` trait + the local-disk git PACK TIER
 # (`GitPackTier<B: BlobStore>` + `RepoGitPlacement`, contract 11.2 / storage §3.5, shipped by P-252).

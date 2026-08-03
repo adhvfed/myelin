@@ -44,7 +44,7 @@ myelin-notif = { path = "../myelin-notif" }
 # The {items,page} + {error:{message,code}} envelopes + the rendered view-models are serde_json::Value
 # (the one workspace-pinned JSON shape) — the CLI parses/renders them directly.
 serde_json = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Build strict form-query strings for paginated Edge calls without interpolating cursor bytes.

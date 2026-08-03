@@ -76,7 +76,7 @@ blake3 = { workspace = true }
 # The router (NOTIF-P3) deserializes the curated `Signal` out of the envelope payload (a poison
 # payload → NonRetryable) and builds the `notif.item.created` references-not-payloads emit payload.
 serde_json = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 sqlx = { workspace = true }
 
