@@ -1,49 +1,45 @@
-//! # `hitl` — the withhold → surface → resume loop + the `hitl_gate` state machine (AG-P9 → P-221, M2-B)
+//! # `hitl` — the withhold → surface → resume loop + the `hitl_gate` state machine
 //!
-//! **Owning architecture doc:**
-//! `planning/05-refined-shared-systems-architecture/agent-fabric.md` §5.3 (HITL: **withhold** (a
-//! gated effect returns `Gated`, does not mutate) → **surface** (a durable-workflow wait, contract
-//! 9.4, surfaced as a chat approval card showing the pending action + risk + the **LIVE cost
-//! estimate**, with the approver set = `list_subjects(object, approve_perm)`, contract 4.4) →
-//! **decide** (minutes or days; the wait holds no runtime) → **resume** (the workflow signal re-runs
-//! the step with the tool name added to "approved"; step 6 of the pipeline now passes; the effect
-//! applies). Rejection settles `Halted::Rejected` with the reason in the trace + audit), §4.4 (the
-//! `hitl_gate` table: `gate_id`, `run_id`, `effect_id`, `risk_summary`, `cost_estimate`,
-//! `approver_filter`, `state`, `card_ref`).
+//! HITL (human-in-the-loop): **withhold** (a gated effect returns `Gated`, does not mutate) →
+//! **surface** (a durable-workflow wait, surfaced as a chat approval card showing the pending
+//! action + risk + the **LIVE cost estimate**, with the approver set = `list_subjects(object,
+//! approve_perm)`) → **decide** (minutes or days; the wait holds no runtime) → **resume** (the
+//! workflow signal re-runs the step with the tool name added to "approved"; step 6 of the pipeline
+//! now passes; the effect applies). Rejection settles `Halted::Rejected` with the reason in the
+//! trace + audit.
 //!
-//! **Contract-index:** OWNS the completion of 8.2's **HITL GATE step** (the state machine the
-//! `Gated` result resumes). CONSUMES 9.4 (the durable HITL signal — `state=waiting` holds NO runtime;
-//! an approval/cancel signal arrives hours/days later, re-leases + replays + consumes — that
-//! machinery is `myelin-flow`'s `request_approval_and_wait`, reconciled
-//! below) and 4.4 (`list_subjects` → `SubjectTree`, the approver set).
+//! The `hitl_gate` row: `gate_id`, `run_id`, `effect_id`, `risk_summary`, `cost_estimate`,
+//! `approver_filter`, `state`, `card_ref`. The durable HITL signal holds NO runtime while
+//! `state=waiting`; an approval/cancel signal arrives hours/days later, re-leases + replays +
+//! consumes — that machinery is `myelin-flow`'s `request_approval_and_wait` (reconciled below);
+//! `list_subjects` → `SubjectTree` supplies the approver set.
 //!
-//! ## What this prompt ships — the agent-fabric HITL machinery on top of `EffectApi::apply`'s `Gated`
+//! ## The machinery on top of `EffectApi::apply`'s `Gated`
 //!
-//! [`crate::effect_api::PlanThenApply`] (AG-P6 → P-218) already returns
+//! [`crate::effect_api::PlanThenApply`] already returns
 //! [`EffectResult::Gated`](myelin_agent::EffectResult) at step 6 when a `requires_approval` tool is
-//! not yet in the run's `approved` set — it opens nothing, it only signals the gate (AG-8: a withheld
+//! not yet in the run's `approved` set — it opens nothing, it only signals the gate (a withheld
 //! gated effect does NOT mutate). THIS module is the machinery that **resumes** that result:
 //!
 //! 1. **WITHHOLD → OPEN A GATE.** [`open_gate`] turns a `Gated` verdict + the [`PlannedEffect`] into a
 //!    [`HitlGate`] row in state [`HitlGateState::Waiting`] — carrying the humanised `risk_summary`
-//!    slot, the LIVE `cost_estimate`, the `approver_filter` (= `list_subjects(object, approve_perm)`,
-//!    4.4), and the `card_ref` the durable wait surfaces as. A withheld gate holds **no runtime**.
+//!    slot, the LIVE `cost_estimate`, the `approver_filter` (= `list_subjects(object, approve_perm)`),
+//!    and the `card_ref` the durable wait surfaces as. A withheld gate holds **no runtime**.
 //! 2. **SURFACE.** [`surface_card`] projects the gate into a [`HitlCard`] — the pending action, the
 //!    risk, the LIVE cost estimate, and the approver set — the chat approval card a viewer sees. The
-//!    durable wait itself (`myelin_flow::approval::request_approval_and_wait`, 9.4) is
-//!    `myelin-flow`'s, consumed via the [`HitlWait`] seam (no production dep — the DAG stays acyclic).
+//!    durable wait itself (`myelin_flow::approval::request_approval_and_wait`) is `myelin-flow`'s,
+//!    consumed via the [`HitlWait`] seam (no production dep — the DAG stays acyclic).
 //! 3. **DECIDE.** A human clicks Approve/Reject minutes-or-days later. The run is PARKED
 //!    (`state=waiting`) holding no runtime; the worker is free. The decide step is observational here
-//!    — the durable wait (9.4) does the multi-day park.
+//!    — the durable wait does the multi-day park.
 //! 4. **RESUME.** [`HitlGate::approve`] transitions `Waiting → Approved` and adds the effect's
-//!    per-(tool, object) gate key ([`crate::effect_api::effect_gate_key`], R2.4 — never the bare
-//!    tool name) to the run's `approved` set ([`ApprovedTools`]); a re-run of
-//!    [`crate::effect_api::PlanThenApply::apply_planned`]
-//!    now passes step 6 for THAT effect and applies. [`HitlGate::reject`] transitions `Waiting → Rejected` and
-//!    settles [`Halted::Rejected`] with the reason in the trace + audit — the effect is never applied
-//!    (0 mutation).
+//!    per-(tool, object) gate key ([`crate::effect_api::effect_gate_key`] — never the bare tool
+//!    name) to the run's `approved` set ([`ApprovedTools`]); a re-run of
+//!    [`crate::effect_api::PlanThenApply::apply_planned`] now passes step 6 for THAT effect and
+//!    applies. [`HitlGate::reject`] transitions `Waiting → Rejected` and settles [`Halted::Rejected`]
+//!    with the reason in the trace + audit — the effect is never applied (0 mutation).
 //!
-//! ## The state machine ([`HitlGateState`], §4.4 `state`)
+//! ## The state machine ([`HitlGateState`])
 //!
 //! ```text
 //!                approve(tool)        ┌──────────┐
@@ -54,7 +50,7 @@
 //!        │ expire(deadline)           └──────────┘
 //!        ▼
 //!   ┌──────────┐
-//!   │ Expired  │  (the approval window lapsed → auto-deny; 0 mutation, AG-8)
+//!   │ Expired  │  (the approval window lapsed → auto-deny; 0 mutation)
 //!   └──────────┘
 //! ```
 //!
@@ -63,47 +59,44 @@
 //! gate). The **0-mutation-pre-approval** invariant is structural: the gate carries the effect but
 //! NEVER applies it — the apply happens only when the re-run of the pipeline (with the tool now in
 //! `approved`) reaches step 7. A Rejected/Expired gate never adds the tool to `approved`, so the
-//! re-run gates again (or the loop withholds it) — the declined effect makes ZERO mutation (AG-8).
+//! re-run gates again (or the loop withholds it) — the declined effect makes ZERO mutation.
 //!
-//! ## Reconciliation with the durable-workflow HITL round-trip (9.4 — `myelin-flow::approval`)
+//! ## Reconciliation with the durable-workflow HITL round-trip (`myelin-flow::approval`)
 //!
 //! The **durable wait** half of the loop — emit `agent.approval.requested` via the outbox ONCE → park
 //! `state=waiting` holding no runtime → resume on the `approval` signal days later, consume-exactly-
-//! once across a re-drive, the per-effect `idem_key` rule (C4) — already landed in
-//! `myelin-flow::approval` (`request_approval_and_wait`,
-//! `per_effect_idem_key`, P-FLOW-10/11 → P-206/P-208). THIS prompt does NOT
-//! re-implement it: it ships the **agent-fabric side** the durable wait drives — the `hitl_gate`
-//! state machine, the card projection (action + risk + LIVE cost), the approver-set derivation
-//! (`list_subjects`, 4.4), and the resume that threads the tool into the run's `approved` set so the
-//! `EffectApi` step passes. The durable wait is consumed through the [`HitlWait`] seam (a caller-
-//! supplied driver), keeping `myelin-agent-service` free of a production dep on `myelin-flow`.
+//! once across a re-drive, the per-effect `idem_key` rule — already lives in `myelin-flow::approval`
+//! (`request_approval_and_wait`, `per_effect_idem_key`). THIS module does NOT re-implement it: it is
+//! the **agent-fabric side** the durable wait drives — the `hitl_gate` state machine, the card
+//! projection (action + risk + LIVE cost), the approver-set derivation (`list_subjects`), and the
+//! resume that threads the tool into the run's `approved` set so the `EffectApi` step passes. The
+//! durable wait is consumed through the [`HitlWait`] seam (a caller-supplied driver), keeping
+//! `myelin-agent-service` free of a production dep on `myelin-flow`.
 //!
-//! ## FLOORS named (cross-references; VISION §3, EI-01 §1)
-//! - **Per-effect resume idempotency (C4/OQ-F) is AG-P10 (→ P-222).** A batch card gating MULTIPLE
-//!   effects keys each on `card_id ":" effect_idx`; a partial approval + double-click is well-defined
-//!   exactly-once. The per-effect key rule itself already landed in
-//!   `per_effect_idem_key`; the exactly-once + per-effect PARITY leg
-//!   (AG-D5's second half) is AG-P10. HERE the gate is single-effect (one gate per withheld effect)
-//!   and the `card_id` is the single-effect key (the degenerate per-effect case, §6.4).
-//! - **The humanise card-text surface is AG-P11 (→ P-223).** The `risk_summary` is a
-//!   [`RiskSummary`] = `(template_key, args)` pair (NOT a raw string, C9/OQ-L); AG-P11 wires it
-//!   through Notif `humanise` (contract 7.3, the ONE templating surface). HERE the card carries the
-//!   humanised SLOT; the render is that follow-on.
-//! - **Implicit auto-dispatch on a casual mention** remains `[OPEN → LEGAL]` L-3, handled at the Chat
-//!   dispatch layer in **AG-P20**, not here (a mention notifies; it does not auto-spawn a costed run).
+//! ## Follow-on floors
+//! - **Per-effect resume idempotency.** A batch card gating MULTIPLE effects keys each on
+//!   `card_id ":" effect_idx`; a partial approval + double-click is well-defined exactly-once. The
+//!   per-effect key rule itself lives in `per_effect_idem_key`. HERE the gate is single-effect (one
+//!   gate per withheld effect) and the `card_id` is the single-effect key (the degenerate per-effect
+//!   case).
+//! - **The humanise card-text surface.** The `risk_summary` is a [`RiskSummary`] = `(template_key,
+//!   args)` pair (NOT a raw string); Notif `humanise` (the ONE templating surface) renders it. HERE
+//!   the card carries the humanised SLOT; the render is a follow-on.
+//! - **Implicit auto-dispatch on a casual mention** is handled at the Chat dispatch layer, not here
+//!   (a mention notifies; it does not auto-spawn a costed run).
 
 use crate::effect_api::{EffectCost, PlannedEffect};
 use myelin_agent::{EffectResult, GateId};
 use myelin_identity::{Consistency, Permission, PrincipalId, SubjectTree};
 use myelin_tenancy::ArtifactRef;
 
-// ───────────────────────── §4.4 the hitl_gate state machine — the state enum ─────────────────────
+// ───────────────────────── the hitl_gate state machine — the state enum ─────────────────────
 
-/// **The `hitl_gate.state` state machine (§4.4 `state`; AG-8).** A gate opens `Waiting`, then
+/// **The `hitl_gate.state` state machine.** A gate opens `Waiting`, then
 /// transitions ONCE to a terminal state: `Approved` (the tool is added to the run's `approved` set; a
 /// re-run of the pipeline step 6 passes and the effect applies) | `Rejected` (settles
 /// [`Halted::Rejected`] with the reason; the effect is never applied — 0 mutation) | `Expired` (the
-/// approval window lapsed → auto-deny; 0 mutation, AG-8). A terminal gate never re-transitions.
+/// approval window lapsed → auto-deny; 0 mutation). A terminal gate never re-transitions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HitlGateState {
     /// the gate is open and PARKED — the durable wait holds no runtime; a human has not yet decided.
@@ -112,12 +105,12 @@ pub enum HitlGateState {
     Approved,
     /// the gate was REJECTED — settles [`Halted::Rejected`]; the effect is never applied (0 mutation).
     Rejected,
-    /// the gate EXPIRED — the approval window lapsed → auto-deny (0 mutation, AG-8).
+    /// the gate EXPIRED — the approval window lapsed → auto-deny (0 mutation).
     Expired,
 }
 
 impl HitlGateState {
-    /// The wire/audit token for the `hitl_gate.state` column (§4.4) — a stable, lowercase taxonomy
+    /// The wire/audit token for the `hitl_gate.state` column — a stable, lowercase taxonomy
     /// token, not PII.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -135,22 +128,22 @@ impl HitlGateState {
     }
 }
 
-// ───────────────────────── the humanised risk_summary slot (C9 — AG-P11 wires humanise) ──────────
+// ───────────────────────── the humanised risk_summary slot ──────────
 
-/// **The humanised `risk_summary` SLOT (§4.4; C9/OQ-L) — a `(template_key, args)` pair, NEVER a raw
-/// string.** The card's `risk_summary` is never an agent-authored raw string: it is a stable
-/// `template_key` + ordered `(name, ArtifactRef)` args that Notif `humanise` (contract 7.3, the ONE
-/// templating surface) renders per-viewer/locale, permission- + erasure-safe.
+/// **The humanised `risk_summary` SLOT — a `(template_key, args)` pair, NEVER a raw string.** The
+/// card's `risk_summary` is never an agent-authored raw string: it is a stable `template_key` +
+/// ordered `(name, ArtifactRef)` args that Notif `humanise` (the ONE templating surface) renders
+/// per-viewer/locale, permission- + erasure-safe.
 ///
-/// **Floor (named):** the humanise WIRING (the `humanise((template_key, args), viewer, locale)` call
-/// that renders this slot into card text) is **AG-P11 (→ P-223)**. HERE the gate carries the SLOT;
-/// the render is that follow-on. Modeling it as `(key, args)` now means AG-P11 wires a render, it
-/// does not re-shape the data.
+/// **Floor:** the humanise WIRING (the `humanise((template_key, args), viewer, locale)` call that
+/// renders this slot into card text) is a follow-on. HERE the gate carries the SLOT; the render is
+/// that follow-on. Modeling it as `(key, args)` now means the follow-on wires a render, it does not
+/// re-shape the data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RiskSummary {
     /// the stable template key (e.g. `agent.hitl.merge_pr`) — a taxonomy token, never free text.
     pub template_key: String,
-    /// the ordered humanise args — `(arg_name, ArtifactRef)` (references-not-payloads, §3.4). The
+    /// the ordered humanise args — `(arg_name, ArtifactRef)` (references-not-payloads). The
     /// rendered text is permission-/erasure-safe because each arg is a REFERENCE Notif resolves
     /// per-viewer, never an inline PII body.
     pub args: Vec<(String, ArtifactRef)>,
@@ -166,15 +159,15 @@ impl RiskSummary {
     }
 }
 
-// ───────────────────────── §4.4 the hitl_gate row + the state machine ─────────────────────────────
+// ───────────────────────── the hitl_gate row + the state machine ─────────────────────────────
 
-/// **A `Halt` settlement of a run (§5.3).** A REJECTED gate settles `Halted::Rejected(reason)` — the
-/// run halts with the reason recorded in the trace + audit; the effect is never applied (0 mutation,
-/// AG-8). (The reason is a machine token / template ref, not PII; the loud audit trail proves WHY the
+/// **A `Halt` settlement of a run.** A REJECTED gate settles `Halted::Rejected(reason)` — the
+/// run halts with the reason recorded in the trace + audit; the effect is never applied (0 mutation).
+/// (The reason is a machine token / template ref, not PII; the loud audit trail proves WHY the
 /// run halted.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Halted {
-    /// the HITL gate was rejected — the reason is recorded in the trace + audit (0 mutation, AG-8).
+    /// the HITL gate was rejected — the reason is recorded in the trace + audit (0 mutation).
     Rejected(String),
     /// the HITL approval window lapsed (auto-deny) — recorded distinctly from an explicit reject.
     Expired,
@@ -202,11 +195,11 @@ impl core::fmt::Display for InvalidTransition {
 
 impl std::error::Error for InvalidTransition {}
 
-/// **The `hitl_gate` row + its state machine (§4.4; the OWNED completion of 8.2's HITL GATE step).**
-/// Field list frozen by §4.4: `gate_id`, `run_id`, `effect_id`, `risk_summary` (the humanised SLOT),
+/// **The `hitl_gate` row + its state machine.**
+/// Fields: `gate_id`, `run_id`, `effect_id`, `risk_summary` (the humanised SLOT),
 /// `cost_estimate` (the LIVE estimate, integer minor-units, never floats), `approver_filter` (=
-/// `list_subjects(object, approve_perm)`, 4.4), `state`, `card_ref`. A gate holds NO runtime while it
-/// waits — the durable wait (9.4) parks the run; this struct is the durable row the wait re-leases.
+/// `list_subjects(object, approve_perm)`), `state`, `card_ref`. A gate holds NO runtime while it
+/// waits — the durable wait parks the run; this struct is the durable row the wait re-leases.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HitlGate {
     /// the opaque gate id (the [`GateId`] the `Gated` verdict carried).
@@ -217,15 +210,15 @@ pub struct HitlGate {
     pub tool_name: String,
     /// the object the effect targets (the `list_subjects` object + the apply target).
     pub object: ArtifactRef,
-    /// the humanised risk summary SLOT the card shows (`(template_key, args)`, C9 — AG-P11 renders it).
+    /// the humanised risk summary SLOT the card shows (`(template_key, args)`).
     pub risk_summary: RiskSummary,
     /// the LIVE cost estimate the card shows, integer minor-units (never floats) — the metered cost of
     /// the withheld effect (wholesale + markup, the BUDGET would debit on apply).
     pub cost_estimate: u64,
-    /// the APPROVER set = `list_subjects(object, approve_perm)` (4.4) — a set of OPAQUE principal
-    /// pseudonyms (4.8), never raw names. Who MAY approve this gate.
+    /// the APPROVER set = `list_subjects(object, approve_perm)` — a set of OPAQUE principal
+    /// pseudonyms, never raw names. Who MAY approve this gate.
     pub approver_filter: Vec<PrincipalId>,
-    /// the gate state (the §4.4 state machine).
+    /// the gate state (the state machine).
     pub state: HitlGateState,
     /// the `card_ref` the gate surfaces as (the chat approval card; the durable-wait `idem_key` base).
     pub card_ref: String,
@@ -233,10 +226,10 @@ pub struct HitlGate {
 
 impl HitlGate {
     /// **WITHHOLD → OPEN: build a `Waiting` gate from a [`PlannedEffect`] + the [`GateId`] the step-6
-    /// `Gated` verdict carried (§5.3 withhold).** The gate carries the humanised risk slot, the LIVE
-    /// cost estimate (the effect's metered cost — what the BUDGET would debit on apply), the approver
-    /// set, and the `card_ref` the durable wait surfaces as. Opening a gate makes NO mutation (AG-8) —
-    /// it is a durable row, not an apply.
+    /// `Gated` verdict carried.** The gate carries the humanised risk slot, the LIVE cost estimate
+    /// (the effect's metered cost — what the BUDGET would debit on apply), the approver set, and the
+    /// `card_ref` the durable wait surfaces as. Opening a gate makes NO mutation — it is a durable
+    /// row, not an apply.
     pub fn open(
         gate_id: GateId,
         run_id: impl Into<String>,
@@ -260,7 +253,7 @@ impl HitlGate {
         }
     }
 
-    /// **RESUME → APPROVE: transition `Waiting → Approved` (§5.3 resume).** The caller then adds
+    /// **RESUME → APPROVE: transition `Waiting → Approved`.** The caller then adds
     /// [`Self::tool_name`] to the run's [`ApprovedTools`] set; a re-run of
     /// [`crate::effect_api::PlanThenApply::apply_planned`] now passes step 6 and the effect applies.
     /// Refused (a no-op) if the gate is already terminal (a double-click is one approval — the second
@@ -275,9 +268,9 @@ impl HitlGate {
         Ok(())
     }
 
-    /// **RESUME → REJECT: transition `Waiting → Rejected` + settle [`Halted::Rejected`] (§5.3
-    /// resume).** The reason is recorded in the trace + audit; the tool is NEVER added to `approved`,
-    /// so the effect is never applied (0 mutation, AG-8). Refused (a no-op) if already terminal.
+    /// **RESUME → REJECT: transition `Waiting → Rejected` + settle [`Halted::Rejected`].** The reason
+    /// is recorded in the trace + audit; the tool is NEVER added to `approved`, so the effect is never
+    /// applied (0 mutation). Refused (a no-op) if already terminal.
     pub fn reject(&mut self, reason: impl Into<String>) -> Result<Halted, InvalidTransition> {
         if self.state.is_terminal() {
             return Err(InvalidTransition {
@@ -289,7 +282,7 @@ impl HitlGate {
     }
 
     /// **The approval window lapsed: transition `Waiting → Expired` (auto-deny).** The effect is never
-    /// applied (0 mutation, AG-8); settles [`Halted::Expired`]. Refused (a no-op) if already terminal.
+    /// applied (0 mutation); settles [`Halted::Expired`]. Refused (a no-op) if already terminal.
     pub fn expire(&mut self) -> Result<Halted, InvalidTransition> {
         if self.state.is_terminal() {
             return Err(InvalidTransition {
@@ -307,21 +300,21 @@ impl HitlGate {
     }
 }
 
-/// **The LIVE cost estimate the card shows (§5.3 — the "LIVE cost estimate") — the withheld effect's
-/// metered total, integer minor-units.** It is the cost the BUDGET would debit on apply
-/// (`wholesale + markup`), so the human approves with the real bill in view (no surprise charge). A
-/// pure function of the effect's [`EffectCost`] — never a float, never a guess.
+/// **The LIVE cost estimate the card shows — the withheld effect's metered total, integer
+/// minor-units.** It is the cost the BUDGET would debit on apply (`wholesale + markup`), so the human
+/// approves with the real bill in view (no surprise charge). A pure function of the effect's
+/// [`EffectCost`] — never a float, never a guess.
 pub fn live_cost_estimate(cost: &EffectCost) -> u64 {
     cost.total()
 }
 
 // ───────────────────────── the surfaced card (action + risk + LIVE cost + approvers) ─────────────
 
-/// **The chat approval card the gate surfaces as (§5.3 surface).** Projects a [`HitlGate`] into the
-/// card a viewer sees: the pending ACTION (tool + object), the humanised RISK summary slot, the LIVE
-/// COST estimate, and the APPROVER set (who may decide). The card's TEXT is rendered by Notif
-/// `humanise` (AG-P11 → P-223, the ONE templating surface) from [`Self::risk_summary`] — HERE the
-/// card carries the slot + the structured fields, not a rendered string.
+/// **The chat approval card the gate surfaces as.** Projects a [`HitlGate`] into the card a viewer
+/// sees: the pending ACTION (tool + object), the humanised RISK summary slot, the LIVE COST estimate,
+/// and the APPROVER set (who may decide). The card's TEXT is rendered by Notif `humanise` (the ONE
+/// templating surface) from [`Self::risk_summary`] — HERE the card carries the slot + the structured
+/// fields, not a rendered string.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HitlCard {
     /// the gate this card surfaces (the durable row the durable wait re-leases).
@@ -330,20 +323,20 @@ pub struct HitlCard {
     pub action_tool: String,
     /// the object the action targets.
     pub action_object: ArtifactRef,
-    /// the humanised risk summary SLOT (`(template_key, args)`, C9 — AG-P11 renders it per-viewer).
+    /// the humanised risk summary SLOT (`(template_key, args)`, rendered per-viewer).
     pub risk_summary: RiskSummary,
     /// the LIVE cost estimate, integer minor-units (the bill the human approves with in view).
     pub cost_estimate: u64,
-    /// the approver set (who MAY decide) = `list_subjects(object, approve_perm)` (4.4).
+    /// the approver set (who MAY decide) = `list_subjects(object, approve_perm)`.
     pub approvers: Vec<PrincipalId>,
     /// the `card_ref` (the durable-wait `idem_key` base; the chat card identity).
     pub card_ref: String,
 }
 
-/// **SURFACE: project a `Waiting` [`HitlGate`] into the [`HitlCard`] a viewer sees (§5.3 surface).**
+/// **SURFACE: project a `Waiting` [`HitlGate`] into the [`HitlCard`] a viewer sees.**
 /// The card shows the pending action + risk + the LIVE cost estimate + the approver set — exactly the
-/// three things AG-D5 asserts a withhold card carries (action + risk + cost). A purely observational
-/// projection (no mutation, no state change) — the surface is the read side of the durable wait.
+/// three things a withhold card carries (action + risk + cost). A purely observational projection (no
+/// mutation, no state change) — the surface is the read side of the durable wait.
 pub fn surface_card(gate: &HitlGate) -> HitlCard {
     HitlCard {
         gate_id: gate.gate_id.clone(),
@@ -356,16 +349,16 @@ pub fn surface_card(gate: &HitlGate) -> HitlCard {
     }
 }
 
-// ───────────────────────── the consumer seams (4.4 list_subjects, 9.4 durable wait) ──────────────
+// ───────────────────────── the consumer seams (list_subjects, durable wait) ──────────────
 
-/// **The contract-4.4 `list_subjects` surface, as the HITL machinery consumes it (CONSUMED, §5.3 —
-/// the approver set).** A seam so `myelin-agent-service` does NOT depend on `myelin-identity-service`
-/// (the engine body) — the same decoupling [`crate::effect_api::CapabilityCheck`] uses. The approver
-/// set = `list_subjects(object, approve_perm)`: the subjects who hold the approval permission on the
-/// gated object, at the run's zookie snapshot. The CDC pairs this consumer with the real Identity
-/// `list_subjects` provider (`tests/cdc_4_4_list_subjects.rs`).
+/// **The `list_subjects` surface, as the HITL machinery consumes it.** A seam so
+/// `myelin-agent-service` does NOT depend on `myelin-identity-service` (the engine body) — the same
+/// decoupling [`crate::effect_api::CapabilityCheck`] uses. The approver set = `list_subjects(object,
+/// approve_perm)`: the subjects who hold the approval permission on the gated object, at the run's
+/// zookie snapshot. The CDC pairs this consumer with the real Identity `list_subjects` provider
+/// (`tests/cdc_4_4_list_subjects.rs`).
 pub trait ApproverSet {
-    /// **`list_subjects` (4.4)** — the subject userset tree of who holds `approve_perm` on `object` at
+    /// **`list_subjects`** — the subject userset tree of who holds `approve_perm` on `object` at
     /// the consistency `at`. The HITL card's `approver_filter` is its [`SubjectTree::members`].
     fn list_subjects(
         &self,
@@ -375,9 +368,9 @@ pub trait ApproverSet {
     ) -> SubjectTree;
 }
 
-/// **Derive the approver set for a gated effect (§5.3 — `list_subjects(object, approve_perm)`, 4.4).**
+/// **Derive the approver set for a gated effect (`list_subjects(object, approve_perm)`).**
 /// The set of principals who MAY approve this gate = who holds `approve_perm` on the gated object at
-/// the run's zookie snapshot. Returns the opaque pseudonyms (4.8), never raw names — the `card.approvers`
+/// the run's zookie snapshot. Returns the opaque pseudonyms, never raw names — the `card.approvers`
 /// + the `hitl_gate.approver_filter`.
 pub fn derive_approver_set<A: ApproverSet>(
     approvers: &A,
@@ -388,24 +381,24 @@ pub fn derive_approver_set<A: ApproverSet>(
     approvers.list_subjects(object, approve_perm, at).members
 }
 
-/// **The durable HITL wait, as the agent fabric consumes it (CONSUMED, contract 9.4).** A seam over
-/// the durable-workflow `request_approval_and_wait` round-trip (`myelin_flow::approval`,
-/// P-FLOW-10/11): emit `agent.approval.requested` via the outbox ONCE → park `state=waiting` holding
-/// NO runtime → resume on the `approval` signal days later (consume-exactly-once across a re-drive).
-/// Modeled as a seam so `myelin-agent-service` does NOT take a production dep on `myelin-flow` (the
-/// DAG stays acyclic — `myelin-flow` already depends on the agent-fabric effect set; the reverse edge
-/// would be a cycle). The production wiring hands the real `WfCtx`-driven round-trip; the CDC pairs
-/// this consumer with the real `myelin-flow` provider (`tests/cdc_9_4_durable_hitl.rs`).
+/// **The durable HITL wait, as the agent fabric consumes it.** A seam over the durable-workflow
+/// `request_approval_and_wait` round-trip (`myelin_flow::approval`): emit `agent.approval.requested`
+/// via the outbox ONCE → park `state=waiting` holding NO runtime → resume on the `approval` signal
+/// days later (consume-exactly-once across a re-drive). Modeled as a seam so `myelin-agent-service`
+/// does NOT take a production dep on `myelin-flow` (the DAG stays acyclic — `myelin-flow` already
+/// depends on the agent-fabric effect set; the reverse edge would be a cycle). The production wiring
+/// hands the real `WfCtx`-driven round-trip; the CDC pairs this consumer with the real `myelin-flow`
+/// provider (`tests/cdc_9_4_durable_hitl.rs`).
 pub trait HitlWait {
-    /// **Park on the durable HITL wait for `gate` (9.4).** Returns the human's [`WaitDecision`] when
+    /// **Park on the durable HITL wait for `gate`.** Returns the human's [`WaitDecision`] when
     /// the `approval` signal arrives (days later) — `Approve`, `Reject(reason)`, or `Expired` (the
     /// window lapsed). While parked, the run holds NO runtime (the worker is free). A re-drive replays
     /// the prefix + consumes the signal EXACTLY once.
     fn park_and_wait(&self, gate: &HitlGate) -> WaitDecision;
 }
 
-/// **The human's decision returned by the durable HITL wait (9.4).** `Approve` (the effect applies),
-/// `Reject(reason)` (the effect is withheld → 0 mutation, AG-8), or `Expired` (the window lapsed →
+/// **The human's decision returned by the durable HITL wait.** `Approve` (the effect applies),
+/// `Reject(reason)` (the effect is withheld → 0 mutation), or `Expired` (the window lapsed →
 /// auto-deny). The decision drives the [`HitlGate`] state-machine transition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WaitDecision {
@@ -419,19 +412,19 @@ pub enum WaitDecision {
 
 // ───────────────────────── the run's approved-tool set (the resume threading) ────────────────────
 
-/// **The run's `approved` PER-EFFECT gate-key set — the slot the resume threads a decided gate into
-/// (§5.3 resume).** `EffectApi::apply`'s step 6 reads exactly this set, keyed by
+/// **The run's `approved` PER-EFFECT gate-key set — the slot the resume threads a decided gate
+/// into.** `EffectApi::apply`'s step 6 reads exactly this set, keyed by
 /// [`crate::effect_api::effect_gate_key`] (`gate:{tool}:{object}` — the SAME key the step-6 `GateId`
 /// is minted from): a `requires_approval` effect whose OWN key is in the set passes the gate and
 /// applies. A fresh run's set is empty (every gated effect withholds); the HITL resume adds an
 /// APPROVED gate's per-effect key so the re-run applies THAT effect. This is the bridge between the
 /// `hitl_gate` machine (this module) and [`crate::effect_api::PlanThenApply::approved`].
 ///
-/// **R2.4 (Defect B fix):** this set held bare TOOL NAMES — approving one `git.merge` admitted every
-/// sibling `git.merge` in a batch, including a DECLINED one re-driven through `apply_planned`. The
-/// set now carries per-(tool, object) keys, so a declined sibling's key is never present and it
-/// gates again (0 mutation, AG-8). The type keeps its name (it is the run's approved set everywhere)
-/// but a bare tool name is no longer an approval key anywhere.
+/// **Why per-(tool, object) keys, not bare tool names:** a bare-tool-name set would let approving one
+/// `git.merge` admit every sibling `git.merge` in a batch, including a DECLINED one re-driven through
+/// `apply_planned`. Per-(tool, object) keys mean a declined sibling's key is never present and it
+/// gates again (0 mutation). The type keeps its name (it is the run's approved set everywhere) but a
+/// bare tool name is no longer an approval key anywhere.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ApprovedTools(pub std::collections::BTreeSet<String>);
 
@@ -441,12 +434,12 @@ impl ApprovedTools {
         ApprovedTools::default()
     }
 
-    /// **RESUME: add an APPROVED gate's PER-EFFECT key to the set (§5.3 resume).** After this, a
-    /// re-run of the pipeline passes step 6 for exactly that `(tool, object)` effect — never for a
-    /// sibling sharing the tool name. Refused (a no-op, returns `false`) if the gate is NOT approved
-    /// (a Rejected/Expired/Waiting gate NEVER threads its key into `approved` — the effect is never
-    /// applied, AG-8). Idempotent: re-admitting an approved gate is a no-op (a double-click is one
-    /// approval — the set is the truth, not the click count).
+    /// **RESUME: add an APPROVED gate's PER-EFFECT key to the set.** After this, a re-run of the
+    /// pipeline passes step 6 for exactly that `(tool, object)` effect — never for a sibling sharing
+    /// the tool name. Refused (a no-op, returns `false`) if the gate is NOT approved (a
+    /// Rejected/Expired/Waiting gate NEVER threads its key into `approved` — the effect is never
+    /// applied). Idempotent: re-admitting an approved gate is a no-op (a double-click is one approval
+    /// — the set is the truth, not the click count).
     pub fn admit(&mut self, gate: &HitlGate) -> bool {
         if !gate.is_approved() {
             return false;
@@ -479,32 +472,31 @@ impl ApprovedTools {
 
 // ───────────────────────── the end-to-end withhold→surface→resume loop driver ────────────────────
 
-/// **The outcome of the full withhold → surface → resume loop for one gated effect (§5.3).** Either
-/// the effect was APPROVED (the tool admitted to `approved`; the caller re-runs the pipeline → applies)
-/// or it was HALTED (rejected/expired → settles [`Halted`]; 0 mutation, AG-8).
+/// **The outcome of the full withhold → surface → resume loop for one gated effect.** Either the
+/// effect was APPROVED (the tool admitted to `approved`; the caller re-runs the pipeline → applies)
+/// or it was HALTED (rejected/expired → settles [`Halted`]; 0 mutation).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HitlOutcome {
     /// the gate was APPROVED — the tool is now in the run's [`ApprovedTools`]; the caller re-runs the
     /// pipeline step (which now passes step 6 → applies). Carries the approved gate.
     Approved(HitlGate),
     /// the gate was HALTED (rejected or expired) — settles [`Halted`]; the effect is never applied
-    /// (0 mutation, AG-8). Carries the halt settlement (the reason recorded in the trace + audit).
+    /// (0 mutation). Carries the halt settlement (the reason recorded in the trace + audit).
     Halted(Halted),
 }
 
-/// **Drive the withhold → surface → resume loop for ONE gated effect (§5.3, the AG-D5 withhold/resume
-/// leg).** Given the `Gated` verdict's [`GateId`], the [`PlannedEffect`], the approver set, and the
-/// durable-wait + approved-set seams:
+/// **Drive the withhold → surface → resume loop for ONE gated effect.** Given the `Gated` verdict's
+/// [`GateId`], the [`PlannedEffect`], the approver set, and the durable-wait + approved-set seams:
 ///
 /// 1. **WITHHOLD → OPEN** a `Waiting` gate ([`HitlGate::open`]) — 0 mutation.
 /// 2. **SURFACE** the card ([`surface_card`]) — the durable wait emits `agent.approval.requested`
-///    (9.4) carrying the card.
+///    carrying the card.
 /// 3. **DECIDE** — park on the durable wait ([`HitlWait::park_and_wait`]); the run holds no runtime
 ///    until a human decides (days later).
 /// 4. **RESUME** — on `Approve`, transition the gate `→ Approved` + admit the tool to `approved`
 ///    ([`ApprovedTools::admit`]) so a re-run applies the effect → [`HitlOutcome::Approved`]; on
 ///    `Reject`/`Expired`, transition `→ Rejected`/`Expired` + settle [`Halted`] → [`HitlOutcome::Halted`]
-///    (0 mutation, AG-8).
+///    (0 mutation).
 ///
 /// **The 0-mutation-pre-approval guarantee:** this driver NEVER applies the effect — it only opens the
 /// gate + threads the decision. The apply happens ONLY when the caller re-runs
@@ -532,7 +524,7 @@ pub fn run_hitl_loop<W: HitlWait>(
         card_ref,
     );
 
-    // 2 + 3. SURFACE + DECIDE — park on the durable wait (9.4); the run holds NO runtime until a
+    // 2 + 3. SURFACE + DECIDE — park on the durable wait; the run holds NO runtime until a
     //        human decides (days later). `surface_card` is the card the wait emits.
     let _card = surface_card(&gate);
     let decision = wait.park_and_wait(&gate);
@@ -559,7 +551,7 @@ pub fn run_hitl_loop<W: HitlWait>(
     }
 }
 
-// ───────────────────────── R2.4: HitlGate persistence over agent_hitl_gate ───────────────────────
+// ───────────────────────── HitlGate persistence over agent_hitl_gate ───────────────────────
 
 use myelin_storage::hitl_gate_durable::{
     GateDecideError, GateOpenError, GateRecord, GateState as DurableGateState, HitlVerdictStore,
@@ -567,7 +559,7 @@ use myelin_storage::hitl_gate_durable::{
 use myelin_storage::TenantScope;
 
 impl HitlGate {
-    /// **Project this gate onto the durable `agent_hitl_gate` row shape (R2.4).** The `effect_id`
+    /// **Project this gate onto the durable `agent_hitl_gate` row shape.** The `effect_id`
     /// is the PER-EFFECT key ([`crate::effect_api::effect_gate_key_str`]) — the same key the step-6
     /// consult and [`ApprovedTools::admit`] use, so the durable verdict and the in-run approval are
     /// keyed identically by construction. `requested_by` is the agent principal whose effect
@@ -583,7 +575,7 @@ impl HitlGate {
             run_id: self.run_id.clone(),
             effect_id: crate::effect_api::effect_gate_key_str(&self.tool_name, &self.object.0),
             // The humanised SLOT serialized as bytes (references-not-payloads: template key +
-            // ArtifactRef args, never inline PII; the DEK envelope is the storage layer's, 11.4).
+            // ArtifactRef args, never inline PII; the DEK envelope is the storage layer's).
             risk_summary: serde_json::to_vec(&serde_json::json!({
                 "template_key": self.risk_summary.template_key,
                 "args": self
@@ -619,7 +611,7 @@ impl HitlGate {
     }
 }
 
-/// **WITHHOLD → PERSIST: INSERT the pending gate row (R2.4 — the durable server-side gate).** A
+/// **WITHHOLD → PERSIST: INSERT the pending gate row (the durable server-side gate).** A
 /// freshly opened `Waiting` [`HitlGate`] becomes an `agent_hitl_gate` row lookup-able by its
 /// `gate_id` across requests/processes; the later decision UPDATEs it via
 /// [`persist_gate_decision`] (or directly through the store's approve/reject/expire, which enforce
@@ -633,14 +625,14 @@ pub fn persist_gate_open(
     store.open(scope, gate.to_gate_record(requested_by))
 }
 
-/// **RESUME → PERSIST: UPDATE the durable row to this gate's decided state (R2.4 / R2.4b).**
+/// **RESUME → PERSIST: UPDATE the durable row to this gate's decided state.**
 /// Dispatches on the in-process state machine's terminal state: `Approved` records `decided_by` and
-/// the store re-enforces the full rule — **the approver must be a `Human` principal** (R2.4b), be
-/// eligible, and be distinct from the requester (a machine/self approval refuses even here);
-/// `Rejected` records the decider; `Expired` records none. The `decided_by` is the AUTHENTICATED
-/// approver `Principal` (its `kind` is the human check, its id is what is persisted). A
-/// still-`Waiting` gate has no decision to persist — refused typed (`NotFound`), with a
-/// debug-assert naming the caller bug loudly in dev.
+/// the store re-enforces the full rule — **the approver must be a `Human` principal**, be eligible,
+/// and be distinct from the requester (a machine/self approval refuses even here); `Rejected` records
+/// the decider; `Expired` records none. The `decided_by` is the AUTHENTICATED approver `Principal`
+/// (its `kind` is the human check, its id is what is persisted). A still-`Waiting` gate has no
+/// decision to persist — refused typed (`NotFound`), with a debug-assert naming the caller bug loudly
+/// in dev.
 pub fn persist_gate_decision(
     store: &mut HitlVerdictStore,
     scope: &TenantScope,
