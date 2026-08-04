@@ -79,7 +79,9 @@ use myelin_git::agent_author as git_author;
 use myelin_git::code_tools as git_code;
 use myelin_git::rebac_fragment::object_types as git_objects;
 
-use crate::defaults::{assert_no_silent_loosening, seed_requires_approval, LooseningViolation};
+use crate::defaults::{
+    cap, mutate_tool_def, register_tool_defs, seed_requires_approval, LooseningViolation,
+};
 
 // ───────────────────────── the frozen Git producer-tool identity (the §6.3 keys) ─────────────────
 
@@ -108,7 +110,7 @@ pub const GIT_TOOL_VERSION: u32 = 1;
 /// the EffectApi `check` step (4.2) resolves. Built from the canonical `myelin-git` constants so a
 /// rename in the fragment is a compile-or-test break here, never a silent drift.
 pub fn git_merge_required_caps() -> Vec<String> {
-    vec![format!("{}.merge", git_objects::PULL_REQUEST)]
+    cap(git_objects::PULL_REQUEST, "merge")
 }
 
 /// **The `required_caps` for `open_pr` (CONSUMED from 4.9).** Opening a PR pushes a branch + creates
@@ -116,7 +118,7 @@ pub fn git_merge_required_caps() -> Vec<String> {
 /// ([`repo_fragment`](myelin_git::rebac_fragment::repo_fragment): `push = writer + admin +
 /// parent_project->write`). Reversible (the PR can be closed), hence NOT gated (§6.3).
 pub fn open_pr_required_caps() -> Vec<String> {
-    vec![format!("{}.push", git_objects::REPO)]
+    cap(git_objects::REPO, "push")
 }
 
 // ───────────────────────── the two Git producer ToolDefs (8.1 — the OWNED registration) ───────────
@@ -131,20 +133,15 @@ pub fn open_pr_required_caps() -> Vec<String> {
 /// - `required_caps = [pull_request.merge]` (4.9) — the cap the EffectApi `check` step enforces.
 /// - `exposed_over_mcp = false` — internal-loop only at v1 (the external MCP endpoint is AG-P25).
 pub fn git_merge_tool_def() -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(GIT_MERGE_TOOL.to_string()),
-        subsystem: GIT_SUBSYSTEM.to_string(),
-        version: GIT_TOOL_VERSION,
-        // The merge input the Git public endpoint validates (the PR ref + the merge strategy). An
-        // opaque-string JSON-Schema carrier at this seam (the rich schema is Git's endpoint's).
-        input_schema: r#"{"type":"object","required":["pull_request"],"properties":{"pull_request":{"type":"string"},"strategy":{"type":"string","enum":["merge","squash","rebase"]}}}"#.to_string(),
-        required_caps: git_merge_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (the value here is overwritten by seed_requires_approval → true).
-        requires_approval: true,
-        exposed_over_mcp: false,
-    })
+    // The merge input the Git public endpoint validates (the PR ref + the merge strategy). An
+    // opaque-string JSON-Schema carrier at this seam (the rich schema is Git's endpoint's).
+    mutate_tool_def(
+        GIT_SUBSYSTEM,
+        GIT_MERGE_TOOL,
+        GIT_TOOL_VERSION,
+        r#"{"type":"object","required":["pull_request"],"properties":{"pull_request":{"type":"string"},"strategy":{"type":"string","enum":["merge","squash","rebase"]}}}"#,
+        git_merge_required_caps(),
+    )
 }
 
 /// **The `open_pr` ToolDef (8.1) — the reversible, NON-gated Git producer tool (§6.3).**
@@ -156,18 +153,13 @@ pub fn git_merge_tool_def() -> ToolDef {
 /// - `required_caps = [repo.push]` (4.9).
 /// - `exposed_over_mcp = false` — internal-loop only at v1.
 pub fn open_pr_tool_def() -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(OPEN_PR_TOOL.to_string()),
-        subsystem: GIT_SUBSYSTEM.to_string(),
-        version: GIT_TOOL_VERSION,
-        input_schema: r#"{"type":"object","required":["repo","source_ref","target_ref"],"properties":{"repo":{"type":"string"},"source_ref":{"type":"string"},"target_ref":{"type":"string"},"title":{"type":"string"}}}"#.to_string(),
-        required_caps: open_pr_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (the value here is overwritten by seed_requires_approval → false).
-        requires_approval: false,
-        exposed_over_mcp: false,
-    })
+    mutate_tool_def(
+        GIT_SUBSYSTEM,
+        OPEN_PR_TOOL,
+        GIT_TOOL_VERSION,
+        r#"{"type":"object","required":["repo","source_ref","target_ref"],"properties":{"repo":{"type":"string"},"source_ref":{"type":"string"},"target_ref":{"type":"string"},"title":{"type":"string"}}}"#,
+        open_pr_required_caps(),
+    )
 }
 
 // ───────────────── the CODE-EXECUTING Git producer ToolDefs (GIT-P27 → P-283, M3-G6) ─────────────
@@ -194,20 +186,15 @@ pub fn open_pr_tool_def() -> ToolDef {
 ///   here, never a silent drift).
 /// - `exposed_over_mcp = false` — GF-9 floor (the external MCP server + threat model is GIT-P33/P6).
 pub fn git_history_rewrite_tool_def() -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(git_code::HISTORY_REWRITE_TOOL.to_string()),
-        subsystem: git_code::GIT_SUBSYSTEM.to_string(),
-        version: git_code::GIT_CODE_TOOL_VERSION,
-        // The rewrite input the Git audited op validates (the repo + the target refs + the opaque
-        // reason code — never the leaked content). An opaque-string JSON-Schema carrier at this seam.
-        input_schema: r#"{"type":"object","required":["repo","target_refs","reason_code"],"properties":{"repo":{"type":"string"},"target_refs":{"type":"array","items":{"type":"string"}},"reason_code":{"type":"string"}}}"#.to_string(),
-        required_caps: git_code::history_rewrite_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (fail-closed default `true` for this unnamed consequential op).
-        requires_approval: true,
-        exposed_over_mcp: false,
-    })
+    // The rewrite input the Git audited op validates (the repo + the target refs + the opaque reason
+    // code — never the leaked content). An opaque-string JSON-Schema carrier at this seam.
+    mutate_tool_def(
+        git_code::GIT_SUBSYSTEM,
+        git_code::HISTORY_REWRITE_TOOL,
+        git_code::GIT_CODE_TOOL_VERSION,
+        r#"{"type":"object","required":["repo","target_refs","reason_code"],"properties":{"repo":{"type":"string"},"target_refs":{"type":"array","items":{"type":"string"}},"reason_code":{"type":"string"}}}"#,
+        git_code::history_rewrite_required_caps(),
+    )
 }
 
 /// **The `git.scip_index` ToolDef (8.1 / §7) — the SCIP-indexing COMPUTE tool on the unified sandbox.**
@@ -257,18 +244,13 @@ pub fn git_scip_index_tool_def() -> ToolDef {
 /// `requires_approval` SEEDED from the frozen §6.3 default (`false` — reversible). `exposed_over_mcp =
 /// false` (internal-loop only at v1; the external MCP endpoint is the post-M5 follow-on AG-P25).
 fn git_author_tool_def(name: &str, input_schema: &str) -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(name.to_string()),
-        subsystem: GIT_SUBSYSTEM.to_string(),
-        version: git_author::GIT_AUTHOR_TOOL_VERSION,
-        input_schema: input_schema.to_string(),
-        required_caps: git_author::review_authoring_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (a reversible authoring tool is NOT gated).
-        requires_approval: false,
-        exposed_over_mcp: false,
-    })
+    mutate_tool_def(
+        GIT_SUBSYSTEM,
+        name,
+        git_author::GIT_AUTHOR_TOOL_VERSION,
+        input_schema,
+        git_author::review_authoring_required_caps(),
+    )
 }
 
 /// **`git.comment` (8.1 / §7)** — an agent posts an inline/thread comment (agent legibly labelled).
@@ -355,22 +337,13 @@ pub fn git_tool_defs() -> Vec<ToolDef> {
 pub fn register_git_tools<S: ToolSurface>(
     surface: &mut S,
 ) -> Result<Vec<ToolDef>, LooseningViolation> {
-    let defs = git_tool_defs();
-    // The guard runs with NO deviations (the strict default): the seeded defs always pass; a
-    // hand-loosened def would be rejected LOUD here.
-    for def in &defs {
-        assert_no_silent_loosening(def, &[])?;
-    }
-    for def in &defs {
-        surface.register_tool(def.clone());
-    }
-    Ok(defs)
+    register_tool_defs(surface, git_tool_defs())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defaults::requires_approval_default;
+    use crate::defaults::{assert_no_silent_loosening, requires_approval_default};
 
     /// A `ToolSurface` over a fixed catalogue (the §4.2 in-memory registry — the same shape the
     /// EffectApi CDC uses). The ONE catalogue both producer tools register into.

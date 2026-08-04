@@ -53,11 +53,11 @@
 //!   next prompt (AG-P21), not this one. Cross-reference stated.
 //! - **The external MCP ENDPOINT** is the post-M5 follow-on (AG-P25); not MCP-exposed at v1.
 
-use myelin_agent::{EffectKind, ToolDef, ToolName, ToolSurface};
+use myelin_agent::{ToolDef, ToolSurface};
 use myelin_identity_service::ci_fragment::object_types as ci_objects;
 use myelin_identity_service::ci_fragment::{ADMINISTER, DEPLOY, TRIGGER};
 
-use crate::defaults::{assert_no_silent_loosening, seed_requires_approval, LooseningViolation};
+use crate::defaults::{cap, mutate_tool_def, register_tool_defs, LooseningViolation};
 
 // ───────────────────────── the frozen CI consumer-tool identity (the §6.3 keys) ──────────────────
 
@@ -95,7 +95,7 @@ pub const CI_TOOL_VERSION: u32 = 1;
 /// deployer ∪ parent_ci_project->administer`). Built from the canonical `myelin-identity-service`
 /// constants so a rename in the fragment is a compile-or-test break here, never a silent drift.
 pub fn deploy_required_caps() -> Vec<String> {
-    vec![format!("{}.{}", ci_objects::ENVIRONMENT, DEPLOY)]
+    cap(ci_objects::ENVIRONMENT, DEPLOY)
 }
 
 /// **The `required_caps` for `ci.write_secret` (CONSUMED from 4.9).** Managing a secret is a CI-project
@@ -104,14 +104,14 @@ pub fn deploy_required_caps() -> Vec<String> {
 /// admin`). A secret's READ is the separate DIRECT NARROW `secret.read` relation (CI-1) — never
 /// inherited; the WRITE is the project-admin gate.
 pub fn write_secret_required_caps() -> Vec<String> {
-    vec![format!("{}.{}", ci_objects::CI_PROJECT, ADMINISTER)]
+    cap(ci_objects::CI_PROJECT, ADMINISTER)
 }
 
 /// **The `required_caps` for `ci.run_pipeline` (CONSUMED from 4.9).** Triggering a (non-prod) pipeline
 /// run is governed by the `run.trigger` permission ([`run_fragment`](myelin_identity_service::ci_fragment::run_fragment):
 /// `trigger = parent_repo->push`). Cheap, reversible, metered → NOT gated.
 pub fn run_pipeline_required_caps() -> Vec<String> {
-    vec![format!("{}.{}", ci_objects::RUN, TRIGGER)]
+    cap(ci_objects::RUN, TRIGGER)
 }
 
 // ───────────────────────── the four CI consumer ToolDefs (8.1 — the OWNED registration) ───────────
@@ -124,53 +124,38 @@ pub fn run_pipeline_required_caps() -> Vec<String> {
 ///   6 WITHHOLDS (`Gated`) until the HITL resume (AG-P9). A deploy NEVER applies before approval.
 /// - `required_caps = [environment.deploy]` (4.9). `exposed_over_mcp = false` (AG-P25).
 pub fn deploy_tool_def() -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(DEPLOY_TOOL.to_string()),
-        subsystem: CI_SUBSYSTEM.to_string(),
-        version: CI_TOOL_VERSION,
-        input_schema: r#"{"type":"object","required":["environment","artifact"],"properties":{"environment":{"type":"string"},"artifact":{"type":"string"}}}"#.to_string(),
-        required_caps: deploy_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (a protected-env deploy is gated → true).
-        requires_approval: true,
-        exposed_over_mcp: false,
-    })
+    mutate_tool_def(
+        CI_SUBSYSTEM,
+        DEPLOY_TOOL,
+        CI_TOOL_VERSION,
+        r#"{"type":"object","required":["environment","artifact"],"properties":{"environment":{"type":"string"},"artifact":{"type":"string"}}}"#,
+        deploy_required_caps(),
+    )
 }
 
 /// **The `ci.approve_deploy` ToolDef (8.1) — the privileged, HITL-GATED deploy approval (§6.3).** Gated
 /// identically to `deploy` (`yes`), `required_caps = [environment.deploy]` (4.9).
 pub fn approve_deploy_tool_def() -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(APPROVE_DEPLOY_TOOL.to_string()),
-        subsystem: CI_SUBSYSTEM.to_string(),
-        version: CI_TOOL_VERSION,
-        input_schema: r#"{"type":"object","required":["deployment"],"properties":{"deployment":{"type":"string"}}}"#.to_string(),
-        required_caps: deploy_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (a deploy approval is gated → true).
-        requires_approval: true,
-        exposed_over_mcp: false,
-    })
+    mutate_tool_def(
+        CI_SUBSYSTEM,
+        APPROVE_DEPLOY_TOOL,
+        CI_TOOL_VERSION,
+        r#"{"type":"object","required":["deployment"],"properties":{"deployment":{"type":"string"}}}"#,
+        deploy_required_caps(),
+    )
 }
 
 /// **The `ci.write_secret` ToolDef (8.1) — the privileged, HITL-GATED secret write (§6.3).** Gated
 /// identically (`yes`), `required_caps = [ci_project.administer]` (4.9 — a secret WRITE is a
 /// project-admin op; the secret READ is the separate DIRECT NARROW relation, CI-1).
 pub fn write_secret_tool_def() -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(WRITE_SECRET_TOOL.to_string()),
-        subsystem: CI_SUBSYSTEM.to_string(),
-        version: CI_TOOL_VERSION,
-        input_schema: r#"{"type":"object","required":["ci_project","name"],"properties":{"ci_project":{"type":"string"},"name":{"type":"string"},"value_ref":{"type":"string"}}}"#.to_string(),
-        required_caps: write_secret_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (a secret write is privileged → gated → true).
-        requires_approval: true,
-        exposed_over_mcp: false,
-    })
+    mutate_tool_def(
+        CI_SUBSYSTEM,
+        WRITE_SECRET_TOOL,
+        CI_TOOL_VERSION,
+        r#"{"type":"object","required":["ci_project","name"],"properties":{"ci_project":{"type":"string"},"name":{"type":"string"},"value_ref":{"type":"string"}}}"#,
+        write_secret_required_caps(),
+    )
 }
 
 /// **The `ci.run_pipeline` ToolDef (8.1) — the non-prod, NON-gated pipeline trigger (§6.3).**
@@ -181,18 +166,13 @@ pub fn write_secret_tool_def() -> ToolDef {
 ///   — non-prod runs are cheap, reversible, metered. Applies DIRECTLY (no HITL gate).
 /// - `required_caps = [run.trigger]` (4.9). `exposed_over_mcp = false`.
 pub fn run_pipeline_tool_def() -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(RUN_PIPELINE_TOOL.to_string()),
-        subsystem: CI_SUBSYSTEM.to_string(),
-        version: CI_TOOL_VERSION,
-        input_schema: r#"{"type":"object","required":["ci_project","ref"],"properties":{"ci_project":{"type":"string"},"ref":{"type":"string"}}}"#.to_string(),
-        required_caps: run_pipeline_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (a non-prod pipeline run is NOT gated).
-        requires_approval: false,
-        exposed_over_mcp: false,
-    })
+    mutate_tool_def(
+        CI_SUBSYSTEM,
+        RUN_PIPELINE_TOOL,
+        CI_TOOL_VERSION,
+        r#"{"type":"object","required":["ci_project","ref"],"properties":{"ci_project":{"type":"string"},"ref":{"type":"string"}}}"#,
+        run_pipeline_required_caps(),
+    )
 }
 
 /// **The four CI consumer ToolDefs, in catalogue order (deploy → approve_deploy → write_secret →
@@ -218,20 +198,14 @@ pub fn ci_tool_defs() -> Vec<ToolDef> {
 pub fn register_ci_tools<S: ToolSurface>(
     surface: &mut S,
 ) -> Result<Vec<ToolDef>, LooseningViolation> {
-    let defs = ci_tool_defs();
-    for def in &defs {
-        assert_no_silent_loosening(def, &[])?;
-    }
-    for def in &defs {
-        surface.register_tool(def.clone());
-    }
-    Ok(defs)
+    register_tool_defs(surface, ci_tool_defs())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defaults::requires_approval_default;
+    use crate::defaults::{assert_no_silent_loosening, requires_approval_default};
+    use myelin_agent::{EffectKind, ToolName};
 
     struct Catalogue {
         defs: Vec<ToolDef>,

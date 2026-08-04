@@ -55,12 +55,12 @@
 //!   (AG-P25); the Issues tools are NOT MCP-exposed at v1 (`exposed_over_mcp = false`).
 
 use myelin_agent::{
-    BudgetView, EffectKind, ProposedEffect, StepOutcome, Submission, SystemContext, ToolCall,
-    ToolCallId, ToolDef, ToolName, ToolSchema, ToolSurface,
+    BudgetView, ProposedEffect, StepOutcome, Submission, SystemContext, ToolCall, ToolCallId,
+    ToolDef, ToolName, ToolSchema, ToolSurface,
 };
 use myelin_issues::rebac_fragment::object_types as issue_objects;
 
-use crate::defaults::{assert_no_silent_loosening, seed_requires_approval, LooseningViolation};
+use crate::defaults::{cap, mutate_tool_def, register_tool_defs, LooseningViolation};
 use crate::dry_run::proposed_effect_sequence;
 use crate::effect_api::{EffectCost, PlannedEffect};
 use crate::issues_tools::{issues_tool_defs, ISSUES_SUBSYSTEM, ISSUES_TOOL_VERSION};
@@ -91,7 +91,7 @@ pub const CLOSE_TOOL: &str = "close";
 /// permission on the parent project (arch §8 table: `issue.create` on project). Built from the
 /// canonical Issues object-type constant (a fragment rename breaks this, never a silent drift).
 pub fn create_required_caps() -> Vec<String> {
-    vec![format!("{}.create", issue_objects::ISSUE)]
+    cap(issue_objects::ISSUE, "create")
 }
 
 /// **The `required_caps` for the field-writing tools — update/comment/link/estimate/reorder/assign
@@ -99,20 +99,20 @@ pub fn create_required_caps() -> Vec<String> {
 /// canonical `issue.update` permission for the field/rank-writing tools (the assignment/transition
 /// edge is governed by the transition cap, declared by [`assign_required_caps`]).
 pub fn update_required_caps() -> Vec<String> {
-    vec![format!("{}.update", issue_objects::ISSUE)]
+    cap(issue_objects::ISSUE, "update")
 }
 
 /// **The `required_caps` for `comment` (4.9).** Arch §8: governed by `issue.comment` (the comment
 /// permission the frozen fragment declares: `comment = view`).
 pub fn comment_required_caps() -> Vec<String> {
-    vec![format!("{}.comment", issue_objects::ISSUE)]
+    cap(issue_objects::ISSUE, "comment")
 }
 
 /// **The `required_caps` for `assign` and `close` (4.9).** Arch §8 maps both to `issue.transition`
 /// (assignment/closing crosses a governed edge): `assign`/`close` are governed by the
 /// `issue.transition` permission a human holds (an agent may only assign/close where a human could).
 pub fn assign_required_caps() -> Vec<String> {
-    vec![format!("{}.transition", issue_objects::ISSUE)]
+    cap(issue_objects::ISSUE, "transition")
 }
 
 // ───────────────────────── the human/CLI CRUD ToolDefs (8.1 — the FULL arch-§8 catalogue) ─────────
@@ -121,18 +121,7 @@ pub fn assign_required_caps() -> Vec<String> {
 /// plan-then-apply pipeline (cap-checked, metered, audited) and whose `requires_approval` is SEEDED
 /// from the frozen §6.3 default. The CRUD tools are reversible → NOT gated (suggest-by-default).
 fn crud_tool_def(name: &str, caps: Vec<String>, input_schema: &str) -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(name.to_string()),
-        subsystem: ISSUES_SUBSYSTEM.to_string(),
-        version: ISSUES_TOOL_VERSION,
-        input_schema: input_schema.to_string(),
-        required_caps: caps,
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 — the value passed here is overwritten by the frozen default.
-        requires_approval: false,
-        exposed_over_mcp: false,
-    })
+    mutate_tool_def(ISSUES_SUBSYSTEM, name, ISSUES_TOOL_VERSION, input_schema, caps)
 }
 
 /// **`issues.create` (8.1 / arch §8) — create an issue (reversible, NOT gated).**
@@ -246,14 +235,7 @@ pub fn full_issues_tool_defs() -> Vec<ToolDef> {
 pub fn register_full_issues_tools<S: ToolSurface>(
     surface: &mut S,
 ) -> Result<Vec<ToolDef>, LooseningViolation> {
-    let defs = full_issues_tool_defs();
-    for def in &defs {
-        assert_no_silent_loosening(def, &[])?;
-    }
-    for def in &defs {
-        surface.register_tool(def.clone());
-    }
-    Ok(defs)
+    register_tool_defs(surface, full_issues_tool_defs())
 }
 
 // ───────────────────────── the LINEAR forecast (the named R-5 floor) ─────────────────────────────
@@ -444,7 +426,8 @@ pub fn replay_forecast_agent(input: &ForecastInput) -> crate::mock::ReplayRecord
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defaults::requires_approval_default;
+    use crate::defaults::{assert_no_silent_loosening, requires_approval_default};
+    use myelin_agent::EffectKind;
 
     /// A `ToolSurface` over a fixed catalogue (the §4.2 in-memory registry).
     struct Catalogue {

@@ -42,7 +42,7 @@
 //!   `requires_approval`, not the MCP exposure path.
 //! - **No other floor.** The seed is the frozen table; the guard is the live VISION §3 rule.
 
-use myelin_agent::{ToolDef, ToolName};
+use myelin_agent::{EffectKind, ToolDef, ToolName, ToolSurface};
 
 // ───────────────────────── the frozen §6.3 default (the seed source of truth) ────────────────────
 
@@ -171,6 +171,69 @@ pub fn requires_approval_for_landing(
 pub fn seed_requires_approval(mut def: ToolDef) -> ToolDef {
     def.requires_approval = requires_approval_default(&def.subsystem, &def.name.0);
     def
+}
+
+// ───────────────────────── the shared producer/consumer ToolDef builder (8.1) ─────────────────────
+
+/// **Build a governed `Mutate` [`ToolDef`] with its `requires_approval` SEEDED from the frozen §6.3
+/// table — the ONE builder every subsystem's producer/consumer Mutate tool is a row of (8.1).** Every
+/// side-effecting agent tool across Git / Knowledge / Issues / CI / Chat is this SAME shape: a
+/// `mutate` effect that routes through [`EffectApi`](myelin_agent::EffectApi) (plan-then-apply),
+/// `side_effecting = true`, NOT MCP-exposed at v1, and a gate that is NOT hand-set — it is stamped
+/// from the frozen table by [`seed_requires_approval`]. The subsystem file supplies only the DATA that
+/// varies: the `(subsystem, name, version, input_schema, required_caps)` row. (A non-Mutate outlier —
+/// the `git.scip_index` `Compute` tool — stays hand-written; it is not a row of this table.)
+pub fn mutate_tool_def(
+    subsystem: &str,
+    name: &str,
+    version: u32,
+    input_schema: &str,
+    required_caps: Vec<String>,
+) -> ToolDef {
+    seed_requires_approval(ToolDef {
+        name: ToolName(name.to_string()),
+        subsystem: subsystem.to_string(),
+        version,
+        input_schema: input_schema.to_string(),
+        required_caps,
+        effect_kind: EffectKind::Mutate,
+        side_effecting: true,
+        // Placeholder — seed_requires_approval OWNS this column (stamps the frozen §6.3 default).
+        requires_approval: false,
+        exposed_over_mcp: false,
+    })
+}
+
+/// **Build the singleton `required_caps` fragment `"<object_type>.<permission>"` (4.9).** The ReBAC
+/// cap-string shape the EffectApi `check` step (4.2) resolves. Consolidates the `format!("{}.{}", …)`
+/// every subsystem's per-tool cap fn repeated; the object-type + permission halves stay the canonical
+/// ReBAC-fragment constants at the call site (a fragment rename is a compile/test break, never a
+/// silent drift).
+pub fn cap(object_type: &str, permission: &str) -> Vec<String> {
+    vec![format!("{object_type}.{permission}")]
+}
+
+// ───────────────────────── the shared registration seam (8.1 — into the ONE ToolSurface) ──────────
+
+/// **Register a subsystem's ToolDefs into the ONE [`ToolSurface`] (8.1 / §6.1) — the ONE registration
+/// body every subsystem shares.** Each def is passed through the VISION §3 no-silent-loosening guard
+/// FIRST ([`assert_no_silent_loosening`]): a registration that tried to flip a frozen `yes → no`
+/// WITHOUT a written deviation is REJECTED LOUD (`Err`), never silently un-gated. The seeded defs
+/// always admit — the guard is the structural ratchet, not a runtime branch. Returns the registered
+/// defs on success (so the caller can assert the catalogue), or the first [`LooseningViolation`].
+pub fn register_tool_defs<S: ToolSurface>(
+    surface: &mut S,
+    defs: Vec<ToolDef>,
+) -> Result<Vec<ToolDef>, LooseningViolation> {
+    // The guard runs with NO deviations (the strict default): the seeded defs always pass; a
+    // hand-loosened def would be rejected LOUD here.
+    for def in &defs {
+        assert_no_silent_loosening(def, &[])?;
+    }
+    for def in &defs {
+        surface.register_tool(def.clone());
+    }
+    Ok(defs)
 }
 
 // ───────────────────────── the no-silent-loosening guard (VISION §3) ─────────────────────────────

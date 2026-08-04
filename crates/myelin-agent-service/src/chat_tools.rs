@@ -54,12 +54,11 @@
 //!   [`crate::dispatch`]). Stated as the defensible posture.
 //! - **The external MCP ENDPOINT** is the post-M5 follow-on (AG-P25); not MCP-exposed at v1.
 
-use myelin_agent::{EffectKind, ToolDef, ToolName, ToolSurface};
+use myelin_agent::{ToolDef, ToolSurface};
 use myelin_chat::rebac_fragment::object_types as chat_objects;
 
 use crate::defaults::{
-    assert_no_silent_loosening, requires_approval_for_landing, seed_requires_approval,
-    LooseningViolation,
+    cap, mutate_tool_def, register_tool_defs, requires_approval_for_landing, LooseningViolation,
 };
 
 // ───────────────────────── the frozen Chat consumer-tool identity (the §6.3 keys) ────────────────
@@ -89,7 +88,7 @@ pub const CHAT_TOOL_VERSION: u32 = 1;
 /// object-type constant so a rename in the fragment is a compile-or-test break here, never a silent
 /// drift.
 pub fn post_required_caps() -> Vec<String> {
-    vec![format!("{}.post", chat_objects::CHANNEL)]
+    cap(chat_objects::CHANNEL, "post")
 }
 
 // ───────────────────────── the two Chat consumer ToolDefs (8.1 — the OWNED registration) ──────────
@@ -98,18 +97,13 @@ pub fn post_required_caps() -> Vec<String> {
 /// through the plan-then-apply path (cap-checked, metered) but is NOT HITL-gated (reversible/cheap,
 /// §6.3 → `requires_approval = no`, seeded). `required_caps = [channel.post]` (4.9).
 fn chat_tool_def(name: &str, input_schema: &str) -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(name.to_string()),
-        subsystem: CHAT_SUBSYSTEM.to_string(),
-        version: CHAT_TOOL_VERSION,
-        input_schema: input_schema.to_string(),
-        required_caps: post_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (a reversible chat action is NOT gated).
-        requires_approval: false,
-        exposed_over_mcp: false,
-    })
+    mutate_tool_def(
+        CHAT_SUBSYSTEM,
+        name,
+        CHAT_TOOL_VERSION,
+        input_schema,
+        post_required_caps(),
+    )
 }
 
 /// **The `chat.post_message` ToolDef (8.1) — the reversible, NON-gated Chat producer tool (§6.3).** An
@@ -160,20 +154,14 @@ pub fn chat_tool_defs() -> Vec<ToolDef> {
 pub fn register_chat_tools<S: ToolSurface>(
     surface: &mut S,
 ) -> Result<Vec<ToolDef>, LooseningViolation> {
-    let defs = chat_tool_defs();
-    for def in &defs {
-        assert_no_silent_loosening(def, &[])?;
-    }
-    for def in &defs {
-        surface.register_tool(def.clone());
-    }
-    Ok(defs)
+    register_tool_defs(surface, chat_tool_defs())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::defaults::requires_approval_default;
+    use myelin_agent::{EffectKind, ToolName};
 
     struct Catalogue {
         defs: Vec<ToolDef>,

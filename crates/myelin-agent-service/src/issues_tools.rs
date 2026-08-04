@@ -62,12 +62,12 @@
 //! - **The external MCP ENDPOINT** (auth + the agent-lane rate-limit) is the post-M5 follow-on
 //!   (AG-P25); these consumer tools are NOT MCP-exposed at v1 (`exposed_over_mcp = false`).
 
-use myelin_agent::{EffectKind, ToolDef, ToolName, ToolSurface};
+use myelin_agent::{ToolDef, ToolSurface};
 use myelin_identity::{CaveatContext, TransitionId};
 use myelin_issues::rebac_fragment::object_types as issue_objects;
 use myelin_tenancy::ArtifactRef;
 
-use crate::defaults::{assert_no_silent_loosening, seed_requires_approval, LooseningViolation};
+use crate::defaults::{cap, mutate_tool_def, register_tool_defs, LooseningViolation};
 
 // ───────────────────────── the frozen Issues consumer-tool identity (the §6.3 keys) ──────────────
 
@@ -106,7 +106,7 @@ pub const ISSUES_TOOL_VERSION: u32 = 1;
 /// from the canonical `myelin-issues` object-type constant so a rename in the fragment is a
 /// compile-or-test break here, never a silent drift.
 pub fn advisory_required_caps() -> Vec<String> {
-    vec![format!("{}.transition", issue_objects::ISSUE)]
+    cap(issue_objects::ISSUE, "transition")
 }
 
 /// **The `required_caps` for `issues.transition` (CONSUMED from 4.9).** Performing the SLA-bound,
@@ -116,10 +116,7 @@ pub fn advisory_required_caps() -> Vec<String> {
 /// `perform_transition = parent_issue->transition` + the approver-role caveat at check-time). The cap
 /// the EffectApi `check` step (4.2) resolves under the [`CaveatContext`].
 pub fn transition_required_caps() -> Vec<String> {
-    vec![format!(
-        "{}.perform_transition",
-        issue_objects::ISSUE_TRANSITION
-    )]
+    cap(issue_objects::ISSUE_TRANSITION, "perform_transition")
 }
 
 // ───────────────────────── the four Issues consumer ToolDefs (8.1 — the OWNED registration) ───────
@@ -129,18 +126,13 @@ pub fn transition_required_caps() -> Vec<String> {
 /// but is NOT HITL-gated (suggest-by-default, §6.3 → `requires_approval = no`, seeded). `required_caps
 /// = [issue.transition]` (4.9 — an agent may only suggest a transition it could perform).
 fn advisory_tool_def(name: &str, input_schema: &str) -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(name.to_string()),
-        subsystem: ISSUES_SUBSYSTEM.to_string(),
-        version: ISSUES_TOOL_VERSION,
-        input_schema: input_schema.to_string(),
-        required_caps: advisory_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (a reversible advisory tool is NOT gated).
-        requires_approval: false,
-        exposed_over_mcp: false,
-    })
+    mutate_tool_def(
+        ISSUES_SUBSYSTEM,
+        name,
+        ISSUES_TOOL_VERSION,
+        input_schema,
+        advisory_required_caps(),
+    )
 }
 
 /// **The `issues.forecast` ToolDef (8.1) — the advisory, NON-gated forecast suggestion (§6.3).** The
@@ -183,20 +175,15 @@ pub fn sla_draft_tool_def() -> ToolDef {
 ///   step enforces under the [`CaveatContext`].
 /// - `exposed_over_mcp = false` — internal-loop only at v1 (the external MCP endpoint is AG-P25).
 pub fn transition_tool_def() -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(TRANSITION_TOOL.to_string()),
-        subsystem: ISSUES_SUBSYSTEM.to_string(),
-        version: ISSUES_TOOL_VERSION,
-        // The transition input the Issues public endpoint validates (the issue ref + the target state
-        // + the optional approver basis). An opaque-string JSON-Schema carrier at this seam.
-        input_schema: r#"{"type":"object","required":["issue","to_state"],"properties":{"issue":{"type":"string"},"to_state":{"type":"string"},"approver":{"type":"string"}}}"#.to_string(),
-        required_caps: transition_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (the gated floor for the SLA-bound transition → true).
-        requires_approval: true,
-        exposed_over_mcp: false,
-    })
+    // The transition input the Issues public endpoint validates (the issue ref + the target state +
+    // the optional approver basis). An opaque-string JSON-Schema carrier at this seam.
+    mutate_tool_def(
+        ISSUES_SUBSYSTEM,
+        TRANSITION_TOOL,
+        ISSUES_TOOL_VERSION,
+        r#"{"type":"object","required":["issue","to_state"],"properties":{"issue":{"type":"string"},"to_state":{"type":"string"},"approver":{"type":"string"}}}"#,
+        transition_required_caps(),
+    )
 }
 
 // ───────────────────────── the transition-ABAC caveat carrier (§5.2 step 2, 4.2) ─────────────────
@@ -252,20 +239,14 @@ pub fn issues_tool_defs() -> Vec<ToolDef> {
 pub fn register_issues_tools<S: ToolSurface>(
     surface: &mut S,
 ) -> Result<Vec<ToolDef>, LooseningViolation> {
-    let defs = issues_tool_defs();
-    for def in &defs {
-        assert_no_silent_loosening(def, &[])?;
-    }
-    for def in &defs {
-        surface.register_tool(def.clone());
-    }
-    Ok(defs)
+    register_tool_defs(surface, issues_tool_defs())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defaults::requires_approval_default;
+    use crate::defaults::{assert_no_silent_loosening, requires_approval_default};
+    use myelin_agent::{EffectKind, ToolName};
 
     /// A `ToolSurface` over a fixed catalogue (the §4.2 in-memory registry). The ONE catalogue all
     /// four consumer tools register into.

@@ -66,11 +66,11 @@
 //! - **The external MCP ENDPOINT** (auth + the agent-lane rate-limit) is the post-M5 follow-on
 //!   (AG-P25); these producer tools are NOT MCP-exposed at v1 (`exposed_over_mcp = false`).
 
-use myelin_agent::{EffectKind, ToolDef, ToolName, ToolSurface};
+use myelin_agent::{ToolDef, ToolSurface};
 use myelin_content::rebac_fragment::object_types as kn_objects;
 use myelin_content::rebac_fragment::{COMMENT, DRAFT, EDIT, PUBLISH};
 
-use crate::defaults::{assert_no_silent_loosening, seed_requires_approval, LooseningViolation};
+use crate::defaults::{cap, mutate_tool_def, register_tool_defs, LooseningViolation};
 
 // ───────────────────────── the frozen KN producer-tool identity (the §6.3 keys) ──────────────────
 
@@ -110,25 +110,25 @@ pub const KNOWLEDGE_TOOL_VERSION: u32 = 1;
 /// from the canonical `myelin-content` constants so a rename in the carrier is a compile-or-test break
 /// here, never a silent drift (the KN parallel to git_tools sourcing from `myelin-git`).
 pub fn publish_required_caps() -> Vec<String> {
-    vec![format!("{}.{}", kn_objects::PAGE, PUBLISH)]
+    cap(kn_objects::PAGE, PUBLISH)
 }
 
 /// **The `required_caps` for `knowledge.edit_confidential` (CONSUMED from 4.9).** Editing a
 /// confidential page is governed by the `page.edit` write permission (4.9). Consequential → gated.
 pub fn edit_confidential_required_caps() -> Vec<String> {
-    vec![format!("{}.{}", kn_objects::PAGE, EDIT)]
+    cap(kn_objects::PAGE, EDIT)
 }
 
 /// **The `required_caps` for `knowledge.draft` (CONSUMED from 4.9).** Creating/updating a private
 /// draft is governed by the `page.draft` write permission (4.9). Reversible → NOT gated.
 pub fn draft_required_caps() -> Vec<String> {
-    vec![format!("{}.{}", kn_objects::PAGE, DRAFT)]
+    cap(kn_objects::PAGE, DRAFT)
 }
 
 /// **The `required_caps` for `knowledge.comment` (CONSUMED from 4.9).** Commenting on a page is
 /// governed by the `page.comment` write permission (4.9). Reversible → NOT gated.
 pub fn comment_required_caps() -> Vec<String> {
-    vec![format!("{}.{}", kn_objects::PAGE, COMMENT)]
+    cap(kn_objects::PAGE, COMMENT)
 }
 
 // ───────────────────────── the four KN producer ToolDefs (8.1 — the OWNED registration) ───────────
@@ -144,39 +144,29 @@ pub fn comment_required_caps() -> Vec<String> {
 /// - `required_caps = [page.publish]` (4.9) — the cap the EffectApi `check` step enforces.
 /// - `exposed_over_mcp = false` — internal-loop only at v1 (the external MCP endpoint is AG-P25).
 pub fn publish_tool_def() -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(PUBLISH_TOOL.to_string()),
-        subsystem: KNOWLEDGE_SUBSYSTEM.to_string(),
-        version: KNOWLEDGE_TOOL_VERSION,
-        // The publish input the KN public endpoint validates (the page ref + the approver-set basis).
-        // An opaque-string JSON-Schema carrier at this seam (the rich schema is KN's endpoint's).
-        input_schema: r#"{"type":"object","required":["page"],"properties":{"page":{"type":"string"},"space":{"type":"string"}}}"#.to_string(),
-        required_caps: publish_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (the value here is overwritten by seed_requires_approval → true).
-        requires_approval: true,
-        exposed_over_mcp: false,
-    })
+    // The publish input the KN public endpoint validates (the page ref + the approver-set basis). An
+    // opaque-string JSON-Schema carrier at this seam (the rich schema is KN's endpoint's).
+    mutate_tool_def(
+        KNOWLEDGE_SUBSYSTEM,
+        PUBLISH_TOOL,
+        KNOWLEDGE_TOOL_VERSION,
+        r#"{"type":"object","required":["page"],"properties":{"page":{"type":"string"},"space":{"type":"string"}}}"#,
+        publish_required_caps(),
+    )
 }
 
 /// **The `knowledge.edit_confidential` ToolDef (8.1) — the consequential, HITL-GATED confidential-edit
 /// producer tool (§6.3 `edit(confidential_page)`).** Gated identically to `publish` (`yes`),
 /// `required_caps = [page.edit]` (4.9). A confidential edit NEVER applies before approval.
 pub fn edit_confidential_tool_def() -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(EDIT_CONFIDENTIAL_TOOL.to_string()),
-        subsystem: KNOWLEDGE_SUBSYSTEM.to_string(),
-        version: KNOWLEDGE_TOOL_VERSION,
-        // The edit input: the page ref + the content delta (the rich block delta is KN's endpoint's).
-        input_schema: r#"{"type":"object","required":["page","blocks"],"properties":{"page":{"type":"string"},"blocks":{"type":"array"}}}"#.to_string(),
-        required_caps: edit_confidential_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (overwritten → true).
-        requires_approval: true,
-        exposed_over_mcp: false,
-    })
+    // The edit input: the page ref + the content delta (the rich block delta is KN's endpoint's).
+    mutate_tool_def(
+        KNOWLEDGE_SUBSYSTEM,
+        EDIT_CONFIDENTIAL_TOOL,
+        KNOWLEDGE_TOOL_VERSION,
+        r#"{"type":"object","required":["page","blocks"],"properties":{"page":{"type":"string"},"blocks":{"type":"array"}}}"#,
+        edit_confidential_required_caps(),
+    )
 }
 
 /// **The `knowledge.draft` ToolDef (8.1) — the reversible, NON-gated KN producer tool (§6.3).**
@@ -187,35 +177,25 @@ pub fn edit_confidential_tool_def() -> ToolDef {
 ///   so the pipeline applies it DIRECTLY (step 6 is a no-op; no gate).
 /// - `required_caps = [page.draft]` (4.9). `exposed_over_mcp = false`.
 pub fn draft_tool_def() -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(DRAFT_TOOL.to_string()),
-        subsystem: KNOWLEDGE_SUBSYSTEM.to_string(),
-        version: KNOWLEDGE_TOOL_VERSION,
-        input_schema: r#"{"type":"object","required":["space"],"properties":{"space":{"type":"string"},"title":{"type":"string"},"blocks":{"type":"array"}}}"#.to_string(),
-        required_caps: draft_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (overwritten → false).
-        requires_approval: false,
-        exposed_over_mcp: false,
-    })
+    mutate_tool_def(
+        KNOWLEDGE_SUBSYSTEM,
+        DRAFT_TOOL,
+        KNOWLEDGE_TOOL_VERSION,
+        r#"{"type":"object","required":["space"],"properties":{"space":{"type":"string"},"title":{"type":"string"},"blocks":{"type":"array"}}}"#,
+        draft_required_caps(),
+    )
 }
 
 /// **The `knowledge.comment` ToolDef (8.1) — the reversible, NON-gated KN producer tool (§6.3).**
 /// `required_caps = [page.comment]` (4.9). Applies DIRECTLY (no HITL gate).
 pub fn comment_tool_def() -> ToolDef {
-    seed_requires_approval(ToolDef {
-        name: ToolName(COMMENT_TOOL.to_string()),
-        subsystem: KNOWLEDGE_SUBSYSTEM.to_string(),
-        version: KNOWLEDGE_TOOL_VERSION,
-        input_schema: r#"{"type":"object","required":["page","body"],"properties":{"page":{"type":"string"},"body":{"type":"string"}}}"#.to_string(),
-        required_caps: comment_required_caps(),
-        effect_kind: EffectKind::Mutate,
-        side_effecting: true,
-        // SEEDED below from §6.3 (overwritten → false).
-        requires_approval: false,
-        exposed_over_mcp: false,
-    })
+    mutate_tool_def(
+        KNOWLEDGE_SUBSYSTEM,
+        COMMENT_TOOL,
+        KNOWLEDGE_TOOL_VERSION,
+        r#"{"type":"object","required":["page","body"],"properties":{"page":{"type":"string"},"body":{"type":"string"}}}"#,
+        comment_required_caps(),
+    )
 }
 
 /// **The four KN producer ToolDefs, in catalogue order (publish → edit_confidential → draft →
@@ -247,22 +227,14 @@ pub fn knowledge_tool_defs() -> Vec<ToolDef> {
 pub fn register_knowledge_tools<S: ToolSurface>(
     surface: &mut S,
 ) -> Result<Vec<ToolDef>, LooseningViolation> {
-    let defs = knowledge_tool_defs();
-    // The guard runs with NO deviations (the strict default): the seeded defs always pass; a
-    // hand-loosened def would be rejected LOUD here.
-    for def in &defs {
-        assert_no_silent_loosening(def, &[])?;
-    }
-    for def in &defs {
-        surface.register_tool(def.clone());
-    }
-    Ok(defs)
+    register_tool_defs(surface, knowledge_tool_defs())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defaults::requires_approval_default;
+    use crate::defaults::{assert_no_silent_loosening, requires_approval_default};
+    use myelin_agent::{EffectKind, ToolName};
 
     /// A `ToolSurface` over a fixed catalogue (the §4.2 in-memory registry — the same shape the
     /// EffectApi CDC uses). The ONE catalogue all four producer tools register into.
