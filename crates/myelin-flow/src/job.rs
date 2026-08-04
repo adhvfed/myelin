@@ -222,11 +222,6 @@ fn dispatch_spec_fingerprint(spec: &JobSpec, timeout_secs: Option<i64>) -> Strin
 }
 
 impl WfCtx {
-    fn job_divergence(&mut self, reason: String) -> WfError {
-        self.latch_divergence(reason.clone());
-        WfError::Nondeterministic(reason)
-    }
-
     /// Dispatch one job as a journaled, replay-safe activity without joining it. A replay returns
     /// the same handle and never calls the runner again.
     pub fn dispatch_job<R>(
@@ -283,7 +278,7 @@ impl WfCtx {
         )?;
 
         if !result.iter().any(|artifact| artifact == &dispatch_marker) {
-            return Err(self.job_divergence(format!(
+            return Err(self.diverge(format!(
                 "job dispatch journal at {dispatch_command_id} does not describe `{idem_token}`"
             )));
         }
@@ -292,7 +287,7 @@ impl WfCtx {
             .find(|artifact| artifact.0.starts_with(JOB_DISPATCH_SPEC_PREFIX));
         if let Some(recorded) = recorded_spec {
             if recorded != &spec_marker {
-                return Err(self.job_divergence(format!(
+                return Err(self.diverge(format!(
                     "job dispatch journal at {dispatch_command_id} changed kind, target, token, or timeout"
                 )));
             }
@@ -302,7 +297,7 @@ impl WfCtx {
                 || artifact.0.starts_with(JOB_DISPATCH_TIMEOUT_SECS_PREFIX)
         });
         if recorded_spec.is_some() != recorded_timeout.is_some() {
-            return Err(self.job_divergence(format!(
+            return Err(self.diverge(format!(
                 "job dispatch journal at {dispatch_command_id} has a partial v2 spec/timeout binding"
             )));
         }
@@ -317,7 +312,7 @@ impl WfCtx {
             // deadline/timeout or target tuple cannot be proven from the journal.
             (None, None) if recorded_spec.is_none() => {}
             _ => {
-                return Err(self.job_divergence(format!(
+                return Err(self.diverge(format!(
                     "job dispatch journal at {dispatch_command_id} changed timeout mode or duration"
                 )))
             }
@@ -328,7 +323,7 @@ impl WfCtx {
             .map(ToOwned::to_owned);
         let recorded_deadline = match recorded_deadline_text {
             Some(deadline) => Some(deadline.parse::<i64>().map_err(|_| {
-                self.job_divergence(format!(
+                self.diverge(format!(
                     "job dispatch journal at {dispatch_command_id} has a malformed deadline"
                 ))
             })?),
@@ -336,12 +331,12 @@ impl WfCtx {
         };
 
         if timeout_secs.is_some() && recorded_deadline.is_none() {
-            return Err(self.job_divergence(format!(
+            return Err(self.diverge(format!(
                 "timed job dispatch journal at {dispatch_command_id} is missing its absolute deadline"
             )));
         }
         if timeout_secs.is_none() && recorded_deadline.is_some() {
-            return Err(self.job_divergence(format!(
+            return Err(self.diverge(format!(
                 "untimed job dispatch journal at {dispatch_command_id} unexpectedly has a deadline"
             )));
         }
@@ -359,7 +354,7 @@ impl WfCtx {
             .insert(idem_token.clone(), identity.clone())
             .is_some_and(|existing| existing != identity)
         {
-            return Err(self.job_divergence(format!(
+            return Err(self.diverge(format!(
                 "job dispatch token `{idem_token}` was reused for a different journaled dispatch"
             )));
         }
@@ -376,7 +371,7 @@ impl WfCtx {
     /// cannot satisfy this join and remain buffered for their own branch.
     pub fn join_dispatched_job(&mut self, job: &DispatchedJob) -> WfResult<JobOutcome> {
         let Some(expected) = self.job_dispatches.get(&job.idem_token) else {
-            return Err(self.job_divergence(
+            return Err(self.diverge(
                 "job join refused an unregistered/foreign dispatch handle".into(),
             ));
         };
@@ -387,7 +382,7 @@ impl WfCtx {
                 job.spec_fingerprint.clone(),
             );
         if !identity_matches {
-            return Err(self.job_divergence(
+            return Err(self.diverge(
                 "job join refused a dispatch handle that differs from journaled identity".into(),
             ));
         }
@@ -403,7 +398,7 @@ impl WfCtx {
             })
             .map(|(token, _)| token.as_str());
         if earliest != Some(job.idem_token.as_str()) {
-            return Err(self.job_divergence(format!(
+            return Err(self.diverge(format!(
                 "unsafe job join order: `{}` is not the earliest outstanding dispatch",
                 job.idem_token
             )));

@@ -912,6 +912,21 @@ impl WfCtx {
         }
     }
 
+    /// Declare a replay divergence: latch it sticky, then produce the halt error. One spelling for
+    /// "the run's history no longer matches — halt non-deterministically."
+    pub(crate) fn diverge(&mut self, reason: String) -> WfError {
+        self.latch_divergence(reason.clone());
+        WfError::Nondeterministic(reason)
+    }
+
+    /// Halt early if a divergence was already latched (the fn-top precheck).
+    fn halt_if_diverged(&self) -> WfResult<()> {
+        match self.divergence.clone() {
+            Some(r) => Err(WfError::Nondeterministic(r)),
+            None => Ok(()),
+        }
+    }
+
     /// The number of activity closures actually EXECUTED on this drive (the FLOW-D1 double-effect
     /// probe). A pure replay of a fully-journaled run reads `0` (every command short-circuited); a
     /// regression that re-executes a journaled activity reads `> 0` and reds the drill.
@@ -1029,9 +1044,7 @@ impl WfCtx {
         // pinned-`wf_version` mismatch armed at resume), NO further command executes — the body is not
         // a deterministic function of its journal, so the run halts as `nondeterministic` rather than
         // making more (possibly double-effecting) progress. Surface the latched reason.
-        if let Some(reason) = self.divergence.clone() {
-            return Err(WfError::Nondeterministic(reason));
-        }
+        self.halt_if_diverged()?;
         let command_id = self.next_command_id();
         // **REPLAY SHORT-CIRCUIT (§4.1).** If this command is already journaled, RETURN the journaled
         // outcome WITHOUT re-executing the closure — the side effect is NOT re-run (the result was
@@ -1059,12 +1072,10 @@ impl WfCtx {
                 // silent double-effect). 0 silent divergence: the guard halts, never silent-continues
                 // (EI-01 §3 — a red gate is information; never invert an assertion).
                 other => {
-                    let reason = format!(
+                    return Err(self.diverge(format!(
                         "replay divergence at {command_id}: body issued `activity` but the journal \
                          records kind `{other}` (the workflow body diverged from its journal)"
-                    );
-                    self.latch_divergence(reason.clone());
-                    return Err(WfError::Nondeterministic(reason));
+                    )));
                 }
             }
         }
@@ -1296,9 +1307,7 @@ impl WfCtx {
     /// (supplied via [`WfCtx::with_timers`]).
     pub fn sleep_until(&mut self, fire_at_secs: i64) -> WfResult<()> {
         // DIVERGENCE HALT (P-FLOW-07): a latched divergence freezes the sleep too (the run already halts).
-        if let Some(reason) = self.divergence.clone() {
-            return Err(WfError::Nondeterministic(reason));
-        }
+        self.halt_if_diverged()?;
         let command_id = self.next_command_id();
         // REPLAY SHORT-CIRCUIT (§4.1): a journaled `timer_set` returns WITHOUT re-arming — the timer is
         // already on the wheel (armed on the first drive). The body issues no second arm on re-drive.
@@ -1309,12 +1318,10 @@ impl WfCtx {
                 // NON-`timer_set` kind (an activity / a side-marker) is a body that diverged from its
                 // journal — latch the divergence + halt (never re-arm against a journaled activity).
                 other => {
-                    let reason = format!(
+                    return Err(self.diverge(format!(
                         "replay divergence at {command_id}: body issued `sleep` but the journal records \
                          kind `{other}` (the workflow body diverged from its journal)"
-                    );
-                    self.latch_divergence(reason.clone());
-                    return Err(WfError::Nondeterministic(reason));
+                    )));
                 }
             }
         }
@@ -1448,9 +1455,7 @@ impl WfCtx {
         arm_timeout: bool,
     ) -> WfResult<WaitOutcome> {
         // DIVERGENCE HALT (P-FLOW-07): a latched divergence freezes the wait (the run already halts).
-        if let Some(reason) = self.divergence.clone() {
-            return Err(WfError::Nondeterministic(reason));
-        }
+        self.halt_if_diverged()?;
         let command_id = self.next_command_id();
 
         // **REPLAY SHORT-CIRCUIT (§4.1).** A `signal_received` at this position returns the SAME
@@ -1468,23 +1473,19 @@ impl WfCtx {
                         (expected_idem_key, &outcome)
                     {
                         if idem_key != expected {
-                            let reason = format!(
+                            return Err(self.diverge(format!(
                                 "replay divergence at {command_id}: exact wait expected idem_key \
                                  `{expected}` but the journal records `{idem_key}`"
-                            );
-                            self.latch_divergence(reason.clone());
-                            return Err(WfError::Nondeterministic(reason));
+                            )));
                         }
                     }
                     if expected_idem_key.is_some() {
                         if let Some(recorded_name) = decode_received_signal_name(&replayed.result) {
                             if recorded_name != name {
-                                let reason = format!(
+                                return Err(self.diverge(format!(
                                     "replay divergence at {command_id}: exact wait expected signal \
                                      name `{name}` but the journal records `{recorded_name}`"
-                                );
-                                self.latch_divergence(reason.clone());
-                                return Err(WfError::Nondeterministic(reason));
+                                )));
                             }
                         }
                     }
@@ -1493,12 +1494,10 @@ impl WfCtx {
                 // a journaled `signal_waited` — fall through to the live re-check (the resume path).
                 crate::wfctx::history_kind::SIGNAL_WAITED => {}
                 other => {
-                    let reason = format!(
+                    return Err(self.diverge(format!(
                         "replay divergence at {command_id}: body issued `wait_for_signal` but the \
                          journal records kind `{other}` (the workflow body diverged from its journal)"
-                    );
-                    self.latch_divergence(reason.clone());
-                    return Err(WfError::Nondeterministic(reason));
+                    )));
                 }
             }
         }
@@ -1523,24 +1522,20 @@ impl WfCtx {
         if already_waited {
             if let Some(recorded) = self.replayed_wait_expected_idem(&command_id) {
                 if Some(recorded.as_str()) != expected_idem_key {
-                    let reason = format!(
+                    return Err(self.diverge(format!(
                         "replay divergence at {command_id}: exact wait expected idem_key {:?} but \
                          the journaled wait expects `{recorded}`",
                         expected_idem_key
-                    );
-                    self.latch_divergence(reason.clone());
-                    return Err(WfError::Nondeterministic(reason));
+                    )));
                 }
             }
             if expected_idem_key.is_some() {
                 if let Some(recorded_name) = self.replayed_wait_expected_name(&command_id) {
                     if recorded_name != name {
-                        let reason = format!(
+                        return Err(self.diverge(format!(
                             "replay divergence at {command_id}: exact wait expected signal name \
                              `{name}` but the journaled wait expects `{recorded_name}`"
-                        );
-                        self.latch_divergence(reason.clone());
-                        return Err(WfError::Nondeterministic(reason));
+                        )));
                     }
                 }
             }
