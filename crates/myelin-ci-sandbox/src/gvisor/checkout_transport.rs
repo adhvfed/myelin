@@ -6,10 +6,9 @@ use crate::runner::{
     PreparationAttemptDisposition, PreparationPhase, PreparationTerminalDisposition,
 };
 use crate::{
-    CheckoutAuthorizationProof, HookError, IdemToken, JobSpec,
-    LaunchPermit, MeterTarget, PhaseAuthorization, ResourceLimits, ResourceUsage,
-    RunTokenCredential, RunnerHooks, SandboxBackend,
-    SandboxResult,
+    CheckoutAuthorizationProof, HookError, IdemToken, JobSpec, LaunchPermit, MeterTarget,
+    PhaseAuthorization, ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks,
+    SandboxBackend, SandboxResult,
 };
 use std::io;
 use std::io::{Seek, Write};
@@ -280,7 +279,7 @@ pub(crate) fn fetch_checkout_pack(
 #[allow(dead_code)]
 pub(crate) struct ParentAttemptCheckoutTransportOutcome {
     pack: PrefetchedCheckoutPack,
-    usage: ResourceUsage,
+    pub(super) usage: ResourceUsage,
 }
 
 impl ParentAttemptCheckoutTransportOutcome {
@@ -363,7 +362,7 @@ impl CheckoutTransportError {
     }
 }
 
-fn checkout_transport_terminal_failed(
+pub(super) fn checkout_transport_terminal_failed(
     message: String,
     usage: ResourceUsage,
 ) -> CheckoutTransportError {
@@ -390,7 +389,10 @@ fn checkout_transport_timed_out(message: String, usage: ResourceUsage) -> Checko
     }
 }
 
-fn checkout_transport_retryable(message: String, usage: ResourceUsage) -> CheckoutTransportError {
+pub(super) fn checkout_transport_retryable(
+    message: String,
+    usage: ResourceUsage,
+) -> CheckoutTransportError {
     CheckoutTransportError::Failed {
         message,
         usage,
@@ -1078,7 +1080,7 @@ fn verify_transport_proof_against_request(
 /// drill.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
-fn fetch_checkout_pack_within_parent_attempt_given(
+pub(super) fn fetch_checkout_pack_within_parent_attempt_given(
     root: &Path,
     tenant: &str,
     region: &str,
@@ -1352,7 +1354,7 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
 /// instant it's created — an unlinked, anonymous-by-path file the process's own fd keeps alive for
 /// exactly as long as it is needed, never left behind on any early-return path).
 #[allow(dead_code)]
-fn tempfile_for_checkout_pack() -> io::Result<std::io::BufWriter<std::fs::File>> {
+pub(super) fn tempfile_for_checkout_pack() -> io::Result<std::io::BufWriter<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
     let path = std::env::temp_dir().join(format!(
         "myelin-checkout-pack-{}-{}",
@@ -1375,4 +1377,2424 @@ fn tempfile_for_checkout_pack() -> io::Result<std::io::BufWriter<std::fs::File>>
     // silently carrying a private pack through a still-path-reachable file.
     std::fs::remove_file(&path)?;
     Ok(std::io::BufWriter::new(file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::checkout_preparation::{
+        checkout_materialization_timed_out, map_checkout_materialization_run_failure,
+    };
+    use super::*;
+    use crate::gvisor::test_fixtures::*;
+    use crate::workspace_intent::GitObjectFormat;
+    use crate::CheckoutAuthorizationScope;
+    use crate::EgressPolicy;
+    use crate::JobKind;
+    use crate::TrustTier;
+    use crate::WorkspaceSpec;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    // =========================================================================================
+    // CT-007 slice 5b.3-3 — the parent-attempt Hop A transport. Deterministic coverage via an
+    // injected executor (`GitWireHopExecutor`) — no real `runsc` binary needed for this refactor
+    // slice (the true runsc/git-rootfs integration is 5b.3-7's live drill).
+    // =========================================================================================
+    mod checkout_transport_5b3_3 {
+        use super::*;
+        // CT-007 slice 5b.3-6e.2 Stage A: git-wire fakes relocated to the test-support module so
+        // the runsc-driver seam + §4 tests share them. Re-imported so the existing tests compile.
+        use crate::gvisor::checkout_transport_test_support::{
+            advertisement_bytes, fake_quiescence_evidence, fetch_response_bytes,
+            permit_recording_executor, sha1_oid, BoxedHopExecutor, FakeRunsc, ScriptedStep,
+        };
+
+        const TENANT: &str = "acme";
+        const REGION: &str = "fr-par";
+        const REPO: &str = "widgets";
+
+        #[test]
+        fn preparation_error_classification_is_structural_never_message_based() {
+            let usage = ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 2,
+            };
+            let transport_failed =
+                checkout_transport_terminal_failed("looks retryable".into(), usage);
+            assert_eq!(
+                transport_failed.attempt_disposition(),
+                PreparationAttemptDisposition::Terminal(PreparationTerminalDisposition::Failed {
+                    phase: PreparationPhase::CheckoutTransport,
+                })
+            );
+            let transport_retryable = checkout_transport_retryable("looks terminal".into(), usage);
+            assert_eq!(
+                transport_retryable.attempt_disposition(),
+                PreparationAttemptDisposition::RetryableInfrastructure {
+                    phase: PreparationPhase::CheckoutTransport,
+                }
+            );
+            let materialization_timeout =
+                checkout_materialization_timed_out("arbitrary diagnostic".into(), usage);
+            assert_eq!(
+                materialization_timeout.attempt_disposition(),
+                PreparationAttemptDisposition::Terminal(PreparationTerminalDisposition::TimedOut {
+                    phase: PreparationPhase::CheckoutMaterialization,
+                })
+            );
+            let poisoned = CheckoutPreparationError::Unreleasable {
+                message: "ordinary words".into(),
+                usage: Some(usage),
+            };
+            assert_eq!(
+                poisoned.attempt_disposition(),
+                PreparationAttemptDisposition::ReconciliationRequired {
+                    phase: PreparationPhase::CheckoutMaterialization,
+                    teardown_unproven: false,
+                    usage_unrepresentable: false,
+                    quarantine_required: true,
+                }
+            );
+        }
+
+        #[test]
+        fn hop_b_commit_outcome_unknown_is_never_downgraded_to_an_ordinary_retry() {
+            let error =
+                map_checkout_materialization_run_failure(RunFailure::commit_outcome_unknown(
+                    "injected impossible immediate-permit commit ambiguity",
+                ));
+            assert_eq!(
+                error.attempt_disposition(),
+                PreparationAttemptDisposition::ReconciliationRequired {
+                    phase: PreparationPhase::CheckoutMaterialization,
+                    teardown_unproven: false,
+                    usage_unrepresentable: false,
+                    quarantine_required: false,
+                }
+            );
+            match error {
+                CheckoutPreparationError::RejectedAfterQuiescence { message, usage, .. } => {
+                    assert_eq!(
+                        usage,
+                        ResourceUsage {
+                            cpu_seconds: 0,
+                            mem_byte_seconds: 0,
+                        }
+                    );
+                    assert!(message.contains("internal invariant violated"));
+                    assert!(message.contains("commit ambiguity"));
+                }
+                other => panic!("expected a fail-closed post-quiescence error, got {other:?}"),
+            }
+        }
+
+        /// A real (not symlinked) bare-repo directory under a fresh root, matching exactly what
+        /// `resolve_bare_repo_path`/`assert_repo_under_root` require — both hops resolve the SAME
+        /// path, so this is staged once per test.
+        fn staged_repo_root() -> PathBuf {
+            let root = temp_dir_for("5b3-3-root");
+            std::fs::create_dir_all(root.join(TENANT).join(REGION).join(format!("{REPO}.git")))
+                .unwrap();
+            root
+        }
+
+        fn checkout_limits() -> ResourceLimits {
+            ResourceLimits {
+                cpu_millis: 1000,
+                mem_bytes: 256 << 20,
+                disk_bytes: 1 << 20,
+                tmpfs_bytes: 64 << 20,
+                pids_max: 64,
+                timeout_secs: 60,
+            }
+        }
+
+        fn parent_attempt_scope(
+            commit_hex: &str,
+            format: GitObjectFormat,
+        ) -> CheckoutAuthorizationScope {
+            CheckoutAuthorizationScope::new(
+                myelin_tenancy::TenantId(TENANT.to_string()),
+                myelin_events::ArtifactRef(format!("myelin://{TENANT}/git/repo/{REPO}")),
+                REPO.to_string(),
+                commit_hex.to_string(),
+                format,
+            )
+        }
+
+        fn minted_proof_for(
+            scope: CheckoutAuthorizationScope,
+            jti: &str,
+        ) -> CheckoutAuthorizationProof {
+            let hooks = ok_hooks().with_checkout_authorization(Box::new(|_spec, _scope| Ok(())));
+            let job = JobSpec::new(
+                JobKind::Ci,
+                fixture_image(),
+                vec!["true".to_string()],
+                vec![],
+                vec![],
+                EgressPolicy::deny_all(),
+                checkout_limits(),
+                WorkspaceSpec::default(),
+                TrustTier::Trusted,
+                RunTokenCredential::new("bearer", jti, 300).unwrap(),
+                MeterTarget {
+                    reserve_id: "r".to_string(),
+                },
+                IdemToken("idem-mint".to_string()),
+            )
+            .unwrap();
+            hooks.authorize_checkout(&job, scope).unwrap()
+        }
+
+        /// CT-007 phase-credential generations: mint a REAL fused [`PhaseAuthorization`]
+        /// through the real hook. `permit_outcome` stands in for the control plane's durable
+        /// phase gate: `Ok(())` = the generation is still current at the spawn boundary,
+        /// `Err(..)` = it is not (requeued, superseded, expired).
+        ///
+        /// Note there is NO way for a test to build one of these by hand either — the only
+        /// route is a genuine hook invocation, exactly like production.
+        fn minted_phase_authorization(
+            scope: CheckoutAuthorizationScope,
+            jti: &str,
+            phase: crate::CheckoutPhase,
+            generation_id: &str,
+            permit_outcome: Result<(), &'static str>,
+        ) -> PhaseAuthorization {
+            let hooks = ok_hooks().with_checkout_phase_authorization(Box::new(
+                move |_spec, _scope, _phase| {
+                    Ok(match permit_outcome {
+                        Ok(()) => LaunchPermit::immediate(),
+                        Err(reason) => {
+                            LaunchPermit::retained(move || Err(HookError(reason.to_string())))
+                        }
+                    })
+                },
+            ));
+            let job = JobSpec::new(
+                JobKind::Ci,
+                fixture_image(),
+                vec!["true".to_string()],
+                vec![],
+                vec![],
+                EgressPolicy::deny_all(),
+                checkout_limits(),
+                WorkspaceSpec::default(),
+                TrustTier::Trusted,
+                RunTokenCredential::new("bearer", jti, 300).unwrap(),
+                MeterTarget {
+                    reserve_id: "r".to_string(),
+                },
+                IdemToken("idem-mint".to_string()),
+            )
+            .unwrap();
+            hooks
+                .authorize_checkout_phase(&job, scope, phase, generation_id)
+                .unwrap()
+        }
+
+        /// A distinct durable generation id per purpose, so the advertise→fetch supersession
+        /// check has real values to compare.
+        fn generation_id_for(phase: crate::CheckoutPhase) -> String {
+            let seed = match phase {
+                crate::CheckoutPhase::Advertise => 'a',
+                crate::CheckoutPhase::Fetch => 'f',
+                crate::CheckoutPhase::Materialization => 'm',
+            };
+            format!("ci-credential:v1:{}", seed.to_string().repeat(64))
+        }
+
+        fn fake_hop_container_run(stdout: Vec<u8>, usage: ResourceUsage) -> ContainerRun {
+            ContainerRun {
+                child: Box::new(FakeRunsc),
+                bundle_dir: temp_dir_for("5b3-3-hop"),
+                result: SandboxResult {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    usage,
+                    stdout,
+                    stderr: Vec::new(),
+                },
+                run_error: None,
+            }
+        }
+
+        struct FailingKillRunsc;
+        impl RunscChild for FailingKillRunsc {
+            fn kill(&mut self) -> Result<(), String> {
+                Err("simulated kill failure".to_string())
+            }
+            fn wait(&mut self) -> Result<i32, String> {
+                Ok(0)
+            }
+        }
+
+        fn fake_hop_container_run_with_unkillable_child(
+            stdout: Vec<u8>,
+            usage: ResourceUsage,
+        ) -> ContainerRun {
+            ContainerRun {
+                child: Box::new(FailingKillRunsc),
+                bundle_dir: temp_dir_for("5b3-3-hop-unkillable"),
+                result: SandboxResult {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    usage,
+                    stdout,
+                    stderr: Vec::new(),
+                },
+                run_error: None,
+            }
+        }
+
+        // A step still returns the simple pre-finalization shape — `scripted_executor` below
+        // auto-wraps a successful step into a `RuntimeFinalization::Finalized` (teardown proven
+        // fine), matching what every EXISTING test needs. Tests that specifically need to exercise a
+        // genuine teardown-unproven `RuntimeFinalization::Failed` (Sol's review, blocker 2) build a
+        // `BoxedHopExecutor` closure directly instead of going through this helper (see
+        // `production_shaped_teardown_failure_is_reported_as_teardown_unproven`).
+        //
+        // `ScriptedStep`, `BoxedHopExecutor`, and `fake_quiescence_evidence` were relocated to the
+        // `checkout_transport_test_support` module (re-imported above).
+
+        /// Scripts exactly `steps.len()` executor calls, one scripted outcome each, in order.
+        /// Returns the executor closure plus a handle to the number of REMAINING (not yet
+        /// consumed) steps, so a test can assert exactly the scripted count of calls happened.
+        /// Panics if invoked more times than scripted (Sol's review: "exactly two ... executions").
+        fn scripted_executor(steps: Vec<ScriptedStep>) -> (BoxedHopExecutor, Arc<Mutex<usize>>) {
+            let remaining = Arc::new(Mutex::new(steps.len()));
+            let remaining_for_closure = Arc::clone(&remaining);
+            let queue = Mutex::new(std::collections::VecDeque::from(steps));
+            let f = move |_job: &JobSpec,
+                          _cfg: &OciConfig,
+                          _stdin: Vec<u8>,
+                          _rootfs: &Path,
+                          _cancellation: &AtomicBool,
+                          _permit: LaunchPermit| {
+                let mut queue = queue.lock().unwrap();
+                let step = queue
+                    .pop_front()
+                    .expect("executor invoked more times than scripted");
+                *remaining_for_closure.lock().unwrap() = queue.len();
+                let finalization_result = match step() {
+                    Ok((run, truncated)) => Ok(RuntimeFinalization::Finalized(FinalizedRun {
+                        primary: Ok((run, truncated)),
+                        evidence: fake_quiescence_evidence(),
+                    })),
+                    Err(run_failure) => Err(run_failure),
+                };
+                // Bundle cleanup is never in question for these auto-wrapped scripted steps —
+                // dedicated tests for an unproven bundle cleanup build a `BoxedHopExecutor`
+                // directly instead (see `bundle_cleanup_failure_forces_teardown_unproven`).
+                (finalization_result, Ok(()))
+            };
+            (Box::new(f), remaining)
+        }
+
+        fn panics_if_called_executor() -> (BoxedHopExecutor, Arc<Mutex<usize>>) {
+            scripted_executor(vec![])
+        }
+
+        // `advertisement_bytes` / `fetch_response_bytes` were relocated to the
+        // `checkout_transport_test_support` module (re-imported above).
+
+        // ---- proof verification happens BEFORE any spawn ----
+
+        #[test]
+        fn proof_with_wrong_run_token_jti_refuses_before_any_spawn() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xc1);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof = minted_proof_for(
+                parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                "jti-minted-against",
+            );
+            let run_token =
+                RunTokenCredential::new("bearer", "jti-actually-running-as", 300).unwrap();
+            let (executor, _remaining) = panics_if_called_executor();
+            let cancellation = AtomicBool::new(false);
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert!(matches!(err, CheckoutTransportError::Refused { .. }));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn proof_with_wrong_tenant_refuses_before_any_spawn() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xc2);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let scope = CheckoutAuthorizationScope::new(
+                myelin_tenancy::TenantId("someone-else".to_string()),
+                myelin_events::ArtifactRef("myelin://someone-else/git/repo/widgets".to_string()),
+                REPO.to_string(),
+                oid.clone(),
+                GitObjectFormat::Sha1,
+            );
+            let proof = minted_proof_for(scope, "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+            let (executor, _remaining) = panics_if_called_executor();
+            let cancellation = AtomicBool::new(false);
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert!(matches!(err, CheckoutTransportError::Refused { .. }));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn proof_with_wrong_repo_refuses_before_any_spawn() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xc3);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let scope = CheckoutAuthorizationScope::new(
+                myelin_tenancy::TenantId(TENANT.to_string()),
+                myelin_events::ArtifactRef("myelin://acme/git/repo/other-repo".to_string()),
+                "other-repo".to_string(),
+                oid.clone(),
+                GitObjectFormat::Sha1,
+            );
+            let proof = minted_proof_for(scope, "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+            let (executor, _remaining) = panics_if_called_executor();
+            let cancellation = AtomicBool::new(false);
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert!(matches!(err, CheckoutTransportError::Refused { .. }));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn proof_with_wrong_commit_refuses_before_any_spawn() {
+            let root = staged_repo_root();
+            let minted_oid = sha1_oid(0xc4);
+            let requested_oid = sha1_oid(0xc5);
+            let expected = ExpectedGitCommitId::new(requested_oid, GitObjectFormat::Sha1).unwrap();
+            let proof = minted_proof_for(
+                parent_attempt_scope(&minted_oid, GitObjectFormat::Sha1),
+                "jti-1",
+            );
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+            let (executor, _remaining) = panics_if_called_executor();
+            let cancellation = AtomicBool::new(false);
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert!(matches!(err, CheckoutTransportError::Refused { .. }));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- happy path ----
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn happy_path_executes_exactly_two_immediate_gated_hops_and_checked_adds_usage() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd1);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 3,
+                mem_byte_seconds: 7,
+            };
+            let fetch_usage = ResourceUsage {
+                cpu_seconds: 11,
+                mem_byte_seconds: 13,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            let fetch_bytes = fetch_response_bytes(b"pack-payload");
+            let (executor, remaining) = scripted_executor(vec![
+                Box::new({
+                    let bytes = advertise_bytes.clone();
+                    move || Ok((fake_hop_container_run(bytes, advertise_usage), false))
+                }),
+                Box::new({
+                    let bytes = fetch_bytes.clone();
+                    move || Ok((fake_hop_container_run(bytes, fetch_usage), false))
+                }),
+            ]);
+            let cancellation = AtomicBool::new(false);
+
+            let outcome = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .expect("scripted happy path must succeed");
+            assert_eq!(
+                *remaining.lock().unwrap(),
+                0,
+                "exactly the two scripted hops must run, no more no less"
+            );
+            let (_pack, usage) = outcome.into_parts();
+            assert_eq!(
+                usage,
+                ResourceUsage {
+                    cpu_seconds: 14,
+                    mem_byte_seconds: 20,
+                },
+                "success must checked-add advertisement + fetch usage"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- the advertise→fetch preparation-lease checkpoint ----
+
+        /// A checkpoint that always refuses, recording that it was consulted exactly once.
+        struct LostLeaseCheckpoint {
+            calls: std::sync::Mutex<u32>,
+        }
+
+        impl crate::PreparationLeaseCheckpoint for LostLeaseCheckpoint {
+            fn renew(&self) -> Result<(), crate::PreparationLeaseLost> {
+                *self.calls.lock().unwrap() += 1;
+                Err(crate::PreparationLeaseLost(
+                    "exact generation no longer owns this claim".into(),
+                ))
+            }
+        }
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn a_lost_preparation_lease_refuses_between_advertise_and_fetch_and_retains_usage() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd9);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 3,
+                mem_byte_seconds: 7,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            // Exactly ONE scripted hop: the fetch must never spawn once the lease is lost.
+            let (executor, remaining) = scripted_executor(vec![Box::new(move || {
+                Ok((
+                    fake_hop_container_run(advertise_bytes, advertise_usage),
+                    false,
+                ))
+            })]);
+            let cancellation = AtomicBool::new(false);
+            let checkpoint = LostLeaseCheckpoint {
+                calls: std::sync::Mutex::new(0),
+            };
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                Some(&checkpoint),
+                &*executor,
+            )
+            .unwrap_err();
+
+            assert_eq!(*checkpoint.calls.lock().unwrap(), 1);
+            assert_eq!(
+                *remaining.lock().unwrap(),
+                0,
+                "only the advertisement hop may run; the fetch hop must never spawn"
+            );
+            match err {
+                CheckoutTransportError::Failed {
+                    usage, disposition, ..
+                } => {
+                    assert_eq!(usage, advertise_usage, "advertisement usage survives");
+                    assert_eq!(
+                        disposition,
+                        PreparationAttemptDisposition::RetryableInfrastructure {
+                            phase: PreparationPhase::CheckoutTransport,
+                        },
+                        "a lost claim generation is a clean retry, not a checkout verdict"
+                    );
+                }
+                other => panic!("expected a retryable lost-lease refusal, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn a_live_preparation_lease_checkpoint_lets_hop_a_complete() {
+            struct LiveCheckpoint {
+                calls: std::sync::Mutex<u32>,
+            }
+            impl crate::PreparationLeaseCheckpoint for LiveCheckpoint {
+                fn renew(&self) -> Result<(), crate::PreparationLeaseLost> {
+                    *self.calls.lock().unwrap() += 1;
+                    Ok(())
+                }
+            }
+
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xda);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let usage = ResourceUsage {
+                cpu_seconds: 2,
+                mem_byte_seconds: 4,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            let fetch_bytes = fetch_response_bytes(b"pack-payload");
+            let (executor, remaining) = scripted_executor(vec![
+                Box::new(move || Ok((fake_hop_container_run(advertise_bytes, usage), false))),
+                Box::new(move || Ok((fake_hop_container_run(fetch_bytes, usage), false))),
+            ]);
+            let cancellation = AtomicBool::new(false);
+            let checkpoint = LiveCheckpoint {
+                calls: std::sync::Mutex::new(0),
+            };
+
+            fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                Some(&checkpoint),
+                &*executor,
+            )
+            .expect("a live checkpoint must not change the happy path");
+            assert_eq!(*checkpoint.calls.lock().unwrap(), 1);
+            assert_eq!(*remaining.lock().unwrap(), 0);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- every failure point retains usage already incurred ----
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn advertisement_parse_failure_retains_advertisement_usage() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd2);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 5,
+                mem_byte_seconds: 9,
+            };
+            let (executor, remaining) = scripted_executor(vec![Box::new(move || {
+                Ok((
+                    fake_hop_container_run(b"not a valid advertisement".to_vec(), advertise_usage),
+                    false,
+                ))
+            })]);
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert_eq!(
+                *remaining.lock().unwrap(),
+                0,
+                "the advertisement hop must still run"
+            );
+            match err {
+                CheckoutTransportError::Failed { usage, .. } => {
+                    assert_eq!(usage, advertise_usage);
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn fetch_pre_spawn_failure_retains_advertisement_usage() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd3);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 5,
+                mem_byte_seconds: 9,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            let (executor, remaining) = scripted_executor(vec![
+                Box::new({
+                    let bytes = advertise_bytes.clone();
+                    move || Ok((fake_hop_container_run(bytes, advertise_usage), false))
+                }),
+                Box::new(|| Err(RunFailure::uncommitted("simulated fetch pre-spawn failure"))),
+            ]);
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert_eq!(
+                *remaining.lock().unwrap(),
+                0,
+                "both hops must have been attempted"
+            );
+            match err {
+                CheckoutTransportError::Failed { usage, .. } => {
+                    assert_eq!(
+                        usage, advertise_usage,
+                        "an Uncommitted fetch failure must still retain the advertisement's \
+                         already-measured usage, never report it as free"
+                    );
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn fetch_post_spawn_executed_failure_retains_advertisement_plus_fetch_usage() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd4);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 5,
+                mem_byte_seconds: 9,
+            };
+            let fetch_failure_usage = ResourceUsage {
+                cpu_seconds: 2,
+                mem_byte_seconds: 4,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            let (executor, remaining) = scripted_executor(vec![
+                Box::new({
+                    let bytes = advertise_bytes.clone();
+                    move || Ok((fake_hop_container_run(bytes, advertise_usage), false))
+                }),
+                Box::new(move || {
+                    Err(RunFailure::executed(
+                        "simulated fetch post-spawn failure",
+                        fetch_failure_usage,
+                    ))
+                }),
+            ]);
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert_eq!(*remaining.lock().unwrap(), 0);
+            match err {
+                CheckoutTransportError::Failed { usage, .. } => {
+                    assert_eq!(
+                        usage,
+                        ResourceUsage {
+                            cpu_seconds: advertise_usage.cpu_seconds
+                                + fetch_failure_usage.cpu_seconds,
+                            mem_byte_seconds: advertise_usage.mem_byte_seconds
+                                + fetch_failure_usage.mem_byte_seconds,
+                        }
+                    );
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- arithmetic overflow refuses loudly ----
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn usage_aggregation_overflow_refuses_loudly() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd5);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            // Advertisement alone doesn't overflow (usage_before starts at zero) — the overflow
+            // must occur when the FETCH hop's own usage is checked-added onto the advertisement's
+            // already-measured `u64::MAX`.
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: u64::MAX,
+                mem_byte_seconds: 1,
+            };
+            let fetch_usage = ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 1,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            let fetch_bytes = fetch_response_bytes(b"pack-payload");
+            let (executor, remaining) = scripted_executor(vec![
+                Box::new(move || {
+                    Ok((
+                        fake_hop_container_run(advertise_bytes, advertise_usage),
+                        false,
+                    ))
+                }),
+                Box::new(move || Ok((fake_hop_container_run(fetch_bytes, fetch_usage), false))),
+            ]);
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert_eq!(
+                *remaining.lock().unwrap(),
+                0,
+                "both hops must have run before the overflow is detected"
+            );
+            // Overflow happens folding the fetch hop's own usage onto the advertisement's
+            // already-measured `u64::MAX` — refused loudly (never wrapped/saturated) rather than
+            // silently reporting a wrapped-around total.
+            match err {
+                CheckoutTransportError::UsageUnrepresentable {
+                    message,
+                    usage,
+                    teardown_unproven,
+                } => {
+                    assert!(message.contains("overflow"), "message was: {message}");
+                    assert_eq!(
+                        usage, advertise_usage,
+                        "on overflow, the last exact provable total is the pre-overflow total"
+                    );
+                    assert!(
+                        !teardown_unproven,
+                        "teardown was independently proven fine here; only usage broke"
+                    );
+                }
+                other => panic!(
+                    "expected UsageUnrepresentable carrying an overflow message, got {other:?}"
+                ),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- teardown-unproven is distinct and still carries usage ----
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn kill_failure_on_a_successful_hop_yields_teardown_unproven_and_retains_usage() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd6);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 5,
+                mem_byte_seconds: 9,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            let (executor, remaining) = scripted_executor(vec![Box::new(move || {
+                Ok((
+                    fake_hop_container_run_with_unkillable_child(advertise_bytes, advertise_usage),
+                    false,
+                ))
+            })]);
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert_eq!(
+                *remaining.lock().unwrap(),
+                0,
+                "only the one scripted (advertisement) hop must have run"
+            );
+            match err {
+                CheckoutTransportError::TeardownUnproven { usage, message } => {
+                    assert_eq!(usage, advertise_usage);
+                    assert!(message.contains("kill"), "message was: {message}");
+                }
+                other => panic!("expected TeardownUnproven, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn truncated_output_combined_with_kill_failure_preserves_both_messages() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd7);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 5,
+                mem_byte_seconds: 9,
+            };
+            let (executor, remaining) = scripted_executor(vec![Box::new(move || {
+                Ok((
+                    fake_hop_container_run_with_unkillable_child(Vec::new(), advertise_usage),
+                    true, // stdout_truncated
+                ))
+            })]);
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert_eq!(
+                *remaining.lock().unwrap(),
+                0,
+                "only the one scripted (advertisement) hop must have run"
+            );
+            match err {
+                CheckoutTransportError::TeardownUnproven { usage, message } => {
+                    assert_eq!(usage, advertise_usage);
+                    assert!(message.contains("wire cap"), "message was: {message}");
+                    assert!(message.contains("kill"), "message was: {message}");
+                }
+                other => {
+                    panic!("expected TeardownUnproven combining both failures, got {other:?}")
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn run_error_combined_with_kill_failure_preserves_both_messages() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd8);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 5,
+                mem_byte_seconds: 9,
+            };
+            let (executor, remaining) = scripted_executor(vec![Box::new(move || {
+                let mut run =
+                    fake_hop_container_run_with_unkillable_child(Vec::new(), advertise_usage);
+                run.run_error = Some("simulated stream error".to_string());
+                Ok((run, false))
+            })]);
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert_eq!(
+                *remaining.lock().unwrap(),
+                0,
+                "only the one scripted (advertisement) hop must have run"
+            );
+            match err {
+                CheckoutTransportError::TeardownUnproven { usage, message } => {
+                    assert_eq!(usage, advertise_usage);
+                    assert!(
+                        message.contains("simulated stream error"),
+                        "message was: {message}"
+                    );
+                    assert!(message.contains("kill"), "message was: {message}");
+                }
+                other => {
+                    panic!("expected TeardownUnproven combining both failures, got {other:?}")
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- no live handle or bundle remains after return, on ANY path ----
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn successful_transport_leaves_no_bundle_dirs_behind() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd9);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_bytes = advertisement_bytes(&oid);
+            let fetch_bytes = fetch_response_bytes(b"pack-payload");
+            let advertise_bundle_dir = temp_dir_for("5b3-3-tracked-advertise-bundle");
+            let fetch_bundle_dir = temp_dir_for("5b3-3-tracked-fetch-bundle");
+            let advertise_bundle_dir_check = advertise_bundle_dir.clone();
+            let fetch_bundle_dir_check = fetch_bundle_dir.clone();
+            let usage = ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 1,
+            };
+            let (executor, _remaining) = scripted_executor(vec![
+                Box::new(move || {
+                    Ok((
+                        ContainerRun {
+                            child: Box::new(FakeRunsc),
+                            bundle_dir: advertise_bundle_dir,
+                            result: SandboxResult {
+                                exit_code: Some(0),
+                                timed_out: false,
+                                usage,
+                                stdout: advertise_bytes,
+                                stderr: Vec::new(),
+                            },
+                            run_error: None,
+                        },
+                        false,
+                    ))
+                }),
+                Box::new(move || {
+                    Ok((
+                        ContainerRun {
+                            child: Box::new(FakeRunsc),
+                            bundle_dir: fetch_bundle_dir,
+                            result: SandboxResult {
+                                exit_code: Some(0),
+                                timed_out: false,
+                                usage,
+                                stdout: fetch_bytes,
+                                stderr: Vec::new(),
+                            },
+                            run_error: None,
+                        },
+                        false,
+                    ))
+                }),
+            ]);
+            let cancellation = AtomicBool::new(false);
+
+            fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .expect("scripted happy path must succeed");
+
+            assert!(
+                !advertise_bundle_dir_check.exists(),
+                "the advertisement hop's bundle dir must be removed by return time"
+            );
+            assert!(
+                !fetch_bundle_dir_check.exists(),
+                "the fetch hop's bundle dir must be removed by return time"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- Sol's round-1 review, blocker 1: a non-passing guest execution must never be
+        // accepted just because its stdout happens to parse ----
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn not_passed_advertisement_is_never_accepted_as_success() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xda);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 5,
+                mem_byte_seconds: 9,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            let (executor, remaining) = scripted_executor(vec![Box::new(move || {
+                let mut run = fake_hop_container_run(advertise_bytes, advertise_usage);
+                run.result.exit_code = Some(1);
+                Ok((run, false))
+            })]);
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert_eq!(*remaining.lock().unwrap(), 0);
+            match err {
+                CheckoutTransportError::Failed { message, usage, .. } => {
+                    assert!(message.contains("did not pass"), "message was: {message}");
+                    assert_eq!(usage, advertise_usage);
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn not_passed_fetch_is_never_accepted_as_success() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xdb);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 5,
+                mem_byte_seconds: 9,
+            };
+            let fetch_usage = ResourceUsage {
+                cpu_seconds: 2,
+                mem_byte_seconds: 4,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            let fetch_bytes = fetch_response_bytes(b"pack-payload");
+            let (executor, remaining) = scripted_executor(vec![
+                Box::new(move || {
+                    Ok((
+                        fake_hop_container_run(advertise_bytes, advertise_usage),
+                        false,
+                    ))
+                }),
+                Box::new(move || {
+                    let mut run = fake_hop_container_run(fetch_bytes, fetch_usage);
+                    run.result.timed_out = true;
+                    Ok((run, false))
+                }),
+            ]);
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert_eq!(*remaining.lock().unwrap(), 0);
+            match err {
+                CheckoutTransportError::Failed { message, usage, .. } => {
+                    assert!(message.contains("did not pass"), "message was: {message}");
+                    assert_eq!(
+                        usage,
+                        ResourceUsage {
+                            cpu_seconds: advertise_usage.cpu_seconds + fetch_usage.cpu_seconds,
+                            mem_byte_seconds: advertise_usage.mem_byte_seconds
+                                + fetch_usage.mem_byte_seconds,
+                        }
+                    );
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- Sol's round-1 review, blocker 2: a genuine production-shaped teardown-unproven
+        // outcome (RuntimeFinalization::Failed) must never be collapsed into an ordinary Failed ----
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn production_shaped_teardown_failure_is_reported_as_teardown_unproven() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xdc);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 5,
+                mem_byte_seconds: 9,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            let bundle_dir = temp_dir_for("5b3-3-teardown-failed-bundle");
+            let bundle_dir_check = bundle_dir.clone();
+            let run = ContainerRun {
+                child: Box::new(FakeRunsc),
+                bundle_dir,
+                result: SandboxResult {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    usage: advertise_usage,
+                    stdout: advertise_bytes,
+                    stderr: Vec::new(),
+                },
+                run_error: None,
+            };
+            let slot = Mutex::new(Some((
+                Ok(RuntimeFinalization::Failed {
+                    primary: Ok((run, false)),
+                    teardown: RuntimeTeardownError {
+                        issues: vec![RuntimeTeardownIssue::ContainerNotConfirmedDeleted(
+                            "simulated: runsc delete did not confirm".to_string(),
+                        )],
+                    },
+                }),
+                Ok(()),
+            )));
+            let executor: BoxedHopExecutor = Box::new(
+                move |_job: &JobSpec,
+                      _cfg: &OciConfig,
+                      _stdin: Vec<u8>,
+                      _rootfs: &Path,
+                      _cancellation: &AtomicBool,
+                      _permit: LaunchPermit| {
+                    slot.lock()
+                        .unwrap()
+                        .take()
+                        .expect("executor invoked more times than scripted (single-shot)")
+                },
+            );
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            match err {
+                CheckoutTransportError::TeardownUnproven { usage, message } => {
+                    assert_eq!(usage, advertise_usage);
+                    assert!(
+                        message.contains("could not be proven"),
+                        "message was: {message}"
+                    );
+                    assert!(
+                        message.contains("did not confirm"),
+                        "message was: {message}"
+                    );
+                }
+                other => panic!("expected TeardownUnproven, got {other:?}"),
+            }
+            assert!(
+                !bundle_dir_check.exists(),
+                "the discarded run's bundle dir must still be removed by this function itself, \
+                 since production's own settle_finalization is never reached on this path"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- Sol's round-1 review, blocker 4: numerical usage is not a lifecycle marker ----
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn zero_usage_advertisement_then_fetch_pre_spawn_failure_is_still_failed_not_refused() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xdd);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            // A completed advertisement hop with GENUINELY ZERO measured usage -- distinct from
+            // "no hop ran yet." A prior implementation compared `usage_before == zero` to decide
+            // Refused-vs-Failed, which would have misclassified this exact case.
+            let zero_advertise_usage = ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            let (executor, remaining) = scripted_executor(vec![
+                Box::new(move || {
+                    Ok((
+                        fake_hop_container_run(advertise_bytes, zero_advertise_usage),
+                        false,
+                    ))
+                }),
+                Box::new(|| Err(RunFailure::uncommitted("simulated fetch pre-spawn failure"))),
+            ]);
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            assert_eq!(*remaining.lock().unwrap(), 0);
+            match err {
+                CheckoutTransportError::Failed { usage, .. } => {
+                    assert_eq!(
+                        usage, zero_advertise_usage,
+                        "a completed-but-zero-usage advertisement followed by a fetch failure \
+                         must still be Failed, never Refused"
+                    );
+                }
+                other => panic!(
+                    "expected Failed (never Refused, even though usage is numerically zero), \
+                     got {other:?}"
+                ),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- Sol's round-3 review, blocker 1: an unproven pre-finalization bundle cleanup
+        // must never be silently reported as the free `Refused` ----
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn bundle_cleanup_failure_forces_teardown_unproven_even_on_the_first_hop() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xde);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            // Simulates a pre-finalization failure (e.g. cgroup creation) whose OWN best-effort
+            // bundle-dir removal also failed -- nothing ever executed (genuinely `Uncommitted`,
+            // first hop), yet the bundle cleanup itself could not be proven.
+            let slot = Mutex::new(Some((
+                Err(RunFailure::uncommitted("simulated cgroup creation failure")),
+                Err("simulated bundle dir removal failure".to_string()),
+            )));
+            let executor: BoxedHopExecutor = Box::new(
+                move |_job: &JobSpec,
+                      _cfg: &OciConfig,
+                      _stdin: Vec<u8>,
+                      _rootfs: &Path,
+                      _cancellation: &AtomicBool,
+                      _permit: LaunchPermit| {
+                    slot.lock()
+                        .unwrap()
+                        .take()
+                        .expect("executor invoked more times than scripted (single-shot)")
+                },
+            );
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            match err {
+                CheckoutTransportError::TeardownUnproven { usage, message } => {
+                    assert_eq!(
+                        usage,
+                        ResourceUsage {
+                            cpu_seconds: 0,
+                            mem_byte_seconds: 0,
+                        },
+                        "nothing ever executed -- zero is the honest total"
+                    );
+                    assert!(
+                        message.contains("bundle directory could not be proven removed"),
+                        "message was: {message}"
+                    );
+                    assert!(
+                        message.contains("simulated bundle dir removal failure"),
+                        "message was: {message}"
+                    );
+                }
+                other => panic!(
+                    "expected TeardownUnproven (an unproven bundle cleanup must never be \
+                     reported as the free Refused, even on the very first hop), got {other:?}"
+                ),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- Sol's round-3 review, blocker 3: a finalization failure must not mask a
+        // simultaneous guest-result failure ----
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn non_passing_result_inside_a_teardown_failure_preserves_both_reasons() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xdf);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 5,
+                mem_byte_seconds: 9,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            let bundle_dir = temp_dir_for("5b3-3-teardown-failed-non-passing-bundle");
+            let run = ContainerRun {
+                child: Box::new(FakeRunsc),
+                bundle_dir,
+                result: SandboxResult {
+                    exit_code: Some(1), // did NOT pass
+                    timed_out: false,
+                    usage: advertise_usage,
+                    stdout: advertise_bytes,
+                    stderr: Vec::new(),
+                },
+                run_error: None,
+            };
+            let slot = Mutex::new(Some((
+                Ok(RuntimeFinalization::Failed {
+                    primary: Ok((run, false)),
+                    teardown: RuntimeTeardownError {
+                        issues: vec![RuntimeTeardownIssue::ContainerNotConfirmedDeleted(
+                            "simulated: runsc delete did not confirm".to_string(),
+                        )],
+                    },
+                }),
+                Ok(()),
+            )));
+            let executor: BoxedHopExecutor = Box::new(
+                move |_job: &JobSpec,
+                      _cfg: &OciConfig,
+                      _stdin: Vec<u8>,
+                      _rootfs: &Path,
+                      _cancellation: &AtomicBool,
+                      _permit: LaunchPermit| {
+                    slot.lock()
+                        .unwrap()
+                        .take()
+                        .expect("executor invoked more times than scripted (single-shot)")
+                },
+            );
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            match err {
+                CheckoutTransportError::TeardownUnproven { usage, message } => {
+                    assert_eq!(usage, advertise_usage);
+                    assert!(
+                        message.contains("did not pass"),
+                        "the guest's own non-passing result must survive, message was: {message}"
+                    );
+                    assert!(
+                        message.contains("could not be proven"),
+                        "the teardown failure must ALSO survive, message was: {message}"
+                    );
+                }
+                other => {
+                    panic!("expected TeardownUnproven combining both facts, got {other:?}")
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- Sol's round-4 review, blocker 1: CommitOutcomeUnknown inside a genuine teardown
+        // failure must not erase it ----
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn commit_outcome_unknown_inside_a_teardown_failure_is_still_teardown_unproven() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xe0);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let slot = Mutex::new(Some((
+                Ok(RuntimeFinalization::Failed {
+                    primary: Err(RunFailure::commit_outcome_unknown(
+                        "simulated commit-outcome ambiguity",
+                    )),
+                    teardown: RuntimeTeardownError {
+                        issues: vec![RuntimeTeardownIssue::ContainerNotConfirmedDeleted(
+                            "simulated: runsc delete did not confirm".to_string(),
+                        )],
+                    },
+                }),
+                Ok(()),
+            )));
+            let executor: BoxedHopExecutor = Box::new(
+                move |_job: &JobSpec,
+                      _cfg: &OciConfig,
+                      _stdin: Vec<u8>,
+                      _rootfs: &Path,
+                      _cancellation: &AtomicBool,
+                      _permit: LaunchPermit| {
+                    slot.lock()
+                        .unwrap()
+                        .take()
+                        .expect("executor invoked more times than scripted (single-shot)")
+                },
+            );
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            match err {
+                CheckoutTransportError::TeardownUnproven { usage, message } => {
+                    assert_eq!(
+                        usage,
+                        ResourceUsage {
+                            cpu_seconds: 0,
+                            mem_byte_seconds: 0,
+                        }
+                    );
+                    assert!(
+                        message.contains("internal invariant violated"),
+                        "message was: {message}"
+                    );
+                    assert!(
+                        message.contains("did not confirm"),
+                        "the independent teardown failure must survive, message was: {message}"
+                    );
+                }
+                other => panic!(
+                    "expected TeardownUnproven (a real independent teardown failure must never \
+                     be erased by an accompanying should-be-impossible commit ambiguity), got \
+                     {other:?}"
+                ),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- Sol's round-4 review, blocker 2: an unproven bundle cleanup must force
+        // TeardownUnproven even when the hop's own result is Ok ----
+
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn bundle_cleanup_failure_forces_teardown_unproven_even_on_an_otherwise_successful_hop() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xe1);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let proof =
+                minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 5,
+                mem_byte_seconds: 9,
+            };
+            let advertise_bytes = advertisement_bytes(&oid);
+            let run = ContainerRun {
+                child: Box::new(FakeRunsc),
+                bundle_dir: temp_dir_for("5b3-3-contradictory-seam-bundle"),
+                result: SandboxResult {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    usage: advertise_usage,
+                    stdout: advertise_bytes,
+                    stderr: Vec::new(),
+                },
+                run_error: None,
+            };
+            // A structurally-permitted but production-never-produces-this combination (Sol's
+            // round-4 review): the finalization result is a clean success, yet the paired
+            // `BundleCleanupProof` is `Err` -- the executor type allows this even though the real
+            // `run_git_wire_container_raw` never returns it (its success path only ever pairs `Ok`
+            // finalization with `Ok(())` cleanup, since nothing is removed on that path yet).
+            let slot = Mutex::new(Some((
+                Ok(RuntimeFinalization::Finalized(FinalizedRun {
+                    primary: Ok((run, false)),
+                    evidence: fake_quiescence_evidence(),
+                })),
+                Err("simulated bundle dir removal failure".to_string()),
+            )));
+            let executor: BoxedHopExecutor = Box::new(
+                move |_job: &JobSpec,
+                      _cfg: &OciConfig,
+                      _stdin: Vec<u8>,
+                      _rootfs: &Path,
+                      _cancellation: &AtomicBool,
+                      _permit: LaunchPermit| {
+                    slot.lock()
+                        .unwrap()
+                        .take()
+                        .expect("executor invoked more times than scripted (single-shot)")
+                },
+            );
+            let cancellation = AtomicBool::new(false);
+
+            let err = fetch_checkout_pack_within_parent_attempt_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                proof,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            match err {
+                CheckoutTransportError::TeardownUnproven { usage, message } => {
+                    assert_eq!(usage, advertise_usage);
+                    assert!(
+                        message.contains("otherwise succeeded"),
+                        "message was: {message}"
+                    );
+                    assert!(
+                        message.contains("simulated bundle dir removal failure"),
+                        "message was: {message}"
+                    );
+                }
+                other => panic!(
+                    "expected TeardownUnproven (an unproven bundle cleanup must never be \
+                     silently discarded just because finalization itself returned Ok), got \
+                     {other:?}"
+                ),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // =================================================================================
+        // CT-007 phase-credential generations: the V2 transport / preparation authority.
+        //
+        // Round-1 blocker 2: the concrete bypass these tests exist to close is "still-valid
+        // proof for requeued claim A + live permit for claim B". With the fused, consuming
+        // `PhaseAuthorization` that pairing is not expressible — the tests below prove the
+        // adjacent mix-and-match attempts that ARE expressible all refuse before any spawn.
+        // =================================================================================
+
+        // `permit_recording_executor` was relocated to the `checkout_transport_test_support`
+        // module (re-imported above) so the runsc-driver seam + §4 tests share the ONE two-call
+        // permit-recording executor.
+
+        fn advertise_authorization(oid: &str, jti: &str) -> PhaseAuthorization {
+            minted_phase_authorization(
+                parent_attempt_scope(oid, GitObjectFormat::Sha1),
+                jti,
+                crate::CheckoutPhase::Advertise,
+                &generation_id_for(crate::CheckoutPhase::Advertise),
+                Ok(()),
+            )
+        }
+
+        /// **Cross-phase substitution, FETCH-for-ADVERTISE.** A well-formed authorization for
+        /// the wrong boundary refuses before anything spawns.
+        #[test]
+        fn a_fetch_phase_authorization_substituted_for_advertise_refuses_before_any_spawn() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd2);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let authorization = minted_phase_authorization(
+                parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                "jti-1",
+                crate::CheckoutPhase::Fetch,
+                &generation_id_for(crate::CheckoutPhase::Fetch),
+                Ok(()),
+            );
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+            let (executor, _remaining) = panics_if_called_executor();
+            let cancellation = AtomicBool::new(false);
+            let mut never = || panic!("the fetch provider must never be reached");
+            let err = fetch_checkout_pack_within_parent_attempt_v2_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                authorization,
+                &mut never,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            match err {
+                CheckoutTransportError::Refused { message } => assert!(
+                    message.contains("minted for the Fetch boundary"),
+                    "message was: {message}"
+                ),
+                other => panic!("expected Refused, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// **CROSS-INVOCATION: an authorization minted against a DIFFERENT claim's credential.**
+        /// This is the closest expressible form of the blocker-2 bypass — the caller holds a
+        /// live authorization (permit included) from claim B and tries to drive claim A's
+        /// transport with it. The authorization's privately retained JTI refuses it.
+        #[test]
+        fn an_authorization_from_another_claim_cannot_drive_this_transport() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd9);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            // Claim B's authorization: fully valid, permit live.
+            let claim_b = advertise_authorization(&oid, "jti-claim-b");
+            // ...presented alongside claim A's credential.
+            let claim_a_credential = RunTokenCredential::new("bearer", "jti-claim-a", 300).unwrap();
+            let (executor, _remaining) = panics_if_called_executor();
+            let cancellation = AtomicBool::new(false);
+            let mut never = || panic!("the fetch provider must never be reached");
+            let err = fetch_checkout_pack_within_parent_attempt_v2_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                claim_a_credential,
+                claim_b,
+                &mut never,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            match err {
+                CheckoutTransportError::Refused { message } => assert!(
+                    message.contains("minted against run-token jti")
+                        && message.contains("jti-claim-b"),
+                    "message was: {message}"
+                ),
+                other => panic!("expected Refused, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// **CROSS-SCOPE: a valid authorization for another repo/commit.**
+        #[test]
+        fn an_authorization_for_another_target_cannot_drive_this_transport() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xda);
+            let other_oid = sha1_oid(0xdb);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            for (label, scope) in [
+                (
+                    "commit",
+                    parent_attempt_scope(&other_oid, GitObjectFormat::Sha1),
+                ),
+                (
+                    "repo",
+                    CheckoutAuthorizationScope::new(
+                        myelin_tenancy::TenantId(TENANT.to_string()),
+                        myelin_events::ArtifactRef(format!(
+                            "myelin://{TENANT}/git/repo/other-repo"
+                        )),
+                        "other-repo".to_string(),
+                        oid.clone(),
+                        GitObjectFormat::Sha1,
+                    ),
+                ),
+                (
+                    "tenant",
+                    CheckoutAuthorizationScope::new(
+                        myelin_tenancy::TenantId("someone-else".to_string()),
+                        myelin_events::ArtifactRef(
+                            "myelin://someone-else/git/repo/widgets".to_string(),
+                        ),
+                        REPO.to_string(),
+                        oid.clone(),
+                        GitObjectFormat::Sha1,
+                    ),
+                ),
+            ] {
+                let authorization = minted_phase_authorization(
+                    scope,
+                    "jti-1",
+                    crate::CheckoutPhase::Advertise,
+                    &generation_id_for(crate::CheckoutPhase::Advertise),
+                    Ok(()),
+                );
+                let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+                let (executor, _remaining) = panics_if_called_executor();
+                let cancellation = AtomicBool::new(false);
+                let mut never = || panic!("the fetch provider must never be reached");
+                let err = fetch_checkout_pack_within_parent_attempt_v2_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    authorization,
+                    &mut never,
+                    &cancellation,
+                    None,
+                    &*executor,
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(err, CheckoutTransportError::Refused { .. }),
+                    "a substituted {label} must refuse before any spawn, got {err:?}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// **Advertisement succeeds but the fetch mint refuses: the fetch never spawns, and the
+        /// advertisement's already-measured usage survives into the error.**
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn a_refused_fetch_mint_never_spawns_the_fetch_and_keeps_the_advertisement_usage() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd3);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let authorization = advertise_authorization(&oid, "jti-advertise");
+            let run_token = RunTokenCredential::new("bearer", "jti-advertise", 300).unwrap();
+            let advertise_usage = ResourceUsage {
+                cpu_seconds: 7,
+                mem_byte_seconds: 700,
+            };
+            let (executor, seen) = permit_recording_executor(vec![Box::new({
+                let oid = oid.clone();
+                move || {
+                    Ok((
+                        fake_hop_container_run(advertisement_bytes(&oid), advertise_usage),
+                        false,
+                    ))
+                }
+            })]);
+            let cancellation = AtomicBool::new(false);
+            let mut refuse = || {
+                Err(HookError(
+                    "the workload generation already superseded it".into(),
+                ))
+            };
+            let err = fetch_checkout_pack_within_parent_attempt_v2_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                authorization,
+                &mut refuse,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .unwrap_err();
+            match err {
+                CheckoutTransportError::Failed { usage, message, .. } => {
+                    assert_eq!(
+                        usage, advertise_usage,
+                        "the advertisement's measured usage must survive a refused fetch mint"
+                    );
+                    assert!(
+                        message.contains("mint fetch-phase credential"),
+                        "message was: {message}"
+                    );
+                }
+                other => {
+                    panic!("expected Failed carrying the advertisement usage, got {other:?}")
+                }
+            }
+            let recorded = seen.lock().unwrap();
+            assert_eq!(
+                recorded.len(),
+                1,
+                "exactly ONE container ran: the advertisement. The fetch never spawned."
+            );
+            assert_eq!(recorded[0], ("jti-advertise".to_string(), true));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// The fetch provider returning a WRONG-PHASE authorization, a MISMATCHED credential, or
+        /// the SAME generation as the advertisement all refuse — and the fetch never spawns.
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn a_divergent_fetch_authorization_refuses_before_the_fetch_spawns() {
+            type Provider =
+                Box<dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>>;
+            /// (label, expected refusal fragment, provider builder).
+            type DivergentFetchCase = (&'static str, &'static str, fn(&str) -> Provider);
+            let cases: Vec<DivergentFetchCase> = vec![
+                (
+                    "wrong phase",
+                    "minted for the Advertise boundary",
+                    |oid: &str| {
+                        let oid = oid.to_string();
+                        Box::new(move || {
+                            Ok((
+                                RunTokenCredential::new("bearer", "jti-fetch", 300).unwrap(),
+                                minted_phase_authorization(
+                                    parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                                    "jti-fetch",
+                                    crate::CheckoutPhase::Advertise,
+                                    "ci-credential:v1:distinct-advertise",
+                                    Ok(()),
+                                ),
+                            ))
+                        })
+                    },
+                ),
+                (
+                    "credential from another invocation",
+                    "minted against run-token jti",
+                    |oid: &str| {
+                        let oid = oid.to_string();
+                        Box::new(move || {
+                            Ok((
+                                // A credential that does NOT belong to the authorization
+                                // returned alongside it.
+                                RunTokenCredential::new("bearer", "jti-other-claim", 300).unwrap(),
+                                minted_phase_authorization(
+                                    parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                                    "jti-fetch",
+                                    crate::CheckoutPhase::Fetch,
+                                    &generation_id_for(crate::CheckoutPhase::Fetch),
+                                    Ok(()),
+                                ),
+                            ))
+                        })
+                    },
+                ),
+                (
+                    "same generation as the advertisement",
+                    "SAME durable generation",
+                    |oid: &str| {
+                        let oid = oid.to_string();
+                        Box::new(move || {
+                            Ok((
+                                RunTokenCredential::new("bearer", "jti-fetch", 300).unwrap(),
+                                minted_phase_authorization(
+                                    parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                                    "jti-fetch",
+                                    crate::CheckoutPhase::Fetch,
+                                    &generation_id_for(crate::CheckoutPhase::Advertise),
+                                    Ok(()),
+                                ),
+                            ))
+                        })
+                    },
+                ),
+            ];
+            for (label, expected_message, build) in cases {
+                let root = staged_repo_root();
+                let oid = sha1_oid(0xd4);
+                let expected =
+                    ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+                let authorization = advertise_authorization(&oid, "jti-advertise");
+                let run_token = RunTokenCredential::new("bearer", "jti-advertise", 300).unwrap();
+                let advertise_usage = ResourceUsage {
+                    cpu_seconds: 3,
+                    mem_byte_seconds: 300,
+                };
+                let (executor, seen) = permit_recording_executor(vec![Box::new({
+                    let oid = oid.clone();
+                    move || {
+                        Ok((
+                            fake_hop_container_run(advertisement_bytes(&oid), advertise_usage),
+                            false,
+                        ))
+                    }
+                })]);
+                let cancellation = AtomicBool::new(false);
+                let mut provider = build(&oid);
+                let err = fetch_checkout_pack_within_parent_attempt_v2_given(
+                    &root,
+                    TENANT,
+                    REGION,
+                    REPO,
+                    &expected,
+                    checkout_limits(),
+                    run_token,
+                    authorization,
+                    &mut *provider,
+                    &cancellation,
+                    None,
+                    &*executor,
+                )
+                .unwrap_err();
+                match err {
+                    CheckoutTransportError::Failed { usage, message, .. } => {
+                        assert_eq!(usage, advertise_usage, "{label}: usage survives");
+                        assert!(
+                            message.contains(expected_message),
+                            "{label}: message was: {message}"
+                        );
+                    }
+                    other => panic!("{label}: expected Failed, got {other:?}"),
+                }
+                assert_eq!(
+                    seen.lock().unwrap().len(),
+                    1,
+                    "{label}: the fetch must never spawn"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+
+        /// **The V2 happy path: each leg spawns under its OWN credential and its OWN durable
+        /// phase permit.** This is what makes a >5-minute Hop A survivable at all.
+        #[test]
+        #[cfg_attr(
+            not(feature = "privileged-host-tests"),
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+        )]
+        fn the_v2_transport_spawns_each_leg_under_its_own_credential_and_phase_permit() {
+            let root = staged_repo_root();
+            let oid = sha1_oid(0xd5);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let authorization = advertise_authorization(&oid, "jti-advertise");
+            let run_token = RunTokenCredential::new("bearer", "jti-advertise", 300).unwrap();
+            let (executor, seen) = permit_recording_executor(vec![
+                Box::new({
+                    let oid = oid.clone();
+                    move || {
+                        Ok((
+                            fake_hop_container_run(
+                                advertisement_bytes(&oid),
+                                ResourceUsage {
+                                    cpu_seconds: 1,
+                                    mem_byte_seconds: 100,
+                                },
+                            ),
+                            false,
+                        ))
+                    }
+                }),
+                Box::new(move || {
+                    Ok((
+                        fake_hop_container_run(
+                            fetch_response_bytes(b"pack-bytes"),
+                            ResourceUsage {
+                                cpu_seconds: 2,
+                                mem_byte_seconds: 200,
+                            },
+                        ),
+                        false,
+                    ))
+                }),
+            ]);
+            let cancellation = AtomicBool::new(false);
+            let fetch_oid = oid.clone();
+            let mut provide = move || {
+                Ok((
+                    RunTokenCredential::new("bearer", "jti-fetch", 300).unwrap(),
+                    minted_phase_authorization(
+                        parent_attempt_scope(&fetch_oid, GitObjectFormat::Sha1),
+                        "jti-fetch",
+                        crate::CheckoutPhase::Fetch,
+                        &generation_id_for(crate::CheckoutPhase::Fetch),
+                        Ok(()),
+                    ),
+                ))
+            };
+            let outcome = fetch_checkout_pack_within_parent_attempt_v2_given(
+                &root,
+                TENANT,
+                REGION,
+                REPO,
+                &expected,
+                checkout_limits(),
+                run_token,
+                authorization,
+                &mut provide,
+                &cancellation,
+                None,
+                &*executor,
+            )
+            .expect("the V2 phase-bound transport completes");
+            assert_eq!(
+                outcome.usage,
+                ResourceUsage {
+                    cpu_seconds: 3,
+                    mem_byte_seconds: 300,
+                }
+            );
+            let recorded = seen.lock().unwrap();
+            assert_eq!(
+                *recorded,
+                vec![
+                    ("jti-advertise".to_string(), true),
+                    ("jti-fetch".to_string(), true),
+                ],
+                "each leg runs under its OWN phase credential and commits its OWN phase permit"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// **A phase permit whose durable generation is no longer current refuses AT THE SPAWN
+        /// GATE**, not at mint time — the whole reason the permit is retained and lazy.
+        #[test]
+        fn a_superseded_phase_permit_refuses_when_the_spawn_gate_commits_it() {
+            let oid = sha1_oid(0xd6);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let authorization = minted_phase_authorization(
+                parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                "jti-1",
+                crate::CheckoutPhase::Advertise,
+                &generation_id_for(crate::CheckoutPhase::Advertise),
+                Err("a successor generation was appended"),
+            );
+            let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
+            let permit = authorization
+                .into_transport_permit(
+                    crate::CheckoutPhase::Advertise,
+                    &run_token,
+                    TENANT,
+                    REPO,
+                    &expected,
+                )
+                .expect("the authorization itself is well-formed");
+            let error = permit
+                .commit_and_release()
+                .expect_err("a superseded generation must refuse at the gate");
+            assert!(
+                error.0.contains("successor generation"),
+                "message was: {}",
+                error.0
+            );
+        }
+
+        // ---- Hop B: the materialization authority ----
+
+        #[test]
+        fn hop_b_consumes_only_a_materialization_authorization_for_the_exact_claim() {
+            let oid = sha1_oid(0xd7);
+            let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
+            let run_token = RunTokenCredential::new("bearer", "jti-materialization", 300).unwrap();
+            // CT-007 slice 5b.3-6a (blocker 1): Hop B's permit is now resolved against the
+            // capsule's FULL derived scope, not just the commit — the capsule was acquired for
+            // exactly this scope.
+            let capsule_scope = parent_attempt_scope(&oid, GitObjectFormat::Sha1);
+
+            // The exact materialization authorization is accepted, and its permit commits.
+            resolve_checkout_preparation_permit(
+                minted_phase_authorization(
+                    parent_attempt_scope(&oid, GitObjectFormat::Sha1),
+                    "jti-materialization",
+                    crate::CheckoutPhase::Materialization,
+                    &generation_id_for(crate::CheckoutPhase::Materialization),
+                    Ok(()),
+                ),
+                &run_token,
+                &capsule_scope,
+                &expected,
+            )
+            .expect("the exact materialization authorization authorizes Hop B")
+            .commit_and_release()
+            .expect("its durable permit commits");
+
+            // Every adjacent substitution refuses.
+            let cases: [(&str, crate::CheckoutPhase, &str, &str, &str); 4] = [
+                (
+                    "fetch phase",
+                    crate::CheckoutPhase::Fetch,
+                    "jti-materialization",
+                    &oid,
+                    "minted for the Fetch boundary",
+                ),
+                (
+                    "advertise phase",
+                    crate::CheckoutPhase::Advertise,
+                    "jti-materialization",
+                    &oid,
+                    "minted for the Advertise boundary",
+                ),
+                (
+                    "another claim's credential",
+                    crate::CheckoutPhase::Materialization,
+                    "jti-other-claim",
+                    &oid,
+                    "minted against run-token jti",
+                ),
+                (
+                    "another commit",
+                    crate::CheckoutPhase::Materialization,
+                    "jti-materialization",
+                    "ffffffffffffffffffffffffffffffffffffffff",
+                    // 5b.3-6a: a different commit is now a FULL-scope mismatch against the
+                    // capsule's own scope, caught before the commit-vs-preparation check.
+                    "was minted for scope",
+                ),
+            ];
+            for (label, phase, jti, commit, expected_message) in cases {
+                let error = resolve_checkout_preparation_permit(
+                    minted_phase_authorization(
+                        parent_attempt_scope(commit, GitObjectFormat::Sha1),
+                        jti,
+                        phase,
+                        &generation_id_for(phase),
+                        Ok(()),
+                    ),
+                    &run_token,
+                    &capsule_scope,
+                    &expected,
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{label} must not drive Hop B"));
+                match error {
+                    CheckoutPreparationError::Refused(message) => assert!(
+                        message.contains(expected_message),
+                        "{label}: message was: {message}"
+                    ),
+                    other => panic!("{label}: expected Refused, got {other:?}"),
+                }
+            }
+        }
+    }
 }

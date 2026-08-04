@@ -114,9 +114,11 @@ impl AcquiredCheckoutRuntime {
                             .to_string(),
                     ))
                 }
-                Err(reason) => return Err(AcquisitionFailure::clean(format!(
+                Err(reason) => {
+                    return Err(AcquisitionFailure::clean(format!(
                     "deriving the checkout authorization scope from the job spec failed: {reason}"
-                ))),
+                )))
+                }
             };
         // The stable workload identity — `myelin-prod-*`, EXACTLY the form `launch_with` mints for an
         // ordinary job (this is the workload's id, distinct from Hop B's own `myelin-checkout-*` id
@@ -279,9 +281,11 @@ impl PreparedCheckoutRuntime {
             BoundWorkloadRefusal,
         >,
     {
-        if let Err(message) = self.acquired.workload_cfg.bind_materialized_cargo_lock(
-            self.prepared_checkout_evidence.cargo_lock_sha256_hex(),
-        ) {
+        if let Err(message) = self
+            .acquired
+            .workload_cfg
+            .bind_materialized_cargo_lock(self.prepared_checkout_evidence.cargo_lock_sha256_hex())
+        {
             let disposal_diagnostics = self.dispose_checkout_runtime(workspace_manager);
             return RetainedWorkloadOutcome::RunFailed {
                 failure: RunFailure::uncommitted(message),
@@ -924,5 +928,240 @@ impl PreparedCheckoutRuntime {
             mount_source_matched_workspace.get(),
             sentinel_read_through_mount.get(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "test-support")]
+    use super::{PreparedCheckoutEvidence, RetainedWorkloadOutcome, RunFailure};
+    #[cfg(feature = "test-support")]
+    use crate::gvisor::test_fixtures::*;
+    #[cfg(feature = "test-support")]
+    use crate::user_namespace::CheckoutSessionCleanup;
+    #[cfg(feature = "test-support")]
+    use crate::CompletionSettlementOwner;
+    #[cfg(feature = "test-support")]
+    use crate::ReserveHandle;
+    #[cfg(feature = "test-support")]
+    use crate::ResourceUsage;
+    #[cfg(feature = "test-support")]
+    use crate::RunnerHooks;
+    #[cfg(feature = "test-support")]
+    use std::sync::Arc;
+    #[cfg(feature = "test-support")]
+    use std::sync::Mutex;
+
+    /// CT-007 slice 5b.3-6c: the DORMANT continuation (steps 15–18) over a REAL capsule with an
+    /// INJECTED terminal Hop B failure — proves the continuation begins/authorizes the materialization
+    /// phase, disposes the capsule along its session disposition (Prepared → delete + release_prepared),
+    /// and routes the terminal disposition through the journal (`complete_phase` + `PreparationTerminal`)
+    /// — all with no `runsc`. Gated like the 6a dispose matrix (real Btrfs+userns); soft-skips otherwise.
+    /// CT-007 slice 5b.3-6c: the `#[cfg(test)]` `into_prepared_for_tests` consuming transition drives
+    /// the REAL session/lease durable state to `Prepared` and yields a `PreparedCheckoutRuntime` — so a
+    /// subsequent `dispose_checkout_runtime` takes the `Prepared → delete + release_prepared` path,
+    /// returning the slot to the pool. Proves the test transition is honest (real durable state), not a
+    /// wrapped `NotStarted` capsule. Gated like the 6a dispose matrix; soft-skips otherwise.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn into_prepared_for_tests_drives_the_real_lease_to_prepared() {
+        let Some((runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("into-prepared")
+        else {
+            return;
+        };
+        let prepared =
+            runtime.into_prepared_for_tests(PreparedCheckoutEvidence::for_tests(ResourceUsage {
+                cpu_seconds: 2,
+                mem_byte_seconds: 3,
+            }));
+        let diagnostics = prepared.dispose_checkout_runtime(&workspace_manager);
+        assert!(
+            diagnostics.is_empty(),
+            "a clean Prepared disposal must produce no diagnostics, got {diagnostics:?}"
+        );
+        assert!(workspace_manager.is_healthy());
+        assert!(
+            userns_allocator.lease().is_ok(),
+            "release_prepared must return the slot to the pool"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// Sol's finding 1 (workload) + 6(a): the closed workload transition mints the WORKLOAD generation
+    /// (step 21) and runs the workload under its OWN rotated spec — the executor observes the workload
+    /// JTI, never the advertise base. Uses `run_retained_workload_given` (the restored `#[cfg(test)]`
+    /// execution seam) so no `runsc` is needed. Soft-skips when the explicit-userns revalidation policy
+    /// is not installed on this host (the workload bind boundary re-revalidates the runsc-root identity
+    /// live; without the policy the transition refuses BEFORE the executor — that is 5b.3-7's real drill).
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn run_retained_workload_threads_the_workload_generation() {
+        let Some((runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("workload-generation-threading")
+        else {
+            return;
+        };
+        let prepared =
+            runtime.into_prepared_for_tests(PreparedCheckoutEvidence::for_tests(ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 1,
+            }));
+        let spec = checkout_spec();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|s| Ok(ReserveHandle(s.meter_to.reserve_id.clone()))),
+            Box::new(|_, _, _| Ok(())),
+            Box::new(|_| Ok(())),
+            Box::new(|_| Ok(())),
+        );
+        let authority = FakeAttemptAuthority::new(true);
+        let seen_workload_jti = Arc::new(Mutex::new(None::<String>));
+        let seen = seen_workload_jti.clone();
+
+        let outcome = prepared.run_retained_workload_given(
+            &authority,
+            &hooks,
+            &spec,
+            &workspace_manager,
+            std::path::Path::new("/abs/staged-rootfs"),
+            move |workload_spec, _cfg, permit, _rootfs, _container_id, _prep| {
+                // Finding 1: the workload runs under its OWN generation, not the advertise base.
+                *seen.lock().unwrap() = Some(workload_spec.run_token.jti.clone());
+                drop(permit);
+                // Assert-only executor: a synthetic pre-CAS Uncommitted so the capsule disposes cleanly.
+                Err(RunFailure::uncommitted(
+                    "synthetic assert-only workload executor",
+                ))
+            },
+        );
+
+        if seen_workload_jti.lock().unwrap().is_none() {
+            // The revalidation policy is not installed — the transition refused before the executor and
+            // already disposed the capsule. Soft-skip (the real bind is 5b.3-7's runsc drill).
+            let _ = outcome;
+            let _ = std::fs::remove_dir_all(&workspace_base);
+            let _ = std::fs::remove_dir_all(&leases_dir);
+            return;
+        }
+        assert_eq!(
+            seen_workload_jti.lock().unwrap().as_deref(),
+            Some("jti-Workload"),
+            "the workload must run under its OWN rotated generation spec (step 21 mint)"
+        );
+        // The synthetic pre-CAS failure disposed the Prepared capsule (release_prepared) → slot reusable.
+        assert!(matches!(outcome, RetainedWorkloadOutcome::RunFailed { .. }));
+        assert!(workspace_manager.is_healthy());
+        assert!(userns_allocator.lease().is_ok());
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// NeverBound (session NotStarted): dispose deletes the workspace and `release_unused`s the lease,
+    /// so the slot becomes reusable and both managers stay healthy.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn dispose_never_bound_deletes_workspace_and_frees_the_slot() {
+        let Some((runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("dispose-never-bound")
+        else {
+            return;
+        };
+        let diagnostics = runtime.dispose_checkout_runtime(&workspace_manager);
+        assert!(
+            diagnostics.is_empty(),
+            "a clean NeverBound disposal must produce no diagnostics, got {diagnostics:?}"
+        );
+        assert!(workspace_manager.is_healthy());
+        assert!(userns_allocator.is_healthy());
+        assert!(
+            userns_allocator.lease().is_ok(),
+            "release_unused must return the slot to the pool — a fresh lease must now succeed"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// Prepared (session bind_preparation + confirm_prepared): dispose deletes the workspace and
+    /// `release_prepared`s the lease, so the slot becomes reusable.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn dispose_prepared_deletes_workspace_and_release_prepared_frees_the_slot() {
+        let Some((mut runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("dispose-prepared")
+        else {
+            return;
+        };
+        // Drive the session to Prepared via the module's own test-only driver — the capsule's fields
+        // are now module-private, so a sibling test can no longer reach them directly.
+        runtime.drive_session_for_tests(CheckoutSessionCleanup::Prepared);
+        let diagnostics = runtime.dispose_checkout_runtime(&workspace_manager);
+        assert!(
+            diagnostics.is_empty(),
+            "a clean Prepared disposal must produce no diagnostics, got {diagnostics:?}"
+        );
+        assert!(workspace_manager.is_healthy());
+        assert!(
+            userns_allocator.lease().is_ok(),
+            "release_prepared must return the slot to the pool — a fresh lease must now succeed"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// TeardownUnproven (session bind_preparation only — teardown never proven): dispose quarantines
+    /// BOTH — the slot is NOT reissued and the workspace manager is poisoned.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn dispose_teardown_unproven_quarantines_both() {
+        let Some((mut runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("dispose-teardown-unproven")
+        else {
+            return;
+        };
+        runtime.drive_session_for_tests(CheckoutSessionCleanup::TeardownUnproven);
+        let diagnostics = runtime.dispose_checkout_runtime(&workspace_manager);
+        assert!(
+            diagnostics.iter().any(|d| d.contains("quarantined")),
+            "a TeardownUnproven disposal must report quarantine, got {diagnostics:?}"
+        );
+        assert!(
+            !workspace_manager.is_healthy(),
+            "dropping the still-live workspace (never delete, never release) must poison the manager"
+        );
+        assert!(
+            userns_allocator.lease().is_err(),
+            "a quarantined slot must NOT be reissued — the pool stays exhausted"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
+
+    /// WorkloadBound (session driven all the way to Done): disposal is structurally impossible, so it
+    /// abandons BOTH and surfaces an invariant violation — slot quarantined, manager poisoned.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn dispose_workload_bound_abandons_both_with_an_invariant_violation() {
+        let Some((mut runtime, workspace_manager, workspace_base, userns_allocator, leases_dir)) =
+            acquire_real_checkout_capsule("dispose-workload-bound")
+        else {
+            return;
+        };
+        runtime.drive_session_for_tests(CheckoutSessionCleanup::WorkloadBound);
+        let diagnostics = runtime.dispose_checkout_runtime(&workspace_manager);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("structurally impossible")),
+            "disposing a WorkloadBound capsule must surface an invariant violation, got {diagnostics:?}"
+        );
+        assert!(!workspace_manager.is_healthy());
+        assert!(
+            userns_allocator.lease().is_err(),
+            "an abandoned slot must NOT be reissued"
+        );
+        let _ = std::fs::remove_dir_all(&workspace_base);
+        let _ = std::fs::remove_dir_all(&leases_dir);
     }
 }

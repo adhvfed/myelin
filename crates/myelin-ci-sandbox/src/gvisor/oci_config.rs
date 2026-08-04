@@ -3,9 +3,7 @@
 
 use super::*;
 use crate::hardening::HardeningProfile;
-use crate::user_namespace::{
-    RunscInvocationMode, UserNamespaceConfig,
-};
+use crate::user_namespace::{RunscInvocationMode, UserNamespaceConfig};
 use crate::{ImageRef, JobKind, JobSpec};
 use std::ffi::CString;
 use std::io;
@@ -46,7 +44,7 @@ const OCI_CARGO_CONFIG_MOUNT: &str = "/tmp/cargo-home/config.toml";
 const TEST_SERVER_CARGO_CONFIG_SOURCE: &str = "/server-owned/cargo/config.toml";
 const TEST_CARGO_VENDOR_MOUNT_SOURCE: &str =
     "/var/lib/myelin/gvisor-assets/cargo-vendor-smoke-v1/vendor";
-const CARGO_VENDOR_SOURCE_NAME: &str = "vendored";
+pub(super) const CARGO_VENDOR_SOURCE_NAME: &str = "vendored";
 
 /// Canonical server policy artifact mounted read-only at `$CARGO_HOME/config.toml`. This and the
 /// corresponding environment variables are defense in depth; the platform-owned Cargo `--config`
@@ -67,13 +65,32 @@ fn is_admitted_structured_cargo_argv(command: &[String]) -> bool {
     let v = CARGO_VENDOR_DIRECTORY_CONFIG;
     let admitted: [Vec<&str>; 4] = [
         vec!["cargo", "build", "--locked", "--config", r, "--config", v],
-        vec!["cargo", "test", "--locked", "--lib", "--config", r, "--config", v],
         vec![
-            "cargo", "test", "--locked", "--lib", "--workspace", "--config", r, "--config", v,
+            "cargo", "test", "--locked", "--lib", "--config", r, "--config", v,
         ],
         vec![
-            "cargo", "clippy", "--locked", "--all-targets", "--config", r, "--config", v, "--",
-            "-D", "warnings",
+            "cargo",
+            "test",
+            "--locked",
+            "--lib",
+            "--workspace",
+            "--config",
+            r,
+            "--config",
+            v,
+        ],
+        vec![
+            "cargo",
+            "clippy",
+            "--locked",
+            "--all-targets",
+            "--config",
+            r,
+            "--config",
+            v,
+            "--",
+            "-D",
+            "warnings",
         ],
     ];
     admitted
@@ -631,7 +648,9 @@ impl OciConfig {
     /// `/proc/<pid>/fd/N` magic-symlink source — it fails to `setns` into the runner's mount
     /// namespace under the sandbox's empty capabilities). The descriptor remains owned by the staged
     /// bundle until after runtime teardown, pinning the verified inode.
-    pub(super) fn fd_bind_cargo_vendor_before_spawn(&self) -> Result<Option<FdBoundCargoVendor>, String> {
+    pub(super) fn fd_bind_cargo_vendor_before_spawn(
+        &self,
+    ) -> Result<Option<FdBoundCargoVendor>, String> {
         match &self.layout {
             OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
                 cargo_vendor: Some(boundary),
@@ -994,5 +1013,668 @@ impl OciConfig {
     /// True iff a network interface is present (false == egress closed at the namespace level).
     pub fn has_network(&self) -> bool {
         self.has_network
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::gvisor::test_fixtures::*;
+    use crate::hardening::HardeningProfile;
+    use crate::user_namespace::{RunscInvocationMode, UserNamespaceConfig};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn structured_cargo_launch_spec_has_verified_ro_vendor_server_config_and_bounded_writable_home()
+    {
+        let fixture = cargo_boundary_fixture("structured-launch");
+        let cfg = wired_cargo_config(&fixture);
+        let json = cfg.to_json().unwrap();
+        assert!(json.contains("CARGO_HOME=/tmp/cargo-home"), "{json}");
+        assert!(json.contains("CARGO_NET_OFFLINE=true"), "{json}");
+        assert!(json.contains("CARGO_SOURCE_CRATES_IO_REPLACE_WITH=vendored"));
+        assert!(json.contains("CARGO_SOURCE_VENDORED_DIRECTORY=/opt/myelin/cargo-vendor"));
+        assert!(json.contains("\"destination\": \"/tmp\""), "{json}");
+        assert_eq!(
+            json.matches("\"type\": \"tmpfs\"").count(),
+            2,
+            "the structured launch has exactly /tmp plus its nested Cargo-home tmpfs: {json}"
+        );
+        assert_eq!(
+            json.matches("\"size=33554432\"").count(),
+            2,
+            "the two tmpfs quotas partition 64 MiB into 32 MiB + 32 MiB, totaling exactly the one declared bound: {json}"
+        );
+        assert!(
+            json.contains("\"destination\": \"/tmp/cargo-home\"")
+                && json.contains("\"uid=65534\"")
+                && json.contains("\"gid=65534\"")
+                && json.contains("\"mode=0700\"")
+                && json.contains("\"rw\""),
+            "the structured Cargo home must be an explicit writable mount owned by the workload: {json}"
+        );
+        assert!(json.contains("\"destination\": \"/opt/myelin/cargo-vendor\""));
+        assert!(json.contains("\"destination\": \"/tmp/cargo-home/config.toml\""));
+        assert_eq!(json.matches("\"ro\"").count(), 2, "{json}");
+
+        let staged = stage_production_bundle(&cfg, &fixture.rootfs).unwrap();
+        let staged_config = std::fs::read_to_string(staged.path.join("cargo-config.toml")).unwrap();
+        assert_eq!(staged_config, SERVER_CARGO_CONFIG_TOML);
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(staged.path.join("cargo-config.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+        let staged_json = std::fs::read_to_string(staged.path.join("config.json")).unwrap();
+        assert!(staged_json.contains(&format!(
+            "\"source\": {:?}",
+            staged.path.join("cargo-config.toml").to_string_lossy()
+        )));
+        assert!(staged_json.contains("\"destination\": \"/tmp/cargo-home/config.toml\""));
+    }
+
+    #[test]
+    fn cargo_vendor_serialization_missing_sources_returns_typed_refusal_without_panicking() {
+        let fixture = cargo_boundary_fixture("typed-source-refusal");
+        let cfg = wired_cargo_config(&fixture);
+        let config_source = Path::new(TEST_SERVER_CARGO_CONFIG_SOURCE);
+        let vendor_source = Path::new(TEST_CARGO_VENDOR_MOUNT_SOURCE);
+
+        let missing_vendor = cfg
+            .to_json_zeroizing_with_cargo_sources(Some(config_source), None)
+            .expect_err("a missing verified vendor source must be a typed refusal");
+        assert!(missing_vendor.contains("without a verified vendor source"));
+
+        let missing_config = cfg
+            .to_json_zeroizing_with_cargo_sources(None, Some(vendor_source))
+            .expect_err("a missing server config source must be a typed refusal");
+        assert!(missing_config.contains("without a server config source"));
+    }
+
+    #[test]
+    fn free_form_command_launch_spec_gets_no_cargo_vendor_boundary() {
+        let fixture = cargo_boundary_fixture("free-form");
+        let mut free_form = structured_cargo_spec(&fixture.reference);
+        free_form.command = vec!["/bin/test".into()];
+        free_form.env.clear();
+        assert!(selected_cargo_vendor(&free_form, &fixture.registry)
+            .unwrap()
+            .is_none());
+        let profile = HardeningProfile::derive(&free_form);
+        let json = OciConfig::from_spec(&free_form, &profile)
+            .with_explicit_user_namespace_and_workspace(
+                UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005),
+                OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace")),
+                PathBuf::from("/abs/staged-rootfs"),
+            )
+            .unwrap()
+            .to_json()
+            .unwrap();
+        assert!(!json.contains(OCI_CARGO_VENDOR_MOUNT), "{json}");
+        assert!(!json.contains(OCI_CARGO_CONFIG_MOUNT), "{json}");
+        assert!(!json.contains("CARGO_HOME="), "{json}");
+        assert!(!json.contains("CARGO_NET_OFFLINE="), "{json}");
+    }
+
+    #[test]
+    fn structured_cargo_argv_allowlist_admits_build_test_clippy_and_rejects_others() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let r = CARGO_SOURCE_REPLACE_CONFIG;
+        let v = CARGO_VENDOR_DIRECTORY_CONFIG;
+        // The exact four lowered argvs the control-plane grammar produces are all admitted.
+        for argv in [
+            vec!["cargo", "build", "--locked", "--config", r, "--config", v],
+            vec![
+                "cargo", "test", "--locked", "--lib", "--config", r, "--config", v,
+            ],
+            vec![
+                "cargo",
+                "test",
+                "--locked",
+                "--lib",
+                "--workspace",
+                "--config",
+                r,
+                "--config",
+                v,
+            ],
+            vec![
+                "cargo",
+                "clippy",
+                "--locked",
+                "--all-targets",
+                "--config",
+                r,
+                "--config",
+                v,
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ] {
+            assert!(
+                is_admitted_structured_cargo_argv(&s(&argv)),
+                "must admit {argv:?}"
+            );
+        }
+        // Anything outside the closed set is refused — a tenant cannot drop `--locked`, run a
+        // non-allowlisted subcommand, reorder the vendor `--config` after clippy's `--`, or shell out.
+        for argv in [
+            vec!["cargo", "build"],
+            vec!["cargo", "run", "--locked", "--config", r, "--config", v],
+            vec!["cargo", "test", "--config", r, "--config", v],
+            vec![
+                "cargo",
+                "clippy",
+                "--locked",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+                "--config",
+                r,
+                "--config",
+                v,
+            ],
+            vec!["/bin/sh", "-c", "cargo build"],
+        ] {
+            assert!(
+                !is_admitted_structured_cargo_argv(&s(&argv)),
+                "must reject {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_cargo_vendor_selection_refuses_nonempty_egress_defense_in_depth() {
+        let fixture = cargo_boundary_fixture("egress-refusal");
+        let mut job = structured_cargo_spec(&fixture.reference);
+        job.egress.allow = vec!["registry.example:443".into()];
+        let error = selected_cargo_vendor(&job, &fixture.registry)
+            .expect_err("the sandbox boundary must independently require network=none");
+        assert!(error.contains("empty egress (network=none)"), "{error}");
+    }
+
+    #[test]
+    fn server_cargo_config_replaces_crates_io_with_the_verified_vendor_directory() {
+        assert_eq!(
+            SERVER_CARGO_CONFIG_TOML,
+            "[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = \"/opt/myelin/cargo-vendor\"\n"
+        );
+    }
+
+    /// **Path A (real-path vendor mount) contract.** The gVisor gofer cannot open a `/proc/pid/fd`
+    /// magic-symlink source (it fails to `setns` into the runner mntns: `join container mntns:
+    /// operation not permitted`), so the OCI mount source is the VERIFIED CANONICAL REAL PATH — like
+    /// the pinned rootfs. This is deliberately NOT swap-immune against the trusted asset-store owner
+    /// uid (that host-compromise class needs immutable storage, out of scope). The guarantees it DOES
+    /// keep, asserted here: (1) the mount source is a real path (never a `/proc/fd` symlink the gofer
+    /// rejects) resolving to the verified vendored crate, (2) the OCI config consumes exactly that
+    /// path, and (3) a persistent pathname replacement makes the NEXT launch fail closed on the
+    /// re-open identity check.
+    #[test]
+    fn verified_cargo_vendor_mount_uses_canonical_real_path_and_reverifies_next_launch() {
+        let fixture = cargo_boundary_fixture("vendor-real-path");
+        let cfg = wired_cargo_config(&fixture);
+        let staged = stage_production_bundle(&cfg, &fixture.rootfs)
+            .expect("the unchanged tree must verify and stage");
+        let source = staged
+            ._cargo_vendor
+            .as_ref()
+            .expect("structured staging holds the verified vendor capability")
+            .vendor_mount_source
+            .clone();
+
+        // (1) A real path the gofer can open — NOT a `/proc/<pid>/fd/N` magic symlink — resolving to
+        // the verified vendored crate.
+        assert!(
+            !source.starts_with("/proc/"),
+            "vendor mount source must be a real path the gofer can open, not a /proc/fd symlink: \
+             {source:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("itoa-1.0.15/lib.rs")).unwrap(),
+            "pub fn fixture() {}",
+        );
+        // (2) The OCI config consumes exactly that real-path source.
+        let staged_json = std::fs::read_to_string(staged.path.join("config.json")).unwrap();
+        assert!(
+            staged_json.contains(&format!("\"source\": {:?}", source.to_string_lossy())),
+            "the OCI mount must consume the verified canonical real-path source: {staged_json}"
+        );
+
+        // (3) A persistent pathname replacement makes the NEXT launch fail closed: the re-open +
+        // identity check refuses the replacement inode. (This does NOT claim same-launch swap
+        // immunity — the mount source is now the real path — but the fd-bound re-verification still
+        // catches a durable swap at the next stage.)
+        let asset_path = fixture.root.join("asset");
+        let moved_path = fixture.root.join("asset-moved-after-verify");
+        std::fs::rename(&asset_path, &moved_path).unwrap();
+        std::fs::create_dir_all(asset_path.join("vendor/itoa-1.0.15")).unwrap();
+        std::fs::write(
+            asset_path.join("vendor/itoa-1.0.15/lib.rs"),
+            b"pub fn replacement() {}",
+        )
+        .unwrap();
+
+        let error = match stage_production_bundle(&cfg, &fixture.rootfs) {
+            Ok(_) => panic!("a later launch must refuse the replacement pathname inode"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("no longer names its registry-verified inode"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn workspace_cargo_config_cannot_shadow_structured_source_boundary() {
+        let fixture = cargo_boundary_fixture("precedence");
+        let workspace = fixture.root.join("workspace");
+        std::fs::create_dir_all(workspace.join(".cargo")).unwrap();
+        std::fs::write(
+            workspace.join(".cargo/config.toml"),
+            b"[source.crates-io]\nreplace-with='tenant'\n[source.tenant]\ndirectory='/workspace/tenant'\n",
+        )
+        .unwrap();
+        let legacy_cargo_home = fixture.root.join("legacy-cargo-home");
+        std::fs::create_dir(&legacy_cargo_home).unwrap();
+        std::fs::write(
+            legacy_cargo_home.join("config"),
+            b"[source.crates-io]\nreplace-with='legacy'\n[source.legacy]\ndirectory='/tmp/legacy'\n",
+        )
+        .unwrap();
+        let cfg = wired_cargo_config(&fixture);
+        let json = cfg.to_json().unwrap();
+        assert_eq!(
+            cfg.args,
+            [
+                "cargo",
+                "build",
+                "--locked",
+                "--config",
+                "source.crates-io.replace-with=\"vendored\"",
+                "--config",
+                "source.vendored.directory=\"/opt/myelin/cargo-vendor\"",
+            ],
+            "platform CLI config must outrank both workspace and legacy Cargo-home config files"
+        );
+        assert!(json.contains("CARGO_SOURCE_CRATES_IO_REPLACE_WITH=vendored"));
+        assert!(json.contains("CARGO_SOURCE_VENDORED_DIRECTORY=/opt/myelin/cargo-vendor"));
+        assert!(json.contains("\"destination\": \"/tmp/cargo-home/config.toml\""));
+        assert!(json.contains("\"ro\""));
+        assert!(!json.contains("/workspace/tenant"));
+    }
+
+    #[test]
+    fn oci_config_enforces_the_backend_independent_hardening() {
+        let cfg = GvisorBackend::oci_config(&spec(vec![])).unwrap();
+        assert!(cfg.root_readonly());
+        assert!(!cfg.has_network(), "no allowlist ⇒ no network interface");
+        let json = cfg.to_json().unwrap();
+        assert!(json.contains("\"readonly\": true"));
+        assert!(json.contains("\"noNewPrivileges\": true"));
+        assert!(
+            json.contains("SCMP_ACT_ERRNO"),
+            "a seccomp profile is attached"
+        );
+        assert!(
+            json.contains("\"bounding\": []"),
+            "all capabilities dropped"
+        );
+        assert!(
+            json.contains("\"type\": \"RLIMIT_NPROC\"")
+                && json.contains("\"hard\": 64")
+                && json.contains("\"soft\": 64"),
+            "rootless gVisor gets an in-sandbox process ceiling independent of host cgroups"
+        );
+        // CT-002b: the untrusted process runs NON-ROOT (defense in depth — never uid 0 in the
+        // sandbox) and the config is RUNNABLE (`cwd` set, else `runsc run` rejects the spec).
+        assert!(
+            json.contains("\"uid\": 65534") && json.contains("\"gid\": 65534"),
+            "the untrusted process must run as a non-root uid/gid (65534)"
+        );
+        assert!(
+            json.contains("\"cwd\": \"/\""),
+            "process.cwd must be set or the OCI runtime rejects the spec"
+        );
+        // CT-003a/CT-003b (SI-017): the OCI emits an (advisory — rootless runsc ignores it) memory
+        // ceiling from spec.limits.mem_bytes; the REAL host-RAM bound is the out-of-band MemoryCgroup
+        // the production run path places the runsc tree into (see MemoryCgroup). It also mounts a
+        // SIZE-BOUNDED writable `/tmp` tmpfs (sized from the scratch quota) so a disk fill hits
+        // ENOSPC instead of an unbounded host-RAM-backed tmpfs. spec()'s limits are mem=256 MiB,
+        // tmpfs=1 GiB.
+        assert!(
+            json.contains(&format!("\"limit\": {}", 256u64 << 20)),
+            "the OCI config must carry the memory ceiling (linux.resources.memory.limit) from spec.limits.mem_bytes"
+        );
+        assert!(
+            json.contains("\"destination\": \"/tmp\"") && json.contains("\"type\": \"tmpfs\""),
+            "a size-bounded writable /tmp tmpfs must be mounted (no unbounded host-RAM-backed scratch)"
+        );
+        assert!(
+            json.contains(&format!("size={}", 1u64 << 30)) && json.contains("mode=1777"),
+            "the /tmp tmpfs must be sized from spec.limits.tmpfs_bytes and writable by the non-root payload"
+        );
+        assert!(
+            !json.contains("\"type\": \"user\"") && !json.contains("uidMappings"),
+            "Rootless mode (the default) must never declare a user namespace or uid/gid mappings \
+             — runsc --rootless installs its own, and a doubly-declared userns fails the gofer"
+        );
+        assert!(
+            json.contains("\"path\": \"rootfs\""),
+            "ordinary rootless launch must use the bundle-relative rootfs: {json}"
+        );
+        assert_eq!(
+            cfg.invocation_mode(),
+            RunscInvocationMode::Rootless,
+            "a config with no explicit user namespace attached must report Rootless"
+        );
+    }
+
+    /// CT-007 slice 3, piece 6 test matrix: the git-wire-shaped `RootlessWithHostMounts` layout —
+    /// an absolute rootfs override alongside its host bind mounts, still fully rootless (no user
+    /// namespace, no uid/gid mappings).
+    #[test]
+    fn oci_config_rootless_with_host_mounts_emits_absolute_root_and_the_bind_mounts() {
+        let cfg = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_rootless_host_mounts(
+                PathBuf::from("/abs/staged-rootfs"),
+                PathBuf::from("/host/repo"),
+                Some(PathBuf::from("/host/quarantine")),
+            )
+            .expect("an absolute rootfs override must be accepted");
+        assert_eq!(
+            cfg.invocation_mode(),
+            RunscInvocationMode::Rootless,
+            "host mounts alone must not imply a user namespace"
+        );
+        let json = cfg.to_json().unwrap();
+        assert!(
+            json.contains("\"path\": \"/abs/staged-rootfs\""),
+            "the absolute rootfs override must be emitted verbatim: {json}"
+        );
+        assert!(
+            json.contains("\"destination\": \"/repo\"") && json.contains("\"ro\""),
+            "the RO repo bind mount must be present: {json}"
+        );
+        assert!(
+            json.contains("\"destination\": \"/quarantine\"") && json.contains("\"rw\""),
+            "the writable quarantine bind mount must be present: {json}"
+        );
+        assert!(
+            !json.contains("\"type\": \"user\"") && !json.contains("uidMappings"),
+            "RootlessWithHostMounts must never declare a user namespace or uid/gid mappings"
+        );
+    }
+
+    #[test]
+    fn oci_config_with_rootless_host_mounts_refuses_a_relative_rootfs() {
+        let result = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_rootless_host_mounts(
+                PathBuf::from("relative/staged-rootfs"),
+                PathBuf::from("/host/repo"),
+                None,
+            );
+        assert!(
+            result.is_err(),
+            "a non-absolute rootfs override must be refused, not silently accepted"
+        );
+    }
+
+    /// CT-007 slice 3, piece 6 test matrix: the workspace-mount layout — absolute root, explicit
+    /// user-namespace mappings, AND exactly one fixed writable workspace bind mount.
+    #[test]
+    fn oci_config_explicit_userns_with_workspace_emits_absolute_root_mappings_and_the_fixed_mount()
+    {
+        let config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
+        let workspace = OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace-subvol"));
+        let cfg = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_explicit_user_namespace_and_workspace(
+                config,
+                workspace,
+                PathBuf::from("/abs/staged-rootfs"),
+            )
+            .expect("an absolute rootfs override must be accepted");
+        assert_eq!(
+            cfg.invocation_mode(),
+            RunscInvocationMode::ExplicitUserNamespace(config)
+        );
+        let json = cfg.to_json().unwrap();
+        assert!(
+            json.contains("\"path\": \"/abs/staged-rootfs\""),
+            "the workspace layout must use an absolute rootfs override: {json}"
+        );
+        assert!(
+            json.contains("\"type\": \"user\""),
+            "a user namespace must be declared: {json}"
+        );
+        assert!(
+            json.contains("\"containerID\": 65534, \"hostID\": 100005, \"size\": 1"),
+            "container uid 65534 must map to the leased subordinate host uid: {json}"
+        );
+        assert!(
+            json.contains("\"destination\": \"/workspace\"")
+                && json.contains("\"source\": \"/host/workspace-subvol\"")
+                && json.contains("\"rw\""),
+            "exactly one fixed writable workspace bind mount must be present: {json}"
+        );
+        assert!(
+            json.contains("\"cwd\": \"/workspace\""),
+            "workspace-backed workloads must start in the checked-out tree: {json}"
+        );
+        // Never readonly, never a caller-selectable destination — only ONE workspace mount entry.
+        assert_eq!(
+            json.matches("\"destination\": \"/workspace\"").count(),
+            1,
+            "exactly one workspace mount, never more: {json}"
+        );
+    }
+
+    #[test]
+    fn oci_config_with_explicit_user_namespace_and_workspace_refuses_a_relative_rootfs() {
+        let config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
+        let workspace = OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace-subvol"));
+        let result = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_explicit_user_namespace_and_workspace(
+                config,
+                workspace,
+                PathBuf::from("relative/staged-rootfs"),
+            );
+        assert!(
+            result.is_err(),
+            "a non-absolute rootfs override must be refused, not silently accepted"
+        );
+    }
+
+    /// Sol's round-1 review of piece 6: layout selection must be ONE-SHOT — chaining two
+    /// layout-selecting builders must never silently discard whichever was selected first, even
+    /// though the enum itself already prevents an invalid FINAL combination.
+    #[test]
+    fn oci_config_layout_selection_is_one_shot() {
+        let config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
+        // userns first, THEN an attempt at rootless host mounts — must refuse, not silently revert.
+        let result = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_user_namespace(config)
+            .unwrap()
+            .with_rootless_host_mounts(
+                PathBuf::from("/abs/staged-rootfs"),
+                PathBuf::from("/host/repo"),
+                None,
+            );
+        assert!(
+            result.is_err(),
+            "attaching host mounts after a user namespace was already selected must refuse, not \
+             silently discard the user namespace"
+        );
+        // host mounts first, THEN an attempt at a user namespace — must refuse, not silently
+        // discard the mounts.
+        let result = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_rootless_host_mounts(
+                PathBuf::from("/abs/staged-rootfs"),
+                PathBuf::from("/host/repo"),
+                None,
+            )
+            .unwrap()
+            .with_user_namespace(config);
+        assert!(
+            result.is_err(),
+            "attaching a user namespace after host mounts were already selected must refuse, not \
+             silently discard the mounts"
+        );
+    }
+
+    /// Sol's round-1 review of piece 6: `RootlessWithHostMounts` must never accept a free-form
+    /// mount descriptor with a caller-controlled destination/mode — that could otherwise smuggle a
+    /// writable `/workspace`-shaped mount into a layout that reports `Rootless`. This test proves
+    /// there is no way to reach that state: the builder's signature only ever accepts fixed
+    /// repo/quarantine host-source paths, never an arbitrary destination or mode.
+    #[test]
+    fn oci_config_rootless_with_host_mounts_never_accepts_an_arbitrary_destination_or_mode() {
+        // The only two mounts `RootlessWithHostMounts` can ever produce are the fixed
+        // WIRE_REPO_MOUNT (always ro) and WIRE_QUARANTINE_MOUNT (always rw, only if requested) —
+        // proven by construction (the builder takes no `guest_dest`/`readonly` parameters at all),
+        // and confirmed here by asserting the JSON never contains anything else.
+        let cfg = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_rootless_host_mounts(
+                PathBuf::from("/abs/staged-rootfs"),
+                PathBuf::from("/host/repo"),
+                Some(PathBuf::from("/host/quarantine")),
+            )
+            .unwrap();
+        let json = cfg.to_json().unwrap();
+        assert!(!json.contains("\"destination\": \"/workspace\""));
+        assert!(json.contains(WIRE_REPO_MOUNT));
+        assert!(json.contains(WIRE_QUARANTINE_MOUNT));
+    }
+
+    /// CT-007 gate 2: a job's declared (non-secret) environment must reach `process.env`. Before
+    /// this, `from_spec` dropped `spec.env` entirely, so a real build job's `CARGO_*` / PATH
+    /// extensions never took effect in the sandbox. Secret values are NOT carried in `spec.env`
+    /// (resolved in-boundary from `SecretRef`), so a plain `NAME=VALUE` render is correct.
+    #[test]
+    fn oci_config_propagates_the_jobs_declared_env_into_process_env() {
+        let mut s = spec(vec![]);
+        s.env = vec![
+            crate::EnvVar {
+                name: "CARGO_NET_OFFLINE".into(),
+                value: "true".into(),
+            },
+            crate::EnvVar {
+                name: "CARGO_HOME".into(),
+                value: "/workspace/.cargo".into(),
+            },
+        ];
+        let json = GvisorBackend::oci_config(&s).unwrap().to_json().unwrap();
+        assert!(
+            json.contains("CARGO_NET_OFFLINE=true"),
+            "declared env dropped: {json}"
+        );
+        assert!(
+            json.contains("CARGO_HOME=/workspace/.cargo"),
+            "declared env dropped: {json}"
+        );
+        // The base PATH is still emitted (declared env is APPENDED after it, not replaced).
+        assert!(
+            json.contains("PATH=/usr/local/sbin"),
+            "base PATH lost: {json}"
+        );
+    }
+
+    #[test]
+    fn injected_secret_reaches_oci_process_env_without_entering_debug_records() {
+        let mut s = spec(vec![]);
+        s.secret_refs = vec![crate::SecretRef {
+            name: "DEPLOY_TOKEN".into(),
+            handle: "opaque:deploy".into(),
+        }];
+        let material = ["boundary", "-only-material"].concat();
+        let s = s
+            .with_resolved_secrets(vec![crate::ResolvedSecretEnv::new(
+                "DEPLOY_TOKEN",
+                material.clone(),
+            )])
+            .expect("the exact declared binding set must couple to redaction");
+
+        let cfg = GvisorBackend::oci_config(&s).expect("covered injection is launchable");
+        let json = cfg.to_json().unwrap();
+        assert!(json.contains(&format!("DEPLOY_TOKEN={material}")));
+        assert!(!format!("{s:?}").contains(&material));
+        assert!(!format!("{:?}", s.resolved_secrets().redaction_plan()).contains(&material));
+        assert!(!format!("{cfg:?}").contains(&material));
+    }
+
+    /// Empty host-mount collections are still valid (git-wire's OWN quarantine mount is genuinely
+    /// optional — a read-only serve with no push in flight has none) — the repo mount alone is
+    /// never itself optional, so "empty" here means "repo only," never "no mounts at all," which
+    /// this test confirms is exactly what a `None` quarantine source produces.
+    #[test]
+    fn oci_config_rootless_with_host_mounts_omits_the_quarantine_mount_when_absent() {
+        let cfg = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_rootless_host_mounts(
+                PathBuf::from("/abs/staged-rootfs"),
+                PathBuf::from("/host/repo"),
+                None,
+            )
+            .unwrap();
+        let json = cfg.to_json().unwrap();
+        assert!(json.contains(WIRE_REPO_MOUNT));
+        assert!(!json.contains(WIRE_QUARANTINE_MOUNT));
+    }
+
+    /// CT-007 slice 2: `with_user_namespace` must produce the EXACT two-entry OCI mapping the
+    /// design specifies, alongside a declared `user` namespace — and `invocation_mode()` must
+    /// report `ExplicitUserNamespace` carrying the SAME config back out.
+    #[test]
+    fn oci_config_with_user_namespace_emits_the_exact_two_entry_mapping() {
+        let config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
+        let cfg = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_user_namespace(config)
+            .expect("a fresh Rootless config must accept a user-namespace layout selection");
+        assert_eq!(
+            cfg.invocation_mode(),
+            RunscInvocationMode::ExplicitUserNamespace(config)
+        );
+        let json = cfg.to_json().unwrap();
+        assert!(
+            json.contains("\"type\": \"user\""),
+            "a user namespace must be declared: {json}"
+        );
+        assert!(
+            json.contains("\"containerID\": 0, \"hostID\": 1000, \"size\": 1"),
+            "container uid/gid 0 must map to the runner's own real identity: {json}"
+        );
+        assert!(
+            json.contains("\"containerID\": 65534, \"hostID\": 100005, \"size\": 1"),
+            "container uid 65534 must map to the leased subordinate host uid: {json}"
+        );
+        assert!(
+            json.contains("\"containerID\": 65534, \"hostID\": 200005, \"size\": 1"),
+            "container gid 65534 must map to the leased subordinate host gid: {json}"
+        );
+        // Every OTHER hardening assertion from the Rootless test must still hold — attaching a
+        // user namespace changes ONLY the namespaces/mappings, nothing else.
+        assert!(json.contains("\"readonly\": true"));
+        assert!(json.contains("\"noNewPrivileges\": true"));
+        assert!(json.contains("\"uid\": 65534") && json.contains("\"gid\": 65534"));
+        assert!(
+            json.contains("\"path\": \"rootfs\""),
+            "explicit userns WITHOUT a workspace mount involves no host bind mount, so it must \
+             still use the bundle-relative rootfs, not an absolute override: {json}"
+        );
     }
 }

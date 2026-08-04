@@ -285,3 +285,103 @@ fn is_executable_file(path: &Path) -> bool {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::Path;
+
+    use crate::gvisor::test_fixtures::*;
+    use std::time::Duration;
+
+    #[test]
+    fn runner_host_preflight_refuses_a_non_absolute_runtime_before_intake() {
+        let error = preflight_gvisor_runner_host(Path::new("runsc"), Path::new("/unused-rootfs"))
+            .expect_err("a PATH-relative runtime is not stable production authority");
+        assert!(error.contains("MYELIN_RUNSC_BIN must be an absolute path"));
+    }
+
+    #[test]
+    fn rootless_version_probe_rejects_an_unexpected_file_capability_before_exec() {
+        let result = probe_runsc_version_given(Path::new("/definitely/not/executable"), |_| {
+            Err("unexpected security.capability xattr".to_string())
+        });
+        assert_eq!(
+            result,
+            Err(RunscProbeError::UnsafeBinary(
+                "unexpected security.capability xattr".to_string()
+            )),
+            "the rootless startup probe must reject metadata before attempting --version"
+        );
+    }
+
+    #[test]
+    fn preflight_capture_and_teardown_result_passes_through_a_clean_success() {
+        let evidence = RuntimeQuiescenceEvidence {
+            container_id: "c".to_string(),
+            namespace: RuntimeNamespaceQuiescence::Rootless,
+            cgroup: CgroupQuiescenceEvidence::assert_for_tests((1, 2)),
+        };
+        let result = preflight_capture_and_teardown_result(Ok(outcome(b"", b"")), Ok(evidence));
+        assert!(result.is_ok(), "expected Ok, got Err");
+    }
+
+    #[test]
+    fn preflight_capture_and_teardown_result_surfaces_a_teardown_only_failure() {
+        let teardown = RuntimeTeardownError {
+            issues: vec![RuntimeTeardownIssue::Cgroup(
+                CgroupQuiescenceError::StillPopulated {
+                    waited: Duration::from_secs(2),
+                },
+            )],
+        };
+        let result = preflight_capture_and_teardown_result(Ok(outcome(b"", b"")), Err(teardown));
+        let Err(message) = result else {
+            panic!("a teardown-only failure must still refuse");
+        };
+        assert!(
+            message.contains("runtime teardown check failed"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn preflight_capture_and_teardown_result_surfaces_a_capture_only_failure() {
+        let evidence = RuntimeQuiescenceEvidence {
+            container_id: "c".to_string(),
+            namespace: RuntimeNamespaceQuiescence::Rootless,
+            cgroup: CgroupQuiescenceEvidence::assert_for_tests((1, 2)),
+        };
+        let capture_failure = RunFailure::uncommitted("spawn runsc: boom");
+        let result = preflight_capture_and_teardown_result(Err(capture_failure), Ok(evidence));
+        let Err(message) = result else {
+            panic!("a capture-only failure must still refuse");
+        };
+        assert!(message.contains("boom"), "{message}");
+    }
+
+    /// Sol's round-2 review, blocker 4: the previous implementation applied `?` to the capture
+    /// result BEFORE ever inspecting the teardown result — when BOTH failed, the teardown
+    /// diagnostic silently disappeared. Proves both messages survive when both fail.
+    #[test]
+    fn preflight_capture_and_teardown_result_reports_both_failures_when_both_fail() {
+        let capture_failure = RunFailure::uncommitted("spawn runsc: boom");
+        let teardown = RuntimeTeardownError {
+            issues: vec![RuntimeTeardownIssue::Cgroup(
+                CgroupQuiescenceError::StillPopulated {
+                    waited: Duration::from_secs(2),
+                },
+            )],
+        };
+        let result = preflight_capture_and_teardown_result(Err(capture_failure), Err(teardown));
+        let Err(message) = result else {
+            panic!("a compound failure must still refuse");
+        };
+        assert!(message.contains("boom"), "{message}");
+        assert!(
+            message.contains("runtime teardown check also failed"),
+            "{message}"
+        );
+    }
+}

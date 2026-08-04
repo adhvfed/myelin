@@ -2,15 +2,11 @@
 //! and the streaming run body every compute/checkout workload goes through.
 
 use super::*;
-use crate::user_namespace::{
-    RunscInvocationMode, UserNamespaceConfig,
-};
-use crate::{
-    JobSpec,
-    LaunchPermit, SandboxCancellation, SandboxOutputSink,
-};
+use crate::user_namespace::{RunscInvocationMode, UserNamespaceConfig};
+use crate::{JobSpec, LaunchPermit, SandboxCancellation, SandboxOutputSink};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -271,7 +267,7 @@ pub(super) fn run_production_container_streaming(
 /// monotonically-incrementing counter makes the suffix collision-proof WITHIN the process; the nanos
 /// keep it unique ACROSS processes.
 pub(super) fn unique_suffix() -> u128 {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -320,11 +316,11 @@ impl Drop for BundleCleanupGuard {
 }
 
 pub(super) struct StagedProductionBundle {
-    path: PathBuf,
+    pub(super) path: PathBuf,
     cleanup: BundleCleanupGuard,
     // Held across staging, spawn, execution, and teardown so the verified vendor inode stays pinned
     // (not reclaimed/recycled) while runsc may still open the real-path mount source.
-    _cargo_vendor: Option<FdBoundCargoVendor>,
+    pub(super) _cargo_vendor: Option<FdBoundCargoVendor>,
 }
 
 impl StagedProductionBundle {
@@ -511,4 +507,344 @@ pub(super) fn require_oci_layout_matches_prepared_mode(
         ));
     }
     Ok(mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::user_namespace::UserNamespaceConfig;
+
+    use std::path::PathBuf;
+
+    use crate::gvisor::test_fixtures::*;
+
+    #[test]
+    fn production_secret_bundle_is_owner_only_and_drop_cleans_post_stage_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let rootfs = std::env::temp_dir().join(format!(
+            "myelin-secret-bundle-rootfs-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir(&rootfs).unwrap();
+        let mut job = spec(vec![]);
+        job.secret_refs = vec![crate::SecretRef {
+            name: "DEPLOY_TOKEN".into(),
+            handle: "myelin://acme/ci/secret/deploy".into(),
+        }];
+        let job = job
+            .with_resolved_secrets(vec![crate::ResolvedSecretEnv::new(
+                "DEPLOY_TOKEN",
+                "secret-bundle-material",
+            )])
+            .unwrap();
+        let cfg = GvisorBackend::oci_config(&job).unwrap();
+        let (bundle_path, post_stage): (PathBuf, Result<(), &'static str>) = {
+            let staged = stage_production_bundle(&cfg, &rootfs).unwrap();
+            let config_path = staged.path.join("config.json");
+
+            assert_eq!(
+                std::fs::metadata(&staged.path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&config_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+
+            (
+                staged.path.clone(),
+                Err("simulated post-stage launch failure"),
+            )
+        };
+        assert_eq!(
+            post_stage.unwrap_err(),
+            "simulated post-stage launch failure"
+        );
+        assert!(!bundle_path.exists());
+        std::fs::remove_dir_all(rootfs).unwrap();
+    }
+
+    #[test]
+    fn cargo_vendor_digest_drift_fails_closed_before_spawn_continuation() {
+        let fixture = cargo_boundary_fixture("drift");
+        let cfg = wired_cargo_config(&fixture);
+        std::fs::write(
+            fixture.root.join("asset/vendor/itoa-1.0.15/tampered"),
+            b"drift",
+        )
+        .unwrap();
+        let error = match stage_production_bundle(&cfg, &fixture.rootfs) {
+            Ok(_) => panic!("post-registration asset drift must refuse"),
+            Err(error) => error,
+        };
+        assert!(error.contains("drifted before spawn"), "{error}");
+    }
+
+    /// Sol's round-2 review, blocker 2: `cfg.invocation_mode()` (what actually executes) and a
+    /// `PreparedRuntimeMode` (what checked deletion/finalization expects) were previously
+    /// constructed independently, with nothing refusing a disagreement between them. Proves the
+    /// mismatch refuses before any spawn attempt, in both directions.
+    #[test]
+    fn require_oci_layout_matches_prepared_mode_refuses_a_disagreement() {
+        let userns_config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
+        let explicit_userns_cfg = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_user_namespace(userns_config)
+            .unwrap();
+        let rootless_cfg = GvisorBackend::oci_config(&spec(vec![])).unwrap();
+
+        // The OCI config selected ExplicitUserNamespace, but the prepared mode says Rootless.
+        assert!(
+            require_oci_layout_matches_prepared_mode(
+                &explicit_userns_cfg,
+                &PreparedRuntimeMode::Rootless
+            )
+            .is_err(),
+            "an ExplicitUserNamespace OCI config paired with a Rootless prepared mode must refuse"
+        );
+
+        // The reverse disagreement: OCI config is Rootless, but the prepared mode says
+        // ExplicitUserNamespace.
+        assert!(
+            require_oci_layout_matches_prepared_mode(
+                &rootless_cfg,
+                &PreparedRuntimeMode::ExplicitUserNamespace {
+                    config: userns_config,
+                    expected_root_identity: (1, 2),
+                }
+            )
+            .is_err(),
+            "a Rootless OCI config paired with an ExplicitUserNamespace prepared mode must refuse"
+        );
+
+        // Agreement in both directions must be accepted.
+        assert!(require_oci_layout_matches_prepared_mode(
+            &rootless_cfg,
+            &PreparedRuntimeMode::Rootless
+        )
+        .is_ok());
+        assert!(require_oci_layout_matches_prepared_mode(
+            &explicit_userns_cfg,
+            &PreparedRuntimeMode::ExplicitUserNamespace {
+                config: userns_config,
+                expected_root_identity: (1, 2),
+            }
+        )
+        .is_ok());
+    }
+
+    /// CT-007 slice 2's live pinned drill: an `OciConfig` with `ExplicitUserNamespace` actually
+    /// boots through the REAL production `stage_production_bundle`/`run_and_capture` machinery
+    /// (not a throwaway spike bundle) — proving the exact command-line/OCI-JSON contract this
+    /// slice produces is genuinely runnable by the pinned `runsc` build, not merely well-formed
+    /// JSON. A real [`crate::user_namespace::UserNamespaceAllocator`] leases the subordinate
+    /// uid/gid pair from this host's REAL `/etc/subuid`/`/etc/subgid`. SKIPS gracefully without
+    /// `runsc` on PATH, the staged escape-drill rootfs, or a usable subordinate-range entry for
+    /// this process's own uid (present on this development host — CI hosts may lack one).
+    #[test]
+    #[cfg(feature = "integration")]
+    fn explicit_user_namespace_boots_through_the_real_production_run_path() {
+        // Sol's review, round 8: this drill previously resolved its OWN `bin` via a separate PATH
+        // search, while `preflight_explicit_userns_policy` validates the process-global cached
+        // `runsc_bin()` — the two could structurally diverge (e.g. if `RESOLVED_RUNSC_BIN` was
+        // already initialized to something else earlier in this process), letting the drill
+        // validate binary A and then execute binary B. Fixed by removing the drill's own
+        // resolution entirely and using `runsc_bin()` — the SAME binary preflight just validated —
+        // for the actual launch/delete calls below. `preflight_explicit_userns_policy` already
+        // fails (and this drill already skips gracefully) if `runsc_bin()` doesn't resolve to a
+        // usable, pinned binary at all, so no separate "runsc not on PATH" precondition check is
+        // needed here anymore.
+        //
+        // This drill's whole point is proving the exact CLI/OCI contract this slice produces is
+        // genuinely runnable — that claim is only proven against the SAME runsc release+build it
+        // was validated against (Sol's review, round 4), a different (even same-version-string)
+        // build is a drill PRECONDITION miss, not a bug this drill exists to catch, and the pin
+        // check must never run against an unhardened pathname (Sol's review, round 7: a standalone
+        // call to `verify_pinned_explicit_userns_runsc` here, BEFORE hardening, violated that
+        // function's own documented caller precondition — a matching binary could still be
+        // replaced between the hash and the `--version` exec if the pathname itself were never
+        // proven immutable first).
+        //
+        // `apply_runsc_invocation_policy`'s `ExplicitUserNamespace` branch now REFUSES outright
+        // without a validated policy (Sol's review, round 4) — this drill exercises the REAL
+        // production activation path, so it must actually install one, exactly as a real
+        // production caller would, rather than reaching into `EXPLICIT_USERNS_POLICY` directly.
+        if let Err(e) = preflight_explicit_userns_policy(
+            resolved_explicit_userns_helper_dir(),
+            resolved_explicit_userns_runsc_root(),
+        ) {
+            eprintln!("[explicit-userns drill] SKIP: preflight_explicit_userns_policy failed: {e}");
+            return;
+        }
+        let bin = runsc_bin();
+        let rootfs = crate::resolved_gvisor_rootfs();
+        if !rootfs.exists() {
+            eprintln!("[explicit-userns drill] SKIP: staged rootfs absent at {rootfs:?}");
+            return;
+        }
+        let leases_dir = std::env::temp_dir().join(format!(
+            "myelin-userns-drill-leases-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        // `try_new_for_tests` (not the strict production `try_new`): this drill's `leases_dir`
+        // sits under `std::env::temp_dir()`, whose PARENT (`/tmp`) is world-writable on virtually
+        // every host — the strict production constructor's parent-not-writable-by-us check (Sol's
+        // review, closing the replaceable-lock-anchor gap) would always refuse it here, which
+        // would test nothing about this drill's actual purpose (proving the REAL bundle/launch
+        // path boots an explicit-userns container). That deployment-layout requirement belongs to
+        // slice 4's production-activation drills, which verify the REAL runner deployment's
+        // directory permissions — not this slice's own test suite. The REAL host `/etc/subuid`/
+        // `/etc/subgid` are still used (this host's copies are already root-owned, mode 644).
+        let allocator = match crate::user_namespace::UserNamespaceAllocator::try_new_for_tests(
+            leases_dir.clone(),
+            Path::new("/etc/subuid"),
+            Path::new("/etc/subgid"),
+            1,
+            Arc::new(|msg: &str| eprintln!("[explicit-userns drill incident] {msg}")),
+        ) {
+            Ok(a) => a,
+            Err(
+                e @ crate::user_namespace::UserNamespaceAllocatorError::NoSubordinateEntry {
+                    ..
+                },
+            ) => {
+                eprintln!(
+                    "[explicit-userns drill] SKIP: no usable /etc/subuid|subgid range for this \
+                     process's uid: {e}"
+                );
+                let _ = std::fs::remove_dir_all(&leases_dir);
+                return;
+            }
+            Err(e) => panic!(
+                "allocator construction failed with an unexpected (non-\"no usable range\") \
+                 error — this indicates a real bug (malformed/unsafe config, lock contention, \
+                 corrupt state, unsafe directory), not an absent host configuration: {e}"
+            ),
+        };
+        let mut lease = allocator
+            .lease()
+            .expect("a fresh allocator's first lease must succeed");
+
+        let mut command_spec = spec(vec![]);
+        command_spec.command = vec!["/bin/sh".into(), "-c".into(), "id".into()];
+        let profile = HardeningProfile::derive(&command_spec);
+        let cfg = OciConfig::from_spec(&command_spec, &profile)
+            .with_user_namespace(lease.config())
+            .expect("a fresh Rootless config must accept a user-namespace layout selection");
+        assert_eq!(
+            cfg.invocation_mode(),
+            RunscInvocationMode::ExplicitUserNamespace(lease.config())
+        );
+
+        let bundle = stage_production_bundle(&cfg, &rootfs).expect("stage the production bundle");
+        let container_id = format!(
+            "myelin-userns-drill-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        // CT-007 slice 3, piece 7b: `preflight_explicit_userns_policy` above already installed the
+        // REAL global policy this drill is exercising — the `(0, 0)` placeholder this test
+        // previously used for `runsc_root_identity` is gone now that piece 7b's real
+        // `finalize_runtime`/`revalidated_explicit_userns_root_identity` wiring exists; this is the
+        // SAME identity `finalize_runtime` will re-confirm at teardown below.
+        let runsc_root_identity = revalidated_explicit_userns_root_identity()
+            .expect("the policy this drill just installed via preflight must revalidate cleanly");
+        let cgroup = MemoryCgroup::create(
+            command_spec.limits.mem_bytes,
+            command_spec.limits.cpu_millis,
+        )
+        .expect("establish a real memory cgroup for this drill");
+        let cgroup_identity = cgroup.identity();
+        lease
+            .bind(container_id.clone(), runsc_root_identity, cgroup_identity)
+            .expect("bind must succeed for a fresh Allocated lease");
+        // Sol's round-3 review: construct `prepared_mode` and derive `mode` through the SAME
+        // agreement-checking helper the production path uses, rather than reading
+        // `cfg.invocation_mode()` independently — this drill should demonstrate the exact contract
+        // it exercises, not bypass it.
+        let prepared_mode = PreparedRuntimeMode::ExplicitUserNamespace {
+            config: lease.config(),
+            expected_root_identity: runsc_root_identity,
+        };
+        let mode = require_oci_layout_matches_prepared_mode(&cfg, &prepared_mode)
+            .expect("the drill's own cfg and prepared mode must agree");
+        let (result, child_retirement) = run_and_capture(
+            bin,
+            &bundle,
+            &container_id,
+            Duration::from_secs(10),
+            command_spec.limits.mem_bytes,
+            RunCaptureOptions {
+                stdin: None,
+                stdout_mode: StdoutMode::CappedHead,
+                cancellation: &NEVER_CANCELLED,
+                redaction: RedactionPlan::none(),
+                output: None,
+            },
+            None,
+            mode,
+            &cgroup,
+        );
+        let evidence = finalize_runtime(
+            bin,
+            &container_id,
+            &prepared_mode,
+            cgroup,
+            RUNTIME_QUIESCE_TIMEOUT,
+            child_retirement,
+        )
+        .expect("checked teardown must succeed through the real production path");
+        assert_eq!(
+            evidence.namespace,
+            RuntimeNamespaceQuiescence::ExplicitUserNamespace {
+                runsc_root_identity
+            }
+        );
+        let _ = std::fs::remove_dir_all(&bundle);
+
+        let outcome = result.unwrap_or_else(|e| {
+            panic!("run_and_capture must succeed through the real production path: {e:?}")
+        });
+        assert!(
+            !outcome.timed_out,
+            "the guest `id` command must not time out"
+        );
+        assert_eq!(
+            outcome.exit,
+            Some(0),
+            "the guest `id` command must exit 0, stderr: {}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&outcome.stdout);
+        assert!(
+            stdout.contains("uid=65534") && stdout.contains("gid=65534"),
+            "the guest must report uid/gid 65534 (mapped via the OCI uidMappings/gidMappings \
+             this slice emits), got: {stdout:?}"
+        );
+
+        let nonce = lease.nonce_for_tests();
+        lease
+            .release(
+                crate::user_namespace::UserNamespaceQuiescenceProof::assert_for_tests(
+                    nonce,
+                    container_id,
+                    runsc_root_identity,
+                    cgroup_identity,
+                ),
+            )
+            .expect("release with the lease's own nonce and bound identity must succeed");
+        let _ = std::fs::remove_dir_all(&leases_dir);
+    }
 }

@@ -4,18 +4,12 @@
 use super::*;
 use crate::hardening::HardeningProfile;
 use crate::runner::RetryableAttemptCause;
-use crate::user_namespace::{
-    UserNamespaceAllocator, UserNamespaceAllocatorError,
-};
-use crate::workspace_manager::{
-    WorkspaceManager,
-    WorkspaceManagerError, WorkspaceStorageMode,
-};
+use crate::user_namespace::{UserNamespaceAllocator, UserNamespaceAllocatorError};
+use crate::workspace_manager::{WorkspaceManager, WorkspaceManagerError, WorkspaceStorageMode};
 use crate::{
-    CompletionSettlementOwner, HookError, JobSpec,
-    LaunchPermit, ReserveHandle, ResourceUsage, RunnerHooks, SandboxBackend, SandboxCancellation, SandboxCycleOutcome,
-    SandboxHandle, SandboxLaunch, SandboxLaunchError, SandboxOutputSink,
-    SandboxResult,
+    CompletionSettlementOwner, HookError, JobSpec, LaunchPermit, ReserveHandle, ResourceUsage,
+    RunnerHooks, SandboxBackend, SandboxCancellation, SandboxCycleOutcome, SandboxHandle,
+    SandboxLaunch, SandboxLaunchError, SandboxOutputSink, SandboxResult,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -61,7 +55,6 @@ impl From<crate::asset_registry::AssetRegistryError> for GvisorError {
         GvisorError::Image(e.to_string())
     }
 }
-
 
 /// A live gVisor container handle (the OCI/`runsc` container id, killable on teardown). Its
 /// lifecycle is RECONCILED with the Firecracker [`VmmChild`](crate::firecracker::VmmChild): both
@@ -1350,5 +1343,1603 @@ impl SandboxBackend for GvisorBackend {
             r.map_err(GvisorError::Runtime)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::runner::RetryableAttemptCause;
+
+    use std::path::PathBuf;
+
+    use crate::gvisor::test_fixtures::*;
+    use crate::user_namespace::{UserNamespaceAllocator, UserNamespaceAllocatorError};
+    use crate::workspace_manager::{WorkspaceManager, WorkspaceManagerError, WorkspaceStorageMode};
+    use crate::{
+        CompletionSettlementOwner, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec,
+        MeterTarget, ReserveHandle, ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks,
+        SandboxBackend, SandboxCancellation, SandboxLaunchError, SandboxOutputSink, TrustTier,
+        WorkspaceSpec,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// CT-007 slice 5b.3-6e.1: the checkout repository-root config validates at boot — no default
+    /// fallback, and a relative / nonexistent / non-directory / non-canonical root fails closed.
+    #[test]
+    fn gvisor_checkout_config_validates_the_repo_root_at_boot() {
+        // A relative path is refused.
+        assert!(matches!(
+            GvisorCheckoutConfig::enabled("relative/repo"),
+            Err(GvisorCheckoutConfigError::NotAbsolute(_))
+        ));
+        // A nonexistent absolute path is refused.
+        let missing = std::env::temp_dir().join(format!(
+            "myelin-checkout-root-missing-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        assert!(matches!(
+            GvisorCheckoutConfig::enabled(&missing),
+            Err(GvisorCheckoutConfigError::NotADirectory { .. })
+        ));
+        // An absolute path to a FILE (not a directory) is refused.
+        let file_path = std::env::temp_dir().join(format!(
+            "myelin-checkout-root-file-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::write(&file_path, b"not a dir").unwrap();
+        assert!(matches!(
+            GvisorCheckoutConfig::enabled(&file_path),
+            Err(GvisorCheckoutConfigError::NotADirectory { .. })
+        ));
+        let _ = std::fs::remove_file(&file_path);
+        // A real, canonical directory is ACCEPTED and retains the exact root.
+        let base = std::env::temp_dir()
+            .join(format!(
+                "myelin-checkout-root-ok-{}-{}",
+                std::process::id(),
+                unique_suffix()
+            ))
+            .canonicalize()
+            .unwrap_or_else(|_| {
+                let p = std::env::temp_dir().join(format!(
+                    "myelin-checkout-root-ok-{}-{}",
+                    std::process::id(),
+                    unique_suffix()
+                ));
+                std::fs::create_dir_all(&p).unwrap();
+                std::fs::canonicalize(&p).unwrap()
+            });
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let accepted =
+            GvisorCheckoutConfig::enabled(&base).expect("a canonical directory must be accepted");
+        assert_eq!(
+            accepted.repo_root(),
+            Some(base.as_path()),
+            "an enabled config exposes exactly the validated root"
+        );
+        // A non-canonical path (a `..`-bearing route to the same real dir) is refused, even though it
+        // resolves to an existing directory.
+        let non_canonical = base.join("..").join(base.file_name().unwrap());
+        assert!(matches!(
+            GvisorCheckoutConfig::enabled(&non_canonical),
+            Err(GvisorCheckoutConfigError::NotCanonical { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn structured_cargo_compute_route_refuses_instead_of_skipping_vendor_boundary() {
+        let fixture = cargo_boundary_fixture("compute-route");
+        let backend = GvisorBackend::new(cargo_compute_registry(&fixture));
+        let job = structured_cargo_spec(&fixture.reference);
+        let error = backend
+            .launch_with(
+                &job,
+                &ok_hooks(),
+                |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                    panic!(
+                        "a structured compute job without Enabled workspace support must not run"
+                    )
+                },
+            )
+            .expect_err("the compute route must refuse rather than omit the vendor mounts");
+        assert!(
+            error
+                .to_string()
+                .contains("requires the Enabled workspace integration"),
+            "{error}"
+        );
+
+        let mut networked_job = structured_cargo_spec(&fixture.reference);
+        networked_job.egress.allow = vec!["registry.example:443".into()];
+        let error = backend
+            .launch_with(
+                &networked_job,
+                &ok_hooks(),
+                |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                    panic!("a networked structured compute job must not run")
+                },
+            )
+            .expect_err("the compute route must apply empty-egress validation");
+        assert!(
+            error.to_string().contains("empty egress (network=none)"),
+            "{error}"
+        );
+    }
+
+    // ───────── CT-007 slice 3, piece 4: WorkspaceIntegration / GvisorWorkspaceConfig ─────────
+
+    #[test]
+    fn new_and_git_wire_only_construct_disabled_workspace_integration() {
+        let backend = GvisorBackend::new(test_registry());
+        assert!(matches!(
+            backend.workspace_integration,
+            WorkspaceIntegration::Disabled
+        ));
+        let git_wire_backend = GvisorBackend::git_wire_only();
+        assert!(matches!(
+            git_wire_backend.workspace_integration,
+            WorkspaceIntegration::Disabled
+        ));
+    }
+
+    #[test]
+    fn try_new_with_disabled_config_never_touches_the_filesystem() {
+        let backend = GvisorBackend::try_new(
+            test_registry(),
+            GvisorWorkspaceConfig::Disabled,
+            Arc::new(|_: &str| {}),
+        )
+        .expect("Disabled construction must never fail");
+        assert!(matches!(
+            backend.workspace_integration,
+            WorkspaceIntegration::Disabled
+        ));
+    }
+
+    #[test]
+    fn try_new_with_enabled_config_refuses_before_touching_workspace_when_userns_is_unsafe() {
+        // Any leases_dir this unprivileged test process can create itself sits under a directory
+        // it owns or can write to (its own home dir, or /tmp) — the strict production allocator's
+        // ancestor-not-writable-by-us check refuses EVERY such path, deliberately: a genuinely
+        // hardened leases dir requires a root-provisioned deployment layout, out of scope for an
+        // ordinary unit test (this crate's own explicit-userns drill documents the identical
+        // constraint). This makes the refusal fully deterministic here, which is exactly what this
+        // test wants: proof that workspace reconciliation is never even attempted once userns
+        // construction fails.
+        let base = std::env::temp_dir().join(format!(
+            "myelin-gvisor-try-new-workspace-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let leases_dir = std::env::temp_dir().join(format!(
+            "myelin-gvisor-try-new-leases-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let result = GvisorBackend::try_new(
+            test_registry(),
+            GvisorWorkspaceConfig::Enabled {
+                base_dir: base.clone(),
+                host_capacity_bytes: 1 << 30,
+                leases_dir,
+                min_pool_size: 1,
+            },
+            Arc::new(|_: &str| {}),
+        );
+        match result {
+            Err(GvisorBackendInitError::UserNamespace(_)) => {}
+            Err(other) => panic!("expected a UserNamespace error, got a different error: {other}"),
+            Ok(_) => panic!(
+                "expected a UserNamespace error — a leases dir under this test's own home/tmp \
+                 directory must never be considered safe"
+            ),
+        }
+        assert!(
+            !base.exists(),
+            "workspace reconciliation must never run when userns construction fails first"
+        );
+    }
+
+    /// Sol's round-1 review of piece 4: the public `try_new`'s own success path (and therefore the
+    /// `Workspace(_)` error-mapping branch, reachable only once userns has ALREADY succeeded) is
+    /// untestable end-to-end on an ordinary dev/CI host — the strict production allocator's
+    /// ancestor check always refuses any leases_dir this unprivileged test process can create
+    /// itself, AND `base_dir` here is never a real quota-enforcing Btrfs mount either, so even a
+    /// hypothetical userns success would just trade one failure for another. These tests instead
+    /// exercise `try_new_with_builders` directly, injecting builders that still return the REAL
+    /// `UserNamespaceAllocator`/`WorkspaceManager` types (via their own existing test-relaxed
+    /// constructors) — never a fabricated stand-in — so what `Enabled` actually holds is unchanged.
+    #[test]
+    fn try_new_with_builders_never_calls_workspace_builder_when_userns_fails() {
+        let workspace_builder_called = Arc::new(AtomicBool::new(false));
+        let flag = workspace_builder_called.clone();
+        let result = GvisorBackend::try_new_with_builders(
+            test_registry(),
+            GvisorWorkspaceConfig::Enabled {
+                base_dir: PathBuf::from("/nonexistent-base-for-this-test"),
+                host_capacity_bytes: 1 << 30,
+                leases_dir: PathBuf::from("/nonexistent-leases-for-this-test"),
+                min_pool_size: 1,
+            },
+            Arc::new(|_: &str| {}),
+            |_leases_dir, _min_pool_size, _sink| {
+                Err(UserNamespaceAllocatorError::NoSubordinateEntry {
+                    path: PathBuf::from("/etc/subuid"),
+                    uid: 0,
+                })
+            },
+            move |_mode, _sink| {
+                flag.store(true, Ordering::SeqCst);
+                Err(WorkspaceManagerError::AlreadyLocked {
+                    base_dir: PathBuf::new(),
+                })
+            },
+        );
+        match result {
+            Err(GvisorBackendInitError::UserNamespace(_)) => {}
+            Err(other) => panic!("expected UserNamespace(_), got a different error: {other}"),
+            Ok(_) => panic!("expected UserNamespace(_), got Ok"),
+        }
+        assert!(
+            !workspace_builder_called.load(Ordering::SeqCst),
+            "the workspace builder must never run once the userns builder has failed"
+        );
+    }
+
+    #[test]
+    fn try_new_with_builders_maps_a_workspace_failure_after_userns_succeeds() {
+        let base = std::env::temp_dir().join(format!(
+            "myelin-gvisor-builders-workspace-fails-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let leases_dir = base.join("leases");
+        let subuid = base.join("subuid");
+        let subgid = base.join("subgid");
+        write_subordinate_file(&subuid, 100_000, 8);
+        write_subordinate_file(&subgid, 200_000, 8);
+        let result = GvisorBackend::try_new_with_builders(
+            test_registry(),
+            GvisorWorkspaceConfig::Enabled {
+                base_dir: PathBuf::from("/nonexistent-base-for-this-test"),
+                host_capacity_bytes: 1 << 30,
+                leases_dir: leases_dir.clone(),
+                min_pool_size: 1,
+            },
+            Arc::new(|_: &str| {}),
+            |leases_dir, min_pool_size, sink| {
+                crate::user_namespace::UserNamespaceAllocator::try_new_for_tests(
+                    leases_dir,
+                    &subuid,
+                    &subgid,
+                    min_pool_size,
+                    sink,
+                )
+            },
+            |mode, _sink| {
+                assert!(
+                    matches!(mode, WorkspaceStorageMode::EphemeralDisk { .. }),
+                    "the correct mode must be forwarded to the workspace builder"
+                );
+                Err(WorkspaceManagerError::AlreadyLocked {
+                    base_dir: PathBuf::from("/nonexistent-base-for-this-test"),
+                })
+            },
+        );
+        match result {
+            Err(GvisorBackendInitError::Workspace(_)) => {}
+            Err(other) => panic!("expected Workspace(_), got a different error: {other}"),
+            Ok(_) => panic!("expected Workspace(_), got Ok"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn try_new_with_builders_produces_enabled_holding_both_managers_when_both_succeed() {
+        let base = std::env::temp_dir().join(format!(
+            "myelin-gvisor-builders-both-succeed-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let leases_dir = base.join("leases");
+        let subuid = base.join("subuid");
+        let subgid = base.join("subgid");
+        write_subordinate_file(&subuid, 100_000, 8);
+        write_subordinate_file(&subgid, 200_000, 8);
+        let backend = GvisorBackend::try_new_with_builders(
+            test_registry(),
+            GvisorWorkspaceConfig::Enabled {
+                base_dir: PathBuf::from("/nonexistent-base-for-this-test"),
+                host_capacity_bytes: 1 << 30,
+                leases_dir: leases_dir.clone(),
+                min_pool_size: 1,
+            },
+            Arc::new(|_: &str| {}),
+            |leases_dir, min_pool_size, sink| {
+                crate::user_namespace::UserNamespaceAllocator::try_new_for_tests(
+                    leases_dir,
+                    &subuid,
+                    &subgid,
+                    min_pool_size,
+                    sink,
+                )
+            },
+            // A `WorkspaceManager::Disabled` instance stands in as a genuine, real value of the
+            // right type (mode-forwarding itself is already asserted in the sibling test above) —
+            // never a fabricated non-real value.
+            |_mode, sink| WorkspaceManager::try_new(WorkspaceStorageMode::Disabled, sink),
+        )
+        .expect("both builders must succeed with a real, fixture-backed subordinate range");
+        assert!(matches!(
+            backend.workspace_integration,
+            WorkspaceIntegration::Enabled { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn try_new_with_builders_invokes_neither_builder_when_disabled() {
+        let userns_called = Arc::new(AtomicBool::new(false));
+        let workspace_called = Arc::new(AtomicBool::new(false));
+        let u = userns_called.clone();
+        let w = workspace_called.clone();
+        let backend = GvisorBackend::try_new_with_builders(
+            test_registry(),
+            GvisorWorkspaceConfig::Disabled,
+            Arc::new(|_: &str| {}),
+            move |leases_dir, min_pool_size, sink| {
+                u.store(true, Ordering::SeqCst);
+                UserNamespaceAllocator::try_new(leases_dir, min_pool_size, sink)
+            },
+            move |mode, sink| {
+                w.store(true, Ordering::SeqCst);
+                WorkspaceManager::try_new(mode, sink)
+            },
+        )
+        .expect("Disabled must always succeed");
+        assert!(matches!(
+            backend.workspace_integration,
+            WorkspaceIntegration::Disabled
+        ));
+        assert!(!userns_called.load(Ordering::SeqCst));
+        assert!(!workspace_called.load(Ordering::SeqCst));
+    }
+
+    /// CT-007 #26/#27 INTEGRATION PROOF — the reproduced release blocker (gate-2 green drill,
+    /// 2026-08-03): a build job MUTATED the shared digest-pinned base rootfs on the host (its
+    /// canonical digest drifted `91ffb0fa… -> eb7248a1…` after one job), so the NEXT runner startup
+    /// panicked `DigestMismatch` at asset re-verify. Cause: per-job mount-target creation / gofer
+    /// writes landed in the SHARED base tree instead of a per-job ephemeral layer.
+    ///
+    /// This drives a REAL launch through `launch_with` -> `launch_compute_common_body` with a per-job
+    /// rootfs overlay manager installed (deterministic mode: no `CAP_SYS_ADMIN`/kernel OverlayFS
+    /// needed, but the SAME integration seam production uses — `materialize_job_guest_root` substitutes
+    /// the overlay merged view for the base everywhere the base path flowed). The injected run closure
+    /// stands in for runsc + the gofer: it WRITES into the guest root it is handed (a new mount-target
+    /// directory + file, and a delete of a base file), exactly the host-side layout mutation that
+    /// corrupted the base before. The property whose violation caused the panic is asserted directly:
+    /// the base tree's canonical digest is BYTE-IDENTICAL before and after the job, and none of the
+    /// job's writes reached the base — they were absorbed by the per-job overlay (a DIFFERENT path).
+    #[test]
+    fn compute_launch_guest_root_is_a_per_job_overlay_leaving_the_base_byte_pristine() {
+        use crate::asset_registry::{GvisorAssetRegistry, RootfsAssetBinding};
+        use crate::canonical_tree_sha256_hex;
+        use crate::rootfs_overlay::{RootfsOverlayManager, RootfsOverlayMode};
+
+        // A dedicated, isolated pinned base rootfs tree (never the shared per-process fixture dir).
+        let root = std::env::temp_dir().join(format!(
+            "myelin-overlay-integration-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let base = root.join("pinned-base");
+        let overlays = root.join("overlays");
+        std::fs::create_dir_all(base.join("etc")).unwrap();
+        std::fs::create_dir(base.join("workspace")).unwrap();
+        std::fs::create_dir_all(base.join("opt/myelin/cargo-vendor")).unwrap();
+        std::fs::write(base.join("etc/keep"), b"keep").unwrap();
+        std::fs::write(base.join("delete-me"), b"delete").unwrap();
+        let digest = canonical_tree_sha256_hex(&base).unwrap();
+        let image = ImageRef::pinned(format!("test.local/overlay-int@sha256:{digest}")).unwrap();
+
+        let registry = Arc::new(
+            GvisorAssetRegistry::from_bindings(vec![RootfsAssetBinding {
+                image: image.clone(),
+                rootfs: base.clone(),
+            }])
+            .expect("the pinned base verifies"),
+        );
+        let manager = Arc::new(
+            RootfsOverlayManager::initialize(
+                RootfsOverlayMode::DeterministicDirectoryForTests {
+                    overlays_dir: overlays.clone(),
+                },
+                Arc::new(|_message: &str| {}),
+            )
+            .expect("the deterministic overlay manager initializes"),
+        );
+        let backend = GvisorBackend::new(registry).with_rootfs_overlay_manager(manager);
+
+        // A minimal image-bearing compute spec resolving to the pinned base above.
+        let job = JobSpec::new(
+            JobKind::Agent,
+            image,
+            vec!["true".into()],
+            vec![],
+            vec![],
+            EgressPolicy { allow: vec![] },
+            ResourceLimits {
+                cpu_millis: 1000,
+                mem_bytes: 256 << 20,
+                disk_bytes: 1 << 30,
+                tmpfs_bytes: 1 << 30,
+                pids_max: 64,
+                timeout_secs: 120,
+            },
+            WorkspaceSpec::default(),
+            TrustTier::UntrustedFork,
+            RunTokenCredential::new("test-bearer", "j", 300).unwrap(),
+            MeterTarget {
+                reserve_id: "r".into(),
+            },
+            IdemToken("idem-overlay-int-1".into()),
+        )
+        .unwrap();
+
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec: &JobSpec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_spec| Ok(())),
+            Box::new(|_spec| Ok(())),
+        );
+
+        let base_digest_before = canonical_tree_sha256_hex(&base).unwrap();
+        let observed_root = Arc::new(Mutex::new(None::<PathBuf>));
+        let seen = observed_root.clone();
+        let base_for_closure = base.clone();
+
+        let launch = backend
+            .launch_with(
+                &job,
+                &hooks,
+                move |_spec, _cfg, _permit, rootfs, _container_id, _prep| {
+                    // The run closure receives the per-job guest root. It MUST be the overlay merged
+                    // view, NOT the shared base.
+                    assert_ne!(
+                        rootfs, base_for_closure,
+                        "the launch must NOT hand runsc the shared pinned base as its guest root"
+                    );
+                    // The merged view is a fully-populated copy of the verified base.
+                    assert_eq!(
+                        std::fs::read_to_string(rootfs.join("etc/keep")).unwrap(),
+                        "keep"
+                    );
+                    // Simulate the exact host-side mutation that corrupted the base before: create a
+                    // fresh mount-target directory + file, and delete a base file. All must land in
+                    // the per-job upper, never the shared base.
+                    std::fs::create_dir(rootfs.join("workspace/gofer-mount-target")).unwrap();
+                    std::fs::write(rootfs.join("workspace/gofer-mount-target/x"), b"job-write")
+                        .unwrap();
+                    std::fs::remove_file(rootfs.join("delete-me")).unwrap();
+                    *seen.lock().unwrap() = Some(rootfs.to_path_buf());
+                    Ok(fake_finalization())
+                },
+            )
+            .expect("the compute path launches");
+        assert!(launch.output_complete);
+
+        // THE property whose violation caused the DigestMismatch panic: the shared pinned base is
+        // byte-identical before and after the job.
+        assert_eq!(
+            canonical_tree_sha256_hex(&base).unwrap(),
+            base_digest_before,
+            "the pinned base rootfs digest must be byte-identical after a job that wrote to its root"
+        );
+        // None of the job's host-side writes reached the base tree.
+        assert!(
+            base.join("delete-me").exists(),
+            "a base file the job deleted (in the overlay) must still exist in the base"
+        );
+        assert!(
+            !base.join("workspace/gofer-mount-target").exists(),
+            "a mount target the job created (in the overlay) must NOT appear in the base"
+        );
+        // The guest root the run closure actually saw was a distinct per-job overlay path.
+        let observed = observed_root
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("run observed a root");
+        assert_ne!(
+            observed, base,
+            "the guest root was a per-job overlay, not the base"
+        );
+        assert!(
+            observed.starts_with(&overlays),
+            "the per-job overlay lives under the manager's overlay root: {observed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Sol's required-tests list: "Enabled health checks precede reserve." Forces
+    /// `userns_allocator.check_identity()` to fail deterministically (replacing the leases dir it
+    /// locked at construction) — no real Btrfs/qgroup privilege needed — and proves `hooks.reserve`
+    /// was never called by the time `launch_with` refuses.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn enabled_health_checks_refuse_before_reserve_is_ever_called() {
+        let Some((userns_allocator, leases_dir)) =
+            real_userns_allocator_for_tests("health-precedes-reserve")
+        else {
+            return;
+        };
+        // Replace the leases dir AFTER construction so `check_identity()`'s re-stat disagrees with
+        // the identity it locked at construction time — a deterministic, real failure.
+        let replacement = leases_dir.with_extension("replacement");
+        std::fs::rename(&leases_dir, &replacement).unwrap();
+        std::fs::create_dir_all(&leases_dir).unwrap();
+        assert!(
+            userns_allocator.check_identity().is_err(),
+            "the replaced leases dir must make check_identity() fail"
+        );
+
+        let workspace_manager =
+            WorkspaceManager::try_new(WorkspaceStorageMode::Disabled, Arc::new(|_: &str| {}))
+                .unwrap();
+        let backend = GvisorBackend {
+            live: Mutex::new(std::collections::HashMap::new()),
+            registry: Some(test_registry()),
+            workspace_integration: WorkspaceIntegration::Enabled {
+                workspace_manager,
+                userns_allocator,
+            },
+            checkout: GvisorCheckoutConfig::disabled(),
+            rootfs_overlay: None,
+        };
+        let reserve_called = Arc::new(AtomicBool::new(false));
+        let reserve_called_in_hook = reserve_called.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(move |spec: &JobSpec| {
+                reserve_called_in_hook.store(true, Ordering::SeqCst);
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let result = backend.launch(&spec(vec![]), &hooks);
+        assert!(
+            result.is_err(),
+            "a failed userns identity check must refuse the launch"
+        );
+        assert!(
+            !reserve_called.load(Ordering::SeqCst),
+            "hooks.reserve must never be called once an Enabled health check has failed"
+        );
+        let _ = std::fs::remove_dir_all(&leases_dir);
+        let _ = std::fs::remove_dir_all(&replacement);
+    }
+
+    /// Sol's round-2 review (hard blocker for this activation commit, since `GvisorBackend::try_new`
+    /// is now `pub`): the promised end-to-end drill through the REAL public activation path —
+    /// `GvisorBackend::try_new(GvisorWorkspaceConfig::Enabled)` + `.launch(...)` — not merely manual
+    /// orchestration of the individual pieces (those already have their own dedicated unit coverage:
+    /// `bind_enabled_lease_given_*`, `finalize_runtime_*`, `gvisor_prod_exec_test`). This is the
+    /// integration proof layered above that deterministic coverage.
+    ///
+    /// Sol's round-3 review: an EARLIER version of this drill generated its own fresh `leases_dir`
+    /// under `std::env::temp_dir()` and treated `GvisorBackend::try_new(Enabled)`'s resulting
+    /// GUARANTEED refusal (the strict allocator constructor can never accept a caller-generated,
+    /// not-pre-provisioned leaf) as an ordinary host-dependent skip — making this drill an
+    /// UNCONDITIONAL skip everywhere, never actually proving anything. Fixed: the ONLY legitimate
+    /// skip condition now is `MYELIN_USERNS_DRILL_LEASES_DIR` being unset (this drill has no
+    /// business fabricating that directory itself — see the const's own doc). Once an operator HAS
+    /// supplied it, `GvisorBackend::try_new(Enabled)` is required to succeed (`.expect`, never a
+    /// caught-and-skipped error) — reaching this point means the host is asserted to be correctly
+    /// provisioned, so any further failure (construction OR `.launch()` itself) is a genuine
+    /// regression this drill exists to catch, not a skip. The externally provisioned leases
+    /// directory is NEVER removed by this drill (it is not this drill's to own or delete) — only the
+    /// workspace base_dir this drill creates for itself is cleaned up.
+    #[test]
+    #[cfg(feature = "integration")]
+    fn explicit_user_namespace_boots_through_the_real_enabled_backend_and_launch() {
+        // Serializes against the checkout-preparation live drill, which shares the SAME
+        // operator-provisioned `leases_dir` (see `USERNS_DRILL_LEASES_DIR_LOCK`'s own doc).
+        let _leases_dir_guard = USERNS_DRILL_LEASES_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(e) = preflight_explicit_userns_policy(
+            resolved_explicit_userns_helper_dir(),
+            resolved_explicit_userns_runsc_root(),
+        ) {
+            eprintln!(
+                "[explicit-userns activation drill] SKIP: preflight_explicit_userns_policy failed: {e}"
+            );
+            return;
+        }
+        let rootfs = crate::resolved_gvisor_rootfs();
+        if !rootfs.exists() {
+            eprintln!(
+                "[explicit-userns activation drill] SKIP: staged rootfs absent at {rootfs:?}"
+            );
+            return;
+        }
+        let leases_dir = match std::env::var(USERNS_DRILL_LEASES_DIR_ENV) {
+            Ok(value) if !value.is_empty() => PathBuf::from(value),
+            _ => {
+                eprintln!(
+                    "[explicit-userns activation drill] SKIP: {USERNS_DRILL_LEASES_DIR_ENV} is not \
+                     set — this drill needs an operator-provisioned leases directory satisfying the \
+                     STRICT production allocator contract (pre-existing, euid-owned, mode 0700 or \
+                     stricter, non-writable-by-us ancestor chain); it cannot fabricate one itself"
+                );
+                return;
+            }
+        };
+
+        let tag = format!("{}-{}", std::process::id(), unique_suffix());
+        // `std::env::temp_dir()` (`/tmp`) is frequently a separate tmpfs mount, not Btrfs — use a
+        // `$HOME`-rooted path instead, matching every other real `WorkspaceManager` fixture in this
+        // file (e.g. `real_workspace_manager_for_tests`).
+        let mut workspace_base_dir = std::env::home_dir().expect("HOME must be set for this test");
+        workspace_base_dir.push(format!(
+            ".local/state/myelin-userns-activation-workspace-{tag}"
+        ));
+        let incident_sink: crate::workspace_manager::IncidentSink =
+            Arc::new(|msg: &str| eprintln!("[explicit-userns activation drill incident] {msg}"));
+
+        let backend = GvisorBackend::try_new(
+            real_userns_drill_registry(&rootfs),
+            GvisorWorkspaceConfig::Enabled {
+                base_dir: workspace_base_dir.clone(),
+                host_capacity_bytes: 1 << 30,
+                leases_dir,
+                min_pool_size: 1,
+            },
+            incident_sink,
+        )
+        .expect(
+            "GvisorBackend::try_new(Enabled) must succeed once an operator-provisioned leases \
+             directory is configured -- reaching this point asserts the host IS correctly \
+             provisioned, so a construction failure here is a genuine regression",
+        );
+
+        // Bind the spec to the SAME image the registry above was just built for (not
+        // `fixture_image()`, which points at a different, throwaway fixture rootfs).
+        let digest = crate::canonical_tar::canonical_tree_sha256_hex(&rootfs)
+            .expect("hash the real staged rootfs");
+        let mut command_spec = spec(vec![]);
+        command_spec.image =
+            ImageRef::pinned(format!("test.local/userns-drill@sha256:{digest}")).unwrap();
+        command_spec.command = vec!["/bin/sh".into(), "-c".into(), "id".into()];
+
+        let launch = backend.launch(&command_spec, &ok_hooks()).expect(
+            "launch through the real Enabled activation path must succeed on a correctly \
+                      provisioned host",
+        );
+        assert_eq!(
+            launch.result.exit_code,
+            Some(0),
+            "the guest `id` command must exit 0, stderr: {}",
+            String::from_utf8_lossy(&launch.result.stderr)
+        );
+        assert!(!launch.result.timed_out);
+        let stdout = String::from_utf8_lossy(&launch.result.stdout);
+        assert!(
+            stdout.contains("uid=65534") && stdout.contains("gid=65534"),
+            "the guest must report uid/gid 65534 (mapped via the OCI uidMappings/gidMappings this \
+             slice emits) through the REAL Enabled activation path, got: {stdout:?}"
+        );
+        backend
+            .kill(&launch.handle)
+            .expect("kill must succeed to clean up the live-map entry after a completed run");
+
+        // The leases dir is externally owned (an operator's install step) -- never removed here.
+        let _ = std::fs::remove_dir_all(&workspace_base_dir);
+    }
+
+    #[test]
+    fn gvisor_launch_drives_four_guarantees_on_the_same_trait() {
+        // The SAME SandboxBackend trait + the SAME hardening — the named-second backend.
+        let backend = GvisorBackend::new(test_registry());
+        let launch = backend
+            .launch_with(
+                &spec(vec![]),
+                &ok_hooks(),
+                |_spec, _cfg, permit, _rootfs, _container_id, _prep| {
+                    permit
+                        .commit_and_release()
+                        .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
+                    Ok(fake_finalization())
+                },
+            )
+            .unwrap();
+        assert_eq!(launch.handle.guest_id, "runsc-idem-runsc-1");
+        // The reshaped seam carries the command result back (CT-001 stub).
+        assert_eq!(launch.result.exit_code, Some(0));
+        assert!(launch.result.passed());
+        backend.kill(&launch.handle).unwrap();
+    }
+
+    /// CT-007 slice 3, piece 7a: `launch_with` (not the run closure) now generates `container_id`
+    /// — this test proves the closure genuinely RECEIVES that same value (not an empty/placeholder
+    /// one), in the expected shape, and that two separate launches never reuse it.
+    #[test]
+    fn launch_with_generates_a_distinct_container_id_the_closure_receives() {
+        let backend = GvisorBackend::new(test_registry());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        for _ in 0..2 {
+            let seen = seen.clone();
+            backend
+                .launch_with(
+                    &spec(vec![]),
+                    &ok_hooks(),
+                    move |_spec, _cfg, permit, _rootfs, container_id, _prep| {
+                        seen.lock().unwrap().push(container_id.to_string());
+                        permit
+                            .commit_and_release()
+                            .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
+                        Ok(fake_finalization())
+                    },
+                )
+                .unwrap();
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for id in seen.iter() {
+            assert!(
+                id.starts_with(&format!("myelin-prod-{}-", std::process::id())),
+                "unexpected container_id shape: {id:?}"
+            );
+        }
+        assert_ne!(
+            seen[0], seen[1],
+            "two separate launches must never reuse the same container_id"
+        );
+    }
+
+    #[test]
+    fn gvisor_refuses_to_start_on_exhaustion() {
+        let backend = GvisorBackend::new(test_registry());
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|_spec| Err(crate::HookError("exhausted".into()))),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let r = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, _permit, _rootfs, _container_id, _prep| Ok(fake_finalization()),
+        );
+        assert!(matches!(
+            r,
+            Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))
+        ));
+    }
+
+    // ───────── CT-007 slice 5b.3-6b: golden compute event-trace regression fence ─────────
+    //
+    // These three tests pin the OBSERVABLE ordered sequence of the ordinary compute path as it flows
+    // through the `launch_with` wrapper into the extracted `launch_compute_with` body. 5b.3-6b moved
+    // that body byte-for-byte and made `launch_with` a plain delegator; the point of these tests is a
+    // regression fence — any future edit that reorders, drops, or duplicates an OBSERVABLE hook/run
+    // step (isolation floor → reserve → launch permit → run spawn → settle) changes the recorded trace
+    // and fails here. The fence covers the observable hook/run ordering and the two early-refusal
+    // boundaries; it does NOT independently detect a reorder among non-observed internal steps (e.g.
+    // moving container-id minting relative to reserve, or a duplicated registry lookup) — those are
+    // covered by the mechanical byte-identity of the extraction plus the existing compute unit tests.
+    // The Disabled (no-privilege) backend is used deliberately: the
+    // Enabled-only steps (workspace-manager health check, `acquire_enabled_workspace`, Enabled
+    // `RuntimePreparation`) are already fenced by the 6a acquire/settle + dispose matrices, and the
+    // compute ORDERING these tests fence is identical regardless of workspace integration.
+
+    /// Golden success trace: the exact ordered hook/run sequence for a compute launch, plus the stable
+    /// `myelin-prod-*` workload id the run closure sees, the single live-map insert, and the
+    /// byte-identical measured usage handed to `settle_completed`.
+    #[test]
+    fn golden_compute_trace_through_launch_with_is_byte_stable() {
+        let backend = GvisorBackend::new(test_registry());
+        let trace = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed_container_id = Arc::new(Mutex::new(None::<String>));
+
+        let t_iso = trace.clone();
+        let t_res = trace.clone();
+        let t_settle = trace.clone();
+        let t_attr = trace.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(move |spec| {
+                t_res.lock().unwrap().push("reserve".into());
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(move |_spec, _h, usage| {
+                t_settle.lock().unwrap().push(format!(
+                    "settle:{}:{}",
+                    usage.cpu_seconds, usage.mem_byte_seconds
+                ));
+                Ok(())
+            }),
+            Box::new(move |_spec| {
+                t_attr.lock().unwrap().push("acquire_launch_permit".into());
+                Ok(())
+            }),
+            Box::new(move |_spec| {
+                t_iso.lock().unwrap().push("isolation_floor".into());
+                Ok(())
+            }),
+        );
+
+        let t_run = trace.clone();
+        let seen_id = observed_container_id.clone();
+        let launch = backend
+            .launch_with(
+                &spec(vec![]),
+                &hooks,
+                move |_spec, _cfg, _permit, _rootfs, container_id, _prep| {
+                    t_run.lock().unwrap().push("run_spawn".into());
+                    *seen_id.lock().unwrap() = Some(container_id.to_string());
+                    Ok(fake_finalization())
+                },
+            )
+            .expect("the ordinary compute path launches");
+
+        assert_eq!(
+            *trace.lock().unwrap(),
+            vec![
+                "isolation_floor".to_string(),
+                "reserve".to_string(),
+                "acquire_launch_permit".to_string(),
+                "run_spawn".to_string(),
+                // `fake_run` measures {cpu:1, mem:1}; `settle_completed` receives it VERBATIM.
+                "settle:1:1".to_string(),
+            ],
+            "the ordered compute sequence through launch_with -> launch_compute_with is the fence"
+        );
+
+        // The container id the run closure receives is the freshly minted stable workload id.
+        let observed = observed_container_id
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the run closure observed a container id");
+        assert!(
+            observed.starts_with(&format!("myelin-prod-{}-", std::process::id())),
+            "the run closure sees the stable myelin-prod-* workload id, got {observed:?}"
+        );
+        // The successful run is inserted into the live map exactly once (keyed by runsc-<idem>).
+        assert_eq!(
+            backend.live.lock().unwrap().len(),
+            1,
+            "a successful compute launch inserts exactly one live entry"
+        );
+        assert!(launch.output_complete);
+    }
+
+    /// Golden failure variant 1 — a `git_wire_only()` backend (no registry) refuses an image-bearing
+    /// job at registry resolve, AFTER the isolation floor but BEFORE `reserve`; the run closure never
+    /// spawns. This fences the registry-None ordering (resolve precedes reserve).
+    #[test]
+    fn golden_git_wire_only_refuses_at_registry_before_reserve() {
+        let backend = GvisorBackend::git_wire_only();
+        let trace = Arc::new(Mutex::new(Vec::<String>::new()));
+        let t_iso = trace.clone();
+        let t_res = trace.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(move |spec| {
+                t_res.lock().unwrap().push("reserve".into());
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_spec| Ok(())),
+            Box::new(move |_spec| {
+                t_iso.lock().unwrap().push("isolation_floor".into());
+                Ok(())
+            }),
+        );
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_at = ran.clone();
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                ran_at.store(true, Ordering::SeqCst);
+                Ok(fake_finalization())
+            },
+        );
+        assert!(
+            matches!(result, Err(SandboxLaunchError::Failed(GvisorError::Image(_)))),
+            "a git_wire_only backend refuses an image-bearing job at registry resolve, got {result:?}"
+        );
+        assert_eq!(
+            *trace.lock().unwrap(),
+            vec!["isolation_floor".to_string()],
+            "isolation floor runs, then registry resolve refuses BEFORE reserve is ever called"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the run closure never spawns on a pre-reserve refusal"
+        );
+    }
+
+    /// Golden failure variant 2 — a `reserve` refusal stops the sequence after the isolation floor and
+    /// reserve, before the launch permit and the run spawn. Fences that reserve gates the launch.
+    #[test]
+    fn golden_reserve_failure_stops_before_launch_permit_and_run() {
+        let backend = GvisorBackend::new(test_registry());
+        let trace = Arc::new(Mutex::new(Vec::<String>::new()));
+        let t_iso = trace.clone();
+        let t_res = trace.clone();
+        let t_attr = trace.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(move |_spec| {
+                t_res.lock().unwrap().push("reserve".into());
+                Err(crate::HookError("reserve exhausted".into()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(move |_spec| {
+                t_attr.lock().unwrap().push("acquire_launch_permit".into());
+                Ok(())
+            }),
+            Box::new(move |_spec| {
+                t_iso.lock().unwrap().push("isolation_floor".into());
+                Ok(())
+            }),
+        );
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_at = ran.clone();
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                ran_at.store(true, Ordering::SeqCst);
+                Ok(fake_finalization())
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))
+            ),
+            "a reserve refusal surfaces as a Hook failure, got {result:?}"
+        );
+        assert_eq!(
+            *trace.lock().unwrap(),
+            vec!["isolation_floor".to_string(), "reserve".to_string()],
+            "isolation floor then reserve; the reserve failure stops before the launch permit and run"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the run closure never spawns when reserve refuses"
+        );
+    }
+
+    #[test]
+    fn successful_reporter_owned_gvisor_launch_defers_settlement_to_terminal_reporter() {
+        let backend = GvisorBackend::new(test_registry());
+        let hook_settled = Arc::new(AtomicBool::new(false));
+        let hook_settled_at = hook_settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, _u| {
+                hook_settled_at.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+
+        backend
+            .launch_with(
+                &spec(vec![]),
+                &hooks,
+                |_spec, _cfg, permit, _rootfs, _container_id, _prep| {
+                    permit
+                        .commit_and_release()
+                        .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
+                    Ok(fake_finalization())
+                },
+            )
+            .expect("the sandbox returns measured usage for the reporter transaction");
+        assert!(
+            !hook_settled.load(Ordering::SeqCst),
+            "reporter-owned completion must not settle through the hook"
+        );
+    }
+
+    #[test]
+    fn settlement_failure_unconditionally_kills_and_forgets_the_container() {
+        let backend = GvisorBackend::new(test_registry());
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _handle, _usage| {
+                Err(crate::HookError("injected settlement failure".into()))
+            }),
+            Box::new(|_spec| Ok(())),
+            Box::new(|_spec| Ok(())),
+        );
+
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, permit, _rootfs, _container_id, _prep| {
+                permit
+                    .commit_and_release()
+                    .map_err(|error| RunFailure::uncommitted(error.to_string()))?;
+                Ok(fake_finalization())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))
+        ));
+        assert!(
+            backend.live.lock().unwrap().is_empty(),
+            "an error without a returned handle cannot retain an unreachable live-map entry"
+        );
+    }
+
+    #[test]
+    fn gvisor_releases_the_unused_reserve_when_final_attribution_refuses() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(Mutex::new(None));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, usage| {
+                *settled_at.lock().unwrap() = Some(usage);
+                Ok(())
+            }),
+            Box::new(|_t| Err(crate::HookError("claim canceled".into()))),
+            Box::new(|_s| Ok(())),
+        );
+        let spawned = Arc::new(AtomicBool::new(false));
+        let spawned_at = spawned.clone();
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                spawned_at.store(true, Ordering::SeqCst);
+                Ok(fake_finalization())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))
+        ));
+        assert!(!spawned.load(Ordering::SeqCst));
+        assert_eq!(
+            *settled.lock().unwrap(),
+            Some(ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            })
+        );
+    }
+
+    /// Sol's round-1 review: "all pre-permit compound-error combinations" -- when final
+    /// attribution refuses AND releasing the now-unused reservation ALSO fails, the caller must see
+    /// BOTH messages, never just the attribution error silently swallowing the release failure (or
+    /// vice versa). Runs against `Disabled` (no privileged workspace needed) since this exercises
+    /// the message-compounding logic itself, which is identical regardless of workspace
+    /// integration -- `cleanup_diagnostics` is unconditionally empty for `Disabled`, so this proves
+    /// the OTHER two of the three compounding sources (attribution error + release failure) meet
+    /// correctly through the real `launch_with` code path, not just the pure `join_diagnostics`
+    /// helper in isolation.
+    #[test]
+    fn launch_permit_refusal_compounds_with_a_failing_reservation_release() {
+        let backend = GvisorBackend::new(test_registry());
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _h, _usage| {
+                Err(crate::HookError("settle backend unavailable".into()))
+            }),
+            Box::new(|_t| Err(crate::HookError("claim canceled".into()))),
+            Box::new(|_s| Ok(())),
+        );
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, _permit, _rootfs, _container_id, _prep| Ok(fake_finalization()),
+        );
+        match result {
+            Err(SandboxLaunchError::Failed(GvisorError::Runtime(message))) => {
+                assert!(
+                    message.contains("claim canceled"),
+                    "the original attribution refusal must survive: {message}"
+                );
+                assert!(
+                    message.contains("releasing the unused reservation also failed"),
+                    "the release failure must be compounded in, not lost: {message}"
+                );
+                assert!(
+                    message.contains("settle backend unavailable"),
+                    "the release failure's own text must be present verbatim: {message}"
+                );
+            }
+            other => panic!("expected a compound GvisorError::Runtime, got {other:?}"),
+        }
+    }
+
+    /// The pre-existing leak this fix closes: previously, ANY error from `run(...)` propagated
+    /// straight out of `launch_with` with NEITHER `release_unused` NOR `settle_completed` ever
+    /// called — leaking the reservation on every single run failure. These tests prove each of the
+    /// four `RunFailure` phases dispatches to the correct outcome, per Sol's corrected disposition
+    /// table (phase × `CompletionSettlementOwner`):
+    ///
+    /// | Phase                    | `Hook` owner                       | `TerminalReporter` owner                  |
+    /// |---------------------------|-------------------------------------|--------------------------------------------|
+    /// | `Uncommitted`             | `release_unused`, then `Failed`     | `release_unused`, then `Failed`             |
+    /// | `CommitOutcomeUnknown`    | `DurableOutcomeUnknown`             | `DurableOutcomeUnknown`                     |
+    /// | `CommittedButNotExecuted` | settle zero, then `Failed`          | `RetryableAttempt(SandboxInfrastructure, 0)`|
+    /// | `Executed`                | settle usage, then `Failed`         | `RetryableAttempt(SandboxInfrastructure, usage)`|
+    ///
+    /// `Uncommitted` and `CommitOutcomeUnknown` are owner-INDEPENDENT (an uncommitted attempt has no
+    /// terminal report to defer to regardless of owner; an outcome-unknown attempt must never be
+    /// guessed at either way) — only the two post-commit phases branch on ownership, since only they
+    /// carry a real (if zero) measured cost a `TerminalReporter` must eventually account for.
+    #[test]
+    fn gvisor_run_failure_uncommitted_releases_reserve_via_release_unused() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(Mutex::new(None));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, usage| {
+                *settled_at.lock().unwrap() = Some(usage);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                Err(RunFailure::uncommitted("injected uncommitted run failure"))
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SandboxLaunchError::Failed(GvisorError::Runtime(_)))
+            ),
+            "an uncommitted run failure must surface as Failed(GvisorError::Runtime): {result:?}"
+        );
+        assert_eq!(
+            *settled.lock().unwrap(),
+            Some(ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            }),
+            "release_unused must settle at zero even under reporter-owned completion — it is \
+             owner-independent, unlike settle_completed"
+        );
+    }
+
+    /// `CommitOutcomeUnknown` must NEVER release or settle — the durable commit outcome is
+    /// genuinely unknown, and guessing either way misaccounts a real reservation. Owner-independent:
+    /// this test uses `Hook` ownership specifically to prove the outcome-unknown path bypasses
+    /// `settle_completed` entirely rather than merely happening to observe a reporter's no-op.
+    #[test]
+    fn gvisor_run_failure_commit_outcome_unknown_never_releases_or_settles() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(AtomicBool::new(false));
+        let settled_at = settled.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        let released_at = released.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, usage| {
+                settled_at.store(true, Ordering::SeqCst);
+                if usage
+                    == (ResourceUsage {
+                        cpu_seconds: 0,
+                        mem_byte_seconds: 0,
+                    })
+                {
+                    released_at.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                Err(RunFailure::commit_outcome_unknown(
+                    "injected commit-outcome-unknown run failure",
+                ))
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SandboxLaunchError::DurableOutcomeUnknown(GvisorError::Runtime(_)))
+            ),
+            "a commit-outcome-unknown run failure must surface as DurableOutcomeUnknown: {result:?}"
+        );
+        assert!(
+            !settled.load(Ordering::SeqCst) && !released.load(Ordering::SeqCst),
+            "neither settle_completed nor release_unused (which also calls the settle hook) may \
+             ever fire for an outcome-unknown attempt"
+        );
+    }
+
+    /// `CommittedButNotExecuted` under `Hook` ownership settles zero synchronously, then surfaces
+    /// `Failed` — a real terminal report IS expected here (unlike `Uncommitted`'s "none will ever
+    /// follow"), and `Hook` ownership means the hook itself is the one committing that report.
+    #[test]
+    fn gvisor_run_failure_committed_but_not_executed_hook_owner_settles_zero_then_fails() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(Mutex::new(None));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, usage| {
+                *settled_at.lock().unwrap() = Some(usage);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                Err(RunFailure::committed_but_not_executed(
+                    "injected committed-but-not-executed run failure",
+                ))
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SandboxLaunchError::Failed(GvisorError::Runtime(_)))
+            ),
+            "a Hook-owned committed-but-not-executed failure must surface as Failed: {result:?}"
+        );
+        assert_eq!(
+            *settled.lock().unwrap(),
+            Some(ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            }),
+            "Hook ownership must settle zero usage synchronously through settle_completed"
+        );
+    }
+
+    /// `CommittedButNotExecuted` under `TerminalReporter` ownership must NOT call `settle_completed`
+    /// at all (it would silently no-op) — it must instead surface `RetryableAttempt` so the RUNNER
+    /// routes it through the reporter's own `report_retryable_attempt` transaction, which durably
+    /// accounts usage and either requeues or terminalizes the exact claim. This is the exact case
+    /// Sol's review caught: the original fix called `settle_completed` here and returned an
+    /// ordinary `Failed`, which under reporter ownership silently discarded the accounting with no
+    /// terminal report ever following.
+    #[test]
+    fn gvisor_run_failure_committed_but_not_executed_reporter_owner_yields_retryable_attempt() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(AtomicBool::new(false));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, _usage| {
+                settled_at.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                Err(RunFailure::committed_but_not_executed(
+                    "injected committed-but-not-executed run failure",
+                ))
+            },
+        );
+        match result {
+            Err(SandboxLaunchError::RetryableAttempt { cause, usage, .. }) => {
+                assert_eq!(cause, RetryableAttemptCause::SandboxInfrastructure);
+                assert_eq!(
+                    usage,
+                    ResourceUsage {
+                        cpu_seconds: 0,
+                        mem_byte_seconds: 0,
+                    }
+                );
+            }
+            other => panic!("expected RetryableAttempt with zero usage, got {other:?}"),
+        }
+        assert!(
+            !settled.load(Ordering::SeqCst),
+            "settle_completed must never be called directly here — the runner's retryable-attempt \
+             transaction is the sole accounting path under reporter ownership"
+        );
+    }
+
+    /// `Executed` under `Hook` ownership must settle the CONSERVATIVE fallback usage synchronously,
+    /// never zero — a job engineered to fail exactly after the runtime was released to exec must not
+    /// execute for free (the host-DoS surface Sol's design closes) — then surface `Failed`.
+    #[test]
+    fn gvisor_run_failure_executed_hook_owner_settles_fallback_usage_then_fails() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(Mutex::new(None));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, usage| {
+                *settled_at.lock().unwrap() = Some(usage);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let fallback_usage = ResourceUsage {
+            cpu_seconds: 7,
+            mem_byte_seconds: 700,
+        };
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                Err(RunFailure::executed(
+                    "injected executed-phase run failure",
+                    fallback_usage,
+                ))
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SandboxLaunchError::Failed(GvisorError::Runtime(_)))
+            ),
+            "a Hook-owned executed-phase failure must surface as Failed: {result:?}"
+        );
+        assert_eq!(
+            *settled.lock().unwrap(),
+            Some(fallback_usage),
+            "the executed phase must settle its carried conservative fallback usage, never zero"
+        );
+    }
+
+    /// `Executed` under `TerminalReporter` ownership must surface `RetryableAttempt` carrying the
+    /// SAME conservative fallback usage (never zero) — the reporter's own transaction, not
+    /// `settle_completed`, is what durably accounts it.
+    #[test]
+    fn gvisor_run_failure_executed_reporter_owner_yields_retryable_attempt_with_fallback_usage() {
+        let backend = GvisorBackend::new(test_registry());
+        let settled = Arc::new(AtomicBool::new(false));
+        let settled_at = settled.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(move |_spec, _h, _usage| {
+                settled_at.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let fallback_usage = ResourceUsage {
+            cpu_seconds: 3,
+            mem_byte_seconds: 300,
+        };
+        let result = backend.launch_with(
+            &spec(vec![]),
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                Err(RunFailure::executed(
+                    "injected executed-phase run failure",
+                    fallback_usage,
+                ))
+            },
+        );
+        match result {
+            Err(SandboxLaunchError::RetryableAttempt { cause, usage, .. }) => {
+                assert_eq!(cause, RetryableAttemptCause::SandboxInfrastructure);
+                assert_eq!(usage, fallback_usage);
+            }
+            other => panic!("expected RetryableAttempt with the fallback usage, got {other:?}"),
+        }
+        assert!(
+            !settled.load(Ordering::SeqCst),
+            "settle_completed must never be called directly here — the runner's retryable-attempt \
+             transaction is the sole accounting path under reporter ownership"
+        );
+    }
+
+    /// CT-007 gate 2/4 (f, corrected ordering): a RED isolation floor refuses BEFORE the registry
+    /// lookup is ever consulted — proven by using a genuinely UNREGISTERED image (so if the
+    /// (wrong-order) implementation queried the registry first, it would refuse there as
+    /// `GvisorError::Image` WITHOUT the floor hook ever having been called, and `floor_called` would
+    /// read `false`). Asserting `floor_called == true` alongside a `GvisorError::Hook` result is only
+    /// possible if the floor really did run first, despite the image being unresolvable — which also
+    /// means an exhausted-wallet caller cannot force the (now-cheap, but real) registry lookup by
+    /// repeatedly failing the floor.
+    #[test]
+    fn red_isolation_floor_refuses_before_registry_lookup_reserve_or_spawn() {
+        let floor_called = Arc::new(AtomicBool::new(false));
+        let floor_called_at = floor_called.clone();
+        let reserve_called = Arc::new(AtomicBool::new(false));
+        let reserve_called_at = reserve_called.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(move |spec| {
+                reserve_called_at.store(true, Ordering::SeqCst);
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(move |_spec| {
+                floor_called_at.store(true, Ordering::SeqCst);
+                Err(crate::HookError(
+                    "isolation floor is RED for this test".into(),
+                ))
+            }),
+        );
+
+        let mut unregistered_spec = spec(vec![]);
+        unregistered_spec.image = ImageRef::pinned(
+            "test.local/genuinely-unregistered@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        )
+        .unwrap();
+        let spawned = Arc::new(AtomicBool::new(false));
+        let spawned_at = spawned.clone();
+        // A fresh, otherwise-empty registry — the spec's image is deliberately NOT registered here,
+        // so a wrong-order (registry-before-floor) implementation would refuse via `Image`, not
+        // `Hook`, and would never call the floor closure at all.
+        let backend = GvisorBackend::new(Arc::new(
+            crate::asset_registry::GvisorAssetRegistry::from_bindings(vec![]).unwrap(),
+        ));
+        let result = backend.launch_with(
+            &unregistered_spec,
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                spawned_at.store(true, Ordering::SeqCst);
+                Ok(fake_finalization())
+            },
+        );
+
+        assert!(
+            matches!(result, Err(SandboxLaunchError::Failed(GvisorError::Hook(_)))),
+            "the isolation floor's own refusal must surface, proving it ran BEFORE the registry \
+             lookup (an unregistered image would otherwise short-circuit as `Image` first): {result:?}"
+        );
+        assert!(
+            floor_called.load(Ordering::SeqCst),
+            "the isolation floor must be consulted even for an unresolvable image"
+        );
+        assert!(
+            !reserve_called.load(Ordering::SeqCst),
+            "no reserve may be attempted"
+        );
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "the run closure must never be invoked"
+        );
+    }
+
+    /// CT-007 gate 2/4 (f, still-correct half): a GREEN isolation floor + an unknown image still
+    /// refuses before `reserve`/the `run` closure — none of them ever fire. This is the part of the
+    /// original ordering test that was already right; it just now runs AFTER the floor instead of
+    /// before it.
+    #[test]
+    fn unknown_image_after_green_floor_refuses_before_reserve_or_spawn() {
+        let floor_called = Arc::new(AtomicBool::new(false));
+        let floor_called_at = floor_called.clone();
+        let reserve_called = Arc::new(AtomicBool::new(false));
+        let reserve_called_at = reserve_called.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::Hook,
+            Box::new(move |spec| {
+                reserve_called_at.store(true, Ordering::SeqCst);
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(move |_spec| {
+                floor_called_at.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        );
+
+        let mut unregistered_spec = spec(vec![]);
+        unregistered_spec.image = ImageRef::pinned(
+            "test.local/genuinely-unregistered@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        )
+        .unwrap();
+        let spawned = Arc::new(AtomicBool::new(false));
+        let spawned_at = spawned.clone();
+        // A fresh, otherwise-empty registry — the fixture image is deliberately NOT registered here.
+        let backend = GvisorBackend::new(Arc::new(
+            crate::asset_registry::GvisorAssetRegistry::from_bindings(vec![]).unwrap(),
+        ));
+        let result = backend.launch_with(
+            &unregistered_spec,
+            &hooks,
+            move |_spec, _cfg, _permit, _rootfs, _container_id, _prep| {
+                spawned_at.store(true, Ordering::SeqCst);
+                Ok(fake_finalization())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SandboxLaunchError::Failed(GvisorError::Image(_)))
+        ));
+        assert!(
+            floor_called.load(Ordering::SeqCst),
+            "the isolation floor must have been consulted (and passed) first"
+        );
+        assert!(
+            !reserve_called.load(Ordering::SeqCst),
+            "no reserve may be attempted"
+        );
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "the run closure must never be invoked"
+        );
+    }
+
+    /// A committed regression pin for `GvisorBackend::git_wire_only()`'s refusal of ordinary launch:
+    /// the behavior existed (see `launch_with`'s `self.registry.as_ref().ok_or_else(...)`) but had no
+    /// test asserting it returns `GvisorError::Image` rather than panicking or hanging.
+    #[test]
+    fn git_wire_only_backend_refuses_ordinary_launch() {
+        let backend = GvisorBackend::git_wire_only();
+        let hooks = ok_hooks();
+        let result = backend.launch(&spec(vec![]), &hooks);
+        assert!(
+            matches!(
+                result,
+                Err(SandboxLaunchError::Failed(GvisorError::Image(_)))
+            ),
+            "a git-wire-only backend has no asset registry and must refuse an ordinary launch as \
+             GvisorError::Image, not panic or hang: {result:?}"
+        );
+    }
+
+    /// The same refusal for the streaming entry point.
+    #[test]
+    fn git_wire_only_backend_refuses_ordinary_launch_streaming() {
+        let backend = GvisorBackend::git_wire_only();
+        let hooks = ok_hooks();
+        let output: Arc<dyn SandboxOutputSink> = Arc::new(RecordingOutput::default());
+        let result =
+            backend.launch_streaming(&spec(vec![]), &hooks, output, SandboxCancellation::new());
+        assert!(
+            matches!(result, Err(SandboxLaunchError::Failed(GvisorError::Image(_)))),
+            "a git-wire-only backend must refuse ordinary launch_streaming the same way as launch: \
+             {result:?}"
+        );
     }
 }

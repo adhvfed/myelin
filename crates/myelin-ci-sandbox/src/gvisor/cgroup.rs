@@ -538,8 +538,8 @@ mod tests {
 
     /// This module's own source, for the launch-ordering source pin below.
     const CGROUP_SOURCE: &str = include_str!("cgroup.rs");
-    /// The parent `gvisor` module's source — the launch continuation the cgroup feeds into lives there.
-    const GVISOR_SOURCE: &str = include_str!("../gvisor.rs");
+    /// The sibling module holding the launch continuation the cgroup feeds into.
+    const RUN_SOURCE: &str = include_str!("run.rs");
 
     /// The body of a named item within `source`, from its signature to the next top-level `}` at
     /// column 0 — enough to scope a source pin to one function without pulling in its neighbours.
@@ -583,7 +583,7 @@ mod tests {
                 < create.find("Ok(MemoryCgroup").unwrap(),
             "MemoryCgroup::create must not return a launchable handle before every limit write succeeds"
         );
-        let run = source_of_in(GVISOR_SOURCE, "fn run_production_container_streaming(");
+        let run = source_of_in(RUN_SOURCE, "fn run_production_container_streaming(");
         assert!(
             run.find("MemoryCgroup::create(spec.limits.mem_bytes, spec.limits.cpu_millis)")
                 .unwrap()

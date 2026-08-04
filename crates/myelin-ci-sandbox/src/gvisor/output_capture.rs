@@ -6,8 +6,7 @@ use crate::launch_gate::{DirectChildRetirement, SandboxCommand, SpawnPhase};
 use crate::redaction::RedactionPlan;
 use crate::user_namespace::RunscInvocationMode;
 use crate::{
-    drain_capped, JobSpec,
-    LaunchPermit, ResourceUsage, SandboxOutputSink, SandboxOutputStream,
+    drain_capped, JobSpec, LaunchPermit, ResourceUsage, SandboxOutputSink, SandboxOutputStream,
     SandboxResult, SANDBOX_CAPTURE_BOUND,
 };
 use std::io::{Read, Seek, Write};
@@ -92,13 +91,13 @@ impl RunFailure {
         }
     }
 
-    fn commit_outcome_unknown(message: impl Into<String>) -> Self {
+    pub(super) fn commit_outcome_unknown(message: impl Into<String>) -> Self {
         Self::CommitOutcomeUnknown {
             message: message.into(),
         }
     }
 
-    fn committed_but_not_executed(message: impl Into<String>) -> Self {
+    pub(super) fn committed_but_not_executed(message: impl Into<String>) -> Self {
         Self::CommittedButNotExecuted {
             message: message.into(),
         }
@@ -580,7 +579,9 @@ impl SandboxOutputSink for TotalLogCappedOutput {
     }
 }
 
-pub(super) fn cap_total_job_output(output: Arc<dyn SandboxOutputSink>) -> Arc<dyn SandboxOutputSink> {
+pub(super) fn cap_total_job_output(
+    output: Arc<dyn SandboxOutputSink>,
+) -> Arc<dyn SandboxOutputSink> {
     Arc::new(TotalLogCappedOutput::new(output))
 }
 
@@ -774,7 +775,11 @@ fn executed_fallback_usage(
 /// bound the Firecracker backend uses (shared `lib.rs` const). Usage is the REAL measured figure: host
 /// CPU-seconds of the `runsc` process (or a wall-clock ceiling fallback so a real run never
 /// under-meters to 0) + mem-byte-seconds from the job's mem ceiling × wall-seconds.
-pub(super) fn build_result(spec: &JobSpec, o: &RunscOutcome, redaction: &RedactionPlan) -> SandboxResult {
+pub(super) fn build_result(
+    spec: &JobSpec,
+    o: &RunscOutcome,
+    redaction: &RedactionPlan,
+) -> SandboxResult {
     // BOUNDARY REDACTION (CT-004f sub-step 1): mask the job's CI-managed secret needles in the captured
     // streams HERE — the last step before the bytes populate `SandboxResult` and cross back toward the
     // durable log pipeline — so no injected secret is sealed into the content-addressed log store. The
@@ -831,5 +836,286 @@ impl RunscChild for SpawnedRunsc {
     fn wait(&mut self) -> Result<i32, String> {
         // The real exit was already captured from the `runsc` child's exit status (no real wait left).
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::Read;
+
+    use std::sync::Arc;
+
+    use crate::gvisor::test_fixtures::*;
+    use crate::redaction::RedactionPlan;
+    use crate::{SandboxOutputSink, SandboxOutputStream, SANDBOX_CAPTURE_BOUND};
+
+    #[test]
+    fn streaming_drain_keeps_only_the_head_but_forwards_chunks_to_the_job_budget() {
+        let input: Vec<u8> = (0..(3 * 64 * 1024 + 17))
+            .map(|offset| (offset % 251) as u8)
+            .collect();
+        let sink = Arc::new(RecordingOutput::default());
+        let capped: Arc<dyn SandboxOutputSink> = Arc::new(TotalLogCappedOutput::new(sink.clone()));
+        let output = StreamingOutput { sink: capped };
+        let redaction = RedactionPlan::none();
+
+        let (head, truncated, error) = drain_capped_streaming(
+            std::io::Cursor::new(&input),
+            1024,
+            SandboxOutputStream::Stdout,
+            Some(&output),
+            &redaction,
+        );
+
+        assert_eq!(error, None);
+        assert!(truncated);
+        assert_eq!(head, input[..1024]);
+        assert_eq!(
+            *sink.bytes.lock().unwrap(),
+            input,
+            "bytes beyond the diagnostic head still reach the shared job budget when under it"
+        );
+    }
+
+    #[test]
+    fn streaming_drain_masks_an_injected_value_split_across_pipe_reads() {
+        let sink = Arc::new(RecordingOutput::default());
+        let output = StreamingOutput { sink: sink.clone() };
+        let redaction = RedactionPlan::for_needles([b"split-secret".to_vec()]).unwrap();
+        let reader = std::io::Cursor::new(b"before split-".as_slice())
+            .chain(std::io::Cursor::new(b"secret after".as_slice()));
+
+        let (_head, _truncated, error) = drain_capped_streaming(
+            reader,
+            1024,
+            SandboxOutputStream::Stdout,
+            Some(&output),
+            &redaction,
+        );
+
+        assert_eq!(error, None);
+        assert!(!sink
+            .bytes
+            .lock()
+            .unwrap()
+            .windows(b"split-secret".len())
+            .any(|window| window == b"split-secret"));
+    }
+
+    #[test]
+    fn result_head_redacts_before_truncating_a_boundary_straddling_secret() {
+        let secret = b"BOUNDARY-STRADDLING-SECRET";
+        let prefix_len = secret.len() / 2;
+        let mut input = vec![b'a'; SANDBOX_CAPTURE_BOUND - prefix_len];
+        input.extend_from_slice(secret);
+        input.extend(std::iter::repeat_n(b'z', SANDBOX_CAPTURE_BOUND));
+        let redaction = RedactionPlan::for_needles([secret.to_vec()]).unwrap();
+
+        let (head, truncated, error) = drain_capped_streaming(
+            std::io::Cursor::new(input),
+            SANDBOX_CAPTURE_BOUND,
+            SandboxOutputStream::Stdout,
+            None,
+            &redaction,
+        );
+
+        assert_eq!(error, None);
+        assert!(truncated);
+        assert!(!head.windows(secret.len()).any(|window| window == secret));
+        assert!(!head[..].ends_with(&secret[..prefix_len]));
+    }
+
+    #[test]
+    fn streaming_capture_total_log_cap_truncates_with_marker_and_stops_growth() {
+        let payload_limit = 1024;
+        let total_limit = payload_limit + TOTAL_LOG_TRUNCATION_MARKER.len();
+        let sink = Arc::new(RecordingOutput::default());
+        let capped = Arc::new(TotalLogCappedOutput::with_limit(sink.clone(), total_limit));
+        let output = StreamingOutput {
+            sink: capped.clone(),
+        };
+        let redaction = RedactionPlan::none();
+        let input = vec![b'x'; 256 * 1024];
+
+        let (_head, truncated, error) = drain_capped_streaming(
+            std::io::Cursor::new(&input),
+            128,
+            SandboxOutputStream::Stdout,
+            Some(&output),
+            &redaction,
+        );
+        assert_eq!(error, None);
+        assert!(truncated, "the diagnostic head is also truncated");
+
+        let captured_before_late_frame = sink.bytes.lock().unwrap().clone();
+        capped
+            .emit(SandboxOutputStream::Stderr, b"late bytes must be discarded")
+            .unwrap();
+        let captured = sink.bytes.lock().unwrap().clone();
+        assert_eq!(captured, captured_before_late_frame);
+        assert_eq!(captured.len(), total_limit);
+        assert_eq!(&captured[..payload_limit], &input[..payload_limit]);
+        assert!(captured.ends_with(TOTAL_LOG_TRUNCATION_MARKER));
+        assert_eq!(capped.captured_bytes(), total_limit);
+    }
+
+    #[test]
+    fn total_log_cap_is_shared_across_streams_and_under_ceiling_is_unchanged() {
+        let sink = Arc::new(RecordingOutput::default());
+        let total_limit = TOTAL_LOG_TRUNCATION_MARKER.len() + 64;
+        let capped = TotalLogCappedOutput::with_limit(sink.clone(), total_limit);
+        capped
+            .emit(SandboxOutputStream::Stdout, b"ordinary stdout\n")
+            .unwrap();
+        capped
+            .emit(SandboxOutputStream::Stderr, b"ordinary stderr\n")
+            .unwrap();
+        assert_eq!(
+            *sink.bytes.lock().unwrap(),
+            b"ordinary stdout\nordinary stderr\n",
+            "combined output below the payload ceiling must be byte-identical"
+        );
+
+        let sink = Arc::new(RecordingOutput::default());
+        let capped =
+            TotalLogCappedOutput::with_limit(sink.clone(), TOTAL_LOG_TRUNCATION_MARKER.len() + 8);
+        capped.emit(SandboxOutputStream::Stdout, b"123456").unwrap();
+        capped.emit(SandboxOutputStream::Stderr, b"abcdef").unwrap();
+        let captured = sink.bytes.lock().unwrap().clone();
+        assert_eq!(&captured[..8], b"123456ab");
+        assert!(captured.ends_with(TOTAL_LOG_TRUNCATION_MARKER));
+        assert_eq!(
+            captured.len(),
+            TOTAL_LOG_TRUNCATION_MARKER.len() + 8,
+            "stdout and stderr must consume one exact shared total-byte budget"
+        );
+    }
+
+    // CT-004f sub-step 1: `build_result` APPLIES the redaction plan to both captured streams — the
+    // boundary seam is wired, not just the `RedactionPlan` unit. A populated injection plan masks the
+    // needle before it reaches `SandboxResult`.
+    #[test]
+    fn build_result_masks_needles_in_both_streams() {
+        let s = spec(vec![]);
+        // Assemble the scanner-shaped credential at runtime. Keeping the complete sentinel in this
+        // source blob would make Myelin's own reject-before-promote scanner reject the repository
+        // that implements and tests it.
+        let needle = [b"AK".as_slice(), b"IAsecret"].concat();
+        let stdout = [b"deploying with ".as_slice(), needle.as_slice(), b" now"].concat();
+        let stderr = [b"error: ".as_slice(), needle.as_slice(), b" invalid"].concat();
+        let plan = RedactionPlan::for_needles([needle.clone()]).unwrap();
+        let o = outcome(&stdout, &stderr);
+        let res = build_result(&s, &o, &plan);
+        assert!(res.stdout.starts_with(b"deploying with "));
+        assert!(res.stdout.ends_with(b" now"));
+        assert!(res.stderr.starts_with(b"error: "));
+        assert!(res.stderr.ends_with(b" invalid"));
+        assert!(!res
+            .stdout
+            .windows(needle.len())
+            .any(|window| window == needle));
+        assert!(!res
+            .stderr
+            .windows(needle.len())
+            .any(|window| window == needle));
+    }
+
+    #[test]
+    fn injected_secret_value_is_absent_from_sandbox_result_when_workload_prints_it() {
+        let mut s = spec(vec![]);
+        s.secret_refs = vec![crate::SecretRef {
+            name: "DEPLOY_TOKEN".into(),
+            handle: "opaque:deploy".into(),
+        }];
+        let material = ["printed", "-secret-material"].concat();
+        let s = s
+            .with_resolved_secrets(vec![crate::ResolvedSecretEnv::new(
+                "DEPLOY_TOKEN",
+                material.clone(),
+            )])
+            .expect("binding and plan are derived together");
+        let stdout = format!("stdout:{material}");
+        let stderr = format!("stderr:{material}");
+        let outcome = outcome(stdout.as_bytes(), stderr.as_bytes());
+
+        let result = build_result(&s, &outcome, s.resolved_secrets().redaction_plan());
+
+        assert!(result.stdout.starts_with(b"stdout:"));
+        assert!(result.stderr.starts_with(b"stderr:"));
+        assert!(!result
+            .stdout
+            .windows(material.len())
+            .any(|window| window == material.as_bytes()));
+        assert!(!result
+            .stderr
+            .windows(material.len())
+            .any(|window| window == material.as_bytes()));
+        assert!(!format!("{result:?}").contains(&material));
+    }
+
+    // A non-secret job's empty plan remains a pass-through: captured output is byte-unchanged.
+    #[test]
+    fn build_result_empty_plan_is_byte_identity() {
+        let s = spec(vec![]);
+        let o = outcome(b"ordinary build log line", b"warning: deprecated");
+        let res = build_result(&s, &o, &RedactionPlan::none());
+        assert_eq!(res.stdout, b"ordinary build log line".to_vec());
+        assert_eq!(res.stderr, b"warning: deprecated".to_vec());
+    }
+
+    /// CT-006c (the streaming fix): the git-wire stdout drain stages straight to a host temp file under
+    /// a generous cap with host memory bounded to one chunk. A response WITHIN the cap comes through
+    /// WHOLE (no 256 KiB truncation); a response OVER the cap is head-bounded AND flagged `truncated`
+    /// (which the wire seam turns into a LOUD `WireError::OutputTooLarge` — never a silent short pack).
+    #[test]
+    fn drain_to_temp_file_streams_whole_under_cap_and_flags_over_cap() {
+        // A 1 MiB stream (FAR past the 256 KiB SANDBOX_CAPTURE_BOUND) under a 4 MiB cap → WHOLE, untruncated.
+        let big = vec![0xABu8; 1024 * 1024];
+        let (out, truncated) = drain_to_temp_file(&big[..], 4 * 1024 * 1024);
+        assert_eq!(
+            out.len(),
+            big.len(),
+            "a real-size pack under the cap comes through WHOLE"
+        );
+        assert_eq!(
+            out, big,
+            "the bytes are byte-identical (no corruption via the temp file)"
+        );
+        assert!(!truncated, "within the cap ⇒ not truncated");
+
+        // The SAME stream under a 64 KiB cap → head-bounded to the cap AND flagged truncated (fail-loud).
+        let (head, over) = drain_to_temp_file(&big[..], 64 * 1024);
+        assert_eq!(
+            head.len(),
+            64 * 1024,
+            "over the cap ⇒ exactly the cap bytes are kept"
+        );
+        assert!(
+            over,
+            "over the cap ⇒ truncated flag set (the wire seam then refuses loudly)"
+        );
+    }
+
+    #[test]
+    fn drain_to_temp_file_marks_a_read_fault_as_incomplete() {
+        struct FaultAfterPrefix(Option<&'static [u8]>);
+
+        impl Read for FaultAfterPrefix {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(prefix) = self.0.take() {
+                    buf[..prefix.len()].copy_from_slice(prefix);
+                    Ok(prefix.len())
+                } else {
+                    Err(std::io::Error::other("injected wire read fault"))
+                }
+            }
+        }
+
+        let (head, incomplete) = drain_to_temp_file(FaultAfterPrefix(Some(b"partial-pack")), 1024);
+
+        assert_eq!(head, b"partial-pack");
+        assert!(incomplete);
     }
 }

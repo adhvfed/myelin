@@ -4,7 +4,11 @@
 use super::*;
 use crate::hardening::HardeningProfile;
 use crate::redaction::RedactionPlan;
-use crate::{CompletionSettlementOwner, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, LaunchPermit, MeterTarget, ReserveHandle, ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch, TrustTier, WorkspaceSpec};
+use crate::{
+    CompletionSettlementOwner, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, LaunchPermit,
+    MeterTarget, ReserveHandle, ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks,
+    SandboxBackend, SandboxHandle, SandboxLaunch, TrustTier, WorkspaceSpec,
+};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -540,7 +544,8 @@ fn run_git_wire_container(
 /// (whichever way the hop's own `Result` came out); `Failed` means teardown itself could not be
 /// proven, alongside whatever the hop's own `Result` was. Named (rather than inlined) purely to keep
 /// clippy's `type_complexity` lint quiet — the meaning is exactly [`RuntimeFinalization`]'s.
-pub(super) type GitWireHopFinalization = RuntimeFinalization<Result<(ContainerRun, bool), RunFailure>>;
+pub(super) type GitWireHopFinalization =
+    RuntimeFinalization<Result<(ContainerRun, bool), RunFailure>>;
 
 /// Whether [`run_git_wire_container_raw`]'s OWN bundle-dir cleanup — on every path that removes it
 /// BEFORE the caller ever sees a live [`ContainerRun`] to retire itself — was independently proven
@@ -727,7 +732,10 @@ impl std::fmt::Display for StageBundleError {
 /// the bundle dir (removed on teardown). Sol's round-3 review: previously, a `config.json` write
 /// failure left the just-created directory behind unconditionally — now best-effort cleaned up, with
 /// the outcome reported via [`StageBundleError::leaked`] rather than silently discarded.
-pub(super) fn stage_config_only_bundle(cfg: &OciConfig, label: &str) -> Result<PathBuf, StageBundleError> {
+pub(super) fn stage_config_only_bundle(
+    cfg: &OciConfig,
+    label: &str,
+) -> Result<PathBuf, StageBundleError> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
     let bundle = std::env::temp_dir().join(format!(
@@ -785,4 +793,266 @@ pub(super) fn stage_config_only_bundle(cfg: &OciConfig, label: &str) -> Result<P
 /// Stage a CONFIG-ONLY OCI bundle for the git wire — see [`stage_config_only_bundle`].
 fn stage_git_wire_bundle(cfg: &OciConfig) -> Result<PathBuf, StageBundleError> {
     stage_config_only_bundle(cfg, "gitwire")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::PathBuf;
+
+    use crate::gvisor::test_fixtures::*;
+    use crate::{
+        CompletionSettlementOwner, IdemToken, MeterTarget, ReserveHandle, ResourceLimits,
+        ResourceUsage, RunTokenCredential, RunnerHooks,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn cancelled_git_wire_refuses_before_reserve_or_spawn() {
+        let cancelled = AtomicBool::new(true);
+        let spec = GitWireSpec {
+            repo_host_path: PathBuf::from("/absent/repo.git"),
+            root: PathBuf::from("/absent"),
+            git_argv: vec!["upload-pack".into()],
+            stdin: Vec::new(),
+            env: Vec::new(),
+            quarantine_host_path: None,
+            limits: ResourceLimits {
+                cpu_millis: 1,
+                mem_bytes: 1,
+                disk_bytes: 1,
+                tmpfs_bytes: 1,
+                pids_max: 1,
+                timeout_secs: 1,
+            },
+            run_token: RunTokenCredential::new("test-bearer", "cancel", 300).unwrap(),
+            meter_to: MeterTarget {
+                reserve_id: "cancel".into(),
+            },
+            idem_token: IdemToken("cancel".into()),
+        };
+        let result = GvisorBackend::git_wire_only().launch_git_wire_until_cancelled(
+            &spec,
+            &ok_hooks(),
+            &cancelled,
+        );
+        assert!(
+            matches!(result, Err(WireError::Runtime(message)) if message.contains("cancelled by process shutdown"))
+        );
+    }
+
+    /// Git-wire is a direct synchronous path with no terminal reporter above it — reporter-owned
+    /// hooks must be refused BEFORE reserve or any rootfs/mount/spawn work, exactly like the
+    /// analogous agent-service `dispatch_compute` refusal. Proven WITHOUT a real `runsc`: the
+    /// refusal happens before any of that is ever touched.
+    #[test]
+    fn git_wire_refuses_reporter_owned_hooks_before_reserve() {
+        // A REAL repo directory under a REAL root — this test is about the ownership refusal, not
+        // the symlink/path-confinement defense (`symlinked_repo_path_is_refused_before_mount`
+        // covers that), so the path itself must actually pass `assert_repo_under_root` first.
+        let tmp = std::env::temp_dir().join(format!(
+            "myelin-gitwire-reporter-owned-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let root = tmp.join("git-root");
+        let repo = root.join("acme").join("fr-par").join("widgets.git");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let reserve_called = Arc::new(AtomicBool::new(false));
+        let reserve_called_at = reserve_called.clone();
+        let hooks = RunnerHooks::new(
+            CompletionSettlementOwner::TerminalReporter,
+            Box::new(move |spec| {
+                reserve_called_at.store(true, Ordering::SeqCst);
+                Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
+            }),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(|_t| Ok(())),
+            Box::new(|_s| Ok(())),
+        );
+        let spec = GitWireSpec {
+            repo_host_path: repo,
+            root,
+            git_argv: vec!["upload-pack".into()],
+            stdin: Vec::new(),
+            env: Vec::new(),
+            quarantine_host_path: None,
+            limits: ResourceLimits {
+                cpu_millis: 1,
+                mem_bytes: 1,
+                disk_bytes: 1,
+                tmpfs_bytes: 1,
+                pids_max: 1,
+                timeout_secs: 1,
+            },
+            run_token: RunTokenCredential::new("test-bearer", "reporter-owned", 300).unwrap(),
+            meter_to: MeterTarget {
+                reserve_id: "reporter-owned".into(),
+            },
+            idem_token: IdemToken("reporter-owned".into()),
+        };
+        let result = GvisorBackend::git_wire_only().launch_git_wire_until_cancelled(
+            &spec,
+            &hooks,
+            &NEVER_CANCELLED,
+        );
+        assert!(
+            matches!(result, Err(WireError::Runtime(ref message)) if message.contains("requires Hook-owned")),
+            "expected a Hook-ownership refusal, got {result:?}"
+        );
+        assert!(
+            !reserve_called.load(Ordering::SeqCst),
+            "reporter-owned hooks must refuse before reserve is ever called"
+        );
+    }
+
+    /// The four `RunFailure` phases dispatch through `dispose_git_wire_run_failure` exactly as
+    /// gVisor's `dispose_run_failure` does under `Hook` ownership (git-wire always settles
+    /// synchronously — there is no reporter to defer to): `Uncommitted` -> `release_unused`;
+    /// `CommitOutcomeUnknown` -> neither release nor settle; `CommittedButNotExecuted` -> settle
+    /// zero; `Executed` -> settle the carried usage. Unit-tested directly (no real `runsc` needed).
+    #[test]
+    fn dispose_git_wire_run_failure_dispatches_all_four_phases() {
+        fn recording_hooks() -> (RunnerHooks, Arc<Mutex<Vec<ResourceUsage>>>) {
+            let settled = Arc::new(Mutex::new(Vec::new()));
+            let settled_at = settled.clone();
+            let hooks = RunnerHooks::new(
+                CompletionSettlementOwner::Hook,
+                Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+                Box::new(move |_spec, _h, usage| {
+                    settled_at.lock().unwrap().push(usage);
+                    Ok(())
+                }),
+                Box::new(|_t| Ok(())),
+                Box::new(|_s| Ok(())),
+            );
+            (hooks, settled)
+        }
+        let job = spec(vec![]);
+        let reserve = ReserveHandle(job.meter_to.reserve_id.clone());
+        let zero = ResourceUsage {
+            cpu_seconds: 0,
+            mem_byte_seconds: 0,
+        };
+
+        let (hooks, settled) = recording_hooks();
+        let error = dispose_git_wire_run_failure(
+            &hooks,
+            &job,
+            &reserve,
+            RunFailure::uncommitted("injected uncommitted"),
+        );
+        assert!(matches!(error, WireError::Runtime(m) if m.contains("injected uncommitted")));
+        assert_eq!(
+            *settled.lock().unwrap(),
+            vec![zero],
+            "release_unused settles zero"
+        );
+
+        let (hooks, settled) = recording_hooks();
+        let error = dispose_git_wire_run_failure(
+            &hooks,
+            &job,
+            &reserve,
+            RunFailure::commit_outcome_unknown("injected outcome unknown"),
+        );
+        assert!(matches!(error, WireError::Runtime(m) if m.contains("needs reconciliation")));
+        assert!(
+            settled.lock().unwrap().is_empty(),
+            "commit-outcome-unknown must never release or settle"
+        );
+
+        let (hooks, settled) = recording_hooks();
+        let error = dispose_git_wire_run_failure(
+            &hooks,
+            &job,
+            &reserve,
+            RunFailure::committed_but_not_executed("injected committed but not executed"),
+        );
+        assert!(
+            matches!(error, WireError::Runtime(m) if m.contains("injected committed but not executed"))
+        );
+        assert_eq!(*settled.lock().unwrap(), vec![zero]);
+
+        let (hooks, settled) = recording_hooks();
+        let fallback_usage = ResourceUsage {
+            cpu_seconds: 4,
+            mem_byte_seconds: 400,
+        };
+        let error = dispose_git_wire_run_failure(
+            &hooks,
+            &job,
+            &reserve,
+            RunFailure::executed("injected executed", fallback_usage),
+        );
+        assert!(matches!(error, WireError::Runtime(m) if m.contains("injected executed")));
+        assert_eq!(
+            *settled.lock().unwrap(),
+            vec![fallback_usage],
+            "executed must settle the carried conservative usage, never zero"
+        );
+    }
+
+    /// **CT-006b 4a — symlink-path defence in depth (no runsc needed).** A textually-clean repo
+    /// locator whose resolved `<repo>.git` is a SYMLINK out of the tenant tree is REFUSED by
+    /// [`assert_repo_under_root`] BEFORE any mount, while a REAL directory under the root is admitted.
+    #[test]
+    fn symlinked_repo_path_is_refused_before_mount() {
+        let tmp = std::env::temp_dir().join(format!(
+            "myelin-gitwire-symlink-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let root = tmp.join("git-root");
+        let outside = tmp.join("outside-the-tree");
+        std::fs::create_dir_all(root.join("acme").join("fr-par")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // (1) A REAL bare-repo directory under the root is admitted.
+        let real = resolve_bare_repo_path(&root, "acme", "fr-par", "widgets").unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        assert!(
+            assert_repo_under_root(&root, &real).is_ok(),
+            "a real directory under the root must be admitted"
+        );
+
+        // (2) A SYMLINKED `<repo>.git` pointing OUT of the tenant tree is refused (final-symlink check
+        //     AND the canonical-escape check would both catch it).
+        let evil = resolve_bare_repo_path(&root, "acme", "fr-par", "evil").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &evil).unwrap();
+        let r = assert_repo_under_root(&root, &evil);
+        assert!(
+            matches!(r, Err(WireError::Path(_))),
+            "a symlinked repo path escaping the tree must be refused, got {r:?}"
+        );
+
+        // (3) A symlinked INTERMEDIATE component (the tenant dir → /tmp) is caught by the canonical
+        //     starts_with check even though the final `<repo>.git` is a real dir under the symlink.
+        let root2 = tmp.join("git-root-2");
+        std::fs::create_dir_all(&root2).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root2.join("acme")).unwrap();
+        let leak_parent = outside.join("fr-par");
+        std::fs::create_dir_all(leak_parent.join("widgets.git")).unwrap();
+        let via_symlinked_component =
+            resolve_bare_repo_path(&root2, "acme", "fr-par", "widgets").unwrap();
+        let r2 = assert_repo_under_root(&root2, &via_symlinked_component);
+        assert!(
+            matches!(r2, Err(WireError::Path(_))),
+            "a symlinked intermediate component leaving the root must be refused, got {r2:?}"
+        );
+
+        // (4) An absent repo path fails closed (never a silent admit).
+        let absent = resolve_bare_repo_path(&root, "acme", "fr-par", "ghost").unwrap();
+        assert!(matches!(
+            assert_repo_under_root(&root, &absent),
+            Err(WireError::Path(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

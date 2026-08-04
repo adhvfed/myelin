@@ -1,13 +1,11 @@
 //! CT-007 slice 5b.3-6e.2 Stage A: the git-wire test-support substrate (fakes + wire fixtures).
 
-use super::*;
 use super::git_wire_codec::pkt_line_encode;
+use super::*;
 use crate::{ImageRef, JobSpec, LaunchPermit, ResourceUsage, SandboxResult};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-
-use super::*;
 
 /// A 40-hex SHA-1-shaped commit oid built from a single repeated byte.
 pub(crate) fn sha1_oid(byte: u8) -> String {
@@ -25,11 +23,7 @@ pub(crate) fn advertisement(first_line: &str, extra_refs: &[&str]) -> Vec<u8> {
 }
 
 /// Assemble a fetch response: optional shallow lines, a flush, a negotiation line, then the pack.
-pub(crate) fn fetch_response(
-    shallow_lines: &[String],
-    negotiation: &str,
-    pack: &[u8],
-) -> Vec<u8> {
+pub(crate) fn fetch_response(shallow_lines: &[String], negotiation: &str, pack: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
     for line in shallow_lines {
         buf.extend(pkt_line_encode(line));
@@ -72,8 +66,7 @@ pub(crate) fn fake_quiescence_evidence() -> RuntimeQuiescenceEvidence {
 
 /// A single scripted Hop-A step: the simple pre-finalization outcome the recording executor
 /// auto-wraps into a `RuntimeFinalization::Finalized`.
-pub(crate) type ScriptedStep =
-    Box<dyn FnOnce() -> Result<(ContainerRun, bool), RunFailure> + Send>;
+pub(crate) type ScriptedStep = Box<dyn FnOnce() -> Result<(ContainerRun, bool), RunFailure> + Send>;
 
 /// A boxed stand-in for [`GitWireHopExecutor`] — call sites pass `&*executor`.
 pub(crate) type BoxedHopExecutor = Box<
@@ -195,10 +188,9 @@ pub fn deterministic_enabled_backend_for_tests(root: &Path) -> (GvisorBackend, I
     std::fs::create_dir_all(&rootfs).expect("stage the workload rootfs dir");
     std::fs::create_dir(rootfs.join("workspace"))
         .expect("precreate the pinned workspace mountpoint");
-    let digest = crate::canonical_tar::canonical_tree_sha256_hex(&rootfs)
-        .expect("hash the staged rootfs");
-    let image =
-        ImageRef::pinned(format!("test.local/checkout-workload@sha256:{digest}")).unwrap();
+    let digest =
+        crate::canonical_tar::canonical_tree_sha256_hex(&rootfs).expect("hash the staged rootfs");
+    let image = ImageRef::pinned(format!("test.local/checkout-workload@sha256:{digest}")).unwrap();
     let registry = Arc::new(
         crate::asset_registry::GvisorAssetRegistry::from_bindings(vec![
             crate::asset_registry::RootfsAssetBinding {

@@ -309,3 +309,124 @@ fn verify_gvisor_git_rootfs_given(
     }
     Ok(canonical)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::gvisor::test_fixtures::*;
+
+    #[test]
+    fn git_rootfs_requires_every_fixed_mountpoint_and_verifies_a_stable_digest() {
+        let rootfs =
+            std::env::temp_dir().join(format!("myelin-git-rootfs-integrity-{}", unique_suffix()));
+        std::fs::create_dir_all(&rootfs).unwrap();
+        for destination in ["tmp", "workspace", "repo", "quarantine"] {
+            std::fs::create_dir(rootfs.join(destination)).unwrap();
+        }
+        std::fs::write(rootfs.join("git-payload"), b"pinned git rootfs bytes").unwrap();
+        let digest = crate::canonical_tar::canonical_tree_sha256_hex(&rootfs).unwrap();
+
+        let first = verify_gvisor_git_rootfs_given(&rootfs, &digest).unwrap();
+        let second = verify_gvisor_git_rootfs_given(&rootfs, &digest).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            crate::canonical_tar::canonical_tree_sha256_hex(&rootfs).unwrap(),
+            digest,
+            "verification itself must not mutate the shared git rootfs"
+        );
+
+        for destination in ["tmp", "workspace", "repo", "quarantine"] {
+            std::fs::remove_dir(rootfs.join(destination)).unwrap();
+            let error = verify_gvisor_git_rootfs_given(&rootfs, &digest)
+                .expect_err("every OCI destination must pre-exist before hashing/use");
+            assert!(
+                error.contains(&format!("/{destination}")),
+                "missing destination must be named: {error}"
+            );
+            std::fs::create_dir(rootfs.join(destination)).unwrap();
+        }
+
+        std::fs::write(rootfs.join("unapproved-drift"), b"drift").unwrap();
+        assert!(
+            verify_gvisor_git_rootfs_given(&rootfs, &digest)
+                .unwrap_err()
+                .contains("DRIFTED"),
+            "content added outside the mountpoints must fail the pin"
+        );
+        let _ = std::fs::remove_dir_all(rootfs);
+    }
+
+    #[test]
+    fn gvisor_corpus_script_carries_every_catalogued_attack_and_the_posture() {
+        // The gVisor corpus probes the SAME catalogued attack ids the host-side parser keys on, so
+        // the gate predicate is one path across backends. A drift here would let a family silently
+        // not run on the gVisor backend.
+        let script = build_gvisor_corpus_script(64);
+        for atk in crate::escape_corpus::CORPUS {
+            assert!(
+                script.contains(atk.id),
+                "catalogued attack `{}` is missing from the gVisor corpus script",
+                atk.id
+            );
+        }
+        assert!(script.contains(crate::escape_corpus::BEGIN_MARKER));
+        assert!(script.contains(crate::escape_corpus::END_MARKER));
+        // The raw-device family is probed as mknod-denial (the faithful gVisor expression of the
+        // contained property — the node is absent and creating one is denied).
+        assert!(script.contains("mknod /dev/mem"));
+        assert!(script.contains("mknod /dev/port"));
+        // The fork-bomb ceiling is carried from the arg.
+        assert!(script.contains("ceiling=64"));
+        assert!(script.contains("trap cleanup_f1 EXIT"));
+        assert!(script.contains("exit 42"));
+        assert!(script.contains("[ \"$admitted\" -gt 64 ]"));
+        assert!(script.contains("F1_forkbomb ESCAPED admitted=$admitted"));
+        // The admitted children are reaped before D2/Mx so the fork-bomb probe cannot consume the
+        // shared memory cgroup and vacuously kill a later independent resource probe.
+        let reap = script.find("cleanup_f1()").unwrap();
+        let verdict = script.find("if [ \"$f1_status\" -eq 42 ]").unwrap();
+        let diskfill = script.find("if dd if=/dev/zero").unwrap();
+        assert!(
+            script.contains("wait 2>/dev/null || true") && reap < verdict && verdict < diskfill
+        );
+        // CT-003b: the anon-memory hog's ATTEMPT sentinel + the END marker precede the oversized
+        // alloc, so the corpus COMPLETES even when the contained hog OOM-kills the whole sentry
+        // mid-alloc (the host cgroup bounds host RAM). The ESCAPED line follows only if it HELD.
+        let attempt = script
+            .find(&format!("{} ATTEMPT", crate::escape_corpus::MEMHOG_ID))
+            .expect("memhog ATTEMPT sentinel in the gVisor corpus");
+        let end = script.find(crate::escape_corpus::END_MARKER).unwrap();
+        assert!(
+            attempt < end,
+            "the memhog ATTEMPT sentinel must precede the END marker"
+        );
+        // Pure-shell doubling allocator (holds the anon memory in the sh process itself; ~1 GiB) —
+        // the host cgroup OOM-kills the sentry when it breaches memory.max, never a false held=0.
+        assert!(script.contains(r#"S="$S$S""#) && script.contains("while [ $n -lt 26 ]"));
+    }
+
+    #[test]
+    fn gvisor_drill_config_expresses_the_mandatory_posture() {
+        let json = gvisor_drill_config_json(&spec(vec![]), GVISOR_CORPUS_SCRIPT).unwrap();
+        // Read-only root, no-new-privs, all caps dropped, the pids ceiling — the SAME mandatory
+        // profile the Firecracker backend enforces, expressed through the OCI spec gVisor consumes.
+        assert!(json.contains("\"readonly\": true"));
+        assert!(json.contains("\"noNewPrivileges\": true"));
+        assert!(json.contains("\"bounding\": []"));
+        assert!(json.contains("\"limit\": 64"));
+        assert!(json.contains("\"type\": \"RLIMIT_NPROC\""));
+        // NO network namespace ⇒ with --network=none only loopback exists (egress closed).
+        assert!(
+            !json.contains("\"type\": \"network\""),
+            "no network namespace ⇒ egress closed (--network=none leaves only loopback)"
+        );
+        // The rootless deviation: NO user namespace (runsc --rootless adds its own).
+        assert!(
+            !json.contains("\"type\": \"user\""),
+            "the rootless gofer fork fails with a doubly-declared user namespace"
+        );
+        // The entrypoint runs the corpus script.
+        assert!(json.contains(GVISOR_CORPUS_SCRIPT));
+    }
+}

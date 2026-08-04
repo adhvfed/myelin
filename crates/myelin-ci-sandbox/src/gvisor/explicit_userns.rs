@@ -688,3 +688,457 @@ pub(super) fn delete_container(bin: &Path, container_id: &str, mode: RunscInvoca
     }
     let _ = cmd.arg("delete").arg("-force").arg(container_id).output();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::process::Command;
+
+    use crate::gvisor::unique_suffix;
+    use crate::user_namespace::{RunscInvocationMode, UserNamespaceConfig};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn every_rootless_runtime_invocation_rejects_an_unexpected_file_capability() {
+        let bin = Path::new("/vetted/runsc");
+        let mut cmd = Command::new(bin);
+        let result = apply_runsc_invocation_policy_checked_given(
+            &mut cmd,
+            bin,
+            RunscInvocationMode::Rootless,
+            None,
+            |path| {
+                Err(format!(
+                    "{path:?} carries an unexpected security.capability xattr"
+                ))
+            },
+        );
+        assert!(result
+            .unwrap_err()
+            .contains("unexpected security.capability xattr"));
+        assert_eq!(
+            cmd.get_args().count(),
+            0,
+            "rejection must happen before even the rootless invocation policy is assembled"
+        );
+    }
+
+    /// `apply_runsc_invocation_policy` is the ONE place `run`/`kill`/`delete` decide their global
+    /// flags AND environment — this test is the single source of truth for `Rootless`'s exact
+    /// flag-and-environment contract (Sol's review: "no independent flag decisions left" at any of
+    /// the three call sites). `ExplicitUserNamespace`'s own contract is covered by
+    /// `apply_explicit_userns_env_matches_the_policy_exactly` below, which exercises the pure
+    /// `Command`-mutation mechanism directly against a hand-built policy — NOT through
+    /// `apply_runsc_invocation_policy` itself, since that requires the process-global
+    /// `EXPLICIT_USERNS_POLICY` to already be validated-and-installed (see that function's own
+    /// refusal-without-preflight behavior, covered by
+    /// `apply_runsc_invocation_policy_refuses_explicit_userns_without_a_validated_policy`).
+    #[test]
+    fn apply_runsc_invocation_policy_matches_the_mode_exactly() {
+        let bin = Path::new("/bin/true");
+        let mut rootless_cmd = Command::new(bin);
+        apply_runsc_invocation_policy(&mut rootless_cmd, bin, RunscInvocationMode::Rootless)
+            .unwrap();
+        assert_eq!(
+            rootless_cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["--rootless"],
+            "Rootless must be byte-identical to the pre-slice-2 flag"
+        );
+        assert_eq!(
+            rootless_cmd.get_envs().count(),
+            0,
+            "Rootless must not alter the child's environment at all"
+        );
+    }
+
+    /// Exercises the pure `Command`-mutation mechanism `ExplicitUserNamespace` mode applies, given
+    /// an already-validated policy — independent of the process-global `EXPLICIT_USERNS_POLICY`
+    /// `OnceLock` (which, once installed by any test sharing this test binary's process, cannot be
+    /// reset) and independent of `preflight_explicit_userns_policy`'s pinned-runsc-digest check
+    /// (which needs a real matching binary this test environment may not have).
+    #[test]
+    fn apply_explicit_userns_env_matches_the_policy_exactly() {
+        let policy = ResolvedExplicitUsernsPolicy {
+            helper_dir: PathBuf::from("/usr/bin"),
+            runsc_root: PathBuf::from("/var/lib/myelin-runsc-explicit-userns"),
+            runsc_root_identity: (0, 0),
+        };
+        let mut cmd = Command::new("runsc");
+        apply_explicit_userns_env(&mut cmd, &policy);
+        let args = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.contains(&"-ignore-cgroups".to_string()),
+            "ExplicitUserNamespace must add -ignore-cgroups: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--rootless".to_string()),
+            "ExplicitUserNamespace must drop --rootless: {args:?}"
+        );
+        assert!(
+            args.contains(&"--root=/var/lib/myelin-runsc-explicit-userns".to_string()),
+            "ExplicitUserNamespace must pass the exact policy's absolute --root=: {args:?}"
+        );
+        let envs: Vec<_> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs,
+            vec![("PATH".to_string(), Some("/usr/bin".to_string()))],
+            "ExplicitUserNamespace must clear the environment and set PATH to ONLY the exact \
+             policy's helper directory: {envs:?}"
+        );
+    }
+
+    /// Sol's review, round 4/5: `ExplicitUserNamespace` mode must REFUSE outright — not fall back
+    /// to ad hoc unvalidated resolution — when no policy has been validated. Calls
+    /// `apply_runsc_invocation_policy_given` directly with an EXPLICIT `None`, rather than driving
+    /// the real process-global `EXPLICIT_USERNS_POLICY` cell (which, once set by ANY test sharing
+    /// this test binary's process — e.g. the live drill — cannot be un-set for a later test to
+    /// observe the pre-installation state). This makes the assertion deterministic regardless of
+    /// test execution order (round 4's version relied on ordering and silently skipped otherwise;
+    /// Sol's review, round 5).
+    #[test]
+    fn apply_runsc_invocation_policy_refuses_explicit_userns_without_a_validated_policy() {
+        let mut cmd = Command::new("runsc");
+        let result = apply_runsc_invocation_policy_given(
+            &mut cmd,
+            RunscInvocationMode::ExplicitUserNamespace(UserNamespaceConfig::for_tests(
+                1000, 1000, 100_000, 200_000,
+            )),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "ExplicitUserNamespace must refuse without a validated policy, not silently proceed"
+        );
+    }
+
+    /// [`preflight_explicit_userns_helpers`] must accept this development host's real
+    /// `/usr/bin` (containing genuine setuid `newuidmap`/`newgidmap`) and must reject a
+    /// substitute helper directory containing a non-setuid stand-in.
+    #[test]
+    fn preflight_explicit_userns_helpers_accepts_real_and_rejects_a_non_setuid_substitute() {
+        let real = Path::new("/usr/bin");
+        if !real.join("newuidmap").exists() || !real.join("newgidmap").exists() {
+            eprintln!("skipping: this host has no /usr/bin/newuidmap or newgidmap");
+            return;
+        }
+        preflight_explicit_userns_helpers(real)
+            .expect("this host's real /usr/bin must pass preflight");
+
+        use std::os::unix::fs::PermissionsExt;
+        let tmp =
+            std::env::temp_dir().join(format!("myelin-preflight-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        for helper in ["newuidmap", "newgidmap"] {
+            std::fs::write(tmp.join(helper), b"#!/bin/sh\nexit 1\n").unwrap();
+            let mut perms = std::fs::metadata(tmp.join(helper)).unwrap().permissions();
+            perms.set_mode(0o755); // executable, but NOT setuid and NOT root-owned
+            std::fs::set_permissions(tmp.join(helper), perms).unwrap();
+        }
+        let result = preflight_explicit_userns_helpers(&tmp);
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(
+            result.is_err(),
+            "a non-root-owned, non-setuid substitute must be refused"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_of_file_matches_a_known_vector() {
+        let tmp = std::env::temp_dir().join(format!("myelin-sha256-test-{}", unique_suffix()));
+        std::fs::write(&tmp, b"abc").unwrap();
+        let digest = sha256_hex_of_file(&tmp).unwrap();
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(
+            digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "must match the well-known SHA-256(\"abc\") test vector"
+        );
+    }
+
+    /// Sol's review, round 4: pinning must check the binary's own content digest, not only the
+    /// version string it happens to print — a forged/rebuilt substitute that echoes the exact
+    /// pinned version line must still be refused if its content digest disagrees.
+    #[test]
+    fn verify_pinned_explicit_userns_runsc_rejects_a_forged_version_string_with_wrong_content() {
+        let tmp = std::env::temp_dir().join(format!("myelin-forged-runsc-{}", unique_suffix()));
+        std::fs::write(
+            &tmp,
+            format!("#!/bin/sh\necho '{PINNED_EXPLICIT_USERNS_RUNSC_VERSION}'\n"),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perms).unwrap();
+        let result = verify_pinned_explicit_userns_runsc(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        assert!(
+            result.is_err(),
+            "a forged version string with the wrong content digest must be refused: {result:?}"
+        );
+    }
+
+    /// Sol's review, round 5: the digest pin alone doesn't stop the binary being replaced between
+    /// preflight and a later launch — `harden_explicit_userns_runsc_binary` must refuse a binary
+    /// this process itself owns (which it could `chmod`/replace at will), not only a wrong digest.
+    #[test]
+    fn harden_explicit_userns_runsc_binary_refuses_a_non_root_owned_file() {
+        let tmp = std::env::temp_dir().join(format!("myelin-fake-runsc-{}", unique_suffix()));
+        std::fs::write(&tmp, b"#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perms).unwrap();
+        let result = harden_explicit_userns_runsc_binary(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        assert!(
+            result.is_err(),
+            "a binary owned by this process's own euid must be refused: {result:?}"
+        );
+    }
+
+    #[test]
+    fn harden_explicit_userns_runsc_binary_refuses_a_symlink() {
+        let base =
+            std::env::temp_dir().join(format!("myelin-fake-runsc-symlink-{}", unique_suffix()));
+        std::fs::create_dir_all(&base).unwrap();
+        let real = base.join("real-runsc");
+        std::fs::write(&real, b"#!/bin/sh\nexit 0\n").unwrap();
+        let link = base.join("runsc");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let result = harden_explicit_userns_runsc_binary(&link);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            result.is_err(),
+            "a symlinked binary path must be refused rather than followed: {result:?}"
+        );
+    }
+
+    /// Mirrors `strict_construction_refuses_a_leases_dir_whose_parent_is_writable_by_us` in
+    /// `user_namespace.rs` — the exact same ancestor-writability requirement, applied here to the
+    /// explicit-userns runsc state root (Sol's review, round 5: an absolute path string alone does
+    /// not freeze what it names).
+    #[test]
+    fn harden_explicit_userns_runsc_root_refuses_a_leaf_under_a_writable_parent() {
+        let base = std::env::temp_dir().join(format!(
+            "myelin-runsc-root-writable-parent-{}",
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let leaf = base.join("runsc-root");
+        let result = harden_explicit_userns_runsc_root(&leaf);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            result.is_err(),
+            "a leaf whose parent is writable by this process must be refused: {result:?}"
+        );
+    }
+
+    /// Sol's review, round 6: no auto-creation — a missing leaf must be refused outright (proven
+    /// via `verify_explicit_userns_runsc_root_leaf` directly, isolated from the ancestor check).
+    #[test]
+    fn verify_explicit_userns_runsc_root_leaf_refuses_a_missing_leaf() {
+        let missing =
+            std::env::temp_dir().join(format!("myelin-missing-runsc-root-{}", unique_suffix()));
+        let result = verify_explicit_userns_runsc_root_leaf(&missing);
+        assert!(
+            result.is_err(),
+            "a non-pre-provisioned leaf must be refused, never auto-created: {result:?}"
+        );
+    }
+
+    /// Isolates JUST `verify_explicit_userns_runsc_root_leaf` (not the full
+    /// `harden_explicit_userns_runsc_root`, whose ancestor check would refuse first against any
+    /// fixture under a writable temp directory) against a real symlinked leaf.
+    #[test]
+    fn verify_explicit_userns_runsc_root_leaf_refuses_a_symlinked_leaf() {
+        let base =
+            std::env::temp_dir().join(format!("myelin-runsc-root-symlink-{}", unique_suffix()));
+        std::fs::create_dir_all(&base).unwrap();
+        let real_dir = base.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link = base.join("runsc-root");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+        let result = verify_explicit_userns_runsc_root_leaf(&link);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            result.is_err(),
+            "a symlinked state-root leaf must be refused rather than followed: {result:?}"
+        );
+    }
+
+    /// Sol's review, round 7: rejecting group/other bits alone still admits a mode like `0500`
+    /// (owner cannot write) or `0000` (owner cannot even search it) — both unusable for actually
+    /// creating/reading runsc state, despite passing the group/other-only check.
+    #[test]
+    fn verify_explicit_userns_runsc_root_leaf_refuses_an_owner_non_writable_directory() {
+        let dir = std::env::temp_dir().join(format!("myelin-runsc-root-0500-{}", unique_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o500); // r-x------: owner cannot write, though group/other bits are clear.
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let result = verify_explicit_userns_runsc_root_leaf(&dir);
+        let mut restore = std::fs::metadata(&dir).unwrap().permissions();
+        restore.set_mode(0o700);
+        std::fs::set_permissions(&dir, restore).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            result.is_err(),
+            "an owner-non-writable directory must be refused even with no group/other bits: \
+             {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_explicit_userns_runsc_root_leaf_accepts_a_properly_pre_provisioned_leaf() {
+        let dir = std::env::temp_dir().join(format!("myelin-runsc-root-ok-{}", unique_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let result = verify_explicit_userns_runsc_root_leaf(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            result.is_ok(),
+            "a real, owned, mode-0700 pre-provisioned directory must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolved_explicit_userns_policy_revalidates_a_matching_identity() {
+        let dir = std::env::temp_dir().join(format!(
+            "myelin-gvisor-userns-root-identity-ok-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let meta = std::fs::metadata(&dir).unwrap();
+        let identity = (meta.dev(), meta.ino());
+        let policy = ResolvedExplicitUsernsPolicy {
+            helper_dir: PathBuf::from("/usr/bin"),
+            runsc_root: dir.clone(),
+            runsc_root_identity: identity,
+        };
+        assert_eq!(policy.revalidated_root_identity(), Ok(identity));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sol's round-1 review on piece 7a: identity (dev, ino) alone is not enough, because the leaf
+    /// is owned by this process's own euid and its MODE can drift (e.g. `0700` chmod'd to `0777`)
+    /// without the identity ever changing — a replacement whose identity genuinely differs is
+    /// already caught by `resolved_explicit_userns_policy_refuses_a_replaced_root`, but a
+    /// same-inode mode drift would NOT be, if revalidation only compared `(dev, ino)`. Proves
+    /// `revalidated_root_identity` reruns the FULL leaf hardening check, not a bare stat, by
+    /// drifting the mode of the SAME directory (no replacement) and confirming revalidation now
+    /// refuses.
+    #[test]
+    fn resolved_explicit_userns_policy_refuses_a_mode_drift_without_replacement() {
+        let dir = std::env::temp_dir().join(format!(
+            "myelin-gvisor-userns-root-identity-drift-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let meta = std::fs::metadata(&dir).unwrap();
+        let identity = (meta.dev(), meta.ino());
+        let policy = ResolvedExplicitUsernsPolicy {
+            helper_dir: PathBuf::from("/usr/bin"),
+            runsc_root: dir.clone(),
+            runsc_root_identity: identity,
+        };
+        // Drift the mode of the SAME directory — no rmdir/mkdir, so (dev, ino) is unchanged.
+        let mut drifted = std::fs::metadata(&dir).unwrap().permissions();
+        drifted.set_mode(0o777);
+        std::fs::set_permissions(&dir, drifted).unwrap();
+        let result = policy.revalidated_root_identity();
+        let mut restore = std::fs::metadata(&dir).unwrap().permissions();
+        restore.set_mode(0o700);
+        std::fs::set_permissions(&dir, restore).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            result.is_err(),
+            "a same-inode mode drift (0700 -> 0777) must be refused, not just identity-compared: \
+             {result:?}"
+        );
+    }
+
+    /// Sol's design-round note (piece 7): the revalidation accessor must catch a state root that
+    /// no longer names the SAME directory it was validated against — e.g. removed and recreated at
+    /// the identical path (a fresh inode) between preflight and a later bind/teardown attempt.
+    ///
+    /// Sol's round-1 review: `rmdir` + immediate `mkdir` at the same path does not guarantee a
+    /// fresh inode — POSIX permits filesystems to reuse a freed inode number. Instead, rename the
+    /// original directory ASIDE (so it stays alive under a different path) and create the
+    /// replacement fresh at the original path, then assert the two identities actually differ
+    /// before relying on that difference to prove refusal.
+    #[test]
+    fn resolved_explicit_userns_policy_refuses_a_replaced_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "myelin-gvisor-userns-root-identity-replaced-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let moved_aside = std::env::temp_dir().join(format!(
+            "myelin-gvisor-userns-root-identity-replaced-original-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let meta = std::fs::metadata(&dir).unwrap();
+        let original_identity = (meta.dev(), meta.ino());
+        let policy = ResolvedExplicitUsernsPolicy {
+            helper_dir: PathBuf::from("/usr/bin"),
+            runsc_root: dir.clone(),
+            runsc_root_identity: original_identity,
+        };
+        std::fs::rename(&dir, &moved_aside).unwrap(); // original stays alive, just relocated
+        std::fs::create_dir(&dir).unwrap(); // a genuinely fresh directory at the original path
+        let mut fresh_perms = std::fs::metadata(&dir).unwrap().permissions();
+        fresh_perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, fresh_perms).unwrap();
+        let fresh_meta = std::fs::metadata(&dir).unwrap();
+        let fresh_identity = (fresh_meta.dev(), fresh_meta.ino());
+        assert_ne!(
+            original_identity, fresh_identity,
+            "the fixture must produce a genuinely different inode, not rely on chance"
+        );
+        assert!(policy.revalidated_root_identity().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&moved_aside);
+    }
+
+    #[test]
+    fn revalidated_explicit_userns_root_identity_given_refuses_without_a_policy() {
+        let result = revalidated_explicit_userns_root_identity_given(None);
+        assert!(matches!(result, Err(ref reason) if reason.contains("never validated")));
+    }
+}
