@@ -547,9 +547,13 @@ pub(crate) fn verify_v2_operational_reservation(
     Ok(policy)
 }
 
-/// Reserve the maximum CPU-seconds plus memory-GiB-seconds the server-owned limits can consume.
-/// These are operational capacity units, not a customer price. Terminal accounting uses the same
-/// two measured dimensions and refunds the unused upper bound.
+/// Reserve the maximum micro-USD COST the server-owned limits can bill: the maximum CPU-seconds and
+/// memory-GiB-seconds each priced at the same per-second rate settlement uses
+/// (`MICRO_USD_PER_CPU_SECOND` / `MICRO_USD_PER_GB_SECOND`). This makes the durable reservation a
+/// true upper bound on the eventual settled price, so the settle cap (`billed_capped = min(billed,
+/// reserved)`) only ever refunds genuine unused headroom — never under-bills a within-limits job.
+/// Terminal accounting prices the same two measured dimensions at the same rates and refunds the
+/// unused remainder.
 fn operational_reservation_amount(
     limits: &CiManifestLimitsV1,
 ) -> Result<i64, CiLaunchAuthorityError> {
@@ -572,8 +576,14 @@ fn operational_reservation_amount(
         .ok_or_else(|| refused("operational memory reservation overflow"))?;
     let cpu_seconds = cpu_millis_seconds.div_ceil(1_000);
     let memory_gib_seconds = memory_byte_seconds.div_ceil(u128::from(GIB_BYTES));
-    let total = cpu_seconds
-        .checked_add(memory_gib_seconds)
+    let cpu_cost = cpu_seconds
+        .checked_mul(u128::from(MICRO_USD_PER_CPU_SECOND))
+        .ok_or_else(|| refused("operational CPU cost overflow"))?;
+    let memory_cost = memory_gib_seconds
+        .checked_mul(u128::from(MICRO_USD_PER_GB_SECOND))
+        .ok_or_else(|| refused("operational memory cost overflow"))?;
+    let total = cpu_cost
+        .checked_add(memory_cost)
         .ok_or_else(|| refused("operational reservation overflow"))?;
     i64::try_from(total).map_err(|_| refused("operational reservation exceeds durable range"))
 }
@@ -1681,19 +1691,25 @@ fn job_lifetime_ceiling(
     per_attempt.checked_mul(u64::from(policy.max_parent_attempts.get()))
 }
 
-/// The final conversion from a raw [`ResourceCeiling`] to operational units — `cpu_seconds +
-/// ceil(mem_byte_seconds / GiB)`, checked. Mirrors [`TierPOperationalCiJobPricer`]'s own conversion
-/// formula exactly, so a job's `v2` reservation and its eventual settlement price always agree on
-/// units. Extracted as its own function (Sol's round-2 review) so both overflow boundaries — the
-/// `checked_add` and the `i64` range check — are directly testable without needing to construct
-/// realistic-looking `CiManifestLimitsV1`/policy inputs that happen to trigger each one.
+/// The final conversion from a raw [`ResourceCeiling`] to the maximum micro-USD COST — `cpu_seconds
+/// × MICRO_USD_PER_CPU_SECOND + ceil(mem_byte_seconds / GiB) × MICRO_USD_PER_GB_SECOND`, checked.
+/// Prices each dimension at the same per-second rate [`TierPOperationalCiJobPricer`] settles at, so
+/// a job's `v2` reservation is a true upper bound on its eventual settlement price and the settle
+/// cap only refunds unused headroom. The cost multiply is done in `u128` (a `u64`-derived ceiling
+/// can never overflow it), so the final `i64` range check is the boundary that fires for an
+/// out-of-range ceiling.
 fn operational_amount_from_ceiling(
     ceiling: ResourceCeiling,
 ) -> Result<i64, CiLaunchAuthorityError> {
     let memory_gib_seconds = ceiling.mem_byte_seconds.div_ceil(GIB_BYTES);
-    let total = ceiling
-        .cpu_seconds
-        .checked_add(memory_gib_seconds)
+    let cpu_cost = u128::from(ceiling.cpu_seconds)
+        .checked_mul(u128::from(MICRO_USD_PER_CPU_SECOND))
+        .ok_or_else(|| refused("operational v2 CPU cost overflow"))?;
+    let memory_cost = u128::from(memory_gib_seconds)
+        .checked_mul(u128::from(MICRO_USD_PER_GB_SECOND))
+        .ok_or_else(|| refused("operational v2 memory cost overflow"))?;
+    let total = cpu_cost
+        .checked_add(memory_cost)
         .ok_or_else(|| refused("operational v2 reservation overflow"))?;
     i64::try_from(total).map_err(|_| refused("operational v2 reservation exceeds durable range"))
 }
@@ -1876,10 +1892,12 @@ mod tests {
         }
 
         #[test]
-        fn v1_amount_is_completely_unchanged_by_this_slice() {
+        fn v1_amount_is_the_max_micro_usd_cost() {
+            // unified-wallet slice 2b: the v1 reservation is now the maximum micro-USD cost (raw
+            // 750 operational units × the 10_000 µUSD/second settlement rate), not raw capacity units.
             assert_eq!(
                 operational_reservation_amount(&linux_small_limits()).unwrap(),
-                750
+                7_500_000
             );
         }
 
@@ -1928,9 +1946,10 @@ mod tests {
             let lifetime = job_lifetime_ceiling(&request, &policy).unwrap();
             assert_eq!(lifetime.cpu_seconds, 3_000);
             assert_eq!(lifetime.mem_byte_seconds, 805_306_368_000);
+            // slice 2b: max micro-USD cost = raw 3_750 operational units × 10_000 µUSD/second.
             assert_eq!(
                 operational_reservation_amount_v2(&request, &policy).unwrap(),
-                3_750
+                37_500_000
             );
         }
 
@@ -1941,9 +1960,10 @@ mod tests {
             let lifetime = job_lifetime_ceiling(&request, &policy).unwrap();
             assert_eq!(lifetime.cpu_seconds, 12_000);
             assert_eq!(lifetime.mem_byte_seconds, 3_221_225_472_000);
+            // slice 2b: max micro-USD cost = raw 15_000 operational units × 10_000 µUSD/second.
             assert_eq!(
                 operational_reservation_amount_v2(&request, &policy).unwrap(),
-                15_000
+                150_000_000
             );
         }
 
@@ -2065,14 +2085,17 @@ mod tests {
         }
 
         #[test]
-        fn operational_amount_from_ceiling_add_overflow_refuses_loudly() {
-            // cpu_seconds is already u64::MAX; adding even one memory-GiB-second overflows u64.
+        fn operational_amount_from_ceiling_huge_cpu_exceeds_i64_after_scaling() {
+            // Before slice 2b this triggered a u64 `checked_add` overflow. Now the micro-USD cost
+            // conversion runs in u128, which a u64-derived ceiling can never overflow (u64::MAX ×
+            // 10_000 ≪ u128::MAX), so the final i64 range check is the guard that fires — a distinct
+            // message ("exceeds"), same fail-closed refusal.
             let ceiling = ResourceCeiling {
                 cpu_seconds: u64::MAX,
                 mem_byte_seconds: GIB_BYTES,
             };
             let err = operational_amount_from_ceiling(ceiling).unwrap_err();
-            assert!(err.0.contains("overflow"), "message was: {}", err.0);
+            assert!(err.0.contains("exceeds"), "message was: {}", err.0);
         }
 
         #[test]
@@ -2438,20 +2461,23 @@ mod tests {
             // BATCH framing (domain, cardinality, ordering, amount) is new to this slice and was
             // previously only exercised by generating expectations through `build_v2_candidates`
             // itself -- a tautology. These are computed once and pasted as literals (never compared
-            // via the same function under test).
+            // via the same function under test). unified-wallet slice 2b: the amount is now the
+            // max micro-USD cost (3_750 × 10_000 = 37_500_000), which the BATCH digest hashes — so
+            // the batch-digest segment of each handle changed accordingly (the per-request digest
+            // segment, which does NOT hash the amount, is unchanged). Recomputed by running the test.
             let requests = fixture_batch();
             let policy = CiAttemptBudgetPolicy::production();
             let candidates = build_v2_candidates(&requests, &policy).unwrap();
             assert_eq!(
                 candidates[0].handle,
-                "ci-reserve:v2:55555555-5555-5555-5555-555555555555:budget-v1:a5:1be02316af6d18a5375d858afaafba500d7d3ee3fc9a3ee2f41a29463f7879e9:88888888-8888-8888-8888-888888888881:681727ec3c89359a8cf69a95741a3a28b168fc058f124de03d68f681c8b34007"
+                "ci-reserve:v2:55555555-5555-5555-5555-555555555555:budget-v1:a5:e9b67f3fd16daa7db27a18c108cf1b4b6d5efc74cb08d4f9277c71bb77cec10b:88888888-8888-8888-8888-888888888881:681727ec3c89359a8cf69a95741a3a28b168fc058f124de03d68f681c8b34007"
             );
-            assert_eq!(candidates[0].amount, 3_750);
+            assert_eq!(candidates[0].amount, 37_500_000);
             assert_eq!(
                 candidates[1].handle,
-                "ci-reserve:v2:55555555-5555-5555-5555-555555555555:budget-v1:a5:1be02316af6d18a5375d858afaafba500d7d3ee3fc9a3ee2f41a29463f7879e9:88888888-8888-8888-8888-888888888882:a7f2a99c7a388abbae3f691c6946ac0ef51c5967bde5c28742f9f71192ee194e"
+                "ci-reserve:v2:55555555-5555-5555-5555-555555555555:budget-v1:a5:e9b67f3fd16daa7db27a18c108cf1b4b6d5efc74cb08d4f9277c71bb77cec10b:88888888-8888-8888-8888-888888888882:a7f2a99c7a388abbae3f691c6946ac0ef51c5967bde5c28742f9f71192ee194e"
             );
-            assert_eq!(candidates[1].amount, 3_750);
+            assert_eq!(candidates[1].amount, 37_500_000);
         }
 
         #[test]
@@ -2624,9 +2650,12 @@ mod tests {
         assert_eq!(priced.memory_wholesale, MicroUsd(1_500_000));
         assert_eq!(priced.cpu_markup, MicroUsd::ZERO);
         assert_eq!(priced.memory_markup, MicroUsd::ZERO);
+        // slice 2b: the reservation now shares the pricer's micro-USD scale — raw 750 operational
+        // units × 10_000 µUSD/second. (Pricer above: 6_000_000 + 1_500_000 = 7_500_000 for the same
+        // linux-small ceiling, so bound == max price.)
         assert_eq!(
             operational_reservation_amount(&linux_small_limits()).unwrap(),
-            750
+            7_500_000
         );
 
         assert_eq!(
@@ -2637,6 +2666,43 @@ mod tests {
                 })
                 .unwrap_err(),
             CiJobPricingError::InvalidOutput
+        );
+    }
+
+    /// unified-wallet slice 2b regression: the durable settle cap
+    /// (`reserve_settle_durable`: `billed_capped = min(billed, reserved)`) must never clamp a
+    /// within-limits job's real settlement price DOWN — that is a silent under-bill. Slice 2 priced
+    /// Tier-P settlement in micro-USD (×10_000); this test proves the reservation ceiling is in the
+    /// SAME unit and is a true upper bound on the price, so the cap only ever refunds genuine unused
+    /// headroom. It asserts the billing invariant directly and depends on NO golden hash value.
+    #[test]
+    fn v1_reservation_ceiling_is_an_upper_bound_on_the_tier_p_settlement_price() {
+        let limits = linux_small_limits();
+        let reserved = operational_reservation_amount(&limits).unwrap();
+        assert_eq!(reserved, 7_500_000, "linux-small v1 reservation, in micro-USD");
+
+        // The most a single within-limits execution can settle to: its raw resource-second ceiling,
+        // priced by the exact pricer the durable settle uses.
+        let ceiling = raw_execution_ceiling(&limits).unwrap();
+        let priced = TierPOperationalCiJobPricer
+            .price(ResourceUsage {
+                cpu_seconds: ceiling.cpu_seconds,
+                mem_byte_seconds: ceiling.mem_byte_seconds,
+            })
+            .unwrap();
+        let price = priced.cpu_wholesale.0
+            + priced.cpu_markup.0
+            + priced.memory_wholesale.0
+            + priced.memory_markup.0;
+
+        assert!(
+            reserved as u64 >= price,
+            "reservation {reserved} must be a valid upper bound on the settlement price {price} — \
+             otherwise the settle cap under-bills a within-limits job"
+        );
+        assert_eq!(
+            reserved as u64, price,
+            "at the server-owned limits the reservation equals the maximum price exactly, not merely >="
         );
     }
 

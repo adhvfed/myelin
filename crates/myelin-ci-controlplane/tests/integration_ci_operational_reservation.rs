@@ -146,8 +146,9 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
     assert_eq!(rows.len(), 2);
     // CT-007 slice 5b.3-4a.1c: fresh batches now mint v2 for real, so the reservation amount covers
     // the full parent-attempt*max_attempts budget (checkout job, production policy) instead of one
-    // v1 workload execution's ceiling (750).
-    assert!(rows.iter().all(|(run_id, amount, state)| *amount == 15_000
+    // v1 workload execution's ceiling. unified-wallet slice 2b: the amount is now the max micro-USD
+    // cost (raw 15_000 operational units × 10_000 µUSD/second).
+    assert!(rows.iter().all(|(run_id, amount, state)| *amount == 150_000_000
         && state == "reserved"
         && run_id.starts_with("ci-reserve:v2:")));
 
