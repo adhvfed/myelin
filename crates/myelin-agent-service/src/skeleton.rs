@@ -1,80 +1,71 @@
 //! # `skeleton` — the SKELETON runtime: the gateway → identity → dispatch → reserve → trace path
-//! at zero cost (AG-P4 → P-216, M2-A)
+//! at zero cost
 //!
-//! **Owning architecture doc:**
-//! `planning/05-refined-shared-systems-architecture/agent-fabric.md` §3.1 (the SKELETON runtime —
-//! *no model, no tools; drives the whole gateway/identity/dispatch/reserve/trace path at ~zero
-//! cost*), §2.3 (`Agent::handle` — the bounded driven multi-turn loop), §5.1 (the agent loop driver:
-//! build_conversation → reserve → step → route → settle), §5.6 (a run is a durable workflow — the
-//! workflow owns budget/gates/state; step/exec are activities; reserve/settle are the bookends),
-//! §5.7 (per-run identity: mint at dispatch, token life == run life, revoke on teardown — *the simple
-//! form here*; the full mint/scrub/revoke + re-mint lands in AG-P13).
+//! The SKELETON runtime drives the whole gateway/identity/dispatch/reserve/trace path at ~zero cost:
+//! no model, no tools. `Agent::handle` is the bounded, driven multi-turn loop; the agent loop driver
+//! runs build_conversation → reserve → step → route → settle. A run is a durable workflow — the
+//! workflow owns budget/gates/state; step/exec are activities; reserve/settle are the bookends.
+//! Per-run identity: mint at dispatch, token life == run life, revoke on teardown (the simple form
+//! here; the full mint/scrub/revoke + re-mint is a follow-on).
 //!
-//! **Contract-index:** OWNS 8.3 (`AgentRuntime::step` — the SKELETON impl) + 8.5 (`Agent::handle` —
-//! the loop body). CONSUMES 4.7 (`mint_run_token`/`revoke` — the per-run token), 11.7
-//! (`reserve`/`settle` — the cost-gate bookends), 9.1/9.2/9.5 (`DurableExecutor` + `WfCtx` — a run is
-//! a durable workflow), 2.2 (`OutboxTx::emit(draft, cause)` — nested causality), 1.8 (the telemetry
-//! signal set — the trace + the reserve/settle ledger are the green artifacts).
+//! ## What the SKELETON proves — the substrate path at zero cost
 //!
-//! ## What this prompt ships — the SKELETON path proven at zero cost
-//!
-//! The SKELETON is the **first-runnable proof slice** (roadmap M2-A): it exercises the WHOLE
-//! substrate path — gateway dispatch, per-run identity, the reserve/settle cost gate, the durable
-//! workflow, and the trace — **without thinking**. There is no model and no tools. The point is to
-//! prove the substrate is right (EI-03 §3 SKELETON → mock → real build order; EI-01 §3 prove-it-or-
-//! it-isn't-real) BEFORE a brain (AG-P5) or hands (AG-P6/AG-P15) plug in.
+//! The SKELETON is the first-runnable proof slice: it exercises the WHOLE substrate path — gateway
+//! dispatch, per-run identity, the reserve/settle cost gate, the durable workflow, and the trace —
+//! **without thinking**. There is no model and no tools. The point is to prove the substrate is
+//! right BEFORE a brain or hands plug in.
 //!
 //! The two contracts this owns:
-//! - [`SkeletonAgentRuntime`] (8.3) — an [`AgentRuntime`] with no model and no tools; its
+//! - [`SkeletonAgentRuntime`] — an [`AgentRuntime`] with no model and no tools; its
 //!   [`step`](AgentRuntime::step) submits IMMEDIATELY ([`StepOutcome::Submit`]). It exercises the
-//!   brain seam, it does not think. The `--use-mock` deterministic brain (AG-P5) plugs into the SAME
-//!   handle loop behind the SAME `&dyn AgentRuntime` seam; the LLM brain (AG-P25, post-M5) likewise.
-//! - [`SkeletonAgent`] (8.5) — the platform-owned `Agent::handle` loop body, wired as a **durable
-//!   workflow** (§5.6). On an [`InboxEvent`] it runs the chained substrate path inside ONE
+//!   brain seam, it does not think. The `--use-mock` deterministic brain plugs into the SAME handle
+//!   loop behind the SAME `&dyn AgentRuntime` seam; the LLM brain likewise.
+//! - [`SkeletonAgent`] — the platform-owned `Agent::handle` loop body, wired as a **durable
+//!   workflow**. On an [`InboxEvent`] it runs the chained substrate path inside ONE
 //!   [`WfCtx`](myelin_flow::WfCtx) co-commit transaction (so the trace journal row + its emit are
-//!   atomic — the same FLOW-D5 silent-data-loss floor `myelin-flow` owns):
-//!   1. **mint** a per-run attenuated token via [`RunTokenMinter::mint_run_token`] (4.7), token life
-//!      == run life;
+//!   atomic — the same silent-data-loss floor `myelin-flow` owns):
+//!   1. **mint** a per-run attenuated token via [`RunTokenMinter::mint_run_token`], token life ==
+//!      run life;
 //!   2. **reserve** at dispatch via the storage [`AgentRunGate`](myelin_storage::agent_run_gate::AgentRunGate)
-//!      (11.7 — no balance → no run);
+//!      (no balance → no run);
 //!   3. **build** the [`Conversation`] (EMPTY for the SKELETON — no trace history, no tools);
 //!   4. **step** the brain (an activity; the SKELETON submits immediately);
 //!   5. **write** the (near-empty) trace row as a journaled+co-committed activity, carrying nested
-//!      causality via [`WfCtx::emit`](myelin_flow::WfCtx::emit)`(draft, cause)` (2.2);
+//!      causality via [`WfCtx::emit`](myelin_flow::WfCtx::emit)`(draft, cause)`;
 //!   6. **settle** the reservation (reserved == settled — a zero-cost SKELETON bills 0);
 //!   7. on **teardown** revoke the token IDEMPOTENTLY (even on crash) via
 //!      [`RunTokenRevoker::revoke`], belt-and-suspenders with the token's auto-expiring TTL.
 //!
-//! ## The telemetry signal set (contract 1.8) — a path that emits no signal has FAILED the drill
+//! ## The telemetry signal set — a path that emits no signal has FAILED the drill
 //! Every run emits the survival signals into a [`SkeletonTelemetry`]: a balanced reserve/settle
 //! ledger (`reserved == settled`), a written `trace_ref`, and the token-revocation lag. The drill
-//! reads these — observability is part of the pass (EI-01 §3).
+//! reads these — observability is part of the pass.
 //!
-//! ## AG-D8 (the no-tool leg) — per-run token revoked on teardown AND auto-expires; 0 leak
+//! ## The no-tool leg — per-run token revoked on teardown AND auto-expires; 0 leak
 //! [`SkeletonAgent::handle`] revokes the per-run token on teardown **even when the run is killed
 //! mid-flight** ([`RunOutcomeKind::KilledMidFlight`]). The child environment the run hands to a tool
 //! is a [`ChildEnv`] minted from the per-run token ONLY — it inherits **no** shared platform token
-//! (the anti-leak unset, §5.7). The drill asserts: revoked-on-teardown + auto-expiry ≤ W + 0 shared
-//! token leaked into the child env + revocation-lag within bound. The **re-mint-on-resume leg is
-//! AG-P13** (→ P-225).
+//! (the anti-leak unset). The drill asserts: revoked-on-teardown + auto-expiry ≤ W + 0 shared
+//! token leaked into the child env + revocation-lag within bound. The re-mint-on-resume leg is a
+//! follow-on.
 //!
 //! ## FLOORS named (this is the SKELETON — a skeleton that masquerades as a working agent is the
-//! failure; VISION §3, EI-01 §1)
+//! failure)
 //! - **The BRAIN is a no-op.** [`SkeletonAgentRuntime::step`] submits immediately — no model, no
-//!   reasoning. The deterministic scripted brain is `MockAgentRuntime` (**AG-P5 → P-217**); the real
-//!   vendor brain is `LlmAgentRuntime` (**AG-P25, post-M5**, designed-not-built — the only place a
-//!   model/SDK/prompt/model-name string ever appears; `no-llm-in-platform`, contract 1.6).
+//!   reasoning. The deterministic scripted brain is `MockAgentRuntime`; the real vendor brain is
+//!   `LlmAgentRuntime` (the only place a model/SDK/prompt/model-name string ever appears —
+//!   `no-llm-in-platform`).
 //! - **The TOOLS are absent.** The SKELETON builds an EMPTY [`Conversation`] (no `tools`) and routes
 //!   nothing — `ToolHands::exec` (compute/external) + `EffectApi::apply`'s plan-then-apply pipeline
-//!   (mutate) land in **AG-P6 → P-218 / AG-P15 → P-226**.
+//!   (mutate) are named follow-ons.
 //! - **The FULL per-run identity** (mint / scrub the shared token / revoke idempotently / re-mint on
-//!   resume) is **AG-P13 → P-225**. Here is the *simple form* — mint at dispatch, revoke on teardown,
-//!   the anti-leak unset, the auto-expiry TTL. The re-mint-on-resume leg of AG-D8 is AG-P13's.
+//!   resume) is a named follow-on. Here is the *simple form* — mint at dispatch, revoke on teardown,
+//!   the anti-leak unset, the auto-expiry TTL.
 //! - **The mint/revoke + reserve/settle + outbox BODIES are the consumed subsystems'.** This crate is
-//!   the CONSUMER: it drives Identity's `mint_run_token`/`revoke` (4.7) through the [`RunTokenMinter`]
-//!   / [`RunTokenRevoker`] seams (the same trait-decoupling `myelin-flow` uses, so the DAG stays
-//!   acyclic — no production dep on `myelin-identity-service`), Storage's [`AgentRunGate`] (11.7), and
-//!   `myelin-flow`'s [`WfCtx`](myelin_flow::WfCtx) co-commit (9.2). The CDC pairs each with a real
+//!   the CONSUMER: it drives Identity's `mint_run_token`/`revoke` through the [`RunTokenMinter`] /
+//!   [`RunTokenRevoker`] seams (the same trait-decoupling `myelin-flow` uses, so the DAG stays
+//!   acyclic — no production dep on `myelin-identity-service`), Storage's [`AgentRunGate`], and
+//!   `myelin-flow`'s [`WfCtx`](myelin_flow::WfCtx) co-commit. The CDC pairs each with a real
 //!   provider impl (`tests/`).
 
 use crate::effect_api::validate_call;
@@ -97,7 +88,7 @@ use myelin_storage::agent_wallet::{AgentWallet, MicroUsd, WalletError};
 use myelin_storage::reserve_settle::{CostLedger, RunId as StorageRunId};
 use myelin_tenancy::{Region, TenantId};
 
-/// The frozen event type the trace-written-and-emitted activity emits (BUS §6.2 token, PII-free).
+/// The frozen event type the trace-written-and-emitted activity emits (PII-free).
 /// A SKELETON run's terminal `agent.run.traced` event carries the trace `ArtifactRef`
 /// references-not-payloads (never a reasoning body) so a downstream consumer can index/erase it.
 pub const AGENT_RUN_TRACED_EVENT: &str = "agent.run.traced";
@@ -107,7 +98,7 @@ pub const AGENT_RUN_TRACED_EVENT: &str = "agent.run.traced";
 /// settles ZERO units (reserved == settled at the floor estimate, refund == reserved).
 pub const SKELETON_STEP_UNIT: &str = "skeleton.step";
 
-/// **The bounded driving loop's max-turns ceiling (§2.3 — the bounded, driven multi-turn loop).**
+/// **The bounded driving loop's max-turns ceiling (the bounded, driven multi-turn loop).**
 /// The runaway guard for THIS slice: the loop steps the brain at most `DEFAULT_MAX_TURNS` times; a
 /// brain that never [`Submit`](StepOutcome::Submit)s within the bound terminates the run GRACEFULLY
 /// as [`SkeletonError::MaxTurnsExhausted`] (never an unbounded loop, never a panic). A well-formed
@@ -192,16 +183,16 @@ impl core::fmt::Display for SpendCapStage {
     }
 }
 
-// ───────────────────────── 8.3 — the SKELETON runtime (no model, no tools) ──────────────────────
+// ───────────────────────── the SKELETON runtime (no model, no tools) ────────────────────────────
 
-/// **8.3 — the SKELETON [`AgentRuntime`] (no model, no tools).** Its [`step`](AgentRuntime::step)
-/// submits IMMEDIATELY — it exercises the brain seam, it does NOT think. This is the §3.1 SKELETON:
+/// **The SKELETON [`AgentRuntime`] (no model, no tools).** Its [`step`](AgentRuntime::step)
+/// submits IMMEDIATELY — it exercises the brain seam, it does NOT think. This is the SKELETON:
 /// the lever that drives the whole gateway/identity/dispatch/reserve/trace path at ~zero cost.
 ///
 /// **Floor (named):** this is NOT a working brain. The deterministic scripted brain is
-/// `MockAgentRuntime` (AG-P5 → P-217) on the SAME `&dyn AgentRuntime` seam; the real vendor brain is
-/// `LlmAgentRuntime` (AG-P25, post-M5). No model/SDK/prompt/model-name string appears here (the
-/// `no-llm-in-platform` ratchet, contract 1.6).
+/// `MockAgentRuntime` on the SAME `&dyn AgentRuntime` seam; the real vendor brain is
+/// `LlmAgentRuntime`. No model/SDK/prompt/model-name string appears here (the
+/// `no-llm-in-platform` ratchet).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SkeletonAgentRuntime;
 
@@ -229,34 +220,34 @@ impl AgentRuntime for SkeletonAgentRuntime {
 /// blanket) so the vendor `LlmAgentRuntime` override does not collide under coherence.
 impl MeteredRuntime for SkeletonAgentRuntime {}
 
-// ───────────────────────── per-run identity: the revoke seam (4.7) + the child-env anti-leak ─────
+// ───────────────────────── per-run identity: the revoke seam + the child-env anti-leak ──────────
 
-/// **The engine's view of the contract-4.7 `revoke` surface (CONSUMED, §5.7).** A trait so
+/// **The engine's view of the `revoke` surface (CONSUMED).** A trait so
 /// `myelin-agent-service` does NOT take a production dependency on `myelin-identity-service` (the DAG
 /// stays acyclic — the same decoupling [`RunTokenMinter`] uses for the mint half). The Identity
 /// `RevocationStore::tear_down_run_token` provider is paired with this consumer seam in the CDC
 /// (`tests/cdc_4_7_revoke.rs`, dev-dep only).
 ///
-/// `revoke` is **idempotent even on crash** (§5.7): revoking an already-revoked / never-minted `jti`
+/// `revoke` is **idempotent even on crash**: revoking an already-revoked / never-minted `jti`
 /// is a no-op success — a teardown that fires twice (the explicit revoke + a crash-recovery sweep)
 /// never errors. The teardown is belt-and-suspenders with the token's auto-expiring TTL.
 pub trait RunTokenRevoker {
-    /// **`revoke(jti)` (contract 4.7).** Revoke the per-run token by its `jti` — idempotently, even
+    /// **`revoke(jti)`.** Revoke the per-run token by its `jti` — idempotently, even
     /// on crash. Returns the measured revocation lag (the seconds between the run's teardown instant
     /// and the revoke landing) so the [`SkeletonTelemetry`] can assert it is within bound. A re-revoke
     /// returns lag `0` (already denylisted — a no-op).
     fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> u64;
 
-    /// **Has this `jti` been revoked OR auto-expired by `now_secs`?** The AG-D8 assertion reads this:
-    /// a killed-mid-flight run's token is revoked-on-teardown AND, even absent the explicit revoke,
+    /// **Has this `jti` been revoked OR auto-expired by `now_secs`?** The killed-mid-flight assertion
+    /// reads this: a killed run's token is revoked-on-teardown AND, even absent the explicit revoke,
     /// auto-expires within the TTL window W. Both legs make the token dead — `true` once either fires.
     fn is_dead(&self, jti: &str, now_secs: i64) -> bool;
 }
 
-/// **The child environment a run hands a tool — minted from the per-run token ONLY (§5.7, the
+/// **The child environment a run hands a tool — minted from the per-run token ONLY (the
 /// anti-leak unset).** The SKELETON's run unsets any shared platform token in the child env (so a
 /// tool the run spawns inherits NO ambient platform credential — *an agent cannot leak the platform's
-/// authority into a child*). The AG-D8 drill asserts [`ChildEnv::shared_platform_token`] is `None` —
+/// authority into a child*). The drill asserts [`ChildEnv::shared_platform_token`] is `None` —
 /// 0 shared token leaked — and that the only credential is the per-run `jti`.
 ///
 /// Built by [`ChildEnv::for_run`]: the per-run `jti` is the ONLY credential; the shared platform
@@ -266,32 +257,32 @@ pub struct ChildEnv {
     /// The per-run token's `jti` — the ONLY credential the child inherits (token life == run life).
     pub run_token_jti: String,
     /// The shared platform token — **always `None`**: the anti-leak unset clears it so no ambient
-    /// platform credential leaks into a tool's environment (§5.7). 0 leak by construction.
+    /// platform credential leaks into a tool's environment. 0 leak by construction.
     pub shared_platform_token: Option<String>,
 }
 
 impl ChildEnv {
     /// **Mint a child environment for a run from its per-run token ONLY.** The shared platform token
-    /// is explicitly UNSET (cleared, never inherited) — the anti-leak property (§5.7). Even if the
+    /// is explicitly UNSET (cleared, never inherited) — the anti-leak property. Even if the
     /// PARENT process holds a `shared_platform_token`, the child gets `None`.
     pub fn for_run(run_token_jti: impl Into<String>) -> ChildEnv {
         ChildEnv {
             run_token_jti: run_token_jti.into(),
-            // The anti-leak unset: clear any inherited shared platform token (0 leak, §5.7).
+            // The anti-leak unset: clear any inherited shared platform token (0 leak).
             shared_platform_token: None,
         }
     }
 
-    /// Whether this child env leaked a shared platform token (the AG-D8 headline: must be `false`).
+    /// Whether this child env leaked a shared platform token (the anti-leak headline: must be `false`).
     pub fn leaked_shared_token(&self) -> bool {
         self.shared_platform_token.is_some()
     }
 }
 
-// ───────────────────────── 1.8 — the telemetry signal set (the green artifacts) ─────────────────
+// ───────────────────────── the telemetry signal set (the green artifacts) ───────────────────────
 
-/// **The contract-1.8 survival signals the SKELETON path emits (the green artifacts, §3.1).** A path
-/// that survives but emits NO signal has FAILED the drill (EI-01 §3 — observability is part of the
+/// **The survival signals the SKELETON path emits (the green artifacts).** A path
+/// that survives but emits NO signal has FAILED the drill (observability is part of the
 /// pass). The drill reads: a balanced reserve/settle ledger (`reserved == settled`), a written
 /// `trace_ref`, and the token-revocation lag.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -304,16 +295,16 @@ pub struct SkeletonTelemetry {
     /// The number of trace rows written (one per completed run — `trace_ref` is non-empty).
     traces_written: u64,
     /// The maximum token-revocation lag observed (seconds between teardown and revoke landing). The
-    /// AG-D8 drill asserts it is within the revocation bound.
+    /// drill asserts it is within the revocation bound.
     max_revocation_lag: u64,
     /// The number of per-run tokens revoked on teardown (one per run — even on a killed run).
     tokens_revoked: u64,
     /// The number of runs that completed the full chain (mint → reserve → step → trace → settle →
     /// revoke). Distinct from killed-mid-flight runs (which still revoke).
     runs_completed: u64,
-    /// The number of runs killed mid-flight (AG-D8): the token is STILL revoked on teardown.
+    /// The number of runs killed mid-flight: the token is STILL revoked on teardown.
     runs_killed: u64,
-    // ───────── raw per-run token usage totals (contract 8.3; NON-FINANCIAL — observability only) ──
+    // ───────── raw per-run token usage totals (NON-FINANCIAL — observability only) ────────────────
     //
     // The run's total RAW provider token counts, accumulated per turn from the metered brain step
     // ([`MeteredRuntime::step_metered`]). This is a NEW, separate observability signal — it holds NO
@@ -349,7 +340,7 @@ impl SkeletonTelemetry {
     pub fn settled(&self) -> u64 {
         self.settled
     }
-    /// **The balanced-ledger predicate (the §5.4 gate):** every minor-unit reserved was settled
+    /// **The balanced-ledger predicate:** every minor-unit reserved was settled
     /// (billed + refunded), so the ledger nets to zero outstanding. A SKELETON bills 0 and refunds
     /// the whole reservation; the gate is `reserved == settled` regardless of the split.
     pub fn ledger_balanced(&self) -> bool {
@@ -371,7 +362,7 @@ impl SkeletonTelemetry {
     pub fn runs_completed(&self) -> u64 {
         self.runs_completed
     }
-    /// The number of runs killed mid-flight (AG-D8).
+    /// The number of runs killed mid-flight.
     pub fn runs_killed(&self) -> u64 {
         self.runs_killed
     }
@@ -404,7 +395,7 @@ impl SkeletonTelemetry {
         self.charged_micro = self.charged_micro.saturating_add(amount.0);
     }
 
-    /// **Accumulate ONE metered turn's raw token usage (contract 8.3; observability only).** A
+    /// **Accumulate ONE metered turn's raw token usage (observability only).** A
     /// reported turn saturating-adds its raw counts into the run totals; a `NotReported` turn bumps
     /// the not-reported counter (the future metering slice fails closed on it). This touches NO money
     /// and NO reserve/settle state — token totals are a separate signal from the cost ledger.
@@ -442,42 +433,42 @@ impl SkeletonTelemetry {
     }
 }
 
-// ───────────────────────── 8.5 — the platform-owned Agent::handle loop body ─────────────────────
+// ───────────────────────── the platform-owned Agent::handle loop body ───────────────────────────
 
 /// **How a SKELETON run terminated.** A run either drives the FULL chain to completion, or is KILLED
-/// mid-flight (the AG-D8 no-tool leg: the failure-injection harness kills the run after dispatch but
+/// mid-flight (the no-tool leg: the failure-injection harness kills the run after dispatch but
 /// before it submits — the teardown STILL revokes the token).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunOutcomeKind {
     /// The run completed the chain: mint → reserve → step → trace → settle → revoke.
     Completed,
     /// The run was killed mid-flight (after dispatch, before submit) — the teardown still revoked the
-    /// per-run token (revoke-even-on-crash, §5.7). The AG-D8 no-tool leg.
+    /// per-run token (revoke-even-on-crash). The no-tool leg.
     KilledMidFlight,
 }
 
-/// **An error driving the SKELETON loop body.** Surfaced LOUD (never swallowed, EI-01 §2): a no-
+/// **An error driving the SKELETON loop body.** Surfaced LOUD (never swallowed): a no-
 /// balance dispatch, a failed mint, or a co-commit failure aborts the run with a typed value — never
 /// a silent half-run. The teardown (token revoke) STILL fires on every error path (defer-on-drop
 /// semantics — even an aborted run is torn down).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SkeletonError {
-    /// The reserve-at-dispatch was REFUSED (no balance → no run, 11.7 / AG-D11). The run never
+    /// The reserve-at-dispatch was REFUSED (no balance → no run). The run never
     /// started; no trace, no settle — but the (never-minted-for-flight) token is still torn down.
     DispatchRefused(String),
-    /// The per-run token mint failed (Identity unavailable / refused, 4.7). The run does not start
-    /// under no token (never run unattributed — §5.7).
+    /// The per-run token mint failed (Identity unavailable / refused). The run does not start
+    /// under no token (never run unattributed).
     MintFailed(String),
-    /// The durable-workflow co-commit (the trace journal row + its emit) failed (9.2 / 2.2). Loud —
-    /// a step is either fully journaled-and-emitted or neither (FLOW-D5).
+    /// The durable-workflow co-commit (the trace journal row + its emit) failed. Loud —
+    /// a step is either fully journaled-and-emitted or neither.
     CoCommit(String),
     /// A proposed [`ToolCall`](myelin_agent::ToolCall) FAILED the `validate_call` security checkpoint
     /// (the tool is unregistered, or its untrusted model arguments don't satisfy the tool's schema).
-    /// The run aborts FAIL-CLOSED — the unvalidated arguments are NEVER dispatched to a tool (§2.1,
-    /// plan-then-apply survives). The teardown STILL fires. Carries the loud validation reason.
+    /// The run aborts FAIL-CLOSED — the unvalidated arguments are NEVER dispatched to a tool
+    /// (plan-then-apply survives). The teardown STILL fires. Carries the loud validation reason.
     ToolValidationRejected(String),
     /// The [`ToolExecutor`] returned an error executing an already-validated call. Surfaced LOUD; the
-    /// run aborts and the teardown STILL fires (never a silent half-run, EI-01 §2).
+    /// run aborts and the teardown STILL fires (never a silent half-run).
     ToolExecFailed(String),
     /// The bounded driving loop reached [`DEFAULT_MAX_TURNS`] without the brain submitting (the
     /// runaway guard for this slice). The run terminates GRACEFULLY — 0 trace written, the teardown
@@ -569,8 +560,8 @@ impl From<RunTokenError> for SkeletonError {
 
 /// **The per-run substrate context the SKELETON loop body drives over (the gateway → identity →
 /// dispatch → reserve → trace path).** Carries the run identity (tenant/region/agent/run_id), the
-/// per-run mint lease (4.7), the reserve/settle gate + ledger (11.7), the durable-workflow journal +
-/// outbox (9.2), and the wallet balance the reserve debits. Built by the dispatch tier (3.6) from a
+/// per-run mint lease, the reserve/settle gate + ledger, the durable-workflow journal +
+/// outbox, and the wallet balance the reserve debits. Built by the dispatch tier from a
 /// delivered [`InboxEvent`]; the SKELETON drives it once per run.
 pub struct RunSubstrate<'a> {
     /// The verified `(tenant, region)` the run executes under (tenant-from-token; never a path).
@@ -581,22 +572,22 @@ pub struct RunSubstrate<'a> {
     pub agent: Principal,
     /// The run id (the durable-workflow instance handle).
     pub run_id: String,
-    /// The contract-4.7 mint seam (CONSUMED) — the SKELETON mints a per-run attenuated token ONCE at
+    /// The mint seam (CONSUMED) — the SKELETON mints a per-run attenuated token ONCE at
     /// dispatch (token life == run life). A trait so this crate takes no production dep on Identity
     /// (the same decoupling `myelin-flow` uses); the CDC pairs it with the real provider.
     pub minter_token: std::sync::Arc<dyn RunTokenMinter + Send + Sync>,
     /// The agent principal id the per-run token is minted FOR (the run's agent identity).
     pub agent_id: String,
-    /// The delegation caveats the mint attenuates the token with (the §6 grant chain — attenuate-only).
+    /// The delegation caveats the mint attenuates the token with (the grant chain — attenuate-only).
     pub caveats: DelegationCaveats,
     /// The per-run token TTL bound, in seconds (token life == run life; the fail-static window W).
     pub token_ttl_secs: u64,
-    /// The contract-4.7 revoke seam — the teardown revoke (idempotent, even on crash).
+    /// The revoke seam — the teardown revoke (idempotent, even on crash).
     pub revoker: &'a dyn RunTokenRevoker,
-    /// The one permissioned tool catalogue (8.1) the driving loop validates each proposed
+    /// The one permissioned tool catalogue the driving loop validates each proposed
     /// [`ToolCall`](myelin_agent::ToolCall) against ([`validate_call`], the security checkpoint). The
     /// SKELETON registers NO tools, so its catalogue is EMPTY and the loop body is never entered (the
-    /// brain submits on turn 0). The delegation-scoped subset (AG-P7) is the same [`ToolSurface`].
+    /// brain submits on turn 0). The delegation-scoped subset is the same [`ToolSurface`].
     pub catalogue: &'a dyn ToolSurface,
     /// The [`ToolExecutor`] seam — turns a VALIDATED [`ToolCall`](myelin_agent::ToolCall) into a
     /// [`ToolResult`](myelin_agent::ToolResult). The loop's tool-dispatch dependency; the three real
@@ -612,44 +603,44 @@ pub struct RunSubstrate<'a> {
     /// nominal [`available`](Self::available)/[`estimate`](Self::estimate) reserve/settle below —
     /// the wallet debit is real billing LAYERED ON TOP, it does not touch the gate.
     pub wallet: Option<&'a dyn RunWallet>,
-    /// The reserve/settle gate (11.7) that fronts the run — no balance → no run.
+    /// The reserve/settle gate that fronts the run — no balance → no run.
     pub gate: &'a mut AgentRunGate,
-    /// The Storage-owned durable cost ledger the gate drives (11.7).
+    /// The Storage-owned durable cost ledger the gate drives.
     pub ledger: &'a mut CostLedger,
     /// The wallet balance the reserve debits (from Commercial; no balance → no run).
     pub available: MicroUsd,
     /// The run's estimated upper-bound cost reserved at dispatch (integer minor-units). A SKELETON's
     /// estimate is a small floor; it settles 0 and refunds the rest (reserved == settled).
     pub estimate: MicroUsd,
-    /// The durable-workflow outbox the trace activity co-commits its emit into (BUS-2, the ONLY emit
+    /// The durable-workflow outbox the trace activity co-commits its emit into (the ONLY emit
     /// path — there is no second publish path).
     pub outbox: &'a myelin_events::OutboxStore,
     /// The ULID minter the outbox stamps emitted event ids with.
     pub minter: std::sync::Arc<dyn myelin_events::IdMinter>,
-    /// The `wf_history`/`wf_activity_attempt` journal the trace activity writes (9.2).
+    /// The `wf_history`/`wf_activity_attempt` journal the trace activity writes.
     pub journal: WfJournal,
     /// The engine's epoch-seconds clock (the lease/revocation clock the teardown reads).
     pub now_secs: i64,
 }
 
-/// **8.5 — the platform-owned `Agent::handle` SKELETON loop body (the durable-workflow driver).**
+/// **The platform-owned `Agent::handle` SKELETON loop body (the durable-workflow driver).**
 ///
 /// This is the ONE platform-owned loop — identical for mock and real (the brain is the only
 /// swappable part). It is NOT a strategy seam. For the SKELETON it drives the chained substrate path
-/// inside one [`WfCtx`] co-commit (§5.6 — a run is a durable workflow). See the module doc for the
+/// inside one [`WfCtx`] co-commit (a run is a durable workflow). See the module doc for the
 /// seven-step chain.
 pub struct SkeletonAgent;
 
 impl SkeletonAgent {
     /// A SKELETON agent (the platform-owned loop holder — stateless; the run state lives in the
-    /// durable workflow + the trace, §3.1).
+    /// durable workflow + the trace).
     pub fn new() -> SkeletonAgent {
         SkeletonAgent
     }
 
-    /// **Drive a multi-day-paused run through RESUME using the per-run identity (AG-P13, §5.7 C6).**
-    /// The loop-driver wiring the AG-P13 deliverable owns: a run that parked for *days* on a HITL gate
-    /// (or a long `SCHEDULE_AND_RUN_JOB`, AG-P16) spans its per-run token's TTL. On wake the driver
+    /// **Drive a multi-day-paused run through RESUME using the per-run identity.**
+    /// The loop-driver the resume deliverable owns: a run that parked for *days* on a HITL gate
+    /// (or a long `SCHEDULE_AND_RUN_JOB`) spans its per-run token's TTL. On wake the driver
     /// RE-MINTS a fresh attenuated token via [`crate::RunIdentity::remint_on_resume`] (same caveats,
     /// the REMAINING run life) BEFORE the resumed work runs, so the resumed activity executes under a
     /// FRESH live token — the run stays attributed within the TTL bound, 0 unattributed window. On
@@ -657,7 +648,7 @@ impl SkeletonAgent {
     ///
     /// This is the engine-side counterpart to `myelin-flow::WfCtx::remint_on_resume` (the durable
     /// engine's automatic resume-leg hook): the Agent-Fabric driver additionally clamps the re-mint
-    /// TTL to the run's *remaining* life (the §5.7 C6 tightening), so a long pause never widens the
+    /// TTL to the run's *remaining* life (the tightening), so a long pause never widens the
     /// attribution window past the run's own deadline. Returns the fresh token's `jti` (the resumed
     /// run's live attribution principal) or a [`SkeletonError::MintFailed`] LOUD (a resume past the
     /// run deadline, or a refused mint, never silently runs unattributed).
@@ -668,7 +659,7 @@ impl SkeletonAgent {
         resume_at_secs: i64,
         telemetry: &mut SkeletonTelemetry,
     ) -> Result<String, SkeletonError> {
-        // RE-MINT on resume (4.7, §5.7 C6): a fresh attenuated token with the SAME caveats and the
+        // RE-MINT on resume: a fresh attenuated token with the SAME caveats and the
         // REMAINING run life. A resume past the run deadline (no remaining life) surfaces LOUD — the
         // resumed work must NOT run past the run's own allotted life (never widen attribution).
         let jti = identity
@@ -676,19 +667,19 @@ impl SkeletonAgent {
             .map_err(|e| SkeletonError::MintFailed(e.to_string()))?
             .jti
             .clone();
-        // TEARDOWN: revoke the CURRENT (re-minted) token idempotently even on crash (4.7, §5.7).
+        // TEARDOWN: revoke the CURRENT (re-minted) token idempotently even on crash.
         let lag = identity.revoke_on_teardown(revoker, resume_at_secs, resume_at_secs);
         telemetry.record_revoke(lag);
         Ok(jti)
     }
 
-    /// **Drive ONE SKELETON run end-to-end on the real substrate, CHAINING the operations (8.5,
-    /// §5.1).** This is the chained-e2e path (EI-01 §4 — real sessions chain mutations, never a single
+    /// **Drive ONE SKELETON run end-to-end on the real substrate, CHAINING the operations.** This is
+    /// the chained-e2e path (real sessions chain mutations, never a single
     /// handler call): deliver → mint → reserve → step → trace → settle → revoke. `kill` injects the
-    /// AG-D8 mid-flight kill (the failure-injection harness): when `RunOutcomeKind::KilledMidFlight`
+    /// mid-flight kill (the failure-injection harness): when `RunOutcomeKind::KilledMidFlight`
     /// the run is killed AFTER dispatch but BEFORE it submits — the teardown STILL revokes the token.
     ///
-    /// Returns the [`RunOutcome`] (the platform-owned loop outcome, 8.5) with the trace ref + the
+    /// Returns the [`RunOutcome`] (the platform-owned loop outcome) with the trace ref + the
     /// settle outcome carried as a machine string (references-not-payloads), or a [`SkeletonError`]
     /// (a refused dispatch / a failed mint / a co-commit failure) — surfaced LOUD. The token is torn
     /// down on EVERY path (completed, killed, or errored) — the teardown is unconditional.
@@ -699,7 +690,7 @@ impl SkeletonAgent {
         telemetry: &mut SkeletonTelemetry,
         kill: RunOutcomeKind,
     ) -> Result<RunOutcome, SkeletonError> {
-        // (1) MINT a per-run attenuated token (4.7). Token life == run life. The mint is the ONLY
+        // (1) MINT a per-run attenuated token. Token life == run life. The mint is the ONLY
         //     token path — the SKELETON never fabricates a token, it always asks Identity (via the
         //     RunTokenMinter seam). The caveats are ATTENUATED per-run (a `run:<id>` caveat naming
         //     THIS run, attenuate-only). A failed mint aborts BEFORE any reserve (never run un-minted).
@@ -712,7 +703,7 @@ impl SkeletonAgent {
         // The teardown instant is the run's life-end; the revoke must land within the bound from here.
         let teardown_at = sub.now_secs;
 
-        // (2) RESERVE-at-dispatch (11.7). No balance → no run. On refusal the run is NEVER started —
+        // (2) RESERVE-at-dispatch. No balance → no run. On refusal the run is NEVER started —
         //     but the just-minted token is STILL torn down (the teardown is unconditional). The gate
         //     is correct-by-construction: a run cannot dispatch without going through reserve.
         let storage_run = StorageRunId::new(sub.run_id.clone());
@@ -732,14 +723,14 @@ impl SkeletonAgent {
         };
         telemetry.record_reserve(in_flight.reserved().0);
 
-        // The child environment a tool would inherit — minted from the per-run token ONLY (§5.7,
-        // anti-leak). Built here so it exists the moment the run is in-flight (a tool could spawn at
-        // any step); the AG-D8 drill reads it. NO shared platform token leaks in (0 leak).
+        // The child environment a tool would inherit — minted from the per-run token ONLY
+        // (anti-leak). Built here so it exists the moment the run is in-flight (a tool could spawn at
+        // any step); the drill reads it. NO shared platform token leaks in (0 leak).
         let _child_env = ChildEnv::for_run(&token.jti);
 
         // (3)+(4)+(5) Drive the durable-workflow body: build the EMPTY conversation, step the brain
         //     (an activity), write the trace (a journaled+co-committed activity carrying nested
-        //     causality). One WfCtx co-commit (§5.6) — the trace journal row + its emit are atomic.
+        //     causality). One WfCtx co-commit — the trace journal row + its emit are atomic.
         let ctx_base = EmitContextBase {
             tenant: sub.tenant.clone(),
             region: sub.region.clone(),
@@ -763,16 +754,16 @@ impl SkeletonAgent {
         // (3) BUILD the conversation — EMPTY at the start (no trace history). The loop appends the
         //     brain's model steps + the tool results it routes so a stateful brain (the mock/LLM,
         //     which reads its own prior turns to know its position) advances; the SKELETON submits on
-        //     turn 0 so the loop body is never entered. The from-trace build (AG-1) + the
-        //     delegation-scoped tool subset (AG-P7) are the named floors.
+        //     turn 0 so the loop body is never entered. The from-trace build + the
+        //     delegation-scoped tool subset are the named floors.
         let mut conv = Conversation::default();
 
-        // (4) DRIVE the bounded multi-turn loop (§2.3/§5.1 — build_conversation → step → route →
+        // (4) DRIVE the bounded multi-turn loop (build_conversation → step → route →
         //     append → step again). The ONE platform-owned loop, identical for mock and real; only the
         //     brain's decision differs. Each turn steps the brain and, per outcome:
         //       - Submit   → terminal: break with the submission (the SKELETON's single turn ends here,
         //         so its behaviour is UNCHANGED — it never enters the UseTools body);
-        //       - UseTools → the §5.0 routing point: VALIDATE each call (the security checkpoint —
+        //       - UseTools → the routing point: VALIDATE each call (the security checkpoint —
         //         fail-closed on Err; the untrusted model arguments are NEVER dispatched), EXECUTE it
         //         through the ToolExecutor seam, append the results to the conversation, and step again.
         //     The loop is BOUNDED by DEFAULT_MAX_TURNS (the runaway guard for this slice — NOT
@@ -888,14 +879,14 @@ impl SkeletonAgent {
                 }
                 StepOutcome::UseTools(calls) => {
                     // Advance the transcript with the brain's decision (a stateful brain reads its own
-                    // prior model turns to know its position — the platform owns history, §2.1).
+                    // prior model turns to know its position — the platform owns history).
                     conv.turns
                         .push(Turn::Model(StepOutcome::UseTools(calls.clone())));
                     let mut outcomes: Vec<ToolOutcome> = Vec::with_capacity(calls.len());
                     for call in &calls {
                         // THE SECURITY CHECKPOINT (fail-closed): an unregistered tool, or arguments
                         // that don't satisfy the tool's schema, ABORT the run — the untrusted args are
-                        // NEVER handed to a tool (§2.1). The teardown still fires (unconditional).
+                        // NEVER handed to a tool. The teardown still fires (unconditional).
                         if let Err(reason) = validate_call(sub.catalogue, call) {
                             drop(ctx); // abandon the co-commit — 0 ghost trace, 0 lost emit.
                             self.teardown(sub, &token, teardown_at, telemetry);
@@ -950,10 +941,10 @@ impl SkeletonAgent {
             }
         };
 
-        // (AG-D8) KILL mid-flight: the failure-injection harness kills the run AFTER dispatch but
+        // KILL mid-flight: the failure-injection harness kills the run AFTER dispatch but
         // BEFORE the trace/settle. The WfCtx is DROPPED without commit (so neither the trace journal
-        // row nor its emit becomes durable — emit-iff-committed, BUS-D4). The teardown STILL revokes
-        // the token (the no-tool leg of AG-D8). The reservation is NEVER interrupted (the run is
+        // row nor its emit becomes durable — emit-iff-committed). The teardown STILL revokes
+        // the token (the no-tool leg). The reservation is NEVER interrupted (the run is
         // in-flight; the only exit is settle — but a killed SKELETON leaves it reserved-not-settled,
         // which is the never-interrupt invariant working: the gate has no tear-down-in-flight API).
         if kill == RunOutcomeKind::KilledMidFlight {
@@ -967,9 +958,9 @@ impl SkeletonAgent {
         }
 
         // (5) WRITE the (near-empty) trace row as a journaled + co-committed activity, then emit the
-        //     terminal `agent.run.traced` event carrying the trace ref with NESTED causality (2.2).
+        //     terminal `agent.run.traced` event carrying the trace ref with NESTED causality.
         //     The activity journals one wf_history row; the emit stages into the SAME OutboxTx; the
-        //     commit makes BOTH durable atomically (FLOW-D5 — 0 ghost, 0 lost).
+        //     commit makes BOTH durable atomically (0 ghost, 0 lost).
         let trace_ref = format!("myelin://{}/agent/trace/{}", sub.tenant.0, sub.run_id);
         let trace_artifact = ArtifactRef(trace_ref.clone());
         ctx.activity(RetryPolicy::default_policy(), {
@@ -1000,7 +991,7 @@ impl SkeletonAgent {
             .map_err(|e| SkeletonError::CoCommit(format!("{e:?}")))?;
         telemetry.record_trace();
 
-        // (6) SETTLE the reservation (11.7). A SKELETON bills ZERO units (no model call) — it settles
+        // (6) SETTLE the reservation. A SKELETON bills ZERO units (no model call) — it settles
         //     with an EMPTY unit slice, so billed == 0 and the WHOLE reservation is refunded. The
         //     ledger is BALANCED: reserved == settled (billed + refunded). The settle is idempotent.
         let settle = in_flight
@@ -1011,7 +1002,7 @@ impl SkeletonAgent {
         telemetry.record_settle(settled_total);
 
         // (7) TEARDOWN: revoke the per-run token idempotently (even on crash), belt-and-suspenders
-        //     with the auto-expiring TTL (§5.7). The teardown is unconditional — it fires on the
+        //     with the auto-expiring TTL. The teardown is unconditional — it fires on the
         //     completed path here exactly as it fired on the killed/errored paths above.
         self.teardown(sub, &token, teardown_at, telemetry);
         telemetry.runs_completed = telemetry.runs_completed.saturating_add(1);
@@ -1026,9 +1017,9 @@ impl SkeletonAgent {
         )))
     }
 
-    /// **The teardown: revoke the per-run token idempotently (4.7, §5.7).** Unconditional — fires on
+    /// **The teardown: revoke the per-run token idempotently.** Unconditional — fires on
     /// every run-exit path (completed / killed / errored). Records the revocation lag into the
-    /// telemetry (the AG-D8 within-bound signal). Idempotent even on crash: a double-teardown (the
+    /// telemetry (the within-bound signal). Idempotent even on crash: a double-teardown (the
     /// explicit revoke + a crash sweep) is a no-op success (lag 0 on the re-revoke).
     fn teardown(
         &self,
@@ -1048,10 +1039,10 @@ impl Default for SkeletonAgent {
     }
 }
 
-/// **8.5 — the frozen `Agent::handle(InboxEvent, &dyn AgentRuntime) -> RunOutcome` shape, owned.**
-/// The trait body. This is the signature seam the dispatch tier (3.6) calls; the rich substrate-
+/// **The frozen `Agent::handle(InboxEvent, &dyn AgentRuntime) -> RunOutcome` shape, owned.**
+/// The trait body. This is the signature seam the dispatch tier calls; the rich substrate-
 /// chaining driver is [`SkeletonAgent::handle_run`] (which the wired path builds the [`RunSubstrate`]
-/// for from the delivered event). `handle` here proves the frozen 8.5 shape is implemented by the
+/// for from the delivered event). `handle` here proves the frozen shape is implemented by the
 /// SKELETON loop; a call with no substrate drives the brain through the `&dyn` seam (the strategy
 /// boundary) and returns the loop outcome.
 impl Agent for SkeletonAgent {
@@ -1079,7 +1070,7 @@ mod tests {
     // ───────── a deterministic mint/revoke seam fake (a REAL impl on the consumed surface) ─────────
 
     /// A deterministic [`RunTokenMinter`] — mints a fresh `jti` per `(agent, run)`, under the lease's
-    /// short TTL (token life == run life). It is a REAL impl on the contract-4.7 surface (the CDC
+    /// short TTL (token life == run life). It is a REAL impl on the mint surface (the CDC
     /// pairs the engine consumer with the Identity provider); here it proves the SKELETON drives the
     /// mint seam (it never fabricates a token).
     #[derive(Default)]
@@ -1107,7 +1098,7 @@ mod tests {
     }
 
     /// A deterministic [`RunTokenRevoker`] over a denylist + the token TTL — proves revoke-on-teardown
-    /// (idempotent even on crash) AND auto-expiry. A REAL impl on the contract-4.7 revoke surface.
+    /// (idempotent even on crash) AND auto-expiry. A REAL impl on the revoke surface.
     #[derive(Default)]
     struct FakeRevoker {
         revoked: std::sync::Mutex<std::collections::HashMap<String, i64>>,
@@ -1193,7 +1184,7 @@ mod tests {
         }
     }
 
-    /// **8.3 — the SKELETON runtime submits immediately (no model, no tools).** `step` returns a
+    /// **The SKELETON runtime submits immediately (no model, no tools).** `step` returns a
     /// frozen-shape `Submit` decision; it never returns `UseTools` (the SKELETON has no tools).
     #[test]
     fn skeleton_runtime_submits_immediately() {
@@ -1204,8 +1195,8 @@ mod tests {
         ));
     }
 
-    /// **8.5 — the chained-e2e SKELETON path: deliver → mint → reserve → step → trace → settle →
-    /// revoke (EI-01 §4 — real sessions CHAIN mutations).** One run drives the WHOLE substrate path
+    /// **The chained-e2e SKELETON path: deliver → mint → reserve → step → trace → settle →
+    /// revoke (real sessions CHAIN mutations).** One run drives the WHOLE substrate path
     /// at zero cost: a trace row is written, the ledger is balanced (reserved == settled), and the
     /// run principal == the per-run token's principal (attribution intact). Telemetry signals emit.
     #[test]
@@ -1286,7 +1277,7 @@ mod tests {
         );
     }
 
-    /// **AG-D8 (no-tool leg) — kill the run mid-flight → the per-run token is revoked on teardown AND
+    /// **The no-tool leg — kill the run mid-flight → the per-run token is revoked on teardown AND
     /// auto-expires ≤ W; 0 shared platform token leaked into the child env.** The headline drill: a
     /// killed run still tears down its token; the child env inherits NO shared platform token.
     #[test]
@@ -1360,7 +1351,7 @@ mod tests {
             "auto-expires by minted_at + W (≤ W window)"
         );
 
-        // 0 SHARED token leaked into the child env (the anti-leak unset, §5.7).
+        // 0 SHARED token leaked into the child env (the anti-leak unset).
         let child = ChildEnv::for_run(jti);
         assert!(
             !child.leaked_shared_token(),
@@ -1381,7 +1372,7 @@ mod tests {
         );
     }
 
-    /// **No balance → no run (11.7 / AG-D11).** A dispatch against an exhausted wallet is REFUSED;
+    /// **No balance → no run.** A dispatch against an exhausted wallet is REFUSED;
     /// the run never starts (no trace, no settle) — but the minted token is STILL torn down (the
     /// teardown is unconditional). The refusal surfaces LOUD.
     #[test]
@@ -1432,7 +1423,7 @@ mod tests {
         );
     }
 
-    /// **The frozen 8.5 `Agent::handle` shape drives the brain through the `&dyn` seam.** The trait
+    /// **The frozen `Agent::handle` shape drives the brain through the `&dyn` seam.** The trait
     /// body (the dispatch tier's entry) drives one step through the strategy boundary and returns the
     /// loop outcome; the rich chained path is `handle_run`.
     #[test]
@@ -1458,8 +1449,8 @@ mod tests {
         assert!(t.ledger_balanced(), "reserved == settled is balanced");
     }
 
-    /// **The contract-1.8 signal accessors are exact (mutation-floor — the signals ARE the green
-    /// artifacts, §3.1; a mutant that fixes an accessor to a constant must be killed).** Each
+    /// **The signal accessors are exact (mutation-floor — the signals ARE the green
+    /// artifacts; a mutant that fixes an accessor to a constant must be killed).** Each
     /// accessor returns the recorded value, distinguishably across values (so a `-> 0`/`-> 1`
     /// constant mutant flips an assertion).
     #[test]
@@ -1518,7 +1509,7 @@ mod tests {
         assert_eq!(t.max_revocation_lag(), 8);
     }
 
-    /// **`ChildEnv::leaked_shared_token` is exact (kills the `-> false` mutant — the AG-D8 anti-leak
+    /// **`ChildEnv::leaked_shared_token` is exact (kills the `-> false` mutant — the anti-leak
     /// headline).** A child env with NO shared token does not leak; one WITH a shared token DOES.
     #[test]
     fn child_env_leak_predicate_is_exact() {
@@ -1539,7 +1530,7 @@ mod tests {
     }
 
     /// **`SkeletonError` Display is non-empty + distinct per variant (kills the `fmt -> Ok(default)`
-    /// mutant — a swallowed error message is a silent failure, EI-01 §2).** Each variant renders its
+    /// mutant — a swallowed error message is a silent failure).** Each variant renders its
     /// machine reason loudly.
     #[test]
     fn skeleton_error_display_is_loud_and_distinct() {
@@ -1847,7 +1838,7 @@ mod tests {
         assert_eq!(tele.runs_completed(), 0);
     }
 
-    // ───────── raw token-usage telemetry (contract 8.3; NON-FINANCIAL — observability only) ──────
+    // ───────── raw token-usage telemetry (NON-FINANCIAL — observability only) ────────────────────
 
     /// **A SKELETON run's token totals are 0 / NotReported, and the ledger is UNAFFECTED.** The
     /// SKELETON has no model, so its single submit turn reports no usage: the token totals stay 0, the
@@ -2291,7 +2282,7 @@ mod tests {
     }
 
     /// **The new metering `SkeletonError` variants render LOUD + distinct** (a swallowed money-path
-    /// error is a silent failure, EI-01 §2).
+    /// error is a silent failure).
     #[test]
     fn metering_error_display_is_loud_and_distinct() {
         let cap = SkeletonError::WalletSpendCapReached {
