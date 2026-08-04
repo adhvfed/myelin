@@ -1,73 +1,61 @@
 //! # `long_park` — the `SCHEDULE_AND_RUN_JOB` long-park idiom CONSUMED by the Agent-Fabric
-//! (AG-P16 → P-228, M2-C)
 //!
-//! **Owning architecture doc:**
-//! `planning/05-refined-shared-systems-architecture/agent-fabric.md` §5.6 (*a run is a durable
-//! workflow + the `SCHEDULE_AND_RUN_JOB` long-park idiom (C5)*): a long sandbox job (a `compute`
-//! tool whose CI run takes minutes-to-hours) dispatches the `kind=agent` job (reserve at dispatch —
-//! 11.7), the run **PARKS holding no runtime**, and completion arrives **hours later** as a durable
-//! signal `signal(run, "job.done", {result}, idem_key = idem_token)` idempotent on `idem_token` (the
-//! runner can deliver "done" twice; the workflow wakes ONCE). On wake after a long park, the per-run
-//! token is RE-MINTED (the §5.7 C6 re-mint-on-resume, AG-P13). **The Fabric CONSUMES this idiom; it
-//! does not reinvent durable waits** (§5.6 / TE-20 build-vs-adopt).
-//!
-//! **Contract-index:** CONSUMES 9.2 (`WfCtx::schedule_and_run_job` — the long-park idiom),
-//! 9.4 (the `job.done` durable signal, idempotent on `idem_token`), 11.7 (reserve at dispatch within
-//! the idiom — the metered form), 4.7 (`mint_run_token` re-mint on resume). The ENGINE half (9.2/9.4)
-//! lives in [`myelin_flow::job`] (P-FLOW-15 → P-211); this is the AGENT-FABRIC consumer that drives a
-//! long `kind=agent` `ToolHands::exec` job through it.
-//!
-//! ## What this prompt (AG-P16) ships — the Fabric's long-park CONSUMER (NO new engine, NO new table)
+//! A long sandbox job (a `compute` tool whose CI run takes minutes-to-hours) dispatches the
+//! `kind=agent` job (reserve at dispatch), the run **PARKS holding no runtime**, and completion
+//! arrives **hours later** as a durable signal `signal(run, "job.done", {result}, idem_key =
+//! idem_token)` idempotent on `idem_token` (the runner can deliver "done" twice; the workflow wakes
+//! ONCE). On wake after a long park, the per-run token is RE-MINTED. **The Fabric CONSUMES this idiom;
+//! it does not reinvent durable waits.** The ENGINE half lives in [`myelin_flow::job`]; this is the
+//! AGENT-FABRIC consumer that drives a long `kind=agent` `ToolHands::exec` job through it.
 //!
 //! The idiom is **already built in the engine** ([`WfCtx::schedule_and_run_job`], composing the
-//! activity / durable-signal / durable-timer primitives). AG-P15 (→ P-226, [`crate::exec`]) shipped
-//! the *in-line activity form* of `ToolHands::exec` (a `compute` job that runs synchronously within
-//! one activity). **AG-P16 is the LONG-PARK form**: the SAME hardened `kind=agent` job
-//! ([`crate::exec::SandboxJob`]) is handed to the engine's `schedule_and_run_job` so a job that takes
-//! HOURS dispatches-and-returns (the worker is freed, the run holds no runtime) and resumes on the
-//! durable `job.done` signal. The Fabric supplies:
+//! activity / durable-signal / durable-timer primitives). The in-line activity form of
+//! `ToolHands::exec` ([`crate::exec`]) runs a `compute` job synchronously within one activity. **This
+//! is the LONG-PARK form**: the SAME hardened `kind=agent` job ([`crate::exec::SandboxJob`]) is handed
+//! to the engine's `schedule_and_run_job` so a job that takes HOURS dispatches-and-returns (the worker
+//! is freed, the run holds no runtime) and resumes on the durable `job.done` signal. The Fabric
+//! supplies:
 //!
-//! - [`AgentJobDispatcher`] — the [`JobRunner`] (contract-8.4 `ToolHands::exec` seam, the engine's
-//!   dispatch TARGET) that hands a long `kind=agent` [`crate::exec::SandboxJob`] to the unified
-//!   sandbox backend for ASYNCHRONOUS execution (it dispatches and returns; the runner runs the job
-//!   for however long it takes and later delivers `job.done`). It reuses [`crate::exec`]'s routing
-//!   split (only a `compute` tool builds a job) and the four-guarantee hardening — a long-park job is
-//!   the SAME hardened spec, just completed-by-signal instead of in-line.
+//! - [`AgentJobDispatcher`] — the [`JobRunner`] (the `ToolHands::exec` seam, the engine's dispatch
+//!   TARGET) that hands a long `kind=agent` [`crate::exec::SandboxJob`] to the unified sandbox backend
+//!   for ASYNCHRONOUS execution (it dispatches and returns; the runner runs the job for however long
+//!   it takes and later delivers `job.done`). It reuses [`crate::exec`]'s routing split (only a
+//!   `compute` tool builds a job) and the four-guarantee hardening — a long-park job is the SAME
+//!   hardened spec, just completed-by-signal instead of in-line.
 //! - [`dispatch_long_compute`] — the Fabric entry point: build the hardened long `kind=agent` job for
 //!   a `compute` `ToolDef` + `Command`, then drive the engine's [`WfCtx::schedule_and_run_job`]
 //!   (dispatch-and-return + park-on-`job.done` + idempotent completion). On wake (a buffered/arriving
 //!   `job.done`, or a timeout) the engine's wait-resume leg RE-MINTS the per-run token (if a
-//!   [`RunTokenLease`] is wired, §6.2 — the long-park resume IS a wait resume, so the engine owns the
-//!   one re-mint; no double-mint).
+//!   [`RunTokenLease`] is wired — the long-park resume IS a wait resume, so the engine owns the one
+//!   re-mint; no double-mint).
 //! - [`LongParkOutcome`] — the Fabric's view of a long-park: `Completed` (the `job.done` arrived,
 //!   consumed exactly once), `Parked` (dispatched, the run waits holding no runtime — the body returns
 //!   promptly), or `TimedOut` (the runner vanished and the SLA timer fired). A thin projection of the
 //!   engine's [`JobOutcome`] so the Fabric never re-exposes the engine's internal shapes raw.
 //!
-//! ## The gate this prompt proves (§5.6 / AG-D-long-park)
+//! ## The invariants this idiom guarantees
 //! 1. **A doubly-delivered `job.done` wakes the run EXACTLY ONCE** (idempotent on `idem_token`) — the
 //!    runner delivers "done" twice (at-least-once under the bus); the run wakes once, the result is
 //!    consumed once.
 //! 2. **The parked run holds NO runtime** — between dispatch and `job.done` the run is
 //!    `state='waiting'`; the worker is free (it dispatched-and-returned). A long compute costs storage
-//!    not compute while parked (VISION §3).
+//!    not compute while parked.
 //! 3. **Re-mint on wake after a long park** — the resumed run runs under a FRESH short-lived per-run
-//!    token (token life == activity life, never the days-long workflow life, §5.7 C6 / AG-P13).
+//!    token (token life == activity life, never the days-long workflow life).
 //!
-//! ## FLOOR named — NONE. The idiom is CONSUMED from the durable-workflow engine, not reinvented.
-//! The engine's [`WfCtx::schedule_and_run_job`] (9.2/9.4) owns the dispatch/park/idempotent-completion
+//! ## The idiom is CONSUMED from the durable-workflow engine, not reinvented
+//! The engine's [`WfCtx::schedule_and_run_job`] owns the dispatch/park/idempotent-completion
 //! mechanics + the reserve/settle bookend (the metered form) + the resume-leg re-mint hook; this
 //! module is the Fabric CONSUMER that points a long `kind=agent` `ToolHands::exec` job at it. The real
-//! sandbox backend (the Firecracker microVM, CI-P2 → P-237) + the ZERO-escapes real-kernel GATE
-//! (AG-P17 → P-229 / CI-P5) are the runner IMPL/GATE follow-ons RECORDED in [`crate::exec`], not owned
-//! here; the real `LlmAgentRuntime` dispatching long compute is post-M5 (AG-P25).
+//! sandbox backend (the Firecracker microVM) + the ZERO-escapes real-kernel GATE are the runner
+//! IMPL/GATE follow-ons RECORDED in [`crate::exec`], not owned here; the real `LlmAgentRuntime`
+//! dispatching long compute is a follow-on.
 //!
 //! ## DB-free
 //! This module touches NO DB / object-store / cache / bus contract directly: it composes the engine's
-//! [`WfCtx`] (proven against the live stack at the durable-workflow tier, P-FLOW-15/16) and the
-//! in-memory [`SandboxBackend`] dispatch seam ([`crate::exec`], proven at AG-P15). `cargo build
-//! --workspace` stays DB-free; no new `integration` feature here (no new data-layer contract is
-//! crossed — recorded in the P-228 report).
+//! [`WfCtx`] (proven against the live stack at the durable-workflow tier) and the in-memory
+//! [`SandboxBackend`] dispatch seam ([`crate::exec`]). `cargo build --workspace` stays DB-free; no new
+//! `integration` feature here (no new data-layer contract is crossed).
 
 use crate::escape_gate::AgentExecGate;
 use crate::exec::{RoutingError, SandboxJob};
@@ -79,8 +67,8 @@ use myelin_ci_sandbox::{
 use myelin_flow::{JobKind, JobOutcome, JobRunner, JobSpec, WfCtx, WfResult};
 use myelin_refs::ArtifactRef;
 
-/// **The Fabric's view of a long-park `SCHEDULE_AND_RUN_JOB` outcome (§5.6).** A thin projection of
-/// the engine's [`JobOutcome`] so the Agent-Fabric never re-exposes the engine's internal shape raw:
+/// **The Fabric's view of a long-park `SCHEDULE_AND_RUN_JOB` outcome.** A thin projection of the
+/// engine's [`JobOutcome`] so the Agent-Fabric never re-exposes the engine's internal shape raw:
 /// a long compute either COMPLETED (the `job.done` arrived hours later, consumed exactly once),
 /// PARKED (dispatched, the run waits holding NO runtime — the body returns promptly), or TIMED OUT
 /// (the runner vanished and the SLA timer bounded the wait).
@@ -88,12 +76,12 @@ use myelin_refs::ArtifactRef;
 pub enum LongParkOutcome {
     /// **The long compute COMPLETED — the `job.done` signal arrived and was CONSUMED exactly once.**
     /// Carries the runner-echoed `idem_token` (= the dispatch token — the no-coordination dedup
-    /// agreement held, §4.9) and the job's references-not-payloads result refs (the trace, never a
-    /// PII body). A double-delivered `job.done` produces this ONCE (the engine's `wf_signal` PK dedup).
+    /// agreement held) and the job's references-not-payloads result refs (the trace, never a PII
+    /// body). A double-delivered `job.done` produces this ONCE (the engine's `wf_signal` PK dedup).
     Completed {
         /// the `idem_token` the runner echoed (= the minted dispatch token).
         idem_token: String,
-        /// the job's result refs (references-not-payloads, §3.4).
+        /// the job's result refs (references-not-payloads).
         result: Vec<ArtifactRef>,
     },
     /// **The job is DISPATCHED and the run PARKED on `job.done` (holds NO runtime).** The run is
@@ -120,8 +108,8 @@ impl LongParkOutcome {
         matches!(self, LongParkOutcome::TimedOut)
     }
 
-    /// Project the engine's [`JobOutcome`] (9.2/9.4) into the Fabric's [`LongParkOutcome`]. A pure
-    /// re-tag — the Fabric consumes the engine's outcome, it does not re-derive completion.
+    /// Project the engine's [`JobOutcome`] into the Fabric's [`LongParkOutcome`]. A pure re-tag — the
+    /// Fabric consumes the engine's outcome, it does not re-derive completion.
     fn from_job_outcome(out: JobOutcome) -> LongParkOutcome {
         match out {
             JobOutcome::Completed { idem_token, result } => {
@@ -134,9 +122,9 @@ impl LongParkOutcome {
 }
 
 /// **The Agent-Fabric [`JobRunner`] — the dispatch TARGET the engine's `schedule_and_run_job` hands
-/// the long `kind=agent` [`JobSpec`] to (contract 8.4 CONSUMED, §5.6/§4.9).** It is the long-park
-/// twin of [`crate::exec::SandboxToolHands`]: where the in-line form (`dispatch_compute`) BLOCKS on
-/// the launch + whole-guest kill within ONE activity, this form DISPATCHES the hardened job onto the
+/// the long `kind=agent` [`JobSpec`] to.** It is the long-park twin of
+/// [`crate::exec::SandboxToolHands`]: where the in-line form (`dispatch_compute`) BLOCKS on the
+/// launch + whole-guest kill within ONE activity, this form DISPATCHES the hardened job onto the
 /// unified-sandbox backend for ASYNCHRONOUS execution and RETURNS immediately (the worker is freed;
 /// the run parks; the runner runs the job for however long it takes and LATER delivers
 /// `signal(run, "job.done", …, idem_key = idem_token)`).
@@ -146,20 +134,20 @@ impl LongParkOutcome {
 /// digest-pin / pids.max / timeout / egress / token-scrub hardening), it is just completed-by-signal
 /// instead of in-line. There is NO second hardening profile and NO host-exec bypass.
 ///
-/// **GATED BY AG-D4 — STRUCTURALLY (AG-P17 → P-229).** The real backend executes untrusted code in
-/// the kernel sandbox, so this dispatcher carries an [`AgentExecGate`] — a value obtainable ONLY from
-/// a GREEN [`EscapeAttestation`](myelin_ci_sandbox::EscapeAttestation) for the production backend. The
+/// **GATED BY THE ESCAPE GATE — STRUCTURALLY.** The real backend executes untrusted code in the
+/// kernel sandbox, so this dispatcher carries an [`AgentExecGate`] — a value obtainable ONLY from a
+/// GREEN [`EscapeAttestation`](myelin_ci_sandbox::EscapeAttestation) for the production backend. The
 /// dispatcher has no constructor without it (mirroring [`crate::exec::SandboxToolHands`]), so the
-/// long-park dispatch is fail-closed on AG-D4 exactly like the in-line `exec` form: no green
+/// long-park dispatch is fail-closed on the escape gate exactly like the in-line `exec` form: no green
 /// attestation ⇒ no `AgentJobDispatcher` ⇒ no untrusted compute. The backend is CI's
 /// (`myelin-ci-sandbox`); the Fabric feeds it the hardened spec.
 pub struct AgentJobDispatcher<'a, B: SandboxBackend> {
-    /// The AG-D4 / CI-T1 escape gate (AG-P17 → P-229) — its existence is the proof a green escape
-    /// attestation for the production backend was consumed (fail-closed: no green ⇒ no dispatcher).
+    /// The escape gate — its existence is the proof a green escape attestation for the production
+    /// backend was consumed (fail-closed: no green ⇒ no dispatcher).
     gate: AgentExecGate,
     /// The unified-sandbox backend (CI owns it; the Fabric feeds the hardened `kind=agent` spec).
     backend: &'a B,
-    /// The pre-built HARDENED `kind=agent` job (the four-guarantee profile, AG-P15). The engine's
+    /// The pre-built HARDENED `kind=agent` job (the four-guarantee profile). The engine's
     /// `JobRunner::dispatch` hands an OPAQUE engine [`JobSpec`] (a dispatch descriptor + the
     /// deterministic idem_token); the Fabric dispatches THIS hardened sandbox spec onto the backend.
     /// They are bound together at [`dispatch_long_compute`] (the engine target encodes the hardened
@@ -172,10 +160,10 @@ impl<'a, B: SandboxBackend> AgentJobDispatcher<'a, B> {
     /// `kind=agent` four-guarantee spec). Usually constructed by [`dispatch_long_compute`], which
     /// builds the hardened job from a `compute` `ToolDef`+`Command` and binds it here.
     ///
-    /// **The AG-D4 `gate` is a REQUIRED argument** — there is no constructor without it. The
-    /// dispatcher cannot exist (and therefore cannot hand untrusted compute to the backend) unless the
-    /// caller holds a GREEN [`AgentExecGate`] for the production backend (the structural fail-closed,
-    /// AG-P17 → P-229; mirrors [`crate::exec::SandboxToolHands::new`]).
+    /// **The `gate` is a REQUIRED argument** — there is no constructor without it. The dispatcher
+    /// cannot exist (and therefore cannot hand untrusted compute to the backend) unless the caller
+    /// holds a GREEN [`AgentExecGate`] for the production backend (the structural fail-closed; mirrors
+    /// [`crate::exec::SandboxToolHands::new`]).
     pub fn new(gate: AgentExecGate, backend: &'a B, job: SandboxJob) -> AgentJobDispatcher<'a, B> {
         AgentJobDispatcher { gate, backend, job }
     }
@@ -185,8 +173,8 @@ impl<'a, B: SandboxBackend> AgentJobDispatcher<'a, B> {
         &self.job
     }
 
-    /// The AG-D4 / CI-T1 escape gate this dispatcher runs under (read-only). Its existence is the
-    /// proof a green escape attestation for the production backend was consumed (AG-P17 → P-229).
+    /// The escape gate this dispatcher runs under (read-only). Its existence is the proof a green
+    /// escape attestation for the production backend was consumed.
     pub fn gate(&self) -> &AgentExecGate {
         &self.gate
     }
@@ -197,15 +185,15 @@ impl<B: SandboxBackend> JobRunner for AgentJobDispatcher<'_, B> {
     /// Returns `Ok(())` on a dispatch the runner ACCEPTED (the completion arrives LATER as the
     /// `job.done` signal the engine parks on), or an [`myelin_flow::ActivityError`] if the dispatch
     /// itself failed (the engine retries it, reusing the SAME deterministic `idem_token` — the runner
-    /// dedups a re-dispatched job on it, §4.9).
+    /// dedups a re-dispatched job on it).
     ///
     /// The engine's opaque [`JobSpec`] argument (kind ∈ {Ci, Agent}, an opaque `target` + the
     /// `idem_token`) is the engine's dispatch CONTRACT; the Fabric's HARDENED
     /// [`crate::exec::SandboxJob`] (the four-guarantee profile) is what actually runs — they refer to
     /// the SAME job (the engine target encodes the hardened job's idem token, bound at
     /// [`dispatch_long_compute`]). A `schedule_and_run_job` for a `kind=agent` job routes through THIS
-    /// runner; a `kind=ci` job is CI's own merge-queue runner (§5.6 — the SAME idiom, a different
-    /// dispatch target).
+    /// runner; a `kind=ci` job is CI's own merge-queue runner (the SAME idiom, a different dispatch
+    /// target).
     fn dispatch(&self, spec: &JobSpec) -> Result<(), myelin_flow::ActivityError> {
         debug_assert_eq!(
             spec.kind,
@@ -215,7 +203,7 @@ impl<B: SandboxBackend> JobRunner for AgentJobDispatcher<'_, B> {
         );
         // Re-stamp the engine's DETERMINISTIC dispatch idem_token (minted on the dispatch position)
         // onto the hardened spec, so the runner echoes THAT token on `job.done` — the no-coordination
-        // dedup key the workflow keys its `wait_for_signal` on (§4.9). The four-guarantee profile is
+        // dedup key the workflow keys its `wait_for_signal` on. The four-guarantee profile is
         // untouched; only the dedup token is rebound to the engine's deterministic one.
         let dispatched = self
             .job
@@ -226,17 +214,17 @@ impl<B: SandboxBackend> JobRunner for AgentJobDispatcher<'_, B> {
         // runs). The real backend enqueues the guest and reports `job.done` later; the in-memory shape
         // stub records the acceptance. A dispatch failure (the runner is unreachable / rejected the
         // spec) surfaces LOUD as an ActivityError so the engine retries it on the SAME idem_token
-        // (never a silent drop — EI-01 §2).
+        // (never a silent drop).
         self.backend
             .accept_async(dispatched.spec())
             .map_err(|e| myelin_flow::ActivityError(format!("async dispatch refused: {e}")))
     }
 }
 
-/// **The Fabric entry point: dispatch a long `compute` job as a `SCHEDULE_AND_RUN_JOB` long-park
-/// (§5.6 — the idiom CONSUMED).** Builds the hardened `kind=agent` [`crate::exec::SandboxJob`] for the
-/// `compute` `def` + `cmd` (the routing split: a non-`compute` tool is REFUSED LOUD — it has no path
-/// to the sandbox), then drives the engine's [`WfCtx::schedule_and_run_job`]:
+/// **The Fabric entry point: dispatch a long `compute` job as a `SCHEDULE_AND_RUN_JOB` long-park (the
+/// idiom CONSUMED).** Builds the hardened `kind=agent` [`crate::exec::SandboxJob`] for the `compute`
+/// `def` + `cmd` (the routing split: a non-`compute` tool is REFUSED LOUD — it has no path to the
+/// sandbox), then drives the engine's [`WfCtx::schedule_and_run_job`]:
 ///
 /// 1. **Dispatch-and-return.** The engine mints the deterministic `idem_token` (on the dispatch
 ///    position), stamps it on the engine's [`JobSpec`], and hands it to [`AgentJobDispatcher`] (which
@@ -247,14 +235,14 @@ impl<B: SandboxBackend> JobRunner for AgentJobDispatcher<'_, B> {
 ///    idem_key = idem_token)` (possibly TWICE — at-least-once), the engine consumes it EXACTLY once
 ///    (the `wf_signal` PK dedup) and resumes. The resume leg RE-MINTS the per-run token (if a
 ///    [`RunTokenLease`](myelin_flow::RunTokenLease) is wired via
-///    [`WfCtx::with_run_identity`](myelin_flow::WfCtx::with_run_identity), §5.7 C6 — the long-park
-///    resume IS a wait resume, so the engine owns the ONE re-mint; no double-mint).
+///    [`WfCtx::with_run_identity`](myelin_flow::WfCtx::with_run_identity) — the long-park resume IS a
+///    wait resume, so the engine owns the ONE re-mint; no double-mint).
 ///
-/// **Reserve at dispatch (11.7):** when the `WfCtx` is metered
+/// **Reserve at dispatch:** when the `WfCtx` is metered
 /// ([`WfCtx::with_budget`](myelin_flow::WfCtx::with_budget)) use [`dispatch_long_compute_metered`]
 /// instead — it fronts the dispatch with the reserve/settle bookend (no balance → the job is NEVER
 /// handed to the runner). The bare form here is the un-metered long-park (the loop-cap depth is the
-/// runaway bound, AG-6).
+/// runaway bound).
 ///
 /// Returns the hardened-job build error ([`RoutingError`]) if the tool is not `compute` / the spec is
 /// not fail-closed buildable, or the engine [`WfResult`] of the long-park (the [`LongParkOutcome`]).
@@ -270,24 +258,24 @@ pub fn dispatch_long_compute<B: SandboxBackend>(
 ) -> Result<WfResult<LongParkOutcome>, RoutingError> {
     // Build the HARDENED kind=agent job (the routing split + the four-guarantee profile). A
     // non-`compute` tool is REFUSED LOUD here — it has no path to the sandbox (the type-level safety
-    // boundary, AG-P15). The hardened SandboxJob carries the Fabric's own dispatch idem token (the
-    // backend dedups a re-dispatch on it); the engine ALSO mints its OWN deterministic idem_token for
-    // the `job.done` wait — both are carried, bound through `long_job_target`. The AG-D4 `gate`
-    // (AG-P17) gates the dispatcher fail-closed: no green attestation ⇒ no dispatcher.
+    // boundary). The hardened SandboxJob carries the Fabric's own dispatch idem token (the backend
+    // dedups a re-dispatch on it); the engine ALSO mints its OWN deterministic idem_token for the
+    // `job.done` wait — both are carried, bound through `long_job_target`. The `gate` gates the
+    // dispatcher fail-closed: no green attestation ⇒ no dispatcher.
     let job = build_long_job(def, cmd, &profile)?;
     let target = long_job_target(&job);
     let dispatcher = AgentJobDispatcher::new(gate, backend, job);
 
-    // Drive the engine's long-park idiom (9.2/9.4): dispatch-and-return + park-on-job.done +
-    // idempotent completion. The engine owns the deterministic idem_token, the parking, the
-    // double-delivery dedup, and the resume-leg re-mint. We CONSUME it — we do not reinvent it.
+    // Drive the engine's long-park idiom: dispatch-and-return + park-on-job.done + idempotent
+    // completion. The engine owns the deterministic idem_token, the parking, the double-delivery
+    // dedup, and the resume-leg re-mint. We CONSUME it — we do not reinvent it.
     let engine_spec = JobSpec::new(JobKind::Agent, target);
     Ok(ctx
         .schedule_and_run_job(engine_spec, &dispatcher, timeout_secs)
         .map(LongParkOutcome::from_job_outcome))
 }
 
-/// **The metered long-park form (§5.6 / 11.7 reserve at dispatch).** The same idiom as
+/// **The metered long-park form (reserve at dispatch).** The same idiom as
 /// [`dispatch_long_compute`], FRONTED by the reserve/settle bookend: it reserves `cost` minor-units
 /// at dispatch (no balance → the job is NEVER handed to the runner) and settles the actual `units` on
 /// the consumed `job.done`. An in-flight parked job is NEVER interrupted (its reservation stays
@@ -332,7 +320,7 @@ pub struct LongComputeProfile {
     pub egress: EgressPolicy,
     /// The resource limits (pids_max + timeout > 0; zero swap structural).
     pub limits: ResourceLimits,
-    /// The run's trust tier (gates secrets/cache/egress; X-1).
+    /// The run's trust tier (gates secrets/cache/egress).
     pub trust_tier: TrustTier,
     /// The per-run attenuated token (guarantee #2; minted at dispatch, re-minted on resume).
     pub run_token: RunTokenCredential,

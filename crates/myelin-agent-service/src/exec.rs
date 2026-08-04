@@ -1,24 +1,13 @@
-//! # `exec` — `ToolHands::exec` on the unified sandbox (AG-P15 → P-226, M2-C)
+//! # `exec` — `ToolHands::exec` on the unified sandbox
 //!
-//! **Owning architecture doc:** `planning/05-refined-shared-systems-architecture/agent-fabric.md`
-//! §2.2 (the hands — `exec(command) -> result`, **no host-exec bypass** + the four uniform
-//! guarantees), §5.0 (the routing table — exec carries ONLY `compute` untrusted code; `mutate` /
-//! `external` route through [`EffectApi`](crate::effect_api), never exec — the routing split is the
-//! safety boundary). Reconciliation: `00-reconciliation-decisions.md` X-6 (the four uniform
-//! guarantees pinned; `ToolHands::exec` **IS** CI's `kind=agent` job on the ONE unified sandbox).
-//! **Contracts:** `contract-index.md` row 8.4 (the Fabric half — the `kind=agent` job spec + the
-//! routing + the four-guarantee wiring; CI owns the runner + the drill), with consumed hooks 11.7
-//! (reserve at dispatch), 4.7 (`mint_run_token` attribution), 1.6 (the `no-host-exec` lint).
+//! [`SandboxToolHands`] realises [`ToolHands::exec`](myelin_agent::ToolHands) as the **dispatch of a
+//! `kind=agent` job onto the ONE unified sandbox** ([`myelin_ci_sandbox`]). `exec` is ONE method with
+//! **NO host-execution path that bypasses it** (the `no-host-exec` invariant — there is no
+//! `std::process::Command` etc anywhere here; all execution goes through [`SandboxBackend::launch`]).
+//! It carries ONLY untrusted code execution (`compute` — a test, a build, a linter, a script) — the
+//! only thing that touches the kernel sandbox.
 //!
-//! ## What this module IS (the Fabric half of 8.4)
-//! [`SandboxToolHands`] realises [`ToolHands::exec`](myelin_agent::ToolHands) (8.4) as the **dispatch
-//! of CI's `kind=agent` job onto the ONE unified sandbox** ([`myelin_ci_sandbox`], CI-P1 → P-129).
-//! `exec` is ONE method with **NO host-execution path that bypasses it** (the `no-host-exec` lint,
-//! 1.6 — there is no `std::process::Command` etc anywhere here; all execution goes through
-//! [`SandboxBackend::launch`]). It carries ONLY untrusted code execution (`compute` — a test, a
-//! build, a linter, a script) — the only thing that touches the kernel sandbox.
-//!
-//! ### The routing split (the safety boundary — §5.0 / X-6 #3)
+//! ## The routing split (the safety boundary)
 //! [`route_of`] classifies a tool by its [`EffectKind`]:
 //! - `read`    → [`ToolRoute::Direct`]   (a permission-filtered subsystem read; no mutation, no
 //!   sandbox);
@@ -35,27 +24,24 @@
 //! convention). This mirrors the EffectApi pipeline's own gate (`effect_api.rs`: only
 //! `Mutate | External` route through `EffectApi`), the two halves meeting at the type boundary.
 //!
-//! ### Reconciliation note (code-wins-over-docs, EI-01 §1)
-//! §2.2 prose says exec carries "compute/external untrusted code", but the **authoritative §5.0
-//! routing table** puts `external` (`side_effecting = true`) through `EffectApi → an egress-reviewed
-//! adapter`, NOT through the raw sandbox — and the frozen `effect_api.rs` body (AG-P6 → P-218)
-//! already routes `Mutate | External` through `EffectApi`. We follow the table + the shipped code:
-//! the ONLY effect kind that reaches the bare sandbox is `compute`. This is the **strongest** form
-//! of the routing split (the smaller the untrusted-code surface that touches the kernel, the safer)
-//! and it makes "a mutate effect can never reach exec" hold a fortiori. Documented per EI-01 §1.
+//! ### Why only `compute` reaches the bare sandbox
+//! `external` (`side_effecting = true`) routes through `EffectApi` to an egress-reviewed adapter, NOT
+//! through the raw sandbox — so the ONLY effect kind that reaches the bare sandbox is `compute`. This
+//! is the **strongest** form of the routing split (the smaller the untrusted-code surface that
+//! touches the kernel, the safer) and it makes "a mutate effect can never reach exec" hold a fortiori.
 //!
-//! ## The four uniform guarantees wired by construction (§2.2 / X-6 — NO subsystem re-implements any)
+//! ## The four uniform guarantees wired by construction (NO subsystem re-implements any)
 //! Every `kind=agent` job dispatched here inherits all four **by construction**, because exec is the
 //! SAME `launch(JobSpec{kind:Agent}, hooks)` path a CI run takes:
 //! 1. **Universal cost gate** ([`RunnerHooks::reserve`]/[`settle`](myelin_ci_sandbox::RunnerHooks)) —
 //!    reserve at dispatch, refuse-on-exhaustion, settle on completion, never interrupt in-flight
-//!    (contract 11.7; the agent-fabric reserve is [`crate::cost_gate`], AG-P14 → P-227).
+//!    (the agent-fabric reserve is [`crate::cost_gate`]).
 //! 2. **Attribution** ([`RunnerHooks::attribute`]) — the job runs under the per-run attenuated token
-//!    ([`RunTokenCredential`], `mint_run_token` 4.7; [`crate::identity`], AG-P13 → P-225); life == run life,
-//!    auto-revoked on teardown, re-mintable on resume. The shared platform token is **scrubbed** from
-//!    the child env ([`SandboxJob::scrubbed_env`]) — re-asserted here.
+//!    ([`RunTokenCredential`], [`crate::identity`]); life == run life, auto-revoked on teardown,
+//!    re-mintable on resume. The shared platform token is **scrubbed** from the child env
+//!    ([`SandboxJob::scrubbed_env`]) — re-asserted here.
 //! 3. **HITL withhold (plan-then-apply)** — structural: side-effecting mutation NEVER goes through
-//!    this runner (the routing split above); it goes through [`EffectApi::apply`] (8.2). See
+//!    this runner (the routing split above); it goes through [`EffectApi::apply`]. See
 //!    [`myelin_ci_sandbox::hitl_withhold_note`].
 //! 4. **Isolation floor** ([`SandboxJob::for_compute`] feeds the FULL named hardening profile into
 //!    the `kind=agent` `JobSpec`: gVisor-class/microVM via the backend; egress default-deny;
@@ -63,33 +49,31 @@
 //!    un-digested tag; whole-guest kill on teardown; secrets resolved INSIDE the boundary as
 //!    [`SecretRef`]s, never forwarded via the runtime).
 //!
-//! ## The AG-D4 / CI-T1 hard escape GATE is CONSUMED here (AG-P17 → P-229)
+//! ## The hard escape GATE is CONSUMED here
 //! [`SandboxToolHands`] carries an [`AgentExecGate`](crate::escape_gate::AgentExecGate) — a value that
 //! can ONLY be obtained from a GREEN [`EscapeAttestation`](myelin_ci_sandbox::EscapeAttestation) for
-//! the production backend (the real-kernel drill CI ran on a microVM, CI-P5 → P-239). The hands have
-//! no constructor without it, so a Fabric exec dispatch is **structurally fail-closed on AG-D4**: no
-//! green attestation ⇒ no `SandboxToolHands` ⇒ no untrusted compute. This is the Fabric half of the
-//! D-4 go/no-go (the CI half is the drill + the attestation; this half is the GATE that refuses to
+//! the production backend (the real-kernel escape drill run on a microVM). The hands have no
+//! constructor without it, so a Fabric exec dispatch is **structurally fail-closed on the escape
+//! gate**: no green attestation ⇒ no `SandboxToolHands` ⇒ no untrusted compute. This is the Fabric
+//! half of the go/no-go (CI owns the drill + the attestation; this half is the GATE that refuses to
 //! dispatch without one). See [`crate::escape_gate`].
 //!
-//! ## Floors named (AG-P17 — there is NO floor on AG-D4)
-//! - **There is NO floor on AG-D4** — ZERO escapes is BOTH the floor and the full answer; it is a
-//!   **PERMANENT GATE** re-run on every backend / image / kernel change. The CI side proved it on a
-//!   real microVM (CI-P5 → P-239). The microVM/gVisor [`myelin_ci_sandbox::SandboxBackend`] impl is
-//!   the **Firecracker backend, CI-P2 (→ P-237)** (the gVisor 2nd is CI-P28).
-//! - **The M4 re-confirm on the prod CI image is AG-P21 (→ P-348)** (CI side CI-P27 / P-348).
+//! ## The escape gate is a permanent, floor-less gate
+//! - **ZERO escapes is BOTH the floor and the full answer** — a **PERMANENT GATE** re-run on every
+//!   backend / image / kernel change (proven on a real microVM). The microVM/gVisor
+//!   [`myelin_ci_sandbox::SandboxBackend`] impl is the **Firecracker backend** (gVisor is the second).
 //! - **Continuous fuzzing + the full CVE corpus + a pre-GA third-party pentest** remain ongoing
 //!   residuals on top of this gate (never "done").
 //! - **`SCHEDULE_AND_RUN_JOB` long-park** (dispatch-and-return, completion as a durable idempotent
-//!   signal) is **AG-P16 (→ P-228)** — here exec is the in-line activity form.
-//! - **The real `LlmAgentRuntime`** running its compute against this same runner is **post-M5
-//!   (AG-P25)** — the only place a model/SDK/prompt string ever lives (`no-llm-in-platform`, 1.6).
+//!   signal, [`crate::long_park`]) is the durable twin — here exec is the in-line activity form.
+//! - **The real `LlmAgentRuntime`** running its compute against this same runner is a follow-on — the
+//!   only place a model/SDK/prompt string ever lives (`no-llm-in-platform`).
 //!
 //! ## DB-free
 //! This module touches NO DB / object-store / cache / bus contract: it builds an in-memory
 //! [`JobSpec`] value and dispatches it through the [`SandboxBackend`] trait seam (the reserve/token
-//! bodies it consumes are already proven against the live stack at AG-P14/AG-P13). So `cargo build
-//! --workspace` stays DB-free and there is no new `integration` feature here.
+//! bodies it consumes are already proven against the live stack). So `cargo build --workspace` stays
+//! DB-free and there is no new `integration` feature here.
 
 use crate::escape_gate::AgentExecGate;
 use myelin_agent::{Command, EffectKind, ToolDef, ToolHands, ToolResult};
@@ -100,16 +84,16 @@ use myelin_ci_sandbox::{
 };
 
 /// The env-var name of the **shared platform token** that MUST be scrubbed from the child env before
-/// any untrusted code runs (§5.7 anti-leak; AG-P13 → P-225). The agent's job runs under the *per-run
-/// attenuated* token ([`RunTokenCredential`]), never the broad platform token — so the platform token is
-/// removed from the child env, and a per-run token name is the only credential the child ever sees.
-/// (The same scrub is enforced in [`crate::skeleton::ChildEnv`]; re-asserted here at the exec seam.)
+/// any untrusted code runs (anti-leak). The agent's job runs under the *per-run attenuated* token
+/// ([`RunTokenCredential`]), never the broad platform token — so the platform token is removed from
+/// the child env, and a per-run token name is the only credential the child ever sees. (The same
+/// scrub is enforced in [`crate::skeleton::ChildEnv`]; re-asserted here at the exec seam.)
 pub const PLATFORM_TOKEN_ENV: &str = "MYELIN_PLATFORM_TOKEN";
 
-// ─────────────────────────────── the routing split (§5.0 / X-6 #3) ───────────────────────────────
+// ─────────────────────────────────────── the routing split ───────────────────────────────────────
 
-/// Where a tool call routes, per its [`EffectKind`] (§5.0 routing table). The platform loop routes a
-/// `UseTools` call to exactly one of these; only [`ToolRoute::Sandbox`] reaches the kernel sandbox.
+/// Where a tool call routes, per its [`EffectKind`]. The platform loop routes a `UseTools` call to
+/// exactly one of these; only [`ToolRoute::Sandbox`] reaches the kernel sandbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolRoute {
     /// `read` (`side_effecting = false`) — a permission-filtered subsystem read API; no mutation, no
@@ -123,8 +107,8 @@ pub enum ToolRoute {
     EffectApi,
 }
 
-/// Classify a tool by its [`EffectKind`] into its [`ToolRoute`] (§5.0). This is the single source of
-/// truth for the routing split: `compute` is the ONLY kind that maps to [`ToolRoute::Sandbox`].
+/// Classify a tool by its [`EffectKind`] into its [`ToolRoute`]. This is the single source of truth
+/// for the routing split: `compute` is the ONLY kind that maps to [`ToolRoute::Sandbox`].
 pub const fn route_of(kind: EffectKind) -> ToolRoute {
     match kind {
         EffectKind::Read => ToolRoute::Direct,
@@ -148,7 +132,7 @@ pub enum RoutingError {
         actual_route: ToolRoute,
     },
     /// The `kind=agent` [`JobSpec`] could not be built fail-closed (an un-digested image, a zero
-    /// `pids_max`, a zero `timeout`). The hardening profile is non-negotiable (X-6 #4 / CI-1).
+    /// `pids_max`, a zero `timeout`). The hardening profile is non-negotiable.
     SpecRejected(SpecError),
 }
 
@@ -237,7 +221,7 @@ impl SandboxJob {
         // (3) GUARANTEE #4 (isolation floor): build the `kind=agent` JobSpec via `agent_job`, which
         //     applies the fail-closed non-negotiables (digest-pin, pids_max, timeout) and the
         //     no-checkout `compute` workspace (read-only root + tmpfs is the backend's mandatory
-        //     profile, CI-P2). Egress default-deny unless the caller opts in. Zero swap is structural
+        //     profile). Egress default-deny unless the caller opts in. Zero swap is structural
         //     (there is no swap field on ResourceLimits). Secrets ride as in-boundary refs.
         let spec = agent_job(
             image,
@@ -270,12 +254,12 @@ impl SandboxJob {
     }
 
     /// **Re-stamp the dispatch `idem_token` on the hardened spec (the `SCHEDULE_AND_RUN_JOB`
-    /// long-park dedup key, §5.6 / §4.9).** The in-line `exec` form (AG-P15) carries the Fabric's own
-    /// idem token; the LONG-PARK form (AG-P16, [`crate::long_park`]) instead stamps the ENGINE's
-    /// DETERMINISTIC dispatch token (minted on the dispatch position, deterministic on the run's
-    /// `command_id`) so the runner echoes THAT token on the `job.done` signal — the no-coordination
-    /// dedup agreement the workflow keys its `wait_for_signal` on. Returns the same hardened spec with
-    /// only the dedup token rebound (the four-guarantee profile is untouched). Chainable.
+    /// long-park dedup key).** The in-line `exec` form carries the Fabric's own idem token; the
+    /// LONG-PARK form ([`crate::long_park`]) instead stamps the ENGINE's DETERMINISTIC dispatch token
+    /// (minted on the dispatch position, deterministic on the run's `command_id`) so the runner echoes
+    /// THAT token on the `job.done` signal — the no-coordination dedup agreement the workflow keys its
+    /// `wait_for_signal` on. Returns the same hardened spec with only the dedup token rebound (the
+    /// four-guarantee profile is untouched). Chainable.
     pub fn with_dispatch_idem_token(mut self, idem_token: IdemToken) -> SandboxJob {
         self.spec.idem_token = idem_token;
         self
@@ -289,12 +273,12 @@ impl SandboxJob {
 
 // ─────────────────────────────── ToolHands::exec — the dispatch ──────────────────────────────────
 
-/// The real [`ToolHands`] (8.4): `exec` dispatches the `kind=agent` job onto the unified sandbox.
+/// The real [`ToolHands`]: `exec` dispatches the `kind=agent` job onto the unified sandbox.
 ///
-/// `B` is the [`SandboxBackend`] (the Firecracker microVM / gVisor backend, CI-P2/CI-P28; a no-op
-/// shape stub in tests). `exec` carries the four-guarantee [`RunnerHooks`] (reserve/settle, attribute,
-/// isolation floor) so EVERY dispatch inherits the guarantees by construction — there is NO host-exec
-/// path that bypasses [`SandboxBackend::launch`] (the `no-host-exec` lint, 1.6).
+/// `B` is the [`SandboxBackend`] (the Firecracker microVM / gVisor backend; a no-op shape stub in
+/// tests). `exec` carries the four-guarantee [`RunnerHooks`] (reserve/settle, attribute, isolation
+/// floor) so EVERY dispatch inherits the guarantees by construction — there is NO host-exec path that
+/// bypasses [`SandboxBackend::launch`] (the `no-host-exec` invariant).
 ///
 /// The [`ToolHands::exec`] frozen signature takes a [`Command`] (the untrusted code) and returns a
 /// [`ToolResult`]; the surrounding context (the hardened image, the per-run token, the reserve
@@ -303,14 +287,14 @@ impl SandboxJob {
 /// each `compute` call. (A `mutate`/`external` call never reaches here — the loop routes it to
 /// [`EffectApi`](crate::effect_api) per [`route_of`].)
 pub struct SandboxToolHands<'a, B: SandboxBackend> {
-    /// **The AG-D4 / CI-T1 hard escape GATE (AG-P17 → P-229).** The Fabric REFUSES to dispatch any
-    /// `kind=agent` compute job unless a GREEN [`EscapeAttestation`](myelin_ci_sandbox::EscapeAttestation)
-    /// exists for the production backend (ZERO escapes, matching kernel/rootfs/corpus identity). The
-    /// [`AgentExecGate`] can ONLY be obtained by [`AgentExecGate::admit`] against a real green
-    /// attestation — so holding `SandboxToolHands` is, by construction, proof the gate is GREEN (no
-    /// green attestation ⇒ no untrusted compute; the fail-closed property is in the TYPE, never a
-    /// hardcoded `true`). The dispatch path asserts the gate's backend identity matches the launched
-    /// job's image before any untrusted code runs.
+    /// **The hard escape GATE.** The Fabric REFUSES to dispatch any `kind=agent` compute job unless a
+    /// GREEN [`EscapeAttestation`](myelin_ci_sandbox::EscapeAttestation) exists for the production
+    /// backend (ZERO escapes, matching kernel/rootfs/corpus identity). The [`AgentExecGate`] can ONLY
+    /// be obtained by [`AgentExecGate::admit`] against a real green attestation — so holding
+    /// `SandboxToolHands` is, by construction, proof the gate is GREEN (no green attestation ⇒ no
+    /// untrusted compute; the fail-closed property is in the TYPE, never a hardcoded `true`). The
+    /// dispatch path asserts the gate's backend identity matches the launched job's image before any
+    /// untrusted code runs.
     gate: AgentExecGate,
     /// The unified-sandbox backend (CI owns it; the Fabric feeds it).
     backend: &'a B,
@@ -324,7 +308,7 @@ pub struct SandboxToolHands<'a, B: SandboxBackend> {
     meter_to: MeterTarget,
     /// The dispatch idempotency token (stamped on `job.done`).
     idem_token: IdemToken,
-    /// The run's trust tier (gates secrets/cache/egress; stamped once, X-1).
+    /// The run's trust tier (gates secrets/cache/egress; stamped once).
     trust_tier: TrustTier,
     /// The resource limits (pids_max + timeout > 0; zero swap structural).
     limits: ResourceLimits,
@@ -336,17 +320,17 @@ pub struct SandboxToolHands<'a, B: SandboxBackend> {
 
 impl<'a, B: SandboxBackend> SandboxToolHands<'a, B> {
     /// Construct the hands scoped to one run. The platform loop builds this from the run substrate
-    /// (the per-run token + reserve + trust tier come from the dispatch tier, AG-P4/P-13/P-14). The
+    /// (the per-run token + reserve + trust tier come from the dispatch tier). The
     /// `image`/`limits`/`egress`/`secret_refs` are the hardened `compute` profile for this run.
     ///
-    /// **The AG-D4 gate (AG-P17 → P-229) is a REQUIRED argument** — there is no constructor without
-    /// it. The hands cannot exist (and therefore `exec` cannot dispatch) unless the caller has
-    /// already obtained a GREEN [`AgentExecGate`] for the production backend ([`AgentExecGate::admit`]
-    /// against a real green [`EscapeAttestation`](myelin_ci_sandbox::EscapeAttestation)). This is the
-    /// structural fail-closed: no green AG-D4 attestation ⇒ no `SandboxToolHands` ⇒ no untrusted
-    /// compute. The gate's admitted backend identity must match the run's hardened `image` digest, so
-    /// the dispatch is on the SAME backend the drill proved (the permanent gate, re-run on every
-    /// backend/image/kernel change).
+    /// **The escape gate is a REQUIRED argument** — there is no constructor without it. The hands
+    /// cannot exist (and therefore `exec` cannot dispatch) unless the caller has already obtained a
+    /// GREEN [`AgentExecGate`] for the production backend ([`AgentExecGate::admit`] against a real
+    /// green [`EscapeAttestation`](myelin_ci_sandbox::EscapeAttestation)). This is the structural
+    /// fail-closed: no green attestation ⇒ no `SandboxToolHands` ⇒ no untrusted compute. The gate's
+    /// admitted backend identity must match the run's hardened `image` digest, so the dispatch is on
+    /// the SAME backend the drill proved (the permanent gate, re-run on every backend/image/kernel
+    /// change).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         gate: AgentExecGate,
@@ -376,8 +360,8 @@ impl<'a, B: SandboxBackend> SandboxToolHands<'a, B> {
         }
     }
 
-    /// The AG-D4 / CI-T1 escape gate this run dispatches under (read-only). Its existence is the proof
-    /// that a GREEN escape attestation for the production backend was consumed (AG-P17 → P-229).
+    /// The escape gate this run dispatches under (read-only). Its existence is the proof that a GREEN
+    /// escape attestation for the production backend was consumed.
     pub fn gate(&self) -> &AgentExecGate {
         &self.gate
     }
@@ -386,20 +370,19 @@ impl<'a, B: SandboxBackend> SandboxToolHands<'a, B> {
     /// `exec` wraps. Drives the backend's `launch` (which fires the four-guarantee hooks), then
     /// whole-guest-kills the guest on teardown (guarantee #4: the guest is never reused across jobs).
     /// Returns the typed [`HookError`] / backend error on a refused dispatch (e.g. an exhausted
-    /// wallet refuses-to-start, 11.7) — never silently swallowed.
+    /// wallet refuses-to-start) — never silently swallowed.
     ///
-    /// **The AG-D4 gate is already proven GREEN by construction** (a `SandboxToolHands` cannot exist
-    /// without a green [`AgentExecGate`], AG-P17 → P-229) — so reaching this dispatch means the
-    /// production backend's real-kernel escape drill was green (ZERO escapes). No green attestation ⇒
-    /// no `SandboxToolHands` ⇒ this method is unreachable.
+    /// **The escape gate is already proven GREEN by construction** (a `SandboxToolHands` cannot exist
+    /// without a green [`AgentExecGate`]) — so reaching this dispatch means the production backend's
+    /// real-kernel escape drill was green (ZERO escapes). No green attestation ⇒ no `SandboxToolHands`
+    /// ⇒ this method is unreachable.
     pub fn dispatch_compute(&self, job: &SandboxJob) -> Result<ToolResult, ExecError<B::Error>> {
         // This dispatch is a direct synchronous call (like the git-wire path) — there is no
         // terminal-reporter/job-queue machinery above it to route a `SandboxLaunchError::
         // RetryableAttempt` through. Refuse BEFORE reserve/launch if the hooks are reporter-owned:
         // a `RetryableAttempt` surfacing here would otherwise convert straight into an inert error
         // string (via `ToolHands::exec`'s `Display`), with NEITHER usage accounted NOR the claim
-        // requeued — the exact silent-accounting-loss class Sol's review caught in the CI runner
-        // and in git-wire, just one seam further out.
+        // requeued — the exact silent-accounting-loss class this seam exists to prevent.
         if self.hooks.completion_settlement_owner() != CompletionSettlementOwner::Hook {
             return Err(ExecError::SettlementOwnerNotHook);
         }
@@ -412,9 +395,9 @@ impl<'a, B: SandboxBackend> SandboxToolHands<'a, B> {
             .map_err(ExecError::Launch)?;
         // Guarantee #4: whole-guest kill on teardown — the guest is destroyed, never reused.
         self.backend.kill(&launch.handle).map_err(ExecError::Kill)?;
-        // RESHAPE-001 / CT-001: the seam now returns `launch.result` (exit_code/stdout/stderr/usage/
-        // timed_out). Surfacing the compute result (exit/streams) into the agent trace is its own
-        // follow-on; here the X-6 routing equivalence is unchanged — we keep the guest-id marker.
+        // The seam returns `launch.result` (exit_code/stdout/stderr/usage/timed_out). Surfacing the
+        // compute result (exit/streams) into the agent trace is its own follow-on; here the routing
+        // equivalence is unchanged — we keep the guest-id marker.
         Ok(ToolResult(format!("sandbox:{}", launch.handle.guest_id)))
     }
 
@@ -482,11 +465,11 @@ impl<E: std::fmt::Display> std::fmt::Display for ExecError<E> {
 impl<E: std::error::Error> std::error::Error for ExecError<E> {}
 
 impl<B: SandboxBackend> ToolHands for SandboxToolHands<'_, B> {
-    /// `exec(Command) -> ToolResult` (the frozen 8.4 signature). Builds the hardened `kind=agent`
-    /// job for a `compute` call and dispatches it onto the unified sandbox via the four-guarantee
-    /// `launch` seam. The frozen signature is infallible (`-> ToolResult`); a fail-closed refusal
-    /// (an un-built job, a refused reserve) renders as a `ToolResult` carrying the error text (an
-    /// ordinary tool error the brain reads), never a silent success and never a host-exec bypass.
+    /// `exec(Command) -> ToolResult` (the frozen signature). Builds the hardened `kind=agent` job for
+    /// a `compute` call and dispatches it onto the unified sandbox via the four-guarantee `launch`
+    /// seam. The frozen signature is infallible (`-> ToolResult`); a fail-closed refusal (an un-built
+    /// job, a refused reserve) renders as a `ToolResult` carrying the error text (an ordinary tool
+    /// error the brain reads), never a silent success and never a host-exec bypass.
     ///
     /// This is the in-line activity form. A `compute` tool's `ToolDef` is implied here (the platform
     /// loop only routes `compute` calls to `exec`; a `mutate`/`external` call goes to `EffectApi`
