@@ -140,6 +140,8 @@ async fn fresh_schema_principal_table_absent_after_foundation_then_present_after
         ("bus_erasure_ledger", "bus-erasure 0053"),
         ("agent_hitl_gate", "hitl-gate 0054 (R2.4)"),
         ("auth_replay", "authentication replay 0070"),
+        ("agent_wallet", "agent-wallet 0080"),
+        ("agent_wallet_ledger", "agent-wallet-ledger 0080"),
     ] {
         assert!(
             table_exists_in(&pool, &schema, table).await,

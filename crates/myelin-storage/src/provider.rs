@@ -251,6 +251,7 @@ pub fn foundation_migrations() -> Migrations {
 /// | `delegation_policy_durable_migrations` | `0061`–`0066` |
 /// | `authz_projection_durable_migrations` | `0067`–`0069` |
 /// | `auth_replay_durable_migrations`  | `0070`–`0071` |
+/// | `agent_wallet_migrations`         | `0080`        |
 ///
 /// The substrate FOUNDATION (`0000`–`0001`, outbox + consumer_dedup) is deliberately NOT in this list:
 /// it stays the separate [`foundation_migrations`] / [`SubstrateProvider::migrate_foundation`] call
@@ -272,12 +273,13 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::delegation_policy_durable::delegation_policy_durable_migrations(),
         crate::authz_projection_durable::authz_projection_durable_migrations(),
         crate::identity_durable::auth_replay_durable_migrations(),
+        crate::agent_wallet::agent_wallet_migrations(),
     ]
 }
 
 /// **The provider-level DURABLE MIGRATION AGGREGATE (W7.2 / doc-18 Part 5 — the boot-migrations fix).**
 /// Composes EVERY durable migration group ([`durable_migration_groups`]) into one ordered
-/// [`Migrations`] in strictly-ascending id order (`0010`–`0053`), so a single boot call migrates the
+/// [`Migrations`] in strictly-ascending id order (`0010`–`0080`), so a single boot call migrates the
 /// complete durable schema every service's stores bind to — closing the doc-18 LIVE DEFECT where a
 /// service main constructed durable stores (e.g. `PrincipalStore::with_pg`, needing identity
 /// `0010`–`0019`) but never migrated their tables, so the first write failed at runtime on a fresh DB.
@@ -948,7 +950,7 @@ mod boot_migrations_tests {
         }
         // Non-vacuity: the full set is present (identity 0010 … auth replay 0071).
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(*ids.last().unwrap(), "0071_auth_replay_rls");
+        assert_eq!(*ids.last().unwrap(), "0080_agent_wallet");
     }
 
     /// STRUCTURAL anti-drift: the aggregate is EXACTLY the flattened concatenation of every group in

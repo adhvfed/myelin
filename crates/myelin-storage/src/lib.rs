@@ -624,6 +624,15 @@ pub mod reserve_settle;
 // durable ledger correctness). Fills the P-ST-16 floor; the CI-run-fronting M4 follow-on is
 // named. Drill rows AG-D6 (surge sheds over-budget) / AG-D11 (runaway loop stops at the wallet).
 pub mod agent_run_gate;
+// The durable prepaid AGENT WALLET (the hosted-agent prepaid balance the reserve/settle cost gate
+// consumes as its `available` param, storage.md §9). Micro-dollar unit (`MicroUsd`, 1 unit =
+// $0.000001) — deliberately SEPARATE from the cent-scaled `MinorUnits` cost ledger, so ZERO impact
+// on CI billing. The `agent_wallet` materialized balance cache + the append-only, IMMUTABLE
+// `agent_wallet_ledger` source of truth (REVOKE UPDATE,DELETE + a raising trigger), both
+// `(tenant, region)` FORCE-RLS. balance == Σ ledger, co-committed in one `with_tenant_tx` per op;
+// no double-spend / no partial debit (insufficient debit refused fail-closed); checked, fail-closed
+// arithmetic. Wiring into reserve/settle (reserve/settle in handle_run) + pricing are follow-on slices.
+pub mod agent_wallet;
 // Residency pinning enforced end-to-end (STOR-D5, P-ST-15 / P-102): the per-pool runtime region-pin
 // (closes the oltp/holder M0 floor), the in-process residency WRITE boundary, the per-store region
 // report, and the `myelin storage residency verify <tenant>` admin path. The control plane's
@@ -750,6 +759,9 @@ pub mod kms_durable;
 pub mod cell_root_durable;
 
 pub use agent_run_gate::{AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind};
+pub use agent_wallet::{
+    agent_wallet_migrations, AgentWallet, CreditKind, MicroUsd, WalletError, AGENT_WALLET_MIGRATION,
+};
 pub use backup::{
     BackupError, BackupSet, BaseBackup, ContinuousArchiver, EpochSecs, LogTierSeal,
     ObjectTierBackup, ObjectVersion, StoreTier, WalOffset, WalSegment,
