@@ -1016,7 +1016,14 @@ fn enter_private_mount_namespace() -> Result<(), String> {
 }
 
 fn current_mount_namespace_identity() -> Result<(u64, u64), String> {
-    let metadata = fs::metadata("/proc/self/ns/mnt")
+    // MUST read `/proc/thread-self`, NOT `/proc/self`: `unshare(CLONE_NEWNS)` moves only the CALLING
+    // thread into the new namespace, but `/proc/self` resolves to the thread-group LEADER — so a
+    // `/proc/self` read compares the leader's namespace to itself and can NEVER fire (a tautology,
+    // false confidence). `/proc/thread-self` reflects the calling thread's own namespace, so the
+    // init-capture and the per-job check genuinely verify that `create_overlay` runs inside the
+    // private namespace `initialize` unshared into (a `std::thread::scope` child inherits it, so this
+    // passes under the real runner thread model while catching a future thread that does not).
+    let metadata = fs::metadata("/proc/thread-self/ns/mnt")
         .map_err(|error| format!("identify current runner mount namespace: {error}"))?;
     Ok((metadata.dev(), metadata.ino()))
 }
