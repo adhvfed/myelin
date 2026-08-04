@@ -16,8 +16,19 @@ debt). One piece at a time. Nothing is released — simplify boldly.
   each verified by identical test counts (550/0/36 + 588/0/49) before merge:
   cgroup enforcement → `gvisor/cgroup.rs`, git wire-protocol codec →
   `gvisor/git_wire_codec.rs`, Linux capability ABI → `gvisor/linux_capabilities.rs`,
-  explicit-userns runsc invocation policy → `gvisor/explicit_userns.rs`.
-  25871 → 23337 so far.
+  explicit-userns runsc invocation policy → `gvisor/explicit_userns.rs`, git-wire
+  (tenant,region,repo) confinement validators → `gvisor/git_wire_confinement.rs`.
+  25871 → 23125 so far (5 extractions).
+- **agent-service engine doc-prune** — the process-archaeology (contract numbers, `§`
+  refs, `AG-P*`/`P-*` IDs) pruned from the biggest engine files while KEEPING every
+  security/money invariant rationale (ordering, fail-closed, plan-then-apply, token
+  attenuation): `skeleton.rs` (the metered loop) done; `effect_api.rs` (plan-then-apply)
+  in progress. Verified comment-only (0 code lines changed), test counts unchanged.
+- **Lint-gate** — GREEN. The gvisor extractions above moved runtime-spawn code into
+  `gvisor/` submodules the `gvisor.rs` no-host-exec exclusion didn't cover (a regression
+  the green-gate drive caught); fixed with a tighter per-lint exclusion. Also taught
+  `tenant-predicate` to recognize the `with_tenant_tx` RLS convention (11 secret-store
+  false positives, verified safe) instead of blanket-excluding the file.
 
 ## Known offenders
 - **`gvisor.rs` (~23k lines)** — still the biggest module. The remaining clusters
