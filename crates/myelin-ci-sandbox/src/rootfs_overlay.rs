@@ -1,9 +1,13 @@
 //! Per-job OverlayFS rootfs primitive.
 //!
-//! This module provides the not-yet-integrated CoW primitive: it can mount the digest-verified base
-//! as OverlayFS's read-only `lowerdir` and give a job fresh `upperdir` and `workdir` directories.
-//! Bundle staging still uses the verified base path directly; switching every staging path to the
-//! merged view is a follow-on change. Hosts used for unit tests select
+//! This module provides the wired-but-dormant CoW primitive: it mounts the digest-verified base as
+//! OverlayFS's read-only `lowerdir` and gives a job fresh `upperdir` and `workdir` directories, so a
+//! job's writes land in the upper and never mutate the shared base. `GvisorBackend::
+//! materialize_job_guest_root` already routes both launch paths (compute + checkout) through the
+//! merged view WHEN a `RootfsOverlayManager` is installed. It stays DORMANT until then: production
+//! has not yet installed a manager (`rootfs_overlay` is `None`), so `materialize_job_guest_root`
+//! returns the bare verified base and behaviour is byte-identical to pre-integration. Activation is a
+//! composition change (`with_rootfs_overlay_manager`) — see tasks #26/#27. Hosts used for unit tests select
 //! [`RootfsOverlayMode::DeterministicDirectoryForTests`], which copies the exact same fd-bound lower
 //! tree into `merged` without requiring `CAP_SYS_ADMIN` or OverlayFS support.
 //!
@@ -1796,7 +1800,7 @@ mod tests {
         assert!(!source.contains(concat!("fn reconcile_", "orphans")));
         assert!(!source.contains(concat!("subvolume ", "delete")));
         assert!(!source.contains(concat!("/usr/bin/", "btrfs")));
-        assert!(source.contains("not-yet-integrated CoW primitive"));
+        assert!(source.contains("wired-but-dormant CoW primitive"));
         assert!(!source.contains(concat!("Production mounts the digest-verified ", "base")));
         assert!(!source.contains(concat!("merged mount is the ", "only path")));
     }
