@@ -68,7 +68,12 @@ the real wiring, at one scale, where hardcoded placeholders stand today.
    wallet; the agent gate's `available` reads `wallet.available(tenant)` instead of a
    literal. Add the `surface` column.
 4. **Wire CI reserve/settle to the wallet**; fold `ci_cost_event` into the unified,
-   FORCE-RLS cost ledger.
+   FORCE-RLS cost ledger. **Must also reconcile the reservation-ceiling scale:** slice 2
+   rescaled the Tier-P *price* to micro-dollars, but the durable reservation ceiling
+   `operational_reservation_amount` (`ci_launch_authority.rs`) is still raw resource-seconds.
+   Inert today (the CI reserve path has no live caller and nothing compares price to bound),
+   but wiring CI reserve/settle makes them meet — the ceiling must be rescaled/re-derived in
+   the same micro-dollar unit as the price, or reservations will be ~10,000× too small.
 5. **Limits model** — the `wallet_limit` table + a reserve-time check.
 
 Ordering isolates risk: slice 1 is large but mechanically safe (pure rename, no scale
