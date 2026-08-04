@@ -89,10 +89,10 @@ fn myelin_tenant() -> TenantId {
 
 /// The run estimate the triage run reserves at dispatch (an upper bound over its metered effects: file
 /// the issue + post the chat thread; integer minor-units, never floats). Headroom over the actual bill.
-const TRIAGE_ESTIMATE: u64 = 12;
+const TRIAGE_ESTIMATE: u64 = 120_000;
 
 /// The Myelin self-tenant wallet balance (≥ the estimate → the triage run dispatches). A funded wallet.
-const MYELIN_WALLET: u64 = 100;
+const MYELIN_WALLET: u64 = 1_000_000;
 
 /// The result of running Myelin's OWN triage agent on a real Myelin CI failure. GREEN iff the CI-fail
 /// Signal DISPATCHED a costed triage run (explicit-first), the reserve/settle ledger BALANCED (reserved

@@ -542,9 +542,9 @@ fn tier_p_reservation_structurally_requires_its_exact_operational_settlement_pol
     let mut priced = PricedCiJobUsage {
         pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
         memory_gb_seconds: 4,
-        cpu_wholesale: MicroUsd(17),
+        cpu_wholesale: MicroUsd(170_000),
         cpu_markup: MicroUsd::ZERO,
-        memory_wholesale: MicroUsd(4),
+        memory_wholesale: MicroUsd(40_000),
         memory_markup: MicroUsd::ZERO,
     };
     let handle = "ci-reserve:v1:run:batch:job:item";
@@ -565,24 +565,24 @@ fn tier_p_reservation_structurally_requires_its_exact_operational_settlement_pol
         Err(CiJobPricingError::InvalidOutput)
     );
     priced.memory_gb_seconds = 4;
-    priced.cpu_wholesale = MicroUsd(16);
+    priced.cpu_wholesale = MicroUsd(160_000);
     assert_eq!(
         validate_reservation_pricing_policy(handle, usage, &priced),
         Err(CiJobPricingError::InvalidOutput)
     );
-    priced.cpu_wholesale = MicroUsd(17);
+    priced.cpu_wholesale = MicroUsd(170_000);
     priced.cpu_markup = MicroUsd(1);
     assert_eq!(
         validate_reservation_pricing_policy(handle, usage, &priced),
         Err(CiJobPricingError::InvalidOutput)
     );
     priced.cpu_markup = MicroUsd::ZERO;
-    priced.memory_wholesale = MicroUsd(3);
+    priced.memory_wholesale = MicroUsd(30_000);
     assert_eq!(
         validate_reservation_pricing_policy(handle, usage, &priced),
         Err(CiJobPricingError::InvalidOutput)
     );
-    priced.memory_wholesale = MicroUsd(4);
+    priced.memory_wholesale = MicroUsd(40_000);
     priced.memory_markup = MicroUsd(1);
     assert_eq!(
         validate_reservation_pricing_policy(handle, usage, &priced),
@@ -608,9 +608,9 @@ fn tier_p_v2_reservation_gate_requires_the_same_exact_settlement_policy_as_v1() 
     let priced = PricedCiJobUsage {
         pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
         memory_gb_seconds: 4,
-        cpu_wholesale: MicroUsd(17),
+        cpu_wholesale: MicroUsd(170_000),
         cpu_markup: MicroUsd::ZERO,
-        memory_wholesale: MicroUsd(4),
+        memory_wholesale: MicroUsd(40_000),
         memory_markup: MicroUsd::ZERO,
     };
     let v2_handle = "ci-reserve:v2:run:budget-v1:a5:batch:job:item";

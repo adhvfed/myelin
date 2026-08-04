@@ -16,8 +16,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::ci_pipeline_driver::{
-    TIER_P_OPERATIONAL_PRICING_REVISION, TIER_P_OPERATIONAL_RESERVATION_PREFIX,
-    TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX,
+    MICRO_USD_PER_CPU_SECOND, MICRO_USD_PER_GB_SECOND, TIER_P_OPERATIONAL_PRICING_REVISION,
+    TIER_P_OPERATIONAL_RESERVATION_PREFIX, TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX,
 };
 use crate::{
     ci_job_id_v2, CiExecutionProfileV1, CiJobAccountingPricer, CiJobLaunchGrantV1,
@@ -158,16 +158,26 @@ pub struct TierPOperationalCiJobPricer;
 impl CiJobAccountingPricer for TierPOperationalCiJobPricer {
     fn price(&self, usage: ResourceUsage) -> Result<PricedCiJobUsage, CiJobPricingError> {
         let memory_gb_seconds = usage.mem_byte_seconds.div_ceil(GIB_BYTES);
+        // Preserve the raw-dimension overflow guard the reservation bound also relies on, then
+        // convert each raw resource-second to its micro-USD unit price (checked: a job whose priced
+        // amount would exceed u64 is refused, not silently wrapped).
         usage
             .cpu_seconds
             .checked_add(memory_gb_seconds)
             .ok_or(CiJobPricingError::InvalidOutput)?;
+        let cpu_wholesale = usage
+            .cpu_seconds
+            .checked_mul(MICRO_USD_PER_CPU_SECOND)
+            .ok_or(CiJobPricingError::InvalidOutput)?;
+        let memory_wholesale = memory_gb_seconds
+            .checked_mul(MICRO_USD_PER_GB_SECOND)
+            .ok_or(CiJobPricingError::InvalidOutput)?;
         Ok(PricedCiJobUsage {
             pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
             memory_gb_seconds,
-            cpu_wholesale: MicroUsd(usage.cpu_seconds),
+            cpu_wholesale: MicroUsd(cpu_wholesale),
             cpu_markup: MicroUsd::ZERO,
-            memory_wholesale: MicroUsd(memory_gb_seconds),
+            memory_wholesale: MicroUsd(memory_wholesale),
             memory_markup: MicroUsd::ZERO,
         })
     }
@@ -2610,8 +2620,8 @@ mod tests {
             .unwrap();
         assert_eq!(priced.pricing_revision, TIER_P_OPERATIONAL_PRICING_REVISION);
         assert_eq!(priced.memory_gb_seconds, 150);
-        assert_eq!(priced.cpu_wholesale, MicroUsd(600));
-        assert_eq!(priced.memory_wholesale, MicroUsd(150));
+        assert_eq!(priced.cpu_wholesale, MicroUsd(6_000_000));
+        assert_eq!(priced.memory_wholesale, MicroUsd(1_500_000));
         assert_eq!(priced.cpu_markup, MicroUsd::ZERO);
         assert_eq!(priced.memory_markup, MicroUsd::ZERO);
         assert_eq!(

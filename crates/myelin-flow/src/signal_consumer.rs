@@ -245,7 +245,9 @@ mod tests {
         ex.start(StartSpec {
             wf_type: "agent.run".into(),
             input: vec![],
-            budget: Some(RunBudget { minor_units: 1_000 }),
+            budget: Some(RunBudget {
+                minor_units: 10_000_000,
+            }),
             idem_key: "k".into(),
         })
         .expect("start")

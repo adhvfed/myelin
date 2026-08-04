@@ -761,6 +761,13 @@ pub struct PricedCiJobUsage {
 /// `ci-reserve:v2:` reservation authority -- `v2` only changes the reservation-amount topology and
 /// durable handle shape, never the zero-markup settlement policy itself.
 pub const TIER_P_OPERATIONAL_PRICING_REVISION: &str = "tier-p-operational:v1";
+/// Tier-P operational unit price in micro-USD: one placeholder unit per measured CPU-second and per
+/// measured memory-GiB-second, at the unified micro-USD scale (`1 cent = 10_000 micro-USD`). This is
+/// the historical 1-cent-per-resource-second placeholder rescaled by the fixed cent→micro-USD factor
+/// so it keeps the SAME real magnitude after the wallet type unification; it is NOT a real price
+/// (real CI pricing is a deferred Commercial decision, R-2). Zero markup, per the frozen policy.
+pub const MICRO_USD_PER_CPU_SECOND: u64 = 10_000;
+pub const MICRO_USD_PER_GB_SECOND: u64 = 10_000;
 pub(crate) const TIER_P_OPERATIONAL_RESERVATION_PREFIX: &str = "ci-reserve:v1:";
 /// CT-007 slice 5b.3-4a.1b: the `v2` reservation-handle prefix (parent-attempt budget authority,
 /// design locked with Sol 2026-07-29). Same Tier-P pricing revision and zero-markup settlement
@@ -810,9 +817,9 @@ pub(crate) fn validate_reservation_pricing_policy(
     let memory_gb_seconds = usage.mem_byte_seconds.div_ceil(PRICING_GIB_BYTES);
     let exact_operational_policy = priced.pricing_revision == TIER_P_OPERATIONAL_PRICING_REVISION
         && priced.memory_gb_seconds == memory_gb_seconds
-        && priced.cpu_wholesale == MicroUsd(usage.cpu_seconds)
+        && priced.cpu_wholesale == MicroUsd(usage.cpu_seconds * MICRO_USD_PER_CPU_SECOND)
         && priced.cpu_markup == MicroUsd::ZERO
-        && priced.memory_wholesale == MicroUsd(memory_gb_seconds)
+        && priced.memory_wholesale == MicroUsd(memory_gb_seconds * MICRO_USD_PER_GB_SECOND)
         && priced.memory_markup == MicroUsd::ZERO;
     if exact_operational_policy {
         Ok(())

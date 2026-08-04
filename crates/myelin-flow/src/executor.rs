@@ -882,7 +882,7 @@ mod tests {
             wf_type: "agent.run".into(),
             input: vec![ArtifactRef("myelin://acme/git/pr/PR-1".into())],
             budget: Some(RunBudget {
-                minor_units: 10_000,
+                minor_units: 100_000_000,
             }),
             idem_key: idem.into(),
         }

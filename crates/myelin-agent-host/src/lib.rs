@@ -90,8 +90,8 @@ impl LlmRunTask {
             system: system.into(),
             prompt: prompt.into(),
             token_ttl_secs: 300,
-            estimate: MicroUsd(10),
-            available: MicroUsd(100),
+            estimate: MicroUsd(100_000),
+            available: MicroUsd(1_000_000),
             now_secs: 0,
             max_output_tokens: None,
         }
