@@ -33,35 +33,31 @@
 
 use serde::{Deserialize, Serialize};
 
-// ───────────────────────── §2.1 the brain — value types (the conversation) ─────────────────────
+// ───────────────────────── the brain — value types (the conversation) ───────────────────────────
 
-/// The agent conversation the *stateless* brain reads (architecture §2.1; contract 8.3). **The
-/// platform owns history** — the runtime is stateless. Carried forward from Phase-3 §2.1:
-/// `{system, turns, tools, budget}`. The concrete `SystemContext` / `ToolSchema` / `BudgetView`
-/// member types land with the runtime (AG-P4/AG-P5); here they are opaque newtypes so the trait
-/// surface compiles and the brain seam is the point.
+/// The agent conversation the *stateless* brain reads: `{system, turns, tools, budget}`. **The
+/// platform owns history** — the runtime is stateless. The concrete member types are opaque
+/// newtypes here so the trait surface compiles and the brain seam is the point.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Conversation {
-    /// Task framing, the agent's role, the labelled-as-agent notice (architecture §2.1).
+    /// Task framing, the agent's role, the labelled-as-agent notice.
     pub system: SystemContext,
-    /// Prior model steps + tool results — platform-owned, the trace (architecture §2.1).
+    /// Prior model steps + tool results — platform-owned, the trace.
     pub turns: Vec<Turn>,
-    /// The tools THIS run may call — already permission/delegation-scoped (§5.2). The N+1-free
-    /// `list_objects` push-down that computes this subset is AG-P7 (→ P-219).
+    /// The tools THIS run may call — already permission/delegation-scoped.
     pub tools: Vec<ToolSchema>,
-    /// Remaining reserve, so the brain can choose to `Submit` early (architecture §2.1).
+    /// Remaining reserve, so the brain can choose to `Submit` early.
     pub budget: BudgetView,
 }
 
-/// The system context the conversation opens with (architecture §2.1). Opaque newtype until the
-/// runtime lands (AG-P4/AG-P5); the field exists so [`Conversation`] is the frozen shape.
+/// The system context the conversation opens with. Opaque newtype; the field exists so
+/// [`Conversation`] is the frozen shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SystemContext(pub String);
 
-/// A tool the run may call, as the brain sees it (architecture §2.1) — the delegation-scoped
-/// tool-list projection (AG-P7 → P-219). This is the tool "as the brain sees it" so the model can
-/// produce valid arguments: the `input_schema` mirrors [`ToolDef::input_schema`], the JSON-schema the
-/// model's chosen [`ToolCall::arguments`] are validated against before dispatch.
+/// A tool the run may call, as the brain sees it — the delegation-scoped tool-list projection, so
+/// the model can produce valid arguments: the `input_schema` mirrors [`ToolDef::input_schema`], the
+/// JSON-schema the model's chosen [`ToolCall::arguments`] are validated against before dispatch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ToolSchema {
     /// The tool name (the catalogue key half; mirrors [`ToolDef::name`]).
@@ -73,12 +69,12 @@ pub struct ToolSchema {
     pub input_schema: String,
 }
 
-/// The remaining-reserve view the brain reads to decide whether to `Submit` early (architecture
-/// §2.1). Opaque until the reserve/settle cost gate lands (AG-P14 → P-227).
+/// The remaining-reserve view the brain reads to decide whether to `Submit` early. Opaque until the
+/// reserve/settle cost gate reads it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct BudgetView(pub u64);
 
-/// One turn of the platform-owned conversation history (architecture §2.1; Phase-3 §2.1):
+/// One turn of the platform-owned conversation history:
 /// `Model(StepOutcome) | ToolResults(Vec<ToolOutcome>) | Approval(ApprovalNote)`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Turn {
@@ -86,24 +82,24 @@ pub enum Turn {
     Model(StepOutcome),
     /// The results of the tool calls the brain requested, each linked back to its call by id.
     ToolResults(Vec<ToolOutcome>),
-    /// An HITL approval note appended to the trace (the card text is humanised, AG-P11 → P-223).
+    /// An HITL approval note appended to the trace (the card text is humanised for the reviewer).
     Approval(ApprovalNote),
 }
 
-/// An HITL approval note carried in the conversation (architecture §2.1). Opaque until the
-/// withhold→surface→resume loop lands (AG-P9 → P-221).
+/// An HITL approval note carried in the conversation. Opaque until the withhold→surface→resume loop
+/// fills it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalNote(pub String);
 
 /// The model-chosen identity of a single tool call, minted by the brain so each later
-/// [`ToolOutcome`] can be linked back to the call it answers (architecture §2.1; contract 8.3). Both
-/// vendors require this linkage (OpenAI a `tool` message with a `tool_call_id`; Anthropic a
-/// `tool_result` block with a `tool_use_id`).
+/// [`ToolOutcome`] can be linked back to the call it answers. Both vendors require this linkage
+/// (OpenAI a `tool` message with a `tool_call_id`; Anthropic a `tool_result` block with a
+/// `tool_use_id`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallId(pub String);
 
-/// A proposed tool call the brain emits (architecture §2.1; contract 8.3). Carries the call `id`
-/// (so its result can be linked back), the tool `name`, and the model's chosen `arguments`.
+/// A proposed tool call the brain emits. Carries the call `id` (so its result can be linked back),
+/// the tool `name`, and the model's chosen `arguments`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// The model-minted call id; the matching [`ToolOutcome::call_id`] links the result back.
@@ -112,16 +108,16 @@ pub struct ToolCall {
     pub name: ToolName,
     /// The model's chosen JSON input for the call. **UNTRUSTED model output** — before a
     /// `ToolCall` is dispatched to a tool, these arguments MUST be validated against that tool's
-    /// [`ToolDef::input_schema`]; the brain only ever *proposes* (plan-then-apply survives, §2.1).
+    /// [`ToolDef::input_schema`]; the brain only ever *proposes* (plan-then-apply survives).
     pub arguments: serde_json::Value,
 }
 
-/// A final submission from the brain — its answer / proposed effects (architecture §2.1).
+/// A final submission from the brain — its answer / proposed effects.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Submission(pub String);
 
-/// The brain's per-step outcome (architecture §2.1; contract 8.3): **use tools**, or **submit**.
-/// The brain only ever *proposes* — it never acts (plan-then-apply survives, §2.1).
+/// The brain's per-step outcome: **use tools**, or **submit**. The brain only ever *proposes* — it
+/// never acts (plan-then-apply survives).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepOutcome {
     /// "Call these tools, give me the results, step me again."
@@ -130,20 +126,19 @@ pub enum StepOutcome {
     Submit(Submission),
 }
 
-/// **Raw provider token usage for ONE model step (contract 8.3; NON-FINANCIAL — counts only).**
+/// **Raw provider token usage for ONE model step (NON-FINANCIAL — counts only).**
 ///
-/// This is the *platform-side* projection of the vendor's per-call token accounting. It lives HERE,
-/// in the seam crate, so the driving loop (`myelin-agent-service`) can observe a run's token usage
-/// WITHOUT depending on the vendor crate `myelin-agent-model` (the `no-llm-in-platform` boundary,
-/// contract 1.6). The vendor→platform mapping (`myelin_agent_model::client::Usage` → this type) is
-/// the sanctioned job of `myelin-agent-model`'s `MeteredRuntime` override.
+/// The *platform-side* projection of the vendor's per-call token accounting. It lives HERE, in the
+/// seam crate, so the driving loop (`myelin-agent-service`) can observe a run's token usage WITHOUT
+/// depending on the vendor crate `myelin-agent-model` (the `no-llm-in-platform` boundary). The
+/// vendor→platform mapping (`myelin_agent_model::client::Usage` → this type) is the job of
+/// `myelin-agent-model`'s `MeteredRuntime` override.
 ///
 /// **Raw counts, never fabricated.** These are the provider's own token counts. A provider that
 /// omits its usage block surfaces [`TokenUsage::NotReported`] — the runtime never estimates a count.
-/// [`TokenUsage::NotReported`] is what the future metering slice reads to **fail closed** (never
-/// price an unmetered call). This carrier is *observability only*: it holds NO money, NO pricing, NO
-/// wallet — pricing raw counts into a bill (wholesale/markup, micro-units) is a SEPARATE,
-/// decision-gated follow-on slice that lives outside this crate.
+/// [`TokenUsage::NotReported`] is what the metering slice reads to **fail closed** (never price an
+/// unmetered call). This carrier is *observability only*: it holds NO money, NO pricing, NO wallet —
+/// pricing raw counts into a bill (wholesale/markup, micro-units) lives outside this crate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenUsage {
     /// The provider reported token counts for the step. `input` is the non-cached prompt tokens
@@ -157,27 +152,27 @@ pub enum TokenUsage {
         /// Completion (output) tokens.
         output: u64,
     },
-    /// The provider omitted usage (or the brain has no usage source, e.g. Skeleton/Mock). The future
-    /// metering slice MUST fail the run closed on this — never estimate a count.
+    /// The provider omitted usage (or the brain has no usage source, e.g. the Mock). The metering
+    /// slice MUST fail the run closed on this — never estimate a count.
     #[default]
     NotReported,
 }
 
-// ───────────────────────── §2.2 the hands — value types (sandboxed exec) ────────────────────────
+// ───────────────────────── the hands — value types (sandboxed exec) ──────────────────────────────
 
-/// A sandboxed command for the hands (architecture §2.2; contract 8.4). Carries only
-/// `compute`/`external` untrusted code — mutation goes through [`EffectApi`], never here.
+/// A sandboxed command for the hands. Carries only `compute`/`external` untrusted code — mutation
+/// goes through [`EffectApi`], never here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Command(pub String);
 
-/// The result of a sandboxed [`ToolHands::exec`] (architecture §2.2; contract 8.4).
+/// The result of a sandboxed [`ToolHands::exec`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult(pub String);
 
-/// A tool [`ToolResult`] linked back to the [`ToolCall`] it answers (architecture §2.1; contract
-/// 8.3/8.4). The platform records these into [`Turn::ToolResults`] so the brain's next step sees
-/// each result keyed to the call it requested — the linkage both vendors require (an OpenAI `tool`
-/// message / an Anthropic `tool_result` block carrying the originating call id).
+/// A tool [`ToolResult`] linked back to the [`ToolCall`] it answers. The platform records these into
+/// [`Turn::ToolResults`] so the brain's next step sees each result keyed to the call it requested —
+/// the linkage both vendors require (an OpenAI `tool` message / an Anthropic `tool_result` block
+/// carrying the originating call id).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolOutcome {
     /// The [`ToolCall::id`] this result answers.
@@ -186,16 +181,16 @@ pub struct ToolOutcome {
     pub result: ToolResult,
 }
 
-// ───────────────────────── §4.2 the tool surface — ToolDef (the frozen field list) ──────────────
+// ───────────────────────── the tool surface — ToolDef (the frozen field list) ────────────────────
 
-/// The lookup key into the one tool catalogue (architecture §4.2; contract 8.1). `ToolDef` is
-/// versioned (forward-only) and keyed by `(subsystem, name, version)`; this is the `name` half.
+/// The lookup key into the one tool catalogue. `ToolDef` is versioned (forward-only) and keyed by
+/// `(subsystem, name, version)`; this is the `name` half.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ToolName(pub String);
 
-/// How an effect routes (architecture §5.0; contract 8.1 `effect_kind`): the platform loop routes
-/// `UseTools` per `effect_kind` / `side_effecting` — `read` direct, `compute`/`external` into the
-/// sandbox ([`ToolHands::exec`]), `mutate` through [`EffectApi::apply`] (plan-then-apply).
+/// How an effect routes: the platform loop routes `UseTools` per `effect_kind` / `side_effecting` —
+/// `read` direct, `compute`/`external` into the sandbox ([`ToolHands::exec`]), `mutate` through
+/// [`EffectApi::apply`] (plan-then-apply).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EffectKind {
     /// A permission-filtered read — no mutation, no sandbox.
@@ -208,43 +203,41 @@ pub enum EffectKind {
     External,
 }
 
-/// A tool definition registered into the one permissioned catalogue (architecture §4.2; contract
-/// 8.1 — **the frozen field list**). Every subsystem contributes its actions; the catalogue is
-/// MCP-exposable (the MCP surface is a projection of `ToolDef`).
+/// A tool definition registered into the one permissioned catalogue — **the frozen field list**.
+/// Every subsystem contributes its actions; the catalogue is MCP-exposable (the MCP surface is a
+/// projection of `ToolDef`).
 ///
-/// **`requires_approval` here is the COLUMN, not a seeded value.** The per-subsystem
-/// `requires_approval` defaults table (CI deploy/secret = yes; Git merge = yes, open_pr = no; …)
-/// is **frozen but SEEDED in AG-P8 (→ P-220)** — this prompt ships the field, not the defaults.
+/// `requires_approval` is the COLUMN, not a seeded value: the per-subsystem defaults table (CI
+/// deploy/secret = yes; Git merge = yes, open_pr = no; …) is seeded with the catalogue, not here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDef {
     /// The tool name (the catalogue key half; `(subsystem, name, version)`).
     pub name: ToolName,
-    /// The contributing subsystem (an event-bus §6.2 token).
+    /// The contributing subsystem (an event-bus token).
     pub subsystem: String,
     /// `ToolDef` is versioned (forward-only).
     pub version: u32,
     /// JSON Schema for the tool's input, validated pre-apply (opaque-string carrier at this seam).
     pub input_schema: String,
-    /// The `Permission`(s) the run must hold (the Id `check`, §5.2).
+    /// The `Permission`(s) the run must hold (the identity `check`).
     pub required_caps: Vec<String>,
     /// How the effect routes (`read | compute | mutate | external`).
     pub effect_kind: EffectKind,
     /// Whether applying the tool has a side effect.
     pub side_effecting: bool,
-    /// Whether the tool is HITL-gated by default. The per-subsystem DEFAULTS are seeded in AG-P8
-    /// (→ P-220); here the column exists, no value is seeded.
+    /// Whether the tool is HITL-gated by default. The per-subsystem defaults are seeded with the
+    /// catalogue; here the column exists, no value is seeded.
     pub requires_approval: bool,
     /// Whether the tool is exposed over the external MCP endpoint (the MCP surface is a projection
-    /// of `ToolDef`; the external endpoint itself is a post-M5 floor).
+    /// of `ToolDef`; the external endpoint itself is a deferred floor).
     pub exposed_over_mcp: bool,
 }
 
-// ───────────────────────── §5.2 plan-then-apply — EffectApi value types ─────────────────────────
+// ───────────────────────── plan-then-apply — EffectApi value types ───────────────────────────────
 
-/// The run context an effect is applied under (architecture §5.2; contract 8.2). Carries the
-/// per-run attenuated token + budget + causality (the full shape lands with the SKELETON runtime,
-/// AG-P4 → P-216, and the plan-then-apply pipeline, AG-P6 → P-218); opaque here so the trait
-/// signature is the frozen shape.
+/// The run context an effect is applied under. Carries the per-run attenuated token + budget +
+/// causality; opaque here (the full shape lands with the runtime) so the trait signature is the
+/// frozen shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RunCtx(pub String);
 
@@ -281,23 +274,23 @@ impl core::fmt::Debug for EffectAuthority {
     }
 }
 
-/// A proposed effect the brain wants the platform to apply (architecture §5.2; contract 8.2).
-/// Agents NEVER mutate directly — a `ProposedEffect` goes through the schema → capability →
-/// delegation → tenant → budget → HITL-gate → apply → meter pipeline (AG-P6 → P-218); opaque here.
+/// A proposed effect the brain wants the platform to apply. Agents NEVER mutate directly — a
+/// `ProposedEffect` goes through the schema → capability → delegation → tenant → budget → HITL-gate
+/// → apply → meter pipeline; opaque here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedEffect(pub String);
 
-/// An opaque event id returned when an effect is applied (architecture §5.2; contract 8.2).
+/// An opaque event id returned when an effect is applied.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventId(pub String);
 
-/// An opaque HITL gate id returned when an effect is withheld pending approval (architecture §5.3;
-/// contract 8.2). A withheld gated tool does NOT mutate (AG-8).
+/// An opaque HITL gate id returned when an effect is withheld pending approval. A withheld gated
+/// tool does NOT mutate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateId(pub String);
 
-/// The outcome of [`EffectApi::apply`] (architecture §5.2; contract 8.2): **Applied**, **Gated**
-/// (withheld for HITL — does not mutate), or **Denied** (an ordinary tool error).
+/// The outcome of [`EffectApi::apply`]: **Applied**, **Gated** (withheld for HITL — does not
+/// mutate), or **Denied** (an ordinary tool error).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EffectResult {
     /// The effect was applied; carries the emitted domain event id.
@@ -308,40 +301,33 @@ pub enum EffectResult {
     Denied(String),
 }
 
-// ───────────────────────── §2.3 the loop / §8.6 delivery — value types ──────────────────────────
+// ───────────────────────── the loop / delivery — value types ─────────────────────────────────────
 
-/// An event the platform delivers into the agent inbox (architecture §2.3/§3.4; contract 8.6).
-/// Carries the envelope + binding + token + budget; agents don't poll. **Explicit-first dispatch**
-/// (CHAT-1): a mention notifies, it does NOT auto-spawn a costed run (the dispatch tier is the
-/// Bus's, §3.6); opaque here, the binding shape lands with the SKELETON runtime (AG-P4 → P-216).
+/// An event the platform delivers into the agent inbox (the envelope + binding + token + budget);
+/// agents don't poll. **Explicit-first dispatch:** a mention notifies, it does NOT auto-spawn a
+/// costed run. Opaque here — the binding shape lands with the runtime.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxEvent(pub String);
 
-/// The outcome of a bounded multi-turn run (architecture §2.3; contract 8.5). Opaque until the
-/// SKELETON loop lands (AG-P4 → P-216).
+/// The outcome of a bounded multi-turn run. Opaque here — the shape lands with the runtime loop.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunOutcome(pub String);
 
 // ───────────────────────── the six traits (frozen signatures only) ──────────────────────────────
 
-/// **THE BRAIN** — the *stateless* runtime (architecture §2.1; contract 8.3; AG-1). The
-/// **only** strategy-swappable seam alongside [`ToolHands`]: the runtime behind which
-/// `MockAgentRuntime` (`--use-mock`) lives now and `LlmAgentRuntime` lives later. The platform owns
-/// the [`Conversation`] history; `step` is pure-ish (conversation in, decision out) so it is
-/// trivially mockable + golden/mutation-testable.
-///
-/// **Floor:** the body is shipped by the runtimes — SKELETON (AG-P4 → P-216), `MockAgentRuntime`
-/// (AG-P5 → P-217), `LlmAgentRuntime` (the only vendor seam, **designed-not-built, AG-P25**, the
-/// only place an LLM SDK/prompt/model-name may ever appear). NO LLM SDK in platform code
-/// (`no-llm-in-platform`, contract 1.6).
+/// **THE BRAIN** — the *stateless* runtime. The **only** strategy-swappable seam alongside
+/// [`ToolHands`]: the runtime behind which `MockAgentRuntime` lives now and `LlmAgentRuntime` lives
+/// later. The platform owns the [`Conversation`] history; `step` is pure-ish (conversation in,
+/// decision out) so it is trivially mockable + golden/mutation-testable. The real vendor brain is
+/// the only place an LLM SDK / prompt / model-name may appear (`no-llm-in-platform`).
 pub trait AgentRuntime {
     /// Take the whole conversation, return a single decision (use tools, or submit).
     fn step(&self, conv: &Conversation) -> StepOutcome;
 }
 
-/// **One brain step PLUS its raw token usage (contract 8.3; NON-FINANCIAL).** The seam decision
-/// [`StepOutcome`] together with the [`TokenUsage`] the model reported for it, so the driving loop
-/// can accumulate per-turn token counts into a run's telemetry. Observability only — no pricing.
+/// **One brain step PLUS its raw token usage (NON-FINANCIAL).** The [`StepOutcome`] together with
+/// the [`TokenUsage`] the model reported for it, so the driving loop can accumulate per-turn token
+/// counts into a run's telemetry. Observability only — no pricing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeteredStep {
     /// The brain's decision this step (use tools, or submit).
@@ -351,17 +337,17 @@ pub struct MeteredStep {
 }
 
 /// **THE METERED BRAIN SEAM** — one step *observably*: the decision AND its raw token usage
-/// (contract 8.3; NON-FINANCIAL — counts only, no pricing). A super-trait of [`AgentRuntime`] with a
-/// DEFAULT [`step_metered`](MeteredRuntime::step_metered): a brain with no usage source (the SKELETON,
-/// the Mock) reports [`TokenUsage::NotReported`] for free; only the real vendor brain
-/// (`LlmAgentRuntime`) overrides it to map the provider's usage → [`TokenUsage`].
+/// (NON-FINANCIAL — counts only, no pricing). A super-trait of [`AgentRuntime`] with a DEFAULT
+/// [`step_metered`](MeteredRuntime::step_metered): a brain with no usage source (the Mock) reports
+/// [`TokenUsage::NotReported`] for free; only the real vendor brain (`LlmAgentRuntime`) overrides it
+/// to map the provider's usage → [`TokenUsage`].
 ///
 /// **Why explicit per-type impls, NOT a blanket `impl<T: AgentRuntime> MeteredRuntime for T`.** A
 /// blanket impl would collide (trait coherence) with the vendor crate's real override
 /// `impl MeteredRuntime for LlmAgentRuntime` — the compiler cannot know the two don't overlap. So
-/// each runtime gets an explicit `impl MeteredRuntime for <Type> {}` (the default is inherited for
-/// free by the Skeleton/Mock), and `LlmAgentRuntime` gets a real body. The default method means an
-/// empty impl is genuinely empty — the seam costs a usage-less brain one line.
+/// each runtime gets an explicit `impl MeteredRuntime for <Type> {}` (the Mock inherits the default
+/// for free), and `LlmAgentRuntime` gets a real body. The default method means an empty impl is
+/// genuinely empty — the seam costs a usage-less brain one line.
 pub trait MeteredRuntime: AgentRuntime {
     /// One step PLUS its token usage. The default is the plain [`AgentRuntime::step`] paired with
     /// [`TokenUsage::NotReported`] (a brain with no usage source). The LLM runtime overrides this to
@@ -374,62 +360,45 @@ pub trait MeteredRuntime: AgentRuntime {
     }
 }
 
-/// **THE LOOP** (architecture §2.3; contract 8.5; AG-3). A platform-owned, **bounded, driven**
-/// multi-turn loop — NOT a single call, NOT the runtime's responsibility, NOT a strategy seam
-/// (identical for mock and real). A run is a durable workflow; nested causality is preserved.
-///
-/// **Floor:** the loop body (build_conversation → reserve → repeatedly `step` → route per §5.0 →
-/// settle) lands with the SKELETON runtime (AG-P4 → P-216).
+/// **THE LOOP** — a platform-owned, **bounded, driven** multi-turn loop. NOT a single call, NOT the
+/// runtime's responsibility, NOT a strategy seam (identical for mock and real). A run is a durable
+/// workflow; nested causality is preserved. The body (build_conversation → reserve → repeatedly
+/// `step` → route → settle) lands with the runtime.
 pub trait Agent {
     /// Drive the bounded multi-turn loop for one delivered inbox event.
     fn handle(&self, inbox: InboxEvent, runtime: &dyn AgentRuntime) -> RunOutcome;
 }
 
-/// **THE HANDS** — sandboxed computation (architecture §2.2; contract 8.4; AG-2). The other
-/// strategy-swappable seam (real `SandboxedHands` / `SimHands`). **No host-execution path bypasses
-/// `exec`** (X-6; the `no-host-exec` lint, contract 1.6, enforces it). `exec` IS the CI runner's
-/// `kind=agent` job on the ONE unified sandbox; it carries only `compute`/`external` untrusted code
+/// **THE HANDS** — sandboxed computation; the other strategy-swappable seam. **No host-execution
+/// path bypasses `exec`** (the `no-host-exec` lint enforces it). `exec` is the CI runner's
+/// `kind=agent` job on the one unified sandbox; it carries only `compute`/`external` untrusted code
 /// — mutation goes through [`EffectApi`], never here (the routing split is the safety boundary).
-///
-/// **Floor:** the sandboxed body + the four uniform guarantees (cost gate, per-run-token
-/// attribution, HITL withhold, isolation floor + the real-kernel escape drill) land in AG-P15
-/// (→ P-226); the hard ZERO-escapes real-kernel GATE is AG-P17 (→ P-229) / CI-P5.
 pub trait ToolHands {
     /// Run untrusted code in the sandbox and return its result.
     fn exec(&self, cmd: Command) -> ToolResult;
 }
 
-/// **THE TOOL REGISTRY** — one permissioned catalogue, MCP-exposable (architecture §4.2; contract
-/// 8.1; ADR-08.4). Platform-owned (identical for mock and real). Every subsystem contributes its
-/// [`ToolDef`]s; `resolve` looks a tool up by name.
-///
-/// **Floor:** the persisted catalogue + the per-subsystem `requires_approval` defaults seed land in
-/// AG-P8 (→ P-220); the data-model migration is AG-P2 (→ P-131).
+/// **THE TOOL REGISTRY** — one permissioned catalogue, MCP-exposable. Platform-owned (identical for
+/// mock and real). Every subsystem contributes its [`ToolDef`]s; `resolve` looks a tool up by name.
 pub trait ToolSurface {
     /// Register a tool into the one catalogue.
     fn register_tool(&mut self, def: ToolDef);
-    /// Resolve a tool by name (architecture §1.3 / Phase-3 §7.1).
+    /// Resolve a tool by name.
     fn resolve(&self, name: &ToolName) -> Option<&ToolDef>;
 }
 
-/// **DELIVERY** — the platform delivers matched events; agents don't poll (architecture §1.3/§3.4;
-/// contract 8.6; ADR-08). Platform-owned. **Explicit-first dispatch** (CHAT-1): a mention notifies,
-/// it does NOT auto-spawn a costed run (implicit auto-dispatch is L-3, counsel-gated, AG-P20).
-///
-/// **Floor:** the dispatch-tier wiring is the Bus's (§3.6); the agent-side consumer lands with the
-/// SKELETON runtime (AG-P4 → P-216).
+/// **DELIVERY** — the platform delivers matched events; agents don't poll. Platform-owned.
+/// **Explicit-first dispatch:** a mention notifies, it does NOT auto-spawn a costed run (implicit
+/// auto-dispatch is a counsel-gated policy question, see `docs/gaps/agent-fabric-floors.md`).
 pub trait EventInbox {
     /// Deliver a matched event into the agent inbox (envelope + binding + token + budget).
     fn deliver(&self, ev: InboxEvent);
 }
 
-/// **PLAN-THEN-APPLY** — the platform-owned write-back path (architecture §5.2; contract 8.2;
-/// ADR-08.3). Platform-owned (identical for mock and real). Agents NEVER mutate directly: every
-/// `ProposedEffect` runs schema → capability → delegation → tenant → budget → HITL-gate → apply via
-/// the public endpoint → meter, and returns `Applied | Gated | Denied`.
-///
-/// **Floor:** the eight-step pipeline body (AG-D1/D2/D3) lands in AG-P6 (→ P-218); the per-effect
-/// HITL idempotency is AG-P10 (→ P-222).
+/// **PLAN-THEN-APPLY** — the platform-owned write-back path. Platform-owned (identical for mock and
+/// real). Agents NEVER mutate directly: every `ProposedEffect` runs schema → capability →
+/// delegation → tenant → budget → HITL-gate → apply via the public endpoint → meter, and returns
+/// `Applied | Gated | Denied`.
 pub trait EffectApi {
     /// Apply (or gate / deny) a proposed effect under the run's context.
     fn apply(&self, run: &RunCtx, effect: ProposedEffect) -> EffectResult;
@@ -453,11 +422,8 @@ pub trait EffectApi {
     }
 }
 
-/// **`run --dry-run`** — plan-then-apply testability (architecture §7.1; contract 8.7). Returns the
-/// proposed effects WITHOUT applying any (the `run --dry-run` plan lever, AG-P8 → P-220). This is
-/// the signature seam; the CLI body lands in AG-P8.
-///
-/// **Floor:** the dry-run lever body lands in AG-P8 (→ P-220).
+/// **`run --dry-run`** — plan-then-apply testability. Returns the proposed effects WITHOUT applying
+/// any. This is the signature seam; the CLI body lands with the runtime.
 pub trait DryRun {
     /// Plan the run for a delivered event without applying any effect.
     fn dry_run(&self, inbox: InboxEvent) -> Vec<ProposedEffect>;
@@ -484,17 +450,16 @@ mod tests {
         }
     }
 
-    /// A deterministic mock impl of every swappable + platform-owned trait — proves all six
-    /// (+`DryRun`, 8.7) signatures compile against a real impl on the SAME code path users hit
-    /// (`--use-mock`, 8.3). No LLM SDK appears (the `no-llm-in-platform` ratchet, 1.6).
+    /// A deterministic mock impl of every swappable + platform-owned trait — proves all six traits
+    /// (+`DryRun`) compile against a real impl on the SAME code path users hit. No LLM SDK appears
+    /// (the `no-llm-in-platform` ratchet).
     struct Mock {
         catalogue: Vec<ToolDef>,
     }
 
     impl AgentRuntime for Mock {
         fn step(&self, _conv: &Conversation) -> StepOutcome {
-            // A mock runtime is a real flag (`--use-mock`, 8.3); a deterministic submit is a valid
-            // skeleton decision. The body proper lands with the runtimes (AG-P4/AG-P5).
+            // A deterministic submit is a valid decision; the body proper lands with the runtimes.
             StepOutcome::Submit(Submission("ok".into()))
         }
     }
@@ -506,8 +471,7 @@ mod tests {
 
     impl Agent for Mock {
         fn handle(&self, _inbox: InboxEvent, runtime: &dyn AgentRuntime) -> RunOutcome {
-            // The bounded loop body lands in AG-P4 (→ P-216). Here it drives one `step` so the
-            // `&dyn AgentRuntime` seam is exercised (the brain is dynamically dispatched).
+            // Drive one `step` so the `&dyn AgentRuntime` seam is exercised (dynamic dispatch).
             let _ = runtime.step(&Conversation::default());
             RunOutcome("done".into())
         }
@@ -516,7 +480,6 @@ mod tests {
     impl ToolHands for Mock {
         fn exec(&self, _cmd: Command) -> ToolResult {
             // SimHands marker — proves it went through the trait, not a host shell (no-host-exec).
-            // The sandboxed body + four uniform guarantees land in AG-P15 (→ P-226).
             ToolResult("sim:executed".into())
         }
     }
@@ -538,8 +501,8 @@ mod tests {
 
     impl EffectApi for Mock {
         fn apply(&self, _run: &RunCtx, _effect: ProposedEffect) -> EffectResult {
-            // Plan-then-apply body (8-step pipeline) lands in AG-P6 (→ P-218); a deterministic
-            // Applied is a valid skeleton outcome that exercises the EffectResult value type.
+            // A deterministic Applied exercises the EffectResult value type; the plan-then-apply
+            // pipeline body lands with the runtime.
             EffectResult::Applied(EventId("evt-1".into()))
         }
     }
@@ -559,8 +522,8 @@ mod tests {
             required_caps: vec!["issue.write".into()],
             effect_kind: EffectKind::Mutate,
             side_effecting: true,
-            // The COLUMN exists; the per-subsystem DEFAULT is seeded in AG-P8 (→ P-220). A test
-            // value here is not the frozen default — it proves the field round-trips.
+            // The column exists; a test value here is not the frozen default — it proves the field
+            // round-trips.
             requires_approval: false,
             exposed_over_mcp: false,
         }
@@ -675,15 +638,11 @@ mod tests {
         assert_eq!(plan, vec![ProposedEffect("planned".into())]);
     }
 
-    // ───────── value-type mutation-score floor (TESTS field: ToolDef/EffectResult/StepOutcome) ──
+    // ───────── value-type mutation-score floor: ToolDef / EffectResult / StepOutcome / EffectKind ─
     //
-    // `myelin-agent` is a mandatory-core glue crate. The value-type module (`ToolDef`,
-    // `EffectResult`, `StepOutcome`, `EffectKind`) is PURE and must be mutation-covered: the floor
-    // is **every mutation of a variant/field/tag of these value types is killed by a test**. A full
-    // `cargo-mutants` run is the substrate mutation-harness's job (P-S22 / the thresholds file); the
-    // tests below discharge the per-line obligation those structural assertions already cover. The
-    // measured `cargo-mutants` run over `crates/myelin-agent` at AG-P1 is recorded in the commit
-    // body (0 missed mutants over the value-type module).
+    // These value types are PURE and must be mutation-covered: every mutation of a variant / field /
+    // tag is killed by a test. The tests below discharge that obligation directly (a full
+    // `cargo-mutants` run over the crate is the substrate mutation-harness's job).
 
     /// Kills any mutation that swaps / drops a `StepOutcome` variant: both variants are
     /// distinguishable and carry their payload.
