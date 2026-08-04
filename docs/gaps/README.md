@@ -6,6 +6,7 @@ missing, why it's deferred, what "done" looks like. Delete an entry when it's cl
 Pre-release — nothing here is a production incident; it's the honest map of the
 distance between "works in a drill" and "a stranger can rely on it."
 
+- [unified-wallet.md](unified-wallet.md) — one prepaid tenant balance for CI + agents, micro-dollar unit, limits. Design of record + slice plan (ACTIVE).
 - [hosted-agent.md](hosted-agent.md) — the metered tool-executing agent: what's real vs. stubbed.
 - [agent-fabric-floors.md](agent-fabric-floors.md) — designed-not-built agent floors + the open policy questions.
 - [launch-surface.md](launch-surface.md) — signup, billing top-ups, UI, deploy, pentest.
