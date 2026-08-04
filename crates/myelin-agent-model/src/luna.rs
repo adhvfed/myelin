@@ -152,13 +152,18 @@ impl LunaClient {
         let mut body = json!({
             "model": self.model,
             "messages": messages,
-            "tool_choice": "auto",
             // Luna rejects function tools on chat/completions unless reasoning_effort is 'none'
             // (the spike's discovery); 'none' keeps this a plain tool-calling loop.
             "reasoning_effort": "none",
         });
+        // `tool_choice` is ONLY valid when `tools` are present — OpenAI 400s a `tool_choice` on a
+        // toolless request ("'tool_choice' is only allowed when 'tools' are specified"). So both keys
+        // are set together, or neither: a no-tools run (e.g. a single-answer hosted agent) sends a
+        // plain completion request. Caught by the hosted-agent no-tools end-to-end drill
+        // (crates/myelin-agent-host).
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
+            body["tool_choice"] = json!("auto");
         }
         if let Some(max) = request.max_output_tokens {
             body["max_completion_tokens"] = json!(max);
@@ -408,6 +413,25 @@ mod tests {
         assert_eq!(messages[3]["role"], "tool");
         assert_eq!(messages[3]["tool_call_id"], "call_1");
         assert_eq!(body["tools"][0]["function"]["name"], "search");
+    }
+
+    #[test]
+    fn body_omits_tool_choice_when_there_are_no_tools() {
+        // A no-tools request (e.g. a single-answer hosted-agent run) must NOT carry `tool_choice` —
+        // OpenAI 400s a `tool_choice` on a toolless request. Both keys are set together or neither.
+        let client = LunaClient::new("k");
+        let request = ModelRequest {
+            system: "answer".into(),
+            turns: vec![ModelTurn::User {
+                content: "hi".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: Some(16),
+        };
+        let body = client.body_for(&request);
+        assert!(body.get("tool_choice").is_none(), "no tool_choice without tools");
+        assert!(body.get("tools").is_none(), "no tools key without tools");
+        assert_eq!(body["reasoning_effort"], "none");
     }
 
     #[test]

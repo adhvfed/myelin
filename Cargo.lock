@@ -2284,6 +2284,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-agent-host"
+version = "0.0.0"
+dependencies = [
+ "myelin-agent",
+ "myelin-agent-model",
+ "myelin-agent-service",
+ "myelin-config",
+ "myelin-events",
+ "myelin-flow",
+ "myelin-identity",
+ "myelin-storage",
+ "myelin-tenancy",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "myelin-agent-model"
 version = "0.0.0"
 dependencies = [

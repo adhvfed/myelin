@@ -273,6 +273,14 @@ members = [
     # eleven-crate library DAG modelled by crate_graph.rs; substrate_is_root()/identity_is_sink()
     # unaffected). See crates/myelin-mcp/src/lib.rs.
     "crates/myelin-mcp",
+    # The hosted-agent COMPOSITION ROOT (AG-P25 real-run wiring): the ONE leaf crate that joins the
+    # real vendor brain (`myelin-agent-model`), the driving loop (`myelin-agent-service`), and the
+    # durable prepaid wallet (`myelin-storage`) into a functioning, metered, end-to-end agent run.
+    # A LEAF consumer (nothing depends on it) — acyclic by construction, OUTSIDE the eleven-crate
+    # library DAG (`crate_graph`), and the single home of the `myelin-agent-model` dependency edge
+    # (the `no-llm-in-platform` boundary keeps agent-service off agent-model). See
+    # crates/myelin-agent-host/src/lib.rs.
+    "crates/myelin-agent-host",
 ]
 
 # Workspace-wide dependency versions. Pinned once here so every glue crate shares

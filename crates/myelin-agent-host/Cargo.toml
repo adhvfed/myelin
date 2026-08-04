@@ -1,0 +1,53 @@
+[package]
+name = "myelin-agent-host"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The HOSTED-AGENT COMPOSITION ROOT (AG-P25 real-run wiring): the ONE leaf crate that composes the
+# real vendor brain (`myelin-agent-model::LlmAgentRuntime` over `LunaClient`), the platform-owned
+# driving loop (`myelin-agent-service::SkeletonAgent::handle_run`), and the durable prepaid wallet
+# (`myelin-storage::AgentWallet`) into a FUNCTIONING, METERED, end-to-end agent run.
+#
+# WHY A NEW LEAF CRATE (the crate-graph reasoning):
+#   - The `no-llm-in-platform` boundary (contract 1.6) forbids `myelin-agent-service` from ever
+#     depending on `myelin-agent-model`. The real brain must therefore be constructed at a
+#     composition root that depends on BOTH crates and passed into `handle_run` as a `&dyn
+#     MeteredRuntime`.
+#   - No existing production crate depends on `myelin-agent-service` — it is itself a documented LEAF
+#     consumer (like the other service crates), and `myelin-agent-model` is a leaf too (nothing
+#     depends on it). There is thus no pre-existing host that could take on the composition.
+#   - A NEW leaf crate is acyclic BY CONSTRUCTION: nothing in the workspace depends on it, so no edge
+#     can close a cycle. It is OUTSIDE the eleven-crate library DAG modelled by
+#     `myelin-substrate::crate_graph` (a terminal consumer, exactly like the service crates), and it
+#     confines the `myelin-agent-model` dependency edge to this single home.
+[dependencies]
+# The two crates the no-llm boundary keeps apart, joined ONLY here:
+myelin-agent-model = { path = "../myelin-agent-model" }     # the real brain (LlmAgentRuntime + LunaClient)
+myelin-agent-service = { path = "../myelin-agent-service" } # the driving loop (SkeletonAgent::handle_run) + metering
+# The frozen agent seam value types the RunSubstrate + the no-tools catalogue/executor reference.
+myelin-agent = { path = "../myelin-agent" }
+# The durable prepaid wallet (money) + the nominal reserve/settle types the RunSubstrate carries.
+myelin-storage = { path = "../myelin-storage" }
+# The durable-workflow seams the RunSubstrate threads (token mint, delegation caveats, journal).
+myelin-flow = { path = "../myelin-flow" }
+# The transactional outbox + id-minter the trace activity co-commits through.
+myelin-events = { path = "../myelin-events" }
+# The agent Principal the run acts as.
+myelin-identity = { path = "../myelin-identity" }
+# The (tenant, region) partition types.
+myelin-tenancy = { path = "../myelin-tenancy" }
+
+[dev-dependencies]
+# The MOCK ModelClient double (hermetic end-to-end, no network) — proves the composition + F1 + the
+# per-turn metering wire up green without touching Luna.
+myelin-agent-model = { path = "../myelin-agent-model", features = ["test-support"] }
+# The in-memory nominal-substrate doubles the drills build: CostLedger::new (storage/test-support) +
+# OutboxStore::new (events/test-support). The wallet stays DURABLE — the money-critical piece is real.
+myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
+# The live Luna drill (gated on OPENAI_API_KEY + live PG :5433, mirroring integration_wallet_metering):
+myelin-config = { path = "../myelin-config" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
