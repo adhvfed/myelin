@@ -1,25 +1,15 @@
 //! # `effect_api` — plan-then-apply `EffectApi::apply`: the schema → capability → delegation →
-//! tenant → budget → HITL-gate → apply → meter pipeline (AG-P6 → P-218, M2-B)
+//! tenant → budget → HITL-gate → apply → meter pipeline
 //!
-//! **Owning architecture doc:**
-//! `planning/05-refined-shared-systems-architecture/agent-fabric.md` §5.2 (the plan-then-apply
-//! pipeline, **in order, fail-closed**: SCHEMA → CAPABILITY (with the `CaveatContext` for
-//! field/transition ABAC, evaluated at check-time off the hot `list_objects` path) → DELEGATION
-//! (`agent.policy ∩ delegation ∩ tenant.policy`, **intersection never union**, attenuation never
-//! up) → TENANT → BUDGET → HITL GATE → APPLY via the subsystem's PUBLIC endpoint as the agent
-//! principal (same gateway, no carve-out) → METER), §5.0 (the routing table: `mutate`/`external`
-//! go through `EffectApi`). Reconciliation §X-6 (the four uniform guarantees), §OQ-E (the
-//! `CaveatContext`).
+//! This module OWNS the body of `EffectApi::apply`. It CONSUMES Identity's `check` (with the
+//! `CaveatContext`), Identity's `delegation` → `EffectivePolicy` (the ∩ algebra), and the
+//! reserve-settle budget. The glue trait [`myelin_agent::EffectApi`] is implemented here; the
+//! eight-step pipeline below IS its body.
 //!
-//! **Contract-index:** OWNS the **body** of 8.2 (`EffectApi::apply`). CONSUMES 4.2 (`check` +
-//! `CaveatContext`), 4.5 (`delegation` → `EffectivePolicy`, the ∩ algebra), 11.7 (BUDGET /
-//! reserve-settle). The glue trait [`myelin_agent::EffectApi`] (8.2, signature half, AG-P1 →
-//! P-130) is implemented here; the eight-step pipeline IS the body the glue crate named as a floor.
-//!
-//! ## What this prompt ships — the eight-step fail-closed pipeline
+//! ## The eight-step fail-closed pipeline
 //!
 //! Agents are a pure-ish function `(event, context) → { effects }`; they **NEVER side-effect
-//! directly** (ADR-08.3 / EI-03 §2/§4). The brain emits a `ProposedEffect`; [`PlanThenApply::apply`]
+//! directly**. The brain emits a `ProposedEffect`; [`PlanThenApply::apply`]
 //! validates each through the pipeline and applies it via the subsystem's PUBLIC endpoint as the
 //! agent principal. The eight steps, **in order, fail-closed** (a step that cannot affirmatively
 //! allow → `Denied`, never a silent allow):
@@ -27,50 +17,50 @@
 //! 1. **SCHEMA** — validate `effect.input` against the [`ToolDef`] JSON Schema; malformed → `Denied`.
 //! 2. **CAPABILITY** — `Id.check(agent_principal, required_cap, object, zookie, caveat)` for every
 //!    `required_cap`; the caveat carries the field/transition ABAC ([`CaveatContext`]) evaluated
-//!    HERE, off the hot `list_objects` path (OQ-E). Any `Deny`/`Conditional` → `Denied`.
+//!    HERE, off the hot `list_objects` path. Any `Deny`/`Conditional` → `Denied`.
 //! 3. **DELEGATION** — `Id.delegation(agent, trigger_actor) → agent.policy ∩ delegation ∩
 //!    tenant.policy`; the required caps must be **inside** the intersection (attenuation, never up).
 //! 4. **TENANT** — the tenant guardrails (agent-allow-list, residency, AI-Act); a forbidden effect
 //!    → `Denied`.
-//! 5. **BUDGET** — the reserve has remaining balance for this effect's metered cost (11.7); no
-//!    balance → `Denied` (no privileged fallback).
+//! 5. **BUDGET** — the reserve has remaining balance for this effect's metered cost; no balance →
+//!    `Denied` (no privileged fallback).
 //! 6. **HITL GATE** — if `tool_def.requires_approval` AND not yet approved for this run → **WITHHELD**:
-//!    return `Gated` and STOP — the tool does NOT mutate (AG-8). The HITL machinery (the
-//!    withhold → surface → resume loop) is AG-P9 (→ P-221); HERE we only return `Gated`.
+//!    return `Gated` and STOP — the tool does NOT mutate. The withhold → surface → resume loop
+//!    lives in the HITL machinery; HERE we only return `Gated`.
 //! 7. **APPLY** — call the subsystem's PUBLIC endpoint as the agent principal (same gateway, no
-//!    carve-out, EI-03 §4) ⇒ the subsystem emits its domain event via ITS outbox. Returns the
+//!    carve-out) ⇒ the subsystem emits its domain event via ITS outbox. Returns the
 //!    `event_id`.
-//! 8. **METER** — settle exactly one cost event for this effect (11.7); wholesale ≠ markup kept
+//! 8. **METER** — settle exactly one cost event for this effect; wholesale ≠ markup kept
 //!    distinct.
 //!
 //! → [`EffectResult`] ∈ `{ Applied(event_id) | Gated(gate_id) | Denied(reason) }`.
 //!
 //! **The denied path:** an effect outside the ∩, a schema reject, a tenant deny, or a budget
-//! refusal returns an ordinary `Denied` tool error — **NO privileged fallback** (AG-5). The denial
+//! refusal returns an ordinary `Denied` tool error — **NO privileged fallback**. The denial
 //! is surfaced LOUD and counted (the [`PipelineSignals`] denial counter; the fallback counter is
 //! ALWAYS 0 by construction — there is no fallback code path).
 //!
 //! ## The consumer seams (the same trait-decoupling `skeleton.rs` uses)
 //! `myelin-agent-service` is a LEAF CONSUMER; it does NOT take a production dep on
 //! `myelin-identity-service` (the engine bodies). The pipeline consumes Identity through two
-//! **seams** ([`CapabilityCheck`] for 4.2 `check`, [`DelegationLookup`] for 4.5 `delegation`), the
+//! **seams** ([`CapabilityCheck`] for `check`, [`DelegationLookup`] for `delegation`), the
 //! tenant guardrails through [`TenantGuard`], and the subsystem PUBLIC endpoint through
 //! [`SubsystemApply`] (the only mutation path — there is no second write path). The provider+consumer
 //! CDC pairs each seam with a real provider (`tests/`).
 //!
-//! ## FLOORS named (cross-references; VISION §3, EI-01 §1)
-//! - **The pipeline is identical for mock and real — there is NO floor on `EffectApi`.** The mock
-//!   and the LLM brain emit `ProposedEffect`s into the SAME pipeline.
-//! - **The delegation-scoped tool-list** (the `list_objects` SetExpr push-down — an optimisation
-//!   that pre-scopes the tool list the brain sees) is **AG-P7 (→ P-219)**. The apply-time re-check
-//!   HERE is the guarantee; the push-down is the optimisation that feeds it.
-//! - **The `requires_approval` per-subsystem DEFAULTS seed + the `run --dry-run` lever** are
-//!   **AG-P8 (→ P-220)**. The gate COLUMN is read HERE (step 6); the defaults are SEEDED there.
+//! ## What lives elsewhere (this module's boundaries)
+//! - **The pipeline is identical for mock and real.** The mock and the LLM brain emit
+//!   `ProposedEffect`s into the SAME pipeline.
+//! - **The delegation-scoped tool-list** (the `list_objects` SetExpr push-down that pre-scopes the
+//!   tool list the brain sees) is an optimisation; the apply-time re-check HERE is the guarantee
+//!   that feeds it.
+//! - **The `requires_approval` per-subsystem defaults + the `run --dry-run` lever** live elsewhere;
+//!   the gate COLUMN is only READ here (step 6).
 //! - **The HITL machinery** (the withhold → surface → resume loop, the `hitl_gate` state machine,
-//!   per-effect resume idempotency) is **AG-P9/P10/P11 (→ P-221/P-222/P-223)**. HERE step 6 only
-//!   returns `Gated` (opens nothing) — the machinery resumes that result.
-//! - **The reserve/settle cost-gate runaway self-limiter** (AG-D11) is **AG-P14 (→ P-227)**. HERE
-//!   the BUDGET step reads the reserve balance (11.7); the runaway-loop drill is AG-P14's.
+//!   per-effect resume idempotency) lives elsewhere; HERE step 6 only returns `Gated` (opens
+//!   nothing) — the machinery resumes that result.
+//! - **The reserve/settle cost-gate runaway self-limiter** lives elsewhere; HERE the BUDGET step
+//!   reads the reserve balance.
 
 use myelin_agent::{
     EffectApi, EffectAuthority, EffectKind, EffectResult, EventId, GateId, ProposedEffect, RunCtx,
@@ -90,12 +80,12 @@ use myelin_tenancy::{ArtifactRef, Region};
 // ───────────────────────── the structured planned effect (the brain's proposal) ─────────────────
 
 /// **A structured proposed effect the brain emitted (the engine's working shape).** The glue
-/// [`ProposedEffect`] (8.2) is an opaque-string carrier across the crate boundary; HERE the engine
+/// [`ProposedEffect`] is an opaque-string carrier across the crate boundary; HERE the engine
 /// parses it into the structured plan it validates through the pipeline. Carries: the tool the
 /// effect invokes (the [`ToolName`] key into the [`ToolSurface`] catalogue), the target object
 /// (`ArtifactRef`), the JSON input the brain authored, and the optional field/transition the ABAC
-/// caveat gates (OQ-E). Built by the dispatch/loop tier when it routes a `mutate`/`external`
-/// `UseTools` call (§5.0).
+/// caveat gates. Built by the dispatch/loop tier when it routes a `mutate`/`external`
+/// `UseTools` call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedEffect {
     /// The tool the effect invokes (the catalogue key — resolved against the [`ToolSurface`]).
@@ -104,10 +94,10 @@ pub struct PlannedEffect {
     pub object: ArtifactRef,
     /// The JSON input the brain authored (validated against the [`ToolDef`] schema at step 1).
     pub input_json: String,
-    /// The field the effect writes, if field-level ABAC applies (OQ-E; e.g. a KN confidential
+    /// The field the effect writes, if field-level ABAC applies (e.g. a KN confidential
     /// field). Carried into the [`CaveatContext`] at step 2.
     pub field: Option<FieldId>,
-    /// The state transition the effect performs, if transition-level ABAC applies (OQ-E; e.g. an
+    /// The state transition the effect performs, if transition-level ABAC applies (e.g. an
     /// Issues SLA-bound `transition(issue, →done)` gated on the approver edge). Carried into the
     /// caveat at step 2.
     pub transition: Option<TransitionId>,
@@ -116,16 +106,16 @@ pub struct PlannedEffect {
     pub cost: EffectCost,
 }
 
-/// **The metered cost of one effect — `(unit, wholesale, markup)`, integer minor-units (11.7).**
+/// **The metered cost of one effect — `(unit, wholesale, markup)`, integer minor-units.**
 /// The BUDGET step (5) checks the reserve has ≥ `total()` remaining; the METER step (8) settles
-/// exactly one cost event with this split (wholesale ≠ markup kept distinct, C-1).
+/// exactly one cost event with this split (wholesale ≠ markup kept distinct).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectCost {
     /// The metered-unit dimension this effect bills (e.g. `issue.transition`).
     pub unit: &'static str,
     /// The wholesale (provider) cost, minor-units.
     pub wholesale: u64,
-    /// The markup (platform margin), minor-units — recorded DISTINCTLY from wholesale (C-1).
+    /// The markup (platform margin), minor-units — recorded DISTINCTLY from wholesale.
     pub markup: u64,
 }
 
@@ -141,7 +131,7 @@ impl EffectCost {
         self.wholesale.checked_add(self.markup)
     }
 
-    /// As the Storage [`MeteredUnit`] the settle records (one cost event per metered unit, 11.7).
+    /// As the Storage [`MeteredUnit`] the settle records (one cost event per metered unit).
     fn as_metered_unit(&self) -> MeteredUnit {
         MeteredUnit {
             unit: self.unit,
@@ -151,11 +141,11 @@ impl EffectCost {
     }
 }
 
-/// **Serialise a [`PlannedEffect`] into the opaque glue [`ProposedEffect`] carrier (8.2).** The
+/// **Serialise a [`PlannedEffect`] into the opaque glue [`ProposedEffect`] carrier.** The
 /// glue crate's [`ProposedEffect`] is an opaque string across the crate boundary; the dispatch tier
 /// builds the structured plan, this stamps it onto the carrier, and [`PlanThenApply::apply`] parses
 /// it back. Deterministic (a golden-fixture round-trip), so two runs over the same plan produce
-/// byte-identical carriers (the AG-D9 proposed-effect-sequence determinism AG-P8 re-asserts).
+/// byte-identical carriers.
 pub fn encode_proposed(plan: &PlannedEffect) -> ProposedEffect {
     // A stable, field-ordered encoding (NOT a serde blob — a fixed, auditable shape).
     let field = plan.field.as_ref().map(|f| f.0.as_str()).unwrap_or("");
@@ -173,7 +163,7 @@ pub fn encode_proposed(plan: &PlannedEffect) -> ProposedEffect {
     ))
 }
 
-/// **The PER-EFFECT gate key (R2.4 — the step-6 approval granularity).** One approval authorizes
+/// **The PER-EFFECT gate key (the step-6 approval granularity).** One approval authorizes
 /// exactly one `(tool, object)` effect: this is both the `GateId` step 6 mints on a withhold AND
 /// the key the step-6 consult reads back from the run's `approved` set (one derivation — the mint
 /// and the consult cannot diverge). An [`crate::hitl::ApprovedTools::admit`] threads exactly this
@@ -188,18 +178,18 @@ pub fn effect_gate_key_str(tool: &str, object: &str) -> String {
     format!("gate:{tool}:{object}")
 }
 
-// ───────────────────────── the consumer seams (CONSUMED: 4.2, 4.5, tenant, apply) ───────────────
+// ───────────────────────── the consumer seams (Identity check/delegation, tenant, apply) ────────
 
-/// **The contract-4.2 `check` surface, as the engine consumes it (CONSUMED, §5.2 step 2).** A seam
+/// **The `check` surface, as the engine consumes it (step 2).** A seam
 /// so `myelin-agent-service` does NOT depend on `myelin-identity-service` (the same decoupling
 /// `skeleton.rs`'s [`crate::skeleton::RunTokenRevoker`] uses — the DAG stays acyclic). The CDC pairs
 /// this consumer with the real Identity `check` provider (`tests/cdc_4_2_capability_check.rs`).
 ///
-/// The caveat carries the field/transition ABAC (OQ-E), evaluated HERE off the hot `list_objects`
+/// The caveat carries the field/transition ABAC, evaluated HERE off the hot `list_objects`
 /// path. A `Conditional` (a caveat needing missing context) is treated as a DENY — never a silent
-/// allow (fail-closed, ADR-03 / §8.6).
+/// allow (fail-closed).
 pub trait CapabilityCheck {
-    /// **`check` (4.2)** — does `subject` hold `permission` on `object` at the consistency `at`,
+    /// **`check`** — does `subject` hold `permission` on `object` at the consistency `at`,
     /// under the optional `caveat`? Returns the per-action [`Decision`] (fail-closed).
     fn check(
         &self,
@@ -211,32 +201,32 @@ pub trait CapabilityCheck {
     ) -> Decision;
 }
 
-/// **The contract-4.5 `delegation` surface, as the engine consumes it (CONSUMED, §5.2 step 3).** A
+/// **The `delegation` surface, as the engine consumes it (step 3).** A
 /// seam (no dep on `myelin-identity-service`). Returns the [`EffectivePolicy`] — the attenuated
 /// capability chain after the monotone intersection `agent.policy ∩ delegation ∩ tenant.policy`
 /// (intersection, never union; attenuation, never up). The CDC pairs this with the real Identity
 /// `delegation` provider (`tests/cdc_4_5_delegation.rs`).
 pub trait DelegationLookup {
-    /// **`delegation` (4.5)** — the run's effective policy after the intersection. The caps inside
+    /// **`delegation`** — the run's effective policy after the intersection. The caps inside
     /// the returned [`EffectivePolicy::caveats`] are the ONLY caps the run may exercise (an agent
-    /// can do nothing no human role can — EI-02 §2).
+    /// can do nothing no human role can).
     fn delegation(&self, agent: &Principal, trigger_actor: &Principal) -> EffectivePolicy;
 }
 
-/// **The tenant guardrails (CONSUMED, §5.2 step 4 — agent-allow-list, residency, AI-Act).** A seam
+/// **The tenant guardrails (step 4 — agent-allow-list, residency, AI-Act).** A seam
 /// the Tenancy/control-plane provides; the engine asks "may THIS agent run THIS effect under THIS
 /// tenant's policy?" A forbidden effect → `Denied` (no carve-out).
 pub trait TenantGuard {
-    /// **Tenant guardrail (4.x / §5.2 step 4)** — is this effect permitted by the tenant's policy
+    /// **Tenant guardrail (step 4)** — is this effect permitted by the tenant's policy
     /// (agent allow-list, residency, AI-Act human-oversight)? `false` → `Denied`.
     fn permits(&self, agent: &Principal, tool: &ToolName, object: &ArtifactRef) -> bool;
 }
 
-/// **The subsystem PUBLIC endpoint the effect applies through (CONSUMED, §5.2 step 7 — same
-/// gateway, no carve-out, EI-03 §4).** The ONLY mutation path: the engine calls the subsystem's
+/// **The subsystem PUBLIC endpoint the effect applies through (step 7 — same
+/// gateway, no carve-out).** The ONLY mutation path: the engine calls the subsystem's
 /// PUBLIC endpoint AS the agent principal, so the subsystem emits its domain event via ITS outbox
 /// (there is no second write path; the agent never reaches into a subsystem's storage — the
-/// `no-cross-db` lint, AG-D1, makes that structurally impossible). The CDC pairs this with a real
+/// `no-cross-db` lint makes that structurally impossible). The CDC pairs this with a real
 /// subsystem-endpoint provider (`tests/cdc_8_2_apply_endpoint.rs`).
 pub trait SubsystemApply {
     /// **Apply via the subsystem's PUBLIC endpoint as the agent principal (step 7).** Returns the
@@ -264,13 +254,13 @@ impl core::fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
-// ───────────────────────── the BUDGET seam (CONSUMED: 11.7) ──────────────────────────────────────
+// ───────────────────────── the BUDGET seam ───────────────────────────────────────────────────────
 
-/// **The reserve/settle budget surface, as the engine consumes it (CONSUMED, §5.2 steps 5+8 —
-/// 11.7).** A seam over the Storage [`reserve_settle`](myelin_storage::reserve_settle) ledger: the
+/// **The reserve/settle budget surface, as the engine consumes it (steps 5+8).** A seam over the
+/// Storage [`reserve_settle`](myelin_storage::reserve_settle) ledger: the
 /// BUDGET step asks "does the reserve have ≥ this effect's cost remaining?" and the METER step
 /// settles exactly one cost event. The runaway self-limiter (reserve REFUSES past an exhausted
-/// wallet) is AG-D11 / AG-P14; HERE the budget is the per-effect remaining-balance check.
+/// wallet) lives elsewhere; HERE the budget is the per-effect remaining-balance check.
 pub trait EffectBudget {
     /// **BUDGET (step 5)** — does the run's reserve have ≥ `cost` minor-units remaining for this
     /// effect? `false` → `Denied` (no privileged fallback — the run cannot spend past its reserve).
@@ -282,12 +272,11 @@ pub trait EffectBudget {
     fn settle_one(&mut self, unit: &MeteredUnit) -> u64;
 }
 
-// ───────────────────────── the eight-step pipeline (8.2 — the OWNED body) ────────────────────────
+// ───────────────────────── the eight-step pipeline (the OWNED body) ──────────────────────────────
 
 /// **The verdict a single pipeline run produced, with the step that decided it (the audit fact the
 /// `proposed_effect` row records).** Distinct from [`EffectResult`] (the glue outcome): this names
-/// WHICH step denied/gated so the trail proves where the pipeline fail-closed (EI-01 §3 — a
-/// property does not exist until a test forces the failure at each step).
+/// WHICH step denied/gated so the trail proves where the pipeline fail-closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PipelineStep {
     /// Step 1 — the input failed the [`ToolDef`] JSON-schema validation.
@@ -311,9 +300,9 @@ pub enum PipelineStep {
 /// **The verdict of the steps-1..6 gate run (the dry-run plan + the apply's pre-mutation decision).**
 /// The pipeline's first SIX steps (SCHEMA → CAPABILITY → DELEGATION → TENANT → BUDGET → HITL-GATE)
 /// are SIDE-EFFECT-FREE: they validate but never mutate or meter. This is exactly what `run --dry-run`
-/// returns (8.7 — *steps 1..6, no apply*), and exactly the decision [`apply_planned`](PlanThenApply::apply_planned)
+/// returns (steps 1..6, no apply), and exactly the decision [`apply_planned`](PlanThenApply::apply_planned)
 /// branches on before step 7. Extracting it makes the dry-run and the live apply share ONE code path
-/// (no second implementation — the plan a dry-run shows IS the plan the apply executes, AG-D9).
+/// (no second implementation — the plan a dry-run shows IS the plan the apply executes).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanVerdict {
     /// Steps 1..6 all PASS and the tool is NOT gated → the effect WOULD apply (step 7) if run live.
@@ -325,8 +314,8 @@ pub enum PlanVerdict {
     WouldDeny(PipelineStep, String),
 }
 
-/// **The contract-1.8 survival signals the pipeline emits (the green artifacts; §3.1, EI-01 §3).**
-/// A path that denies/gates but emits NO signal has FAILED the drill. The AG-D2 drill reads the
+/// **The survival signals the pipeline emits (the green artifacts).**
+/// A path that denies/gates but emits NO signal has FAILED the drill. The drill reads the
 /// **denial counter** (it increments on every Denied) and the **fallback counter** (which is ALWAYS
 /// 0 — there is NO privileged-fallback code path; the field exists so the drill can ASSERT 0, not
 /// because anything ever increments it).
@@ -355,7 +344,7 @@ impl PipelineSignals {
     pub fn applied(&self) -> u64 {
         self.applied
     }
-    /// The number of effects DENIED (the AG-D2 denial counter).
+    /// The number of effects DENIED (the denial counter).
     pub fn denied(&self) -> u64 {
         self.denied
     }
@@ -363,16 +352,15 @@ impl PipelineSignals {
     pub fn gated(&self) -> u64 {
         self.gated
     }
-    /// The number of privileged-fallback fires — **ALWAYS 0** (no fallback path exists; AG-D2).
+    /// The number of privileged-fallback fires — **ALWAYS 0** (no fallback path exists).
     ///
     /// **Mutation note (measured):** `cargo-mutants` reports `replace … -> 0` as MISSED on this
     /// accessor. That mutant is **provably equivalent**: the field is only ever its `Default` (0) and
     /// NO method in this crate mutates it (there is no privileged-fallback code path — that absence
-    /// IS the AG-D2 property). Returning `0` and returning `self.privileged_fallback` are the
+    /// IS the property). Returning `0` and returning `self.privileged_fallback` are the
     /// identical function, so no test can distinguish them. The invariant itself is forced by
     /// `privileged_fallback_stays_zero_across_every_outcome` (the counter is 0 across applied /
-    /// gated / denied / apply-failed). This is the one named equivalent-mutant survivor; the
-    /// apply-pipeline mutation score is otherwise 39/40 caught (the 6 unviable are type-only).
+    /// gated / denied / apply-failed).
     pub fn privileged_fallback(&self) -> u64 {
         self.privileged_fallback
     }
@@ -382,7 +370,7 @@ impl PipelineSignals {
     }
 }
 
-/// **8.2 — the plan-then-apply `EffectApi` (the OWNED eight-step pipeline body).** Platform-owned —
+/// **The plan-then-apply `EffectApi` (the OWNED eight-step pipeline body).** Platform-owned —
 /// identical for mock and real (the whole point of plan-then-apply; agents NEVER mutate directly).
 /// Holds the consumer seams (Identity `check`/`delegation`, the tenant guard, the budget, the
 /// subsystem apply endpoint) + the [`ToolSurface`] catalogue the schema/cap/gate steps read.
@@ -399,17 +387,17 @@ where
     A: SubsystemApply,
     B: EffectBudget,
 {
-    /// The one permissioned tool catalogue (8.1) — schema/caps/gate read the [`ToolDef`].
+    /// The one permissioned tool catalogue — schema/caps/gate read the [`ToolDef`].
     pub catalogue: &'a S,
-    /// The contract-4.2 `check` seam (CONSUMED).
+    /// The `check` seam.
     pub check: &'a C,
-    /// The contract-4.5 `delegation` seam (CONSUMED).
+    /// The `delegation` seam.
     pub delegation: &'a D,
-    /// The tenant guardrails seam (CONSUMED).
+    /// The tenant guardrails seam.
     pub tenant: &'a T,
-    /// The subsystem PUBLIC endpoint apply seam (CONSUMED — the ONLY mutation path).
+    /// The subsystem PUBLIC endpoint apply seam (the ONLY mutation path).
     pub apply_endpoint: &'a A,
-    /// The reserve/settle budget seam (CONSUMED, 11.7) — mutably borrowed (the meter settles).
+    /// The reserve/settle budget seam — mutably borrowed (the meter settles).
     pub budget: &'a mut B,
     /// The agent principal the run acts as (the `check`/`delegation`/`apply` subject).
     pub agent: Principal,
@@ -419,15 +407,15 @@ where
     pub zookie: Zookie,
     /// The set of PER-EFFECT gate keys ([`effect_gate_key`] — `gate:{tool}:{object}`) already
     /// APPROVED for this run (step 6 reads this — a gated effect whose OWN key was approved
-    /// passes). Empty for a fresh run; the HITL resume (AG-P9/P10) adds an approved gate's key.
+    /// passes). Empty for a fresh run; the HITL resume adds an approved gate's key.
     ///
-    /// **R2.4 (Defect B fix):** this set held bare TOOL NAMES, so approving `git.merge` on PR 40
-    /// admitted `git.merge` run-wide — a DECLINED sibling on PR 41 re-driven through
-    /// `apply_planned` fell through step 6 and applied. The set now carries the SAME
-    /// per-(tool, object) key the step-6 `GateId` is minted from: a declined sibling's key is
-    /// never present, so it gates again (0 mutation, AG-8).
+    /// **Why the key is per-(tool, object), not a bare tool name:** an earlier version held bare
+    /// TOOL NAMES, so approving `git.merge` on PR 40 admitted `git.merge` run-wide — a DECLINED
+    /// sibling on PR 41 re-driven through `apply_planned` fell through step 6 and applied. The set
+    /// now carries the SAME per-(tool, object) key the step-6 `GateId` is minted from: a declined
+    /// sibling's key is never present, so it gates again (0 mutation).
     pub approved: std::collections::BTreeSet<String>,
-    /// The contract-1.8 signal set the pipeline records into (mutably borrowed).
+    /// The signal set the pipeline records into (mutably borrowed).
     pub signals: &'a mut PipelineSignals,
 }
 
@@ -440,20 +428,20 @@ where
     A: SubsystemApply,
     B: EffectBudget,
 {
-    /// **Apply a structured [`PlannedEffect`] through the eight-step pipeline (the §5.2 core).**
+    /// **Apply a structured [`PlannedEffect`] through the eight-step pipeline (the pipeline core).**
     /// IN ORDER, FAIL-CLOSED: a step that cannot affirmatively allow returns `Denied`/`Gated` and
-    /// STOPS — there is no privileged fallback (AG-5), no carve-out (EI-03 §4), and the mutation
-    /// happens ONLY at step 7 via the subsystem's PUBLIC endpoint. Records the signals (the AG-D2
+    /// STOPS — there is no privileged fallback, no carve-out, and the mutation
+    /// happens ONLY at step 7 via the subsystem's PUBLIC endpoint. Records the signals (the
     /// denial counter, the meter) and returns the glue [`EffectResult`].
     pub fn apply_planned(&mut self, plan: &PlannedEffect) -> EffectResult {
         // Steps 1..6 — the SIDE-EFFECT-FREE gate (schema → cap → delegation → tenant → budget →
-        // HITL-gate). Shared verbatim with `run --dry-run` (8.7): the plan a dry-run shows IS the
-        // plan the live apply executes (AG-D9 — there is no second pipeline). This records the
+        // HITL-gate). Shared verbatim with `run --dry-run`: the plan a dry-run shows IS the
+        // plan the live apply executes (there is no second pipeline). This records the
         // denial/gated signals (the gate IS the decision); steps 7..8 below only run on WouldApply.
         match self.plan_through_gate(plan) {
             PlanVerdict::WouldDeny(step, reason) => return self.deny(step, reason),
             PlanVerdict::WouldGate(gate_id) => {
-                // Step 6 WITHHELD — the tool does NOT mutate (AG-8). Count it + return Gated.
+                // Step 6 WITHHELD — the tool does NOT mutate. Count it + return Gated.
                 self.signals.gated = self.signals.gated.saturating_add(1);
                 return EffectResult::Gated(gate_id);
             }
@@ -481,13 +469,13 @@ where
     }
 
     /// **Run the SIDE-EFFECT-FREE gate (steps 1..6) and return the [`PlanVerdict`] (the `run
-    /// --dry-run` plan, 8.7; the apply's pre-mutation decision).** SCHEMA → CAPABILITY → DELEGATION
+    /// --dry-run` plan; the apply's pre-mutation decision).** SCHEMA → CAPABILITY → DELEGATION
     /// → TENANT → BUDGET → HITL-GATE, **in order, fail-closed** — but it NEVER calls the apply
     /// endpoint (step 7) and NEVER meters (step 8). The mutation + meter are the caller's
     /// ([`apply_planned`](PlanThenApply::apply_planned)) when (and only when) the verdict is
     /// [`PlanVerdict::WouldApply`].
     ///
-    /// **Determinism (AG-D9):** the verdict is a pure function of `(plan, catalogue, check,
+    /// **Determinism:** the verdict is a pure function of `(plan, catalogue, check,
     /// delegation, tenant, budget-balance, approved-set)` — two runs over the same inputs produce
     /// byte-identical verdicts (the dry-run plan is reproducible). It does NOT mutate `self.signals`
     /// (a dry-run is observational — the denial/gated counters are the LIVE apply's, recorded by
@@ -508,7 +496,7 @@ where
             return PlanVerdict::WouldDeny(PipelineStep::Schema, reason);
         }
 
-        // Only `mutate`/`external` effects route through EffectApi (§5.0). A `read`/`compute` tool
+        // Only `mutate`/`external` effects route through EffectApi. A `read`/`compute` tool
         // reaching the apply path is a routing bug — fail-closed (never apply a non-mutate here).
         if !matches!(def.effect_kind, EffectKind::Mutate | EffectKind::External) {
             return PlanVerdict::WouldDeny(
@@ -521,8 +509,8 @@ where
         }
 
         // The CaveatContext for step 2 — the field/transition ABAC, evaluated HERE off the hot
-        // list_objects path (OQ-E). The attrs map is empty at this seam (the predicate evaluator is
-        // Id's, P-ID-22); the object/field/transition carry the ABAC condition.
+        // list_objects path. The attrs map is empty at this seam (the predicate evaluator is
+        // Id's); the object/field/transition carry the ABAC condition.
         let caveat = CaveatContext {
             object: plan.object.clone(),
             field: plan.field.clone(),
@@ -544,7 +532,7 @@ where
             {
                 Decision::Allow => {}
                 // Conditional == a caveat needs context the run did not supply → DENY, never a
-                // silent allow (fail-closed, ADR-03 / §8.6).
+                // silent allow (fail-closed).
                 Decision::Deny | Decision::Conditional => {
                     return PlanVerdict::WouldDeny(
                         PipelineStep::Capability,
@@ -582,7 +570,7 @@ where
             );
         }
 
-        // (5) BUDGET — the reserve has remaining balance for this effect's metered cost (11.7). No
+        // (5) BUDGET — the reserve has remaining balance for this effect's metered cost. No
         //     balance → Denied (no privileged fallback — the run cannot spend past its reserve).
         let Some(cost) = plan.cost.checked_total() else {
             return PlanVerdict::WouldDeny(
@@ -598,11 +586,11 @@ where
         }
 
         // (6) HITL GATE — if the tool requires_approval AND this EFFECT's per-(tool, object) gate
-        //     key is not yet approved for this run → WITHHELD: the tool does NOT mutate (AG-8).
-        //     The HITL machinery (open the card, surface, resume) is AG-P9 — HERE we only signal
-        //     the gate. The COLUMN read here is the FROZEN §6.3 default (seeded at registration,
-        //     [`crate::defaults`]). R2.4: the consult is keyed by [`effect_gate_key`] — the SAME
-        //     key the `GateId` below is minted from — never by the bare tool name, so an approved
+        //     key is not yet approved for this run → WITHHELD: the tool does NOT mutate. The HITL
+        //     machinery (open the card, surface, resume) lives elsewhere — HERE we only signal
+        //     the gate. The COLUMN read here is the frozen default (seeded at registration,
+        //     [`crate::defaults`]). The consult is keyed by [`effect_gate_key`] — the SAME key
+        //     the `GateId` below is minted from — never by the bare tool name, so an approved
         //     sibling sharing a tool name can NEVER admit a declined effect.
         let gate_key = effect_gate_key(&plan.tool, &plan.object);
         if def.requires_approval && !self.approved.contains(&gate_key) {
@@ -613,22 +601,22 @@ where
     }
 
     /// Record a DENIED verdict at `step` and return the ordinary `Denied` tool error (NO privileged
-    /// fallback — the deny is the end of the line, surfaced loud + counted, AG-5/AG-D2).
+    /// fallback — the deny is the end of the line, surfaced loud + counted).
     fn deny(&mut self, _step: PipelineStep, reason: String) -> EffectResult {
         self.signals.denied = self.signals.denied.saturating_add(1);
         EffectResult::Denied(reason)
     }
 }
 
-/// **8.2 — the glue [`EffectApi`] frozen-shape bridge.** Bridges the opaque [`ProposedEffect`]
+/// **The glue [`EffectApi`] frozen-shape bridge.** Bridges the opaque [`ProposedEffect`]
 /// carrier to the structured pipeline: parse the carrier → [`apply_planned`](PlanThenApply::apply_planned).
 /// A carrier that cannot be parsed is `Denied` (fail-closed — a malformed proposal never mutates).
 ///
 /// **Note on `&self`:** the glue trait is `fn apply(&self, ...)`, but the pipeline mutates the
 /// budget meter + the signal set. The bridge holds the [`PlanThenApply`] behind a [`core::cell::RefCell`]
 /// (a local newtype — the orphan rule forbids `impl EffectApi for RefCell<…>` directly) so the OWNED
-/// body satisfies the frozen `&self` signature without changing the glue contract (8.2 is frozen,
-/// AG-P1). The structured [`apply_planned`](PlanThenApply::apply_planned) is the primary entry the
+/// body satisfies the frozen `&self` signature without changing the glue contract. The structured
+/// [`apply_planned`](PlanThenApply::apply_planned) is the primary entry the
 /// dispatch tier calls; this bridge is the frozen-shape entry the external MCP / a workflow activity
 /// use.
 pub struct EffectApiBridge<'a, S, C, D, T, A, B>(
@@ -740,16 +728,16 @@ where
 // ───────────────────────── step 1 — the JSON-schema validator (the SCHEMA gate) ──────────────────
 
 /// **Validate `input_json` against the [`ToolDef`] `input_schema` (step 1, the SCHEMA gate).** A
-/// real, bounded JSON-Schema check (NOT a stub — the gate must FORCE the failure, EI-01 §3): the
+/// real, bounded JSON-Schema check (NOT a stub — the gate must FORCE the failure): the
 /// input must parse as JSON, and — when the schema declares an object with `required` fields and/or
 /// typed `properties` — every required field must be present and every present typed field must
 /// match its declared JSON type. A malformed input or a missing/mistyped required field is
 /// `Err(reason)` (Denied). An empty/`{}` schema admits any valid JSON (no constraints to fail).
 ///
-/// **Floor (named):** this is a bounded subset of JSON Schema (`type`, `required`, `properties` for
+/// **Scope:** this is a bounded subset of JSON Schema (`type`, `required`, `properties` for
 /// object inputs) — sufficient for the frozen `ToolDef` schemas; the full JSON-Schema vocabulary
-/// (nested `$ref`, `oneOf`, formats) is not needed by the M2 tool catalogue and is deferred to a
-/// later prompt if a tool ever needs it. The gate it provides is REAL: it forces the AG-D-schema
+/// (nested `$ref`, `oneOf`, formats) is not needed by the current tool catalogue and is deferred
+/// until a tool needs it. The gate it provides is REAL: it forces the schema
 /// failures (a wrong-typed / missing-required input is denied at step 1, not silently applied).
 pub fn validate_schema(input_schema: &str, input_json: &str) -> Result<(), String> {
     let input: serde_json::Value =
@@ -806,7 +794,7 @@ pub fn validate_schema(input_schema: &str, input_json: &str) -> Result<(), Strin
 /// **THE UNTRUSTED-ARGUMENTS ENFORCEMENT SEAM — validate a [`ToolCall`]'s model-chosen `arguments`
 /// against the tool's [`ToolDef::input_schema`] BEFORE the call is dispatched to any tool.**
 ///
-/// `ToolCall::arguments` is **untrusted model output** (the brain widened seam, §2.1). A real
+/// `ToolCall::arguments` is **untrusted model output**. A real
 /// tool-calling loop MUST route every `ToolCall` through this checkpoint before it dispatches the
 /// call — for EVERY effect kind (a `read`/`compute`/`external` tool that goes to the hands, as well
 /// as a `mutate` tool that goes to [`PlanThenApply`]). It reuses the SAME bounded JSON-Schema
@@ -816,7 +804,7 @@ pub fn validate_schema(input_schema: &str, input_json: &str) -> Result<(), Strin
 ///
 /// **TODO (the tool-calling loop slice):** the platform loop that turns a
 /// [`StepOutcome::UseTools`](myelin_agent::StepOutcome::UseTools) into real tool invocations does not
-/// exist yet (VISION §3 — the mock fabricates results, the dry-run maps names to fixture effects, so
+/// exist yet (the mock fabricates results, the dry-run maps names to fixture effects, so
 /// no `ToolCall::arguments` are dispatched to a live tool today). That loop MUST call this function
 /// on each `ToolCall` and refuse to dispatch on `Err` — this is the seam it fills, so the untrusted
 /// arguments are NEVER handed to a tool unvalidated.
@@ -866,7 +854,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
     }
 }
 
-// ───────────────────────── the opaque-carrier decode (the §5.0 routing entry) ────────────────────
+// ───────────────────────── the opaque-carrier decode (the routing entry) ─────────────────────────
 
 /// **Parse the opaque glue [`ProposedEffect`] carrier back into a structured [`PlannedEffect`].**
 /// The inverse of [`encode_proposed`]; a carrier that does not match the field-ordered shape is
